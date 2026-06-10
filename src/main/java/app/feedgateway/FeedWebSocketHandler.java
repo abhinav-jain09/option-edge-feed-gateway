@@ -1,0 +1,30 @@
+package app.feedgateway;
+
+import org.springframework.stereotype.Component;
+import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.TextWebSocketHandler;
+
+@Component
+public class FeedWebSocketHandler extends TextWebSocketHandler {
+    private final FeedGatewayService gatewayService;
+
+    public FeedWebSocketHandler(FeedGatewayService gatewayService) {
+        this.gatewayService = gatewayService;
+    }
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) {
+        gatewayService.addClient(session);
+    }
+
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        gatewayService.removeClient(session);
+    }
+
+    @Override
+    public void handleTransportError(WebSocketSession session, Throwable exception) {
+        gatewayService.removeClient(session);
+    }
+}
