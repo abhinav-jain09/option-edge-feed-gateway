@@ -62,10 +62,16 @@ public class FeedGatewayService {
     private final AtomicBoolean stateCaughtUp = new AtomicBoolean(false);
     private final AtomicLong coalescedUpdates = new AtomicLong();
     private final AtomicLong batchesSent = new AtomicLong();
+    private final AtomicLong consumerRestarts = new AtomicLong();
     private ExecutorService executor;
     private ScheduledExecutorService batchExecutor;
 
     private record CachedEvent(String event, String json) {
+    }
+
+    @FunctionalInterface
+    private interface ConsumerAttempt {
+        void run(boolean retry) throws RuntimeException;
     }
 
     public FeedGatewayService(GatewaySettings settings, ObjectMapper mapper) {
@@ -164,6 +170,7 @@ public class FeedGatewayService {
                 + "\"webSocketBatchMs\":" + settings.webSocketBatchMs() + ","
                 + "\"coalescedUpdates\":" + coalescedUpdates.get() + ","
                 + "\"batchesSent\":" + batchesSent.get() + ","
+                + "\"consumerRestarts\":" + consumerRestarts.get() + ","
                 + "\"cacheTtlMs\":" + settings.cacheTtlMs()
                 + "}";
     }
@@ -200,6 +207,10 @@ public class FeedGatewayService {
 
     private void runAlertConsumer() {
         Map<String, String> topicEvents = Map.of(settings.volumeSandwichAlertsTopic(), "volume-sandwich-alert");
+        runRetryingConsumer("alerts", retry -> runAlertConsumerOnce(topicEvents), null);
+    }
+
+    private void runAlertConsumerOnce(Map<String, String> topicEvents) {
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("alerts"))) {
             List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
             consumer.assign(partitions);
@@ -212,17 +223,18 @@ public class FeedGatewayService {
                     }
                 }
             }
-        } catch (WakeupException ignored) {
-            // Normal shutdown.
-        } catch (RuntimeException e) {
-            if (running.get()) {
-                System.err.println("Feed gateway alert consumer error: " + e.getMessage());
-                e.printStackTrace();
-            }
         }
     }
 
     private void runAssignedCacheConsumer(String name, Map<String, String> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
+        runRetryingConsumer(
+                name,
+                retry -> runAssignedCacheConsumerOnce(name, topicEvents, avro, caughtUpFlag),
+                () -> markCacheRecovering(caughtUpFlag)
+        );
+    }
+
+    private void runAssignedCacheConsumerOnce(String name, Map<String, String> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
             List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
             consumer.assign(partitions);
@@ -248,13 +260,6 @@ public class FeedGatewayService {
                     live = true;
                     markCacheCaughtUp(name, events, caughtUpFlag);
                 }
-            }
-        } catch (WakeupException ignored) {
-            // Normal shutdown.
-        } catch (RuntimeException e) {
-            if (running.get()) {
-                System.err.println("Feed gateway " + name + " consumer error: " + e.getMessage());
-                e.printStackTrace();
             }
         }
     }
@@ -286,10 +291,28 @@ public class FeedGatewayService {
     }
 
     private void runLiveConsumer(String name, Map<String, String> topicEvents, boolean avro, AtomicBoolean cacheCaughtUpFlag) {
+        runRetryingConsumer(
+                name,
+                retry -> runLiveConsumerOnce(name, topicEvents, avro, cacheCaughtUpFlag, retry),
+                null
+        );
+    }
+
+    private void runLiveConsumerOnce(
+            String name,
+            Map<String, String> topicEvents,
+            boolean avro,
+            AtomicBoolean cacheCaughtUpFlag,
+            boolean retry
+    ) {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
             List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
             consumer.assign(partitions);
-            consumer.seekToEnd(partitions);
+            if (retry) {
+                seekToCacheWindow(consumer, partitions);
+            } else {
+                consumer.seekToEnd(partitions);
+            }
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
                 for (ConsumerRecord<String, Object> record : records) {
@@ -305,13 +328,65 @@ public class FeedGatewayService {
                 }
                 purgeExpiredCache(System.currentTimeMillis());
             }
-        } catch (WakeupException ignored) {
-            // Normal shutdown.
-        } catch (RuntimeException e) {
-            if (running.get()) {
+        }
+    }
+
+    private void runRetryingConsumer(String name, ConsumerAttempt attempt, Runnable afterFailure) {
+        long retryDelayMs = settings.consumerRetryInitialMs();
+        long maxRetryDelayMs = Math.max(retryDelayMs, settings.consumerRetryMaxMs());
+        boolean retry = false;
+        while (running.get()) {
+            boolean failed = false;
+            try {
+                attempt.run(retry);
+                if (!running.get()) {
+                    return;
+                }
+                failed = true;
+                System.err.println("Feed gateway " + name + " consumer exited unexpectedly; restarting.");
+            } catch (WakeupException e) {
+                if (!running.get()) {
+                    return;
+                }
+                failed = true;
+                System.err.println("Feed gateway " + name + " consumer wakeup while running; restarting.");
+            } catch (RuntimeException e) {
+                if (!running.get()) {
+                    return;
+                }
+                failed = true;
                 System.err.println("Feed gateway " + name + " consumer error: " + e.getMessage());
                 e.printStackTrace();
             }
+            if (!failed) {
+                return;
+            }
+            if (afterFailure != null) {
+                afterFailure.run();
+            }
+            consumerRestarts.incrementAndGet();
+            if (!sleepBeforeConsumerRetry(name, retryDelayMs)) {
+                return;
+            }
+            retry = true;
+            retryDelayMs = Math.min(maxRetryDelayMs, Math.max(retryDelayMs + 1, retryDelayMs * 2));
+        }
+    }
+
+    private boolean sleepBeforeConsumerRetry(String name, long retryDelayMs) {
+        System.err.println("Feed gateway " + name + " consumer restarting in " + retryDelayMs + " ms.");
+        try {
+            Thread.sleep(retryDelayMs);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private void markCacheRecovering(AtomicBoolean caughtUpFlag) {
+        if (caughtUpFlag.getAndSet(false)) {
+            broadcast("status", statusJson());
         }
     }
 

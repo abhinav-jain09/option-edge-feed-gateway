@@ -59,6 +59,14 @@ public final class GatewaySettings {
         return intValue("GATEWAY_KAFKA_METADATA_TIMEOUT_MS", 30_000, 1_000);
     }
 
+    public int consumerRetryInitialMs() {
+        return intValue("GATEWAY_KAFKA_RETRY_INITIAL_MS", 1_000, 100);
+    }
+
+    public int consumerRetryMaxMs() {
+        return intValue("GATEWAY_KAFKA_RETRY_MAX_MS", 30_000, 1_000);
+    }
+
     public long cacheTtlMs() {
         return intValue("GATEWAY_CACHE_TTL_MS", 900_000, 0);
     }

@@ -155,11 +155,13 @@ Kafka and Schema Registry should stay private. They should be reachable by `opti
 
 The gateway intentionally reads compacted/current topics from the beginning on startup so it can rebuild the latest cache.
 
-The replay cache is bounded by `GATEWAY_CACHE_TTL_MS`, which defaults to 2 minutes. Records older than the TTL, based on the Kafka record timestamp, are not kept in the gateway cache and are not sent to new WebSocket clients. This prevents old expiries from filling the UI after restart while still allowing active strikes to populate quickly when the producer keeps emitting fresh snapshots.
+The replay cache is bounded by `GATEWAY_CACHE_TTL_MS`, which defaults to 15 minutes. Records older than the TTL, based on the Kafka record timestamp, are not kept in the gateway cache and are not sent to new WebSocket clients. This prevents old expiries from filling the UI after restart while still allowing active strikes to populate quickly when the producer keeps emitting fresh snapshots.
 
 It does not broadcast old startup records one-by-one to connected WebSocket clients. While startup replay is in progress, live records update the gateway cache but are not sent to the UI yet. After each cache consumer catches up to the startup end offset, it sends the latest cached state once and then broadcasts only latest-state WebSocket batches.
 
 The alert topic starts at the end, so old alerts are not replayed.
+
+If Kafka or the network is temporarily unavailable, each gateway consumer restarts with exponential backoff. Cache consumers mark themselves not caught up while recovering, rebuild the bounded cache window, and replay the latest cached state to connected UI clients when caught up again. Live consumers replay the bounded cache window after a restart so clients do not need a browser refresh after an outage.
 
 The gateway `/health` values `snapshots`, `gammaHistories`, and `currentStates` are cache sizes, not live message counters. They may stay the same while live records are still being sent to the UI, because updates replace the same strike keys in the in-memory cache.
 
@@ -290,7 +292,9 @@ Environment variables and matching Java system properties are supported.
 | `GATEWAY_KAFKA_POLL_MS` | `250` | Kafka poll interval |
 | `GATEWAY_WS_BATCH_MS` | `125` | WebSocket latest-state batch cadence in milliseconds |
 | `GATEWAY_KAFKA_METADATA_TIMEOUT_MS` | `30000` | Topic metadata wait timeout |
-| `GATEWAY_CACHE_TTL_MS` | `120000` | Maximum age for records kept in the gateway replay cache |
+| `GATEWAY_KAFKA_RETRY_INITIAL_MS` | `1000` | Initial delay before restarting a failed Kafka consumer |
+| `GATEWAY_KAFKA_RETRY_MAX_MS` | `30000` | Maximum delay between Kafka consumer restart attempts |
+| `GATEWAY_CACHE_TTL_MS` | `900000` | Maximum age for records kept in the gateway replay cache |
 
 Example:
 
