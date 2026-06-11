@@ -243,6 +243,7 @@ public class FeedGatewayService {
         Map<String, String> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.volumeSandwichTopic(), "volume-sandwich");
         topicEvents.put(settings.unusualWhalesGexTopic(), "gex-by-strike");
+        topicEvents.put(settings.unusualWhalesGexHistoryTopic(), "gex-by-strike");
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -258,6 +259,7 @@ public class FeedGatewayService {
         Map<String, String> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.volumeSandwichTopic(), "volume-sandwich");
         topicEvents.put(settings.unusualWhalesGexTopic(), "gex-by-strike");
+        topicEvents.put(settings.unusualWhalesGexHistoryTopic(), "gex-by-strike");
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
@@ -504,6 +506,13 @@ public class FeedGatewayService {
         if (previousEventTime != null && previousEventTime > eventTime) {
             return null;
         }
+        if ("gex-by-strike".equals(event)
+                && previousEventTime != null
+                && previousEventTime == eventTime
+                && hasGexHistory(gexByStrike.get(key))
+                && !hasGexHistory(json)) {
+            return null;
+        }
         if (isExpired(eventTime, System.currentTimeMillis())) {
             removeCacheEntry(versionKey);
             return null;
@@ -649,6 +658,18 @@ public class FeedGatewayService {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
         }
         return fallback;
+    }
+
+    private boolean hasGexHistory(String json) {
+        if (json == null || json.isBlank()) {
+            return false;
+        }
+        try {
+            JsonNode history = mapper.readTree(json).path("history");
+            return history.isObject() && history.fieldNames().hasNext();
+        } catch (JsonProcessingException ignored) {
+            return false;
+        }
     }
 
     private static String text(JsonNode root, String field) {

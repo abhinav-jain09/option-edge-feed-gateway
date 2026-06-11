@@ -47,6 +47,10 @@ public final class GatewaySettings {
         return value("KAFKA_UNUSUAL_WHALES_GEX_TOPIC", "options.unusualwhales.gex.strike");
     }
 
+    public String unusualWhalesGexHistoryTopic() {
+        return value("KAFKA_UNUSUAL_WHALES_GEX_HISTORY_TOPIC", "options.unusualwhales.gex.strike.history");
+    }
+
     public int pollMs() {
         return intValue("GATEWAY_KAFKA_POLL_MS", 250, 10);
     }

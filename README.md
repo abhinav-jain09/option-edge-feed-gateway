@@ -18,6 +18,15 @@ Kafka final display topics -> feed gateway in-memory cache -> /ws/events WebSock
 
 Use this when the UI should read from one WebSocket fanout service instead of every OptionsEdge app instance consuming Kafka and replaying data on restart.
 
+Unusual Whales GEX is forwarded from both the current and history-enriched topics as the same UI event:
+
+```text
+options.unusualwhales.gex.strike         -> gex-by-strike
+options.unusualwhales.gex.strike.history -> gex-by-strike
+```
+
+The history topic keeps the same base payload and adds `history` buckets for the strike hover tooltip.
+
 ## Local URLs
 
 These are the local URLs and ports used by the tested setup.
