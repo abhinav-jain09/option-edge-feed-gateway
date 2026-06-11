@@ -1,5 +1,9 @@
 pipeline {
   agent any
+  environment {
+    JAVA_HOME = '/usr/lib/jvm/java-26'
+    PATH = "/usr/lib/jvm/java-26/bin:${env.PATH}"
+  }
   parameters {
     string(name: 'IMAGE_REGISTRY', defaultValue: 'ghcr.io/abhinav-jain09', description: 'Docker registry namespace')
     string(name: 'IMAGE_TAG', defaultValue: '', description: 'Docker tag. Defaults to current git SHA.')
