@@ -11,10 +11,24 @@ pipeline {
   }
   stages {
     stage('Test') {
-      steps { sh 'mvn -B test' }
+      steps {
+        sh '''
+          export JAVA_HOME=/usr/lib/jvm/java-26
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
+          mvn -B test
+        '''
+      }
     }
     stage('Package') {
-      steps { sh 'mvn -B package' }
+      steps {
+        sh '''
+          export JAVA_HOME=/usr/lib/jvm/java-26
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
+          mvn -B package
+        '''
+      }
     }
     stage('Image') {
       steps {
