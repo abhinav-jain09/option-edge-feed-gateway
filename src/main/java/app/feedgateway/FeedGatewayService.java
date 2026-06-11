@@ -47,17 +47,17 @@ public class FeedGatewayService {
     private final ObjectMapper mapper;
     private final Set<WebSocketSession> clients = new CopyOnWriteArraySet<>();
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
-    private final Map<String, String> gammaHistories = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
+    private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, Long> cacheEventTimes = new ConcurrentHashMap<>();
     private final Object batchLock = new Object();
     private final Map<String, String> pendingSnapshots = new LinkedHashMap<>();
-    private final Map<String, String> pendingGammaHistories = new LinkedHashMap<>();
     private final Map<String, String> pendingPaces = new LinkedHashMap<>();
     private final Map<String, String> pendingDirectionalPressures = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
+    private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean avroCaughtUp = new AtomicBoolean(false);
     private final AtomicBoolean stateCaughtUp = new AtomicBoolean(false);
@@ -137,10 +137,10 @@ public class FeedGatewayService {
         clients.add(session);
         send(session, "status", statusJson());
         if (avroCaughtUp.get()) {
-            sendCachedState(session, List.of("snapshot", "gamma-history", "pace", "directional-pressure"));
+            sendCachedState(session, List.of("snapshot", "pace", "directional-pressure"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("volume-sandwich"));
+            sendCachedState(session, List.of("volume-sandwich", "gex-by-strike"));
         }
     }
 
@@ -163,10 +163,10 @@ public class FeedGatewayService {
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
                 + "\"clients\":" + clients.size() + ","
                 + "\"snapshots\":" + snapshots.size() + ","
-                + "\"gammaHistories\":" + gammaHistories.size() + ","
                 + "\"paces\":" + paces.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
+                + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"pendingEvents\":" + pendingEventCount() + ","
                 + "\"webSocketBatchMs\":" + settings.webSocketBatchMs() + ","
                 + "\"coalescedUpdates\":" + coalescedUpdates.get() + ","
@@ -195,9 +195,6 @@ public class FeedGatewayService {
                 + "# HELP options_edge_feed_gateway_snapshots Cached option snapshot count.\n"
                 + "# TYPE options_edge_feed_gateway_snapshots gauge\n"
                 + "options_edge_feed_gateway_snapshots " + snapshots.size() + "\n"
-                + "# HELP options_edge_feed_gateway_gamma_histories Cached gamma-history count.\n"
-                + "# TYPE options_edge_feed_gateway_gamma_histories gauge\n"
-                + "options_edge_feed_gateway_gamma_histories " + gammaHistories.size() + "\n"
                 + "# HELP options_edge_feed_gateway_paces Cached pace count.\n"
                 + "# TYPE options_edge_feed_gateway_paces gauge\n"
                 + "options_edge_feed_gateway_paces " + paces.size() + "\n"
@@ -207,6 +204,9 @@ public class FeedGatewayService {
                 + "# HELP options_edge_feed_gateway_current_states Cached current-state count.\n"
                 + "# TYPE options_edge_feed_gateway_current_states gauge\n"
                 + "options_edge_feed_gateway_current_states " + currentStates.size() + "\n"
+                + "# HELP options_edge_feed_gateway_gex_by_strike Cached Unusual Whales GEX strike count.\n"
+                + "# TYPE options_edge_feed_gateway_gex_by_strike gauge\n"
+                + "options_edge_feed_gateway_gex_by_strike " + gexByStrike.size() + "\n"
                 + "# HELP options_edge_feed_gateway_pending_events Pending WebSocket events waiting for the next batch.\n"
                 + "# TYPE options_edge_feed_gateway_pending_events gauge\n"
                 + "options_edge_feed_gateway_pending_events " + pendingEventCount() + "\n"
@@ -234,7 +234,6 @@ public class FeedGatewayService {
     private void runAvroCacheConsumer() {
         Map<String, String> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.displayTopic(), "snapshot");
-        topicEvents.put(settings.gammaHistoryTopic(), "gamma-history");
         topicEvents.put(settings.paceTopic(), "pace");
         topicEvents.put(settings.directionalPressureTopic(), "directional-pressure");
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
@@ -243,13 +242,13 @@ public class FeedGatewayService {
     private void runJsonStateCacheConsumer() {
         Map<String, String> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.volumeSandwichTopic(), "volume-sandwich");
+        topicEvents.put(settings.unusualWhalesGexTopic(), "gex-by-strike");
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
     private void runAvroLiveConsumer() {
         Map<String, String> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.displayTopic(), "snapshot");
-        topicEvents.put(settings.gammaHistoryTopic(), "gamma-history");
         topicEvents.put(settings.paceTopic(), "pace");
         topicEvents.put(settings.directionalPressureTopic(), "directional-pressure");
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
@@ -258,6 +257,7 @@ public class FeedGatewayService {
     private void runJsonStateLiveConsumer() {
         Map<String, String> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.volumeSandwichTopic(), "volume-sandwich");
+        topicEvents.put(settings.unusualWhalesGexTopic(), "gex-by-strike");
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
@@ -514,11 +514,6 @@ public class FeedGatewayService {
                 snapshots.put(key, json);
                 return key;
             }
-            case "gamma-history" -> {
-                cacheEventTimes.put(versionKey, eventTime);
-                gammaHistories.put(key, json);
-                return key;
-            }
             case "pace" -> {
                 cacheEventTimes.put(versionKey, eventTime);
                 paces.put(key, json);
@@ -533,6 +528,11 @@ public class FeedGatewayService {
                 cacheEventTimes.put(versionKey, eventTime);
                 currentStates.put(versionKey, json);
                 return versionKey;
+            }
+            case "gex-by-strike" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                gexByStrike.put(key, json);
+                return key;
             }
             default -> {
                 return null;
@@ -583,11 +583,6 @@ public class FeedGatewayService {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("snapshot", entry.getValue()))
                         .forEach(cachedEvents::add);
-                case "gamma-history" -> gammaHistories.entrySet().stream()
-                        .filter(entry -> isCacheFresh("gamma-history:" + entry.getKey(), nowMs))
-                        .sorted(Map.Entry.comparingByKey())
-                        .map(entry -> new CachedEvent("gamma-history", entry.getValue()))
-                        .forEach(cachedEvents::add);
                 case "pace" -> paces.entrySet().stream()
                         .filter(entry -> isCacheFresh("pace:" + entry.getKey(), nowMs))
                         .sorted(Map.Entry.comparingByKey())
@@ -603,6 +598,11 @@ public class FeedGatewayService {
                         .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("volume-sandwich", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "gex-by-strike" -> gexByStrike.entrySet().stream()
+                        .filter(entry -> isCacheFresh("gex-by-strike:" + entry.getKey(), nowMs))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
                         .forEach(cachedEvents::add);
                 default -> {
                     // Unknown events are ignored because there is no replay cache for them.
@@ -626,14 +626,14 @@ public class FeedGatewayService {
         cacheEventTimes.remove(versionKey);
         if (versionKey.startsWith("snapshot:")) {
             snapshots.remove(versionKey.substring("snapshot:".length()));
-        } else if (versionKey.startsWith("gamma-history:")) {
-            gammaHistories.remove(versionKey.substring("gamma-history:".length()));
         } else if (versionKey.startsWith("pace:")) {
             paces.remove(versionKey.substring("pace:".length()));
         } else if (versionKey.startsWith("directional-pressure:")) {
             directionalPressures.remove(versionKey.substring("directional-pressure:".length()));
         } else if (versionKey.startsWith("volume-sandwich:")) {
             currentStates.remove(versionKey);
+        } else if (versionKey.startsWith("gex-by-strike:")) {
+            gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
         }
     }
 
@@ -725,10 +725,10 @@ public class FeedGatewayService {
     private Map<String, String> pendingMap(String event) {
         return switch (event) {
             case "snapshot" -> pendingSnapshots;
-            case "gamma-history" -> pendingGammaHistories;
             case "pace" -> pendingPaces;
             case "directional-pressure" -> pendingDirectionalPressures;
             case "volume-sandwich" -> pendingVolumeSandwiches;
+            case "gex-by-strike" -> pendingGexByStrike;
             default -> null;
         };
     }
@@ -746,10 +746,10 @@ public class FeedGatewayService {
                 }
                 envelope = uiBatchEnvelopeJson(
                         new ArrayList<>(pendingSnapshots.values()),
-                        new ArrayList<>(pendingGammaHistories.values()),
                         new ArrayList<>(pendingPaces.values()),
                         new ArrayList<>(pendingDirectionalPressures.values()),
-                        new ArrayList<>(pendingVolumeSandwiches.values())
+                        new ArrayList<>(pendingVolumeSandwiches.values()),
+                        new ArrayList<>(pendingGexByStrike.values())
                 );
                 clearPendingLocked();
             }
@@ -773,18 +773,18 @@ public class FeedGatewayService {
 
     private int pendingEventCountLocked() {
         return pendingSnapshots.size()
-                + pendingGammaHistories.size()
                 + pendingPaces.size()
                 + pendingDirectionalPressures.size()
-                + pendingVolumeSandwiches.size();
+                + pendingVolumeSandwiches.size()
+                + pendingGexByStrike.size();
     }
 
     private void clearPendingLocked() {
         pendingSnapshots.clear();
-        pendingGammaHistories.clear();
         pendingPaces.clear();
         pendingDirectionalPressures.clear();
         pendingVolumeSandwiches.clear();
+        pendingGexByStrike.clear();
     }
 
     private String envelopeJson(String event, String json) {
@@ -794,31 +794,31 @@ public class FeedGatewayService {
 
     private String uiBatchEnvelopeJson(List<CachedEvent> cachedEvents) {
         List<String> snapshotJsons = new ArrayList<>();
-        List<String> gammaHistoryJsons = new ArrayList<>();
         List<String> paceJsons = new ArrayList<>();
         List<String> directionalPressureJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
+        List<String> gexByStrikeJsons = new ArrayList<>();
         for (CachedEvent cachedEvent : cachedEvents) {
             switch (cachedEvent.event()) {
                 case "snapshot" -> snapshotJsons.add(cachedEvent.json());
-                case "gamma-history" -> gammaHistoryJsons.add(cachedEvent.json());
                 case "pace" -> paceJsons.add(cachedEvent.json());
                 case "directional-pressure" -> directionalPressureJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
+                case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
                 default -> {
                     // This batch protocol only carries latest-state feed events.
                 }
             }
         }
-        return uiBatchEnvelopeJson(snapshotJsons, gammaHistoryJsons, paceJsons, directionalPressureJsons, volumeSandwichJsons);
+        return uiBatchEnvelopeJson(snapshotJsons, paceJsons, directionalPressureJsons, volumeSandwichJsons, gexByStrikeJsons);
     }
 
     private String uiBatchEnvelopeJson(
             List<String> snapshotJsons,
-            List<String> gammaHistoryJsons,
             List<String> paceJsons,
             List<String> directionalPressureJsons,
-            List<String> volumeSandwichJsons
+            List<String> volumeSandwichJsons,
+            List<String> gexByStrikeJsons
     ) {
         return "{"
                 + "\"type\":\"ui-batch\","
@@ -826,10 +826,10 @@ public class FeedGatewayService {
                 + "\"sentAtMs\":" + System.currentTimeMillis() + ","
                 + "\"cadenceMs\":" + settings.webSocketBatchMs() + ","
                 + "\"snapshots\":" + jsonArray(snapshotJsons) + ","
-                + "\"gammaHistories\":" + jsonArray(gammaHistoryJsons) + ","
                 + "\"paces\":" + jsonArray(paceJsons) + ","
                 + "\"directionalPressures\":" + jsonArray(directionalPressureJsons) + ","
-                + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons)
+                + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
+                + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons)
                 + "}"
                 + "}";
     }
@@ -848,9 +848,9 @@ public class FeedGatewayService {
                 + "\"avroCaughtUp\":" + avroCaughtUp.get() + ","
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
                 + "\"snapshots\":" + snapshots.size() + ","
-                + "\"gammaHistories\":" + gammaHistories.size() + ","
                 + "\"paces\":" + paces.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
+                + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"cacheTtlMs\":" + settings.cacheTtlMs()
                 + "}";
     }

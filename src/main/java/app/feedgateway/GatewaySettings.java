@@ -27,10 +27,6 @@ public final class GatewaySettings {
         return value("KAFKA_DISPLAY_TOPIC", "display");
     }
 
-    public String gammaHistoryTopic() {
-        return value("KAFKA_GAMMA_HISTORY_TOPIC", "display.gamma.history");
-    }
-
     public String paceTopic() {
         return value("KAFKA_PACE_TOPIC", "options.ibkr.pace");
     }
@@ -45,6 +41,10 @@ public final class GatewaySettings {
 
     public String volumeSandwichAlertsTopic() {
         return value("KAFKA_VOLUME_SANDWICH_ALERTS_TOPIC", "display.volume.sandwich.alerts");
+    }
+
+    public String unusualWhalesGexTopic() {
+        return value("KAFKA_UNUSUAL_WHALES_GEX_TOPIC", "options.unusualwhales.gex.strike");
     }
 
     public int pollMs() {

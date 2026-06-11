@@ -163,7 +163,7 @@ The alert topic starts at the end, so old alerts are not replayed.
 
 If Kafka or the network is temporarily unavailable, each gateway consumer restarts with exponential backoff. Cache consumers mark themselves not caught up while recovering, rebuild the bounded cache window, and replay the latest cached state to connected UI clients when caught up again. Live consumers replay the bounded cache window after a restart so clients do not need a browser refresh after an outage.
 
-The gateway `/health` values `snapshots`, `gammaHistories`, and `currentStates` are cache sizes, not live message counters. They may stay the same while live records are still being sent to the UI, because updates replace the same strike keys in the in-memory cache.
+The gateway `/health` values `snapshots`, `gexByStrike`, and `currentStates` are cache sizes, not live message counters. They may stay the same while live records are still being sent to the UI, because updates replace the same strike keys in the in-memory cache.
 
 ## Spot Price Update Troubleshooting
 
@@ -239,7 +239,7 @@ Single WebSocket messages use this envelope and remain supported for compatibili
 Latest-state feed updates are normally sent as fixed-cadence batches:
 
 ```json
-{"type":"ui-batch","data":{"snapshots":[],"gammaHistories":[],"paces":[],"directionalPressures":[],"volumeSandwiches":[]}}
+{"type":"ui-batch","data":{"snapshots":[],"paces":[],"directionalPressures":[],"volumeSandwiches":[],"gexByStrike":[]}}
 ```
 
 Current event types:
@@ -247,7 +247,7 @@ Current event types:
 - `status`
 - `ui-batch`
 - `snapshot`
-- `gamma-history`
+- `gex-by-strike`
 - `pace`
 - `directional-pressure`
 - `volume-sandwich`
@@ -286,7 +286,7 @@ Environment variables and matching Java system properties are supported.
 | `KAFKA_SCHEMA_REGISTRY_URL` | `http://192.168.100.252:8082` | Schema Registry URL for Avro display topics |
 | `GATEWAY_KAFKA_GROUP_ID` | `options-edge-feed-gateway` | Base id used for consumer group/client names |
 | `KAFKA_DISPLAY_TOPIC` | `display` | Avro option-chain display topic |
-| `KAFKA_GAMMA_HISTORY_TOPIC` | `display.gamma.history` | Avro gamma-history display topic |
+| `KAFKA_UNUSUAL_WHALES_GEX_TOPIC` | `options.unusualwhales.gex.strike` | JSON strike-level Unusual Whales GEX topic |
 | `KAFKA_VOLUME_DIRECTION_CURRENT_TOPIC` | `display.volume.direction.current` | JSON current volume-direction topic |
 | `KAFKA_VOLUME_SANDWICH_CURRENT_TOPIC` | `display.volume.sandwich.current` | JSON current volume-sandwich topic |
 | `KAFKA_VOLUME_SANDWICH_ALERTS_TOPIC` | `display.volume.sandwich.alerts` | JSON live-only sandwich-alert topic |
