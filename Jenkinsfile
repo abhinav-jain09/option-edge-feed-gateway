@@ -14,6 +14,7 @@ pipeline {
       steps {
         sh '''
           export JAVA_HOME=/usr/lib/jvm/java-26
+          export MAVEN_SKIP_RC=true
           export PATH="$JAVA_HOME/bin:$PATH"
           java -version
           mvn -B test
@@ -24,6 +25,7 @@ pipeline {
       steps {
         sh '''
           export JAVA_HOME=/usr/lib/jvm/java-26
+          export MAVEN_SKIP_RC=true
           export PATH="$JAVA_HOME/bin:$PATH"
           java -version
           mvn -B package
