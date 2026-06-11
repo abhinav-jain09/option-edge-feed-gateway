@@ -5,7 +5,7 @@ pipeline {
     PATH = "/usr/lib/jvm/java-26/bin:${env.PATH}"
   }
   parameters {
-    string(name: 'IMAGE_REGISTRY', defaultValue: 'ghcr.io/abhinav-jain09', description: 'Docker registry namespace')
+    string(name: 'IMAGE_REGISTRY', defaultValue: '192.168.100.252:5000', description: 'Docker registry namespace')
     string(name: 'IMAGE_TAG', defaultValue: '', description: 'Docker tag. Defaults to current git SHA.')
     booleanParam(name: 'PUSH_IMAGE', defaultValue: true, description: 'Push built image to registry')
   }
