@@ -21,4 +21,9 @@ public class GatewayController {
     public String health() {
         return service.healthJson();
     }
+
+    @GetMapping(value = "/metrics", produces = MediaType.TEXT_PLAIN_VALUE)
+    public String metrics() {
+        return service.metrics();
+    }
 }

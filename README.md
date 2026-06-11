@@ -227,6 +227,7 @@ Both raw and display offsets should increase during live market data. If raw inc
 
 - `GET /` returns a short text description.
 - `GET /health` returns gateway state and cache counts.
+- `GET /metrics` returns Prometheus text metrics for gateway readiness, cache sizes, clients, batches, and consumer restarts.
 - `WS /ws/events` streams feed events to frontend clients.
 
 Single WebSocket messages use this envelope and remain supported for compatibility:

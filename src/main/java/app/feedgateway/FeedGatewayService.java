@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class FeedGatewayService {
+    private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
     private final ObjectMapper mapper;
     private final Set<WebSocketSession> clients = new CopyOnWriteArraySet<>();
@@ -173,6 +174,61 @@ public class FeedGatewayService {
                 + "\"consumerRestarts\":" + consumerRestarts.get() + ","
                 + "\"cacheTtlMs\":" + settings.cacheTtlMs()
                 + "}";
+    }
+
+    public String metrics() {
+        purgeExpiredCache(System.currentTimeMillis());
+        long uptimeSeconds = Math.max(0, Duration.between(startedAt, Instant.now()).toSeconds());
+        return ""
+                + "# HELP options_edge_feed_gateway_running Whether the feed gateway is running.\n"
+                + "# TYPE options_edge_feed_gateway_running gauge\n"
+                + "options_edge_feed_gateway_running " + boolMetric(running.get()) + "\n"
+                + "# HELP options_edge_feed_gateway_avro_caught_up Whether Avro cache consumers have caught up.\n"
+                + "# TYPE options_edge_feed_gateway_avro_caught_up gauge\n"
+                + "options_edge_feed_gateway_avro_caught_up " + boolMetric(avroCaughtUp.get()) + "\n"
+                + "# HELP options_edge_feed_gateway_state_caught_up Whether JSON state cache consumers have caught up.\n"
+                + "# TYPE options_edge_feed_gateway_state_caught_up gauge\n"
+                + "options_edge_feed_gateway_state_caught_up " + boolMetric(stateCaughtUp.get()) + "\n"
+                + "# HELP options_edge_feed_gateway_clients Connected WebSocket client count.\n"
+                + "# TYPE options_edge_feed_gateway_clients gauge\n"
+                + "options_edge_feed_gateway_clients " + clients.size() + "\n"
+                + "# HELP options_edge_feed_gateway_snapshots Cached option snapshot count.\n"
+                + "# TYPE options_edge_feed_gateway_snapshots gauge\n"
+                + "options_edge_feed_gateway_snapshots " + snapshots.size() + "\n"
+                + "# HELP options_edge_feed_gateway_gamma_histories Cached gamma-history count.\n"
+                + "# TYPE options_edge_feed_gateway_gamma_histories gauge\n"
+                + "options_edge_feed_gateway_gamma_histories " + gammaHistories.size() + "\n"
+                + "# HELP options_edge_feed_gateway_paces Cached pace count.\n"
+                + "# TYPE options_edge_feed_gateway_paces gauge\n"
+                + "options_edge_feed_gateway_paces " + paces.size() + "\n"
+                + "# HELP options_edge_feed_gateway_directional_pressures Cached directional-pressure count.\n"
+                + "# TYPE options_edge_feed_gateway_directional_pressures gauge\n"
+                + "options_edge_feed_gateway_directional_pressures " + directionalPressures.size() + "\n"
+                + "# HELP options_edge_feed_gateway_current_states Cached current-state count.\n"
+                + "# TYPE options_edge_feed_gateway_current_states gauge\n"
+                + "options_edge_feed_gateway_current_states " + currentStates.size() + "\n"
+                + "# HELP options_edge_feed_gateway_pending_events Pending WebSocket events waiting for the next batch.\n"
+                + "# TYPE options_edge_feed_gateway_pending_events gauge\n"
+                + "options_edge_feed_gateway_pending_events " + pendingEventCount() + "\n"
+                + "# HELP options_edge_feed_gateway_coalesced_updates_total Total coalesced gateway updates.\n"
+                + "# TYPE options_edge_feed_gateway_coalesced_updates_total counter\n"
+                + "options_edge_feed_gateway_coalesced_updates_total " + coalescedUpdates.get() + "\n"
+                + "# HELP options_edge_feed_gateway_batches_sent_total Total WebSocket batches sent.\n"
+                + "# TYPE options_edge_feed_gateway_batches_sent_total counter\n"
+                + "options_edge_feed_gateway_batches_sent_total " + batchesSent.get() + "\n"
+                + "# HELP options_edge_feed_gateway_consumer_restarts_total Total Kafka consumer restart attempts.\n"
+                + "# TYPE options_edge_feed_gateway_consumer_restarts_total counter\n"
+                + "options_edge_feed_gateway_consumer_restarts_total " + consumerRestarts.get() + "\n"
+                + "# HELP options_edge_feed_gateway_cache_ttl_ms Replay cache TTL in milliseconds.\n"
+                + "# TYPE options_edge_feed_gateway_cache_ttl_ms gauge\n"
+                + "options_edge_feed_gateway_cache_ttl_ms " + settings.cacheTtlMs() + "\n"
+                + "# HELP options_edge_feed_gateway_uptime_seconds Seconds since the feed gateway service object was created.\n"
+                + "# TYPE options_edge_feed_gateway_uptime_seconds gauge\n"
+                + "options_edge_feed_gateway_uptime_seconds " + uptimeSeconds + "\n";
+    }
+
+    private static int boolMetric(boolean value) {
+        return value ? 1 : 0;
     }
 
     private void runAvroCacheConsumer() {
