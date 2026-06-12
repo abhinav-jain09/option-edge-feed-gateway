@@ -23,32 +23,73 @@ public final class GatewaySettings {
         return value("GATEWAY_KAFKA_GROUP_ID", "options-edge-feed-gateway");
     }
 
-    public String displayTopic() {
-        return value("KAFKA_DISPLAY_TOPIC", "display");
+    public String marketDataSelectionTopic() {
+        return value("KAFKA_MARKET_DATA_SELECTION_TOPIC", "options.marketdata.selection");
     }
 
-    public String paceTopic() {
-        return value("KAFKA_PACE_TOPIC", "options.ibkr.pace");
+    public String initialMarketDataSource() {
+        return normalizeSource(value("APP_MARKET_DATA_SOURCE", "IBKR"));
     }
 
-    public String directionalPressureTopic() {
-        return value("KAFKA_DIRECTIONAL_PRESSURE_TOPIC", "options.ibkr.directional-pressure");
+    public String initialSymbol() {
+        return value("IB_SYMBOL", "SPX").toUpperCase();
     }
 
-    public String volumeSandwichTopic() {
-        return value("KAFKA_VOLUME_SANDWICH_CURRENT_TOPIC", "display.volume.sandwich.current");
+    public String initialExpiry() {
+        return normalizeExpiry(value("IB_EXPIRY", ""));
     }
 
-    public String volumeSandwichAlertsTopic() {
-        return value("KAFKA_VOLUME_SANDWICH_ALERTS_TOPIC", "display.volume.sandwich.alerts");
+    public String ibkrDisplayTopic() {
+        return value("KAFKA_IBKR_DISPLAY_TOPIC", value("KAFKA_DISPLAY_TOPIC", "options.ibkr.display"));
     }
 
-    public String unusualWhalesGexTopic() {
-        return value("KAFKA_UNUSUAL_WHALES_GEX_TOPIC", "options.unusualwhales.gex.strike");
+    public String databentoDisplayTopic() {
+        return value("KAFKA_DATABENTO_DISPLAY_TOPIC", "options.databento.display");
     }
 
-    public String unusualWhalesGexHistoryTopic() {
-        return value("KAFKA_UNUSUAL_WHALES_GEX_HISTORY_TOPIC", "options.unusualwhales.gex.strike.history");
+    public String ibkrPaceTopic() {
+        return value("KAFKA_IBKR_PACE_TOPIC", value("KAFKA_PACE_TOPIC", "options.ibkr.pace"));
+    }
+
+    public String databentoPaceTopic() {
+        return value("KAFKA_DATABENTO_PACE_TOPIC", "options.databento.pace");
+    }
+
+    public String ibkrDirectionalPressureTopic() {
+        return value("KAFKA_IBKR_DIRECTIONAL_PRESSURE_TOPIC",
+                value("KAFKA_DIRECTIONAL_PRESSURE_TOPIC", "options.ibkr.directional-pressure"));
+    }
+
+    public String databentoDirectionalPressureTopic() {
+        return value("KAFKA_DATABENTO_DIRECTIONAL_PRESSURE_TOPIC", "options.databento.directional-pressure");
+    }
+
+    public String ibkrVolumeSandwichTopic() {
+        return value("KAFKA_IBKR_VOLUME_SANDWICH_CURRENT_TOPIC",
+                value("KAFKA_VOLUME_SANDWICH_CURRENT_TOPIC", "options.ibkr.volume-sandwich.current"));
+    }
+
+    public String databentoVolumeSandwichTopic() {
+        return value("KAFKA_DATABENTO_VOLUME_SANDWICH_CURRENT_TOPIC", "options.databento.volume-sandwich.current");
+    }
+
+    public String ibkrVolumeSandwichAlertsTopic() {
+        return value("KAFKA_IBKR_VOLUME_SANDWICH_ALERTS_TOPIC",
+                value("KAFKA_VOLUME_SANDWICH_ALERTS_TOPIC", "options.ibkr.volume-sandwich.alerts"));
+    }
+
+    public String databentoVolumeSandwichAlertsTopic() {
+        return value("KAFKA_DATABENTO_VOLUME_SANDWICH_ALERTS_TOPIC", "options.databento.volume-sandwich.alerts");
+    }
+
+    public String ibkrUnusualWhalesGexTopic() {
+        return value("KAFKA_IBKR_UNUSUAL_WHALES_GEX_TOPIC",
+                value("KAFKA_UNUSUAL_WHALES_GEX_TOPIC", "options.ibkr.unusualwhales.gex.strike"));
+    }
+
+    public String ibkrUnusualWhalesGexHistoryTopic() {
+        return value("KAFKA_IBKR_UNUSUAL_WHALES_GEX_HISTORY_TOPIC",
+                value("KAFKA_UNUSUAL_WHALES_GEX_HISTORY_TOPIC", "options.ibkr.unusualwhales.gex.strike.history"));
     }
 
     public int pollMs() {
@@ -99,5 +140,19 @@ public final class GatewaySettings {
         } catch (NumberFormatException ignored) {
             return Math.max(min, fallback);
         }
+    }
+
+    public static String normalizeSource(String source) {
+        if ("IB".equalsIgnoreCase(source) || "IBKR".equalsIgnoreCase(source)) {
+            return "IBKR";
+        }
+        if ("DATABENTO".equalsIgnoreCase(source) || "DB".equalsIgnoreCase(source)) {
+            return "DATABENTO";
+        }
+        return source == null ? "" : source.trim().toUpperCase();
+    }
+
+    public static String normalizeExpiry(String expiry) {
+        return expiry == null ? "" : expiry.trim().replace("-", "");
     }
 }

@@ -3,6 +3,7 @@ package app.feedgateway;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -39,6 +40,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 public class FeedGatewayService {
@@ -61,13 +63,41 @@ public class FeedGatewayService {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean avroCaughtUp = new AtomicBoolean(false);
     private final AtomicBoolean stateCaughtUp = new AtomicBoolean(false);
+    private final AtomicReference<ActiveSelection> activeSelection;
     private final AtomicLong coalescedUpdates = new AtomicLong();
     private final AtomicLong batchesSent = new AtomicLong();
     private final AtomicLong consumerRestarts = new AtomicLong();
+    private final AtomicLong forwardedEvents = new AtomicLong();
+    private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private ExecutorService executor;
     private ScheduledExecutorService batchExecutor;
 
     private record CachedEvent(String event, String json) {
+    }
+
+    private record TopicBinding(String source, String event) {
+    }
+
+    private record ActiveSelection(String source, String symbol, String expiry, long selectionEpoch, long selectedAtMs) {
+        private static ActiveSelection fromSettings(GatewaySettings settings) {
+            return new ActiveSelection(
+                    GatewaySettings.normalizeSource(settings.initialMarketDataSource()),
+                    settings.initialSymbol(),
+                    GatewaySettings.normalizeExpiry(settings.initialExpiry()),
+                    0L,
+                    0L
+            );
+        }
+
+        private boolean newerThan(ActiveSelection other) {
+            if (other == null) {
+                return true;
+            }
+            if (selectionEpoch > 0L || other.selectionEpoch > 0L) {
+                return selectionEpoch > other.selectionEpoch;
+            }
+            return selectedAtMs > other.selectedAtMs;
+        }
     }
 
     @FunctionalInterface
@@ -78,6 +108,7 @@ public class FeedGatewayService {
     public FeedGatewayService(GatewaySettings settings, ObjectMapper mapper) {
         this.settings = settings;
         this.mapper = mapper;
+        this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
     }
 
     @PostConstruct
@@ -85,11 +116,12 @@ public class FeedGatewayService {
         if (!settings.enabled() || !running.compareAndSet(false, true)) {
             return;
         }
-        executor = Executors.newFixedThreadPool(5, runnable -> {
+        executor = Executors.newFixedThreadPool(6, runnable -> {
             Thread thread = new Thread(runnable, "options-edge-feed-gateway");
             thread.setDaemon(true);
             return thread;
         });
+        executor.submit(this::runSelectionConsumer);
         executor.submit(this::runAvroLiveConsumer);
         executor.submit(this::runJsonStateLiveConsumer);
         executor.submit(this::runAvroCacheConsumer);
@@ -157,8 +189,13 @@ public class FeedGatewayService {
 
     public String healthJson() {
         purgeExpiredCache(System.currentTimeMillis());
+        ActiveSelection selection = activeSelection.get();
         return "{"
                 + "\"running\":" + running.get() + ","
+                + "\"marketDataSource\":\"" + escapeJson(selection.source()) + "\","
+                + "\"symbol\":\"" + escapeJson(selection.symbol()) + "\","
+                + "\"expiry\":\"" + escapeJson(selection.expiry()) + "\","
+                + "\"selectionEpoch\":" + selection.selectionEpoch() + ","
                 + "\"avroCaughtUp\":" + avroCaughtUp.get() + ","
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
                 + "\"clients\":" + clients.size() + ","
@@ -171,6 +208,8 @@ public class FeedGatewayService {
                 + "\"webSocketBatchMs\":" + settings.webSocketBatchMs() + ","
                 + "\"coalescedUpdates\":" + coalescedUpdates.get() + ","
                 + "\"batchesSent\":" + batchesSent.get() + ","
+                + "\"forwardedEvents\":" + forwardedEvents.get() + ","
+                + "\"inactiveDroppedEvents\":" + inactiveDroppedEvents.get() + ","
                 + "\"consumerRestarts\":" + consumerRestarts.get() + ","
                 + "\"cacheTtlMs\":" + settings.cacheTtlMs()
                 + "}";
@@ -179,6 +218,7 @@ public class FeedGatewayService {
     public String metrics() {
         purgeExpiredCache(System.currentTimeMillis());
         long uptimeSeconds = Math.max(0, Duration.between(startedAt, Instant.now()).toSeconds());
+        ActiveSelection selection = activeSelection.get();
         return ""
                 + "# HELP options_edge_feed_gateway_running Whether the feed gateway is running.\n"
                 + "# TYPE options_edge_feed_gateway_running gauge\n"
@@ -216,6 +256,19 @@ public class FeedGatewayService {
                 + "# HELP options_edge_feed_gateway_batches_sent_total Total WebSocket batches sent.\n"
                 + "# TYPE options_edge_feed_gateway_batches_sent_total counter\n"
                 + "options_edge_feed_gateway_batches_sent_total " + batchesSent.get() + "\n"
+                + "# HELP options_edge_marketdata_selected_source Selected market-data source.\n"
+                + "# TYPE options_edge_marketdata_selected_source gauge\n"
+                + "options_edge_marketdata_selected_source{source=\"IBKR\"} " + boolMetric("IBKR".equals(selection.source())) + "\n"
+                + "options_edge_marketdata_selected_source{source=\"DATABENTO\"} " + boolMetric("DATABENTO".equals(selection.source())) + "\n"
+                + "# HELP options_edge_marketdata_selection_epoch Active market-data selection epoch.\n"
+                + "# TYPE options_edge_marketdata_selection_epoch gauge\n"
+                + "options_edge_marketdata_selection_epoch " + selection.selectionEpoch() + "\n"
+                + "# HELP options_edge_gateway_forwarded_total Selected-source records forwarded to browsers.\n"
+                + "# TYPE options_edge_gateway_forwarded_total counter\n"
+                + "options_edge_gateway_forwarded_total " + forwardedEvents.get() + "\n"
+                + "# HELP options_edge_gateway_inactive_dropped_total Inactive-source records consumed but not forwarded.\n"
+                + "# TYPE options_edge_gateway_inactive_dropped_total counter\n"
+                + "options_edge_gateway_inactive_dropped_total " + inactiveDroppedEvents.get() + "\n"
                 + "# HELP options_edge_feed_gateway_consumer_restarts_total Total Kafka consumer restart attempts.\n"
                 + "# TYPE options_edge_feed_gateway_consumer_restarts_total counter\n"
                 + "options_edge_feed_gateway_consumer_restarts_total " + consumerRestarts.get() + "\n"
@@ -231,44 +284,75 @@ public class FeedGatewayService {
         return value ? 1 : 0;
     }
 
+    private void runSelectionConsumer() {
+        runRetryingConsumer("selection", retry -> runSelectionConsumerOnce(), null);
+    }
+
+    private void runSelectionConsumerOnce() {
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("selection"))) {
+            List<TopicPartition> partitions = partitionsFor(consumer, Set.of(settings.marketDataSelectionTopic()));
+            consumer.assign(partitions);
+            consumer.seekToBeginning(partitions);
+            while (running.get()) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                for (ConsumerRecord<String, String> record : records) {
+                    ActiveSelection selection = selectionFromJson(record.value(), record.timestamp());
+                    if (selection != null) {
+                        applySelection(selection);
+                    }
+                }
+            }
+        }
+    }
+
     private void runAvroCacheConsumer() {
-        Map<String, String> topicEvents = new LinkedHashMap<>();
-        topicEvents.put(settings.displayTopic(), "snapshot");
-        topicEvents.put(settings.paceTopic(), "pace");
-        topicEvents.put(settings.directionalPressureTopic(), "directional-pressure");
+        Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
+        topicEvents.put(settings.ibkrDisplayTopic(), new TopicBinding("IBKR", "snapshot"));
+        topicEvents.put(settings.ibkrPaceTopic(), new TopicBinding("IBKR", "pace"));
+        topicEvents.put(settings.ibkrDirectionalPressureTopic(), new TopicBinding("IBKR", "directional-pressure"));
+        topicEvents.put(settings.databentoDisplayTopic(), new TopicBinding("DATABENTO", "snapshot"));
+        topicEvents.put(settings.databentoPaceTopic(), new TopicBinding("DATABENTO", "pace"));
+        topicEvents.put(settings.databentoDirectionalPressureTopic(), new TopicBinding("DATABENTO", "directional-pressure"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
     private void runJsonStateCacheConsumer() {
-        Map<String, String> topicEvents = new LinkedHashMap<>();
-        topicEvents.put(settings.volumeSandwichTopic(), "volume-sandwich");
-        topicEvents.put(settings.unusualWhalesGexTopic(), "gex-by-strike");
-        topicEvents.put(settings.unusualWhalesGexHistoryTopic(), "gex-by-strike");
+        Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
+        topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
+        topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
+        topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
+        topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
     private void runAvroLiveConsumer() {
-        Map<String, String> topicEvents = new LinkedHashMap<>();
-        topicEvents.put(settings.displayTopic(), "snapshot");
-        topicEvents.put(settings.paceTopic(), "pace");
-        topicEvents.put(settings.directionalPressureTopic(), "directional-pressure");
+        Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
+        topicEvents.put(settings.ibkrDisplayTopic(), new TopicBinding("IBKR", "snapshot"));
+        topicEvents.put(settings.ibkrPaceTopic(), new TopicBinding("IBKR", "pace"));
+        topicEvents.put(settings.ibkrDirectionalPressureTopic(), new TopicBinding("IBKR", "directional-pressure"));
+        topicEvents.put(settings.databentoDisplayTopic(), new TopicBinding("DATABENTO", "snapshot"));
+        topicEvents.put(settings.databentoPaceTopic(), new TopicBinding("DATABENTO", "pace"));
+        topicEvents.put(settings.databentoDirectionalPressureTopic(), new TopicBinding("DATABENTO", "directional-pressure"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
     private void runJsonStateLiveConsumer() {
-        Map<String, String> topicEvents = new LinkedHashMap<>();
-        topicEvents.put(settings.volumeSandwichTopic(), "volume-sandwich");
-        topicEvents.put(settings.unusualWhalesGexTopic(), "gex-by-strike");
-        topicEvents.put(settings.unusualWhalesGexHistoryTopic(), "gex-by-strike");
+        Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
+        topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
+        topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
+        topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
+        topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
     private void runAlertConsumer() {
-        Map<String, String> topicEvents = Map.of(settings.volumeSandwichAlertsTopic(), "volume-sandwich-alert");
+        Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
+        topicEvents.put(settings.ibkrVolumeSandwichAlertsTopic(), new TopicBinding("IBKR", "volume-sandwich-alert"));
+        topicEvents.put(settings.databentoVolumeSandwichAlertsTopic(), new TopicBinding("DATABENTO", "volume-sandwich-alert"));
         runRetryingConsumer("alerts", retry -> runAlertConsumerOnce(topicEvents), null);
     }
 
-    private void runAlertConsumerOnce(Map<String, String> topicEvents) {
+    private void runAlertConsumerOnce(Map<String, TopicBinding> topicEvents) {
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("alerts"))) {
             List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
             consumer.assign(partitions);
@@ -276,15 +360,20 @@ public class FeedGatewayService {
             while (running.get()) {
                 ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
                 for (ConsumerRecord<String, String> record : records) {
-                    if (record.value() != null && !record.value().isBlank()) {
-                        broadcast(topicEvents.get(record.topic()), record.value());
+                    TopicBinding binding = topicEvents.get(record.topic());
+                    String json = binding == null ? null : enrichJson(record.value(), binding);
+                    if (json != null && !json.isBlank() && shouldForward(binding, json)) {
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                    } else {
+                        inactiveDroppedEvents.incrementAndGet();
                     }
                 }
             }
         }
     }
 
-    private void runAssignedCacheConsumer(String name, Map<String, String> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
+    private void runAssignedCacheConsumer(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
         runRetryingConsumer(
                 name,
                 retry -> runAssignedCacheConsumerOnce(name, topicEvents, avro, caughtUpFlag),
@@ -292,13 +381,13 @@ public class FeedGatewayService {
         );
     }
 
-    private void runAssignedCacheConsumerOnce(String name, Map<String, String> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
+    private void runAssignedCacheConsumerOnce(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
             List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
             consumer.assign(partitions);
             seekToCacheWindow(consumer, partitions);
             Map<TopicPartition, Long> bootstrapEndOffsets = consumer.endOffsets(partitions);
-            List<String> events = new ArrayList<>(topicEvents.values());
+            List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
             boolean live = caughtUp(consumer, bootstrapEndOffsets);
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
@@ -306,12 +395,12 @@ public class FeedGatewayService {
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
                 for (ConsumerRecord<String, Object> record : records) {
-                    String event = topicEvents.get(record.topic());
-                    String json = avro ? avroJson(record.value()) : stringJson(record.value());
-                    if (event == null || json == null || json.isBlank()) {
+                    TopicBinding binding = topicEvents.get(record.topic());
+                    String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
+                    if (binding == null || json == null || json.isBlank()) {
                         continue;
                     }
-                    updateCache(event, record, json);
+                    updateCache(binding, record, json);
                 }
                 purgeExpiredCache(System.currentTimeMillis());
                 if (!live && caughtUp(consumer, bootstrapEndOffsets)) {
@@ -348,7 +437,7 @@ public class FeedGatewayService {
         }
     }
 
-    private void runLiveConsumer(String name, Map<String, String> topicEvents, boolean avro, AtomicBoolean cacheCaughtUpFlag) {
+    private void runLiveConsumer(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean cacheCaughtUpFlag) {
         runRetryingConsumer(
                 name,
                 retry -> runLiveConsumerOnce(name, topicEvents, avro, cacheCaughtUpFlag, retry),
@@ -358,7 +447,7 @@ public class FeedGatewayService {
 
     private void runLiveConsumerOnce(
             String name,
-            Map<String, String> topicEvents,
+            Map<String, TopicBinding> topicEvents,
             boolean avro,
             AtomicBoolean cacheCaughtUpFlag,
             boolean retry
@@ -374,14 +463,17 @@ public class FeedGatewayService {
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
                 for (ConsumerRecord<String, Object> record : records) {
-                    String event = topicEvents.get(record.topic());
-                    String json = avro ? avroJson(record.value()) : stringJson(record.value());
-                    if (event == null || json == null || json.isBlank()) {
+                    TopicBinding binding = topicEvents.get(record.topic());
+                    String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
+                    if (binding == null || json == null || json.isBlank()) {
                         continue;
                     }
-                    String cacheKey = updateCache(event, record, json);
-                    if (cacheKey != null && cacheCaughtUpFlag.get()) {
-                        enqueuePending(event, cacheKey, json);
+                    String cacheKey = updateCache(binding, record, json);
+                    if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json)) {
+                        enqueuePending(binding.event(), cacheKey, json);
+                        forwardedEvents.incrementAndGet();
+                    } else if (cacheKey != null) {
+                        inactiveDroppedEvents.incrementAndGet();
                     }
                 }
                 purgeExpiredCache(System.currentTimeMillis());
@@ -493,13 +585,112 @@ public class FeedGatewayService {
         }
     }
 
-    private synchronized String updateCache(String event, ConsumerRecord<String, ?> record, String json) {
+    private ActiveSelection selectionFromJson(String json, long recordTimestampMs) {
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            String command = text(root, "command");
+            String type = text(root, "type");
+            if (!"select-market-data-source".equalsIgnoreCase(command)
+                    && !"select-market-data-source".equalsIgnoreCase(type)) {
+                return null;
+            }
+            String source = GatewaySettings.normalizeSource(text(root, "source"));
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            if (source.isBlank() || symbol.isBlank() || expiry.isBlank()) {
+                return null;
+            }
+            long selectedAtMs = parseInstantMs(text(root, "requestedAt"), recordTimestampMs);
+            long epoch = longField(root, "selectionEpoch", selectedAtMs);
+            return new ActiveSelection(source, symbol, expiry, epoch, selectedAtMs);
+        } catch (JsonProcessingException ignored) {
+            return null;
+        }
+    }
+
+    private void applySelection(ActiveSelection next) {
+        ActiveSelection previous = activeSelection.get();
+        if (!next.newerThan(previous)) {
+            return;
+        }
+        activeSelection.set(next);
+        synchronized (batchLock) {
+            clearPendingLocked();
+        }
+        String resetJson = activeSelectionJson(next);
+        broadcast("reset", resetJson);
+        broadcast("status", statusJson());
+        broadcastCachedState(List.of("snapshot", "pace", "directional-pressure", "volume-sandwich", "gex-by-strike"));
+        System.out.println("Feed gateway selected market data source " + next.source()
+                + " " + next.symbol() + " " + next.expiry()
+                + " epoch=" + next.selectionEpoch());
+    }
+
+    private boolean shouldForward(TopicBinding binding, String json) {
+        if (binding == null) {
+            return false;
+        }
+        ActiveSelection selection = activeSelection.get();
+        if (!binding.source().equals(selection.source())) {
+            return false;
+        }
+        if ("gex-by-strike".equals(binding.event()) && !"IBKR".equals(selection.source())) {
+            return false;
+        }
+        return matchesActiveSelection(json, selection);
+    }
+
+    private boolean matchesActiveSelection(String json, ActiveSelection selection) {
+        if (json == null || json.isBlank() || selection == null) {
+            return false;
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            String source = GatewaySettings.normalizeSource(text(root, "marketDataSource"));
+            if (source.isBlank() && "UNUSUAL_WHALES".equalsIgnoreCase(text(root, "source"))) {
+                source = "IBKR";
+            }
+            if (!source.isBlank() && !selection.source().equals(source)) {
+                return false;
+            }
+            return selection.symbol().equalsIgnoreCase(text(root, "symbol"))
+                    && selection.expiry().equals(normalizeExpiry(text(root, "expiry")));
+        } catch (JsonProcessingException ignored) {
+            return false;
+        }
+    }
+
+    private String enrichJson(String json, TopicBinding binding) {
+        if (json == null || json.isBlank() || binding == null) {
+            return json;
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            if (!(root instanceof ObjectNode object)) {
+                return json;
+            }
+            object.put("marketDataSource", binding.source());
+            if (!object.hasNonNull("source")) {
+                object.put("source", binding.source());
+            }
+            return mapper.writeValueAsString(object);
+        } catch (JsonProcessingException ignored) {
+            return json;
+        }
+    }
+
+    private synchronized String updateCache(TopicBinding binding, ConsumerRecord<String, ?> record, String json) {
+        String event = binding.event();
         String key = record.key() == null || record.key().isBlank()
                 ? record.topic() + ":" + record.partition()
                 : record.key();
         if ("directional-pressure".equals(event)) {
             key = directionalPressureCacheKey(json, key);
         }
+        key = binding.source() + "|" + key;
         String versionKey = event + ":" + key;
         long eventTime = cacheTimestamp(record);
         Long previousEventTime = cacheEventTimes.get(versionKey);
@@ -584,32 +775,39 @@ public class FeedGatewayService {
 
     private synchronized List<CachedEvent> cachedEvents(List<String> events, long nowMs) {
         purgeExpiredCache(nowMs);
+        ActiveSelection selection = activeSelection.get();
         List<CachedEvent> cachedEvents = new ArrayList<>();
         for (String event : events) {
             switch (event) {
                 case "snapshot" -> snapshots.entrySet().stream()
                         .filter(entry -> isCacheFresh("snapshot:" + entry.getKey(), nowMs))
+                        .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("snapshot", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "pace" -> paces.entrySet().stream()
                         .filter(entry -> isCacheFresh("pace:" + entry.getKey(), nowMs))
+                        .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("pace", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "directional-pressure" -> directionalPressures.entrySet().stream()
                         .filter(entry -> isCacheFresh("directional-pressure:" + entry.getKey(), nowMs))
+                        .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("directional-pressure", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "volume-sandwich" -> currentStates.entrySet().stream()
                         .filter(entry -> "volume-sandwich".equals(eventFromCacheKey(entry.getKey())))
                         .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
+                        .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("volume-sandwich", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "gex-by-strike" -> gexByStrike.entrySet().stream()
                         .filter(entry -> isCacheFresh("gex-by-strike:" + entry.getKey(), nowMs))
+                        .filter(entry -> "IBKR".equals(selection.source()))
+                        .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
                         .forEach(cachedEvents::add);
@@ -675,6 +873,32 @@ public class FeedGatewayService {
     private static String text(JsonNode root, String field) {
         JsonNode value = root == null ? null : root.get(field);
         return value == null || value.isNull() ? "" : value.asText("").trim();
+    }
+
+    private static long longField(JsonNode root, String field, long fallback) {
+        JsonNode value = root == null ? null : root.get(field);
+        if (value == null || value.isNull()) {
+            return fallback;
+        }
+        if (value.canConvertToLong()) {
+            return value.asLong();
+        }
+        try {
+            return Long.parseLong(value.asText("").trim());
+        } catch (NumberFormatException ignored) {
+            return fallback;
+        }
+    }
+
+    private static long parseInstantMs(String value, long fallback) {
+        if (value == null || value.isBlank()) {
+            return fallback > 0L ? fallback : System.currentTimeMillis();
+        }
+        try {
+            return Instant.parse(value).toEpochMilli();
+        } catch (RuntimeException ignored) {
+            return fallback > 0L ? fallback : System.currentTimeMillis();
+        }
     }
 
     private static String normalizeExpiry(String expiry) {
@@ -841,11 +1065,16 @@ public class FeedGatewayService {
             List<String> volumeSandwichJsons,
             List<String> gexByStrikeJsons
     ) {
+        ActiveSelection selection = activeSelection.get();
         return "{"
                 + "\"type\":\"ui-batch\","
                 + "\"data\":{"
                 + "\"sentAtMs\":" + System.currentTimeMillis() + ","
                 + "\"cadenceMs\":" + settings.webSocketBatchMs() + ","
+                + "\"marketDataSource\":\"" + escapeJson(selection.source()) + "\","
+                + "\"symbol\":\"" + escapeJson(selection.symbol()) + "\","
+                + "\"expiry\":\"" + escapeJson(selection.expiry()) + "\","
+                + "\"selectionEpoch\":" + selection.selectionEpoch() + ","
                 + "\"snapshots\":" + jsonArray(snapshotJsons) + ","
                 + "\"paces\":" + jsonArray(paceJsons) + ","
                 + "\"directionalPressures\":" + jsonArray(directionalPressureJsons) + ","
@@ -863,9 +1092,14 @@ public class FeedGatewayService {
     }
 
     private String statusJson() {
+        ActiveSelection selection = activeSelection.get();
         return "{"
                 + "\"status\":\"connected\","
                 + "\"time\":\"" + escapeJson(Instant.now().toString()) + "\","
+                + "\"marketDataSource\":\"" + escapeJson(selection.source()) + "\","
+                + "\"symbol\":\"" + escapeJson(selection.symbol()) + "\","
+                + "\"expiry\":\"" + escapeJson(selection.expiry()) + "\","
+                + "\"selectionEpoch\":" + selection.selectionEpoch() + ","
                 + "\"avroCaughtUp\":" + avroCaughtUp.get() + ","
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
                 + "\"snapshots\":" + snapshots.size() + ","
@@ -873,6 +1107,15 @@ public class FeedGatewayService {
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"cacheTtlMs\":" + settings.cacheTtlMs()
+                + "}";
+    }
+
+    private String activeSelectionJson(ActiveSelection selection) {
+        return "{"
+                + "\"marketDataSource\":\"" + escapeJson(selection.source()) + "\","
+                + "\"symbol\":\"" + escapeJson(selection.symbol()) + "\","
+                + "\"expiry\":\"" + escapeJson(selection.expiry()) + "\","
+                + "\"selectionEpoch\":" + selection.selectionEpoch()
                 + "}";
     }
 
