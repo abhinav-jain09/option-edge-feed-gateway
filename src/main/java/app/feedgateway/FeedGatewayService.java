@@ -55,6 +55,7 @@ public class FeedGatewayService {
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, Long> cacheEventTimes = new ConcurrentHashMap<>();
     private final Map<String, RecordPosition> cachePositions = new ConcurrentHashMap<>();
+    private final Map<String, Long> sourceLastForwardedAt = new ConcurrentHashMap<>();
     private final Object batchLock = new Object();
     private final Map<String, String> pendingSnapshots = new LinkedHashMap<>();
     private final Map<String, String> pendingPaces = new LinkedHashMap<>();
@@ -72,6 +73,11 @@ public class FeedGatewayService {
     private final AtomicLong forwardedEvents = new AtomicLong();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
+    private final AtomicLong seekToLatestEvents = new AtomicLong();
+    private final AtomicLong sourceStaleEvents = new AtomicLong();
+    private final AtomicLong lastSourceStaleBroadcastMs = new AtomicLong();
+    private final AtomicLong lastLagCheckMs = new AtomicLong();
+    private final AtomicReference<String> readySelectionKey = new AtomicReference<>("");
     private ExecutorService executor;
     private ScheduledExecutorService batchExecutor;
 
@@ -217,7 +223,12 @@ public class FeedGatewayService {
                 + "\"forwardedEvents\":" + forwardedEvents.get() + ","
                 + "\"inactiveDroppedEvents\":" + inactiveDroppedEvents.get() + ","
                 + "\"staleDroppedEvents\":" + staleDroppedEvents.get() + ","
+                + "\"seekToLatestEvents\":" + seekToLatestEvents.get() + ","
+                + "\"sourceStaleEvents\":" + sourceStaleEvents.get() + ","
+                + "\"lastSelectedForwardAgeSeconds\":" + lastSelectedForwardAgeSeconds(selection) + ","
                 + "\"offsetBarriers\":" + offsetBarriers.get().size() + ","
+                + "\"maxLagRecords\":" + settings.maxLagRecords() + ","
+                + "\"maxStaleMs\":" + settings.maxStaleMs() + ","
                 + "\"consumerRestarts\":" + consumerRestarts.get() + ","
                 + "\"cacheTtlMs\":" + settings.cacheTtlMs()
                 + "}";
@@ -280,6 +291,21 @@ public class FeedGatewayService {
                 + "# HELP options_edge_gateway_stale_dropped_total Selected-source records dropped behind the active switch barrier.\n"
                 + "# TYPE options_edge_gateway_stale_dropped_total counter\n"
                 + "options_edge_gateway_stale_dropped_total " + staleDroppedEvents.get() + "\n"
+                + "# HELP options_edge_gateway_seek_to_latest_total Selected-source backlog seek-to-latest operations.\n"
+                + "# TYPE options_edge_gateway_seek_to_latest_total counter\n"
+                + "options_edge_gateway_seek_to_latest_total " + seekToLatestEvents.get() + "\n"
+                + "# HELP options_edge_gateway_source_stale_total Times the selected source was reported stale.\n"
+                + "# TYPE options_edge_gateway_source_stale_total counter\n"
+                + "options_edge_gateway_source_stale_total " + sourceStaleEvents.get() + "\n"
+                + "# HELP options_edge_gateway_last_forward_age_seconds Age of the last forwarded selected-source record.\n"
+                + "# TYPE options_edge_gateway_last_forward_age_seconds gauge\n"
+                + "options_edge_gateway_last_forward_age_seconds " + lastSelectedForwardAgeSeconds(selection) + "\n"
+                + "# HELP options_edge_gateway_max_lag_records Configured selected-source max lag before seeking latest.\n"
+                + "# TYPE options_edge_gateway_max_lag_records gauge\n"
+                + "options_edge_gateway_max_lag_records " + settings.maxLagRecords() + "\n"
+                + "# HELP options_edge_gateway_max_stale_ms Configured selected-source max stale age in milliseconds.\n"
+                + "# TYPE options_edge_gateway_max_stale_ms gauge\n"
+                + "options_edge_gateway_max_stale_ms " + settings.maxStaleMs() + "\n"
                 + "# HELP options_edge_gateway_offset_barrier Selected-source next-offset switch barrier by topic partition.\n"
                 + "# TYPE options_edge_gateway_offset_barrier gauge\n"
                 + offsetBarrierMetrics()
@@ -296,6 +322,14 @@ public class FeedGatewayService {
 
     private static int boolMetric(boolean value) {
         return value ? 1 : 0;
+    }
+
+    private long lastSelectedForwardAgeSeconds(ActiveSelection selection) {
+        Long lastForwardedAtMs = sourceLastForwardedAt.get(selection.source());
+        if (lastForwardedAtMs == null || lastForwardedAtMs <= 0L) {
+            return -1L;
+        }
+        return Math.max(0L, (System.currentTimeMillis() - lastForwardedAtMs) / 1_000L);
     }
 
     private String offsetBarrierMetrics() {
@@ -393,6 +427,7 @@ public class FeedGatewayService {
                     if (json != null && !json.isBlank() && shouldForward(binding, json, record)) {
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
+                        recordSelectedForward(binding, json);
                     } else {
                         inactiveDroppedEvents.incrementAndGet();
                     }
@@ -422,6 +457,7 @@ public class FeedGatewayService {
             }
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                maybeSeekSelectedSourceToLatest(consumer, partitions, topicEvents);
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
@@ -500,6 +536,7 @@ public class FeedGatewayService {
                     if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json, record)) {
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
+                        recordSelectedForward(binding, json);
                     } else if (cacheKey != null) {
                         inactiveDroppedEvents.incrementAndGet();
                     }
@@ -560,6 +597,49 @@ public class FeedGatewayService {
             Thread.currentThread().interrupt();
             return false;
         }
+    }
+
+    private void maybeSeekSelectedSourceToLatest(
+            KafkaConsumer<?, ?> consumer,
+            List<TopicPartition> partitions,
+            Map<String, TopicBinding> topicEvents
+    ) {
+        long maxLagRecords = settings.maxLagRecords();
+        if (maxLagRecords <= 0L) {
+            return;
+        }
+        long nowMs = System.currentTimeMillis();
+        long previousCheckMs = lastLagCheckMs.get();
+        if (nowMs - previousCheckMs < 5_000L || !lastLagCheckMs.compareAndSet(previousCheckMs, nowMs)) {
+            return;
+        }
+        ActiveSelection selection = activeSelection.get();
+        List<TopicPartition> selectedPartitions = partitions.stream()
+                .filter(partition -> {
+                    TopicBinding binding = topicEvents.get(partition.topic());
+                    return binding != null && selection.source().equals(binding.source());
+                })
+                .toList();
+        if (selectedPartitions.isEmpty()) {
+            return;
+        }
+        Map<TopicPartition, Long> endOffsets = consumer.endOffsets(selectedPartitions);
+        long maxLag = 0L;
+        for (TopicPartition partition : selectedPartitions) {
+            long endOffset = endOffsets.getOrDefault(partition, 0L);
+            long position = consumer.position(partition);
+            maxLag = Math.max(maxLag, Math.max(0L, endOffset - position));
+        }
+        if (maxLag <= maxLagRecords) {
+            return;
+        }
+        consumer.seekToEnd(selectedPartitions);
+        seekToLatestEvents.incrementAndGet();
+        reportSourceStale(selection, "lag-" + maxLag);
+        System.err.println("Feed gateway selected source " + selection.source()
+                + " lag=" + maxLag
+                + " exceeded maxLagRecords=" + maxLagRecords
+                + "; sought selected partitions to latest.");
     }
 
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {
@@ -645,12 +725,14 @@ public class FeedGatewayService {
             return;
         }
         offsetBarriers.set(captureOffsetBarriers(next));
+        readySelectionKey.set("");
         activeSelection.set(next);
         synchronized (batchLock) {
             clearPendingLocked();
         }
         String resetJson = activeSelectionJson(next);
         broadcast("reset", resetJson);
+        broadcast("source-switching", activeSelectionJson(next, "source-switching"));
         broadcast("status", statusJson());
         broadcastCachedState(List.of("snapshot", "pace", "directional-pressure", "volume-sandwich", "gex-by-strike"));
         System.out.println("Feed gateway selected market data source " + next.source()
@@ -714,10 +796,36 @@ public class FeedGatewayService {
             return false;
         }
         if (!passesSelectionBarrier(record, selection)) {
-            staleDroppedEvents.incrementAndGet();
+            reportSourceStale(selection, "switch-barrier");
             return false;
         }
         return matchesActiveSelection(json, selection);
+    }
+
+    private void recordSelectedForward(TopicBinding binding, String json) {
+        ActiveSelection selection = activeSelection.get();
+        sourceLastForwardedAt.put(selection.source(), System.currentTimeMillis());
+        if (!"snapshot".equals(binding.event())) {
+            return;
+        }
+        String key = selectionKey(selection);
+        if (readySelectionKey.compareAndSet("", key) || readySelectionKey.compareAndSet(null, key)) {
+            broadcast("source-ready", activeSelectionJson(selection, "source-ready"));
+        }
+    }
+
+    private void reportSourceStale(ActiveSelection selection, String reason) {
+        staleDroppedEvents.incrementAndGet();
+        sourceStaleEvents.incrementAndGet();
+        long nowMs = System.currentTimeMillis();
+        long previousMs = lastSourceStaleBroadcastMs.get();
+        if (nowMs - previousMs >= 5_000L && lastSourceStaleBroadcastMs.compareAndSet(previousMs, nowMs)) {
+            broadcast("source-stale", activeSelectionJson(selection, "source-stale:" + reason));
+        }
+    }
+
+    private String selectionKey(ActiveSelection selection) {
+        return selection.source() + "|" + selection.symbol() + "|" + selection.expiry() + "|" + selection.selectionEpoch();
     }
 
     private boolean matchesActiveSelection(String json, ActiveSelection selection) {
@@ -936,7 +1044,11 @@ public class FeedGatewayService {
     }
 
     private boolean passesSelectionTimeBarrier(long eventTimeMs, ActiveSelection selection) {
-        return selection == null || selection.selectedAtMs() <= 0L || eventTimeMs >= selection.selectedAtMs();
+        if (selection != null && selection.selectedAtMs() > 0L && eventTimeMs < selection.selectedAtMs()) {
+            return false;
+        }
+        long maxStaleMs = settings.maxStaleMs();
+        return maxStaleMs <= 0L || eventTimeMs >= System.currentTimeMillis() - maxStaleMs;
     }
 
     private boolean passesOffsetBarrier(TopicPartition partition, long offset) {
@@ -1227,6 +1339,7 @@ public class FeedGatewayService {
                 + "\"selectionEpoch\":" + selection.selectionEpoch() + ","
                 + "\"avroCaughtUp\":" + avroCaughtUp.get() + ","
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
+                + "\"lastSelectedForwardAgeSeconds\":" + lastSelectedForwardAgeSeconds(selection) + ","
                 + "\"snapshots\":" + snapshots.size() + ","
                 + "\"paces\":" + paces.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
@@ -1236,11 +1349,18 @@ public class FeedGatewayService {
     }
 
     private String activeSelectionJson(ActiveSelection selection) {
+        return activeSelectionJson(selection, "selected");
+    }
+
+    private String activeSelectionJson(ActiveSelection selection, String status) {
         return "{"
+                + "\"status\":\"" + escapeJson(status) + "\","
+                + "\"time\":\"" + escapeJson(Instant.now().toString()) + "\","
                 + "\"marketDataSource\":\"" + escapeJson(selection.source()) + "\","
                 + "\"symbol\":\"" + escapeJson(selection.symbol()) + "\","
                 + "\"expiry\":\"" + escapeJson(selection.expiry()) + "\","
-                + "\"selectionEpoch\":" + selection.selectionEpoch()
+                + "\"selectionEpoch\":" + selection.selectionEpoch() + ","
+                + "\"lastSelectedForwardAgeSeconds\":" + lastSelectedForwardAgeSeconds(selection)
                 + "}";
     }
 

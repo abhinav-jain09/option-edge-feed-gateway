@@ -116,6 +116,14 @@ public final class GatewaySettings {
         return intValue("GATEWAY_CACHE_TTL_MS", 900_000, 0);
     }
 
+    public long maxLagRecords() {
+        return longValue("MARKETDATA_GATEWAY_MAX_LAG_RECORDS", 5_000L, 0L);
+    }
+
+    public long maxStaleMs() {
+        return longValue("MARKETDATA_GATEWAY_MAX_STALE_MS", 15_000L, 0L);
+    }
+
     public static String value(String key, String fallback) {
         String env = System.getenv(key);
         if (env != null && !env.isBlank()) {
@@ -137,6 +145,15 @@ public final class GatewaySettings {
         String value = value(key, Integer.toString(fallback));
         try {
             return Math.max(min, Integer.parseInt(value));
+        } catch (NumberFormatException ignored) {
+            return Math.max(min, fallback);
+        }
+    }
+
+    public static long longValue(String key, long fallback, long min) {
+        String value = value(key, Long.toString(fallback));
+        try {
+            return Math.max(min, Long.parseLong(value));
         } catch (NumberFormatException ignored) {
             return Math.max(min, fallback);
         }
