@@ -325,7 +325,7 @@ public class FeedGatewayService {
     }
 
     private long lastSelectedForwardAgeSeconds(ActiveSelection selection) {
-        Long lastForwardedAtMs = sourceLastForwardedAt.get(selection.source());
+        Long lastForwardedAtMs = sourceLastForwardedAt.get(selectionKey(selection));
         if (lastForwardedAtMs == null || lastForwardedAtMs <= 0L) {
             return -1L;
         }
@@ -804,7 +804,7 @@ public class FeedGatewayService {
 
     private void recordSelectedForward(TopicBinding binding, String json) {
         ActiveSelection selection = activeSelection.get();
-        sourceLastForwardedAt.put(selection.source(), System.currentTimeMillis());
+        sourceLastForwardedAt.put(selectionKey(selection), System.currentTimeMillis());
         if (!"snapshot".equals(binding.event())) {
             return;
         }
@@ -818,10 +818,22 @@ public class FeedGatewayService {
         staleDroppedEvents.incrementAndGet();
         sourceStaleEvents.incrementAndGet();
         long nowMs = System.currentTimeMillis();
+        if (hasRecentSelectedForward(selection, nowMs)) {
+            return;
+        }
         long previousMs = lastSourceStaleBroadcastMs.get();
         if (nowMs - previousMs >= 5_000L && lastSourceStaleBroadcastMs.compareAndSet(previousMs, nowMs)) {
             broadcast("source-stale", activeSelectionJson(selection, "source-stale:" + reason));
         }
+    }
+
+    private boolean hasRecentSelectedForward(ActiveSelection selection, long nowMs) {
+        Long lastForwardedAtMs = sourceLastForwardedAt.get(selectionKey(selection));
+        if (lastForwardedAtMs == null || lastForwardedAtMs <= 0L) {
+            return false;
+        }
+        long maxStaleMs = settings.maxStaleMs();
+        return maxStaleMs <= 0L || nowMs - lastForwardedAtMs <= maxStaleMs;
     }
 
     private String selectionKey(ActiveSelection selection) {
@@ -1008,7 +1020,6 @@ public class FeedGatewayService {
                         .forEach(cachedEvents::add);
                 case "gex-by-strike" -> gexByStrike.entrySet().stream()
                         .filter(entry -> isCacheFresh("gex-by-strike:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("gex-by-strike:" + entry.getKey(), selection))
                         .filter(entry -> "IBKR".equals(selection.source()))
                         .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
