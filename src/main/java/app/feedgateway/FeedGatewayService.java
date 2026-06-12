@@ -54,6 +54,7 @@ public class FeedGatewayService {
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, Long> cacheEventTimes = new ConcurrentHashMap<>();
+    private final Map<String, RecordPosition> cachePositions = new ConcurrentHashMap<>();
     private final Object batchLock = new Object();
     private final Map<String, String> pendingSnapshots = new LinkedHashMap<>();
     private final Map<String, String> pendingPaces = new LinkedHashMap<>();
@@ -64,11 +65,13 @@ public class FeedGatewayService {
     private final AtomicBoolean avroCaughtUp = new AtomicBoolean(false);
     private final AtomicBoolean stateCaughtUp = new AtomicBoolean(false);
     private final AtomicReference<ActiveSelection> activeSelection;
+    private final AtomicReference<Map<TopicPartition, Long>> offsetBarriers = new AtomicReference<>(Map.of());
     private final AtomicLong coalescedUpdates = new AtomicLong();
     private final AtomicLong batchesSent = new AtomicLong();
     private final AtomicLong consumerRestarts = new AtomicLong();
     private final AtomicLong forwardedEvents = new AtomicLong();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
+    private final AtomicLong staleDroppedEvents = new AtomicLong();
     private ExecutorService executor;
     private ScheduledExecutorService batchExecutor;
 
@@ -76,6 +79,9 @@ public class FeedGatewayService {
     }
 
     private record TopicBinding(String source, String event) {
+    }
+
+    private record RecordPosition(TopicPartition partition, long offset) {
     }
 
     private record ActiveSelection(String source, String symbol, String expiry, long selectionEpoch, long selectedAtMs) {
@@ -210,6 +216,8 @@ public class FeedGatewayService {
                 + "\"batchesSent\":" + batchesSent.get() + ","
                 + "\"forwardedEvents\":" + forwardedEvents.get() + ","
                 + "\"inactiveDroppedEvents\":" + inactiveDroppedEvents.get() + ","
+                + "\"staleDroppedEvents\":" + staleDroppedEvents.get() + ","
+                + "\"offsetBarriers\":" + offsetBarriers.get().size() + ","
                 + "\"consumerRestarts\":" + consumerRestarts.get() + ","
                 + "\"cacheTtlMs\":" + settings.cacheTtlMs()
                 + "}";
@@ -269,6 +277,12 @@ public class FeedGatewayService {
                 + "# HELP options_edge_gateway_inactive_dropped_total Inactive-source records consumed but not forwarded.\n"
                 + "# TYPE options_edge_gateway_inactive_dropped_total counter\n"
                 + "options_edge_gateway_inactive_dropped_total " + inactiveDroppedEvents.get() + "\n"
+                + "# HELP options_edge_gateway_stale_dropped_total Selected-source records dropped behind the active switch barrier.\n"
+                + "# TYPE options_edge_gateway_stale_dropped_total counter\n"
+                + "options_edge_gateway_stale_dropped_total " + staleDroppedEvents.get() + "\n"
+                + "# HELP options_edge_gateway_offset_barrier Selected-source next-offset switch barrier by topic partition.\n"
+                + "# TYPE options_edge_gateway_offset_barrier gauge\n"
+                + offsetBarrierMetrics()
                 + "# HELP options_edge_feed_gateway_consumer_restarts_total Total Kafka consumer restart attempts.\n"
                 + "# TYPE options_edge_feed_gateway_consumer_restarts_total counter\n"
                 + "options_edge_feed_gateway_consumer_restarts_total " + consumerRestarts.get() + "\n"
@@ -282,6 +296,20 @@ public class FeedGatewayService {
 
     private static int boolMetric(boolean value) {
         return value ? 1 : 0;
+    }
+
+    private String offsetBarrierMetrics() {
+        StringBuilder builder = new StringBuilder();
+        offsetBarriers.get().entrySet().stream()
+                .sorted(Map.Entry.comparingByKey(Comparator.comparing(TopicPartition::topic).thenComparingInt(TopicPartition::partition)))
+                .forEach(entry -> builder.append("options_edge_gateway_offset_barrier{topic=\"")
+                        .append(escapeJson(entry.getKey().topic()))
+                        .append("\",partition=\"")
+                        .append(entry.getKey().partition())
+                        .append("\"} ")
+                        .append(entry.getValue())
+                        .append('\n'));
+        return builder.toString();
     }
 
     private void runSelectionConsumer() {
@@ -362,7 +390,7 @@ public class FeedGatewayService {
                 for (ConsumerRecord<String, String> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = binding == null ? null : enrichJson(record.value(), binding);
-                    if (json != null && !json.isBlank() && shouldForward(binding, json)) {
+                    if (json != null && !json.isBlank() && shouldForward(binding, json, record)) {
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
                     } else {
@@ -469,7 +497,7 @@ public class FeedGatewayService {
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
-                    if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json)) {
+                    if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json, record)) {
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
                     } else if (cacheKey != null) {
@@ -616,6 +644,7 @@ public class FeedGatewayService {
         if (!next.newerThan(previous)) {
             return;
         }
+        offsetBarriers.set(captureOffsetBarriers(next));
         activeSelection.set(next);
         synchronized (batchLock) {
             clearPendingLocked();
@@ -629,7 +658,51 @@ public class FeedGatewayService {
                 + " epoch=" + next.selectionEpoch());
     }
 
-    private boolean shouldForward(TopicBinding binding, String json) {
+    private Map<TopicPartition, Long> captureOffsetBarriers(ActiveSelection selection) {
+        List<String> topics = outputTopicsForSource(selection.source());
+        if (topics.isEmpty()) {
+            return Map.of();
+        }
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("barrier"))) {
+            List<TopicPartition> partitions = partitionsFor(consumer, Set.copyOf(topics));
+            Map<TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
+            System.out.println("Feed gateway captured " + endOffsets.size()
+                    + " switch offset barriers for " + selection.source()
+                    + " " + selection.symbol() + " " + selection.expiry()
+                    + " epoch=" + selection.selectionEpoch());
+            return Map.copyOf(endOffsets);
+        } catch (RuntimeException e) {
+            System.err.println("Feed gateway could not capture switch offset barriers; falling back to time/epoch barrier: "
+                    + e.getMessage());
+            return Map.of();
+        }
+    }
+
+    private List<String> outputTopicsForSource(String source) {
+        if ("IBKR".equals(source)) {
+            return List.of(
+                    settings.ibkrDisplayTopic(),
+                    settings.ibkrPaceTopic(),
+                    settings.ibkrDirectionalPressureTopic(),
+                    settings.ibkrVolumeSandwichTopic(),
+                    settings.ibkrVolumeSandwichAlertsTopic(),
+                    settings.ibkrUnusualWhalesGexTopic(),
+                    settings.ibkrUnusualWhalesGexHistoryTopic()
+            );
+        }
+        if ("DATABENTO".equals(source)) {
+            return List.of(
+                    settings.databentoDisplayTopic(),
+                    settings.databentoPaceTopic(),
+                    settings.databentoDirectionalPressureTopic(),
+                    settings.databentoVolumeSandwichTopic(),
+                    settings.databentoVolumeSandwichAlertsTopic()
+            );
+        }
+        return List.of();
+    }
+
+    private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
         if (binding == null) {
             return false;
         }
@@ -638,6 +711,10 @@ public class FeedGatewayService {
             return false;
         }
         if ("gex-by-strike".equals(binding.event()) && !"IBKR".equals(selection.source())) {
+            return false;
+        }
+        if (!passesSelectionBarrier(record, selection)) {
+            staleDroppedEvents.incrementAndGet();
             return false;
         }
         return matchesActiveSelection(json, selection);
@@ -654,6 +731,10 @@ public class FeedGatewayService {
                 source = "IBKR";
             }
             if (!source.isBlank() && !selection.source().equals(source)) {
+                return false;
+            }
+            long recordEpoch = longField(root, "selectionEpoch", 0L);
+            if (recordEpoch > 0L && selection.selectionEpoch() > 0L && recordEpoch < selection.selectionEpoch()) {
                 return false;
             }
             return selection.symbol().equalsIgnoreCase(text(root, "symbol"))
@@ -675,6 +756,10 @@ public class FeedGatewayService {
             object.put("marketDataSource", binding.source());
             if (!object.hasNonNull("source")) {
                 object.put("source", binding.source());
+            }
+            ActiveSelection selection = activeSelection.get();
+            if (!object.hasNonNull("sessionDate")) {
+                object.put("sessionDate", selection.expiry());
             }
             return mapper.writeValueAsString(object);
         } catch (JsonProcessingException ignored) {
@@ -711,26 +796,31 @@ public class FeedGatewayService {
         switch (event) {
             case "snapshot" -> {
                 cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
                 snapshots.put(key, json);
                 return key;
             }
             case "pace" -> {
                 cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
                 paces.put(key, json);
                 return key;
             }
             case "directional-pressure" -> {
                 cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
                 directionalPressures.put(key, json);
                 return key;
             }
             case "volume-sandwich" -> {
                 cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
                 currentStates.put(versionKey, json);
                 return versionKey;
             }
             case "gex-by-strike" -> {
                 cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
                 gexByStrike.put(key, json);
                 return key;
             }
@@ -781,18 +871,21 @@ public class FeedGatewayService {
             switch (event) {
                 case "snapshot" -> snapshots.entrySet().stream()
                         .filter(entry -> isCacheFresh("snapshot:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("snapshot:" + entry.getKey(), selection))
                         .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("snapshot", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "pace" -> paces.entrySet().stream()
                         .filter(entry -> isCacheFresh("pace:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("pace:" + entry.getKey(), selection))
                         .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("pace", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "directional-pressure" -> directionalPressures.entrySet().stream()
                         .filter(entry -> isCacheFresh("directional-pressure:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("directional-pressure:" + entry.getKey(), selection))
                         .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("directional-pressure", entry.getValue()))
@@ -800,12 +893,14 @@ public class FeedGatewayService {
                 case "volume-sandwich" -> currentStates.entrySet().stream()
                         .filter(entry -> "volume-sandwich".equals(eventFromCacheKey(entry.getKey())))
                         .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier(entry.getKey(), selection))
                         .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("volume-sandwich", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "gex-by-strike" -> gexByStrike.entrySet().stream()
                         .filter(entry -> isCacheFresh("gex-by-strike:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("gex-by-strike:" + entry.getKey(), selection))
                         .filter(entry -> "IBKR".equals(selection.source()))
                         .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
@@ -824,13 +919,43 @@ public class FeedGatewayService {
         return ttlMs <= 0 || eventTime < nowMs - ttlMs;
     }
 
-    private long cacheTimestamp(ConsumerRecord<String, ?> record) {
+    private boolean passesSelectionBarrier(String versionKey, ActiveSelection selection) {
+        Long eventTimeMs = cacheEventTimes.get(versionKey);
+        if (eventTimeMs == null || !passesSelectionTimeBarrier(eventTimeMs, selection)) {
+            return false;
+        }
+        RecordPosition position = cachePositions.get(versionKey);
+        return position == null || passesOffsetBarrier(position.partition(), position.offset());
+    }
+
+    private boolean passesSelectionBarrier(ConsumerRecord<?, ?> record, ActiveSelection selection) {
+        if (!passesSelectionTimeBarrier(cacheTimestamp(record), selection)) {
+            return false;
+        }
+        return passesOffsetBarrier(new TopicPartition(record.topic(), record.partition()), record.offset());
+    }
+
+    private boolean passesSelectionTimeBarrier(long eventTimeMs, ActiveSelection selection) {
+        return selection == null || selection.selectedAtMs() <= 0L || eventTimeMs >= selection.selectedAtMs();
+    }
+
+    private boolean passesOffsetBarrier(TopicPartition partition, long offset) {
+        Long barrier = offsetBarriers.get().get(partition);
+        return barrier == null || offset >= barrier;
+    }
+
+    private long cacheTimestamp(ConsumerRecord<?, ?> record) {
         long eventTime = record.timestamp();
         return eventTime >= 0 ? eventTime : System.currentTimeMillis();
     }
 
+    private RecordPosition recordPosition(ConsumerRecord<?, ?> record) {
+        return new RecordPosition(new TopicPartition(record.topic(), record.partition()), record.offset());
+    }
+
     private void removeCacheEntry(String versionKey) {
         cacheEventTimes.remove(versionKey);
+        cachePositions.remove(versionKey);
         if (versionKey.startsWith("snapshot:")) {
             snapshots.remove(versionKey.substring("snapshot:".length()));
         } else if (versionKey.startsWith("pace:")) {
