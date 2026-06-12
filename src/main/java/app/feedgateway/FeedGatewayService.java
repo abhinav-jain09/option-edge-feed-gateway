@@ -688,7 +688,9 @@ public class FeedGatewayService {
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
         if (caughtUpFlag.compareAndSet(false, true)) {
             broadcast("status", statusJson());
-            broadcastCachedState(events);
+            if (broadcastCachedState(events)) {
+                markSelectionReady(activeSelection.get());
+            }
             System.out.println("Feed gateway " + name + " cache caught up; replayed cached state to clients.");
         }
     }
@@ -734,7 +736,9 @@ public class FeedGatewayService {
         broadcast("reset", resetJson);
         broadcast("source-switching", activeSelectionJson(next, "source-switching"));
         broadcast("status", statusJson());
-        broadcastCachedState(List.of("snapshot", "pace", "directional-pressure", "volume-sandwich", "gex-by-strike"));
+        if (broadcastCachedState(List.of("snapshot", "pace", "directional-pressure", "volume-sandwich", "gex-by-strike"))) {
+            markSelectionReady(next);
+        }
         System.out.println("Feed gateway selected market data source " + next.source()
                 + " " + next.symbol() + " " + next.expiry()
                 + " epoch=" + next.selectionEpoch());
@@ -808,7 +812,12 @@ public class FeedGatewayService {
         if (!"snapshot".equals(binding.event())) {
             return;
         }
+        markSelectionReady(selection);
+    }
+
+    private void markSelectionReady(ActiveSelection selection) {
         String key = selectionKey(selection);
+        sourceLastForwardedAt.put(key, System.currentTimeMillis());
         if (readySelectionKey.compareAndSet("", key) || readySelectionKey.compareAndSet(null, key)) {
             broadcast("source-ready", activeSelectionJson(selection, "source-ready"));
         }
@@ -841,6 +850,14 @@ public class FeedGatewayService {
     }
 
     private boolean matchesActiveSelection(String json, ActiveSelection selection) {
+        return matchesSelection(json, selection, true);
+    }
+
+    private boolean matchesCachedSelection(String json, ActiveSelection selection) {
+        return matchesSelection(json, selection, false);
+    }
+
+    private boolean matchesSelection(String json, ActiveSelection selection, boolean enforceSelectionEpoch) {
         if (json == null || json.isBlank() || selection == null) {
             return false;
         }
@@ -854,7 +871,10 @@ public class FeedGatewayService {
                 return false;
             }
             long recordEpoch = longField(root, "selectionEpoch", 0L);
-            if (recordEpoch > 0L && selection.selectionEpoch() > 0L && recordEpoch < selection.selectionEpoch()) {
+            if (enforceSelectionEpoch
+                    && recordEpoch > 0L
+                    && selection.selectionEpoch() > 0L
+                    && recordEpoch < selection.selectionEpoch()) {
                 return false;
             }
             return selection.symbol().equalsIgnoreCase(text(root, "symbol"))
@@ -965,15 +985,16 @@ public class FeedGatewayService {
         return eventTime != null && !isExpired(eventTime, nowMs);
     }
 
-    private void broadcastCachedState(List<String> events) {
+    private boolean broadcastCachedState(List<String> events) {
         List<CachedEvent> cachedEvents = cachedEvents(events, System.currentTimeMillis());
         if (cachedEvents.isEmpty()) {
-            return;
+            return false;
         }
         String envelope = uiBatchEnvelopeJson(cachedEvents);
         for (WebSocketSession client : clients) {
             sendEnvelope(client, envelope);
         }
+        return cachedEvents.stream().anyMatch(cachedEvent -> "snapshot".equals(cachedEvent.event()));
     }
 
     private void sendCachedState(WebSocketSession session, List<String> events) {
@@ -991,37 +1012,33 @@ public class FeedGatewayService {
             switch (event) {
                 case "snapshot" -> snapshots.entrySet().stream()
                         .filter(entry -> isCacheFresh("snapshot:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("snapshot:" + entry.getKey(), selection))
-                        .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("snapshot", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "pace" -> paces.entrySet().stream()
                         .filter(entry -> isCacheFresh("pace:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("pace:" + entry.getKey(), selection))
-                        .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("pace", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "directional-pressure" -> directionalPressures.entrySet().stream()
                         .filter(entry -> isCacheFresh("directional-pressure:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("directional-pressure:" + entry.getKey(), selection))
-                        .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("directional-pressure", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "volume-sandwich" -> currentStates.entrySet().stream()
                         .filter(entry -> "volume-sandwich".equals(eventFromCacheKey(entry.getKey())))
                         .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier(entry.getKey(), selection))
-                        .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("volume-sandwich", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "gex-by-strike" -> gexByStrike.entrySet().stream()
                         .filter(entry -> isCacheFresh("gex-by-strike:" + entry.getKey(), nowMs))
                         .filter(entry -> "IBKR".equals(selection.source()))
-                        .filter(entry -> matchesActiveSelection(entry.getValue(), selection))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
                         .forEach(cachedEvents::add);
