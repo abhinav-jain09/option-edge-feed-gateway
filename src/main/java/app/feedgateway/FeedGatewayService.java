@@ -4,6 +4,12 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.optionsedge.contracts.hpsf.HpsfAuditEvent;
+import com.optionsedge.contracts.hpsf.HpsfExitIntentEvent;
+import com.optionsedge.contracts.hpsf.HpsfSignal;
+import com.optionsedge.contracts.hpsf.HpsfTopics;
+import com.optionsedge.contracts.hpsf.MarketFlowSnapshot;
+import com.optionsedge.contracts.hpsf.StrikeScoreSnapshot;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -47,12 +53,20 @@ public class FeedGatewayService {
     private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
     private final ObjectMapper mapper;
+    private final HpsfGatewayViewMapper hpsfViewMapper;
     private final Set<WebSocketSession> clients = new CopyOnWriteArraySet<>();
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
+    private final Map<String, String> hpsfLatestSignals = new ConcurrentHashMap<>();
+    private final Map<String, String> hpsfMarketFlows = new ConcurrentHashMap<>();
+    private final Map<String, String> hpsfTopCandidates = new ConcurrentHashMap<>();
+    private final Map<String, String> hpsfAudits = new ConcurrentHashMap<>();
+    private final Map<String, String> hpsfExitIntents = new ConcurrentHashMap<>();
+    private final Map<String, StrikeScoreSnapshot> hpsfStrikeScores = new ConcurrentHashMap<>();
+    private final Map<String, String> hpsfLatestEvaluationIds = new ConcurrentHashMap<>();
     private final Map<String, Long> cacheEventTimes = new ConcurrentHashMap<>();
     private final Map<String, RecordPosition> cachePositions = new ConcurrentHashMap<>();
     private final Map<String, Long> sourceLastForwardedAt = new ConcurrentHashMap<>();
@@ -62,9 +76,15 @@ public class FeedGatewayService {
     private final Map<String, String> pendingDirectionalPressures = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
+    private final Map<String, String> pendingHpsfLatestSignals = new LinkedHashMap<>();
+    private final Map<String, String> pendingHpsfMarketFlows = new LinkedHashMap<>();
+    private final Map<String, String> pendingHpsfTopCandidates = new LinkedHashMap<>();
+    private final Map<String, String> pendingHpsfAudits = new LinkedHashMap<>();
+    private final Map<String, String> pendingHpsfExitIntents = new LinkedHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean avroCaughtUp = new AtomicBoolean(false);
     private final AtomicBoolean stateCaughtUp = new AtomicBoolean(false);
+    private final AtomicBoolean hpsfCaughtUp = new AtomicBoolean(false);
     private final AtomicReference<ActiveSelection> activeSelection;
     private final AtomicReference<Map<TopicPartition, Long>> offsetBarriers = new AtomicReference<>(Map.of());
     private final AtomicLong coalescedUpdates = new AtomicLong();
@@ -88,6 +108,9 @@ public class FeedGatewayService {
     }
 
     private record RecordPosition(TopicPartition partition, long offset) {
+    }
+
+    private record HpsfCacheUpdate(String event, String key, String json) {
     }
 
     private record ActiveSelection(String source, String symbol, String expiry, long selectionEpoch, long selectedAtMs) {
@@ -117,9 +140,10 @@ public class FeedGatewayService {
         void run(boolean retry) throws RuntimeException;
     }
 
-    public FeedGatewayService(GatewaySettings settings, ObjectMapper mapper) {
+    public FeedGatewayService(GatewaySettings settings, ObjectMapper mapper, HpsfGatewayViewMapper hpsfViewMapper) {
         this.settings = settings;
         this.mapper = mapper;
+        this.hpsfViewMapper = hpsfViewMapper;
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
     }
 
@@ -128,7 +152,7 @@ public class FeedGatewayService {
         if (!settings.enabled() || !running.compareAndSet(false, true)) {
             return;
         }
-        executor = Executors.newFixedThreadPool(6, runnable -> {
+        executor = Executors.newFixedThreadPool(8, runnable -> {
             Thread thread = new Thread(runnable, "options-edge-feed-gateway");
             thread.setDaemon(true);
             return thread;
@@ -139,6 +163,8 @@ public class FeedGatewayService {
         executor.submit(this::runAvroCacheConsumer);
         executor.submit(this::runJsonStateCacheConsumer);
         executor.submit(this::runAlertConsumer);
+        executor.submit(this::runHpsfCacheConsumer);
+        executor.submit(this::runHpsfLiveConsumer);
         batchExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "options-edge-feed-gateway-batcher");
             thread.setDaemon(true);
@@ -186,6 +212,15 @@ public class FeedGatewayService {
         if (stateCaughtUp.get()) {
             sendCachedState(session, List.of("volume-sandwich", "gex-by-strike"));
         }
+        if (hpsfCaughtUp.get()) {
+            sendCachedState(session, List.of(
+                    "hpsf-latest-signal",
+                    "hpsf-market-flow",
+                    "hpsf-top-candidates",
+                    "hpsf-audit",
+                    "hpsf-exit-intent"
+            ));
+        }
     }
 
     public void removeClient(WebSocketSession session) {
@@ -210,12 +245,18 @@ public class FeedGatewayService {
                 + "\"selectionEpoch\":" + selection.selectionEpoch() + ","
                 + "\"avroCaughtUp\":" + avroCaughtUp.get() + ","
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
+                + "\"hpsfCaughtUp\":" + hpsfCaughtUp.get() + ","
                 + "\"clients\":" + clients.size() + ","
                 + "\"snapshots\":" + snapshots.size() + ","
                 + "\"paces\":" + paces.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
+                + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
+                + "\"hpsfMarketFlows\":" + hpsfMarketFlows.size() + ","
+                + "\"hpsfTopCandidates\":" + hpsfTopCandidates.size() + ","
+                + "\"hpsfAudits\":" + hpsfAudits.size() + ","
+                + "\"hpsfExitIntents\":" + hpsfExitIntents.size() + ","
                 + "\"pendingEvents\":" + pendingEventCount() + ","
                 + "\"webSocketBatchMs\":" + settings.webSocketBatchMs() + ","
                 + "\"coalescedUpdates\":" + coalescedUpdates.get() + ","
@@ -248,6 +289,9 @@ public class FeedGatewayService {
                 + "# HELP options_edge_feed_gateway_state_caught_up Whether JSON state cache consumers have caught up.\n"
                 + "# TYPE options_edge_feed_gateway_state_caught_up gauge\n"
                 + "options_edge_feed_gateway_state_caught_up " + boolMetric(stateCaughtUp.get()) + "\n"
+                + "# HELP options_edge_feed_gateway_hpsf_caught_up Whether HPSF view cache consumers have caught up.\n"
+                + "# TYPE options_edge_feed_gateway_hpsf_caught_up gauge\n"
+                + "options_edge_feed_gateway_hpsf_caught_up " + boolMetric(hpsfCaughtUp.get()) + "\n"
                 + "# HELP options_edge_feed_gateway_clients Connected WebSocket client count.\n"
                 + "# TYPE options_edge_feed_gateway_clients gauge\n"
                 + "options_edge_feed_gateway_clients " + clients.size() + "\n"
@@ -266,6 +310,21 @@ public class FeedGatewayService {
                 + "# HELP options_edge_feed_gateway_gex_by_strike Cached Unusual Whales GEX strike count.\n"
                 + "# TYPE options_edge_feed_gateway_gex_by_strike gauge\n"
                 + "options_edge_feed_gateway_gex_by_strike " + gexByStrike.size() + "\n"
+                + "# HELP options_edge_feed_gateway_hpsf_latest_signals Cached HPSF latest-signal view count.\n"
+                + "# TYPE options_edge_feed_gateway_hpsf_latest_signals gauge\n"
+                + "options_edge_feed_gateway_hpsf_latest_signals " + hpsfLatestSignals.size() + "\n"
+                + "# HELP options_edge_feed_gateway_hpsf_market_flows Cached HPSF market-flow view count.\n"
+                + "# TYPE options_edge_feed_gateway_hpsf_market_flows gauge\n"
+                + "options_edge_feed_gateway_hpsf_market_flows " + hpsfMarketFlows.size() + "\n"
+                + "# HELP options_edge_feed_gateway_hpsf_top_candidates Cached HPSF top-candidates view count.\n"
+                + "# TYPE options_edge_feed_gateway_hpsf_top_candidates gauge\n"
+                + "options_edge_feed_gateway_hpsf_top_candidates " + hpsfTopCandidates.size() + "\n"
+                + "# HELP options_edge_feed_gateway_hpsf_audits Cached HPSF audit view count.\n"
+                + "# TYPE options_edge_feed_gateway_hpsf_audits gauge\n"
+                + "options_edge_feed_gateway_hpsf_audits " + hpsfAudits.size() + "\n"
+                + "# HELP options_edge_feed_gateway_hpsf_exit_intents Cached HPSF exit-intent view count.\n"
+                + "# TYPE options_edge_feed_gateway_hpsf_exit_intents gauge\n"
+                + "options_edge_feed_gateway_hpsf_exit_intents " + hpsfExitIntents.size() + "\n"
                 + "# HELP options_edge_feed_gateway_pending_events Pending WebSocket events waiting for the next batch.\n"
                 + "# TYPE options_edge_feed_gateway_pending_events gauge\n"
                 + "options_edge_feed_gateway_pending_events " + pendingEventCount() + "\n"
@@ -412,6 +471,87 @@ public class FeedGatewayService {
         topicEvents.put(settings.ibkrVolumeSandwichAlertsTopic(), new TopicBinding("IBKR", "volume-sandwich-alert"));
         topicEvents.put(settings.databentoVolumeSandwichAlertsTopic(), new TopicBinding("DATABENTO", "volume-sandwich-alert"));
         runRetryingConsumer("alerts", retry -> runAlertConsumerOnce(topicEvents), null);
+    }
+
+    private void runHpsfCacheConsumer() {
+        runRetryingConsumer(
+                "hpsf-cache",
+                retry -> runHpsfCacheConsumerOnce(),
+                () -> markCacheRecovering(hpsfCaughtUp)
+        );
+    }
+
+    private void runHpsfLiveConsumer() {
+        runRetryingConsumer("hpsf-live", retry -> runHpsfLiveConsumerOnce(retry), null);
+    }
+
+    private void runHpsfCacheConsumerOnce() {
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("hpsf-cache"))) {
+            List<TopicPartition> partitions = partitionsFor(consumer, hpsfTopics());
+            consumer.assign(partitions);
+            seekToCacheWindow(consumer, partitions);
+            Map<TopicPartition, Long> bootstrapEndOffsets = consumer.endOffsets(partitions);
+            boolean live = caughtUp(consumer, bootstrapEndOffsets);
+            if (live) {
+                markCacheCaughtUp("hpsf", hpsfEvents(), hpsfCaughtUp);
+            }
+            while (running.get()) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                for (ConsumerRecord<String, String> record : records) {
+                    updateHpsfCache(record);
+                }
+                purgeExpiredCache(System.currentTimeMillis());
+                if (!live && caughtUp(consumer, bootstrapEndOffsets)) {
+                    live = true;
+                    markCacheCaughtUp("hpsf", hpsfEvents(), hpsfCaughtUp);
+                }
+            }
+        }
+    }
+
+    private void runHpsfLiveConsumerOnce(boolean retry) {
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("hpsf-live"))) {
+            List<TopicPartition> partitions = partitionsFor(consumer, hpsfTopics());
+            consumer.assign(partitions);
+            if (retry) {
+                seekToCacheWindow(consumer, partitions);
+            } else {
+                consumer.seekToEnd(partitions);
+            }
+            while (running.get()) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                for (ConsumerRecord<String, String> record : records) {
+                    HpsfCacheUpdate update = updateHpsfCache(record);
+                    if (update != null && hpsfCaughtUp.get()) {
+                        enqueuePending(update.event(), update.key(), update.json());
+                        forwardedEvents.incrementAndGet();
+                    } else if (update != null) {
+                        inactiveDroppedEvents.incrementAndGet();
+                    }
+                }
+                purgeExpiredCache(System.currentTimeMillis());
+            }
+        }
+    }
+
+    private Set<String> hpsfTopics() {
+        return Set.of(
+                settings.hpsfLatestSignalTopic(),
+                settings.hpsfMarketFlowTopic(),
+                settings.hpsfStrikeScoreTopic(),
+                settings.hpsfAuditTopic(),
+                settings.hpsfExitSignalTopic()
+        );
+    }
+
+    private List<String> hpsfEvents() {
+        return List.of(
+                "hpsf-latest-signal",
+                "hpsf-market-flow",
+                "hpsf-top-candidates",
+                "hpsf-audit",
+                "hpsf-exit-intent"
+        );
     }
 
     private void runAlertConsumerOnce(Map<String, TopicBinding> topicEvents) {
@@ -970,6 +1110,135 @@ public class FeedGatewayService {
         }
     }
 
+    private synchronized HpsfCacheUpdate updateHpsfCache(ConsumerRecord<String, String> record) {
+        String rawJson = record.value();
+        if (rawJson == null || rawJson.isBlank()) {
+            return null;
+        }
+        try {
+            HpsfCacheUpdate update = hpsfCacheUpdate(record, rawJson);
+            if (update == null || update.json() == null || update.json().isBlank()) {
+                return null;
+            }
+            String versionKey = update.event() + ":" + update.key();
+            long eventTime = cacheTimestamp(record);
+            Long previousEventTime = cacheEventTimes.get(versionKey);
+            if (previousEventTime != null && previousEventTime > eventTime) {
+                return null;
+            }
+            if (isExpired(eventTime, System.currentTimeMillis())) {
+                removeCacheEntry(versionKey);
+                return null;
+            }
+            cacheEventTimes.put(versionKey, eventTime);
+            cachePositions.put(versionKey, recordPosition(record));
+            putHpsfView(update);
+            return update;
+        } catch (RuntimeException e) {
+            System.err.println("Feed gateway could not map HPSF topic " + record.topic()
+                    + " offset=" + record.offset()
+                    + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    private HpsfCacheUpdate hpsfCacheUpdate(ConsumerRecord<String, String> record, String rawJson) {
+        String topic = record.topic();
+        if (settings.hpsfLatestSignalTopic().equals(topic)) {
+            HpsfSignal signal = read(rawJson, HpsfSignal.class);
+            String groupKey = hpsfGroupKey(signal.tradeDate(), signal.expiry(), fallbackKey(record));
+            hpsfLatestEvaluationIds.put(groupKey, signal.evaluationId());
+            String json = write(hpsfViewMapper.latestSignalView(HpsfTopics.HPSF_LATEST_SIGNAL, signal));
+            HpsfCacheUpdate update = new HpsfCacheUpdate("hpsf-latest-signal", groupKey, json);
+            HpsfCacheUpdate candidates = topCandidatesUpdate(groupKey);
+            if (candidates != null) {
+                cacheEventTimes.put(candidates.event() + ":" + candidates.key(), cacheTimestamp(record));
+                cachePositions.put(candidates.event() + ":" + candidates.key(), recordPosition(record));
+                putHpsfView(candidates);
+                if (hpsfCaughtUp.get()) {
+                    enqueuePending(candidates.event(), candidates.key(), candidates.json());
+                }
+            }
+            return update;
+        }
+        if (settings.hpsfMarketFlowTopic().equals(topic)) {
+            MarketFlowSnapshot snapshot = read(rawJson, MarketFlowSnapshot.class);
+            String key = fallbackKey(record);
+            return new HpsfCacheUpdate("hpsf-market-flow", key, write(hpsfViewMapper.marketFlowView(snapshot)));
+        }
+        if (settings.hpsfStrikeScoreTopic().equals(topic)) {
+            StrikeScoreSnapshot score = read(rawJson, StrikeScoreSnapshot.class);
+            String groupKey = hpsfGroupKey(score.tradeDate(), score.expiry(), fallbackKey(record));
+            hpsfStrikeScores.put(groupKey + "|" + fallbackKey(record), score);
+            return topCandidatesUpdate(groupKey);
+        }
+        if (settings.hpsfAuditTopic().equals(topic)) {
+            HpsfAuditEvent audit = read(rawJson, HpsfAuditEvent.class);
+            String key = hpsfGroupKey(audit.tradeDate(), audit.expiry(), fallbackKey(record));
+            return new HpsfCacheUpdate("hpsf-audit", key, write(hpsfViewMapper.auditView(audit)));
+        }
+        if (settings.hpsfExitSignalTopic().equals(topic)) {
+            HpsfExitIntentEvent event = read(rawJson, HpsfExitIntentEvent.class);
+            String key = hpsfGroupKey(event.tradeDate(), event.expiry(), fallbackKey(record));
+            return new HpsfCacheUpdate("hpsf-exit-intent", key, write(hpsfViewMapper.exitIntentView(event)));
+        }
+        return null;
+    }
+
+    private HpsfCacheUpdate topCandidatesUpdate(String groupKey) {
+        String latestEvaluationId = hpsfLatestEvaluationIds.get(groupKey);
+        List<StrikeScoreSnapshot> scores = hpsfStrikeScores.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(groupKey + "|"))
+                .map(Map.Entry::getValue)
+                .filter(score -> latestEvaluationId == null || latestEvaluationId.equals(score.evaluationId()))
+                .toList();
+        if (scores.isEmpty()) {
+            return null;
+        }
+        return new HpsfCacheUpdate("hpsf-top-candidates", groupKey, write(hpsfViewMapper.topCandidatesView(scores)));
+    }
+
+    private void putHpsfView(HpsfCacheUpdate update) {
+        switch (update.event()) {
+            case "hpsf-latest-signal" -> hpsfLatestSignals.put(update.key(), update.json());
+            case "hpsf-market-flow" -> hpsfMarketFlows.put(update.key(), update.json());
+            case "hpsf-top-candidates" -> hpsfTopCandidates.put(update.key(), update.json());
+            case "hpsf-audit" -> hpsfAudits.put(update.key(), update.json());
+            case "hpsf-exit-intent" -> hpsfExitIntents.put(update.key(), update.json());
+            default -> {
+                // Unknown HPSF events are ignored because they have no UI contract.
+            }
+        }
+    }
+
+    private <T> T read(String json, Class<T> type) {
+        try {
+            return mapper.readValue(json, type);
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException("Invalid " + type.getSimpleName() + " JSON", e);
+        }
+    }
+
+    private String write(Object value) {
+        try {
+            return mapper.writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException("Could not serialize HPSF view", e);
+        }
+    }
+
+    private String hpsfGroupKey(String tradeDate, String expiry, String fallback) {
+        if (tradeDate != null && !tradeDate.isBlank() && expiry != null && !expiry.isBlank()) {
+            return tradeDate + "|" + expiry;
+        }
+        return fallback;
+    }
+
+    private String fallbackKey(ConsumerRecord<?, ?> record) {
+        String key = record.key() == null ? "" : String.valueOf(record.key()).trim();
+        return key.isBlank() ? record.topic() + ":" + record.partition() : key;
+    }
+
     private synchronized void purgeExpiredCache(long nowMs) {
         List<String> expiredKeys = new ArrayList<>();
         for (Map.Entry<String, Long> entry : cacheEventTimes.entrySet()) {
@@ -1042,6 +1311,31 @@ public class FeedGatewayService {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "hpsf-latest-signal" -> hpsfLatestSignals.entrySet().stream()
+                        .filter(entry -> isCacheFresh("hpsf-latest-signal:" + entry.getKey(), nowMs))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("hpsf-latest-signal", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "hpsf-market-flow" -> hpsfMarketFlows.entrySet().stream()
+                        .filter(entry -> isCacheFresh("hpsf-market-flow:" + entry.getKey(), nowMs))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("hpsf-market-flow", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "hpsf-top-candidates" -> hpsfTopCandidates.entrySet().stream()
+                        .filter(entry -> isCacheFresh("hpsf-top-candidates:" + entry.getKey(), nowMs))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("hpsf-top-candidates", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "hpsf-audit" -> hpsfAudits.entrySet().stream()
+                        .filter(entry -> isCacheFresh("hpsf-audit:" + entry.getKey(), nowMs))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("hpsf-audit", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "hpsf-exit-intent" -> hpsfExitIntents.entrySet().stream()
+                        .filter(entry -> isCacheFresh("hpsf-exit-intent:" + entry.getKey(), nowMs))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("hpsf-exit-intent", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 default -> {
                     // Unknown events are ignored because there is no replay cache for them.
                 }
@@ -1106,6 +1400,16 @@ public class FeedGatewayService {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
+        } else if (versionKey.startsWith("hpsf-latest-signal:")) {
+            hpsfLatestSignals.remove(versionKey.substring("hpsf-latest-signal:".length()));
+        } else if (versionKey.startsWith("hpsf-market-flow:")) {
+            hpsfMarketFlows.remove(versionKey.substring("hpsf-market-flow:".length()));
+        } else if (versionKey.startsWith("hpsf-top-candidates:")) {
+            hpsfTopCandidates.remove(versionKey.substring("hpsf-top-candidates:".length()));
+        } else if (versionKey.startsWith("hpsf-audit:")) {
+            hpsfAudits.remove(versionKey.substring("hpsf-audit:".length()));
+        } else if (versionKey.startsWith("hpsf-exit-intent:")) {
+            hpsfExitIntents.remove(versionKey.substring("hpsf-exit-intent:".length()));
         }
     }
 
@@ -1239,6 +1543,11 @@ public class FeedGatewayService {
             case "directional-pressure" -> pendingDirectionalPressures;
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
+            case "hpsf-latest-signal" -> pendingHpsfLatestSignals;
+            case "hpsf-market-flow" -> pendingHpsfMarketFlows;
+            case "hpsf-top-candidates" -> pendingHpsfTopCandidates;
+            case "hpsf-audit" -> pendingHpsfAudits;
+            case "hpsf-exit-intent" -> pendingHpsfExitIntents;
             default -> null;
         };
     }
@@ -1259,7 +1568,12 @@ public class FeedGatewayService {
                         new ArrayList<>(pendingPaces.values()),
                         new ArrayList<>(pendingDirectionalPressures.values()),
                         new ArrayList<>(pendingVolumeSandwiches.values()),
-                        new ArrayList<>(pendingGexByStrike.values())
+                        new ArrayList<>(pendingGexByStrike.values()),
+                        new ArrayList<>(pendingHpsfLatestSignals.values()),
+                        new ArrayList<>(pendingHpsfMarketFlows.values()),
+                        new ArrayList<>(pendingHpsfTopCandidates.values()),
+                        new ArrayList<>(pendingHpsfAudits.values()),
+                        new ArrayList<>(pendingHpsfExitIntents.values())
                 );
                 clearPendingLocked();
             }
@@ -1286,7 +1600,12 @@ public class FeedGatewayService {
                 + pendingPaces.size()
                 + pendingDirectionalPressures.size()
                 + pendingVolumeSandwiches.size()
-                + pendingGexByStrike.size();
+                + pendingGexByStrike.size()
+                + pendingHpsfLatestSignals.size()
+                + pendingHpsfMarketFlows.size()
+                + pendingHpsfTopCandidates.size()
+                + pendingHpsfAudits.size()
+                + pendingHpsfExitIntents.size();
     }
 
     private void clearPendingLocked() {
@@ -1295,6 +1614,11 @@ public class FeedGatewayService {
         pendingDirectionalPressures.clear();
         pendingVolumeSandwiches.clear();
         pendingGexByStrike.clear();
+        pendingHpsfLatestSignals.clear();
+        pendingHpsfMarketFlows.clear();
+        pendingHpsfTopCandidates.clear();
+        pendingHpsfAudits.clear();
+        pendingHpsfExitIntents.clear();
     }
 
     private String envelopeJson(String event, String json) {
@@ -1308,6 +1632,11 @@ public class FeedGatewayService {
         List<String> directionalPressureJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
+        List<String> hpsfLatestSignalJsons = new ArrayList<>();
+        List<String> hpsfMarketFlowJsons = new ArrayList<>();
+        List<String> hpsfTopCandidatesJsons = new ArrayList<>();
+        List<String> hpsfAuditJsons = new ArrayList<>();
+        List<String> hpsfExitIntentJsons = new ArrayList<>();
         for (CachedEvent cachedEvent : cachedEvents) {
             switch (cachedEvent.event()) {
                 case "snapshot" -> snapshotJsons.add(cachedEvent.json());
@@ -1315,12 +1644,28 @@ public class FeedGatewayService {
                 case "directional-pressure" -> directionalPressureJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
+                case "hpsf-latest-signal" -> hpsfLatestSignalJsons.add(cachedEvent.json());
+                case "hpsf-market-flow" -> hpsfMarketFlowJsons.add(cachedEvent.json());
+                case "hpsf-top-candidates" -> hpsfTopCandidatesJsons.add(cachedEvent.json());
+                case "hpsf-audit" -> hpsfAuditJsons.add(cachedEvent.json());
+                case "hpsf-exit-intent" -> hpsfExitIntentJsons.add(cachedEvent.json());
                 default -> {
                     // This batch protocol only carries latest-state feed events.
                 }
             }
         }
-        return uiBatchEnvelopeJson(snapshotJsons, paceJsons, directionalPressureJsons, volumeSandwichJsons, gexByStrikeJsons);
+        return uiBatchEnvelopeJson(
+                snapshotJsons,
+                paceJsons,
+                directionalPressureJsons,
+                volumeSandwichJsons,
+                gexByStrikeJsons,
+                hpsfLatestSignalJsons,
+                hpsfMarketFlowJsons,
+                hpsfTopCandidatesJsons,
+                hpsfAuditJsons,
+                hpsfExitIntentJsons
+        );
     }
 
     private String uiBatchEnvelopeJson(
@@ -1328,7 +1673,12 @@ public class FeedGatewayService {
             List<String> paceJsons,
             List<String> directionalPressureJsons,
             List<String> volumeSandwichJsons,
-            List<String> gexByStrikeJsons
+            List<String> gexByStrikeJsons,
+            List<String> hpsfLatestSignalJsons,
+            List<String> hpsfMarketFlowJsons,
+            List<String> hpsfTopCandidatesJsons,
+            List<String> hpsfAuditJsons,
+            List<String> hpsfExitIntentJsons
     ) {
         ActiveSelection selection = activeSelection.get();
         return "{"
@@ -1344,7 +1694,12 @@ public class FeedGatewayService {
                 + "\"paces\":" + jsonArray(paceJsons) + ","
                 + "\"directionalPressures\":" + jsonArray(directionalPressureJsons) + ","
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
-                + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons)
+                + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
+                + "\"hpsfLatestSignals\":" + jsonArray(hpsfLatestSignalJsons) + ","
+                + "\"hpsfMarketFlows\":" + jsonArray(hpsfMarketFlowJsons) + ","
+                + "\"hpsfTopCandidates\":" + jsonArray(hpsfTopCandidatesJsons) + ","
+                + "\"hpsfAudits\":" + jsonArray(hpsfAuditJsons) + ","
+                + "\"hpsfExitIntents\":" + jsonArray(hpsfExitIntentJsons)
                 + "}"
                 + "}";
     }
@@ -1367,11 +1722,17 @@ public class FeedGatewayService {
                 + "\"selectionEpoch\":" + selection.selectionEpoch() + ","
                 + "\"avroCaughtUp\":" + avroCaughtUp.get() + ","
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
+                + "\"hpsfCaughtUp\":" + hpsfCaughtUp.get() + ","
                 + "\"lastSelectedForwardAgeSeconds\":" + lastSelectedForwardAgeSeconds(selection) + ","
                 + "\"snapshots\":" + snapshots.size() + ","
                 + "\"paces\":" + paces.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
+                + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
+                + "\"hpsfMarketFlows\":" + hpsfMarketFlows.size() + ","
+                + "\"hpsfTopCandidates\":" + hpsfTopCandidates.size() + ","
+                + "\"hpsfAudits\":" + hpsfAudits.size() + ","
+                + "\"hpsfExitIntents\":" + hpsfExitIntents.size() + ","
                 + "\"cacheTtlMs\":" + settings.cacheTtlMs()
                 + "}";
     }
