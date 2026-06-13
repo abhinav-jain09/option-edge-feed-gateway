@@ -92,6 +92,26 @@ public final class GatewaySettings {
                 value("KAFKA_UNUSUAL_WHALES_GEX_HISTORY_TOPIC", "options.ibkr.unusualwhales.gex.strike.history"));
     }
 
+    public String hpsfLatestSignalTopic() {
+        return value("KAFKA_HPSF_LATEST_SIGNAL_TOPIC", "options.hpsf.latest-signal");
+    }
+
+    public String hpsfMarketFlowTopic() {
+        return value("KAFKA_HPSF_MARKET_FLOW_TOPIC", "options.hpsf.market-flow");
+    }
+
+    public String hpsfStrikeScoreTopic() {
+        return value("KAFKA_HPSF_STRIKE_SCORE_TOPIC", "options.hpsf.strike-score");
+    }
+
+    public String hpsfAuditTopic() {
+        return value("KAFKA_HPSF_AUDIT_TOPIC", "options.hpsf.audit");
+    }
+
+    public String hpsfExitSignalTopic() {
+        return value("KAFKA_HPSF_EXIT_SIGNAL_TOPIC", "options.hpsf.exit-signal");
+    }
+
     public int pollMs() {
         return intValue("GATEWAY_KAFKA_POLL_MS", 250, 10);
     }

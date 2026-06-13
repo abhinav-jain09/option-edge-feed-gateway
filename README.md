@@ -248,7 +248,7 @@ Single WebSocket messages use this envelope and remain supported for compatibili
 Latest-state feed updates are normally sent as fixed-cadence batches:
 
 ```json
-{"type":"ui-batch","data":{"snapshots":[],"paces":[],"directionalPressures":[],"volumeSandwiches":[],"gexByStrike":[]}}
+{"type":"ui-batch","data":{"snapshots":[],"paces":[],"directionalPressures":[],"volumeSandwiches":[],"gexByStrike":[],"hpsfLatestSignals":[],"hpsfMarketFlows":[],"hpsfTopCandidates":[],"hpsfAudits":[],"hpsfExitIntents":[]}}
 ```
 
 Current event types:
@@ -261,6 +261,13 @@ Current event types:
 - `directional-pressure`
 - `volume-sandwich`
 - `volume-sandwich-alert`
+- `hpsf-latest-signal`
+- `hpsf-market-flow`
+- `hpsf-top-candidates`
+- `hpsf-audit`
+- `hpsf-exit-intent`
+
+HPSF current-decision views are mapped only from `options.hpsf.latest-signal`; the gateway does not infer current decisions from historical `options.hpsf.signal`.
 
 ## Run
 
@@ -299,6 +306,11 @@ Environment variables and matching Java system properties are supported.
 | `KAFKA_VOLUME_DIRECTION_CURRENT_TOPIC` | `display.volume.direction.current` | JSON current volume-direction topic |
 | `KAFKA_VOLUME_SANDWICH_CURRENT_TOPIC` | `display.volume.sandwich.current` | JSON current volume-sandwich topic |
 | `KAFKA_VOLUME_SANDWICH_ALERTS_TOPIC` | `display.volume.sandwich.alerts` | JSON live-only sandwich-alert topic |
+| `KAFKA_HPSF_LATEST_SIGNAL_TOPIC` | `options.hpsf.latest-signal` | HPSF current decision source topic |
+| `KAFKA_HPSF_MARKET_FLOW_TOPIC` | `options.hpsf.market-flow` | HPSF market-flow source topic |
+| `KAFKA_HPSF_STRIKE_SCORE_TOPIC` | `options.hpsf.strike-score` | HPSF strike-score source topic for top candidates |
+| `KAFKA_HPSF_AUDIT_TOPIC` | `options.hpsf.audit` | HPSF audit source topic |
+| `KAFKA_HPSF_EXIT_SIGNAL_TOPIC` | `options.hpsf.exit-signal` | HPSF informational exit-intent source topic |
 | `GATEWAY_KAFKA_POLL_MS` | `250` | Kafka poll interval |
 | `GATEWAY_WS_BATCH_MS` | `125` | WebSocket latest-state batch cadence in milliseconds |
 | `GATEWAY_KAFKA_METADATA_TIMEOUT_MS` | `30000` | Topic metadata wait timeout |

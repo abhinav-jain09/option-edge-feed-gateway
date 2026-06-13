@@ -8,9 +8,24 @@ pipeline {
     string(name: 'IMAGE_REGISTRY', defaultValue: '192.168.100.252:5000', description: 'Docker registry namespace')
     string(name: 'IMAGE_TAG', defaultValue: '', description: 'Docker tag. Defaults to current git SHA.')
     string(name: 'DEV_IMAGE_TAG', defaultValue: 'dev', description: 'Also publish this mutable dev tag for the deploy job. Empty disables it.')
+    string(name: 'CONTRACTS_BRANCH', defaultValue: 'main', description: 'options-edge-contracts branch to install before building the gateway')
     booleanParam(name: 'PUSH_IMAGE', defaultValue: true, description: 'Push built image to registry')
   }
   stages {
+    stage('Install Contracts') {
+      steps {
+        sh '''
+          export JAVA_HOME=/usr/lib/jvm/java-26
+          export MAVEN_SKIP_RC=true
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
+          rm -rf .deps/options-edge-contracts
+          git clone git@github.com:abhinav-jain09/options-edge-contracts.git .deps/options-edge-contracts
+          git -C .deps/options-edge-contracts checkout "${CONTRACTS_BRANCH:-main}"
+          mvn -B -f .deps/options-edge-contracts/pom.xml install
+        '''
+      }
+    }
     stage('Test') {
       steps {
         sh '''
