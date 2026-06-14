@@ -884,7 +884,7 @@ public class FeedGatewayService {
         broadcast("reset", resetJson);
         broadcast("source-switching", activeSelectionJson(next, "source-switching"));
         broadcast("status", statusJson());
-        if (broadcastCachedState(List.of("snapshot", "pace", "directional-pressure", "volume-sandwich", "gex-by-strike"))) {
+        if (broadcastCachedState(sourceSwitchReplayEvents())) {
             markSelectionReady(next);
         }
         System.out.println("Feed gateway selected market data source " + next.source()
@@ -935,6 +935,10 @@ public class FeedGatewayService {
             );
         }
         return List.of();
+    }
+
+    static List<String> sourceSwitchReplayEvents() {
+        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "volume-sandwich", "gex-by-strike");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
