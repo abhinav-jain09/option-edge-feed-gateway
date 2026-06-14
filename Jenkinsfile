@@ -54,7 +54,7 @@ pipeline {
           set -euo pipefail
           TAG="${IMAGE_TAG:-$(git rev-parse --short=12 HEAD)}"
           DEV_TAG="${DEV_IMAGE_TAG:-}"
-          docker build -t "$IMAGE_REGISTRY/options-edge-feed-gateway:$TAG" .
+          docker build --no-cache -t "$IMAGE_REGISTRY/options-edge-feed-gateway:$TAG" .
           if [ -n "$DEV_TAG" ] && [ "$DEV_TAG" != "$TAG" ]; then
             docker tag "$IMAGE_REGISTRY/options-edge-feed-gateway:$TAG" "$IMAGE_REGISTRY/options-edge-feed-gateway:$DEV_TAG"
           fi
