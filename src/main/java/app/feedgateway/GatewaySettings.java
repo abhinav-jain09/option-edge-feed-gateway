@@ -60,6 +60,10 @@ public final class GatewaySettings {
                 value("KAFKA_DIRECTIONAL_PRESSURE_TOPIC", "options.ibkr.directional-pressure"));
     }
 
+    public String ibkrVixPriceTopic() {
+        return value("KAFKA_IBKR_VIX_PRICE_TOPIC", "underlying.vix.price");
+    }
+
     public String databentoDirectionalPressureTopic() {
         return value("KAFKA_DATABENTO_DIRECTIONAL_PRESSURE_TOPIC", "options.databento.directional-pressure");
     }

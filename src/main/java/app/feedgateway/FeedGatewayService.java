@@ -58,6 +58,7 @@ public class FeedGatewayService {
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
+    private final Map<String, String> indexPrices = new ConcurrentHashMap<>();
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfLatestSignals = new ConcurrentHashMap<>();
@@ -74,6 +75,7 @@ public class FeedGatewayService {
     private final Map<String, String> pendingSnapshots = new LinkedHashMap<>();
     private final Map<String, String> pendingPaces = new LinkedHashMap<>();
     private final Map<String, String> pendingDirectionalPressures = new LinkedHashMap<>();
+    private final Map<String, String> pendingIndexPrices = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfLatestSignals = new LinkedHashMap<>();
@@ -210,7 +212,7 @@ public class FeedGatewayService {
             sendCachedState(session, List.of("snapshot", "pace", "directional-pressure"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("volume-sandwich", "gex-by-strike"));
+            sendCachedState(session, List.of("vix-price", "volume-sandwich", "gex-by-strike"));
         }
         if (hpsfCaughtUp.get()) {
             sendCachedState(session, List.of(
@@ -250,6 +252,7 @@ public class FeedGatewayService {
                 + "\"snapshots\":" + snapshots.size() + ","
                 + "\"paces\":" + paces.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
+                + "\"indexPrices\":" + indexPrices.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
@@ -304,6 +307,9 @@ public class FeedGatewayService {
                 + "# HELP options_edge_feed_gateway_directional_pressures Cached directional-pressure count.\n"
                 + "# TYPE options_edge_feed_gateway_directional_pressures gauge\n"
                 + "options_edge_feed_gateway_directional_pressures " + directionalPressures.size() + "\n"
+                + "# HELP options_edge_feed_gateway_index_prices Cached index price count.\n"
+                + "# TYPE options_edge_feed_gateway_index_prices gauge\n"
+                + "options_edge_feed_gateway_index_prices " + indexPrices.size() + "\n"
                 + "# HELP options_edge_feed_gateway_current_states Cached current-state count.\n"
                 + "# TYPE options_edge_feed_gateway_current_states gauge\n"
                 + "options_edge_feed_gateway_current_states " + currentStates.size() + "\n"
@@ -439,6 +445,7 @@ public class FeedGatewayService {
 
     private void runJsonStateCacheConsumer() {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
+        topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
         topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
@@ -459,6 +466,7 @@ public class FeedGatewayService {
 
     private void runJsonStateLiveConsumer() {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
+        topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
         topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
@@ -910,6 +918,7 @@ public class FeedGatewayService {
                     settings.ibkrDisplayTopic(),
                     settings.ibkrPaceTopic(),
                     settings.ibkrDirectionalPressureTopic(),
+                    settings.ibkrVixPriceTopic(),
                     settings.ibkrVolumeSandwichTopic(),
                     settings.ibkrVolumeSandwichAlertsTopic(),
                     settings.ibkrUnusualWhalesGexTopic(),
@@ -938,6 +947,9 @@ public class FeedGatewayService {
         }
         if ("gex-by-strike".equals(binding.event()) && !"IBKR".equals(selection.source())) {
             return false;
+        }
+        if ("vix-price".equals(binding.event())) {
+            return "IBKR".equals(selection.source()) && passesSelectionBarrier(record, selection);
         }
         if (!passesSelectionBarrier(record, selection)) {
             reportSourceStale(selection, "switch-barrier");
@@ -1090,6 +1102,12 @@ public class FeedGatewayService {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 directionalPressures.put(key, json);
+                return key;
+            }
+            case "vix-price" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                indexPrices.put(key, json);
                 return key;
             }
             case "volume-sandwich" -> {
@@ -1297,6 +1315,12 @@ public class FeedGatewayService {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("directional-pressure", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "vix-price" -> indexPrices.entrySet().stream()
+                        .filter(entry -> isCacheFresh("vix-price:" + entry.getKey(), nowMs))
+                        .filter(entry -> "IBKR".equals(selection.source()))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("vix-price", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "volume-sandwich" -> currentStates.entrySet().stream()
                         .filter(entry -> "volume-sandwich".equals(eventFromCacheKey(entry.getKey())))
                         .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
@@ -1396,6 +1420,8 @@ public class FeedGatewayService {
             paces.remove(versionKey.substring("pace:".length()));
         } else if (versionKey.startsWith("directional-pressure:")) {
             directionalPressures.remove(versionKey.substring("directional-pressure:".length()));
+        } else if (versionKey.startsWith("vix-price:")) {
+            indexPrices.remove(versionKey.substring("vix-price:".length()));
         } else if (versionKey.startsWith("volume-sandwich:")) {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
@@ -1541,6 +1567,7 @@ public class FeedGatewayService {
             case "snapshot" -> pendingSnapshots;
             case "pace" -> pendingPaces;
             case "directional-pressure" -> pendingDirectionalPressures;
+            case "vix-price" -> pendingIndexPrices;
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
             case "hpsf-latest-signal" -> pendingHpsfLatestSignals;
@@ -1567,6 +1594,7 @@ public class FeedGatewayService {
                         new ArrayList<>(pendingSnapshots.values()),
                         new ArrayList<>(pendingPaces.values()),
                         new ArrayList<>(pendingDirectionalPressures.values()),
+                        new ArrayList<>(pendingIndexPrices.values()),
                         new ArrayList<>(pendingVolumeSandwiches.values()),
                         new ArrayList<>(pendingGexByStrike.values()),
                         new ArrayList<>(pendingHpsfLatestSignals.values()),
@@ -1599,6 +1627,7 @@ public class FeedGatewayService {
         return pendingSnapshots.size()
                 + pendingPaces.size()
                 + pendingDirectionalPressures.size()
+                + pendingIndexPrices.size()
                 + pendingVolumeSandwiches.size()
                 + pendingGexByStrike.size()
                 + pendingHpsfLatestSignals.size()
@@ -1612,6 +1641,7 @@ public class FeedGatewayService {
         pendingSnapshots.clear();
         pendingPaces.clear();
         pendingDirectionalPressures.clear();
+        pendingIndexPrices.clear();
         pendingVolumeSandwiches.clear();
         pendingGexByStrike.clear();
         pendingHpsfLatestSignals.clear();
@@ -1630,6 +1660,7 @@ public class FeedGatewayService {
         List<String> snapshotJsons = new ArrayList<>();
         List<String> paceJsons = new ArrayList<>();
         List<String> directionalPressureJsons = new ArrayList<>();
+        List<String> indexPriceJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
         List<String> hpsfLatestSignalJsons = new ArrayList<>();
@@ -1642,6 +1673,7 @@ public class FeedGatewayService {
                 case "snapshot" -> snapshotJsons.add(cachedEvent.json());
                 case "pace" -> paceJsons.add(cachedEvent.json());
                 case "directional-pressure" -> directionalPressureJsons.add(cachedEvent.json());
+                case "vix-price" -> indexPriceJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
                 case "hpsf-latest-signal" -> hpsfLatestSignalJsons.add(cachedEvent.json());
@@ -1658,6 +1690,7 @@ public class FeedGatewayService {
                 snapshotJsons,
                 paceJsons,
                 directionalPressureJsons,
+                indexPriceJsons,
                 volumeSandwichJsons,
                 gexByStrikeJsons,
                 hpsfLatestSignalJsons,
@@ -1672,6 +1705,7 @@ public class FeedGatewayService {
             List<String> snapshotJsons,
             List<String> paceJsons,
             List<String> directionalPressureJsons,
+            List<String> indexPriceJsons,
             List<String> volumeSandwichJsons,
             List<String> gexByStrikeJsons,
             List<String> hpsfLatestSignalJsons,
@@ -1693,6 +1727,7 @@ public class FeedGatewayService {
                 + "\"snapshots\":" + jsonArray(snapshotJsons) + ","
                 + "\"paces\":" + jsonArray(paceJsons) + ","
                 + "\"directionalPressures\":" + jsonArray(directionalPressureJsons) + ","
+                + "\"indexPrices\":" + jsonArray(indexPriceJsons) + ","
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
                 + "\"hpsfLatestSignals\":" + jsonArray(hpsfLatestSignalJsons) + ","
