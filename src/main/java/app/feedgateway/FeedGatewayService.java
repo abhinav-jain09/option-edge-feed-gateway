@@ -1486,11 +1486,11 @@ public class FeedGatewayService {
     }
 
     static boolean enforceCachedReplayMaxStale(String event, String source) {
-        return !("snapshot".equals(event) && "DATABENTO".equals(GatewaySettings.normalizeSource(source)));
+        return !"snapshot".equals(event);
     }
 
     static boolean enforceCachedReplayOffsetBarrier(String event, String source) {
-        return !("snapshot".equals(event) && "DATABENTO".equals(GatewaySettings.normalizeSource(source)));
+        return !"snapshot".equals(event);
     }
 
     private boolean passesOffsetBarrier(TopicPartition partition, long offset) {

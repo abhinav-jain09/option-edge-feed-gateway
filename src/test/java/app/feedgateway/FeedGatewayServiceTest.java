@@ -44,14 +44,16 @@ class FeedGatewayServiceTest {
     }
 
     @Test
-    void cachedDatabentoSnapshotsCanReplayPastLiveStaleWindow() {
+    void cachedOptionSnapshotsCanReplayPastLiveStaleWindowForEitherSource() {
         assertFalse(FeedGatewayService.enforceCachedReplayMaxStale("snapshot", "DATABENTO"));
+        assertFalse(FeedGatewayService.enforceCachedReplayMaxStale("snapshot", "IBKR"));
         assertTrue(FeedGatewayService.enforceCachedReplayMaxStale("pace", "DATABENTO"));
-        assertTrue(FeedGatewayService.enforceCachedReplayMaxStale("snapshot", "IBKR"));
+        assertTrue(FeedGatewayService.enforceCachedReplayMaxStale("pace", "IBKR"));
 
         assertFalse(FeedGatewayService.enforceCachedReplayOffsetBarrier("snapshot", "DATABENTO"));
+        assertFalse(FeedGatewayService.enforceCachedReplayOffsetBarrier("snapshot", "IBKR"));
         assertTrue(FeedGatewayService.enforceCachedReplayOffsetBarrier("pace", "DATABENTO"));
-        assertTrue(FeedGatewayService.enforceCachedReplayOffsetBarrier("snapshot", "IBKR"));
+        assertTrue(FeedGatewayService.enforceCachedReplayOffsetBarrier("pace", "IBKR"));
     }
 
     @Test
