@@ -122,7 +122,7 @@ public class FeedGatewayService {
                     GatewaySettings.normalizeSource(settings.initialMarketDataSource()),
                     settings.initialSymbol(),
                     GatewaySettings.normalizeExpiry(settings.initialExpiry()),
-                    nowMs,
+                    0L,
                     nowMs
             );
         }

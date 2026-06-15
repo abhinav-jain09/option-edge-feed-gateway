@@ -3,6 +3,8 @@ package app.feedgateway;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -64,6 +66,17 @@ class FeedGatewayServiceTest {
                 assertEquals(1, new GatewaySettings().maxPollRecords()));
         withSystemProperty("GATEWAY_KAFKA_FETCH_MAX_BYTES", "128", () ->
                 assertEquals(1024, new GatewaySettings().fetchMaxBytes()));
+    }
+
+    @Test
+    void gatewayInitialExpiryRollsAfterOptionMarketClose() {
+        ZonedDateTime beforeClose = ZonedDateTime.of(2026, 6, 15, 15, 30, 0, 0,
+                ZoneId.of("America/New_York"));
+        ZonedDateTime afterClose = ZonedDateTime.of(2026, 6, 15, 16, 15, 0, 0,
+                ZoneId.of("America/New_York"));
+
+        assertEquals("20260615", GatewaySettings.normalizeMarketExpiry("20260615", beforeClose));
+        assertEquals("20260616", GatewaySettings.normalizeMarketExpiry("20260615", afterClose));
     }
 
     @Test
