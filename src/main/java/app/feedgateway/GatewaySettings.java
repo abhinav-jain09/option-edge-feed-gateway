@@ -28,7 +28,7 @@ public final class GatewaySettings {
     }
 
     public String initialMarketDataSource() {
-        return normalizeSource(value("APP_MARKET_DATA_SOURCE", "IBKR"));
+        return normalizeSource(value("APP_MARKET_DATA_SOURCE", "DATABENTO"));
     }
 
     public String initialSymbol() {
@@ -62,6 +62,10 @@ public final class GatewaySettings {
 
     public String ibkrVixPriceTopic() {
         return value("KAFKA_IBKR_VIX_PRICE_TOPIC", "underlying.vix.price");
+    }
+
+    public String databentoEsTradesTopic() {
+        return value("KAFKA_DATABENTO_ES_TRADES_TOPIC", value("KAFKA_HPSF_ES_TRADES_TOPIC", "underlying.es.trades"));
     }
 
     public String databentoDirectionalPressureTopic() {

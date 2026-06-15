@@ -117,12 +117,13 @@ public class FeedGatewayService {
 
     private record ActiveSelection(String source, String symbol, String expiry, long selectionEpoch, long selectedAtMs) {
         private static ActiveSelection fromSettings(GatewaySettings settings) {
+            long nowMs = System.currentTimeMillis();
             return new ActiveSelection(
                     GatewaySettings.normalizeSource(settings.initialMarketDataSource()),
                     settings.initialSymbol(),
                     GatewaySettings.normalizeExpiry(settings.initialExpiry()),
-                    0L,
-                    0L
+                    nowMs,
+                    nowMs
             );
         }
 
@@ -212,7 +213,7 @@ public class FeedGatewayService {
             sendCachedState(session, List.of("snapshot", "pace", "directional-pressure"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "volume-sandwich", "gex-by-strike"));
+            sendCachedState(session, List.of("vix-price", "index-price", "volume-sandwich", "gex-by-strike"));
         }
         if (hpsfCaughtUp.get()) {
             sendCachedState(session, List.of(
@@ -446,6 +447,7 @@ public class FeedGatewayService {
     private void runJsonStateCacheConsumer() {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
+        topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
         topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
@@ -467,6 +469,7 @@ public class FeedGatewayService {
     private void runJsonStateLiveConsumer() {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
+        topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
         topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
@@ -930,6 +933,8 @@ public class FeedGatewayService {
                     settings.databentoDisplayTopic(),
                     settings.databentoPaceTopic(),
                     settings.databentoDirectionalPressureTopic(),
+                    settings.ibkrVixPriceTopic(),
+                    settings.databentoEsTradesTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic()
             );
@@ -938,7 +943,7 @@ public class FeedGatewayService {
     }
 
     static List<String> sourceSwitchReplayEvents() {
-        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "volume-sandwich", "gex-by-strike");
+        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "volume-sandwich", "gex-by-strike");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -946,14 +951,17 @@ public class FeedGatewayService {
             return false;
         }
         ActiveSelection selection = activeSelection.get();
+        if ("vix-price".equals(binding.event())) {
+            return passesSelectionBarrier(record, selection);
+        }
+        if ("index-price".equals(binding.event())) {
+            return "DATABENTO".equals(selection.source()) && passesSelectionBarrier(record, selection);
+        }
         if (!binding.source().equals(selection.source())) {
             return false;
         }
         if ("gex-by-strike".equals(binding.event()) && !"IBKR".equals(selection.source())) {
             return false;
-        }
-        if ("vix-price".equals(binding.event())) {
-            return "IBKR".equals(selection.source()) && passesSelectionBarrier(record, selection);
         }
         if (!passesSelectionBarrier(record, selection)) {
             reportSourceStale(selection, "switch-barrier");
@@ -1108,7 +1116,7 @@ public class FeedGatewayService {
                 directionalPressures.put(key, json);
                 return key;
             }
-            case "vix-price" -> {
+            case "vix-price", "index-price" -> {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 indexPrices.put(key, json);
@@ -1321,9 +1329,14 @@ public class FeedGatewayService {
                         .forEach(cachedEvents::add);
                 case "vix-price" -> indexPrices.entrySet().stream()
                         .filter(entry -> isCacheFresh("vix-price:" + entry.getKey(), nowMs))
-                        .filter(entry -> "IBKR".equals(selection.source()))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("vix-price", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "index-price" -> indexPrices.entrySet().stream()
+                        .filter(entry -> isCacheFresh("index-price:" + entry.getKey(), nowMs))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("index-price", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "volume-sandwich" -> currentStates.entrySet().stream()
                         .filter(entry -> "volume-sandwich".equals(eventFromCacheKey(entry.getKey())))
@@ -1426,6 +1439,8 @@ public class FeedGatewayService {
             directionalPressures.remove(versionKey.substring("directional-pressure:".length()));
         } else if (versionKey.startsWith("vix-price:")) {
             indexPrices.remove(versionKey.substring("vix-price:".length()));
+        } else if (versionKey.startsWith("index-price:")) {
+            indexPrices.remove(versionKey.substring("index-price:".length()));
         } else if (versionKey.startsWith("volume-sandwich:")) {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
@@ -1571,7 +1586,7 @@ public class FeedGatewayService {
             case "snapshot" -> pendingSnapshots;
             case "pace" -> pendingPaces;
             case "directional-pressure" -> pendingDirectionalPressures;
-            case "vix-price" -> pendingIndexPrices;
+            case "vix-price", "index-price" -> pendingIndexPrices;
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
             case "hpsf-latest-signal" -> pendingHpsfLatestSignals;
@@ -1677,7 +1692,7 @@ public class FeedGatewayService {
                 case "snapshot" -> snapshotJsons.add(cachedEvent.json());
                 case "pace" -> paceJsons.add(cachedEvent.json());
                 case "directional-pressure" -> directionalPressureJsons.add(cachedEvent.json());
-                case "vix-price" -> indexPriceJsons.add(cachedEvent.json());
+                case "vix-price", "index-price" -> indexPriceJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
                 case "hpsf-latest-signal" -> hpsfLatestSignalJsons.add(cachedEvent.json());
