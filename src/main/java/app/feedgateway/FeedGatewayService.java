@@ -1073,6 +1073,9 @@ public class FeedGatewayService {
             return false;
         }
         long recordEpoch = longField(root, "selectionEpoch", 0L);
+        if (enforceSelectionEpoch && selectionEpoch > 0L && recordEpoch <= 0L && "DATABENTO".equals(selectedSource)) {
+            return false;
+        }
         if (enforceSelectionEpoch
                 && recordEpoch > 0L
                 && selectionEpoch > 0L
