@@ -57,6 +57,18 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void cachedOptionSnapshotsCanReplayBeforeNewSelectionTime() {
+        FeedGatewayService service = new FeedGatewayService(
+                new GatewaySettings(),
+                new ObjectMapper(),
+                new HpsfGatewayViewMapper()
+        );
+
+        assertTrue(service.passesSelectionTimeBarrierForTest(100L, 200L, false));
+        assertFalse(service.passesSelectionTimeBarrierForTest(100L, 200L, true));
+    }
+
+    @Test
     void gatewayKafkaFetchSettingsAreBoundedByDefault() {
         GatewaySettings settings = new GatewaySettings();
 

@@ -1475,14 +1475,18 @@ public class FeedGatewayService {
     }
 
     private boolean passesSelectionTimeBarrier(long eventTimeMs, ActiveSelection selection, boolean enforceMaxStale) {
-        if (selection != null && selection.selectedAtMs() > 0L && eventTimeMs < selection.selectedAtMs()) {
-            return false;
-        }
         if (!enforceMaxStale) {
             return true;
         }
+        if (selection != null && selection.selectedAtMs() > 0L && eventTimeMs < selection.selectedAtMs()) {
+            return false;
+        }
         long maxStaleMs = settings.maxStaleMs();
         return maxStaleMs <= 0L || eventTimeMs >= System.currentTimeMillis() - maxStaleMs;
+    }
+
+    boolean passesSelectionTimeBarrierForTest(long eventTimeMs, long selectedAtMs, boolean enforceMaxStale) {
+        return passesSelectionTimeBarrier(eventTimeMs, new ActiveSelection("IBKR", "SPX", "20260616", 1L, selectedAtMs), enforceMaxStale);
     }
 
     static boolean enforceCachedReplayMaxStale(String event, String source) {
