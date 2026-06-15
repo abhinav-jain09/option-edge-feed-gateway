@@ -140,6 +140,22 @@ public final class GatewaySettings {
         return intValue("GATEWAY_KAFKA_RETRY_MAX_MS", 30_000, 1_000);
     }
 
+    public int maxPollRecords() {
+        return intValue("GATEWAY_KAFKA_MAX_POLL_RECORDS", 100, 1);
+    }
+
+    public int fetchMaxBytes() {
+        return intValue("GATEWAY_KAFKA_FETCH_MAX_BYTES", 4 * 1024 * 1024, 1024);
+    }
+
+    public int maxPartitionFetchBytes() {
+        return intValue("GATEWAY_KAFKA_MAX_PARTITION_FETCH_BYTES", 512 * 1024, 1024);
+    }
+
+    public int receiveBufferBytes() {
+        return intValue("GATEWAY_KAFKA_RECEIVE_BUFFER_BYTES", 512 * 1024, 1024);
+    }
+
     public long cacheTtlMs() {
         return intValue("GATEWAY_CACHE_TTL_MS", 900_000, 0);
     }

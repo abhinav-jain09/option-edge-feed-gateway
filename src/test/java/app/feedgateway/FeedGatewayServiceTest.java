@@ -42,6 +42,24 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void gatewayKafkaFetchSettingsAreBoundedByDefault() {
+        GatewaySettings settings = new GatewaySettings();
+
+        assertEquals(100, settings.maxPollRecords());
+        assertEquals(4 * 1024 * 1024, settings.fetchMaxBytes());
+        assertEquals(512 * 1024, settings.maxPartitionFetchBytes());
+        assertEquals(512 * 1024, settings.receiveBufferBytes());
+    }
+
+    @Test
+    void gatewayKafkaFetchSettingsCanBeOverriddenWithMinimums() {
+        withSystemProperty("GATEWAY_KAFKA_MAX_POLL_RECORDS", "0", () ->
+                assertEquals(1, new GatewaySettings().maxPollRecords()));
+        withSystemProperty("GATEWAY_KAFKA_FETCH_MAX_BYTES", "128", () ->
+                assertEquals(1024, new GatewaySettings().fetchMaxBytes()));
+    }
+
+    @Test
     void cachedSelectionRejectsOlderSelectionEpochs() throws Exception {
         ObjectMapper mapper = new ObjectMapper();
 
@@ -63,5 +81,19 @@ class FeedGatewayServiceTest {
                 200,
                 true
         ));
+    }
+
+    private static void withSystemProperty(String key, String value, Runnable assertion) {
+        String previous = System.getProperty(key);
+        try {
+            System.setProperty(key, value);
+            assertion.run();
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
     }
 }

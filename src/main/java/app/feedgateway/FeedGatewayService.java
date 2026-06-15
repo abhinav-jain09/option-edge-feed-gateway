@@ -724,6 +724,10 @@ public class FeedGatewayService {
                 failed = true;
                 System.err.println("Feed gateway " + name + " consumer error: " + e.getMessage());
                 e.printStackTrace();
+            } catch (OutOfMemoryError e) {
+                System.err.println("Feed gateway " + name + " consumer exhausted heap; exiting for clean pod restart.");
+                e.printStackTrace();
+                System.exit(137);
             }
             if (!failed) {
                 return;
@@ -1894,6 +1898,10 @@ public class FeedGatewayService {
         properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
         properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
         properties.put(ConsumerConfig.CLIENT_ID_CONFIG, settings.groupIdBase() + "-" + name);
+        properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, Integer.toString(settings.maxPollRecords()));
+        properties.put(ConsumerConfig.FETCH_MAX_BYTES_CONFIG, Integer.toString(settings.fetchMaxBytes()));
+        properties.put(ConsumerConfig.MAX_PARTITION_FETCH_BYTES_CONFIG, Integer.toString(settings.maxPartitionFetchBytes()));
+        properties.put(ConsumerConfig.RECEIVE_BUFFER_CONFIG, Integer.toString(settings.receiveBufferBytes()));
         return properties;
     }
 
