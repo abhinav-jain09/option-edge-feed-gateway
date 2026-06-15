@@ -601,8 +601,9 @@ public class FeedGatewayService {
             consumer.assign(partitions);
             seekToCacheWindow(consumer, partitions);
             Map<TopicPartition, Long> bootstrapEndOffsets = consumer.endOffsets(partitions);
+            Map<TopicPartition, Long> catchUpEndOffsets = catchUpEndOffsets(bootstrapEndOffsets, topicEvents);
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
-            boolean live = caughtUp(consumer, bootstrapEndOffsets);
+            boolean live = caughtUp(consumer, catchUpEndOffsets);
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
             }
@@ -618,7 +619,7 @@ public class FeedGatewayService {
                     updateCache(binding, record, json);
                 }
                 purgeExpiredCache(System.currentTimeMillis());
-                if (!live && caughtUp(consumer, bootstrapEndOffsets)) {
+                if (!live && caughtUp(consumer, catchUpEndOffsets)) {
                     live = true;
                     markCacheCaughtUp(name, events, caughtUpFlag);
                 }
@@ -834,6 +835,24 @@ public class FeedGatewayService {
             }
         }
         return true;
+    }
+
+    private Map<TopicPartition, Long> catchUpEndOffsets(
+            Map<TopicPartition, Long> endOffsets,
+            Map<String, TopicBinding> topicEvents
+    ) {
+        ActiveSelection selection = activeSelection.get();
+        Map<TopicPartition, Long> selectedEndOffsets = new LinkedHashMap<>();
+        for (Map.Entry<TopicPartition, Long> entry : endOffsets.entrySet()) {
+            TopicBinding binding = topicEvents.get(entry.getKey().topic());
+            if (binding == null) {
+                continue;
+            }
+            if (selection.source().equals(binding.source()) || "vix-price".equals(binding.event())) {
+                selectedEndOffsets.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return selectedEndOffsets.isEmpty() ? endOffsets : selectedEndOffsets;
     }
 
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
