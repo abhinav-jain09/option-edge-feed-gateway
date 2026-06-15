@@ -1352,7 +1352,11 @@ public class FeedGatewayService {
             switch (event) {
                 case "snapshot" -> snapshots.entrySet().stream()
                         .filter(entry -> isCacheFresh("snapshot:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("snapshot:" + entry.getKey(), selection))
+                        .filter(entry -> passesSelectionBarrier(
+                                "snapshot:" + entry.getKey(),
+                                selection,
+                                enforceCachedReplayMaxStale("snapshot", selection == null ? "" : selection.source())
+                        ))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("snapshot", entry.getValue()))
@@ -1437,8 +1441,12 @@ public class FeedGatewayService {
     }
 
     private boolean passesSelectionBarrier(String versionKey, ActiveSelection selection) {
+        return passesSelectionBarrier(versionKey, selection, true);
+    }
+
+    private boolean passesSelectionBarrier(String versionKey, ActiveSelection selection, boolean enforceMaxStale) {
         Long eventTimeMs = cacheEventTimes.get(versionKey);
-        if (eventTimeMs == null || !passesSelectionTimeBarrier(eventTimeMs, selection)) {
+        if (eventTimeMs == null || !passesSelectionTimeBarrier(eventTimeMs, selection, enforceMaxStale)) {
             return false;
         }
         RecordPosition position = cachePositions.get(versionKey);
@@ -1453,11 +1461,22 @@ public class FeedGatewayService {
     }
 
     private boolean passesSelectionTimeBarrier(long eventTimeMs, ActiveSelection selection) {
+        return passesSelectionTimeBarrier(eventTimeMs, selection, true);
+    }
+
+    private boolean passesSelectionTimeBarrier(long eventTimeMs, ActiveSelection selection, boolean enforceMaxStale) {
         if (selection != null && selection.selectedAtMs() > 0L && eventTimeMs < selection.selectedAtMs()) {
             return false;
         }
+        if (!enforceMaxStale) {
+            return true;
+        }
         long maxStaleMs = settings.maxStaleMs();
         return maxStaleMs <= 0L || eventTimeMs >= System.currentTimeMillis() - maxStaleMs;
+    }
+
+    static boolean enforceCachedReplayMaxStale(String event, String source) {
+        return !("snapshot".equals(event) && "DATABENTO".equals(GatewaySettings.normalizeSource(source)));
     }
 
     private boolean passesOffsetBarrier(TopicPartition partition, long offset) {

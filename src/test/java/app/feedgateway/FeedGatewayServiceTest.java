@@ -42,6 +42,13 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void cachedDatabentoSnapshotsCanReplayPastLiveStaleWindow() {
+        assertFalse(FeedGatewayService.enforceCachedReplayMaxStale("snapshot", "DATABENTO"));
+        assertTrue(FeedGatewayService.enforceCachedReplayMaxStale("pace", "DATABENTO"));
+        assertTrue(FeedGatewayService.enforceCachedReplayMaxStale("snapshot", "IBKR"));
+    }
+
+    @Test
     void gatewayKafkaFetchSettingsAreBoundedByDefault() {
         GatewaySettings settings = new GatewaySettings();
 
