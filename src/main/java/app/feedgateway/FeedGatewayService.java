@@ -848,11 +848,15 @@ public class FeedGatewayService {
             if (binding == null) {
                 continue;
             }
-            if (selection.source().equals(binding.source()) || "vix-price".equals(binding.event())) {
+            if (requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 selectedEndOffsets.put(entry.getKey(), entry.getValue());
             }
         }
         return selectedEndOffsets.isEmpty() ? endOffsets : selectedEndOffsets;
+    }
+
+    static boolean requiresCatchUpForActiveSource(String activeSource, String bindingSource) {
+        return activeSource != null && activeSource.equals(bindingSource);
     }
 
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {

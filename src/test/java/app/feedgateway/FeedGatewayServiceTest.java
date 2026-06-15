@@ -6,6 +6,8 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FeedGatewayServiceTest {
     @Test
@@ -31,5 +33,11 @@ class FeedGatewayServiceTest {
         assertEquals("ES.V.0", service.indexPriceCacheKey(firstEsTrade, "trade-1"));
         assertEquals("ES.V.0", service.indexPriceCacheKey(nextEsTrade, "trade-2"));
         assertEquals("VIX", service.indexPriceCacheKey(vixPrice, "vix-record"));
+    }
+
+    @Test
+    void catchUpRequiresOnlyActiveSource() {
+        assertTrue(FeedGatewayService.requiresCatchUpForActiveSource("DATABENTO", "DATABENTO"));
+        assertFalse(FeedGatewayService.requiresCatchUpForActiveSource("DATABENTO", "IBKR"));
     }
 }
