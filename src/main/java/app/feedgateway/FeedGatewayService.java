@@ -1041,7 +1041,7 @@ public class FeedGatewayService {
     }
 
     private boolean matchesCachedSelection(String json, ActiveSelection selection) {
-        return matchesSelection(json, selection, false);
+        return matchesSelection(json, selection, true);
     }
 
     private boolean matchesSelection(String json, ActiveSelection selection, boolean enforceSelectionEpoch) {
@@ -1050,25 +1050,37 @@ public class FeedGatewayService {
         }
         try {
             JsonNode root = mapper.readTree(json);
-            String source = GatewaySettings.normalizeSource(text(root, "marketDataSource"));
-            if (source.isBlank() && "UNUSUAL_WHALES".equalsIgnoreCase(text(root, "source"))) {
-                source = "IBKR";
-            }
-            if (!source.isBlank() && !selection.source().equals(source)) {
-                return false;
-            }
-            long recordEpoch = longField(root, "selectionEpoch", 0L);
-            if (enforceSelectionEpoch
-                    && recordEpoch > 0L
-                    && selection.selectionEpoch() > 0L
-                    && recordEpoch < selection.selectionEpoch()) {
-                return false;
-            }
-            return selection.symbol().equalsIgnoreCase(text(root, "symbol"))
-                    && selection.expiry().equals(normalizeExpiry(text(root, "expiry")));
+            return matchesSelectionNode(root, selection.source(), selection.symbol(), selection.expiry(),
+                    selection.selectionEpoch(), enforceSelectionEpoch);
         } catch (JsonProcessingException ignored) {
             return false;
         }
+    }
+
+    static boolean matchesSelectionNode(
+            JsonNode root,
+            String selectedSource,
+            String selectedSymbol,
+            String selectedExpiry,
+            long selectionEpoch,
+            boolean enforceSelectionEpoch
+    ) {
+        String source = GatewaySettings.normalizeSource(text(root, "marketDataSource"));
+        if (source.isBlank() && "UNUSUAL_WHALES".equalsIgnoreCase(text(root, "source"))) {
+            source = "IBKR";
+        }
+        if (!source.isBlank() && !selectedSource.equals(source)) {
+            return false;
+        }
+        long recordEpoch = longField(root, "selectionEpoch", 0L);
+        if (enforceSelectionEpoch
+                && recordEpoch > 0L
+                && selectionEpoch > 0L
+                && recordEpoch < selectionEpoch) {
+            return false;
+        }
+        return selectedSymbol.equalsIgnoreCase(text(root, "symbol"))
+                && selectedExpiry.equals(normalizeExpiry(text(root, "expiry")));
     }
 
     private String enrichJson(String json, TopicBinding binding) {
