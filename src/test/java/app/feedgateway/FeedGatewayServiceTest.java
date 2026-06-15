@@ -54,15 +54,6 @@ class FeedGatewayServiceTest {
                 200,
                 true
         ));
-        assertFalse(FeedGatewayService.matchesSelectionNode(
-                mapper.readTree("{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260615\","
-                        + "\"strike\":7580}"),
-                "DATABENTO",
-                "SPX",
-                "20260615",
-                200,
-                true
-        ));
         assertTrue(FeedGatewayService.matchesSelectionNode(
                 mapper.readTree("{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260615\","
                         + "\"selectionEpoch\":200,\"strike\":7585}"),

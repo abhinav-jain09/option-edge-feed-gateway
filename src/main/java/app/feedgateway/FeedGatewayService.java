@@ -1073,9 +1073,6 @@ public class FeedGatewayService {
             return false;
         }
         long recordEpoch = longField(root, "selectionEpoch", 0L);
-        if (enforceSelectionEpoch && selectionEpoch > 0L && recordEpoch <= 0L && "DATABENTO".equals(selectedSource)) {
-            return false;
-        }
         if (enforceSelectionEpoch
                 && recordEpoch > 0L
                 && selectionEpoch > 0L
@@ -1351,18 +1348,21 @@ public class FeedGatewayService {
             switch (event) {
                 case "snapshot" -> snapshots.entrySet().stream()
                         .filter(entry -> isCacheFresh("snapshot:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("snapshot:" + entry.getKey(), selection))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("snapshot", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "pace" -> paces.entrySet().stream()
                         .filter(entry -> isCacheFresh("pace:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("pace:" + entry.getKey(), selection))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("pace", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "directional-pressure" -> directionalPressures.entrySet().stream()
                         .filter(entry -> isCacheFresh("directional-pressure:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("directional-pressure:" + entry.getKey(), selection))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("directional-pressure", entry.getValue()))
@@ -1381,12 +1381,14 @@ public class FeedGatewayService {
                 case "volume-sandwich" -> currentStates.entrySet().stream()
                         .filter(entry -> "volume-sandwich".equals(eventFromCacheKey(entry.getKey())))
                         .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier(entry.getKey(), selection))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("volume-sandwich", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "gex-by-strike" -> gexByStrike.entrySet().stream()
                         .filter(entry -> isCacheFresh("gex-by-strike:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("gex-by-strike:" + entry.getKey(), selection))
                         .filter(entry -> "IBKR".equals(selection.source()))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
