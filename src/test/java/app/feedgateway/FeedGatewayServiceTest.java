@@ -121,6 +121,21 @@ class FeedGatewayServiceTest {
         ));
     }
 
+    @Test
+    void cachedSnapshotReplayCanIgnoreOlderSelectionEpoch() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+
+        assertTrue(FeedGatewayService.matchesSelectionNode(
+                mapper.readTree("{\"marketDataSource\":\"IBKR\",\"symbol\":\"SPX\",\"expiry\":\"20260616\","
+                        + "\"selectionEpoch\":100,\"strike\":7580}"),
+                "IBKR",
+                "SPX",
+                "20260616",
+                200,
+                false
+        ));
+    }
+
     private static void withSystemProperty(String key, String value, Runnable assertion) {
         String previous = System.getProperty(key);
         try {

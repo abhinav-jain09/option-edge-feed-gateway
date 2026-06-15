@@ -1048,6 +1048,10 @@ public class FeedGatewayService {
         return matchesSelection(json, selection, true);
     }
 
+    private boolean matchesCachedSelection(String json, ActiveSelection selection, boolean enforceSelectionEpoch) {
+        return matchesSelection(json, selection, enforceSelectionEpoch);
+    }
+
     private boolean matchesSelection(String json, ActiveSelection selection, boolean enforceSelectionEpoch) {
         if (json == null || json.isBlank() || selection == null) {
             return false;
@@ -1358,7 +1362,7 @@ public class FeedGatewayService {
                                 enforceCachedReplayMaxStale("snapshot", selection == null ? "" : selection.source()),
                                 enforceCachedReplayOffsetBarrier("snapshot", selection == null ? "" : selection.source())
                         ))
-                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection, false))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("snapshot", entry.getValue()))
                         .forEach(cachedEvents::add);
