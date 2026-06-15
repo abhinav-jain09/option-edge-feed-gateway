@@ -48,6 +48,10 @@ class FeedGatewayServiceTest {
         assertFalse(FeedGatewayService.enforceCachedReplayMaxStale("snapshot", "DATABENTO"));
         assertTrue(FeedGatewayService.enforceCachedReplayMaxStale("pace", "DATABENTO"));
         assertTrue(FeedGatewayService.enforceCachedReplayMaxStale("snapshot", "IBKR"));
+
+        assertFalse(FeedGatewayService.enforceCachedReplayOffsetBarrier("snapshot", "DATABENTO"));
+        assertTrue(FeedGatewayService.enforceCachedReplayOffsetBarrier("pace", "DATABENTO"));
+        assertTrue(FeedGatewayService.enforceCachedReplayOffsetBarrier("snapshot", "IBKR"));
     }
 
     @Test

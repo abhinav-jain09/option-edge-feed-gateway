@@ -1355,7 +1355,8 @@ public class FeedGatewayService {
                         .filter(entry -> passesSelectionBarrier(
                                 "snapshot:" + entry.getKey(),
                                 selection,
-                                enforceCachedReplayMaxStale("snapshot", selection == null ? "" : selection.source())
+                                enforceCachedReplayMaxStale("snapshot", selection == null ? "" : selection.source()),
+                                enforceCachedReplayOffsetBarrier("snapshot", selection == null ? "" : selection.source())
                         ))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
@@ -1441,16 +1442,25 @@ public class FeedGatewayService {
     }
 
     private boolean passesSelectionBarrier(String versionKey, ActiveSelection selection) {
-        return passesSelectionBarrier(versionKey, selection, true);
+        return passesSelectionBarrier(versionKey, selection, true, true);
     }
 
     private boolean passesSelectionBarrier(String versionKey, ActiveSelection selection, boolean enforceMaxStale) {
+        return passesSelectionBarrier(versionKey, selection, enforceMaxStale, true);
+    }
+
+    private boolean passesSelectionBarrier(
+            String versionKey,
+            ActiveSelection selection,
+            boolean enforceMaxStale,
+            boolean enforceOffset
+    ) {
         Long eventTimeMs = cacheEventTimes.get(versionKey);
         if (eventTimeMs == null || !passesSelectionTimeBarrier(eventTimeMs, selection, enforceMaxStale)) {
             return false;
         }
         RecordPosition position = cachePositions.get(versionKey);
-        return position == null || passesOffsetBarrier(position.partition(), position.offset());
+        return !enforceOffset || position == null || passesOffsetBarrier(position.partition(), position.offset());
     }
 
     private boolean passesSelectionBarrier(ConsumerRecord<?, ?> record, ActiveSelection selection) {
@@ -1476,6 +1486,10 @@ public class FeedGatewayService {
     }
 
     static boolean enforceCachedReplayMaxStale(String event, String source) {
+        return !("snapshot".equals(event) && "DATABENTO".equals(GatewaySettings.normalizeSource(source)));
+    }
+
+    static boolean enforceCachedReplayOffsetBarrier(String event, String source) {
         return !("snapshot".equals(event) && "DATABENTO".equals(GatewaySettings.normalizeSource(source)));
     }
 
