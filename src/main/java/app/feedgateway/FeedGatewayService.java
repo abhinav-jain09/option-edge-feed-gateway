@@ -1078,6 +1078,8 @@ public class FeedGatewayService {
                 : record.key();
         if ("directional-pressure".equals(event)) {
             key = directionalPressureCacheKey(json, key);
+        } else if ("vix-price".equals(event) || "index-price".equals(event)) {
+            key = indexPriceCacheKey(json, key);
         }
         key = binding.source() + "|" + key;
         String versionKey = event + ":" + key;
@@ -1465,6 +1467,23 @@ public class FeedGatewayService {
             String expiry = normalizeExpiry(text(root, "expiry"));
             if (!symbol.isBlank() && !expiry.isBlank()) {
                 return symbol + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    String indexPriceCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            if (!symbol.isBlank()) {
+                return symbol;
+            }
+            String instrumentId = text(root, "instrumentId");
+            if (!instrumentId.isBlank()) {
+                return "instrument:" + instrumentId;
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
