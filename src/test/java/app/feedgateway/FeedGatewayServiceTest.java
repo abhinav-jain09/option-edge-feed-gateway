@@ -46,9 +46,9 @@ class FeedGatewayServiceTest {
     void paceCacheKeyUsesNumericStrikePayloadIdentity() throws Exception {
         FeedGatewayService service = service();
 
-        assertEquals("SPX|20260616|7585", paceCacheKey(
+        assertEquals("IBKR|SPX|20260616|7585", paceCacheKey(
                 service,
-                "{\"symbol\":\"SPX\",\"expiry\":\"2026-06-16\",\"strike\":7585}",
+                "{\"source\":\"IBKR\",\"symbol\":\"SPX\",\"expiry\":\"2026-06-16\",\"strike\":7585}",
                 "fallback"
         ));
     }
@@ -57,9 +57,9 @@ class FeedGatewayServiceTest {
     void paceCacheKeyPreservesDecimalStrikePayloadIdentity() throws Exception {
         FeedGatewayService service = service();
 
-        assertEquals("SPX|20260616|7585.5", paceCacheKey(
+        assertEquals("DATABENTO|SPX|20260616|7585.5", paceCacheKey(
                 service,
-                "{\"symbol\":\"spx\",\"expiry\":\"20260616\",\"strike\":7585.5}",
+                "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"spx\",\"expiry\":\"20260616\",\"strike\":7585.5}",
                 "fallback"
         ));
     }
@@ -70,9 +70,43 @@ class FeedGatewayServiceTest {
 
         assertEquals("fallback-key", paceCacheKey(
                 service,
-                "{\"symbol\":\"SPX\",\"strike\":7585}",
+                "{\"source\":\"IBKR\",\"symbol\":\"SPX\",\"strike\":7585}",
                 "fallback-key"
         ));
+    }
+
+    @Test
+    void paceCacheKeyFallsBackWhenSourceIsMissing() throws Exception {
+        FeedGatewayService service = service();
+
+        assertEquals("fallback-key", paceCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"expiry\":\"20260616\",\"strike\":7585}",
+                "fallback-key"
+        ));
+    }
+
+    @Test
+    void paceCacheStoresSameStrikeSeparatelyBySource() throws Exception {
+        FeedGatewayService service = service();
+        Object ibkrBinding = topicBinding("IBKR", "pace");
+        Object databentoBinding = topicBinding("DATABENTO", "pace");
+
+        String ibkrKey = updateCache(
+                service,
+                ibkrBinding,
+                new ConsumerRecord<>("options.ibkr.pace", 0, 1L, "ignored", ""),
+                "{\"source\":\"IBKR\",\"symbol\":\"SPX\",\"expiry\":\"20260616\",\"strike\":7585,\"eventTime\":\"2026-06-16T14:00:00Z\"}"
+        );
+        String databentoKey = updateCache(
+                service,
+                databentoBinding,
+                new ConsumerRecord<>("options.databento.pace", 0, 2L, "ignored", ""),
+                "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260616\",\"strike\":7585,\"eventTime\":\"2026-06-16T14:00:00Z\"}"
+        );
+
+        assertEquals("IBKR|SPX|20260616|7585", ibkrKey);
+        assertEquals("DATABENTO|SPX|20260616|7585", databentoKey);
     }
 
     @Test

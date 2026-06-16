@@ -1137,7 +1137,9 @@ public class FeedGatewayService {
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
         }
-        key = binding.source() + "|" + key;
+        if (!"pace".equals(event)) {
+            key = binding.source() + "|" + key;
+        }
         String versionKey = event + ":" + key;
         long eventTime = cacheTimestamp(record);
         Long previousEventTime = cacheEventTimes.get(versionKey);
@@ -1591,11 +1593,15 @@ public class FeedGatewayService {
     private String paceCacheKey(String json, String fallback) {
         try {
             JsonNode root = mapper.readTree(json);
+            String source = GatewaySettings.normalizeSource(text(root, "marketDataSource"));
+            if (source.isBlank()) {
+                source = GatewaySettings.normalizeSource(text(root, "source"));
+            }
             String symbol = text(root, "symbol").toUpperCase();
             String expiry = normalizeExpiry(text(root, "expiry"));
             double strike = doubleField(root, "strike", Double.NaN);
-            if (!symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike)) {
-                return symbol + "|" + expiry + "|" + formatStrike(strike);
+            if (!source.isBlank() && !symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike)) {
+                return source + "|" + symbol + "|" + expiry + "|" + formatStrike(strike);
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
