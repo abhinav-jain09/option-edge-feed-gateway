@@ -43,6 +43,46 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void paceCacheKeyUsesNumericStrikePayloadIdentity() throws Exception {
+        FeedGatewayService service = service();
+
+        assertEquals("SPX|20260616|7585", paceCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"expiry\":\"2026-06-16\",\"strike\":7585}",
+                "fallback"
+        ));
+    }
+
+    @Test
+    void paceCacheKeyPreservesDecimalStrikePayloadIdentity() throws Exception {
+        FeedGatewayService service = service();
+
+        assertEquals("SPX|20260616|7585.5", paceCacheKey(
+                service,
+                "{\"symbol\":\"spx\",\"expiry\":\"20260616\",\"strike\":7585.5}",
+                "fallback"
+        ));
+    }
+
+    @Test
+    void paceCacheKeyFallsBackWhenRequiredFieldsAreMissing() throws Exception {
+        FeedGatewayService service = service();
+
+        assertEquals("fallback-key", paceCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"strike\":7585}",
+                "fallback-key"
+        ));
+    }
+
+    @Test
+    void paceCacheKeyFallsBackForMalformedJson() throws Exception {
+        FeedGatewayService service = service();
+
+        assertEquals("fallback-key", paceCacheKey(service, "{not-json", "fallback-key"));
+    }
+
+    @Test
     void catchUpRequiresOnlyActiveSource() {
         assertTrue(FeedGatewayService.requiresCatchUpForActiveSource("DATABENTO", "DATABENTO"));
         assertFalse(FeedGatewayService.requiresCatchUpForActiveSource("DATABENTO", "IBKR"));
@@ -193,6 +233,20 @@ class FeedGatewayServiceTest {
         Constructor<?> constructor = type.getDeclaredConstructor(String.class, String.class);
         constructor.setAccessible(true);
         return constructor.newInstance(source, event);
+    }
+
+    private static FeedGatewayService service() {
+        return new FeedGatewayService(
+                new GatewaySettings(),
+                new ObjectMapper(),
+                new HpsfGatewayViewMapper()
+        );
+    }
+
+    private static String paceCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("paceCacheKey", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, fallback);
     }
 
     private static String updateCache(
