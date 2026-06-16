@@ -1,8 +1,13 @@
 package app.feedgateway;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -136,6 +141,39 @@ class FeedGatewayServiceTest {
         ));
     }
 
+    @Test
+    void strikeFlowGatewayContractConsumesCachesAndExposesUiBatchHealthAndMetrics() throws Exception {
+        FeedGatewayService service = new FeedGatewayService(
+                new GatewaySettings(),
+                new ObjectMapper(),
+                new HpsfGatewayViewMapper()
+        );
+        GatewaySettings settings = new GatewaySettings();
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        String payload = "{\"eventType\":\"strike-flow\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260619\",\"strikes\":[]}";
+        Object binding = topicBinding("DATABENTO", "strike-flow");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.databentoStrikeFlowTopic(),
+                0,
+                12L,
+                "SPX|20260619",
+                payload
+        );
+
+        String cacheKey = updateCache(service, binding, record, payload);
+        String eventEnvelope = envelopeJson(service, "strike-flow", payload);
+        String batchEnvelope = uiBatchEnvelopeJson(service, List.of(payload));
+
+        assertEquals("options.databento.strike-flow", settings.databentoStrikeFlowTopic());
+        assertTrue(source.contains("topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding(\"DATABENTO\", \"strike-flow\"));"));
+        assertEquals("DATABENTO|SPX|20260619", cacheKey);
+        assertTrue(eventEnvelope.contains("\"type\":\"strike-flow\""));
+        assertTrue(batchEnvelope.contains("\"strikeFlows\":[{\"eventType\":\"strike-flow\""));
+        assertTrue(service.healthJson().contains("\"strikeFlows\":1"));
+        assertTrue(service.metrics().contains("options_edge_feed_gateway_strike_flows 1"));
+    }
+
     private static void withSystemProperty(String key, String value, Runnable assertion) {
         String previous = System.getProperty(key);
         try {
@@ -148,5 +186,64 @@ class FeedGatewayServiceTest {
                 System.setProperty(key, previous);
             }
         }
+    }
+
+    private static Object topicBinding(String source, String event) throws Exception {
+        Class<?> type = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Constructor<?> constructor = type.getDeclaredConstructor(String.class, String.class);
+        constructor.setAccessible(true);
+        return constructor.newInstance(source, event);
+    }
+
+    private static String updateCache(
+            FeedGatewayService service,
+            Object binding,
+            ConsumerRecord<String, String> record,
+            String json
+    ) throws Exception {
+        Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Method method = FeedGatewayService.class.getDeclaredMethod("updateCache", bindingType, ConsumerRecord.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, binding, record, json);
+    }
+
+    private static String envelopeJson(FeedGatewayService service, String event, String json) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("envelopeJson", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, event, json);
+    }
+
+    private static String uiBatchEnvelopeJson(FeedGatewayService service, List<String> strikeFlows) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "uiBatchEnvelopeJson",
+                List.class,
+                List.class,
+                List.class,
+                List.class,
+                List.class,
+                List.class,
+                List.class,
+                List.class,
+                List.class,
+                List.class,
+                List.class,
+                List.class
+        );
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(),
+                List.of(),
+                List.of(),
+                strikeFlows,
+                List.of(),
+                List.of(),
+                List.of(),
+                List.of(),
+                List.of(),
+                List.of(),
+                List.of(),
+                List.of()
+        );
     }
 }
