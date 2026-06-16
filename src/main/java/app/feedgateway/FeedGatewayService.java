@@ -459,6 +459,7 @@ public class FeedGatewayService {
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
+        topicEvents.put(settings.ibkrStrikeFlowTopic(), new TopicBinding("IBKR", "strike-flow"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -482,6 +483,7 @@ public class FeedGatewayService {
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
+        topicEvents.put(settings.ibkrStrikeFlowTopic(), new TopicBinding("IBKR", "strike-flow"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
@@ -957,6 +959,7 @@ public class FeedGatewayService {
                     settings.ibkrPaceTopic(),
                     settings.ibkrDirectionalPressureTopic(),
                     settings.ibkrVixPriceTopic(),
+                    settings.ibkrStrikeFlowTopic(),
                     settings.ibkrVolumeSandwichTopic(),
                     settings.ibkrVolumeSandwichAlertsTopic(),
                     settings.ibkrUnusualWhalesGexTopic(),
@@ -1411,7 +1414,6 @@ public class FeedGatewayService {
                 case "strike-flow" -> strikeFlows.entrySet().stream()
                         .filter(entry -> isCacheFresh("strike-flow:" + entry.getKey(), nowMs))
                         .filter(entry -> passesSelectionBarrier("strike-flow:" + entry.getKey(), selection))
-                        .filter(entry -> "DATABENTO".equals(selection.source()))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("strike-flow", entry.getValue()))

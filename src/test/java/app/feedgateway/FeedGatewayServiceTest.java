@@ -152,7 +152,10 @@ class FeedGatewayServiceTest {
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         String payload = "{\"eventType\":\"strike-flow\",\"marketDataSource\":\"DATABENTO\","
                 + "\"symbol\":\"SPX\",\"expiry\":\"20260619\",\"strikes\":[]}";
+        String ibkrPayload = "{\"eventType\":\"strike-flow\",\"marketDataSource\":\"IBKR\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260619\",\"strikes\":[]}";
         Object binding = topicBinding("DATABENTO", "strike-flow");
+        Object ibkrBinding = topicBinding("IBKR", "strike-flow");
         ConsumerRecord<String, String> record = new ConsumerRecord<>(
                 settings.databentoStrikeFlowTopic(),
                 0,
@@ -160,18 +163,34 @@ class FeedGatewayServiceTest {
                 "SPX|20260619",
                 payload
         );
+        ConsumerRecord<String, String> ibkrRecord = new ConsumerRecord<>(
+                settings.ibkrStrikeFlowTopic(),
+                0,
+                13L,
+                "SPX|20260619",
+                ibkrPayload
+        );
 
         String cacheKey = updateCache(service, binding, record, payload);
+        String ibkrCacheKey = updateCache(service, ibkrBinding, ibkrRecord, ibkrPayload);
         String eventEnvelope = envelopeJson(service, "strike-flow", payload);
         String batchEnvelope = uiBatchEnvelopeJson(service, List.of(payload));
 
         assertEquals("options.databento.strike-flow", settings.databentoStrikeFlowTopic());
+        assertEquals("options.ibkr.strike-flow", settings.ibkrStrikeFlowTopic());
         assertTrue(source.contains("topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding(\"DATABENTO\", \"strike-flow\"));"));
+        assertTrue(source.contains("topicEvents.put(settings.ibkrStrikeFlowTopic(), new TopicBinding(\"IBKR\", \"strike-flow\"));"));
+        assertTrue(source.contains("settings.ibkrStrikeFlowTopic()"));
+        int strikeFlowReplay = source.indexOf("case \"strike-flow\"");
+        int volumeSandwichReplay = source.indexOf("case \"volume-sandwich\"", strikeFlowReplay);
+        assertFalse(source.substring(strikeFlowReplay, volumeSandwichReplay)
+                .contains(".filter(entry -> \"DATABENTO\".equals(selection.source()))"));
         assertEquals("DATABENTO|SPX|20260619", cacheKey);
+        assertEquals("IBKR|SPX|20260619", ibkrCacheKey);
         assertTrue(eventEnvelope.contains("\"type\":\"strike-flow\""));
         assertTrue(batchEnvelope.contains("\"strikeFlows\":[{\"eventType\":\"strike-flow\""));
-        assertTrue(service.healthJson().contains("\"strikeFlows\":1"));
-        assertTrue(service.metrics().contains("options_edge_feed_gateway_strike_flows 1"));
+        assertTrue(service.healthJson().contains("\"strikeFlows\":2"));
+        assertTrue(service.metrics().contains("options_edge_feed_gateway_strike_flows 2"));
     }
 
     private static void withSystemProperty(String key, String value, Runnable assertion) {
