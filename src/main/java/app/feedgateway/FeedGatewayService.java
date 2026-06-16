@@ -58,6 +58,7 @@ public class FeedGatewayService {
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
+    private final Map<String, String> strikeFlows = new ConcurrentHashMap<>();
     private final Map<String, String> indexPrices = new ConcurrentHashMap<>();
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
@@ -75,6 +76,7 @@ public class FeedGatewayService {
     private final Map<String, String> pendingSnapshots = new LinkedHashMap<>();
     private final Map<String, String> pendingPaces = new LinkedHashMap<>();
     private final Map<String, String> pendingDirectionalPressures = new LinkedHashMap<>();
+    private final Map<String, String> pendingStrikeFlows = new LinkedHashMap<>();
     private final Map<String, String> pendingIndexPrices = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
@@ -213,7 +215,7 @@ public class FeedGatewayService {
             sendCachedState(session, List.of("snapshot", "pace", "directional-pressure"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "volume-sandwich", "gex-by-strike"));
+            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "volume-sandwich", "gex-by-strike"));
         }
         if (hpsfCaughtUp.get()) {
             sendCachedState(session, List.of(
@@ -253,6 +255,7 @@ public class FeedGatewayService {
                 + "\"snapshots\":" + snapshots.size() + ","
                 + "\"paces\":" + paces.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
+                + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"indexPrices\":" + indexPrices.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
@@ -308,6 +311,9 @@ public class FeedGatewayService {
                 + "# HELP options_edge_feed_gateway_directional_pressures Cached directional-pressure count.\n"
                 + "# TYPE options_edge_feed_gateway_directional_pressures gauge\n"
                 + "options_edge_feed_gateway_directional_pressures " + directionalPressures.size() + "\n"
+                + "# HELP options_edge_feed_gateway_strike_flows Cached strike-flow count.\n"
+                + "# TYPE options_edge_feed_gateway_strike_flows gauge\n"
+                + "options_edge_feed_gateway_strike_flows " + strikeFlows.size() + "\n"
                 + "# HELP options_edge_feed_gateway_index_prices Cached index price count.\n"
                 + "# TYPE options_edge_feed_gateway_index_prices gauge\n"
                 + "options_edge_feed_gateway_index_prices " + indexPrices.size() + "\n"
@@ -452,6 +458,7 @@ public class FeedGatewayService {
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
+        topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -474,6 +481,7 @@ public class FeedGatewayService {
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
+        topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
@@ -962,6 +970,7 @@ public class FeedGatewayService {
                     settings.databentoDirectionalPressureTopic(),
                     settings.ibkrVixPriceTopic(),
                     settings.databentoEsTradesTopic(),
+                    settings.databentoStrikeFlowTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic()
             );
@@ -970,7 +979,7 @@ public class FeedGatewayService {
     }
 
     static List<String> sourceSwitchReplayEvents() {
-        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "volume-sandwich", "gex-by-strike");
+        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "volume-sandwich", "gex-by-strike");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -1123,6 +1132,8 @@ public class FeedGatewayService {
             key = directionalPressureCacheKey(json, key);
         } else if ("vix-price".equals(event) || "index-price".equals(event)) {
             key = indexPriceCacheKey(json, key);
+        } else if ("strike-flow".equals(event)) {
+            key = strikeFlowCacheKey(json, key);
         }
         key = binding.source() + "|" + key;
         String versionKey = event + ":" + key;
@@ -1165,6 +1176,12 @@ public class FeedGatewayService {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 indexPrices.put(key, json);
+                return key;
+            }
+            case "strike-flow" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                strikeFlows.put(key, json);
                 return key;
             }
             case "volume-sandwich" -> {
@@ -1391,6 +1408,14 @@ public class FeedGatewayService {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("index-price", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "strike-flow" -> strikeFlows.entrySet().stream()
+                        .filter(entry -> isCacheFresh("strike-flow:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("strike-flow:" + entry.getKey(), selection))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("strike-flow", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "volume-sandwich" -> currentStates.entrySet().stream()
                         .filter(entry -> "volume-sandwich".equals(eventFromCacheKey(entry.getKey())))
                         .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
@@ -1528,6 +1553,8 @@ public class FeedGatewayService {
             indexPrices.remove(versionKey.substring("vix-price:".length()));
         } else if (versionKey.startsWith("index-price:")) {
             indexPrices.remove(versionKey.substring("index-price:".length()));
+        } else if (versionKey.startsWith("strike-flow:")) {
+            strikeFlows.remove(versionKey.substring("strike-flow:".length()));
         } else if (versionKey.startsWith("volume-sandwich:")) {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
@@ -1546,6 +1573,20 @@ public class FeedGatewayService {
     }
 
     private String directionalPressureCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            if (!symbol.isBlank() && !expiry.isBlank()) {
+                return symbol + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    private String strikeFlowCacheKey(String json, String fallback) {
         try {
             JsonNode root = mapper.readTree(json);
             String symbol = text(root, "symbol").toUpperCase();
@@ -1690,6 +1731,7 @@ public class FeedGatewayService {
             case "snapshot" -> pendingSnapshots;
             case "pace" -> pendingPaces;
             case "directional-pressure" -> pendingDirectionalPressures;
+            case "strike-flow" -> pendingStrikeFlows;
             case "vix-price", "index-price" -> pendingIndexPrices;
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
@@ -1717,6 +1759,7 @@ public class FeedGatewayService {
                         new ArrayList<>(pendingSnapshots.values()),
                         new ArrayList<>(pendingPaces.values()),
                         new ArrayList<>(pendingDirectionalPressures.values()),
+                        new ArrayList<>(pendingStrikeFlows.values()),
                         new ArrayList<>(pendingIndexPrices.values()),
                         new ArrayList<>(pendingVolumeSandwiches.values()),
                         new ArrayList<>(pendingGexByStrike.values()),
@@ -1750,6 +1793,7 @@ public class FeedGatewayService {
         return pendingSnapshots.size()
                 + pendingPaces.size()
                 + pendingDirectionalPressures.size()
+                + pendingStrikeFlows.size()
                 + pendingIndexPrices.size()
                 + pendingVolumeSandwiches.size()
                 + pendingGexByStrike.size()
@@ -1764,6 +1808,7 @@ public class FeedGatewayService {
         pendingSnapshots.clear();
         pendingPaces.clear();
         pendingDirectionalPressures.clear();
+        pendingStrikeFlows.clear();
         pendingIndexPrices.clear();
         pendingVolumeSandwiches.clear();
         pendingGexByStrike.clear();
@@ -1783,6 +1828,7 @@ public class FeedGatewayService {
         List<String> snapshotJsons = new ArrayList<>();
         List<String> paceJsons = new ArrayList<>();
         List<String> directionalPressureJsons = new ArrayList<>();
+        List<String> strikeFlowJsons = new ArrayList<>();
         List<String> indexPriceJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
@@ -1796,6 +1842,7 @@ public class FeedGatewayService {
                 case "snapshot" -> snapshotJsons.add(cachedEvent.json());
                 case "pace" -> paceJsons.add(cachedEvent.json());
                 case "directional-pressure" -> directionalPressureJsons.add(cachedEvent.json());
+                case "strike-flow" -> strikeFlowJsons.add(cachedEvent.json());
                 case "vix-price", "index-price" -> indexPriceJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
@@ -1813,6 +1860,7 @@ public class FeedGatewayService {
                 snapshotJsons,
                 paceJsons,
                 directionalPressureJsons,
+                strikeFlowJsons,
                 indexPriceJsons,
                 volumeSandwichJsons,
                 gexByStrikeJsons,
@@ -1828,6 +1876,7 @@ public class FeedGatewayService {
             List<String> snapshotJsons,
             List<String> paceJsons,
             List<String> directionalPressureJsons,
+            List<String> strikeFlowJsons,
             List<String> indexPriceJsons,
             List<String> volumeSandwichJsons,
             List<String> gexByStrikeJsons,
@@ -1850,6 +1899,7 @@ public class FeedGatewayService {
                 + "\"snapshots\":" + jsonArray(snapshotJsons) + ","
                 + "\"paces\":" + jsonArray(paceJsons) + ","
                 + "\"directionalPressures\":" + jsonArray(directionalPressureJsons) + ","
+                + "\"strikeFlows\":" + jsonArray(strikeFlowJsons) + ","
                 + "\"indexPrices\":" + jsonArray(indexPriceJsons) + ","
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
@@ -1885,6 +1935,7 @@ public class FeedGatewayService {
                 + "\"snapshots\":" + snapshots.size() + ","
                 + "\"paces\":" + paces.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
+                + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
                 + "\"hpsfMarketFlows\":" + hpsfMarketFlows.size() + ","

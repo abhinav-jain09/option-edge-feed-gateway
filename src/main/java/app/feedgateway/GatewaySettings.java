@@ -83,6 +83,10 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_DIRECTIONAL_PRESSURE_TOPIC", "options.databento.directional-pressure");
     }
 
+    public String databentoStrikeFlowTopic() {
+        return value("KAFKA_DATABENTO_STRIKE_FLOW_TOPIC", "options.databento.strike-flow");
+    }
+
     public String ibkrVolumeSandwichTopic() {
         return value("KAFKA_IBKR_VOLUME_SANDWICH_CURRENT_TOPIC",
                 value("KAFKA_VOLUME_SANDWICH_CURRENT_TOPIC", "options.ibkr.volume-sandwich.current"));
