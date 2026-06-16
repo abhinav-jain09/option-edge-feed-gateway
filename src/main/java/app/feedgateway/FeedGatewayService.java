@@ -1128,7 +1128,9 @@ public class FeedGatewayService {
         String key = record.key() == null || record.key().isBlank()
                 ? record.topic() + ":" + record.partition()
                 : record.key();
-        if ("directional-pressure".equals(event)) {
+        if ("pace".equals(event)) {
+            key = paceCacheKey(json, key);
+        } else if ("directional-pressure".equals(event)) {
             key = directionalPressureCacheKey(json, key);
         } else if ("vix-price".equals(event) || "index-price".equals(event)) {
             key = indexPriceCacheKey(json, key);
@@ -1586,6 +1588,21 @@ public class FeedGatewayService {
         return fallback;
     }
 
+    private String paceCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            double strike = doubleField(root, "strike", Double.NaN);
+            if (!symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike)) {
+                return symbol + "|" + expiry + "|" + formatStrike(strike);
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
     private String strikeFlowCacheKey(String json, String fallback) {
         try {
             JsonNode root = mapper.readTree(json);
@@ -1647,6 +1664,28 @@ public class FeedGatewayService {
         } catch (NumberFormatException ignored) {
             return fallback;
         }
+    }
+
+    private static double doubleField(JsonNode root, String field, double fallback) {
+        JsonNode value = root == null ? null : root.get(field);
+        if (value == null || value.isNull()) {
+            return fallback;
+        }
+        if (value.isNumber()) {
+            return value.asDouble();
+        }
+        try {
+            return Double.parseDouble(value.asText("").trim());
+        } catch (NumberFormatException ignored) {
+            return fallback;
+        }
+    }
+
+    private static String formatStrike(double strike) {
+        if (strike == Math.rint(strike)) {
+            return Long.toString((long) strike);
+        }
+        return Double.toString(strike);
     }
 
     private static long parseInstantMs(String value, long fallback) {
