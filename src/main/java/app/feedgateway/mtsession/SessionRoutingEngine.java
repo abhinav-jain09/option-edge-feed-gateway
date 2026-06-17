@@ -293,6 +293,14 @@ public final class SessionRoutingEngine {
         return recordEpoch <= 0L || app.epoch() <= 0L || recordEpoch >= app.epoch();
     }
 
+    /**
+     * True if this specific socket should receive {@code record} — same filter as live routing
+     * ({@link #route}). Used for per-session filtered cached-state replay on connect (FR-11).
+     */
+    public boolean shouldDeliverToSocket(RoutableRecord record, String socketId) {
+        return route(record).contains(socketId);
+    }
+
     // ---------------------------------------------------------------------
     // Index maintenance
     // ---------------------------------------------------------------------

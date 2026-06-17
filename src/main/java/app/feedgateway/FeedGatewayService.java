@@ -226,10 +226,11 @@ public class FeedGatewayService {
         clients.add(session);
         clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
-        // In per-session mode the global cached-state replay is skipped: it is unfiltered across all
-        // contracts and would leak other sessions' data on connect. Each socket receives only its
-        // own contract's live (and future cached-per-session) data via the router.
+        // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
+        // each socket gets only the cached state matching its own AppSession selection (no cross-
+        // contract leak), then live routed data (FR-11).
         if (perSessionRouting()) {
+            replayCachedToSocket(session);
             return;
         }
         if (avroCaughtUp.get()) {
@@ -1709,6 +1710,38 @@ public class FeedGatewayService {
     private void broadcast(String event, String json) {
         for (WebSocketSession client : clients) {
             send(client, event, json);
+        }
+    }
+
+    /** Per-session filtered replay of cached state to a newly-connected socket (FR-11). */
+    private void replayCachedToSocket(WebSocketSession session) {
+        replayCacheMap(session, "snapshot", snapshots);
+        replayCacheMap(session, "pace", paces);
+        replayCacheMap(session, "directional-pressure", directionalPressures);
+        replayCacheMap(session, "strike-flow", strikeFlows);
+        replayCacheMap(session, "gex-by-strike", gexByStrike);
+        replayCacheMap(session, "index-price", indexPrices);
+    }
+
+    private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {
+        if (routingEngine == null) {
+            return;
+        }
+        String socketId = session.getId();
+        for (String json : cache.values()) {
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            try {
+                JsonNode root = mapper.readTree(json);
+                String source = root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "";
+                Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
+                if (rec.isPresent() && routingEngine.shouldDeliverToSocket(rec.get(), socketId)) {
+                    send(session, event, json);
+                }
+            } catch (JsonProcessingException ignored) {
+                // skip malformed cached entry
+            }
         }
     }
 
