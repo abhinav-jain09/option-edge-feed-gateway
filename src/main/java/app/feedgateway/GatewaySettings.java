@@ -48,6 +48,11 @@ public final class GatewaySettings {
         return intValue("GATEWAY_WS_TICKET_TTL_SECONDS", 10, 1);
     }
 
+    /** Route the live data path per-session through the engine instead of broadcasting (OE-DDD-001 §8, finding #3). */
+    public boolean routingPerSession() {
+        return boolValue("GATEWAY_ROUTING_PER_SESSION", false);
+    }
+
     public String bootstrapServers() {
         return value("KAFKA_BOOTSTRAP_SERVERS", DEFAULT_BOOTSTRAP_SERVERS);
     }

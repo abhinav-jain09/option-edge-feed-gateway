@@ -4,6 +4,11 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import app.feedgateway.mtsession.RoutableRecord;
+import app.feedgateway.mtsession.SessionRoutingEngine;
+import app.feedgateway.mtsession.gateway.GatewayRecordMapper;
+import java.util.Optional;
+import org.springframework.lang.Nullable;
 import com.optionsedge.contracts.hpsf.HpsfAuditEvent;
 import com.optionsedge.contracts.hpsf.HpsfExitIntentEvent;
 import com.optionsedge.contracts.hpsf.HpsfSignal;
@@ -55,6 +60,8 @@ public class FeedGatewayService {
     private final ObjectMapper mapper;
     private final HpsfGatewayViewMapper hpsfViewMapper;
     private final Set<WebSocketSession> clients = new CopyOnWriteArraySet<>();
+    private final Map<String, WebSocketSession> clientsById = new ConcurrentHashMap<>();
+    private final SessionRoutingEngine routingEngine;
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
@@ -145,11 +152,18 @@ public class FeedGatewayService {
         void run(boolean retry) throws RuntimeException;
     }
 
-    public FeedGatewayService(GatewaySettings settings, ObjectMapper mapper, HpsfGatewayViewMapper hpsfViewMapper) {
+    public FeedGatewayService(GatewaySettings settings, ObjectMapper mapper, HpsfGatewayViewMapper hpsfViewMapper,
+                              @Nullable SessionRoutingEngine routingEngine) {
         this.settings = settings;
         this.mapper = mapper;
         this.hpsfViewMapper = hpsfViewMapper;
+        this.routingEngine = routingEngine;
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
+    }
+
+    /** True when per-session routing is enabled and the engine is wired (auth on); else legacy broadcast. */
+    private boolean perSessionRouting() {
+        return settings.routingPerSession() && routingEngine != null;
     }
 
     @PostConstruct
@@ -210,7 +224,14 @@ public class FeedGatewayService {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
         clients.add(session);
+        clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
+        // In per-session mode the global cached-state replay is skipped: it is unfiltered across all
+        // contracts and would leak other sessions' data on connect. Each socket receives only its
+        // own contract's live (and future cached-per-session) data via the router.
+        if (perSessionRouting()) {
+            return;
+        }
         if (avroCaughtUp.get()) {
             sendCachedState(session, List.of("snapshot", "pace", "directional-pressure"));
         }
@@ -230,6 +251,7 @@ public class FeedGatewayService {
 
     public void removeClient(WebSocketSession session) {
         clients.remove(session);
+        clientsById.remove(session.getId());
         try {
             if (session.isOpen()) {
                 session.close();
@@ -584,7 +606,7 @@ public class FeedGatewayService {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = binding == null ? null : enrichJson(record.value(), binding);
                     if (json != null && !json.isBlank() && shouldForward(binding, json, record)) {
-                        broadcast(binding.event(), json);
+                        routeOrBroadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
                         recordSelectedForward(binding, json);
                     } else {
@@ -1690,6 +1712,36 @@ public class FeedGatewayService {
         }
     }
 
+    /**
+     * Per-session routing cutover (OE-DDD-001 §8, finding #3): when enabled, deliver an event only
+     * to the sockets whose AppSession selection matches it (via {@link SessionRoutingEngine});
+     * otherwise fall back to the legacy broadcast. Source is read from the payload's
+     * {@code marketDataSource}; events that don't map to a routable type (e.g. HPSF) broadcast.
+     */
+    private void routeOrBroadcast(String event, String json) {
+        if (perSessionRouting()) {
+            SessionRoutingEngine engine = routingEngine;
+            try {
+                JsonNode root = mapper.readTree(json);
+                String source = root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "";
+                Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
+                if (rec.isPresent()) {
+                    for (String socketId : engine.route(rec.get())) {
+                        WebSocketSession s = clientsById.get(socketId);
+                        if (s != null) {
+                            send(s, event, json);
+                        }
+                    }
+                    return;
+                }
+                // unroutable event (e.g. hpsf-*): fall through to broadcast
+            } catch (JsonProcessingException ignored) {
+                // malformed JSON: fall through to broadcast
+            }
+        }
+        broadcast(event, json);
+    }
+
     private void send(WebSocketSession session, String event, String json) {
         sendEnvelope(session, envelopeJson(event, json));
     }
@@ -1713,6 +1765,12 @@ public class FeedGatewayService {
 
     private void enqueuePending(String event, String key, String json) {
         if (clients.isEmpty()) {
+            return;
+        }
+        if (perSessionRouting()) {
+            // Per-session cutover: route this event to only the matching sockets (unbatched).
+            // Per-session batching is a follow-up; correctness of isolation comes first.
+            routeOrBroadcast(event, json);
             return;
         }
         synchronized (batchLock) {

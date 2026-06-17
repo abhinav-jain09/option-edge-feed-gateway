@@ -30,7 +30,8 @@ class FeedGatewayServiceTest {
         FeedGatewayService service = new FeedGatewayService(
                 new GatewaySettings(),
                 new ObjectMapper(),
-                new HpsfGatewayViewMapper()
+                new HpsfGatewayViewMapper(),
+                null
         );
 
         String firstEsTrade = "{\"symbol\":\"ES.v.0\",\"instrumentId\":\"42140864\",\"price\":7580.5}";
@@ -66,7 +67,8 @@ class FeedGatewayServiceTest {
         FeedGatewayService service = new FeedGatewayService(
                 new GatewaySettings(),
                 new ObjectMapper(),
-                new HpsfGatewayViewMapper()
+                new HpsfGatewayViewMapper(),
+                null
         );
 
         assertTrue(service.passesSelectionTimeBarrierForTest(100L, 200L, false));
@@ -146,7 +148,8 @@ class FeedGatewayServiceTest {
         FeedGatewayService service = new FeedGatewayService(
                 new GatewaySettings(),
                 new ObjectMapper(),
-                new HpsfGatewayViewMapper()
+                new HpsfGatewayViewMapper(),
+                null
         );
         GatewaySettings settings = new GatewaySettings();
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
