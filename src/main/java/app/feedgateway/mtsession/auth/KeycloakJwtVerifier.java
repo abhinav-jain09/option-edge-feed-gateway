@@ -31,7 +31,7 @@ import java.util.Set;
  * <p>Thread-safe and intended to be a long-lived singleton; the JWKS source caches keys and refreshes
  * on rotation.
  */
-public final class KeycloakJwtVerifier {
+public final class KeycloakJwtVerifier implements TokenVerifier {
 
     private final String issuer;
     private final String expectedClientId; // nullable → azp not enforced

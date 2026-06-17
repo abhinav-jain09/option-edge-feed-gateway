@@ -22,6 +22,32 @@ public final class GatewaySettings {
         return boolValue("KAFKA_ENABLED", true);
     }
 
+    // ---- Multi-tenant session auth (OE-DDD-001 §5; default OFF — flag-gated migration, DDD §12) ----
+
+    public boolean authEnabled() {
+        return boolValue("GATEWAY_AUTH_ENABLED", false);
+    }
+
+    public String wsAllowedOrigins() {
+        return value("GATEWAY_WS_ALLOWED_ORIGINS", "*");
+    }
+
+    public String keycloakIssuer() {
+        return value("GATEWAY_KEYCLOAK_ISSUER", "");
+    }
+
+    public String keycloakClientId() {
+        return value("GATEWAY_KEYCLOAK_CLIENT_ID", "options-edge-web");
+    }
+
+    public String redisUri() {
+        return value("GATEWAY_REDIS_URI", "");
+    }
+
+    public int wsTicketTtlSeconds() {
+        return intValue("GATEWAY_WS_TICKET_TTL_SECONDS", 10, 1);
+    }
+
     public String bootstrapServers() {
         return value("KAFKA_BOOTSTRAP_SERVERS", DEFAULT_BOOTSTRAP_SERVERS);
     }
