@@ -1,5 +1,6 @@
 package app.feedgateway.mtsession;
 
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -31,6 +32,7 @@ public final class SessionRoutingEngine {
 
     private final ConcurrencyLimits limits;
     private final SubscriptionManager subscriptions;
+    private final Clock clock;
     private final SharedSnapshotCache cache = new SharedSnapshotCache();
 
     private final Map<String, AppSession> appSessions = new LinkedHashMap<>();
@@ -40,8 +42,13 @@ public final class SessionRoutingEngine {
     private final Map<UnderlyingKey, Set<String>> appByUnderlying = new LinkedHashMap<>();
 
     public SessionRoutingEngine(ConcurrencyLimits limits, SubscriptionManager subscriptions) {
+        this(limits, subscriptions, Clock.systemUTC());
+    }
+
+    public SessionRoutingEngine(ConcurrencyLimits limits, SubscriptionManager subscriptions, Clock clock) {
         this.limits = Objects.requireNonNull(limits, "limits");
         this.subscriptions = Objects.requireNonNull(subscriptions, "subscriptions");
+        this.clock = Objects.requireNonNull(clock, "clock");
     }
 
     // ---------------------------------------------------------------------
@@ -54,11 +61,29 @@ public final class SessionRoutingEngine {
      */
     public AppSession registerAppSession(String appSessionId, String userId, Selection selection,
                                          Set<String> entitlements) {
+        return registerAppSession(appSessionId, userId, selection, entitlements,
+                ApprovalState.APPROVED, UserSessionPolicy.systemDefault());
+    }
+
+    /**
+     * Register a new AppSession with explicit approval state and session policy. Rejects
+     * unapproved users (FR-15), enforces concurrency limits (FR-27) and source entitlement (FR-12),
+     * stamps activity/deadline timestamps from the engine clock, and acquires the Databento
+     * subscription where applicable.
+     */
+    public AppSession registerAppSession(String appSessionId, String userId, Selection selection,
+                                         Set<String> entitlements, ApprovalState approvalState,
+                                         UserSessionPolicy policy) {
         Objects.requireNonNull(appSessionId, "appSessionId");
         Objects.requireNonNull(userId, "userId");
         Objects.requireNonNull(selection, "selection");
+        Objects.requireNonNull(approvalState, "approvalState");
+        Objects.requireNonNull(policy, "policy");
         if (appSessions.containsKey(appSessionId)) {
             throw new IllegalStateException("AppSession already registered: " + appSessionId);
+        }
+        if (!approvalState.grantsAccess()) {
+            throw new NotApprovedException("User " + userId + " is not approved (" + approvalState + ")");
         }
         if (!EntitlementPolicy.canSelect(selection.source(), entitlements)) {
             throw new NotEntitledException("User " + userId + " not entitled to source " + selection.source());
@@ -74,7 +99,7 @@ public final class SessionRoutingEngine {
         }
 
         AppSession app = new AppSession(appSessionId, userId, entitlements == null ? Set.of() : entitlements,
-                selection, 1L);
+                selection, 1L, policy, clock.millis());
         appSessions.put(appSessionId, app);
         userApps.add(appSessionId);
         addToIndexes(app, selection);
@@ -96,6 +121,7 @@ public final class SessionRoutingEngine {
         }
         socketToApp.put(socketId, appSessionId);
         app.addSocket(socketId);
+        app.touch(clock.millis());
     }
 
     /** Detach a socket; the AppSession persists (grace window is the caller's policy, FR-11/§6.2). */
@@ -130,19 +156,33 @@ public final class SessionRoutingEngine {
             subscriptions.acquire(newSelection.subscriptionKey(), appSessionId, newSelection.strikeWindow());
         }
         app.bumpEpoch();
+        app.touch(clock.millis());
     }
 
-    /** Fully tear down an AppSession (idle/max/logout/suspend): unindex, release subs, drop sockets. */
-    public void teardownAppSession(String appSessionId) {
+    /** Refresh the activity timestamp for an AppSession (heartbeat / data ack), deferring idle timeout. */
+    public void touchActivity(String appSessionId) {
+        AppSession app = appSessions.get(appSessionId);
+        if (app != null) {
+            app.touch(clock.millis());
+        }
+    }
+
+    /**
+     * Fully tear down an AppSession (idle/max/logout/suspend): unindex, release subs, drop sockets.
+     *
+     * @return the ids of the sockets that were attached and must now be closed by the caller.
+     */
+    public Set<String> teardownAppSession(String appSessionId) {
         AppSession app = appSessions.remove(appSessionId);
         if (app == null) {
-            return;
+            return Set.of();
         }
+        Set<String> closedSockets = new LinkedHashSet<>(app.socketIds());
         removeFromIndexes(app, app.selection());
         if (app.selection().source() == MarketDataSource.DATABENTO) {
             subscriptions.release(app.selection().subscriptionKey(), appSessionId);
         }
-        for (String socketId : app.socketIds()) {
+        for (String socketId : closedSockets) {
             socketToApp.remove(socketId);
         }
         Set<String> userApps = userToApps.get(app.userId());
@@ -152,6 +192,45 @@ public final class SessionRoutingEngine {
                 userToApps.remove(app.userId());
             }
         }
+        return closedSockets;
+    }
+
+    /** Outcome of an expiry sweep: which AppSessions ended and which sockets must be closed. */
+    public record SweepResult(Set<String> expiredAppSessionIds, Set<String> closedSocketIds) {
+    }
+
+    /**
+     * Tear down every AppSession whose idle timeout or max-session deadline has passed (FR-18).
+     * Returns the affected AppSession ids and the sockets the caller must close.
+     */
+    public SweepResult sweepExpired() {
+        long now = clock.millis();
+        Set<String> expired = new LinkedHashSet<>();
+        Set<String> closed = new LinkedHashSet<>();
+        for (AppSession app : new ArrayList<>(appSessions.values())) {
+            if (app.isIdleExpired(now) || app.isMaxExpired(now)) {
+                expired.add(app.id());
+                closed.addAll(teardownAppSession(app.id()));
+            }
+        }
+        return new SweepResult(expired, closed);
+    }
+
+    /**
+     * Force-logout / suspend a user: tear down all of their AppSessions immediately (FR-22/FR-23).
+     *
+     * @return the sockets the caller must close.
+     */
+    public Set<String> forceLogoutUser(String userId) {
+        Set<String> userApps = userToApps.get(userId);
+        if (userApps == null) {
+            return Set.of();
+        }
+        Set<String> closed = new LinkedHashSet<>();
+        for (String appId : new ArrayList<>(userApps)) {
+            closed.addAll(teardownAppSession(appId));
+        }
+        return closed;
     }
 
     // ---------------------------------------------------------------------

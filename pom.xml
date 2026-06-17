@@ -60,6 +60,11 @@
             <version>9.40</version>
         </dependency>
         <dependency>
+            <!-- Redis-backed single-use WS ticket store (OE-DDD-001 §5.3/§6.5); version via Spring Boot BOM -->
+            <groupId>io.lettuce</groupId>
+            <artifactId>lettuce-core</artifactId>
+        </dependency>
+        <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>

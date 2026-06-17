@@ -2,12 +2,14 @@ package app.feedgateway.mtsession;
 
 import java.util.Collections;
 import java.util.LinkedHashSet;
+import java.util.Objects;
 import java.util.Set;
 
 /**
- * Persistent per-user application session (OE-DDD-001 §6.1). Selection, epoch, and attached sockets
- * are mutated only by {@link SessionRoutingEngine}, which owns all consistency between an
- * AppSession and the routing indexes.
+ * Persistent per-user application session (OE-DDD-001 §6.1). Carries the user's approval state,
+ * resolved session policy, and the activity/deadline timestamps that drive idle-timeout and
+ * max-session enforcement (§6.3/§6.6, FR-17/FR-18). Selection, epoch, sockets, and activity are
+ * mutated only by {@link SessionRoutingEngine}.
  */
 public final class AppSession {
 
@@ -15,15 +17,27 @@ public final class AppSession {
     private final String userId;
     private final Set<String> entitlements;
     private final Set<String> socketIds = new LinkedHashSet<>();
+    private final UserSessionPolicy policy;
+    private final long createdAtMillis;
+    private final long maxDeadlineMillis; // 0 ⇒ unlimited
+
     private Selection selection;
     private long epoch;
+    private long lastActivityAtMillis;
 
-    AppSession(String id, String userId, Set<String> entitlements, Selection selection, long epoch) {
+    AppSession(String id, String userId, Set<String> entitlements, Selection selection, long epoch,
+               UserSessionPolicy policy, long nowMillis) {
         this.id = id;
         this.userId = userId;
         this.entitlements = Set.copyOf(entitlements);
         this.selection = selection;
         this.epoch = epoch;
+        this.policy = Objects.requireNonNull(policy, "policy");
+        this.createdAtMillis = nowMillis;
+        this.lastActivityAtMillis = nowMillis;
+        this.maxDeadlineMillis = policy.isUnlimited()
+                ? 0L
+                : nowMillis + (long) policy.maxSessionMinutes() * 60_000L;
     }
 
     public String id() {
@@ -50,12 +64,39 @@ public final class AppSession {
         return epoch;
     }
 
+    public UserSessionPolicy policy() {
+        return policy;
+    }
+
+    public long createdAtMillis() {
+        return createdAtMillis;
+    }
+
+    public long lastActivityAtMillis() {
+        return lastActivityAtMillis;
+    }
+
+    public long maxDeadlineMillis() {
+        return maxDeadlineMillis;
+    }
+
     public Set<String> socketIds() {
         return Collections.unmodifiableSet(socketIds);
     }
 
     public boolean hasSockets() {
         return !socketIds.isEmpty();
+    }
+
+    /** True if idle longer than the policy's idle timeout (FR-18). */
+    public boolean isIdleExpired(long nowMillis) {
+        long idleMillis = (long) policy.idleTimeoutMinutes() * 60_000L;
+        return nowMillis - lastActivityAtMillis >= idleMillis;
+    }
+
+    /** True if the absolute max-session deadline has passed (FR-18); never for unlimited sessions. */
+    public boolean isMaxExpired(long nowMillis) {
+        return maxDeadlineMillis > 0L && nowMillis >= maxDeadlineMillis;
     }
 
     // ---- package-private mutation, driven by the engine ----
@@ -66,6 +107,10 @@ public final class AppSession {
 
     void bumpEpoch() {
         this.epoch++;
+    }
+
+    void touch(long nowMillis) {
+        this.lastActivityAtMillis = nowMillis;
     }
 
     boolean addSocket(String socketId) {
