@@ -1,0 +1,49 @@
+{
+  "realm": "optionsedge",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 300,
+  "roles": {
+    "realm": [
+      { "name": "user", "description": "Baseline approved user" },
+      { "name": "ibkr-user", "description": "May select IBKR mode" },
+      { "name": "trader", "description": "May stage orders" },
+      { "name": "admin", "description": "Administrative access" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "options-edge-web",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["*"],
+      "webOrigins": ["*"],
+      "protocol": "openid-connect",
+      "attributes": { "pkce.code.challenge.method": "S256" }
+    }
+  ],
+  "users": [
+    {
+      "username": "testtrader",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "testtrader@example.local",
+      "firstName": "Test",
+      "lastName": "Trader",
+      "credentials": [ { "type": "password", "value": "Test1234!", "temporary": false } ],
+      "realmRoles": ["user", "trader", "ibkr-user"]
+    },
+    {
+      "username": "databentouser",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "dbnto@example.local",
+      "firstName": "Databento",
+      "lastName": "User",
+      "credentials": [ { "type": "password", "value": "Test1234!", "temporary": false } ],
+      "realmRoles": ["user"]
+    }
+  ]
+}
