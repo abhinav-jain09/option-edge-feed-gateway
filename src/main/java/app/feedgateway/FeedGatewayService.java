@@ -607,7 +607,7 @@ public class FeedGatewayService {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = binding == null ? null : enrichJson(record.value(), binding);
                     if (json != null && !json.isBlank() && (perSessionRouting() || shouldForward(binding, json, record))) {
-                        routeOrBroadcast(binding.event(), json);
+                        routeOrBroadcast(binding.source(), binding.event(), json);
                         forwardedEvents.incrementAndGet();
                         recordSelectedForward(binding, json);
                     } else {
@@ -716,11 +716,13 @@ public class FeedGatewayService {
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
-                    // Per-session mode: bypass the global single-source/selection/barrier gate and let
-                    // the engine route per-session (supports IBKR + Databento users simultaneously, and
-                    // delivers replayed data). shouldForward remains the gate in legacy mode.
-                    if (cacheKey != null && cacheCaughtUpFlag.get()
-                            && (perSessionRouting() || shouldForward(binding, json, record))) {
+                    // Per-session mode: route directly via the engine using the authoritative
+                    // topic-binding source (bypasses the global single-source/selection/barrier gate;
+                    // supports IBKR + Databento users simultaneously). shouldForward gates legacy mode.
+                    if (perSessionRouting()) {
+                        routeOrBroadcast(binding.source(), binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                    } else if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json, record)) {
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
                         recordSelectedForward(binding, json);
@@ -1732,13 +1734,19 @@ public class FeedGatewayService {
             return;
         }
         String socketId = session.getId();
-        for (String json : cache.values()) {
+        for (Map.Entry<String, String> entry : cache.entrySet()) {
+            String json = entry.getValue();
             if (json == null || json.isBlank()) {
                 continue;
             }
             try {
                 JsonNode root = mapper.readTree(json);
-                String source = root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "";
+                // Cache keys are "SOURCE|..." (see updateCache); use that as the authoritative source
+                // since Avro contract payloads carry no marketDataSource field.
+                String key = entry.getKey();
+                int bar = key == null ? -1 : key.indexOf('|');
+                String source = bar > 0 ? key.substring(0, bar)
+                        : (root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "");
                 Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
                 if (rec.isPresent() && routingEngine.shouldDeliverToSocket(rec.get(), socketId)) {
                     send(session, event, json);
@@ -1755,12 +1763,17 @@ public class FeedGatewayService {
      * otherwise fall back to the legacy broadcast. Source is read from the payload's
      * {@code marketDataSource}; events that don't map to a routable type (e.g. HPSF) broadcast.
      */
-    private void routeOrBroadcast(String event, String json) {
+    private void routeOrBroadcast(String bindingSource, String event, String json) {
         if (perSessionRouting()) {
             SessionRoutingEngine engine = routingEngine;
             try {
                 JsonNode root = mapper.readTree(json);
-                String source = root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "";
+                // Source is authoritative from the TOPIC BINDING (OE-DDD-001 §8.6): Avro contract
+                // events (display/pace) carry no marketDataSource field, so the payload alone cannot
+                // identify the source. Fall back to the payload only if the binding source is absent.
+                String source = (bindingSource != null && !bindingSource.isBlank())
+                        ? bindingSource
+                        : (root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "");
                 Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
                 if (rec.isPresent()) {
                     for (String socketId : engine.route(rec.get())) {
@@ -1804,12 +1817,8 @@ public class FeedGatewayService {
         if (clients.isEmpty()) {
             return;
         }
-        if (perSessionRouting()) {
-            // Per-session cutover: route this event to only the matching sockets (unbatched).
-            // Per-session batching is a follow-up; correctness of isolation comes first.
-            routeOrBroadcast(event, json);
-            return;
-        }
+        // Per-session routing is handled at the consume sites (with the authoritative binding source);
+        // enqueuePending is the legacy batched path only.
         synchronized (batchLock) {
             Map<String, String> pending = pendingMap(event);
             if (pending == null) {
