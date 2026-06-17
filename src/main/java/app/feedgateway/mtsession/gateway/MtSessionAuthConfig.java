@@ -36,13 +36,33 @@ public class MtSessionAuthConfig {
     @Bean
     public TicketStore ticketStore(GatewaySettings settings) {
         String redisUri = settings.redisUri();
-        if (redisUri == null || redisUri.isBlank()) {
+        boolean hasRedis = redisUri != null && !redisUri.isBlank();
+        // Auth is enabled (this config loads only when gateway.auth.enabled=true). Outside dev/test a
+        // durable, shared ticket store is mandatory — single-use ticket redemption must hold across
+        // instances — so fail startup rather than silently fall back to the in-memory store.
+        requireDurableTicketStore(hasRedis, settings);
+        if (!hasRedis) {
             return new InMemoryTicketStore(Clock.systemUTC(), () -> UUID.randomUUID().toString());
         }
         RedisClient client = RedisClient.create(redisUri);
         StatefulRedisConnection<String, String> conn = client.connect();
         return new RedisTicketStore(conn.sync(), Clock.systemUTC(),
                 () -> UUID.randomUUID().toString(), "oe:ticket:");
+    }
+
+    /**
+     * Enforce the production ticket-store policy (req. 6): when auth is on and the profile is not
+     * dev/test, {@code GATEWAY_REDIS_URI} must be set. The in-memory store is allowed only for dev/test.
+     *
+     * @throws IllegalStateException (failing startup) if Redis is required but not configured
+     */
+    static void requireDurableTicketStore(boolean hasRedis, GatewaySettings settings) {
+        if (!hasRedis && !settings.isDevOrTest()) {
+            throw new IllegalStateException(
+                    "GATEWAY_REDIS_URI is required when GATEWAY_AUTH_ENABLED=true and APP_PROFILE is not "
+                            + "dev/test (APP_PROFILE=" + settings.appProfile() + "). The in-memory ticket store "
+                            + "is permitted only for dev/test; set GATEWAY_REDIS_URI for a durable shared store.");
+        }
     }
 
     @Bean

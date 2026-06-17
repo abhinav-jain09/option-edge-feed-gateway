@@ -233,6 +233,15 @@ public final class GatewaySettings {
         return "prod".equalsIgnoreCase(appProfile()) || "production".equalsIgnoreCase(appProfile());
     }
 
+    /**
+     * Dev/test profiles may use the in-memory ticket store; every other profile requires a durable,
+     * shared {@code GATEWAY_REDIS_URI} so single-use ticket redemption holds across gateway instances.
+     */
+    public boolean isDevOrTest() {
+        String profile = appProfile();
+        return "dev".equalsIgnoreCase(profile) || "test".equalsIgnoreCase(profile);
+    }
+
     /** Allow replay even in a prod profile (defaults off; safety guard, req. 11). */
     public boolean replayAllowInProd() {
         return boolValue("DATABENTO_REPLAY_ALLOW_PROD", false);
