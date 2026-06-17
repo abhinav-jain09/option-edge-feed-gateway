@@ -13,14 +13,14 @@ pipeline {
       steps {
         sh '''
           set -eu
-          if [ -x "$HOME/Library/Java/JavaVirtualMachines/openjdk-26.0.1/Contents/Home/bin/java" ]; then
-            export JAVA_HOME="$HOME/Library/Java/JavaVirtualMachines/openjdk-26.0.1/Contents/Home"
-          elif [ -x /usr/lib/jvm/java-26/bin/java ]; then
-            export JAVA_HOME=/usr/lib/jvm/java-26
+          if [ -x "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java" ]; then
+            export JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
+          elif [ -x /usr/lib/jvm/java-21/bin/java ]; then
+            export JAVA_HOME=/usr/lib/jvm/java-21
           elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
             export JAVA_HOME="$JAVA_HOME"
           else
-            echo "Java 26 was not found on this Jenkins agent" >&2
+            echo "Java 21 was not found on this Jenkins agent" >&2
             exit 1
           fi
           export MAVEN_SKIP_RC=true
@@ -37,14 +37,14 @@ pipeline {
       steps {
         sh '''
           set -eu
-          if [ -x "$HOME/Library/Java/JavaVirtualMachines/openjdk-26.0.1/Contents/Home/bin/java" ]; then
-            export JAVA_HOME="$HOME/Library/Java/JavaVirtualMachines/openjdk-26.0.1/Contents/Home"
-          elif [ -x /usr/lib/jvm/java-26/bin/java ]; then
-            export JAVA_HOME=/usr/lib/jvm/java-26
+          if [ -x "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java" ]; then
+            export JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
+          elif [ -x /usr/lib/jvm/java-21/bin/java ]; then
+            export JAVA_HOME=/usr/lib/jvm/java-21
           elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
             export JAVA_HOME="$JAVA_HOME"
           else
-            echo "Java 26 was not found on this Jenkins agent" >&2
+            echo "Java 21 was not found on this Jenkins agent" >&2
             exit 1
           fi
           export MAVEN_SKIP_RC=true
@@ -58,14 +58,14 @@ pipeline {
       steps {
         sh '''
           set -eu
-          if [ -x "$HOME/Library/Java/JavaVirtualMachines/openjdk-26.0.1/Contents/Home/bin/java" ]; then
-            export JAVA_HOME="$HOME/Library/Java/JavaVirtualMachines/openjdk-26.0.1/Contents/Home"
-          elif [ -x /usr/lib/jvm/java-26/bin/java ]; then
-            export JAVA_HOME=/usr/lib/jvm/java-26
+          if [ -x "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java" ]; then
+            export JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
+          elif [ -x /usr/lib/jvm/java-21/bin/java ]; then
+            export JAVA_HOME=/usr/lib/jvm/java-21
           elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
             export JAVA_HOME="$JAVA_HOME"
           else
-            echo "Java 26 was not found on this Jenkins agent" >&2
+            echo "Java 21 was not found on this Jenkins agent" >&2
             exit 1
           fi
           export MAVEN_SKIP_RC=true
