@@ -40,6 +40,11 @@ public final class GatewaySettings {
         return value("GATEWAY_KEYCLOAK_CLIENT_ID", "options-edge-web");
     }
 
+    /** Where the gateway fetches Keycloak signing keys; may differ from the issuer (proxy/split-horizon). */
+    public String keycloakJwksUrl() {
+        return value("GATEWAY_KEYCLOAK_JWKS_URL", "");
+    }
+
     public String redisUri() {
         return value("GATEWAY_REDIS_URI", "");
     }

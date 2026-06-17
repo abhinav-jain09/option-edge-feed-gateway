@@ -54,7 +54,7 @@ public class MtSessionAuthConfig {
                 throw new JwtVerificationException("GATEWAY_KEYCLOAK_ISSUER is not configured");
             };
         }
-        return new KeycloakJwtVerifier(issuer, settings.keycloakClientId());
+        return new KeycloakJwtVerifier(issuer, settings.keycloakJwksUrl(), settings.keycloakClientId());
     }
 
     @Bean

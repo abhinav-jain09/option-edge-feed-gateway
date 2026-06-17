@@ -2,6 +2,8 @@
   "realm": "optionsedge",
   "enabled": true,
   "sslRequired": "none",
+  "registrationAllowed": true,
+  "registrationEmailAsUsername": false,
   "accessTokenLifespan": 300,
   "roles": {
     "realm": [

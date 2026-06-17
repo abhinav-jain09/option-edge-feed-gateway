@@ -42,17 +42,31 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
      * @param expectedClientId required {@code azp}, or {@code null} to skip the azp check
      */
     public KeycloakJwtVerifier(String issuerUri, String expectedClientId) {
-        this.issuer = Objects.requireNonNull(issuerUri, "issuerUri");
-        this.expectedClientId = expectedClientId;
-        this.processor = buildProcessor(issuerUri);
+        this(issuerUri, null, expectedClientId);
     }
 
-    private static ConfigurableJWTProcessor<SecurityContext> buildProcessor(String issuerUri) {
+    /**
+     * @param issuerUri        the issuer the tokens carry (validated exactly), e.g. as seen by the browser
+     * @param jwksUrlOverride  where to fetch signing keys (may differ from the issuer when Keycloak is
+     *                         reached via a different network path — the "behind a proxy" pattern);
+     *                         null → derive from the issuer
+     * @param expectedClientId required {@code azp}, or {@code null} to skip the azp check
+     */
+    public KeycloakJwtVerifier(String issuerUri, String jwksUrlOverride, String expectedClientId) {
+        this.issuer = Objects.requireNonNull(issuerUri, "issuerUri");
+        this.expectedClientId = expectedClientId;
+        String jwksUrl = (jwksUrlOverride == null || jwksUrlOverride.isBlank())
+                ? issuerUri + "/protocol/openid-connect/certs"
+                : jwksUrlOverride;
+        this.processor = buildProcessor(issuerUri, jwksUrl);
+    }
+
+    private static ConfigurableJWTProcessor<SecurityContext> buildProcessor(String issuerUri, String jwksUrlStr) {
         URL jwksUrl;
         try {
-            jwksUrl = URI.create(issuerUri + "/protocol/openid-connect/certs").toURL();
+            jwksUrl = URI.create(jwksUrlStr).toURL();
         } catch (MalformedURLException | IllegalArgumentException e) {
-            throw new IllegalArgumentException("Invalid issuer URI: " + issuerUri, e);
+            throw new IllegalArgumentException("Invalid JWKS URL: " + jwksUrlStr, e);
         }
         JWKSource<SecurityContext> jwkSource = JWKSourceBuilder.create(jwksUrl).build();
         JWSKeySelector<SecurityContext> keySelector =

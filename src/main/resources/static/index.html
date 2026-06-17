@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OptionsEdge — Sign in</title>
+  <script src="http://localhost:8080/js/keycloak.js"></script>
+  <style>
+    :root { --bg:#0f172a; --panel:#1e293b; --accent:#2563eb; --green:#16a34a; --text:#e2e8f0; --muted:#94a3b8; --line:#334155; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:14px 22px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; }
+    header h1 { font-size:18px; margin:0; font-weight:700; }
+    header .sp { flex:1; }
+    .pill { font-size:12px; color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:3px 10px; }
+    main { max-width:980px; margin:36px auto; padding:0 20px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:26px; }
+    .center { text-align:center; }
+    h2 { margin:0 0 6px; }
+    p.muted { color:var(--muted); margin:6px 0 22px; }
+    button { font:inherit; border:0; border-radius:9px; padding:11px 18px; cursor:pointer; font-weight:600; }
+    .primary { background:var(--accent); color:#fff; }
+    .ghost { background:transparent; color:var(--text); border:1px solid var(--line); }
+    .row { display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin:18px 0; }
+    .stat { background:#0b1220; border:1px solid var(--line); border-radius:10px; padding:14px; }
+    .stat .k { color:var(--muted); font-size:12px; } .stat .v { font-size:20px; font-weight:700; margin-top:4px; }
+    label { display:block; color:var(--muted); font-size:12px; margin:10px 0 4px; }
+    select,input { width:100%; padding:9px; background:#0b1220; color:var(--text); border:1px solid var(--line); border-radius:8px; }
+    .controls { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:12px; align-items:end; }
+    table { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
+    th,td { text-align:right; padding:6px 10px; border-bottom:1px solid var(--line); }
+    th:first-child,td:first-child { text-align:left; }
+    .tag { font-size:11px; padding:2px 8px; border-radius:6px; background:#0b1220; border:1px solid var(--line); color:var(--muted); }
+    .ok { color:var(--green); } .err { color:#f87171; }
+    code { background:#0b1220; padding:2px 6px; border-radius:5px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>OptionsEdge</h1>
+    <span class="pill" id="env">multi-tenant gateway</span>
+    <span class="sp"></span>
+    <span class="pill" id="who" style="display:none"></span>
+    <button class="ghost" id="logout" style="display:none">Sign out</button>
+  </header>
+  <main id="main"><div class="card center"><h2>Loading…</h2></div></main>
+
+<script>
+const KC_URL = "http://localhost:8080", REALM = "optionsedge", CLIENT = "options-edge-web";
+const kc = new Keycloak({ url: KC_URL, realm: REALM, clientId: CLIENT });
+let ws = null, msgs = 0, strikes = {};
+const main = document.getElementById("main");
+
+function viewLoggedOut() {
+  document.getElementById("who").style.display = "none";
+  document.getElementById("logout").style.display = "none";
+  main.innerHTML = `
+    <div class="card center">
+      <h2>Welcome to OptionsEdge</h2>
+      <p class="muted">Sign in to your account, or create a new one to request access.</p>
+      <div class="row">
+        <button class="primary" id="signin">Sign in</button>
+        <button class="ghost" id="signup">Create account</button>
+      </div>
+      <p class="muted" style="margin-top:22px">New accounts may require administrator approval before market data is available.</p>
+    </div>`;
+  document.getElementById("signin").onclick = () => kc.login();
+  document.getElementById("signup").onclick = () => kc.register();
+}
+
+function viewApp() {
+  const t = kc.tokenParsed || {};
+  const roles = (t.realm_access && t.realm_access.roles || []).filter(r => ["user","ibkr-user","trader","admin"].includes(r));
+  document.getElementById("who").style.display = "";
+  document.getElementById("who").textContent = (t.preferred_username || "user") + " · " + (roles.join(", ") || "no roles");
+  document.getElementById("logout").style.display = "";
+  const ibkr = roles.includes("ibkr-user");
+  main.innerHTML = `
+    <div class="card">
+      <h2>You're in, ${t.given_name || t.preferred_username || "trader"} 👋</h2>
+      <p class="muted">Authenticated via Keycloak. Choose a feed and enter the live application.</p>
+      <div class="controls">
+        <div><label>Source</label><select id="src">
+          <option value="DATABENTO">DATABENTO</option>
+          ${ibkr ? '<option value="IBKR">IBKR</option>' : ''}
+        </select></div>
+        <div><label>Symbol</label><input id="sym" value="SPX"></div>
+        <div><label>Expiry</label><input id="exp" value="20260617"></div>
+        <div><label>Strike from</label><input id="lo" value="0"></div>
+        <div><label>Strike to</label><input id="hi" value="1000000"></div>
+        <div><button class="primary" id="enter">Enter application →</button></div>
+      </div>
+      <div class="grid">
+        <div class="stat"><div class="k">Connection</div><div class="v" id="conn">—</div></div>
+        <div class="stat"><div class="k">Messages</div><div class="v" id="m">0</div></div>
+        <div class="stat"><div class="k">Distinct strikes</div><div class="v" id="ds">0</div></div>
+        <div class="stat"><div class="k">Strike range</div><div class="v" id="rng">—</div></div>
+      </div>
+      <table><thead><tr><th>Strike</th><th>Updates</th></tr></thead><tbody id="rows"></tbody></table>
+    </div>`;
+  document.getElementById("enter").onclick = enterApp;
+}
+
+async function enterApp() {
+  if (ws) { try { ws.close(); } catch(e){} ws = null; }
+  msgs = 0; strikes = {}; render();
+  const body = {
+    source: document.getElementById("src").value,
+    symbol: document.getElementById("sym").value,
+    expiry: document.getElementById("exp").value,
+    strikeLo: parseFloat(document.getElementById("lo").value),
+    strikeHi: parseFloat(document.getElementById("hi").value)
+  };
+  document.getElementById("conn").textContent = "minting ticket…";
+  await kc.updateToken(30);
+  let ticket;
+  try {
+    const r = await fetch("/api/ws-ticket", { method:"POST",
+      headers:{ "Authorization":"Bearer "+kc.token, "Content-Type":"application/json" },
+      body: JSON.stringify(body) });
+    if (!r.ok) { document.getElementById("conn").innerHTML = '<span class="err">'+r.status+' '+(await r.text())+'</span>'; return; }
+    ticket = (await r.json()).ticket;
+  } catch (e) { document.getElementById("conn").innerHTML = '<span class="err">ticket error</span>'; return; }
+
+  const wsUrl = (location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws/events?ticket="+ticket;
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => { document.getElementById("conn").innerHTML = '<span class="ok">connected</span>'; };
+  ws.onclose = () => { document.getElementById("conn").innerHTML = '<span class="err">closed</span>'; };
+  ws.onerror = () => { document.getElementById("conn").innerHTML = '<span class="err">error</span>'; };
+  ws.onmessage = (ev) => {
+    msgs++;
+    try { scan(JSON.parse(ev.data)); } catch(e){}
+    render();
+  };
+}
+
+function scan(o) {
+  if (o && typeof o === "object") {
+    if (typeof o.strike === "number") strikes[o.strike] = (strikes[o.strike]||0)+1;
+    for (const k in o) scan(o[k]);
+  }
+}
+function render() {
+  document.getElementById("m").textContent = msgs;
+  const ks = Object.keys(strikes).map(Number).sort((a,b)=>a-b);
+  document.getElementById("ds").textContent = ks.length;
+  document.getElementById("rng").textContent = ks.length ? (ks[0]+" … "+ks[ks.length-1]) : "—";
+  const rows = document.getElementById("rows");
+  rows.innerHTML = ks.slice(0,40).map(k => `<tr><td>${k}</td><td>${strikes[k]}</td></tr>`).join("");
+}
+
+kc.init({ onLoad: "check-sso", pkceMethod: "S256" })
+  .then(auth => {
+    document.getElementById("logout").onclick = () => kc.logout();
+    auth ? viewApp() : viewLoggedOut();
+  })
+  .catch(() => { main.innerHTML = '<div class="card center err"><h2>Keycloak unavailable</h2><p class="muted">Is Keycloak reachable at '+KC_URL+'?</p></div>'; });
+</script>
+</body>
+</html>
