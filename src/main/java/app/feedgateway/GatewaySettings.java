@@ -219,6 +219,35 @@ public final class GatewaySettings {
         return longValue("MARKETDATA_GATEWAY_MAX_STALE_MS", 15_000L, 0L);
     }
 
+    /** Per-session historical replay (Live↔Replay switching) is enabled only when this flag is on. */
+    public boolean replayUiEnabled() {
+        return boolValue("DATABENTO_REPLAY_UI_ENABLED", false);
+    }
+
+    /** Runtime profile (dev/staging/prod). Replay is rejected in prod unless explicitly allowed. */
+    public String appProfile() {
+        return value("APP_PROFILE", "dev");
+    }
+
+    public boolean isProd() {
+        return "prod".equalsIgnoreCase(appProfile()) || "production".equalsIgnoreCase(appProfile());
+    }
+
+    /** Allow replay even in a prod profile (defaults off; safety guard, req. 11). */
+    public boolean replayAllowInProd() {
+        return boolValue("DATABENTO_REPLAY_ALLOW_PROD", false);
+    }
+
+    /** Hard upper bound on a replay window (req. 11: max 30 minutes). */
+    public long replayMaxWindowMs() {
+        return longValue("GATEWAY_REPLAY_MAX_WINDOW_MS", 30L * 60L * 1000L, 60_000L);
+    }
+
+    /** Hard upper bound on records streamed in one replay run (req. 11: bounded). */
+    public int replayMaxRecords() {
+        return intValue("GATEWAY_REPLAY_MAX_RECORDS", 200_000, 1);
+    }
+
     public static String value(String key, String fallback) {
         String env = System.getenv(key);
         if (env != null && !env.isBlank()) {

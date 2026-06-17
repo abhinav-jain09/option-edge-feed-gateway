@@ -274,6 +274,9 @@ public final class SessionRoutingEngine {
             if (app == null) {
                 continue;
             }
+            if (app.isReplaying()) {
+                continue; // I4 — a replaying session receives ONLY its private replay stream, never live
+            }
             if (!passesBarrier(app, record.selectionEpoch())) {
                 continue;
             }
@@ -299,6 +302,28 @@ public final class SessionRoutingEngine {
      */
     public boolean shouldDeliverToSocket(RoutableRecord record, String socketId) {
         return route(record).contains(socketId);
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-session Live↔Replay mode (req. 7/8 — isolated replay routing)
+    // ---------------------------------------------------------------------
+
+    /** Enter/leave replay mode for one AppSession. While replaying, {@link #route} skips its sockets. */
+    public void setReplayMode(String appSessionId, boolean replaying) {
+        AppSession app = require(appSessionId);
+        app.setReplaying(replaying);
+        app.touch(clock.millis());
+    }
+
+    public boolean isReplaying(String appSessionId) {
+        AppSession app = appSessions.get(appSessionId);
+        return app != null && app.isReplaying();
+    }
+
+    /** Sockets currently attached to an AppSession — the only recipients of its replay stream. */
+    public Set<String> socketsForAppSession(String appSessionId) {
+        AppSession app = appSessions.get(appSessionId);
+        return app == null ? Set.of() : new LinkedHashSet<>(app.socketIds());
     }
 
     // ---------------------------------------------------------------------

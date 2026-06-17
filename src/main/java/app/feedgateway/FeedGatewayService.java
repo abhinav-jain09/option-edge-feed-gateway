@@ -5,7 +5,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import app.feedgateway.mtsession.RoutableRecord;
+import app.feedgateway.mtsession.AppSession;
+import app.feedgateway.mtsession.MarketDataSource;
 import app.feedgateway.mtsession.SessionRoutingEngine;
+import app.feedgateway.mtsession.gateway.ReplayParams;
+import app.feedgateway.mtsession.gateway.ReplayRunner;
 import app.feedgateway.mtsession.gateway.GatewayRecordMapper;
 import java.util.Optional;
 import org.springframework.lang.Nullable;
@@ -38,6 +42,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,7 +59,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Service
-public class FeedGatewayService {
+public class FeedGatewayService implements ReplayRunner {
     private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
     private final ObjectMapper mapper;
@@ -103,6 +108,7 @@ public class FeedGatewayService {
     private final AtomicLong consumerRestarts = new AtomicLong();
     private final AtomicLong forwardedEvents = new AtomicLong();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
+    private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
     private final AtomicLong seekToLatestEvents = new AtomicLong();
     private final AtomicLong sourceStaleEvents = new AtomicLong();
@@ -293,6 +299,7 @@ public class FeedGatewayService {
                 + "\"batchesSent\":" + batchesSent.get() + ","
                 + "\"forwardedEvents\":" + forwardedEvents.get() + ","
                 + "\"inactiveDroppedEvents\":" + inactiveDroppedEvents.get() + ","
+                + "\"droppedNonRoutableEvents\":" + droppedNonRoutableEvents.get() + ","
                 + "\"staleDroppedEvents\":" + staleDroppedEvents.get() + ","
                 + "\"seekToLatestEvents\":" + seekToLatestEvents.get() + ","
                 + "\"sourceStaleEvents\":" + sourceStaleEvents.get() + ","
@@ -383,6 +390,9 @@ public class FeedGatewayService {
                 + "# HELP options_edge_gateway_inactive_dropped_total Inactive-source records consumed but not forwarded.\n"
                 + "# TYPE options_edge_gateway_inactive_dropped_total counter\n"
                 + "options_edge_gateway_inactive_dropped_total " + inactiveDroppedEvents.get() + "\n"
+                + "# HELP options_edge_gateway_dropped_non_routable_total Malformed/unroutable market-data events dropped (per-session mode, not broadcast).\n"
+                + "# TYPE options_edge_gateway_dropped_non_routable_total counter\n"
+                + "options_edge_gateway_dropped_non_routable_total " + droppedNonRoutableEvents.get() + "\n"
                 + "# HELP options_edge_gateway_stale_dropped_total Selected-source records dropped behind the active switch barrier.\n"
                 + "# TYPE options_edge_gateway_stale_dropped_total counter\n"
                 + "options_edge_gateway_stale_dropped_total " + staleDroppedEvents.get() + "\n"
@@ -1380,9 +1390,15 @@ public class FeedGatewayService {
         if (cachedEvents.isEmpty()) {
             return false;
         }
-        String envelope = uiBatchEnvelopeJson(cachedEvents);
-        for (WebSocketSession client : clients) {
-            sendEnvelope(client, envelope);
+        // Per-session mode: cached market-data state is replayed per-socket on connect
+        // (replayCachedToSocket, FR-11); never fan a global ui-batch of snapshots/paces to all.
+        if (perSessionRouting()) {
+            droppedNonRoutableEvents.addAndGet(cachedEvents.size());
+        } else {
+            String envelope = uiBatchEnvelopeJson(cachedEvents);
+            for (WebSocketSession client : clients) {
+                sendEnvelope(client, envelope);
+            }
         }
         return cachedEvents.stream().anyMatch(cachedEvent -> "snapshot".equals(cachedEvent.event()));
     }
@@ -1714,6 +1730,13 @@ public class FeedGatewayService {
     }
 
     private void broadcast(String event, String json) {
+        // Per-session routing: only explicitly allowlisted global events may fan out to every
+        // socket. Any other event reaching here (e.g. a market-data event via a fallback path) is
+        // dropped so it can never leak to another user. Legacy mode broadcasts everything.
+        if (perSessionRouting() && !isGlobalBroadcastEvent(event)) {
+            droppedNonRoutableEvents.incrementAndGet();
+            return;
+        }
         for (WebSocketSession client : clients) {
             send(client, event, json);
         }
@@ -1757,11 +1780,252 @@ public class FeedGatewayService {
         }
     }
 
+    // =====================================================================
+    // Per-session historical replay (ReplayRunner, reqs 7/8). Reads historical
+    // records READ-ONLY (assign + seek, auto-commit off) and streams them ONLY to
+    // the requesting session's sockets. Nothing is ever published to live topics.
+    // While a session replays, SessionRoutingEngine.route() skips it, so other
+    // users keep receiving live data uninterrupted (req. 7).
+    // =====================================================================
+
+    private final Map<String, AtomicBoolean> replayRunning = new ConcurrentHashMap<>();
+
+    @Override
+    public ReplayRunner.Mode startReplay(ReplayParams params) {
+        if (routingEngine == null) {
+            throw new IllegalStateException("per-session routing is not enabled");
+        }
+        String appSessionId = params.sessionId();
+        stopReplay(appSessionId); // cancel any prior run for this session
+        routingEngine.setReplayMode(appSessionId, true);
+        // Clear the live rows and flip the UI badge (reqs 9).
+        sendToAppSession(appSessionId, "reset", "{\"reason\":\"replay-start\"}");
+        sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_RUNNING", params, 0L));
+        AtomicBoolean flag = new AtomicBoolean(true);
+        replayRunning.put(appSessionId, flag);
+        Thread thread = new Thread(() -> runReplay(appSessionId, params, flag), "replay-" + appSessionId);
+        thread.setDaemon(true);
+        thread.start();
+        return ReplayRunner.Mode.REPLAY_RUNNING;
+    }
+
+    @Override
+    public ReplayRunner.Mode stopReplay(String appSessionId) {
+        AtomicBoolean flag = replayRunning.remove(appSessionId);
+        if (flag != null) {
+            flag.set(false); // signal the reader thread to halt
+        }
+        return ReplayRunner.Mode.REPLAY_COMPLETE; // stays in replay mode until the user returns to live
+    }
+
+    @Override
+    public ReplayRunner.Mode resumeLive(String appSessionId) {
+        stopReplay(appSessionId);
+        if (routingEngine != null) {
+            routingEngine.setReplayMode(appSessionId, false);
+        }
+        // Clear replay rows and re-seed the latest live cache, then live routing resumes (req. 10).
+        sendToAppSession(appSessionId, "reset", "{\"reason\":\"return-to-live\"}");
+        replayLiveCacheToAppSession(appSessionId);
+        sendToAppSession(appSessionId, "replay-status", "{\"mode\":\"LIVE\"}");
+        return ReplayRunner.Mode.LIVE;
+    }
+
+    private void runReplay(String appSessionId, ReplayParams params, AtomicBoolean flag) {
+        MarketDataSource source = routingEngine.appSession(appSessionId)
+                .map(app -> app.selection().source()).orElse(null);
+        long delivered = 0L;
+        if (source != null) {
+            Map<String, String> avroTopics = new LinkedHashMap<>();
+            Map<String, String> stringTopics = new LinkedHashMap<>();
+            if (source == MarketDataSource.DATABENTO) {
+                avroTopics.put(settings.databentoDisplayTopic(), "snapshot");
+                avroTopics.put(settings.databentoPaceTopic(), "pace");
+                avroTopics.put(settings.databentoDirectionalPressureTopic(), "directional-pressure");
+                stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
+                stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
+            } else {
+                avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
+                avroTopics.put(settings.ibkrPaceTopic(), "pace");
+                avroTopics.put(settings.ibkrDirectionalPressureTopic(), "directional-pressure");
+                stringTopics.put(settings.ibkrUnusualWhalesGexTopic(), "gex-by-strike");
+                stringTopics.put(settings.ibkrVixPriceTopic(), "vix-price");
+            }
+            try {
+                delivered += replayWindow(appSessionId, params, source, avroTopics, true, flag, delivered);
+                delivered += replayWindow(appSessionId, params, source, stringTopics, false, flag, delivered);
+            } catch (RuntimeException e) {
+                sendToAppSession(appSessionId, "replay-status", "{\"mode\":\"REPLAY_COMPLETE\",\"error\":\""
+                        + escapeJson(String.valueOf(e.getMessage())) + "\"}");
+            }
+        }
+        replayRunning.remove(appSessionId, flag);
+        sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_COMPLETE", params, delivered));
+    }
+
+    /** Read one consumer's records in [startUtcMs, endUtcMs) and stream matches to the session. */
+    private long replayWindow(String appSessionId, ReplayParams params, MarketDataSource source,
+                              Map<String, String> topicEvents, boolean avro, AtomicBoolean flag, long alreadyDelivered) {
+        if (topicEvents.isEmpty()) {
+            return 0L;
+        }
+        Properties props = avro
+                ? avroConsumerProperties("replay-" + appSessionId)
+                : stringObjectConsumerProperties("replay-" + appSessionId);
+        // Unique group per run so the windowed read is independent and commits nothing (read-only).
+        props.put(ConsumerConfig.GROUP_ID_CONFIG,
+                settings.groupIdBase() + "-replay-" + appSessionId + "-" + (avro ? "avro" : "str"));
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        long delivered = 0L;
+        try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(props)) {
+            List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
+            consumer.assign(partitions);
+            Map<TopicPartition, Long> startQuery = new HashMap<>();
+            Map<TopicPartition, Long> endQuery = new HashMap<>();
+            for (TopicPartition tp : partitions) {
+                startQuery.put(tp, params.startUtcMs());
+                endQuery.put(tp, params.endUtcMs());
+            }
+            Map<TopicPartition, OffsetAndTimestamp> startOffsets = consumer.offsetsForTimes(startQuery);
+            Map<TopicPartition, OffsetAndTimestamp> endOffsets = consumer.offsetsForTimes(endQuery);
+            Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
+            Map<TopicPartition, Long> endTarget = new HashMap<>();
+            List<TopicPartition> active = new ArrayList<>();
+            for (TopicPartition tp : partitions) {
+                OffsetAndTimestamp start = startOffsets.get(tp);
+                if (start == null) {
+                    continue; // no records at/after the window start
+                }
+                OffsetAndTimestamp end = endOffsets.get(tp);
+                long target = end != null ? end.offset() : logEnd.getOrDefault(tp, start.offset());
+                if (target <= start.offset()) {
+                    continue; // empty window on this partition
+                }
+                consumer.seek(tp, start.offset());
+                endTarget.put(tp, target);
+                active.add(tp);
+            }
+            if (active.isEmpty()) {
+                return 0L;
+            }
+            int maxRecords = params.maxRecords();
+            Set<TopicPartition> done = new HashSet<>();
+            while (flag.get() && running.get() && done.size() < active.size()
+                    && (alreadyDelivered + delivered) < maxRecords) {
+                ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                boolean advanced = false;
+                for (TopicPartition tp : active) {
+                    if (done.contains(tp)) {
+                        continue;
+                    }
+                    for (ConsumerRecord<String, Object> rec : records.records(tp)) {
+                        if (rec.offset() >= endTarget.get(tp)) {
+                            break;
+                        }
+                        if ((alreadyDelivered + delivered) >= maxRecords) {
+                            break;
+                        }
+                        advanced = true;
+                        String event = topicEvents.get(tp.topic());
+                        String json = enrichJson(avro ? avroJson(rec.value()) : stringJson(rec.value()),
+                                new TopicBinding(source.name(), event));
+                        if (json == null || json.isBlank()) {
+                            continue;
+                        }
+                        if (replayMatches(params, event, json)) {
+                            sendToAppSession(appSessionId, event, json);
+                            delivered++;
+                        }
+                    }
+                    if (consumer.position(tp) >= endTarget.get(tp)) {
+                        done.add(tp);
+                    }
+                }
+                if (records.isEmpty() && !advanced) {
+                    break; // window exhausted (no more data forthcoming)
+                }
+            }
+        }
+        return delivered;
+    }
+
+    /** A replay record matches the session: same contract (symbol+expiry) and inside the strike window. */
+    private boolean replayMatches(ReplayParams params, String event, String json) {
+        if ("index-price".equals(event) || "vix-price".equals(event)) {
+            return true; // underlying/vix carry no strike and a different symbol — always relevant
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
+            String expiry = root.hasNonNull("expiry") ? GatewaySettings.normalizeExpiry(root.get("expiry").asText("")) : "";
+            if (!params.symbol().equalsIgnoreCase(symbol) || !params.expiry().equals(expiry)) {
+                return false;
+            }
+            if (routingEngine != null && root.hasNonNull("strike") && root.get("strike").isNumber()) {
+                AppSession app = routingEngine.appSession(params.sessionId()).orElse(null);
+                if (app != null && !app.selection().strikeWindow().contains(root.get("strike").asDouble())) {
+                    return false; // per-user strike-window filter (same as live)
+                }
+            }
+            return true;
+        } catch (JsonProcessingException e) {
+            return false;
+        }
+    }
+
+    private void sendToAppSession(String appSessionId, String event, String json) {
+        if (routingEngine == null) {
+            return;
+        }
+        for (String socketId : routingEngine.socketsForAppSession(appSessionId)) {
+            WebSocketSession s = clientsById.get(socketId);
+            if (s != null) {
+                send(s, event, json);
+            }
+        }
+    }
+
+    private void replayLiveCacheToAppSession(String appSessionId) {
+        if (routingEngine == null) {
+            return;
+        }
+        for (String socketId : routingEngine.socketsForAppSession(appSessionId)) {
+            WebSocketSession s = clientsById.get(socketId);
+            if (s != null) {
+                replayCachedToSocket(s);
+            }
+        }
+    }
+
+    private String replayStatusJson(String mode, ReplayParams params, long delivered) {
+        return "{\"mode\":\"" + mode + "\",\"symbol\":\"" + escapeJson(params.symbol())
+                + "\",\"expiry\":\"" + escapeJson(params.expiry())
+                + "\",\"startUtcMs\":" + params.startUtcMs() + ",\"endUtcMs\":" + params.endUtcMs()
+                + ",\"records\":" + delivered + ",\"maxRecords\":" + params.maxRecords() + "}";
+    }
+
+    /**
+     * Events that may legitimately fan out to every connected socket while per-session routing is
+     * active. These are connection/selection lifecycle signals — identical for all users and
+     * carrying no per-user market data. Everything else (snapshot/pace/strike-flow/etc., and any
+     * malformed or unroutable payload) is DROPPED rather than broadcast in per-session mode, so a
+     * per-user market-data event can never reach another user's socket.
+     */
+    static final Set<String> GLOBAL_BROADCAST_EVENTS = Set.of(
+            "status", "reset", "source-switching", "source-ready", "source-stale");
+
+    static boolean isGlobalBroadcastEvent(String event) {
+        return GLOBAL_BROADCAST_EVENTS.contains(event);
+    }
+
     /**
      * Per-session routing cutover (OE-DDD-001 §8, finding #3): when enabled, deliver an event only
-     * to the sockets whose AppSession selection matches it (via {@link SessionRoutingEngine});
-     * otherwise fall back to the legacy broadcast. Source is read from the payload's
-     * {@code marketDataSource}; events that don't map to a routable type (e.g. HPSF) broadcast.
+     * to the sockets whose AppSession selection matches it (via {@link SessionRoutingEngine}).
+     *
+     * <p>In per-session mode there is NO broadcast fallback for market data: if the payload is
+     * malformed, or maps to no routable key (a known market-data event we couldn't key), it is
+     * dropped — never broadcast — unless it is an explicitly {@linkplain #GLOBAL_BROADCAST_EVENTS
+     * allowlisted global event}. In legacy mode the behaviour is unchanged (broadcast).
      */
     private void routeOrBroadcast(String bindingSource, String event, String json) {
         if (perSessionRouting()) {
@@ -1784,10 +2048,17 @@ public class FeedGatewayService {
                     }
                     return;
                 }
-                // unroutable event (e.g. hpsf-*): fall through to broadcast
-            } catch (JsonProcessingException ignored) {
-                // malformed JSON: fall through to broadcast
+                // Unroutable while per-session: drop unless it is an allowlisted global event.
+                if (isGlobalBroadcastEvent(event)) {
+                    broadcast(event, json);
+                } else {
+                    droppedNonRoutableEvents.incrementAndGet();
+                }
+            } catch (JsonProcessingException malformed) {
+                // Malformed payload while per-session: drop, never broadcast.
+                droppedNonRoutableEvents.incrementAndGet();
             }
+            return;
         }
         broadcast(event, json);
     }

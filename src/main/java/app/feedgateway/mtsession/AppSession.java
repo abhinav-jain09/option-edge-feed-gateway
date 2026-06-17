@@ -24,6 +24,7 @@ public final class AppSession {
     private Selection selection;
     private long epoch;
     private long lastActivityAtMillis;
+    private volatile boolean replaying; // per-session Live↔Replay mode (live delivery suppressed while true)
 
     AppSession(String id, String userId, Set<String> entitlements, Selection selection, long epoch,
                UserSessionPolicy policy, long nowMillis) {
@@ -88,6 +89,11 @@ public final class AppSession {
         return !socketIds.isEmpty();
     }
 
+    /** True while this session is in historical-replay mode; live records are not delivered to it. */
+    public boolean isReplaying() {
+        return replaying;
+    }
+
     /** True if idle longer than the policy's idle timeout (FR-18). */
     public boolean isIdleExpired(long nowMillis) {
         long idleMillis = (long) policy.idleTimeoutMinutes() * 60_000L;
@@ -107,6 +113,10 @@ public final class AppSession {
 
     void bumpEpoch() {
         this.epoch++;
+    }
+
+    void setReplaying(boolean replaying) {
+        this.replaying = replaying;
     }
 
     void touch(long nowMillis) {

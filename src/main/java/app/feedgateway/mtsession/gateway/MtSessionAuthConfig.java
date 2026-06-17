@@ -74,4 +74,18 @@ public class MtSessionAuthConfig {
                                                                  GatewaySettings settings) {
         return new TicketHandshakeInterceptor(authenticator, settings.authEnabled());
     }
+
+    /**
+     * Control plane for per-session Live↔Replay switching. The data plane ({@link ReplayRunner}) is
+     * the {@link app.feedgateway.FeedGatewayService} bean. Replay is administratively gated by
+     * {@code DATABENTO_REPLAY_UI_ENABLED} and disabled in prod unless explicitly allowed (req. 11).
+     */
+    @Bean
+    public ReplayService replayService(TokenVerifier tokenVerifier, SessionRoutingEngine engine,
+                                       ReplayRunner replayRunner, GatewaySettings settings) {
+        boolean prodBlocked = settings.isProd() && !settings.replayAllowInProd();
+        return new ReplayService(tokenVerifier, engine, replayRunner,
+                settings.replayUiEnabled(), prodBlocked,
+                settings.replayMaxWindowMs(), settings.replayMaxRecords());
+    }
 }
