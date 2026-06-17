@@ -10,6 +10,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Supplier;
 
 /**
  * The per-socket routing core (OE-DDD-001 §8.7). Owns the AppSession registry, the dual reverse
@@ -23,8 +25,11 @@ import java.util.Set;
  *   <li><b>I3</b> — all IBKR sessions resolve to the same contract key and receive identical fan-out.</li>
  * </ul>
  *
- * <p>Not internally synchronised; the gateway serialises mutation/routing on its event loop. Tests
- * drive it single-threaded.
+ * <p><b>Thread-safety:</b> internally synchronised with a {@link ReentrantReadWriteLock}. Mutations
+ * (register/change/attach/detach/teardown/sweep/forceLogout/setReplayMode) take the write lock;
+ * routing and queries (route/shouldDeliverToSocket and the observability accessors) take the read
+ * lock, so many routes/queries run concurrently but never alongside a mutation. The lock is
+ * reentrant, so nested calls (sweep→teardown, shouldDeliverToSocket→route) are safe.
  */
 public final class SessionRoutingEngine {
 
@@ -34,12 +39,40 @@ public final class SessionRoutingEngine {
     private final SubscriptionManager subscriptions;
     private final Clock clock;
     private final SharedSnapshotCache cache = new SharedSnapshotCache();
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private final Map<String, AppSession> appSessions = new LinkedHashMap<>();
     private final Map<String, Set<String>> userToApps = new LinkedHashMap<>();
     private final Map<String, String> socketToApp = new LinkedHashMap<>();
     private final Map<SubscriptionKey, Set<String>> appByContract = new LinkedHashMap<>();
     private final Map<UnderlyingKey, Set<String>> appByUnderlying = new LinkedHashMap<>();
+
+    private void runWrite(Runnable body) {
+        lock.writeLock().lock();
+        try {
+            body.run();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private <T> T callWrite(Supplier<T> body) {
+        lock.writeLock().lock();
+        try {
+            return body.get();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private <T> T callRead(Supplier<T> body) {
+        lock.readLock().lock();
+        try {
+            return body.get();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
 
     public SessionRoutingEngine(ConcurrencyLimits limits, SubscriptionManager subscriptions) {
         this(limits, subscriptions, Clock.systemUTC());
@@ -79,60 +112,66 @@ public final class SessionRoutingEngine {
         Objects.requireNonNull(selection, "selection");
         Objects.requireNonNull(approvalState, "approvalState");
         Objects.requireNonNull(policy, "policy");
-        if (appSessions.containsKey(appSessionId)) {
-            throw new IllegalStateException("AppSession already registered: " + appSessionId);
-        }
-        if (!approvalState.grantsAccess()) {
-            throw new NotApprovedException("User " + userId + " is not approved (" + approvalState + ")");
-        }
-        if (!EntitlementPolicy.canSelect(selection.source(), entitlements)) {
-            throw new NotEntitledException("User " + userId + " not entitled to source " + selection.source());
-        }
-        if (appSessions.size() >= limits.maxTotalAppSessions()) {
-            throw new CapacityException(CapacityException.Limit.TOTAL_APP_SESSIONS,
-                    "Global AppSession limit reached (" + limits.maxTotalAppSessions() + ")");
-        }
-        Set<String> userApps = userToApps.computeIfAbsent(userId, u -> new LinkedHashSet<>());
-        if (userApps.size() >= limits.maxAppSessionsPerUser()) {
-            throw new CapacityException(CapacityException.Limit.APP_SESSIONS_PER_USER,
-                    "Per-user AppSession limit reached for " + userId + " (" + limits.maxAppSessionsPerUser() + ")");
-        }
+        return callWrite(() -> {
+            if (appSessions.containsKey(appSessionId)) {
+                throw new IllegalStateException("AppSession already registered: " + appSessionId);
+            }
+            if (!approvalState.grantsAccess()) {
+                throw new NotApprovedException("User " + userId + " is not approved (" + approvalState + ")");
+            }
+            if (!EntitlementPolicy.canSelect(selection.source(), entitlements)) {
+                throw new NotEntitledException("User " + userId + " not entitled to source " + selection.source());
+            }
+            if (appSessions.size() >= limits.maxTotalAppSessions()) {
+                throw new CapacityException(CapacityException.Limit.TOTAL_APP_SESSIONS,
+                        "Global AppSession limit reached (" + limits.maxTotalAppSessions() + ")");
+            }
+            Set<String> userApps = userToApps.computeIfAbsent(userId, u -> new LinkedHashSet<>());
+            if (userApps.size() >= limits.maxAppSessionsPerUser()) {
+                throw new CapacityException(CapacityException.Limit.APP_SESSIONS_PER_USER,
+                        "Per-user AppSession limit reached for " + userId + " (" + limits.maxAppSessionsPerUser() + ")");
+            }
 
-        AppSession app = new AppSession(appSessionId, userId, entitlements == null ? Set.of() : entitlements,
-                selection, 1L, policy, clock.millis());
-        appSessions.put(appSessionId, app);
-        userApps.add(appSessionId);
-        addToIndexes(app, selection);
-        if (selection.source() == MarketDataSource.DATABENTO) {
-            subscriptions.acquire(selection.subscriptionKey(), appSessionId, selection.strikeWindow());
-        }
-        return app;
+            AppSession app = new AppSession(appSessionId, userId, entitlements == null ? Set.of() : entitlements,
+                    selection, 1L, policy, clock.millis());
+            appSessions.put(appSessionId, app);
+            userApps.add(appSessionId);
+            addToIndexes(app, selection);
+            if (selection.source() == MarketDataSource.DATABENTO) {
+                subscriptions.acquire(selection.subscriptionKey(), appSessionId, selection.strikeWindow());
+            }
+            return app;
+        });
     }
 
     /** Attach a WebSocket to an AppSession, enforcing the per-AppSession socket limit (FR-27). */
     public void attachSocket(String appSessionId, String socketId) {
-        AppSession app = require(appSessionId);
-        if (socketToApp.containsKey(socketId)) {
-            throw new IllegalStateException("Socket already attached: " + socketId);
-        }
-        if (app.socketIds().size() >= limits.maxSocketsPerAppSession()) {
-            throw new CapacityException(CapacityException.Limit.SOCKETS_PER_APP_SESSION,
-                    "Per-AppSession socket limit reached for " + appSessionId + " (" + limits.maxSocketsPerAppSession() + ")");
-        }
-        socketToApp.put(socketId, appSessionId);
-        app.addSocket(socketId);
-        app.touch(clock.millis());
+        runWrite(() -> {
+            AppSession app = require(appSessionId);
+            if (socketToApp.containsKey(socketId)) {
+                throw new IllegalStateException("Socket already attached: " + socketId);
+            }
+            if (app.socketIds().size() >= limits.maxSocketsPerAppSession()) {
+                throw new CapacityException(CapacityException.Limit.SOCKETS_PER_APP_SESSION,
+                        "Per-AppSession socket limit reached for " + appSessionId + " (" + limits.maxSocketsPerAppSession() + ")");
+            }
+            socketToApp.put(socketId, appSessionId);
+            app.addSocket(socketId);
+            app.touch(clock.millis());
+        });
     }
 
     /** Detach a socket; the AppSession persists (grace window is the caller's policy, FR-11/§6.2). */
     public void detachSocket(String socketId) {
-        String appId = socketToApp.remove(socketId);
-        if (appId != null) {
-            AppSession app = appSessions.get(appId);
-            if (app != null) {
-                app.removeSocket(socketId);
+        runWrite(() -> {
+            String appId = socketToApp.remove(socketId);
+            if (appId != null) {
+                AppSession app = appSessions.get(appId);
+                if (app != null) {
+                    app.removeSocket(socketId);
+                }
             }
-        }
+        });
     }
 
     /**
@@ -140,31 +179,35 @@ public final class SessionRoutingEngine {
      * per-session epoch so stale pre-switch records are dropped for this session only (§8.3).
      */
     public void changeSelection(String appSessionId, Selection newSelection) {
-        AppSession app = require(appSessionId);
         Objects.requireNonNull(newSelection, "newSelection");
-        if (!EntitlementPolicy.canSelect(newSelection.source(), app.entitlements())) {
-            throw new NotEntitledException("AppSession " + appSessionId + " not entitled to source " + newSelection.source());
-        }
-        Selection old = app.selection();
-        removeFromIndexes(app, old);
-        if (old.source() == MarketDataSource.DATABENTO) {
-            subscriptions.release(old.subscriptionKey(), appSessionId);
-        }
-        app.setSelection(newSelection);
-        addToIndexes(app, newSelection);
-        if (newSelection.source() == MarketDataSource.DATABENTO) {
-            subscriptions.acquire(newSelection.subscriptionKey(), appSessionId, newSelection.strikeWindow());
-        }
-        app.bumpEpoch();
-        app.touch(clock.millis());
+        runWrite(() -> {
+            AppSession app = require(appSessionId);
+            if (!EntitlementPolicy.canSelect(newSelection.source(), app.entitlements())) {
+                throw new NotEntitledException("AppSession " + appSessionId + " not entitled to source " + newSelection.source());
+            }
+            Selection old = app.selection();
+            removeFromIndexes(app, old);
+            if (old.source() == MarketDataSource.DATABENTO) {
+                subscriptions.release(old.subscriptionKey(), appSessionId);
+            }
+            app.setSelection(newSelection);
+            addToIndexes(app, newSelection);
+            if (newSelection.source() == MarketDataSource.DATABENTO) {
+                subscriptions.acquire(newSelection.subscriptionKey(), appSessionId, newSelection.strikeWindow());
+            }
+            app.bumpEpoch();
+            app.touch(clock.millis());
+        });
     }
 
     /** Refresh the activity timestamp for an AppSession (heartbeat / data ack), deferring idle timeout. */
     public void touchActivity(String appSessionId) {
-        AppSession app = appSessions.get(appSessionId);
-        if (app != null) {
-            app.touch(clock.millis());
-        }
+        runWrite(() -> {
+            AppSession app = appSessions.get(appSessionId);
+            if (app != null) {
+                app.touch(clock.millis());
+            }
+        });
     }
 
     /**
@@ -173,26 +216,28 @@ public final class SessionRoutingEngine {
      * @return the ids of the sockets that were attached and must now be closed by the caller.
      */
     public Set<String> teardownAppSession(String appSessionId) {
-        AppSession app = appSessions.remove(appSessionId);
-        if (app == null) {
-            return Set.of();
-        }
-        Set<String> closedSockets = new LinkedHashSet<>(app.socketIds());
-        removeFromIndexes(app, app.selection());
-        if (app.selection().source() == MarketDataSource.DATABENTO) {
-            subscriptions.release(app.selection().subscriptionKey(), appSessionId);
-        }
-        for (String socketId : closedSockets) {
-            socketToApp.remove(socketId);
-        }
-        Set<String> userApps = userToApps.get(app.userId());
-        if (userApps != null) {
-            userApps.remove(appSessionId);
-            if (userApps.isEmpty()) {
-                userToApps.remove(app.userId());
+        return callWrite(() -> {
+            AppSession app = appSessions.remove(appSessionId);
+            if (app == null) {
+                return Set.of();
             }
-        }
-        return closedSockets;
+            Set<String> closedSockets = new LinkedHashSet<>(app.socketIds());
+            removeFromIndexes(app, app.selection());
+            if (app.selection().source() == MarketDataSource.DATABENTO) {
+                subscriptions.release(app.selection().subscriptionKey(), appSessionId);
+            }
+            for (String socketId : closedSockets) {
+                socketToApp.remove(socketId);
+            }
+            Set<String> userApps = userToApps.get(app.userId());
+            if (userApps != null) {
+                userApps.remove(appSessionId);
+                if (userApps.isEmpty()) {
+                    userToApps.remove(app.userId());
+                }
+            }
+            return closedSockets;
+        });
     }
 
     /** Outcome of an expiry sweep: which AppSessions ended and which sockets must be closed. */
@@ -204,16 +249,18 @@ public final class SessionRoutingEngine {
      * Returns the affected AppSession ids and the sockets the caller must close.
      */
     public SweepResult sweepExpired() {
-        long now = clock.millis();
-        Set<String> expired = new LinkedHashSet<>();
-        Set<String> closed = new LinkedHashSet<>();
-        for (AppSession app : new ArrayList<>(appSessions.values())) {
-            if (app.isIdleExpired(now) || app.isMaxExpired(now)) {
-                expired.add(app.id());
-                closed.addAll(teardownAppSession(app.id()));
+        return callWrite(() -> {
+            long now = clock.millis();
+            Set<String> expired = new LinkedHashSet<>();
+            Set<String> closed = new LinkedHashSet<>();
+            for (AppSession app : new ArrayList<>(appSessions.values())) {
+                if (app.isIdleExpired(now) || app.isMaxExpired(now)) {
+                    expired.add(app.id());
+                    closed.addAll(teardownAppSession(app.id())); // reentrant write lock
+                }
             }
-        }
-        return new SweepResult(expired, closed);
+            return new SweepResult(expired, closed);
+        });
     }
 
     /**
@@ -222,15 +269,17 @@ public final class SessionRoutingEngine {
      * @return the sockets the caller must close.
      */
     public Set<String> forceLogoutUser(String userId) {
-        Set<String> userApps = userToApps.get(userId);
-        if (userApps == null) {
-            return Set.of();
-        }
-        Set<String> closed = new LinkedHashSet<>();
-        for (String appId : new ArrayList<>(userApps)) {
-            closed.addAll(teardownAppSession(appId));
-        }
-        return closed;
+        return callWrite(() -> {
+            Set<String> userApps = userToApps.get(userId);
+            if (userApps == null) {
+                return Set.of();
+            }
+            Set<String> closed = new LinkedHashSet<>();
+            for (String appId : new ArrayList<>(userApps)) {
+                closed.addAll(teardownAppSession(appId)); // reentrant write lock
+            }
+            return closed;
+        });
     }
 
     // ---------------------------------------------------------------------
@@ -243,53 +292,53 @@ public final class SessionRoutingEngine {
      * The shared cache is updated for contract records regardless of subscriber count (NFR-3).
      */
     public Set<String> route(RoutableRecord record) {
-        Optional<RoutingTarget> targetOpt = RoutingKeyDeriver.derive(record);
-        if (targetOpt.isEmpty()) {
-            return Set.of();
-        }
-        RoutingTarget target = targetOpt.get();
+        return callRead(() -> {
+            Optional<RoutingTarget> targetOpt = RoutingKeyDeriver.derive(record);
+            if (targetOpt.isEmpty()) {
+                return Set.of();
+            }
+            RoutingTarget target = targetOpt.get();
 
-        List<String> candidates;
-        boolean contractScoped;
-        SubscriptionKey contractKey = null;
-        switch (target) {
-            case RoutingTarget.Contract c -> {
-                contractScoped = true;
-                contractKey = c.key();
-                cache.put(contractKey, Boolean.TRUE); // one entry per contract (I2)
-                candidates = snapshot(appByContract.get(contractKey));
+            List<String> candidates;
+            boolean contractScoped;
+            switch (target) {
+                case RoutingTarget.Contract c -> {
+                    contractScoped = true;
+                    cache.put(c.key(), Boolean.TRUE); // one entry per contract (I2); cache is concurrent
+                    candidates = snapshot(appByContract.get(c.key()));
+                }
+                case RoutingTarget.Underlying u -> {
+                    contractScoped = false;
+                    candidates = snapshot(appByUnderlying.get(u.key()));
+                }
             }
-            case RoutingTarget.Underlying u -> {
-                contractScoped = false;
-                candidates = snapshot(appByUnderlying.get(u.key()));
+            if (candidates.isEmpty()) {
+                return Set.of();
             }
-        }
-        if (candidates.isEmpty()) {
-            return Set.of();
-        }
 
-        Set<String> sockets = new LinkedHashSet<>();
-        for (String appId : candidates) {
-            AppSession app = appSessions.get(appId);
-            if (app == null) {
-                continue;
+            Set<String> sockets = new LinkedHashSet<>();
+            for (String appId : candidates) {
+                AppSession app = appSessions.get(appId);
+                if (app == null) {
+                    continue;
+                }
+                if (app.isReplaying()) {
+                    continue; // I4 — a replaying session receives ONLY its private replay stream, never live
+                }
+                if (!passesBarrier(app, record.selectionEpoch())) {
+                    continue;
+                }
+                if (!EntitlementPolicy.canReceive(target.source(), app.entitlements())) {
+                    continue;
+                }
+                if (contractScoped && record.strike().isPresent()
+                        && !app.selection().strikeWindow().contains(record.strike().getAsDouble())) {
+                    continue; // per-user strike delivery filter
+                }
+                sockets.addAll(app.socketIds());
             }
-            if (app.isReplaying()) {
-                continue; // I4 — a replaying session receives ONLY its private replay stream, never live
-            }
-            if (!passesBarrier(app, record.selectionEpoch())) {
-                continue;
-            }
-            if (!EntitlementPolicy.canReceive(target.source(), app.entitlements())) {
-                continue;
-            }
-            if (contractScoped && record.strike().isPresent()
-                    && !app.selection().strikeWindow().contains(record.strike().getAsDouble())) {
-                continue; // per-user strike delivery filter
-            }
-            sockets.addAll(app.socketIds());
-        }
-        return sockets;
+            return sockets;
+        });
     }
 
     private static boolean passesBarrier(AppSession app, long recordEpoch) {
@@ -301,7 +350,7 @@ public final class SessionRoutingEngine {
      * ({@link #route}). Used for per-session filtered cached-state replay on connect (FR-11).
      */
     public boolean shouldDeliverToSocket(RoutableRecord record, String socketId) {
-        return route(record).contains(socketId);
+        return callRead(() -> route(record).contains(socketId)); // reentrant read lock
     }
 
     // ---------------------------------------------------------------------
@@ -310,20 +359,26 @@ public final class SessionRoutingEngine {
 
     /** Enter/leave replay mode for one AppSession. While replaying, {@link #route} skips its sockets. */
     public void setReplayMode(String appSessionId, boolean replaying) {
-        AppSession app = require(appSessionId);
-        app.setReplaying(replaying);
-        app.touch(clock.millis());
+        runWrite(() -> {
+            AppSession app = require(appSessionId);
+            app.setReplaying(replaying);
+            app.touch(clock.millis());
+        });
     }
 
     public boolean isReplaying(String appSessionId) {
-        AppSession app = appSessions.get(appSessionId);
-        return app != null && app.isReplaying();
+        return callRead(() -> {
+            AppSession app = appSessions.get(appSessionId);
+            return app != null && app.isReplaying();
+        });
     }
 
     /** Sockets currently attached to an AppSession — the only recipients of its replay stream. */
     public Set<String> socketsForAppSession(String appSessionId) {
-        AppSession app = appSessions.get(appSessionId);
-        return app == null ? Set.of() : new LinkedHashSet<>(app.socketIds());
+        return callRead(() -> {
+            AppSession app = appSessions.get(appSessionId);
+            return app == null ? Set.of() : new LinkedHashSet<>(app.socketIds());
+        });
     }
 
     // ---------------------------------------------------------------------
@@ -381,16 +436,18 @@ public final class SessionRoutingEngine {
     // ---------------------------------------------------------------------
 
     public int appSessionCount() {
-        return appSessions.size();
+        return callRead(appSessions::size);
     }
 
     public int appSessionCountForUser(String userId) {
-        Set<String> apps = userToApps.get(userId);
-        return apps == null ? 0 : apps.size();
+        return callRead(() -> {
+            Set<String> apps = userToApps.get(userId);
+            return apps == null ? 0 : apps.size();
+        });
     }
 
     public Optional<AppSession> appSession(String appSessionId) {
-        return Optional.ofNullable(appSessions.get(appSessionId));
+        return callRead(() -> Optional.ofNullable(appSessions.get(appSessionId)));
     }
 
     public SubscriptionManager subscriptions() {
@@ -402,12 +459,14 @@ public final class SessionRoutingEngine {
     }
 
     public int distinctContractIndexSize() {
-        return appByContract.size();
+        return callRead(appByContract::size);
     }
 
     public Map<SubscriptionKey, Integer> contractFanoutSizes() {
-        Map<SubscriptionKey, Integer> out = new LinkedHashMap<>();
-        appByContract.forEach((k, v) -> out.put(k, v.size()));
-        return Collections.unmodifiableMap(out);
+        return callRead(() -> {
+            Map<SubscriptionKey, Integer> out = new LinkedHashMap<>();
+            appByContract.forEach((k, v) -> out.put(k, v.size()));
+            return Collections.unmodifiableMap(out);
+        });
     }
 }
