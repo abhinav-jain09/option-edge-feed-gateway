@@ -21,17 +21,37 @@ public class FeedWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
-        // When auth is enabled, the handshake bound an AppSession id; attach this socket to it.
         SessionRoutingEngine engine = engineProvider.getIfAvailable();
-        Object appSessionId = session.getAttributes().get(TicketHandshakeInterceptor.ATTR_APP_SESSION_ID);
-        if (engine != null && appSessionId instanceof String id) {
+        // Auth on (the session router bean exists ⟺ gateway.auth.enabled=true): the handshake has
+        // already redeemed the single-use ticket and bound an AppSession id. This socket MUST attach
+        // to that session — if it cannot, REJECT it. A redeemed ticket must never leave an
+        // unattached live client (no AppSession to route or tear it down), so addClient is skipped.
+        if (engine != null) {
+            Object attr = session.getAttributes().get(TicketHandshakeInterceptor.ATTR_APP_SESSION_ID);
+            if (!(attr instanceof String id) || id.isBlank()) {
+                reject(session, "no session bound");
+                return;
+            }
             try {
+                // attachSocket validates all limits before mutating, so a throw leaves no partial state.
                 engine.attachSocket(id, session.getId());
-            } catch (RuntimeException ignored) {
-                // AppSession may have expired between ticket mint and connect; fall through to legacy add.
+            } catch (RuntimeException attachFailed) {
+                // AppSession expired between ticket mint and connect, or the per-AppSession socket
+                // cap was reached. Close the socket; never register it as a live client.
+                reject(session, "attach rejected");
+                return;
             }
         }
         gatewayService.addClient(session);
+    }
+
+    /** Best-effort close of a socket we refuse to admit, so no unattached client lingers. */
+    private static void reject(WebSocketSession session, String reason) {
+        try {
+            session.close(CloseStatus.POLICY_VIOLATION.withReason(reason));
+        } catch (Exception ignored) {
+            // best-effort; the socket is already being torn down
+        }
     }
 
     @Override
