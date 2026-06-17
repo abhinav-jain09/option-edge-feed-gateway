@@ -606,7 +606,7 @@ public class FeedGatewayService {
                 for (ConsumerRecord<String, String> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = binding == null ? null : enrichJson(record.value(), binding);
-                    if (json != null && !json.isBlank() && shouldForward(binding, json, record)) {
+                    if (json != null && !json.isBlank() && (perSessionRouting() || shouldForward(binding, json, record))) {
                         routeOrBroadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
                         recordSelectedForward(binding, json);
@@ -716,7 +716,11 @@ public class FeedGatewayService {
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
-                    if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json, record)) {
+                    // Per-session mode: bypass the global single-source/selection/barrier gate and let
+                    // the engine route per-session (supports IBKR + Databento users simultaneously, and
+                    // delivers replayed data). shouldForward remains the gate in legacy mode.
+                    if (cacheKey != null && cacheCaughtUpFlag.get()
+                            && (perSessionRouting() || shouldForward(binding, json, record))) {
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
                         recordSelectedForward(binding, json);
