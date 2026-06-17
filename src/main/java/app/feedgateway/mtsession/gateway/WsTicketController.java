@@ -10,16 +10,24 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
  * Mints a single-use WS ticket after verifying the caller's bearer JWT (OE-DDD-001 §5.3 / §11.1).
  * Only registered when {@code gateway.auth.enabled=true} (flag-gated migration, DDD §12).
+ *
+ * <p>CORS is open here because the ticket carries no ambient authority — it is minted only against a
+ * verified {@code Authorization: Bearer} token (not cookies), so a cross-origin caller (e.g. the
+ * option-chain UI served from a different port) can mint a ticket for its own bearer token without a
+ * credentialed cross-site risk.
  */
 @RestController
+@CrossOrigin(origins = "*", allowedHeaders = "*", methods = {RequestMethod.POST, RequestMethod.OPTIONS})
 @ConditionalOnProperty(name = "gateway.auth.enabled", havingValue = "true")
 public final class WsTicketController {
 
