@@ -29,17 +29,44 @@ public final class GatewayRecordMapper {
         if (type == null) {
             return Optional.empty();
         }
+        // The topic binding is the authoritative source (OE-DDD-001 §8.6). The payload may also carry
+        // a source — thread both into the RoutableRecord, but if the payload DECLARES a source that
+        // contradicts the binding it is misrouted/corrupt data: reject it so it is never delivered to
+        // a session of the binding source.
+        String payloadMarketDataSource = textOrNull(root, "marketDataSource");
+        String payloadSource = textOrNull(root, "source");
+        if (contradicts(source.get(), payloadMarketDataSource) || contradicts(source.get(), payloadSource)) {
+            return Optional.empty();
+        }
         long epoch = root.hasNonNull("selectionEpoch") ? root.get("selectionEpoch").asLong(0L) : 0L;
         if (type.isUnderlying()) {
             return Optional.of(new RoutableRecord(source.get(), type, null, null,
-                    OptionalDouble.empty(), epoch, null, null));
+                    OptionalDouble.empty(), epoch, payloadMarketDataSource, payloadSource));
         }
         String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
         String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
         OptionalDouble strike = root.hasNonNull("strike")
                 ? OptionalDouble.of(root.get("strike").asDouble())
                 : OptionalDouble.empty();
-        return Optional.of(new RoutableRecord(source.get(), type, symbol, expiry, strike, epoch, null, null));
+        return Optional.of(new RoutableRecord(source.get(), type, symbol, expiry, strike, epoch,
+                payloadMarketDataSource, payloadSource));
+    }
+
+    private static String textOrNull(JsonNode root, String field) {
+        return root.hasNonNull(field) ? root.get(field).asText(null) : null;
+    }
+
+    /**
+     * True if {@code payloadSourceText} names a known market-data source that differs from the
+     * authoritative {@code binding}. Absent or unrecognised payload sources do not contradict — the
+     * binding remains authoritative (Avro contract events legitimately carry no source field).
+     */
+    private static boolean contradicts(MarketDataSource binding, String payloadSourceText) {
+        if (payloadSourceText == null || payloadSourceText.isBlank()) {
+            return false;
+        }
+        Optional<MarketDataSource> payload = MarketDataSource.parse(payloadSourceText);
+        return payload.isPresent() && payload.get() != binding;
     }
 
     /** Maps the gateway's event-name strings to the routing {@link EventType}, or null if unroutable. */

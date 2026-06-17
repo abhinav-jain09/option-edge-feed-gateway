@@ -66,4 +66,49 @@ class GatewayRecordMapperTest {
         assertNull(GatewayRecordMapper.eventTypeFor("hpsf-audit"));
         assertNull(GatewayRecordMapper.eventTypeFor(null));
     }
+
+    // ---- source-mismatch rejection (req. 5) ----
+
+    @Test
+    void databentoBindingWithIbkrPayloadIsRejected() throws Exception {
+        // payload marketDataSource contradicts the authoritative binding
+        assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "snapshot",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20260617\",\"strike\":7500,\"marketDataSource\":\"IBKR\"}"))
+                .isEmpty());
+        // payload source field contradicts the binding
+        assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "strike-flow",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20260617\",\"source\":\"IBKR\"}"))
+                .isEmpty());
+        // symmetric: IBKR binding + Databento payload
+        assertTrue(GatewayRecordMapper.toRoutableRecord("IBKR", "snapshot",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20260617\",\"strike\":7500,\"marketDataSource\":\"DB\"}"))
+                .isEmpty());
+    }
+
+    @Test
+    void matchingSourceIsAcceptedAndPayloadSourcesThreadedThrough() throws Exception {
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "snapshot",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20260617\",\"strike\":7500,"
+                        + "\"marketDataSource\":\"DATABENTO\",\"source\":\"DATABENTO\"}")).orElseThrow();
+        assertEquals(MarketDataSource.DATABENTO, rec.bindingSource());
+        assertEquals("DATABENTO", rec.payloadMarketDataSource());
+        assertEquals("DATABENTO", rec.payloadSource());
+    }
+
+    @Test
+    void avroContractEventWithoutPayloadSourceStaysBindingAuthoritative() throws Exception {
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "snapshot",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20260617\",\"strike\":7500}")).orElseThrow();
+        assertEquals(MarketDataSource.DATABENTO, rec.bindingSource());
+        assertNull(rec.payloadMarketDataSource());
+        assertNull(rec.payloadSource());
+    }
+
+    @Test
+    void unrecognisedPayloadSourceDoesNotContradict() throws Exception {
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "snapshot",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20260617\",\"strike\":7500,\"marketDataSource\":\"WAT\"}"))
+                .orElseThrow();
+        assertEquals("WAT", rec.payloadMarketDataSource());
+    }
 }

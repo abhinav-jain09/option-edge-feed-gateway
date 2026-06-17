@@ -121,6 +121,22 @@ class FeedGatewayPerSessionBroadcastTest {
     }
 
     @Test
+    void databentoBindingWithIbkrPayloadIsRejectedAndNotDelivered() throws Exception {
+        // Misrouted record: Databento topic binding, but the payload declares IBKR. u1 is a Databento
+        // SPX/20260612 session — it must NOT receive this source-mismatched record.
+        routeOrBroadcast("DATABENTO", "snapshot",
+                "{\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":7500,\"marketDataSource\":\"IBKR\"}");
+        assertTrue(u1.isEmpty(), "source-mismatched record must not reach the binding-source user");
+        assertTrue(u2.isEmpty(), "source-mismatched record must not reach any user");
+
+        // Positive control: the same record with a matching source IS delivered to u1.
+        routeOrBroadcast("DATABENTO", "snapshot",
+                "{\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":7500,\"marketDataSource\":\"DATABENTO\"}");
+        assertEquals(1, u1.size());
+        assertTrue(u2.isEmpty());
+    }
+
+    @Test
     void allowlistClassifiesMarketDataAsNonGlobal() {
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("status"));
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("reset"));
