@@ -55,7 +55,8 @@ public final class ReplayService {
         String appSessionId = authenticatedSession(bearerToken);
         Objects.requireNonNull(request, "request");
         ReplayParams params = ReplayParams.of(request.sessionId(), request.symbol(), request.expiry(),
-                request.startUtc(), request.endUtc(), request.maxRecords(), maxWindowMs, maxRecordsCap);
+                request.startUtc(), request.endUtc(), request.maxRecords(), maxWindowMs, maxRecordsCap,
+                request.runId());
         if (!appSessionId.equals(params.sessionId())) {
             throw new IllegalArgumentException("sessionId does not match the authenticated session");
         }
@@ -109,8 +110,12 @@ public final class ReplayService {
         return appSessionId;
     }
 
-    /** Request body shared by the start endpoint (req. 6). */
+    /**
+     * Request body shared by the start endpoint (req. 6). {@code runId} is optional: when present, the
+     * gateway streams the orchestrated run's local {@code *.replay.<runId>.*} topics; when absent, it
+     * falls back to slicing the live topics by timestamp.
+     */
     public record ReplayRequest(String sessionId, String symbol, String expiry,
-                                String startUtc, String endUtc, Integer maxRecords) {
+                                String startUtc, String endUtc, Integer maxRecords, String runId) {
     }
 }

@@ -33,10 +33,11 @@ public final class ReplayController {
         return guarded(authorization, token -> {
             ReplayService.ReplayAck ack = replayService.start(token, request);
             ReplayParams p = ack.params();
+            String runIdJson = p.runId() == null ? "null" : "\"" + esc(p.runId()) + "\"";
             String body = "{\"mode\":\"" + ack.mode() + "\",\"sessionId\":\"" + esc(p.sessionId())
                     + "\",\"symbol\":\"" + esc(p.symbol()) + "\",\"expiry\":\"" + esc(p.expiry())
                     + "\",\"startUtcMs\":" + p.startUtcMs() + ",\"endUtcMs\":" + p.endUtcMs()
-                    + ",\"maxRecords\":" + p.maxRecords() + "}";
+                    + ",\"maxRecords\":" + p.maxRecords() + ",\"runId\":" + runIdJson + "}";
             return ResponseEntity.ok(body);
         });
     }

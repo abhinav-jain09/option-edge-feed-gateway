@@ -17,9 +17,9 @@ import org.springframework.http.ResponseEntity;
 class ReplayControllerTest {
 
     private static final ReplayService.ReplayRequest REQ = new ReplayService.ReplayRequest(
-            "app:u1", "SPX", "20260612", "2026-06-12T14:00:00Z", "2026-06-12T14:20:00Z", 1000);
+            "app:u1", "SPX", "20260612", "2026-06-12T14:00:00Z", "2026-06-12T14:20:00Z", 1000, null);
     private static final ReplayParams PARAMS =
-            new ReplayParams("app:u1", "SPX", "20260612", 1_000L, 2_000L, 1000);
+            new ReplayParams("app:u1", "SPX", "20260612", 1_000L, 2_000L, 1000, null);
 
     @Test
     void missingBearerIsUnauthorizedOnEveryEndpoint() {

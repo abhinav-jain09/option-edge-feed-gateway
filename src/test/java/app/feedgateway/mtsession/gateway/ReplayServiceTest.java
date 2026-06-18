@@ -65,7 +65,7 @@ class ReplayServiceTest {
     }
 
     private static ReplayService.ReplayRequest req(String sessionId) {
-        return new ReplayService.ReplayRequest(sessionId, "SPX", "20260612", START, END, 1000);
+        return new ReplayService.ReplayRequest(sessionId, "SPX", "20260612", START, END, 1000, null);
     }
 
     @Test
@@ -78,6 +78,19 @@ class ReplayServiceTest {
 
         assertSame(ReplayRunner.Mode.REPLAY_RUNNING, ack.mode());
         assertEquals(List.of("start:app:u1:SPX:20260612"), runner.calls);
+    }
+
+    @Test
+    void startThreadsRunIdIntoParams() throws Exception {
+        SessionRoutingEngine engine = engineWith("app:u1", "u1");
+        ReplayService svc = service(engine, new RecordingRunner(), "u1", true, false);
+        ReplayService.ReplayRequest withRun =
+                new ReplayService.ReplayRequest("app:u1", "SPX", "20260612", START, END, 1000, "r-123");
+
+        ReplayService.ReplayAck ack = svc.start("tok", withRun);
+
+        assertEquals("r-123", ack.params().runId());
+        assertTrue(ack.params().hasRun());
     }
 
     @Test
@@ -100,7 +113,7 @@ class ReplayServiceTest {
         SessionRoutingEngine engine = engineWith("app:u1", "u1");
         ReplayService svc = service(engine, new RecordingRunner(), "u1", true, false);
         ReplayService.ReplayRequest tooLong =
-                new ReplayService.ReplayRequest("app:u1", "SPX", "20260612", START, "2026-06-12T14:40:00Z", 1000);
+                new ReplayService.ReplayRequest("app:u1", "SPX", "20260612", START, "2026-06-12T14:40:00Z", 1000, null);
         assertThrows(IllegalArgumentException.class, () -> svc.start("tok", tooLong));
     }
 

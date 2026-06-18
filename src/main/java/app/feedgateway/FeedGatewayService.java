@@ -9,6 +9,7 @@ import app.feedgateway.mtsession.AppSession;
 import app.feedgateway.mtsession.MarketDataSource;
 import app.feedgateway.mtsession.SessionRoutingEngine;
 import app.feedgateway.mtsession.gateway.ReplayParams;
+import app.feedgateway.mtsession.gateway.ReplayTopicResolver;
 import app.feedgateway.mtsession.gateway.ReplayRunner;
 import app.feedgateway.mtsession.gateway.GatewayRecordMapper;
 import java.util.Optional;
@@ -1851,6 +1852,11 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics.put(settings.ibkrUnusualWhalesGexTopic(), "gex-by-strike");
                 stringTopics.put(settings.ibkrVixPriceTopic(), "vix-price");
             }
+            if (params.hasRun()) {
+                // Read the orchestrated run's LOCAL replay topics instead of the live topics.
+                avroTopics = toReplayTopics(avroTopics, params.runId());
+                stringTopics = toReplayTopics(stringTopics, params.runId());
+            }
             try {
                 delivered += replayWindow(appSessionId, params, source, avroTopics, true, flag, delivered);
                 delivered += replayWindow(appSessionId, params, source, stringTopics, false, flag, delivered);
@@ -1880,30 +1886,46 @@ public class FeedGatewayService implements ReplayRunner {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(props)) {
             List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
             consumer.assign(partitions);
-            Map<TopicPartition, Long> startQuery = new HashMap<>();
-            Map<TopicPartition, Long> endQuery = new HashMap<>();
-            for (TopicPartition tp : partitions) {
-                startQuery.put(tp, params.startUtcMs());
-                endQuery.put(tp, params.endUtcMs());
-            }
-            Map<TopicPartition, OffsetAndTimestamp> startOffsets = consumer.offsetsForTimes(startQuery);
-            Map<TopicPartition, OffsetAndTimestamp> endOffsets = consumer.offsetsForTimes(endQuery);
             Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
             Map<TopicPartition, Long> endTarget = new HashMap<>();
             List<TopicPartition> active = new ArrayList<>();
-            for (TopicPartition tp : partitions) {
-                OffsetAndTimestamp start = startOffsets.get(tp);
-                if (start == null) {
-                    continue; // no records at/after the window start
+            if (params.hasRun()) {
+                // Orchestrated run: the *.replay.<runId>.* topics already contain exactly the windowed
+                // data, so read each partition in full (beginning..log-end) — no timestamp slicing.
+                Map<TopicPartition, Long> begin = consumer.beginningOffsets(partitions);
+                for (TopicPartition tp : partitions) {
+                    long start = begin.getOrDefault(tp, 0L);
+                    long target = logEnd.getOrDefault(tp, start);
+                    if (target <= start) {
+                        continue; // empty partition
+                    }
+                    consumer.seek(tp, start);
+                    endTarget.put(tp, target);
+                    active.add(tp);
                 }
-                OffsetAndTimestamp end = endOffsets.get(tp);
-                long target = end != null ? end.offset() : logEnd.getOrDefault(tp, start.offset());
-                if (target <= start.offset()) {
-                    continue; // empty window on this partition
+            } else {
+                Map<TopicPartition, Long> startQuery = new HashMap<>();
+                Map<TopicPartition, Long> endQuery = new HashMap<>();
+                for (TopicPartition tp : partitions) {
+                    startQuery.put(tp, params.startUtcMs());
+                    endQuery.put(tp, params.endUtcMs());
                 }
-                consumer.seek(tp, start.offset());
-                endTarget.put(tp, target);
-                active.add(tp);
+                Map<TopicPartition, OffsetAndTimestamp> startOffsets = consumer.offsetsForTimes(startQuery);
+                Map<TopicPartition, OffsetAndTimestamp> endOffsets = consumer.offsetsForTimes(endQuery);
+                for (TopicPartition tp : partitions) {
+                    OffsetAndTimestamp start = startOffsets.get(tp);
+                    if (start == null) {
+                        continue; // no records at/after the window start
+                    }
+                    OffsetAndTimestamp end = endOffsets.get(tp);
+                    long target = end != null ? end.offset() : logEnd.getOrDefault(tp, start.offset());
+                    if (target <= start.offset()) {
+                        continue; // empty window on this partition
+                    }
+                    consumer.seek(tp, start.offset());
+                    endTarget.put(tp, target);
+                    active.add(tp);
+                }
             }
             if (active.isEmpty()) {
                 return 0L;
@@ -1947,6 +1969,15 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
         return delivered;
+    }
+
+    /** Map each live topic in {@code topicEvents} to its per-runId replay-namespace equivalent. */
+    private static Map<String, String> toReplayTopics(Map<String, String> topicEvents, String runId) {
+        Map<String, String> resolved = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : topicEvents.entrySet()) {
+            resolved.put(ReplayTopicResolver.toReplayTopic(e.getKey(), runId), e.getValue());
+        }
+        return resolved;
     }
 
     /** A replay record matches the session: same contract (symbol+expiry) and inside the strike window. */

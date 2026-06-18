@@ -16,12 +16,23 @@ public record ReplayParams(
         String expiry,
         long startUtcMs,
         long endUtcMs,
-        int maxRecords) {
+        int maxRecords,
+        String runId) {
 
     public ReplayParams {
         Objects.requireNonNull(sessionId, "sessionId");
         Objects.requireNonNull(symbol, "symbol");
         Objects.requireNonNull(expiry, "expiry");
+        runId = (runId == null || runId.isBlank()) ? null : runId.trim();
+    }
+
+    /**
+     * True when this replay is backed by an orchestrated run: the gateway reads the run's local
+     * {@code *.replay.<runId>.*} topics (full topic, already windowed) instead of slicing the live
+     * topics by timestamp.
+     */
+    public boolean hasRun() {
+        return runId != null;
     }
 
     /**
@@ -34,6 +45,12 @@ public record ReplayParams(
     public static ReplayParams of(String sessionId, String symbol, String expiry,
                                   String startUtc, String endUtc, Integer maxRecords,
                                   long maxWindowMs, int maxRecordsCap) {
+        return of(sessionId, symbol, expiry, startUtc, endUtc, maxRecords, maxWindowMs, maxRecordsCap, null);
+    }
+
+    public static ReplayParams of(String sessionId, String symbol, String expiry,
+                                  String startUtc, String endUtc, Integer maxRecords,
+                                  long maxWindowMs, int maxRecordsCap, String runId) {
         String sid = requireText(sessionId, "sessionId");
         String sym = requireText(symbol, "symbol").toUpperCase();
         String exp = requireText(expiry, "expiry").replace("-", "");
@@ -47,7 +64,7 @@ public record ReplayParams(
         }
         int requested = maxRecords == null ? 1000 : maxRecords;
         int bounded = Math.max(1, Math.min(maxRecordsCap, requested));
-        return new ReplayParams(sid, sym, exp, start, end, bounded);
+        return new ReplayParams(sid, sym, exp, start, end, bounded, runId);
     }
 
     private static String requireText(String value, String field) {
