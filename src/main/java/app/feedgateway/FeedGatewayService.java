@@ -169,9 +169,18 @@ public class FeedGatewayService implements ReplayRunner {
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
     }
 
-    /** True when per-session routing is enabled and the engine is wired (auth on); else legacy broadcast. */
+    /**
+     * True when the live data path is routed per-session instead of broadcast.
+     *
+     * <p>Isolation is COUPLED to auth (review finding #2 / C-2): whenever the routing engine is wired —
+     * which is exactly when {@code GATEWAY_AUTH_ENABLED=true} (MtSessionAuthConfig only creates the
+     * SessionRoutingEngine bean then) — per-session routing is forced ON. Otherwise an authenticated
+     * socket would receive the global broadcast of EVERY user's data. The legacy
+     * {@code GATEWAY_ROUTING_PER_SESSION} flag can only be used to force routing on; it can no longer be
+     * used to leave an auth-enabled gateway in broadcast mode.
+     */
     private boolean perSessionRouting() {
-        return settings.routingPerSession() && routingEngine != null;
+        return routingEngine != null || settings.routingPerSession();
     }
 
     @PostConstruct

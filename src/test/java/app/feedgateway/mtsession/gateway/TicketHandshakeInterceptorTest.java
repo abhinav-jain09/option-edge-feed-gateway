@@ -35,9 +35,12 @@ class TicketHandshakeInterceptorTest {
 
     private ServerHttpRequest requestWithTicket(String ticketId) {
         ServerHttpRequest req = mock(ServerHttpRequest.class);
-        String uri = "http://gw/ws/events" + (ticketId == null ? "" : "?ticket=" + ticketId);
-        when(req.getURI()).thenReturn(URI.create(uri));
-        when(req.getHeaders()).thenReturn(new HttpHeaders());
+        HttpHeaders headers = new HttpHeaders();
+        if (ticketId != null) {
+            headers.add("Sec-WebSocket-Protocol", "oe.ticket." + ticketId);
+        }
+        when(req.getURI()).thenReturn(URI.create("http://gw/ws/events"));
+        when(req.getHeaders()).thenReturn(headers);
         return req;
     }
 

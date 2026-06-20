@@ -6,6 +6,7 @@ import com.nimbusds.jose.jwk.source.JWKSourceBuilder;
 import com.nimbusds.jose.proc.JWSKeySelector;
 import com.nimbusds.jose.proc.JWSVerificationKeySelector;
 import com.nimbusds.jose.proc.SecurityContext;
+import com.nimbusds.jose.util.DefaultResourceRetriever;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.proc.ConfigurableJWTProcessor;
 import com.nimbusds.jwt.proc.DefaultJWTClaimsVerifier;
@@ -25,36 +26,47 @@ import java.util.Set;
  *
  * <p>Enforces: RS256 signature against the realm's published keys (fetched and cached from the
  * {@code /protocol/openid-connect/certs} endpoint), exact issuer match, presence of {@code sub}
- * and a valid {@code exp}/{@code iat}, and — when configured — that the authorized party
- * ({@code azp}) equals the expected browser client. Any failure throws {@link JwtVerificationException}.
+ * and a valid {@code exp}/{@code iat}, that the token's {@code aud} contains the expected audience
+ * (when configured), and — when configured — that the authorized party ({@code azp}) equals the
+ * expected browser client. Any failure throws {@link JwtVerificationException}.
  *
- * <p>Thread-safe and intended to be a long-lived singleton; the JWKS source caches keys and refreshes
- * on rotation.
+ * <p>Algorithm is pinned to RS256 via {@link JWSVerificationKeySelector}, so {@code alg=none} and
+ * HS256-with-the-public-key confusion attacks cannot select a key.
+ *
+ * <p>The JWKS fetch uses a bounded {@link DefaultResourceRetriever} (connect + read timeouts, size cap)
+ * with a retrying, rate-limited, refresh-ahead cache, so a slow/flapping Keycloak JWKS endpoint can never
+ * hang a verification thread indefinitely (review finding #9).
+ *
+ * <p>Thread-safe; intended to be a long-lived singleton.
  */
 public final class KeycloakJwtVerifier implements TokenVerifier {
 
+    // JWKS fetch bounds — a slow JWKS endpoint must not wedge a request thread.
+    private static final int JWKS_CONNECT_TIMEOUT_MS = 2_000;
+    private static final int JWKS_READ_TIMEOUT_MS = 2_000;
+    private static final int JWKS_SIZE_LIMIT_BYTES = 256 * 1024;
+
     private final String issuer;
-    private final String expectedClientId; // nullable → azp not enforced
+    private final String expectedClientId;  // nullable → azp not enforced
+    private final String expectedAudience;   // nullable/blank → aud not enforced
     private final ConfigurableJWTProcessor<SecurityContext> processor;
 
-    /**
-     * @param issuerUri        e.g. {@code http://localhost:8099/realms/optionsedge}
-     * @param expectedClientId required {@code azp}, or {@code null} to skip the azp check
-     */
     public KeycloakJwtVerifier(String issuerUri, String expectedClientId) {
-        this(issuerUri, null, expectedClientId);
+        this(issuerUri, null, expectedClientId, null);
     }
 
     /**
      * @param issuerUri        the issuer the tokens carry (validated exactly), e.g. as seen by the browser
      * @param jwksUrlOverride  where to fetch signing keys (may differ from the issuer when Keycloak is
-     *                         reached via a different network path — the "behind a proxy" pattern);
-     *                         null → derive from the issuer
+     *                         reached via a different network path); null → derive from the issuer
      * @param expectedClientId required {@code azp}, or {@code null} to skip the azp check
+     * @param expectedAudience required value within {@code aud}, or {@code null}/blank to skip the aud check
      */
-    public KeycloakJwtVerifier(String issuerUri, String jwksUrlOverride, String expectedClientId) {
+    public KeycloakJwtVerifier(String issuerUri, String jwksUrlOverride, String expectedClientId,
+                               String expectedAudience) {
         this.issuer = Objects.requireNonNull(issuerUri, "issuerUri");
         this.expectedClientId = expectedClientId;
+        this.expectedAudience = (expectedAudience == null || expectedAudience.isBlank()) ? null : expectedAudience;
         String jwksUrl = (jwksUrlOverride == null || jwksUrlOverride.isBlank())
                 ? issuerUri + "/protocol/openid-connect/certs"
                 : jwksUrlOverride;
@@ -68,7 +80,13 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
         } catch (MalformedURLException | IllegalArgumentException e) {
             throw new IllegalArgumentException("Invalid JWKS URL: " + jwksUrlStr, e);
         }
-        JWKSource<SecurityContext> jwkSource = JWKSourceBuilder.create(jwksUrl).build();
+        DefaultResourceRetriever retriever =
+                new DefaultResourceRetriever(JWKS_CONNECT_TIMEOUT_MS, JWKS_READ_TIMEOUT_MS, JWKS_SIZE_LIMIT_BYTES);
+        JWKSource<SecurityContext> jwkSource = JWKSourceBuilder.create(jwksUrl, retriever)
+                .retrying(true)
+                .rateLimited(true)
+                .refreshAheadCache(true)
+                .build();
         JWSKeySelector<SecurityContext> keySelector =
                 new JWSVerificationKeySelector<>(JWSAlgorithm.RS256, jwkSource);
 
@@ -94,6 +112,15 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
             claims = processor.process(token, null);
         } catch (Exception e) {
             throw new JwtVerificationException("token verification failed: " + e.getMessage(), e);
+        }
+
+        // Audience: the token must be intended for this surface. Keycloak access tokens may carry several
+        // audiences (e.g. "account"), so require the expected value to be present (not an exact-equals).
+        if (expectedAudience != null) {
+            List<String> aud = claims.getAudience();
+            if (aud == null || !aud.contains(expectedAudience)) {
+                throw new JwtVerificationException("token audience does not include " + expectedAudience);
+            }
         }
 
         String azp;

@@ -19,11 +19,19 @@ public record ReplayParams(
         int maxRecords,
         String runId) {
 
+    // Orchestrator run ids look like r-20260612-093000-160000-7aceb330. Pin the charset (no dots — dots are
+    // Kafka topic separators) so a crafted runId can never inject extra topic segments via ReplayTopicResolver
+    // (defense-in-depth on top of the resolver's namespace assertion; review finding #6).
+    private static final java.util.regex.Pattern RUN_ID = java.util.regex.Pattern.compile("[A-Za-z0-9_-]{1,128}");
+
     public ReplayParams {
         Objects.requireNonNull(sessionId, "sessionId");
         Objects.requireNonNull(symbol, "symbol");
         Objects.requireNonNull(expiry, "expiry");
         runId = (runId == null || runId.isBlank()) ? null : runId.trim();
+        if (runId != null && !RUN_ID.matcher(runId).matches()) {
+            throw new IllegalArgumentException("runId has an invalid format");
+        }
     }
 
     /**

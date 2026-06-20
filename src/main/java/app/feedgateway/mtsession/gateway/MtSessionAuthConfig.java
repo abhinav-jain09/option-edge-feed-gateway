@@ -51,17 +51,21 @@ public class MtSessionAuthConfig {
     }
 
     /**
-     * Enforce the production ticket-store policy (req. 6): when auth is on and the profile is not
-     * dev/test, {@code GATEWAY_REDIS_URI} must be set. The in-memory store is allowed only for dev/test.
+     * Enforce the durable ticket-store policy (req. 6, review finding #7). When auth is on, the in-memory
+     * ticket store is allowed ONLY via an explicit, deliberate opt-out ({@code GATEWAY_ALLOW_INMEMORY_TICKETS=true});
+     * otherwise {@code GATEWAY_REDIS_URI} is mandatory. This is fail-closed: it no longer keys off the
+     * {@code APP_PROFILE} *default* ("dev"), so a real deploy that enables auth but forgets to set
+     * {@code APP_PROFILE=prod} can never silently fall back to a non-durable, non-shared store.
      *
      * @throws IllegalStateException (failing startup) if Redis is required but not configured
      */
     static void requireDurableTicketStore(boolean hasRedis, GatewaySettings settings) {
-        if (!hasRedis && !settings.isDevOrTest()) {
+        if (!hasRedis && !settings.allowInMemoryTickets()) {
             throw new IllegalStateException(
-                    "GATEWAY_REDIS_URI is required when GATEWAY_AUTH_ENABLED=true and APP_PROFILE is not "
-                            + "dev/test (APP_PROFILE=" + settings.appProfile() + "). The in-memory ticket store "
-                            + "is permitted only for dev/test; set GATEWAY_REDIS_URI for a durable shared store.");
+                    "GATEWAY_REDIS_URI is required when GATEWAY_AUTH_ENABLED=true. The in-memory ticket store "
+                            + "is not durable or shared across instances and must be opted into explicitly with "
+                            + "GATEWAY_ALLOW_INMEMORY_TICKETS=true (dev/test only); otherwise set GATEWAY_REDIS_URI "
+                            + "(APP_PROFILE=" + settings.appProfile() + ").");
         }
     }
 
@@ -74,7 +78,8 @@ public class MtSessionAuthConfig {
                 throw new JwtVerificationException("GATEWAY_KEYCLOAK_ISSUER is not configured");
             };
         }
-        return new KeycloakJwtVerifier(issuer, settings.keycloakJwksUrl(), settings.keycloakClientId());
+        return new KeycloakJwtVerifier(issuer, settings.keycloakJwksUrl(), settings.keycloakClientId(),
+                settings.keycloakAudience());
     }
 
     @Bean

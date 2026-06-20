@@ -331,9 +331,15 @@ public final class SessionRoutingEngine {
                 if (!EntitlementPolicy.canReceive(target.source(), app.entitlements())) {
                     continue;
                 }
-                if (contractScoped && record.strike().isPresent()
+                // Per-user strike delivery filter — DATABENTO only. I3 requires every IBKR session on a
+                // contract to receive identical fan-out (IBKR delivers a fixed chain, not a per-user strike
+                // window), so the strike filter must never narrow an IBKR record (review finding #5 / I3).
+                // Enforced in code here, not left to the caller-convention that IBKR selections use ALL.
+                if (contractScoped
+                        && target.source() == MarketDataSource.DATABENTO
+                        && record.strike().isPresent()
                         && !app.selection().strikeWindow().contains(record.strike().getAsDouble())) {
-                    continue; // per-user strike delivery filter
+                    continue;
                 }
                 sockets.addAll(app.socketIds());
             }

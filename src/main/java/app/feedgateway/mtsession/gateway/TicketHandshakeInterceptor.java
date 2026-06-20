@@ -52,22 +52,18 @@ public final class TicketHandshakeInterceptor implements HandshakeInterceptor {
         // no-op
     }
 
-    /** Ticket may arrive as the {@code oe.ticket.<id>} subprotocol (preferred) or {@code ?ticket=<id>}. */
+    /**
+     * The ticket MUST arrive as the {@code oe.ticket.<id>} subprotocol. The {@code ?ticket=<id>} query
+     * fallback was removed (review finding #10): a ticket in the upgrade URL leaks into access/proxy logs,
+     * browser history, and Referer headers, where it could be replayed within its TTL before the legitimate
+     * client connects. The subprotocol header is not logged by default and is the standard browser-WS path.
+     */
     private static String extractTicket(ServerHttpRequest request) {
         for (String proto : request.getHeaders().getOrEmpty("Sec-WebSocket-Protocol")) {
             for (String token : proto.split(",")) {
                 String t = token.trim();
                 if (t.startsWith(SUBPROTOCOL_PREFIX)) {
                     return t.substring(SUBPROTOCOL_PREFIX.length());
-                }
-            }
-        }
-        String query = request.getURI().getQuery();
-        if (query != null) {
-            for (String pair : query.split("&")) {
-                int eq = pair.indexOf('=');
-                if (eq > 0 && "ticket".equals(pair.substring(0, eq))) {
-                    return pair.substring(eq + 1);
                 }
             }
         }

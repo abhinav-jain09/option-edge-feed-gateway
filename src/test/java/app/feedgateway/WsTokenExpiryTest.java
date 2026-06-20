@@ -31,6 +31,7 @@ class WsTokenExpiryTest {
         }
         when(session.getAttributes()).thenReturn(attrs);
         when(session.isOpen()).thenReturn(true);
+        when(session.getId()).thenReturn(java.util.UUID.randomUUID().toString());
         return session;
     }
 

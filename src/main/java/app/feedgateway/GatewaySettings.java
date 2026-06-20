@@ -40,6 +40,11 @@ public final class GatewaySettings {
         return value("GATEWAY_KEYCLOAK_CLIENT_ID", "options-edge-web");
     }
 
+    /** Required value within the token's {@code aud} (review finding #8). Default matches the WS audience. */
+    public String keycloakAudience() {
+        return value("GATEWAY_KEYCLOAK_AUDIENCE", "options-edge-web");
+    }
+
     /** Where the gateway fetches Keycloak signing keys; may differ from the issuer (proxy/split-horizon). */
     public String keycloakJwksUrl() {
         return value("GATEWAY_KEYCLOAK_JWKS_URL", "");
@@ -47,6 +52,11 @@ public final class GatewaySettings {
 
     public String redisUri() {
         return value("GATEWAY_REDIS_URI", "");
+    }
+
+    /** Explicit, deliberate dev/test opt-in to the non-durable in-memory ticket store (review finding #7). */
+    public boolean allowInMemoryTickets() {
+        return boolValue("GATEWAY_ALLOW_INMEMORY_TICKETS", false);
     }
 
     public int wsTicketTtlSeconds() {
