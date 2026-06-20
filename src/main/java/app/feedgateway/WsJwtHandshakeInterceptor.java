@@ -30,6 +30,8 @@ import java.util.Map;
 public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
 
     static final String BEARER_SUBPROTOCOL = "oc.bearer";
+    /** Session attribute holding the token's expiry (epoch ms), so the reaper can close it when it lapses. */
+    static final String AUTH_EXPIRES_AT_ATTR = "authExpiresAtEpochMs";
     private static final String SEC_WEBSOCKET_PROTOCOL = "Sec-WebSocket-Protocol";
 
     private final GatewaySettings settings;
@@ -59,7 +61,7 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
             Jwt jwt = decoder().decode(token);
             attributes.put("sub", jwt.getSubject());
             if (jwt.getExpiresAt() != null) {
-                attributes.put("authExpiresAtEpochMs", jwt.getExpiresAt().toEpochMilli());
+                attributes.put(AUTH_EXPIRES_AT_ATTR, jwt.getExpiresAt().toEpochMilli());
             }
             return true;
         } catch (JwtException e) {

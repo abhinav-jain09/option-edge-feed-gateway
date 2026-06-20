@@ -24,6 +24,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.springframework.stereotype.Service;
+import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
@@ -237,6 +238,36 @@ public class FeedGatewayService {
         } catch (IOException | IllegalStateException ignored) {
             // Removing the session from the fanout set is sufficient.
         }
+    }
+
+    // 4001 is in the application-private close-code range (4000-4999); the browser client reads it,
+    // refreshes the token, and reconnects.
+    private static final CloseStatus TOKEN_EXPIRED_STATUS = new CloseStatus(4001, "token expired");
+
+    /**
+     * Closes any authenticated socket whose access token has expired. Auth is enforced only at the
+     * handshake, so without this sweep a long-lived socket would keep streaming live quotes after its
+     * token died. Sockets opened while WS auth was disabled carry no expiry attribute and are left
+     * untouched. Returns the number of sockets closed (for logging/tests).
+     */
+    public int closeExpiredAuthSessions(long nowMs) {
+        int closed = 0;
+        for (WebSocketSession session : clients) {
+            Object expiry = session.getAttributes().get(WsJwtHandshakeInterceptor.AUTH_EXPIRES_AT_ATTR);
+            if (!(expiry instanceof Long expiresAtMs) || nowMs < expiresAtMs) {
+                continue;
+            }
+            clients.remove(session);
+            try {
+                if (session.isOpen()) {
+                    session.close(TOKEN_EXPIRED_STATUS);
+                }
+            } catch (IOException | IllegalStateException ignored) {
+                // Removing the session from the fanout set is sufficient.
+            }
+            closed++;
+        }
+        return closed;
     }
 
     public String healthJson() {
