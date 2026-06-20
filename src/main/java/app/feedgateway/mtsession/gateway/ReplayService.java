@@ -19,16 +19,19 @@ public final class ReplayService {
     private final TokenVerifier verifier;
     private final SessionRoutingEngine engine;
     private final ReplayRunner runner;
+    private final ReplayRunAuthorizer runAuthorizer;
     private final boolean enabled;
     private final boolean prodBlocked;
     private final long maxWindowMs;
     private final int maxRecordsCap;
 
     public ReplayService(TokenVerifier verifier, SessionRoutingEngine engine, ReplayRunner runner,
-                         boolean enabled, boolean prodBlocked, long maxWindowMs, int maxRecordsCap) {
+                         ReplayRunAuthorizer runAuthorizer, boolean enabled, boolean prodBlocked,
+                         long maxWindowMs, int maxRecordsCap) {
         this.verifier = Objects.requireNonNull(verifier, "verifier");
         this.engine = Objects.requireNonNull(engine, "engine");
         this.runner = Objects.requireNonNull(runner, "runner");
+        this.runAuthorizer = Objects.requireNonNull(runAuthorizer, "runAuthorizer");
         this.enabled = enabled;
         this.prodBlocked = prodBlocked;
         this.maxWindowMs = maxWindowMs;
@@ -62,6 +65,13 @@ public final class ReplayService {
         }
         if (engine.appSession(appSessionId).isEmpty()) {
             throw new IllegalStateException("no active session to replay; connect first");
+        }
+        // P0 (runId authz): owning the WS session does NOT prove ownership of an orchestrated run. Before
+        // the runId is turned into replay-topic names and read, authorize (issuer, subject, runId) against
+        // the orchestrator — the source of truth for run ownership. Live-slice replays (no runId) read only
+        // the caller's own session/selection, so they need no run authorization.
+        if (params.hasRun()) {
+            runAuthorizer.authorizeRun(bearerToken, params.runId());
         }
         ReplayRunner.Mode mode = runner.startReplay(params);
         return new ReplayAck(mode, params);

@@ -59,9 +59,32 @@ class ReplayServiceTest {
         return engine;
     }
 
+    /** Records each runId it is asked to authorize; allows by default unless {@code deny} is set. */
+    private static final class RecordingAuthorizer implements ReplayRunAuthorizer {
+        final List<String> authorized = new ArrayList<>();
+        boolean deny;
+
+        @Override
+        public void authorizeRun(String bearerToken, String runId) {
+            authorized.add(runId);
+            if (deny) {
+                throw new ReplayRunAuthorizationException("denied: " + runId);
+            }
+        }
+    }
+
+    private static final ReplayRunAuthorizer ALLOW_ALL = (token, runId) -> { };
+
     private ReplayService service(SessionRoutingEngine engine, ReplayRunner runner, String userId,
                                   boolean enabled, boolean prodBlocked) {
-        return new ReplayService(verifierFor(userId), engine, runner, enabled, prodBlocked, MAX_WINDOW_MS, MAX_RECORDS);
+        return service(engine, runner, ALLOW_ALL, userId, enabled, prodBlocked);
+    }
+
+    private ReplayService service(SessionRoutingEngine engine, ReplayRunner runner,
+                                  ReplayRunAuthorizer authorizer, String userId,
+                                  boolean enabled, boolean prodBlocked) {
+        return new ReplayService(verifierFor(userId), engine, runner, authorizer, enabled, prodBlocked,
+                MAX_WINDOW_MS, MAX_RECORDS);
     }
 
     private static ReplayService.ReplayRequest req(String sessionId) {
@@ -91,6 +114,47 @@ class ReplayServiceTest {
 
         assertEquals("r-123", ack.params().runId());
         assertTrue(ack.params().hasRun());
+    }
+
+    @Test
+    void runBackedReplayIsDeniedWhenTheCallerDoesNotOwnTheRun() {
+        // P0: owning app:u1's WS session must NOT let u1 read another user's orchestrated run.
+        SessionRoutingEngine engine = engineWith("app:u1", "u1");
+        RecordingRunner runner = new RecordingRunner();
+        RecordingAuthorizer authz = new RecordingAuthorizer();
+        authz.deny = true;
+        ReplayService svc = service(engine, runner, authz, "u1", true, false);
+        ReplayService.ReplayRequest someoneElsesRun =
+                new ReplayService.ReplayRequest("app:u1", "SPX", "20260612", START, END, 1000, "r-not-mine");
+
+        assertThrows(ReplayRunAuthorizer.ReplayRunAuthorizationException.class,
+                () -> svc.start("tok", someoneElsesRun));
+        assertEquals(List.of("r-not-mine"), authz.authorized, "the runId must be authorized before reading");
+        assertTrue(runner.calls.isEmpty(), "no topic read may start when run authorization fails");
+    }
+
+    @Test
+    void runBackedReplayAuthorizesTheRunIdWithTheCallersToken() throws Exception {
+        SessionRoutingEngine engine = engineWith("app:u1", "u1");
+        RecordingAuthorizer authz = new RecordingAuthorizer();
+        ReplayService svc = service(engine, new RecordingRunner(), authz, "u1", true, false);
+        ReplayService.ReplayRequest withRun =
+                new ReplayService.ReplayRequest("app:u1", "SPX", "20260612", START, END, 1000, "r-mine");
+
+        svc.start("tok", withRun);
+        assertEquals(List.of("r-mine"), authz.authorized);
+    }
+
+    @Test
+    void liveSliceReplaySkipsRunAuthorization() throws Exception {
+        // No runId → the caller replays only their own session's live data; no orchestrator check needed.
+        SessionRoutingEngine engine = engineWith("app:u1", "u1");
+        RecordingAuthorizer authz = new RecordingAuthorizer();
+        authz.deny = true; // would fail if consulted
+        ReplayService svc = service(engine, new RecordingRunner(), authz, "u1", true, false);
+
+        svc.start("tok", req("app:u1"));
+        assertTrue(authz.authorized.isEmpty(), "live-slice replay must not consult run authorization");
     }
 
     @Test
@@ -151,7 +215,8 @@ class ReplayServiceTest {
         TokenVerifier failing = token -> {
             throw new JwtVerificationException("bad");
         };
-        ReplayService svc = new ReplayService(failing, engine, new RecordingRunner(), true, false, MAX_WINDOW_MS, MAX_RECORDS);
+        ReplayService svc = new ReplayService(failing, engine, new RecordingRunner(), ALLOW_ALL, true, false,
+                MAX_WINDOW_MS, MAX_RECORDS);
         assertThrows(JwtVerificationException.class, () -> svc.start("tok", req("app:u1")));
     }
 

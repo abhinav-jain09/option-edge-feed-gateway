@@ -107,10 +107,30 @@ public class MtSessionAuthConfig {
      */
     @Bean
     public ReplayService replayService(TokenVerifier tokenVerifier, SessionRoutingEngine engine,
-                                       ReplayRunner replayRunner, GatewaySettings settings) {
+                                       ReplayRunner replayRunner, ReplayRunAuthorizer replayRunAuthorizer,
+                                       GatewaySettings settings) {
         boolean prodBlocked = settings.isProd() && !settings.replayAllowInProd();
-        return new ReplayService(tokenVerifier, engine, replayRunner,
+        return new ReplayService(tokenVerifier, engine, replayRunner, replayRunAuthorizer,
                 settings.replayUiEnabled(), prodBlocked,
                 settings.replayMaxWindowMs(), settings.replayMaxRecords());
+    }
+
+    /**
+     * Authorizes runId ownership against the orchestrator before any replay topic is read (P0 — runId
+     * authz). With no {@code GATEWAY_REPLAY_ORCHESTRATOR_URL} configured we cannot confirm ownership, so
+     * the authorizer denies every runId-backed replay (fail closed); {@link MtSessionSecurityInvariant}
+     * additionally refuses startup in that posture when replay is enabled.
+     */
+    @Bean
+    public ReplayRunAuthorizer replayRunAuthorizer(GatewaySettings settings) {
+        String base = settings.replayOrchestratorBaseUrl();
+        if (base == null || base.isBlank()) {
+            return (token, runId) -> {
+                throw new ReplayRunAuthorizer.ReplayRunAuthorizationException(
+                        "replay run authorization unavailable: GATEWAY_REPLAY_ORCHESTRATOR_URL is not configured");
+            };
+        }
+        return new OrchestratorReplayRunAuthorizer(base,
+                Duration.ofMillis(settings.replayOrchestratorTimeoutMs()));
     }
 }

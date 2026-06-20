@@ -73,6 +73,9 @@ public final class ReplayController {
             return error(HttpStatus.UNAUTHORIZED, "invalid token");
         } catch (ReplayService.ReplayDisabledException e) {
             return error(HttpStatus.FORBIDDEN, e.getMessage());
+        } catch (ReplayRunAuthorizer.ReplayRunAuthorizationException e) {
+            // The caller does not own (or we could not confirm ownership of) the requested runId.
+            return error(HttpStatus.FORBIDDEN, e.getMessage());
         } catch (IllegalArgumentException e) {
             return error(HttpStatus.BAD_REQUEST, e.getMessage());
         } catch (IllegalStateException e) {

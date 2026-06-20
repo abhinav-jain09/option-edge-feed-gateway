@@ -67,6 +67,24 @@ class MtSessionSecurityInvariantTest {
     }
 
     @Test
+    void replayEnabledWithoutOrchestratorUrlFailsStartup() {
+        // Replay turns a caller-supplied runId into topic reads, so an orchestrator to authorize runId
+        // ownership is mandatory whenever replay is enabled — refuse to start otherwise.
+        Map<String, String> m = prodProps();
+        m.put("DATABENTO_REPLAY_UI_ENABLED", "true");
+        withProps(m, () -> assertTrue(msg(assertThrows(IllegalStateException.class,
+                MtSessionSecurityInvariantTest::check)).contains("GATEWAY_REPLAY_ORCHESTRATOR_URL")));
+    }
+
+    @Test
+    void replayEnabledWithOrchestratorUrlStarts() {
+        Map<String, String> m = prodProps();
+        m.put("DATABENTO_REPLAY_UI_ENABLED", "true");
+        m.put("GATEWAY_REPLAY_ORCHESTRATOR_URL", "http://hpsf-replay-orchestrator:8080");
+        withProps(m, () -> assertDoesNotThrow(MtSessionSecurityInvariantTest::check));
+    }
+
+    @Test
     void devOptOutsAllowInsecureLocalSetup() {
         // dev: in-memory tickets + plaintext kafka, BUT issuer + exact origins are still mandatory.
         Map<String, String> m = new HashMap<>();

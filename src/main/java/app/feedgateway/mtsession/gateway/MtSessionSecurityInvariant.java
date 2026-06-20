@@ -59,6 +59,15 @@ public class MtSessionSecurityInvariant implements InitializingBean {
             errors.add("GATEWAY_KAFKA_SECURITY_PROTOCOL must be SSL/SASL_SSL"
                     + " (or GATEWAY_ALLOW_INSECURE_KAFKA=true for dev)");
         }
+        // Replay turns a caller-supplied runId into topic names the gateway reads, so it MUST authorize
+        // runId ownership against the orchestrator first (P0 — runId authz). Without an orchestrator URL
+        // every runId-backed replay fails closed, so refuse to start in that misconfiguration rather than
+        // silently disabling a security control operators believe is on.
+        if (settings.replayUiEnabled()
+                && (settings.replayOrchestratorBaseUrl() == null || settings.replayOrchestratorBaseUrl().isBlank())) {
+            errors.add("GATEWAY_REPLAY_ORCHESTRATOR_URL must be set when DATABENTO_REPLAY_UI_ENABLED=true"
+                    + " (runId ownership is authorized against the orchestrator before any topic is read)");
+        }
 
         if (!errors.isEmpty()) {
             throw new IllegalStateException(

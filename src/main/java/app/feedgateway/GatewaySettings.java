@@ -324,6 +324,22 @@ public final class GatewaySettings {
         return intValue("GATEWAY_REPLAY_MAX_RECORDS", 200_000, 1);
     }
 
+    /**
+     * Base URL of the replay orchestrator. The gateway calls its ownership-checked run endpoint to
+     * authorize {@code (issuer, subject, runId)} before turning a runId into replay topics (P0 — runId
+     * authz). Blank means no orchestrator is configured: runId-backed replays are then denied (fail
+     * closed), and {@link app.feedgateway.mtsession.gateway.MtSessionSecurityInvariant} refuses startup
+     * when replay is enabled without it.
+     */
+    public String replayOrchestratorBaseUrl() {
+        return value("GATEWAY_REPLAY_ORCHESTRATOR_URL", "");
+    }
+
+    /** Timeout for the orchestrator run-ownership authorization call; on timeout the request is denied. */
+    public long replayOrchestratorTimeoutMs() {
+        return longValue("GATEWAY_REPLAY_ORCHESTRATOR_TIMEOUT_MS", 3_000L, 200L);
+    }
+
     public static String value(String key, String fallback) {
         String env = System.getenv(key);
         if (env != null && !env.isBlank()) {
