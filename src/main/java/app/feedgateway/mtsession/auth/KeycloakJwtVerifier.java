@@ -52,7 +52,13 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
     private final ConfigurableJWTProcessor<SecurityContext> processor;
 
     public KeycloakJwtVerifier(String issuerUri, String expectedClientId) {
-        this(issuerUri, null, expectedClientId, null);
+        this(issuerUri, null, expectedClientId, (String) null);
+    }
+
+    /** Test seam: build a verifier whose keys come from an in-memory {@link JWKSource} (no network). */
+    static KeycloakJwtVerifier forJwkSource(String issuerUri, String expectedClientId, String expectedAudience,
+                                            JWKSource<SecurityContext> jwkSource) {
+        return new KeycloakJwtVerifier(issuerUri, expectedClientId, expectedAudience, jwkSource);
     }
 
     /**
@@ -64,16 +70,21 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
      */
     public KeycloakJwtVerifier(String issuerUri, String jwksUrlOverride, String expectedClientId,
                                String expectedAudience) {
+        this(issuerUri, expectedClientId, expectedAudience,
+                jwkSourceFromUrl((jwksUrlOverride == null || jwksUrlOverride.isBlank())
+                        ? issuerUri + "/protocol/openid-connect/certs"
+                        : jwksUrlOverride));
+    }
+
+    private KeycloakJwtVerifier(String issuerUri, String expectedClientId, String expectedAudience,
+                                JWKSource<SecurityContext> jwkSource) {
         this.issuer = Objects.requireNonNull(issuerUri, "issuerUri");
         this.expectedClientId = expectedClientId;
         this.expectedAudience = (expectedAudience == null || expectedAudience.isBlank()) ? null : expectedAudience;
-        String jwksUrl = (jwksUrlOverride == null || jwksUrlOverride.isBlank())
-                ? issuerUri + "/protocol/openid-connect/certs"
-                : jwksUrlOverride;
-        this.processor = buildProcessor(issuerUri, jwksUrl);
+        this.processor = buildProcessor(issuerUri, Objects.requireNonNull(jwkSource, "jwkSource"));
     }
 
-    private static ConfigurableJWTProcessor<SecurityContext> buildProcessor(String issuerUri, String jwksUrlStr) {
+    private static JWKSource<SecurityContext> jwkSourceFromUrl(String jwksUrlStr) {
         URL jwksUrl;
         try {
             jwksUrl = URI.create(jwksUrlStr).toURL();
@@ -82,14 +93,18 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
         }
         DefaultResourceRetriever retriever =
                 new DefaultResourceRetriever(JWKS_CONNECT_TIMEOUT_MS, JWKS_READ_TIMEOUT_MS, JWKS_SIZE_LIMIT_BYTES);
-        JWKSource<SecurityContext> jwkSource = JWKSourceBuilder.create(jwksUrl, retriever)
+        return JWKSourceBuilder.create(jwksUrl, retriever)
                 .retrying(true)
                 .rateLimited(true)
                 .refreshAheadCache(true)
                 .build();
+    }
+
+    private static ConfigurableJWTProcessor<SecurityContext> buildProcessor(
+            String issuerUri, JWKSource<SecurityContext> jwkSource) {
+        // RS256 pinned -> alg=none / HS256-with-public-key confusion cannot select a key.
         JWSKeySelector<SecurityContext> keySelector =
                 new JWSVerificationKeySelector<>(JWSAlgorithm.RS256, jwkSource);
-
         ConfigurableJWTProcessor<SecurityContext> p = new DefaultJWTProcessor<>();
         p.setJWSKeySelector(keySelector);
         p.setJWTClaimsSetVerifier(new DefaultJWTClaimsVerifier<>(
