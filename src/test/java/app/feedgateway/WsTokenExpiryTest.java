@@ -20,7 +20,7 @@ class WsTokenExpiryTest {
     private static final long NOW = 1_700_000_000_000L;
 
     private FeedGatewayService newService() {
-        return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper());
+        return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
     }
 
     private static WebSocketSession sessionWithExpiry(Long expiresAtMs) {

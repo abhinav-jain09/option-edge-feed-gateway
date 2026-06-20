@@ -276,7 +276,8 @@ class FeedGatewayServiceTest {
         return new FeedGatewayService(
                 new GatewaySettings(),
                 new ObjectMapper(),
-                new HpsfGatewayViewMapper()
+                new HpsfGatewayViewMapper(),
+                null /* routingEngine: legacy broadcast path */
         );
     }
 

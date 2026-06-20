@@ -28,9 +28,9 @@ public final class GatewaySettings {
         return boolValue("GATEWAY_AUTH_ENABLED", false);
     }
 
-    public String wsAllowedOrigins() {
-        return value("GATEWAY_WS_ALLOWED_ORIGINS", "*");
-    }
+    // NOTE: the WS handshake origin allow-list is a single source of truth — wsAllowedOrigins() below
+    // (WS_ALLOWED_ORIGINS), shared by BOTH the oc.bearer and the multi-tenant ticket handshake. The old
+    // GATEWAY_WS_ALLOWED_ORIGINS alias was dropped to avoid two competing origin lists.
 
     public String keycloakIssuer() {
         return value("GATEWAY_KEYCLOAK_ISSUER", "");
