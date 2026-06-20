@@ -9,6 +9,7 @@ import app.feedgateway.mtsession.AppSession;
 import app.feedgateway.mtsession.EventType;
 import app.feedgateway.mtsession.MarketDataSource;
 import app.feedgateway.mtsession.SessionRoutingEngine;
+import app.feedgateway.mtsession.gateway.ReplayChronology;
 import app.feedgateway.mtsession.gateway.ReplayParams;
 import app.feedgateway.mtsession.gateway.ReplayTopicResolver;
 import app.feedgateway.mtsession.gateway.ReplayRunner;
@@ -43,11 +44,13 @@ import org.springframework.web.socket.WebSocketSession;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -1961,8 +1964,10 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics = toReplayTopics(stringTopics, params.runId());
             }
             try {
-                delivered += replayWindow(appSessionId, params, source, avroTopics, true, flag, delivered);
-                delivered += replayWindow(appSessionId, params, source, stringTopics, false, flag, delivered);
+                // P0 (replay chronology): a SINGLE deterministic k-way merge across ALL topics (avro +
+                // string) by canonical event time — never topic-by-topic, which would surface "all
+                // snapshots then all strike-flow" and let the record cap drain entirely in one phase.
+                delivered += replayMerged(appSessionId, params, source, avroTopics, stringTopics, flag);
             } catch (RuntimeException e) {
                 sendToAppSession(appSessionId, "replay-status", "{\"mode\":\"REPLAY_COMPLETE\",\"error\":\""
                         + escapeJson(String.valueOf(e.getMessage())) + "\"}");
@@ -1972,12 +1977,66 @@ public class FeedGatewayService implements ReplayRunner {
         sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_COMPLETE", params, delivered));
     }
 
-    /** Read one consumer's records in [startUtcMs, endUtcMs) and stream matches to the session. */
-    private long replayWindow(String appSessionId, ReplayParams params, MarketDataSource source,
-                              Map<String, String> topicEvents, boolean avro, AtomicBoolean flag, long alreadyDelivered) {
-        if (topicEvents.isEmpty()) {
+    /**
+     * Deterministic chronological replay (P0 — replay chronology). Reads the session's avro AND string
+     * replay topics together and merges every partition by canonical event time
+     * ({@code eventTimestamp → topic → partition → offset}; see {@link ReplayChronology}), so the outbound
+     * stream reproduces the real market sequence and the record cap bounds the merged timeline instead of
+     * being exhausted by whichever topic is read first. Each outbound event keeps its source timestamp,
+     * topic, partition and offset.
+     */
+    private long replayMerged(String appSessionId, ReplayParams params, MarketDataSource source,
+                              Map<String, String> avroTopics, Map<String, String> stringTopics,
+                              AtomicBoolean flag) {
+        if (avroTopics.isEmpty() && stringTopics.isEmpty()) {
             return 0L;
         }
+        KafkaConsumer<String, Object> avro = null;
+        KafkaConsumer<String, Object> str = null;
+        try {
+            Map<TopicPartition, ReplayPartitionState> parts = new LinkedHashMap<>();
+            if (!avroTopics.isEmpty()) {
+                avro = new KafkaConsumer<>(replayConsumerProps(appSessionId, true));
+                openReplayPartitions(avro, params, avroTopics, true, parts);
+            }
+            if (!stringTopics.isEmpty()) {
+                str = new KafkaConsumer<>(replayConsumerProps(appSessionId, false));
+                openReplayPartitions(str, params, stringTopics, false, parts);
+            }
+            if (parts.isEmpty()) {
+                return 0L;
+            }
+            return mergeReplayPartitions(appSessionId, params, source, avro, str, parts, flag);
+        } finally {
+            if (avro != null) {
+                avro.close();
+            }
+            if (str != null) {
+                str.close();
+            }
+        }
+    }
+
+    /** Per-partition cursor for the replay merge: a buffer of in-order records plus its window end. */
+    private static final class ReplayPartitionState {
+        final boolean avro;
+        final String event;
+        final long endTarget;                          // exclusive: read offsets < endTarget
+        final ArrayDeque<MergeRecord> buffer = new ArrayDeque<>();
+        boolean drained;                               // consumer position reached endTarget — nothing more to poll
+
+        ReplayPartitionState(boolean avro, String event, long endTarget) {
+            this.avro = avro;
+            this.event = event;
+            this.endTarget = endTarget;
+        }
+    }
+
+    /** One buffered record awaiting chronological emission. */
+    private record MergeRecord(ReplayChronology.Cursor cursor, String event, Object value, boolean avro) {
+    }
+
+    private Properties replayConsumerProps(String appSessionId, boolean avro) {
         Properties props = avro
                 ? avroConsumerProperties("replay-" + appSessionId)
                 : stringObjectConsumerProperties("replay-" + appSessionId);
@@ -1985,100 +2044,207 @@ public class FeedGatewayService implements ReplayRunner {
         props.put(ConsumerConfig.GROUP_ID_CONFIG,
                 settings.groupIdBase() + "-replay-" + appSessionId + "-" + (avro ? "avro" : "str"));
         props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        return props;
+    }
+
+    /** Assign + seek this consumer's partitions for the window (or full runId topics) and register state. */
+    private void openReplayPartitions(KafkaConsumer<String, Object> consumer, ReplayParams params,
+                                      Map<String, String> topicEvents, boolean avro,
+                                      Map<TopicPartition, ReplayPartitionState> parts) {
+        List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
+        consumer.assign(partitions);
+        Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
+        if (params.hasRun()) {
+            // Orchestrated run: the *.replay.<runId>.* topics already contain exactly the windowed data,
+            // so read each partition in full (beginning..log-end) — no timestamp slicing.
+            Map<TopicPartition, Long> begin = consumer.beginningOffsets(partitions);
+            for (TopicPartition tp : partitions) {
+                long start = begin.getOrDefault(tp, 0L);
+                long target = logEnd.getOrDefault(tp, start);
+                if (target <= start) {
+                    continue; // empty partition
+                }
+                consumer.seek(tp, start);
+                parts.put(tp, new ReplayPartitionState(avro, topicEvents.get(tp.topic()), target));
+            }
+        } else {
+            Map<TopicPartition, Long> startQuery = new HashMap<>();
+            Map<TopicPartition, Long> endQuery = new HashMap<>();
+            for (TopicPartition tp : partitions) {
+                startQuery.put(tp, params.startUtcMs());
+                endQuery.put(tp, params.endUtcMs());
+            }
+            Map<TopicPartition, OffsetAndTimestamp> startOffsets = consumer.offsetsForTimes(startQuery);
+            Map<TopicPartition, OffsetAndTimestamp> endOffsets = consumer.offsetsForTimes(endQuery);
+            for (TopicPartition tp : partitions) {
+                OffsetAndTimestamp start = startOffsets.get(tp);
+                if (start == null) {
+                    continue; // no records at/after the window start
+                }
+                OffsetAndTimestamp end = endOffsets.get(tp);
+                long target = end != null ? end.offset() : logEnd.getOrDefault(tp, start.offset());
+                if (target <= start.offset()) {
+                    continue; // empty window on this partition
+                }
+                consumer.seek(tp, start.offset());
+                parts.put(tp, new ReplayPartitionState(avro, topicEvents.get(tp.topic()), target));
+            }
+        }
+    }
+
+    /**
+     * The chronological merge core. Holds a small per-partition buffer for both consumers and always emits
+     * the globally-earliest available record ({@link ReplayChronology#ORDER}). A not-yet-drained partition
+     * with an empty buffer BLOCKS emission until it is polled, so no later-but-first-read record can jump
+     * ahead of an earlier one on another topic/partition. The cap bounds DELIVERED (matched) records, taken
+     * from the front of the merged timeline.
+     */
+    private long mergeReplayPartitions(String appSessionId, ReplayParams params, MarketDataSource source,
+                                       KafkaConsumer<String, Object> avro, KafkaConsumer<String, Object> str,
+                                       Map<TopicPartition, ReplayPartitionState> parts, AtomicBoolean flag) {
         long delivered = 0L;
-        try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(props)) {
-            List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
-            consumer.assign(partitions);
-            Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
-            Map<TopicPartition, Long> endTarget = new HashMap<>();
-            List<TopicPartition> active = new ArrayList<>();
-            if (params.hasRun()) {
-                // Orchestrated run: the *.replay.<runId>.* topics already contain exactly the windowed
-                // data, so read each partition in full (beginning..log-end) — no timestamp slicing.
-                Map<TopicPartition, Long> begin = consumer.beginningOffsets(partitions);
-                for (TopicPartition tp : partitions) {
-                    long start = begin.getOrDefault(tp, 0L);
-                    long target = logEnd.getOrDefault(tp, start);
-                    if (target <= start) {
-                        continue; // empty partition
+        int maxRecords = params.maxRecords();
+        int idlePolls = 0;
+        final int maxIdlePolls = 50;
+        while (flag.get() && running.get() && delivered < maxRecords) {
+            if (hasUnbufferedActivePartition(parts)) {
+                boolean got = pollIntoBuffers(avro, parts) | pollIntoBuffers(str, parts);
+                refreshDrained(avro, true, parts);
+                refreshDrained(str, false, parts);
+                if (hasUnbufferedActivePartition(parts)) {
+                    if (got) {
+                        idlePolls = 0;
+                        continue; // poll again until every active partition has a head buffered
                     }
-                    consumer.seek(tp, start);
-                    endTarget.put(tp, target);
-                    active.add(tp);
-                }
-            } else {
-                Map<TopicPartition, Long> startQuery = new HashMap<>();
-                Map<TopicPartition, Long> endQuery = new HashMap<>();
-                for (TopicPartition tp : partitions) {
-                    startQuery.put(tp, params.startUtcMs());
-                    endQuery.put(tp, params.endUtcMs());
-                }
-                Map<TopicPartition, OffsetAndTimestamp> startOffsets = consumer.offsetsForTimes(startQuery);
-                Map<TopicPartition, OffsetAndTimestamp> endOffsets = consumer.offsetsForTimes(endQuery);
-                for (TopicPartition tp : partitions) {
-                    OffsetAndTimestamp start = startOffsets.get(tp);
-                    if (start == null) {
-                        continue; // no records at/after the window start
-                    }
-                    OffsetAndTimestamp end = endOffsets.get(tp);
-                    long target = end != null ? end.offset() : logEnd.getOrDefault(tp, start.offset());
-                    if (target <= start.offset()) {
-                        continue; // empty window on this partition
-                    }
-                    consumer.seek(tp, start.offset());
-                    endTarget.put(tp, target);
-                    active.add(tp);
-                }
-            }
-            if (active.isEmpty()) {
-                return 0L;
-            }
-            int maxRecords = params.maxRecords();
-            Set<TopicPartition> done = new HashSet<>();
-            while (flag.get() && running.get() && done.size() < active.size()
-                    && (alreadyDelivered + delivered) < maxRecords) {
-                ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
-                boolean advanced = false;
-                for (TopicPartition tp : active) {
-                    if (done.contains(tp)) {
+                    if (++idlePolls <= maxIdlePolls) {
                         continue;
                     }
-                    for (ConsumerRecord<String, Object> rec : records.records(tp)) {
-                        if (rec.offset() >= endTarget.get(tp)) {
-                            break;
-                        }
-                        if ((alreadyDelivered + delivered) >= maxRecords) {
-                            break;
-                        }
-                        advanced = true;
-                        String event = topicEvents.get(tp.topic());
-                        // A single malformed/poison record must NOT abort the whole windowed replay
-                        // (review finding #12). Convert+match+send is guarded per-record: on failure we
-                        // skip that one record and keep streaming the remaining good ones.
-                        try {
-                            String json = enrichJson(avro ? avroJson(rec.value()) : stringJson(rec.value()),
-                                    new TopicBinding(source.name(), event));
-                            if (json == null || json.isBlank()) {
-                                continue;
-                            }
-                            if (replayMatches(params, event, json)) {
-                                sendToAppSession(appSessionId, event, json);
-                                delivered++;
-                            }
-                        } catch (RuntimeException poison) {
-                            // skip the poison record; the replay continues with the next record
+                    // No data is forthcoming for the still-empty partitions; treat them as exhausted so the
+                    // merge can drain the buffered remainder deterministically.
+                    for (ReplayPartitionState st : parts.values()) {
+                        if (st.buffer.isEmpty()) {
+                            st.drained = true;
                         }
                     }
-                    if (consumer.position(tp) >= endTarget.get(tp)) {
-                        done.add(tp);
-                    }
+                } else {
+                    idlePolls = 0;
                 }
-                if (records.isEmpty() && !advanced) {
-                    break; // window exhausted (no more data forthcoming)
-                }
+            }
+            MergeRecord next = pollGlobalMinimum(parts);
+            if (next == null) {
+                break; // every partition drained and emptied
+            }
+            if (emitReplayRecord(appSessionId, params, source, next)) {
+                delivered++;
             }
         }
         return delivered;
+    }
+
+    private static boolean hasUnbufferedActivePartition(Map<TopicPartition, ReplayPartitionState> parts) {
+        for (ReplayPartitionState st : parts.values()) {
+            if (!st.drained && st.buffer.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Poll one consumer and append every in-window record to its partition buffer. */
+    private boolean pollIntoBuffers(KafkaConsumer<String, Object> consumer,
+                                    Map<TopicPartition, ReplayPartitionState> parts) {
+        if (consumer == null) {
+            return false;
+        }
+        ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+        boolean appended = false;
+        for (ConsumerRecord<String, Object> rec : records) {
+            TopicPartition tp = new TopicPartition(rec.topic(), rec.partition());
+            ReplayPartitionState st = parts.get(tp);
+            if (st == null || rec.offset() >= st.endTarget) {
+                continue; // beyond the window end — ignore (position still advances past it)
+            }
+            ReplayChronology.Cursor cursor =
+                    new ReplayChronology.Cursor(rec.timestamp(), rec.topic(), rec.partition(), rec.offset());
+            st.buffer.addLast(new MergeRecord(cursor, st.event, rec.value(), st.avro));
+            appended = true;
+        }
+        return appended;
+    }
+
+    /** Mark this consumer's partitions whose position reached the window end (nothing more will be polled). */
+    private void refreshDrained(KafkaConsumer<String, Object> consumer, boolean avro,
+                                Map<TopicPartition, ReplayPartitionState> parts) {
+        if (consumer == null) {
+            return;
+        }
+        for (Map.Entry<TopicPartition, ReplayPartitionState> e : parts.entrySet()) {
+            ReplayPartitionState st = e.getValue();
+            if (st.drained || st.avro != avro) {
+                continue;
+            }
+            if (consumer.position(e.getKey()) >= st.endTarget) {
+                st.drained = true;
+            }
+        }
+    }
+
+    /** Pop the globally-earliest buffered record across all partitions ({@link ReplayChronology#ORDER}). */
+    private MergeRecord pollGlobalMinimum(Map<TopicPartition, ReplayPartitionState> parts) {
+        ReplayPartitionState minState = null;
+        MergeRecord min = null;
+        for (ReplayPartitionState st : parts.values()) {
+            MergeRecord head = st.buffer.peek();
+            if (head == null) {
+                continue;
+            }
+            if (min == null || ReplayChronology.ORDER.compare(head.cursor(), min.cursor()) < 0) {
+                min = head;
+                minState = st;
+            }
+        }
+        if (minState != null) {
+            minState.buffer.pollFirst();
+        }
+        return min;
+    }
+
+    /** Convert, stamp provenance, filter to the session, and stream one merged record. */
+    private boolean emitReplayRecord(String appSessionId, ReplayParams params, MarketDataSource source,
+                                     MergeRecord r) {
+        // A single malformed/poison record must NOT abort the windowed replay (review finding #12).
+        try {
+            String raw = r.avro() ? avroJson(r.value()) : stringJson(r.value());
+            String json = enrichJson(raw, new TopicBinding(source.name(), r.event()));
+            if (json == null || json.isBlank()) {
+                return false;
+            }
+            json = withReplayProvenance(json, r.cursor());
+            if (replayMatches(params, r.event(), json)) {
+                sendToAppSession(appSessionId, r.event(), json);
+                return true;
+            }
+            return false;
+        } catch (RuntimeException poison) {
+            return false; // skip the poison record; the merge continues with the next
+        }
+    }
+
+    /** Retain the record's canonical event time, topic, partition and offset on the outbound event. */
+    private String withReplayProvenance(String json, ReplayChronology.Cursor cursor) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            if (root instanceof ObjectNode object) {
+                object.put("replaySourceTimestamp", cursor.eventTimestamp());
+                object.put("replaySourceTopic", cursor.topic());
+                object.put("replaySourcePartition", cursor.partition());
+                object.put("replaySourceOffset", cursor.offset());
+                return mapper.writeValueAsString(object);
+            }
+        } catch (JsonProcessingException ignored) {
+            // fall through with the unannotated json
+        }
+        return json;
     }
 
     /** Map each live topic in {@code topicEvents} to its per-runId replay-namespace equivalent. */
