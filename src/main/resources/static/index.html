@@ -3,6 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- P0 (XSS hardening): restrictive CSP. Scripts are self-hosted only (no inline JS, no third-party CDN),
+       so a reflected error_description / token claim cannot execute even if it reached the DOM. connect-src
+       allows this dev stub's Keycloak origin; update it together with the KC constant in login.js for prod. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://localhost:8080; form-action 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <meta name="referrer" content="no-referrer">
   <title>OptionsEdge — Sign in</title>
   <style>
     :root { --bg:#0f172a; --panel:#1e293b; --accent:#2563eb; --green:#16a34a; --text:#e2e8f0; --muted:#94a3b8; --line:#334155; }
@@ -39,140 +44,6 @@
   </header>
   <main id="main"></main>
 
-<script>
-const KC = "http://localhost:8080/realms/optionsedge", CLIENT = "options-edge-web";
-const TOKEN_URL = KC + "/protocol/openid-connect/token";
-const AUTH_URL = KC + "/protocol/openid-connect/auth";
-const REG_URL = KC + "/protocol/openid-connect/registrations";
-const REDIRECT_URI = location.origin + "/";
-let tok = null, refresh = null, expAt = 0, ws = null, msgs = 0, strikes = {};
-const main = document.getElementById("main");
-const el = id => document.getElementById(id);
-
-function parseJwt(t){ try { const s=t.split(".")[1].replace(/-/g,"+").replace(/_/g,"/"); return JSON.parse(atob(s)); } catch(e){ return {}; } }
-
-// ---- PKCE (authorization-code flow, required by the options-edge-web client) ----
-function b64url(buf){ return btoa(String.fromCharCode.apply(null, new Uint8Array(buf))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
-function randVerifier(){ const a=new Uint8Array(32); crypto.getRandomValues(a); return b64url(a.buffer); }
-async function challenge(v){ const d=await crypto.subtle.digest("SHA-256", new TextEncoder().encode(v)); return b64url(d); }
-
-// Start browser redirect to Keycloak (endpoint = "registrations" to sign up, or "auth" to sign in).
-async function startRedirect(endpoint) {
-  const verifier = randVerifier(), state = randVerifier();
-  sessionStorage.setItem("pkce_verifier", verifier);
-  sessionStorage.setItem("pkce_state", state);
-  const cc = await challenge(verifier);
-  const url = endpoint + "?" + new URLSearchParams({
-    client_id: CLIENT, response_type: "code", scope: "openid",
-    redirect_uri: REDIRECT_URI, state,
-    code_challenge: cc, code_challenge_method: "S256"
-  }).toString();
-  location.assign(url);
-}
-
-// On return from Keycloak (?code=...), exchange the code for tokens.
-async function handleRedirectCallback() {
-  const q = new URLSearchParams(location.search);
-  const code = q.get("code");
-  if (q.get("error")) { history.replaceState({}, "", REDIRECT_URI); viewLogin(decodeURIComponent(q.get("error_description")||q.get("error"))); return true; }
-  if (!code) return false;
-  const verifier = sessionStorage.getItem("pkce_verifier");
-  history.replaceState({}, "", REDIRECT_URI);
-  if (q.get("state") !== sessionStorage.getItem("pkce_state") || !verifier) { viewLogin("Sign-in session expired, please try again."); return true; }
-  try {
-    const body = new URLSearchParams({ grant_type:"authorization_code", client_id:CLIENT, code, redirect_uri:REDIRECT_URI, code_verifier:verifier });
-    const r = await fetch(TOKEN_URL, { method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body });
-    if (!r.ok) { viewLogin("Could not complete sign-in."); return true; }
-    const j = await r.json();
-    tok=j.access_token; refresh=j.refresh_token; expAt=Date.now()+(j.expires_in-30)*1000;
-    sessionStorage.removeItem("pkce_verifier"); sessionStorage.removeItem("pkce_state");
-    viewApp();
-  } catch(e){ viewLogin("Could not reach Keycloak to complete sign-in."); }
-  return true;
-}
-
-function viewLogin(err) {
-  el("who").style.display="none"; el("logout").style.display="none";
-  main.innerHTML =
-    '<div class="card narrow">' +
-      '<h2 class="center">Sign in</h2>' +
-      '<p class="muted center">Access the OptionsEdge live feed.</p>' +
-      '<label>Username</label><input id="u" autocomplete="username">' +
-      '<label>Password</label><input id="p" type="password" autocomplete="current-password">' +
-      '<div style="height:14px"></div>' +
-      '<button class="primary" id="login">Sign in</button>' +
-      '<div class="msg ' + (err?'err':'') + '" id="m">' + (err||"") + '</div>' +
-      '<p class="muted center" style="margin-top:18px">No account? <a href="#" id="register">Create one</a></p>' +
-    '</div>';
-  el("login").onclick = doLogin;
-  el("register").onclick = e => { e.preventDefault(); startRedirect(REG_URL); };
-  el("p").addEventListener("keydown", e => { if (e.key==="Enter") doLogin(); });
-}
-
-async function doLogin() {
-  const u = el("u").value.trim(), p = el("p").value;
-  el("m").textContent = "Signing in…"; el("m").className = "msg";
-  try {
-    const body = new URLSearchParams({ grant_type:"password", client_id:CLIENT, username:u, password:p, scope:"openid" });
-    const r = await fetch(TOKEN_URL, { method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body });
-    if (!r.ok) { viewLogin("Invalid username or password."); return; }
-    const j = await r.json();
-    tok = j.access_token; refresh = j.refresh_token; expAt = Date.now() + (j.expires_in-30)*1000;
-    viewApp();
-  } catch (e) { viewLogin("Cannot reach Keycloak ("+KC+")."); }
-}
-
-async function ensureToken() {
-  if (Date.now() < expAt) return true;
-  try {
-    const body = new URLSearchParams({ grant_type:"refresh_token", client_id:CLIENT, refresh_token:refresh });
-    const r = await fetch(TOKEN_URL, { method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body });
-    if (!r.ok) return false;
-    const j = await r.json(); tok=j.access_token; refresh=j.refresh_token; expAt=Date.now()+(j.expires_in-30)*1000; return true;
-  } catch(e){ return false; }
-}
-
-function viewApp() {
-  const t = parseJwt(tok);
-  const roles = (t.realm_access&&t.realm_access.roles||[]).filter(r=>["user","ibkr-user","trader","admin"].includes(r));
-  el("who").style.display=""; el("who").textContent = (t.preferred_username||"user")+" · "+(roles.join(", ")||"user");
-  el("logout").style.display=""; el("logout").onclick = () => { tok=null; if(ws)ws.close(); viewLogin(); };
-  const ibkr = roles.includes("ibkr-user");
-  main.innerHTML =
-    '<div class="card">' +
-      '<h2>You\'re in, ' + (t.given_name||t.preferred_username||"trader") + ' &#128075;</h2>' +
-      '<p class="muted">Authenticated via Keycloak. Choose a feed and enter the live application.</p>' +
-      '<div class="controls">' +
-        '<div><label>Source</label><select id="src"><option>DATABENTO</option>' + (ibkr?'<option>IBKR</option>':'') + '</select></div>' +
-        '<div><label>Symbol</label><input id="sym" value="SPX"></div>' +
-        '<div><label>Expiry</label><input id="exp" value="20260617"></div>' +
-        '<div><label>Strike from</label><input id="lo" value="0"></div>' +
-        '<div><label>Strike to</label><input id="hi" value="1000000"></div>' +
-        '<div><button class="primary" id="enter">Enter application &#8594;</button></div>' +
-      '</div>' +
-      '<div class="msg err" id="m2"></div>' +
-      '<p class="muted" style="margin-top:14px">Opens the live option chain for your session. ' +
-      'Your feed and strike window are isolated from other users.</p>' +
-    '</div>';
-  el("enter").onclick = enterApp;
-}
-
-async function enterApp() {
-  el("m2").textContent = "";
-  if (!await ensureToken()) { viewLogin("Session expired, please sign in again."); return; }
-  const sel = {
-    source: el("src").value, symbol: el("sym").value.trim().toUpperCase(), expiry: el("exp").value.trim(),
-    strikeLo: parseFloat(el("lo").value), strikeHi: parseFloat(el("hi").value), maxStrikes: 45
-  };
-  // Hand the session + selection to the real option-chain UI.
-  sessionStorage.setItem("oe_tok", tok);
-  sessionStorage.setItem("oe_refresh", refresh);
-  sessionStorage.setItem("oe_expAt", String(expAt));
-  sessionStorage.setItem("oe_sel", JSON.stringify(sel));
-  location.assign("/app.html");
-}
-
-handleRedirectCallback().then(handled => { if (!handled) viewLogin(); });
-</script>
+<script src="/login.js"></script>
 </body>
 </html>
