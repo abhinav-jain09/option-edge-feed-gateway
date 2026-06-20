@@ -44,6 +44,7 @@ class FeedGatewayReplayCancellationTest {
         engine.attachSocket("app:u1", "s1");
         FeedGatewayService svc =
                 new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), engine);
+        svc.runOutboundWritesInline(); // synchronous delivery for deterministic assertions
         Field running = FeedGatewayService.class.getDeclaredField("running");
         running.setAccessible(true);
         ((AtomicBoolean) running.get(svc)).set(true);

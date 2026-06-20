@@ -246,6 +246,30 @@ public final class GatewaySettings {
         return intValue("GATEWAY_WS_BATCH_MS", 125, 100);
     }
 
+    // P0 (slow-client isolation): the Kafka consumer never writes to a socket directly. Each socket has a
+    // bounded, coalescing outbound queue drained by a dedicated writer; breaching a bound disconnects only
+    // that client. These knobs size the queue, the writer pool, and the per-write deadline.
+
+    /** Max messages buffered per socket before that slow client is disconnected. */
+    public int wsMaxQueuedMessages() {
+        return intValue("GATEWAY_WS_MAX_QUEUED_MESSAGES", 1_000, 1);
+    }
+
+    /** Max bytes buffered per socket before that slow client is disconnected. */
+    public long wsMaxQueuedBytes() {
+        return longValue("GATEWAY_WS_MAX_QUEUED_BYTES", 16L * 1024 * 1024, 1_024L);
+    }
+
+    /** Per-write deadline (container blocking-send timeout): a write that exceeds it drops the client. */
+    public long wsWriteDeadlineMs() {
+        return longValue("GATEWAY_WS_WRITE_DEADLINE_MS", 5_000L, 100L);
+    }
+
+    /** Size of the shared pool of outbound writer threads (one active drain per socket at a time). */
+    public int wsWriterThreads() {
+        return intValue("GATEWAY_WS_WRITER_THREADS", 8, 1);
+    }
+
     public int metadataTimeoutMs() {
         return intValue("GATEWAY_KAFKA_METADATA_TIMEOUT_MS", 30_000, 1_000);
     }

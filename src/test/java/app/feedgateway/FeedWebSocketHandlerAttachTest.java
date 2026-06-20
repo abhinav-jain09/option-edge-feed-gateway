@@ -35,7 +35,10 @@ class FeedWebSocketHandlerAttachTest {
             new Selection(MarketDataSource.DATABENTO, "SPX", "20260617", StrikeWindow.ALL);
 
     private FeedGatewayService gateway() {
-        return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+        FeedGatewayService svc =
+                new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+        svc.runOutboundWritesInline();
+        return svc;
     }
 
     @SuppressWarnings("unchecked")

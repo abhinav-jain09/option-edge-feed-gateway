@@ -80,6 +80,29 @@ public class FeedGatewayService implements ReplayRunner {
     private final HpsfGatewayViewMapper hpsfViewMapper;
     private final Set<WebSocketSession> clients = new CopyOnWriteArraySet<>();
     private final Map<String, WebSocketSession> clientsById = new ConcurrentHashMap<>();
+    // P0 (slow-client isolation): per-socket bounded async outbound queues. The Kafka thread enqueues here
+    // and returns; dedicated writers do the network I/O, so one slow client never stalls polling.
+    private final Map<String, OutboundChannel> outbound = new ConcurrentHashMap<>();
+    private volatile ExecutorService outboundWriters;
+    private volatile java.util.concurrent.Executor outboundWriterOverride; // test seam (caller-runs)
+    private final AtomicLong wsEnqueued = new AtomicLong();
+    private final AtomicLong wsCoalesced = new AtomicLong();
+    private final AtomicLong wsSent = new AtomicLong();
+    private final AtomicLong wsSlowDisconnects = new AtomicLong();
+    private final AtomicLong wsWriteErrors = new AtomicLong();
+    private final AtomicLong wsDroppedOnClose = new AtomicLong();
+    private final OutboundChannel.Metrics outboundMetrics = new OutboundChannel.Metrics() {
+        @Override public void enqueued(int bytes) { wsEnqueued.incrementAndGet(); }
+        @Override public void coalesced() { wsCoalesced.incrementAndGet(); }
+        @Override public void sent(int bytes) { wsSent.incrementAndGet(); }
+        @Override public void disconnectedSlow() { wsSlowDisconnects.incrementAndGet(); }
+        @Override public void writeError() { wsWriteErrors.incrementAndGet(); }
+        @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
+    };
+    private static final Set<String> COALESCABLE_EVENTS = Set.of(
+            "snapshot", "pace", "directional-pressure", "strike-flow", "volume-sandwich", "gex-by-strike",
+            "index-price", "vix-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
+            "hpsf-audit", "hpsf-exit-intent");
     private final SessionRoutingEngine routingEngine;
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
@@ -228,6 +251,26 @@ public class FeedGatewayService implements ReplayRunner {
                 settings.webSocketBatchMs(),
                 TimeUnit.MILLISECONDS
         );
+        // P0 (write deadline): force-close any socket whose send has been stuck past the deadline, freeing
+        // its writer-pool thread so a few stuck/adversarial clients can never starve the healthy ones.
+        batchExecutor.scheduleAtFixedRate(
+                this::enforceOutboundWriteDeadlines,
+                settings.wsWriteDeadlineMs(),
+                Math.max(100L, settings.wsWriteDeadlineMs() / 2),
+                TimeUnit.MILLISECONDS
+        );
+    }
+
+    private void enforceOutboundWriteDeadlines() {
+        long now = System.currentTimeMillis();
+        long deadline = settings.wsWriteDeadlineMs();
+        for (OutboundChannel channel : outbound.values()) {
+            try {
+                channel.enforceWriteDeadline(now, deadline);
+            } catch (RuntimeException ignored) {
+                // a single channel must not break the sweep
+            }
+        }
     }
 
     @PreDestroy
@@ -265,11 +308,27 @@ public class FeedGatewayService implements ReplayRunner {
                 Thread.currentThread().interrupt();
             }
         }
+        for (OutboundChannel channel : outbound.values()) {
+            channel.shutdown();
+        }
+        outbound.clear();
+        ExecutorService currentOutboundWriters = outboundWriters;
+        if (currentOutboundWriters != null) {
+            currentOutboundWriters.shutdownNow();
+            try {
+                currentOutboundWriters.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     public void addClient(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
+        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(),
+                settings.wsMaxQueuedMessages(), settings.wsMaxQueuedBytes(), outboundMetrics, this::onSlowDisconnect);
+        outbound.put(session.getId(), channel);
         clients.add(session);
         clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
@@ -298,15 +357,71 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     public void removeClient(WebSocketSession session) {
-        clients.remove(session);
-        clientsById.remove(session.getId());
+        String id = session.getId();
+        OutboundChannel channel = outbound.remove(id);
+        WebSocketSession stored = clientsById.remove(id);
+        if (stored != null) {
+            clients.remove(stored);
+        }
+        if (channel != null) {
+            channel.shutdown(); // quiet teardown — normal disconnect, not a slow-client eviction
+        }
+        closeQuietly(stored != null ? stored : session);
+    }
+
+    /** Detach a client the channel just disconnected for being too slow (the socket is already closed). */
+    private void onSlowDisconnect(OutboundChannel channel) {
+        outbound.remove(channel.socketId(), channel);
+        WebSocketSession stored = clientsById.remove(channel.socketId());
+        if (stored != null) {
+            clients.remove(stored);
+        }
+    }
+
+    private static void closeQuietly(WebSocketSession session) {
         try {
-            if (session.isOpen()) {
+            if (session != null && session.isOpen()) {
                 session.close();
             }
-        } catch (IOException | IllegalStateException ignored) {
-            // Removing the session from the fanout set is sufficient.
+        } catch (IOException | RuntimeException ignored) {
+            // best effort
         }
+    }
+
+    private int totalOutboundQueued() {
+        int sum = 0;
+        for (OutboundChannel channel : outbound.values()) {
+            sum += channel.queueDepth();
+        }
+        return sum;
+    }
+
+    /** Visible for tests: run outbound writes inline (caller-runs) so delivery is synchronous + deterministic. */
+    void runOutboundWritesInline() {
+        outboundWriterOverride = Runnable::run;
+    }
+
+    private java.util.concurrent.Executor outboundWriterExecutor() {
+        java.util.concurrent.Executor override = outboundWriterOverride;
+        return override != null ? override : outboundWriters();
+    }
+
+    private ExecutorService outboundWriters() {
+        ExecutorService e = outboundWriters;
+        if (e == null) {
+            synchronized (this) {
+                e = outboundWriters;
+                if (e == null) {
+                    e = Executors.newFixedThreadPool(settings.wsWriterThreads(), r -> {
+                        Thread t = new Thread(r, "options-edge-ws-writer");
+                        t.setDaemon(true);
+                        return t;
+                    });
+                    outboundWriters = e;
+                }
+            }
+        }
+        return e;
     }
 
     // 4001 is in the application-private close-code range (4000-4999); the browser client reads it,
@@ -327,6 +442,11 @@ public class FeedGatewayService implements ReplayRunner {
                 continue;
             }
             clients.remove(session);
+            clientsById.remove(session.getId());
+            OutboundChannel channel = outbound.remove(session.getId());
+            if (channel != null) {
+                channel.shutdown();
+            }
             try {
                 if (session.isOpen()) {
                     session.close(TOKEN_EXPIRED_STATUS);
@@ -352,6 +472,11 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
                 + "\"hpsfCaughtUp\":" + hpsfCaughtUp.get() + ","
                 + "\"clients\":" + clients.size() + ","
+                + "\"outboundQueued\":" + totalOutboundQueued() + ","
+                + "\"outboundCoalesced\":" + wsCoalesced.get() + ","
+                + "\"outboundSlowDisconnects\":" + wsSlowDisconnects.get() + ","
+                + "\"outboundWriteErrors\":" + wsWriteErrors.get() + ","
+                + "\"outboundDroppedOnClose\":" + wsDroppedOnClose.get() + ","
                 + "\"snapshots\":" + snapshots.size() + ","
                 + "\"paces\":" + paces.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
@@ -403,6 +528,21 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_clients Connected WebSocket client count.\n"
                 + "# TYPE options_edge_feed_gateway_clients gauge\n"
                 + "options_edge_feed_gateway_clients " + clients.size() + "\n"
+                + "# HELP options_edge_gateway_ws_queued Outbound messages currently buffered across all sockets.\n"
+                + "# TYPE options_edge_gateway_ws_queued gauge\n"
+                + "options_edge_gateway_ws_queued " + totalOutboundQueued() + "\n"
+                + "# HELP options_edge_gateway_ws_coalesced_total Replaceable snapshots collapsed by coalescing.\n"
+                + "# TYPE options_edge_gateway_ws_coalesced_total counter\n"
+                + "options_edge_gateway_ws_coalesced_total " + wsCoalesced.get() + "\n"
+                + "# HELP options_edge_gateway_ws_slow_disconnects_total Clients disconnected for exceeding outbound limits.\n"
+                + "# TYPE options_edge_gateway_ws_slow_disconnects_total counter\n"
+                + "options_edge_gateway_ws_slow_disconnects_total " + wsSlowDisconnects.get() + "\n"
+                + "# HELP options_edge_gateway_ws_write_errors_total Outbound write failures/timeouts.\n"
+                + "# TYPE options_edge_gateway_ws_write_errors_total counter\n"
+                + "options_edge_gateway_ws_write_errors_total " + wsWriteErrors.get() + "\n"
+                + "# HELP options_edge_gateway_ws_dropped_on_close_total Queued messages discarded when a slow client was dropped.\n"
+                + "# TYPE options_edge_gateway_ws_dropped_on_close_total counter\n"
+                + "options_edge_gateway_ws_dropped_on_close_total " + wsDroppedOnClose.get() + "\n"
                 + "# HELP options_edge_feed_gateway_snapshots Cached option snapshot count.\n"
                 + "# TYPE options_edge_feed_gateway_snapshots gauge\n"
                 + "options_edge_feed_gateway_snapshots " + snapshots.size() + "\n"
@@ -2649,23 +2789,61 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void send(WebSocketSession session, String event, String json) {
-        sendEnvelope(session, envelopeJson(event, json));
+        enqueueOutbound(session, envelopeJson(event, json), coalesceKeyFor(event, json));
     }
 
     private void sendEnvelope(WebSocketSession session, String envelope) {
+        // Control / batch / cached-state envelopes are never coalesced — every one must be delivered.
+        enqueueOutbound(session, envelope, null);
+    }
+
+    /**
+     * Hand an envelope to the socket's bounded async channel and return immediately (P0 — the Kafka thread
+     * NEVER blocks on browser I/O). A non-null {@code coalesceKey} collapses replaceable snapshots to
+     * latest-wins. Untracked sessions (never added via {@link #addClient}) fall back to a guarded direct
+     * send — that path is never on the Kafka hot loop.
+     */
+    private void enqueueOutbound(WebSocketSession session, String envelope, String coalesceKey) {
+        if (session == null || envelope == null) {
+            return;
+        }
+        OutboundChannel channel = outbound.get(session.getId());
+        if (channel != null) {
+            channel.enqueue(envelope, coalesceKey);
+            return;
+        }
         if (!session.isOpen()) {
-            removeClient(session);
             return;
         }
         try {
             synchronized (session) {
                 session.sendMessage(new TextMessage(envelope));
             }
-            if (GatewaySettings.boolValue("GATEWAY_WS_LOG_MESSAGES", false)) {
-                System.out.println("goes to UI ->>> " + envelope);
-            }
-        } catch (IOException | IllegalStateException ignored) {
-            removeClient(session);
+        } catch (IOException | RuntimeException ignored) {
+            closeQuietly(session);
+        }
+    }
+
+    /**
+     * Coalescing key for replaceable market-data snapshots: {@code event|symbol|expiry|strike}. Returns
+     * null (never coalesce) for non-replaceable events, and for REPLAY records — those are distinct
+     * historical events (stamped with {@code replaySourceOffset}), so every one must be delivered in order.
+     */
+    private String coalesceKeyFor(String event, String json) {
+        if (event == null || !COALESCABLE_EVENTS.contains(event)) {
+            return null;
+        }
+        if (json == null || json.contains("\"replaySourceOffset\"")) {
+            return null; // replay record (or empty) — do not coalesce
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
+            String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
+            String strike = root.hasNonNull("strike") ? root.get("strike").asText("") : "";
+            return event + "|" + symbol + "|" + expiry + "|" + strike;
+        } catch (JsonProcessingException unparseable) {
+            return null; // when in doubt, deliver it
         }
     }
 

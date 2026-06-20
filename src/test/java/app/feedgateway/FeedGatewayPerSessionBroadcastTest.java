@@ -49,6 +49,7 @@ class FeedGatewayPerSessionBroadcastTest {
         engine.attachSocket("app:u2", "s2");
 
         svc = new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), engine);
+        svc.runOutboundWritesInline(); // synchronous delivery for deterministic assertions
         svc.addClient(socket("s1", u1));
         svc.addClient(socket("s2", u2));
         u1.clear();
