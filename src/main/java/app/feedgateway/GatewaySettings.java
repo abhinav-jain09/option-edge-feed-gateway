@@ -30,6 +30,26 @@ public final class GatewaySettings {
         return value("KAFKA_SCHEMA_REGISTRY_URL", DEFAULT_SCHEMA_REGISTRY_URL);
     }
 
+    // --- WebSocket authentication (Keycloak JWT carried in the Sec-WebSocket-Protocol subprotocol) ---
+
+    /** When true, /ws/events requires a valid Keycloak token at the handshake. Off in local dev. */
+    public boolean wsAuthEnabled() {
+        return boolValue("WS_AUTH_ENABLED", false);
+    }
+
+    public String wsAuthIssuer() {
+        return value("WS_AUTH_ISSUER_URI", "");
+    }
+
+    public String wsAuthAudience() {
+        return value("WS_AUTH_AUDIENCE", "options-edge-web");
+    }
+
+    /** Comma-separated allowed Origins for the WS handshake ('*' only acceptable when auth is disabled). */
+    public String wsAllowedOrigins() {
+        return value("WS_ALLOWED_ORIGINS", "*");
+    }
+
     public String groupIdBase() {
         return value("GATEWAY_KAFKA_GROUP_ID", "options-edge-feed-gateway");
     }
