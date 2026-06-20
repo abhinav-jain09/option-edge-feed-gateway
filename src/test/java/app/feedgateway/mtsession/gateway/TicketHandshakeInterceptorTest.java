@@ -31,7 +31,7 @@ class TicketHandshakeInterceptorTest {
     private final AtomicInteger seq = new AtomicInteger();
     private final InMemoryTicketStore store =
             new InMemoryTicketStore(Clock.systemUTC(), () -> "tkt-" + seq.incrementAndGet());
-    private final HandshakeTicketAuthenticator authenticator = new HandshakeTicketAuthenticator(store);
+    private final HandshakeTicketAuthenticator authenticator = new HandshakeTicketAuthenticator(store, "test-instance");
 
     private ServerHttpRequest requestWithTicket(String ticketId) {
         ServerHttpRequest req = mock(ServerHttpRequest.class);

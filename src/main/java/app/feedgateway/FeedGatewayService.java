@@ -533,6 +533,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"avroCaughtUp\":" + avroCaughtUp.get() + ","
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
                 + "\"hpsfCaughtUp\":" + hpsfCaughtUp.get() + ","
+                + "\"instanceId\":\"" + escapeJson(settings.instanceId()) + "\","
                 + "\"clients\":" + clients.size() + ","
                 + "\"outboundQueued\":" + totalOutboundQueued() + ","
                 + "\"outboundCoalesced\":" + wsCoalesced.get() + ","

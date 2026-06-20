@@ -270,6 +270,33 @@ public final class GatewaySettings {
         return intValue("GATEWAY_WS_WRITER_THREADS", 8, 1);
     }
 
+    /**
+     * Stable id of THIS gateway replica (P1 — multi-replica ticket binding). Tickets are stamped with it,
+     * and the handshake rejects a ticket minted by a different replica — so the WS upgrade MUST be sticky-
+     * routed to the replica that minted the ticket (which is also the replica consuming/routing that
+     * session's Kafka data). Defaults to GATEWAY_INSTANCE_ID, else the hostname (the pod name in k8s),
+     * else "local". The separator {@code ~} is reserved for the ticket-id prefix and stripped here.
+     */
+    public String instanceId() {
+        String configured = value("GATEWAY_INSTANCE_ID", "");
+        if (!configured.isBlank()) {
+            return sanitizeInstanceId(configured);
+        }
+        try {
+            String host = java.net.InetAddress.getLocalHost().getHostName();
+            if (host != null && !host.isBlank()) {
+                return sanitizeInstanceId(host);
+            }
+        } catch (RuntimeException | java.net.UnknownHostException ignored) {
+            // fall through to the stable default
+        }
+        return "local";
+    }
+
+    private static String sanitizeInstanceId(String value) {
+        return value.trim().replace("~", "-");
+    }
+
     public int metadataTimeoutMs() {
         return intValue("GATEWAY_KAFKA_METADATA_TIMEOUT_MS", 30_000, 1_000);
     }

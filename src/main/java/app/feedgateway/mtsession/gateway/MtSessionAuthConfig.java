@@ -44,13 +44,16 @@ public class MtSessionAuthConfig {
         // durable, shared ticket store is mandatory — single-use ticket redemption must hold across
         // instances — so fail startup rather than silently fall back to the in-memory store.
         requireDurableTicketStore(hasRedis, settings);
+        // P1 (multi-replica): stamp the minting replica into the ticket id (<instance>~<random>) so the
+        // handshake can reject a ticket that reached the wrong replica before redeeming it.
+        String instanceId = settings.instanceId();
+        java.util.function.Supplier<String> ids = () -> instanceId + "~" + UUID.randomUUID();
         if (!hasRedis) {
-            return new InMemoryTicketStore(Clock.systemUTC(), () -> UUID.randomUUID().toString());
+            return new InMemoryTicketStore(Clock.systemUTC(), ids);
         }
         RedisClient client = RedisClient.create(redisUri);
         StatefulRedisConnection<String, String> conn = client.connect();
-        return new RedisTicketStore(conn.sync(), Clock.systemUTC(),
-                () -> UUID.randomUUID().toString(), "oe:ticket:");
+        return new RedisTicketStore(conn.sync(), Clock.systemUTC(), ids, "oe:ticket:");
     }
 
     /**
@@ -86,8 +89,9 @@ public class MtSessionAuthConfig {
     }
 
     @Bean
-    public HandshakeTicketAuthenticator handshakeTicketAuthenticator(TicketStore ticketStore) {
-        return new HandshakeTicketAuthenticator(ticketStore);
+    public HandshakeTicketAuthenticator handshakeTicketAuthenticator(TicketStore ticketStore,
+                                                                     GatewaySettings settings) {
+        return new HandshakeTicketAuthenticator(ticketStore, settings.instanceId());
     }
 
     @Bean
