@@ -1,0 +1,121 @@
+// Deploy the feed-gateway as a host `java -jar` process on the local-mac dev agent.
+//
+// The gateway consumes the final display topics from Kafka and broadcasts them to the browser over an
+// authenticated WebSocket (:8093). Previously it was hand-launched, so its runtime env (WS auth issuer,
+// Kafka, port, origins) wasn't reproducible. This job makes the launch durable + main-only, mirroring the
+// replay-orchestrator deploy: it builds the jar, then (re)starts the process with env sourced from an
+// operator-maintained file (kept out of git), and fails closed if the WS isn't auth-gated.
+pipeline {
+  agent { label 'local-mac' }
+
+  options {
+    disableConcurrentBuilds()
+    skipDefaultCheckout(false)
+  }
+
+  environment {
+    JAVA_HOME = '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home'
+    MAVEN_SKIP_RC = 'true'
+    PATH = "${JAVA_HOME}/bin:/opt/homebrew/bin:/usr/bin:/bin:${env.PATH}"
+    CONTRACTS_REPO = 'git@github.com:abhinav-jain09/options-edge-contracts.git'
+    // Operator-maintained runtime env (out of git). See .env.dev.example / .env.prod.example for the keys.
+    ENV_FILE = '/Users/abhinav/ci/config/feed-gateway.env'
+    PID_FILE = '/Users/abhinav/ci/run/feed-gateway.pid'
+    LOG_FILE = '/Users/abhinav/ci/logs/feed-gateway.log'
+    HEALTH_PORT = '8093'
+  }
+
+  stages {
+    stage('Checkout (main only)') {
+      steps {
+        sh '''
+          set -euo pipefail
+          reported_branch="${BRANCH_NAME:-${GIT_BRANCH:-}}"
+          if [ -n "$reported_branch" ] && [ "$reported_branch" != "main" ] && [ "$reported_branch" != "origin/main" ] && [ "$reported_branch" != "*/main" ]; then
+            echo "Deployment blocked: checked-out branch is '$reported_branch', only main is allowed." >&2
+            exit 1
+          fi
+          git fetch --quiet origin main
+          if ! git branch -r --contains "$(git rev-parse HEAD)" | sed 's/^[[:space:]]*//' | grep -Fx 'origin/main' >/dev/null; then
+            echo "Deployment blocked: HEAD is not contained in origin/main." >&2
+            exit 1
+          fi
+        '''
+      }
+    }
+
+    stage('Install Contracts') {
+      steps {
+        sh '''
+          set -euo pipefail
+          rm -rf .deps/options-edge-contracts
+          git clone "$CONTRACTS_REPO" .deps/options-edge-contracts
+          mvn -B -f .deps/options-edge-contracts/pom.xml install -DskipTests
+        '''
+      }
+    }
+
+    stage('Package') {
+      steps {
+        sh 'mvn -B clean package -DskipTests'
+      }
+    }
+
+    stage('Deploy') {
+      steps {
+        sh '''
+          set -euo pipefail
+          mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
+
+          jar="$(find target -maxdepth 1 -type f -name 'options-edge-feed-gateway-*.jar' ! -name '*.original' | sort | head -n1)"
+          [ -n "$jar" ] || { echo "Deploy failed: no gateway jar under target/." >&2; exit 1; }
+          echo "Launching $jar"
+
+          # Load the runtime env (WS auth issuer/audience/origins, Kafka, port). Out of git; see .env.*.example.
+          if [ -f "$ENV_FILE" ]; then
+            set -a; . "$ENV_FILE"; set +a
+          else
+            echo "WARNING: $ENV_FILE not found — the gateway will fall back to code defaults (likely wrong for this env)." >&2
+          fi
+
+          # Stop the previous instance: by pid file, then by whatever still holds the port.
+          if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            kill "$(cat "$PID_FILE")" 2>/dev/null || true
+          fi
+          old="$(lsof -nP -iTCP:${HEALTH_PORT} -sTCP:LISTEN -t 2>/dev/null || true)"
+          [ -n "$old" ] && { kill $old 2>/dev/null || true; }
+          for i in $(seq 1 15); do lsof -nP -iTCP:${HEALTH_PORT} -sTCP:LISTEN -t >/dev/null 2>&1 && sleep 1 || break; done
+          lsof -nP -iTCP:${HEALTH_PORT} -sTCP:LISTEN -t >/dev/null 2>&1 && { kill -9 $(lsof -nP -iTCP:${HEALTH_PORT} -sTCP:LISTEN -t) 2>/dev/null || true; sleep 1; }
+
+          # Detach so the process survives the Jenkins build (BUILD_ID/JENKINS_NODE_COOKIE=dontKillMe).
+          export BUILD_ID=dontKillMe
+          export JENKINS_NODE_COOKIE=dontKillMe
+          nohup "$JAVA_HOME/bin/java" -jar "$jar" >"$LOG_FILE" 2>&1 &
+          echo $! > "$PID_FILE"
+          echo "feed-gateway started, pid $(cat "$PID_FILE")"
+
+          # Liveness: the gateway serves the root.
+          deadline=$((SECONDS + 90)); healthy=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            if curl -fsS --max-time 5 "http://localhost:${HEALTH_PORT}/" >/dev/null 2>&1; then healthy=1; break; fi
+            if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then echo "gateway exited before becoming healthy" >&2; tail -n 120 "$LOG_FILE" || true; exit 1; fi
+            sleep 2
+          done
+          [ "$healthy" = "1" ] || { echo "gateway did not become healthy" >&2; tail -n 120 "$LOG_FILE" || true; exit 1; }
+
+          # Fail closed: the WS endpoint MUST reject an unauthenticated client when WS auth is enabled.
+          if [ "${WS_AUTH_ENABLED:-false}" = "true" ]; then
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://localhost:${HEALTH_PORT}/ws/events" || echo 000)"
+            if [ "$code" != "401" ]; then
+              echo "SECURITY GATE FAILED: /ws/events returned $code without a token (expected 401)." >&2
+              kill "$(cat "$PID_FILE")" 2>/dev/null || true
+              exit 1
+            fi
+            echo "Security gate OK: /ws/events returns 401 without a token."
+          fi
+          echo "Deployed feed-gateway -> http://localhost:${HEALTH_PORT}/ (Kafka=${KAFKA_ENABLED:-?}, issuer=${WS_AUTH_ISSUER_URI:-?})"
+        '''
+      }
+    }
+  }
+}
