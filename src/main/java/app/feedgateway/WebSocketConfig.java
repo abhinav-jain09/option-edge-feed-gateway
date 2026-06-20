@@ -49,6 +49,8 @@ public class WebSocketConfig implements WebSocketConfigurer {
         //  - otherwise                 -> the default oc.bearer JWT handshake (WsJwtHandshakeInterceptor,
         //                                 which itself enforces only when WS_AUTH_ENABLED=true)
         if (ticketMode) {
+            // Echo the oe.ticket.<id> subprotocol so the browser can carry the ticket out of the URL.
+            registration.setHandshakeHandler(new app.feedgateway.mtsession.gateway.TicketSubProtocolHandshakeHandler());
             registration.addInterceptors(ticketInterceptor);
         } else {
             registration.addInterceptors(jwtInterceptor);

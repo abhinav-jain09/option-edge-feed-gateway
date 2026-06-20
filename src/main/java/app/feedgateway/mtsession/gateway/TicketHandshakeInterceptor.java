@@ -21,7 +21,8 @@ public final class TicketHandshakeInterceptor implements HandshakeInterceptor {
 
     public static final String ATTR_APP_SESSION_ID = "mt.appSessionId";
     public static final String ATTR_USER_ID = "mt.userId";
-    private static final String SUBPROTOCOL_PREFIX = "oe.ticket.";
+    /** The approved subprotocol carrying the single-use ticket: {@code oe.ticket.<id>}. */
+    public static final String SUBPROTOCOL_PREFIX = "oe.ticket.";
 
     private final HandshakeTicketAuthenticator authenticator;
     private final boolean authEnabled;

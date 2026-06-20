@@ -56,6 +56,30 @@ class KeycloakJwtVerifierHermeticTest {
         return jwt.serialize();
     }
 
+    /** A verifier that ALSO enforces the access-token type (typ=Bearer), as production does. */
+    private static KeycloakJwtVerifier typedVerifier() {
+        JWKSource<SecurityContext> src = new ImmutableJWKSet<>(new JWKSet(rsa.toPublicJWK()));
+        return KeycloakJwtVerifier.forJwkSource(ISSUER, CLIENT, AUD, "Bearer", src);
+    }
+
+    @Test
+    void acceptsAccessTokenTypeBearer() throws Exception {
+        assertEquals("u1",
+                typedVerifier().verify(signRs256(validClaims().claim("typ", "Bearer").build(), "k1")).userId());
+    }
+
+    @Test
+    void rejectsRefreshOrIdTokenByType() throws Exception {
+        KeycloakJwtVerifier v = typedVerifier();
+        assertThrows(JwtVerificationException.class,
+                () -> v.verify(signRs256(validClaims().claim("typ", "Refresh").build(), "k1")));
+        assertThrows(JwtVerificationException.class,
+                () -> v.verify(signRs256(validClaims().claim("typ", "ID").build(), "k1")));
+        // A token with no typ at all is rejected when token-type is enforced.
+        assertThrows(JwtVerificationException.class,
+                () -> v.verify(signRs256(validClaims().build(), "k1")));
+    }
+
     @Test
     void validTokenIsAccepted() throws Exception {
         VerifiedPrincipal p = verifier.verify(signRs256(validClaims().build(), "k1"));

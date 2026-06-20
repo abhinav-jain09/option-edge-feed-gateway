@@ -45,6 +45,15 @@ public class MtSessionSecurityInvariant implements InitializingBean {
         if (settings.keycloakIssuer() == null || settings.keycloakIssuer().isBlank()) {
             errors.add("GATEWAY_KEYCLOAK_ISSUER must be set");
         }
+        // Bind the token to THIS API and the authorized client, not just the issuer: a valid token for a
+        // different surface must be rejected. The verifier additionally enforces the access-token type (typ).
+        if (settings.keycloakAudience() == null || settings.keycloakAudience().isBlank()) {
+            errors.add("GATEWAY_KEYCLOAK_AUDIENCE must be set (API audience binding; should be an"
+                    + " API-specific value, not the web client id)");
+        }
+        if (settings.keycloakClientId() == null || settings.keycloakClientId().isBlank()) {
+            errors.add("GATEWAY_KEYCLOAK_CLIENT_ID must be set (authorized-party/azp binding)");
+        }
         boolean wildcardOrigin = Arrays.stream(settings.wsAllowedOrigins().split(","))
                 .map(String::trim).anyMatch("*"::equals);
         if (wildcardOrigin) {

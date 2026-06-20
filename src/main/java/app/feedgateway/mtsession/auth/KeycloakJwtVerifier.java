@@ -46,9 +46,13 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
     private static final int JWKS_READ_TIMEOUT_MS = 2_000;
     private static final int JWKS_SIZE_LIMIT_BYTES = 256 * 1024;
 
+    /** Keycloak stamps {@code typ=Bearer} on access tokens (Refresh/ID tokens carry other values). */
+    static final String ACCESS_TOKEN_TYPE = "Bearer";
+
     private final String issuer;
     private final String expectedClientId;  // nullable → azp not enforced
     private final String expectedAudience;   // nullable/blank → aud not enforced
+    private final String expectedTokenType;  // nullable → typ not enforced
     private final ConfigurableJWTProcessor<SecurityContext> processor;
 
     public KeycloakJwtVerifier(String issuerUri, String expectedClientId) {
@@ -58,7 +62,13 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
     /** Test seam: build a verifier whose keys come from an in-memory {@link JWKSource} (no network). */
     static KeycloakJwtVerifier forJwkSource(String issuerUri, String expectedClientId, String expectedAudience,
                                             JWKSource<SecurityContext> jwkSource) {
-        return new KeycloakJwtVerifier(issuerUri, expectedClientId, expectedAudience, jwkSource);
+        return new KeycloakJwtVerifier(issuerUri, expectedClientId, expectedAudience, null, jwkSource);
+    }
+
+    /** Test seam variant that also enforces the token type ({@code typ}). */
+    static KeycloakJwtVerifier forJwkSource(String issuerUri, String expectedClientId, String expectedAudience,
+                                            String expectedTokenType, JWKSource<SecurityContext> jwkSource) {
+        return new KeycloakJwtVerifier(issuerUri, expectedClientId, expectedAudience, expectedTokenType, jwkSource);
     }
 
     /**
@@ -70,17 +80,20 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
      */
     public KeycloakJwtVerifier(String issuerUri, String jwksUrlOverride, String expectedClientId,
                                String expectedAudience) {
-        this(issuerUri, expectedClientId, expectedAudience,
+        // Production path enforces the access-token type (typ=Bearer) so a refresh or ID token can never
+        // open a data session.
+        this(issuerUri, expectedClientId, expectedAudience, ACCESS_TOKEN_TYPE,
                 jwkSourceFromUrl((jwksUrlOverride == null || jwksUrlOverride.isBlank())
                         ? issuerUri + "/protocol/openid-connect/certs"
                         : jwksUrlOverride));
     }
 
     private KeycloakJwtVerifier(String issuerUri, String expectedClientId, String expectedAudience,
-                                JWKSource<SecurityContext> jwkSource) {
+                                String expectedTokenType, JWKSource<SecurityContext> jwkSource) {
         this.issuer = Objects.requireNonNull(issuerUri, "issuerUri");
         this.expectedClientId = expectedClientId;
         this.expectedAudience = (expectedAudience == null || expectedAudience.isBlank()) ? null : expectedAudience;
+        this.expectedTokenType = (expectedTokenType == null || expectedTokenType.isBlank()) ? null : expectedTokenType;
         this.processor = buildProcessor(issuerUri, Objects.requireNonNull(jwkSource, "jwkSource"));
     }
 
@@ -129,7 +142,21 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
             throw new JwtVerificationException("token verification failed: " + e.getMessage(), e);
         }
 
-        // Audience: the token must be intended for this surface. Keycloak access tokens may carry several
+        // Token type: only an ACCESS token may open a data session — a refresh or ID token must be rejected
+        // even if otherwise valid. Keycloak stamps typ=Bearer on access tokens.
+        if (expectedTokenType != null) {
+            String typ;
+            try {
+                typ = claims.getStringClaim("typ");
+            } catch (java.text.ParseException e) {
+                throw new JwtVerificationException("invalid typ claim", e);
+            }
+            if (typ == null || !expectedTokenType.equalsIgnoreCase(typ)) {
+                throw new JwtVerificationException("unexpected token type (typ): " + typ);
+            }
+        }
+
+        // Audience: the token must be intended for this API surface. Keycloak access tokens may carry several
         // audiences (e.g. "account"), so require the expected value to be present (not an exact-equals).
         if (expectedAudience != null) {
             List<String> aud = claims.getAudience();

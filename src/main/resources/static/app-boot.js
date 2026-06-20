@@ -87,9 +87,13 @@
   function PatchedWS(url, protocols) {
     var u = String(url);
     if (u.indexOf("/ws/events") >= 0 && currentTicket) {
-      u += (u.indexOf("?") >= 0 ? "&" : "?") + "ticket=" + encodeURIComponent(currentTicket);
+      // P1: carry the single-use ticket in the APPROVED subprotocol, never the URL — a ticket in the query
+      // string leaks into proxy/access logs and could be replayed from any origin before redemption.
+      var sub = "oe.ticket." + currentTicket;
       currentTicket = null;
-      setTimeout(refreshTicket, 0);
+      setTimeout(refreshTicket, 0); // pre-mint the next ticket for reconnects
+      if (protocols === undefined) return new RealWS(u, sub);
+      return new RealWS(u, [].concat(protocols).concat(sub));
     }
     return protocols === undefined ? new RealWS(u) : new RealWS(u, protocols);
   }

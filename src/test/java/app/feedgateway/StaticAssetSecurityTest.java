@@ -121,6 +121,16 @@ class StaticAssetSecurityTest {
     }
 
     @Test
+    void wsTicketTravelsInSubprotocolNotTheUrl() throws IOException {
+        // P1: a ticket in the URL query string leaks into proxy/access logs. The browser must carry it in
+        // the approved oe.ticket.<id> subprotocol instead.
+        String boot = read("app-boot.js");
+        assertTrue(boot.contains("\"oe.ticket.\""), "ticket must be sent via the oe.ticket.* subprotocol");
+        assertFalse(boot.contains("\"ticket=\"") || boot.contains("+ \"ticket=\""),
+                "the ticket must NOT be appended to the WebSocket URL as a query parameter");
+    }
+
+    @Test
     void replayWindowUsesTimezoneAwareConversionNotAHardcodedOffset() throws IOException {
         String boot = read("app-boot.js");
         assertFalse(boot.contains("\"-04:00\"") || boot.contains("'-04:00'"),
