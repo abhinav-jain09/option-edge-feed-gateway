@@ -429,12 +429,15 @@ public final class SessionRoutingEngine {
         }
     }
 
-    /** A session is interested in its symbol's underlying plus the always-relevant VIX (§8.6). */
+    /** A session is interested in its symbol's underlying plus the always-relevant, SHARED VIX (§8.6). */
     private static List<UnderlyingKey> underlyingKeys(Selection selection) {
         List<UnderlyingKey> keys = new ArrayList<>(2);
-        keys.add(new UnderlyingKey(selection.source(), selection.underlying()));
+        // The primary underlying keeps the session's source; a shared underlying (VIX) uses SHARED so it is
+        // received regardless of source — matching how shared records route (see RoutingKeyDeriver).
+        keys.add(new UnderlyingKey(
+                SharedUnderlyings.routingSource(selection.underlying(), selection.source()), selection.underlying()));
         if (!VIX.equalsIgnoreCase(selection.underlying())) {
-            keys.add(new UnderlyingKey(selection.source(), VIX));
+            keys.add(new UnderlyingKey(MarketDataSource.SHARED, VIX));
         }
         return keys;
     }

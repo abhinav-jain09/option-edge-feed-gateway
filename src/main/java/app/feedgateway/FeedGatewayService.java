@@ -109,6 +109,10 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
     private final Map<String, String> strikeFlows = new ConcurrentHashMap<>();
     private final Map<String, String> indexPrices = new ConcurrentHashMap<>();
+    // P1 (VIX/underlying consistency): VIX is cached SEPARATELY from ES/index so each cache entry keeps its
+    // ORIGINAL event type (vix-price vs index-price) on replay, instead of being flattened to index-price.
+    // This map is also the "last known VIX" — replayed when present, omitted when absent (VIX is optional).
+    private final Map<String, String> vixPrices = new ConcurrentHashMap<>();
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfLatestSignals = new ConcurrentHashMap<>();
@@ -545,6 +549,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"indexPrices\":" + indexPrices.size() + ","
+                + "\"vixPrices\":" + vixPrices.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
@@ -621,6 +626,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_index_prices Cached index price count.\n"
                 + "# TYPE options_edge_feed_gateway_index_prices gauge\n"
                 + "options_edge_feed_gateway_index_prices " + indexPrices.size() + "\n"
+                + "# HELP options_edge_feed_gateway_vix_prices Cached shared VIX (last-known) entry count.\n"
+                + "# TYPE options_edge_feed_gateway_vix_prices gauge\n"
+                + "options_edge_feed_gateway_vix_prices " + vixPrices.size() + "\n"
                 + "# HELP options_edge_feed_gateway_current_states Cached current-state count.\n"
                 + "# TYPE options_edge_feed_gateway_current_states gauge\n"
                 + "options_edge_feed_gateway_current_states " + currentStates.size() + "\n"
@@ -1496,7 +1504,13 @@ public class FeedGatewayService implements ReplayRunner {
                 directionalPressures.put(key, json);
                 return key;
             }
-            case "vix-price", "index-price" -> {
+            case "vix-price" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                vixPrices.put(key, json); // SHARED last-known VIX, kept distinct from ES/index
+                return key;
+            }
+            case "index-price" -> {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 indexPrices.put(key, json);
@@ -1732,7 +1746,9 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("directional-pressure", entry.getValue()))
                         .forEach(cachedEvents::add);
-                case "vix-price" -> indexPrices.entrySet().stream()
+                case "vix-price" -> vixPrices.entrySet().stream()
+                        // VIX is SHARED + optional: replay the last-known value to every session (any source);
+                        // an empty map simply omits VIX.
                         .filter(entry -> isCacheFresh("vix-price:" + entry.getKey(), nowMs))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("vix-price", entry.getValue()))
@@ -1885,7 +1901,7 @@ public class FeedGatewayService implements ReplayRunner {
         } else if (versionKey.startsWith("directional-pressure:")) {
             directionalPressures.remove(versionKey.substring("directional-pressure:".length()));
         } else if (versionKey.startsWith("vix-price:")) {
-            indexPrices.remove(versionKey.substring("vix-price:".length()));
+            vixPrices.remove(versionKey.substring("vix-price:".length()));
         } else if (versionKey.startsWith("index-price:")) {
             indexPrices.remove(versionKey.substring("index-price:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
@@ -2080,6 +2096,9 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
         replayCacheMap(session, "gex-by-strike", gexByStrike);
+        // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
+        // as index-price — so a VIX record is never delivered mislabelled as index-price.
+        replayCacheMap(session, "vix-price", vixPrices);
         replayCacheMap(session, "index-price", indexPrices);
     }
 

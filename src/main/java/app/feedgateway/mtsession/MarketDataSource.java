@@ -11,7 +11,14 @@ import java.util.Optional;
  */
 public enum MarketDataSource {
     IBKR,
-    DATABENTO;
+    DATABENTO,
+    /**
+     * A shared underlying feed (e.g. VIX) that is NOT owned by either tenant mode: it is delivered to every
+     * session regardless of the session's selected source, and can never be selected as a primary source
+     * (OE-DDD-001 §8.6 — shared underlyings). Routing keys for shared underlyings use this source so a
+     * DATABENTO session and an IBKR session both index/receive them under the same {@code SHARED|<sym>} key.
+     */
+    SHARED;
 
     /**
      * Parse a source token, tolerating the historical aliases used across the feeds
@@ -26,6 +33,7 @@ public enum MarketDataSource {
         return switch (v) {
             case "IBKR", "IB" -> Optional.of(IBKR);
             case "DATABENTO", "DB" -> Optional.of(DATABENTO);
+            case "SHARED" -> Optional.of(SHARED);
             default -> Optional.empty();
         };
     }

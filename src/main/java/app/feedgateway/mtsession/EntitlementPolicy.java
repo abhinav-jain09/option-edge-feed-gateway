@@ -19,11 +19,17 @@ public final class EntitlementPolicy {
         return switch (source) {
             case IBKR -> entitlements != null && entitlements.contains(IBKR_USER);
             case DATABENTO -> true;
+            // SHARED underlyings (VIX) are never a primary selection — a session selects IBKR or DATABENTO.
+            case SHARED -> false;
         };
     }
 
     /** Router-side double check: never deliver a source's data to a session not entitled to it. */
     public static boolean canReceive(MarketDataSource source, Set<String> entitlements) {
+        // SHARED underlyings (VIX) are delivered to every session regardless of its selected-source entitlement.
+        if (source == MarketDataSource.SHARED) {
+            return true;
+        }
         return canSelect(source, entitlements);
     }
 

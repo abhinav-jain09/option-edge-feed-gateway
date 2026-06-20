@@ -24,6 +24,17 @@ public final class RoutingKeyDeriver {
     public static Optional<RoutingTarget> derive(RoutableRecord record) {
         MarketDataSource source = record.bindingSource();
 
+        // Shared underlyings (VIX) route under SHARED regardless of the binding/payload source, so EVERY
+        // session — DATABENTO or IBKR — receives them. The source-mismatch guard below does not apply here
+        // (VIX is intentionally source-agnostic).
+        if (record.eventType().isUnderlying()) {
+            String underlying = record.eventType().underlyingSymbol();
+            if (SharedUnderlyings.isShared(underlying)) {
+                return Optional.of(new RoutingTarget.Underlying(
+                        new UnderlyingKey(MarketDataSource.SHARED, underlying)));
+            }
+        }
+
         Optional<MarketDataSource> payloadSource = MarketDataSource.parse(record.payloadMarketDataSource());
         if (payloadSource.isEmpty()
                 && record.payloadSource() != null

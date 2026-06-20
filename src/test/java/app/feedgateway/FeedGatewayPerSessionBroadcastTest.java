@@ -200,6 +200,36 @@ class FeedGatewayPerSessionBroadcastTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void cachedVixReplaysAsVixPriceNotIndexPrice() throws Exception {
+        // P1 (preserve original event type): a VIX entry in the cache must replay to a newly-connected socket
+        // as a `vix-price` event — not flattened into `index-price` as before.
+        java.lang.reflect.Field f = FeedGatewayService.class.getDeclaredField("vixPrices");
+        f.setAccessible(true);
+        ((java.util.Map<String, String>) f.get(svc)).put("IBKR|VIX", "{\"price\":15.5}");
+
+        engine.registerAppSession("app:u3", "u3",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260612", StrikeWindow.ALL), Set.of());
+        engine.attachSocket("app:u3", "s3");
+        List<String> u3 = new ArrayList<>();
+        svc.addClient(socket("s3", u3)); // triggers per-session cached replay
+
+        assertTrue(u3.stream().anyMatch(m -> m.contains("\"type\":\"vix-price\"")),
+                "cached VIX is replayed as vix-price");
+        assertFalse(u3.stream().anyMatch(m -> m.contains("\"type\":\"index-price\"") && m.contains("15.5")),
+                "cached VIX must NOT be replayed mislabelled as index-price");
+    }
+
+    @Test
+    void sharedVixReachesDatabentoSessionsEvenThoughItIsBoundToIbkr() throws Exception {
+        // P1: VIX is bound to the IBKR topic, but it is a SHARED underlying. Both DATABENTO sessions (u1, u2)
+        // must receive it — the previous bug indexed them under DATABENTO|VIX while VIX routed to IBKR|VIX.
+        routeOrBroadcast("IBKR", "vix-price", "{\"price\":15.5}");
+        assertEquals(1, u1.size(), "DATABENTO session u1 receives the shared VIX");
+        assertEquals(1, u2.size(), "DATABENTO session u2 receives the shared VIX");
+    }
+
+    @Test
     void allowlistClassifiesMarketDataAsNonGlobal() {
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("status"));
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("reset"));

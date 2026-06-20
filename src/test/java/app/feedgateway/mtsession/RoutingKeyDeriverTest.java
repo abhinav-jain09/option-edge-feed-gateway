@@ -20,11 +20,23 @@ class RoutingKeyDeriverTest {
     }
 
     @Test
-    void derivesUnderlyingKey() {
+    void vixIsSharedRegardlessOfBindingSource() {
+        // P1: VIX is a SHARED underlying — it routes under SHARED|VIX no matter which source's topic it
+        // arrived on, so DATABENTO and IBKR sessions (both indexed under SHARED|VIX) all receive it.
+        for (MarketDataSource binding : new MarketDataSource[]{MarketDataSource.IBKR, MarketDataSource.DATABENTO}) {
+            RoutingTarget t = RoutingKeyDeriver.derive(
+                    RoutableRecord.underlying(binding, EventType.VIX_PRICE, 0)).orElseThrow();
+            RoutingTarget.Underlying u = assertInstanceOf(RoutingTarget.Underlying.class, t);
+            assertEquals(new UnderlyingKey(MarketDataSource.SHARED, "VIX"), u.key());
+        }
+    }
+
+    @Test
+    void nonSharedUnderlyingKeepsItsSource() {
         RoutingTarget t = RoutingKeyDeriver.derive(
-                RoutableRecord.underlying(MarketDataSource.IBKR, EventType.VIX_PRICE, 0)).orElseThrow();
+                RoutableRecord.underlying(MarketDataSource.DATABENTO, EventType.INDEX_PRICE, 0)).orElseThrow();
         RoutingTarget.Underlying u = assertInstanceOf(RoutingTarget.Underlying.class, t);
-        assertEquals(new UnderlyingKey(MarketDataSource.IBKR, "VIX"), u.key());
+        assertEquals(new UnderlyingKey(MarketDataSource.DATABENTO, "SPX"), u.key());
     }
 
     @Test
