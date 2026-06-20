@@ -166,6 +166,28 @@
     }).catch(function () { rpMsg(label + " failed"); });
   }
 
+  // P0 (real sign-out): tear down the server AppSession (closes the WS), revoke the refresh token, wipe all
+  // stored credentials + selection, then end the Keycloak SSO session — leaving nothing to resume.
+  var REVOKE_URL = KC + "/protocol/openid-connect/revoke";
+  var LOGOUT_URL = KC + "/protocol/openid-connect/logout";
+  var SESSION_KEYS = ["oe_tok", "oe_refresh", "oe_expAt", "oe_sel", "pkce_verifier", "pkce_state"];
+  function doLogout() {
+    var accessTok = tok, refreshTok = refresh;
+    var serverLogout = accessTok
+      ? fetch("/api/logout", { method: "POST", headers: { "Authorization": "Bearer " + accessTok } }).catch(function () {})
+      : Promise.resolve();
+    var revoke = refreshTok
+      ? fetch(REVOKE_URL, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ client_id: CLIENT, token: refreshTok, token_type_hint: "refresh_token" }) }).catch(function () {})
+      : Promise.resolve();
+    Promise.all([serverLogout, revoke]).then(function () {
+      tok = null; refresh = null; expAt = 0; currentTicket = null;
+      SESSION_KEYS.forEach(function (k) { try { S.removeItem(k); } catch (e) {} });
+      var redirect = location.origin + "/index.html";
+      location.assign(LOGOUT_URL + "?" + new URLSearchParams({ client_id: CLIENT, post_logout_redirect_uri: redirect }));
+    });
+  }
+
   function setupReplayBar() {
     var bar = el("oe-replay-bar"); if (!bar) return;
     bar.style.display = "flex";
@@ -173,6 +195,7 @@
     el("oe-rp-start-btn").onclick = startReplay;
     el("oe-rp-stop-btn").onclick = function () { modeCall("/api/replay/historical/stop", "REPLAY_COMPLETE", "stop"); };
     el("oe-rp-live-btn").onclick = function () { setMode("RETURNING_TO_LIVE"); modeCall("/api/replay/live/resume", "LIVE", "return to live"); };
+    if (el("oe-signout-btn")) el("oe-signout-btn").onclick = doLogout;
   }
 
   // Build the boot-error box with DOM nodes + textContent (NEVER innerHTML) so an error message can't inject.

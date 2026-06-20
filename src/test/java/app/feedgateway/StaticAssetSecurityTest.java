@@ -102,6 +102,25 @@ class StaticAssetSecurityTest {
     }
 
     @Test
+    void signOutFullyTearsDownTheSessionEverywhere() throws IOException {
+        // P0 (real sign-out): the logout handlers must (a) tear down the server AppSession, (b) revoke the
+        // refresh token, (c) wipe ALL stored credentials + selection, (d) end the Keycloak SSO session.
+        for (String js : new String[]{"login.js", "app-boot.js"}) {
+            String src = read(js);
+            assertTrue(src.contains("/api/logout"), js + " must tear down the server-side AppSession");
+            assertTrue(src.contains("openid-connect/revoke"), js + " must revoke the refresh token");
+            assertTrue(src.contains("openid-connect/logout"), js + " must end the Keycloak SSO session");
+            for (String key : new String[]{"oe_tok", "oe_refresh", "oe_expAt", "oe_sel"}) {
+                assertTrue(src.contains(key), js + " must clear stored " + key);
+            }
+            assertTrue(src.contains("removeItem"), js + " must remove stored credentials, not just memory");
+        }
+        // The old broken handler only nulled `tok` and redrew the view — that exact shortcut must be gone.
+        assertFalse(read("login.js").contains("tok=null; if(ws)ws.close(); viewLogin()"),
+                "login.js must not use the no-op logout that left stored tokens behind");
+    }
+
+    @Test
     void replayWindowUsesTimezoneAwareConversionNotAHardcodedOffset() throws IOException {
         String boot = read("app-boot.js");
         assertFalse(boot.contains("\"-04:00\"") || boot.contains("'-04:00'"),

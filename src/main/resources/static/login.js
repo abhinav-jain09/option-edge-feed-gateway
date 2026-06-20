@@ -10,6 +10,9 @@ const KC = "http://localhost:8080/realms/optionsedge", CLIENT = "options-edge-we
 const TOKEN_URL = KC + "/protocol/openid-connect/token";
 const AUTH_URL = KC + "/protocol/openid-connect/auth";
 const REG_URL = KC + "/protocol/openid-connect/registrations";
+const REVOKE_URL = KC + "/protocol/openid-connect/revoke";
+const LOGOUT_URL = KC + "/protocol/openid-connect/logout";
+const SESSION_KEYS = ["oe_tok", "oe_refresh", "oe_expAt", "oe_sel", "pkce_verifier", "pkce_state"];
 const REDIRECT_URI = location.origin + "/";
 let tok = null, refresh = null, expAt = 0, ws = null;
 const main = document.getElementById("main");
@@ -112,7 +115,7 @@ function viewApp() {
   const roles = (t.realm_access&&t.realm_access.roles||[]).filter(r=>["user","ibkr-user","trader","admin"].includes(r));
   el("who").style.display="";
   el("who").textContent = (t.preferred_username||"user")+" · "+(roles.join(", ")||"user");  // claim — textContent
-  el("logout").style.display=""; el("logout").onclick = () => { tok=null; if(ws)ws.close(); viewLogin(); };
+  el("logout").style.display=""; el("logout").onclick = doLogout;
   const ibkr = roles.includes("ibkr-user");
   // CONSTANT template — no external data. The greeting (which embeds a token claim) is set via textContent.
   main.innerHTML =
@@ -134,6 +137,26 @@ function viewApp() {
   // given_name / preferred_username are signed claims but still EXTERNAL data — textContent only.
   el("greet").textContent = "You’re in, " + (t.given_name || t.preferred_username || "trader") + " 👋";
   el("enter").onclick = enterApp;
+}
+
+// P0 (real sign-out): a complete logout. Tear down the SERVER session (closes every socket), REVOKE the
+// refresh token at Keycloak, wipe ALL stored credentials + selection, then end the Keycloak SSO session.
+// Nothing is left that /app.html could load to resume the authenticated application.
+async function doLogout() {
+  const accessTok = tok, refreshTok = refresh;
+  // 1. Server-side AppSession teardown (force-closes the user's WebSockets) — do it while the bearer is valid.
+  try { if (accessTok) await fetch("/api/logout", { method:"POST", headers:{ "Authorization":"Bearer "+accessTok } }); } catch(e){}
+  // 2. Revoke the refresh token so it can never mint a new access token (kills the offline/SSO session).
+  try {
+    if (refreshTok) await fetch(REVOKE_URL, { method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body: new URLSearchParams({ client_id:CLIENT, token:refreshTok, token_type_hint:"refresh_token" }) });
+  } catch(e){}
+  // 3. Drop every in-memory and stored credential + selection, and close any open socket.
+  try { if (ws) ws.close(); } catch(e){}
+  tok=null; refresh=null; expAt=0;
+  SESSION_KEYS.forEach(k => { try { sessionStorage.removeItem(k); } catch(e){} });
+  // 4. End the Keycloak browser SSO session (RP-initiated logout), returning to the sign-in page.
+  location.assign(LOGOUT_URL + "?" + new URLSearchParams({ client_id: CLIENT, post_logout_redirect_uri: REDIRECT_URI }));
 }
 
 async function enterApp() {

@@ -369,6 +369,34 @@ public class FeedGatewayService implements ReplayRunner {
         closeQuietly(stored != null ? stored : session);
     }
 
+    /**
+     * P0 (logout completeness): tear down a user's entire server-side session. Cancels any in-flight
+     * replay, removes the AppSession from the routing engine (so no further live/replay data can be routed
+     * to it), and force-closes EVERY socket attached to it. Returns the number of sockets closed. Safe to
+     * call when nothing is attached (returns 0).
+     */
+    public int logout(String appSessionId) {
+        if (routingEngine == null || appSessionId == null || appSessionId.isBlank()) {
+            return 0;
+        }
+        synchronized (replayControlLock) {
+            cancelActiveReplay(appSessionId); // stop any in-flight replay reader for this session
+        }
+        Set<String> sockets = routingEngine.teardownAppSession(appSessionId);
+        for (String socketId : sockets) {
+            OutboundChannel channel = outbound.remove(socketId);
+            WebSocketSession stored = clientsById.remove(socketId);
+            if (stored != null) {
+                clients.remove(stored);
+            }
+            if (channel != null) {
+                channel.shutdown();
+            }
+            closeQuietly(stored != null ? stored : (channel != null ? channel.session() : null));
+        }
+        return sockets.size();
+    }
+
     /** Detach a client the channel just disconnected for being too slow (the socket is already closed). */
     private void onSlowDisconnect(OutboundChannel channel) {
         outbound.remove(channel.socketId(), channel);
