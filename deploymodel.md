@@ -24,7 +24,7 @@ Run two Java services on the remote machine:
 
 ```text
 options-edge              port 8080
-options-edge-feed-gateway port 8091
+options-edge-feed-gateway port 8093
 ```
 
 If IB Gateway also runs on the same machine, `options-edge` should connect to:
@@ -62,19 +62,19 @@ Replace `<remote-machine-ip>` with the remote server IP or DNS name.
 | --- | --- |
 | OptionsEdge UI | `http://<remote-machine-ip>:8080/` |
 | OptionsEdge config | `http://<remote-machine-ip>:8080/api/config` |
-| Feed gateway health | `http://<remote-machine-ip>:8091/health` |
-| Feed gateway WebSocket | `ws://<remote-machine-ip>:8091/ws/events` |
+| Feed gateway health | `http://<remote-machine-ip>:8093/health` |
+| Feed gateway WebSocket | `ws://<remote-machine-ip>:8093/ws/events` |
 
 Example:
 
 ```text
 OptionsEdge UI:          http://192.168.100.20:8080/
 OptionsEdge config:      http://192.168.100.20:8080/api/config
-Feed gateway health:     http://192.168.100.20:8091/health
-Feed gateway WebSocket:  ws://192.168.100.20:8091/ws/events
+Feed gateway health:     http://192.168.100.20:8093/health
+Feed gateway WebSocket:  ws://192.168.100.20:8093/ws/events
 ```
 
-Important: do not use `ws://127.0.0.1:8091/ws/events` for remote browser clients. In a browser, `127.0.0.1` means the user's own computer, not the remote gateway server.
+Important: do not use `ws://127.0.0.1:8093/ws/events` for remote browser clients. In a browser, `127.0.0.1` means the user's own computer, not the remote gateway server.
 
 ## Deploy `options-edge`
 
@@ -96,7 +96,7 @@ IB_USE_DELAYED_DATA=false
 IB_MAX_STRIKES=45
 
 APP_FEED_GATEWAY_ENABLED=true
-APP_FEED_GATEWAY_WS_URL=ws://<remote-machine-ip>:8091/ws/events
+APP_FEED_GATEWAY_WS_URL=ws://<remote-machine-ip>:8093/ws/events
 
 KAFKA_BOOTSTRAP_SERVERS=192.168.100.252:9092
 KAFKA_SCHEMA_REGISTRY_URL=http://192.168.100.252:8082
@@ -105,7 +105,7 @@ KAFKA_SCHEMA_REGISTRY_URL=http://192.168.100.252:8082
 The key setting is:
 
 ```bash
-APP_FEED_GATEWAY_WS_URL=ws://<remote-machine-ip>:8091/ws/events
+APP_FEED_GATEWAY_WS_URL=ws://<remote-machine-ip>:8093/ws/events
 ```
 
 That URL is sent to the browser through:
@@ -116,12 +116,12 @@ http://<remote-machine-ip>:8080/api/config
 
 ## Deploy `options-edge-feed-gateway`
 
-Run the gateway app on port `8091`.
+Run the gateway app on port `8093`.
 
 Environment:
 
 ```bash
-APP_WEB_PORT=8091
+APP_WEB_PORT=8093
 KAFKA_BOOTSTRAP_SERVERS=192.168.100.252:9092
 KAFKA_SCHEMA_REGISTRY_URL=http://192.168.100.252:8082
 ```
@@ -134,7 +134,7 @@ Open these ports to browser/client machines:
 
 ```text
 8080 -> OptionsEdge UI
-8091 -> Feed gateway HTTP and WebSocket
+8093 -> Feed gateway HTTP and WebSocket
 ```
 
 Keep these private:
@@ -150,7 +150,7 @@ Keep these private:
 From the browser/client machine:
 
 ```bash
-curl http://<remote-machine-ip>:8091/health
+curl http://<remote-machine-ip>:8093/health
 curl http://<remote-machine-ip>:8080/api/config
 ```
 
@@ -169,7 +169,7 @@ The OptionsEdge config should show:
 ```json
 {
   "feedGatewayEnabled": true,
-  "feedGatewayWsUrl": "ws://<remote-machine-ip>:8091/ws/events"
+  "feedGatewayWsUrl": "ws://<remote-machine-ip>:8093/ws/events"
 }
 ```
 
@@ -201,7 +201,7 @@ Reverse proxy model:
 
 ```text
 Browser -> https://options.example.com/ -> options-edge:8080
-Browser -> wss://feed.example.com/ws/events -> options-edge-feed-gateway:8091
+Browser -> wss://feed.example.com/ws/events -> options-edge-feed-gateway:8093
 ```
 
 Then start `options-edge` with:
