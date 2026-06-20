@@ -36,12 +36,9 @@ class FeedGatewayPerSessionBroadcastTest {
     private FeedGatewayService svc;
     private final List<String> u1 = new ArrayList<>(); // user 1 socket s1 (SPX/20260612)
     private final List<String> u2 = new ArrayList<>(); // user 2 socket s2 (SPX/20260620)
-    private String previousFlag;
 
     @BeforeEach
     void setUp() throws Exception {
-        previousFlag = System.getProperty("GATEWAY_ROUTING_PER_SESSION");
-        System.setProperty("GATEWAY_ROUTING_PER_SESSION", "true");
         engine = new SessionRoutingEngine(new ConcurrencyLimits(5, 5, 100), new SubscriptionManager());
         engine.registerAppSession("app:u1", "u1",
                 new Selection(MarketDataSource.DATABENTO, "SPX", "20260612", StrikeWindow.ALL), Set.of());
@@ -57,14 +54,6 @@ class FeedGatewayPerSessionBroadcastTest {
         u2.clear(); // discard the initial status/cache-replay sent on connect
     }
 
-    @AfterEach
-    void tearDown() {
-        if (previousFlag == null) {
-            System.clearProperty("GATEWAY_ROUTING_PER_SESSION");
-        } else {
-            System.setProperty("GATEWAY_ROUTING_PER_SESSION", previousFlag);
-        }
-    }
 
     private WebSocketSession socket(String id, List<String> sink) throws Exception {
         WebSocketSession ws = mock(WebSocketSession.class);

@@ -180,7 +180,9 @@ public class FeedGatewayService implements ReplayRunner {
      * used to leave an auth-enabled gateway in broadcast mode.
      */
     private boolean perSessionRouting() {
-        return routingEngine != null || settings.routingPerSession();
+        // Intrinsic to auth (P0): the routing engine exists exactly when GATEWAY_AUTH_ENABLED=true, so an
+        // authenticated gateway ALWAYS routes per-session. There is no separate routing flag to leave off.
+        return routingEngine != null;
     }
 
     @PostConstruct
@@ -2492,6 +2494,7 @@ public class FeedGatewayService implements ReplayRunner {
         properties.put(ConsumerConfig.FETCH_MAX_BYTES_CONFIG, Integer.toString(settings.fetchMaxBytes()));
         properties.put(ConsumerConfig.MAX_PARTITION_FETCH_BYTES_CONFIG, Integer.toString(settings.maxPartitionFetchBytes()));
         properties.put(ConsumerConfig.RECEIVE_BUFFER_CONFIG, Integer.toString(settings.receiveBufferBytes()));
+        settings.applyKafkaSecurity(properties); // TLS/SASL when configured (required under auth — P0)
         return properties;
     }
 

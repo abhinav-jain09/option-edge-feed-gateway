@@ -63,9 +63,46 @@ public final class GatewaySettings {
         return intValue("GATEWAY_WS_TICKET_TTL_SECONDS", 10, 1);
     }
 
-    /** Route the live data path per-session through the engine instead of broadcasting (OE-DDD-001 §8, finding #3). */
-    public boolean routingPerSession() {
-        return boolValue("GATEWAY_ROUTING_PER_SESSION", false);
+    // Per-session routing is no longer a separate flag (P0): it is INTRINSIC to auth. Whenever
+    // GATEWAY_AUTH_ENABLED=true the SessionRoutingEngine bean exists and the live data path is routed
+    // per-session — they cannot be turned on independently, so an authenticated socket can never receive
+    // the global broadcast. (FeedGatewayService.perSessionRouting() == routingEngine != null.)
+
+    /** Kafka client security protocol (PLAINTEXT/SSL/SASL_SSL/SASL_PLAINTEXT). Default PLAINTEXT (dev). */
+    public String kafkaSecurityProtocol() {
+        return value("GATEWAY_KAFKA_SECURITY_PROTOCOL", "PLAINTEXT").trim().toUpperCase();
+    }
+
+    /** True when the configured Kafka protocol encrypts/authenticates (i.e. not PLAINTEXT). */
+    public boolean kafkaSecure() {
+        String p = kafkaSecurityProtocol();
+        return p.equals("SSL") || p.equals("SASL_SSL") || p.equals("SASL_PLAINTEXT");
+    }
+
+    /** Explicit dev/test opt-out allowing PLAINTEXT Kafka while auth is on (P0 production invariant). */
+    public boolean allowInsecureKafka() {
+        return boolValue("GATEWAY_ALLOW_INSECURE_KAFKA", false);
+    }
+
+    /** Apply the Kafka client security settings (protocol + optional SASL/SSL passthrough) to a config. */
+    public void applyKafkaSecurity(java.util.Properties props) {
+        String protocol = kafkaSecurityProtocol();
+        if (protocol.equals("PLAINTEXT")) {
+            return;
+        }
+        props.put("security.protocol", protocol);
+        putIfPresent(props, "sasl.mechanism", "GATEWAY_KAFKA_SASL_MECHANISM");
+        putIfPresent(props, "sasl.jaas.config", "GATEWAY_KAFKA_SASL_JAAS_CONFIG");
+        putIfPresent(props, "ssl.truststore.location", "GATEWAY_KAFKA_SSL_TRUSTSTORE_LOCATION");
+        putIfPresent(props, "ssl.truststore.password", "GATEWAY_KAFKA_SSL_TRUSTSTORE_PASSWORD");
+        putIfPresent(props, "ssl.endpoint.identification.algorithm", "GATEWAY_KAFKA_SSL_ENDPOINT_ID_ALGORITHM");
+    }
+
+    private void putIfPresent(java.util.Properties props, String key, String envKey) {
+        String v = value(envKey, "");
+        if (!v.isBlank()) {
+            props.put(key, v);
+        }
     }
 
     public String bootstrapServers() {
