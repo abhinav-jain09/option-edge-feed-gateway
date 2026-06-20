@@ -43,6 +43,17 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-websocket</artifactId>
         </dependency>
+        <!--
+          Keycloak JWT decoding for the WebSocket handshake. We deliberately depend ONLY on
+          spring-security-oauth2-jose (NimbusJwtDecoder + JWT validators) and NOT on
+          spring-security-oauth2-resource-server: the latter drags in spring-security-web, which trips
+          Spring Boot's servlet security auto-config and would lock down every existing gateway endpoint
+          behind a generated password. The handshake interceptor is our only enforcement point.
+        -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-oauth2-jose</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>kafka-clients</artifactId>

@@ -34,6 +34,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.springframework.stereotype.Service;
+import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
@@ -267,6 +268,36 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (IOException | IllegalStateException ignored) {
             // Removing the session from the fanout set is sufficient.
         }
+    }
+
+    // 4001 is in the application-private close-code range (4000-4999); the browser client reads it,
+    // refreshes the token, and reconnects.
+    private static final CloseStatus TOKEN_EXPIRED_STATUS = new CloseStatus(4001, "token expired");
+
+    /**
+     * Closes any authenticated socket whose access token has expired. Auth is enforced only at the
+     * handshake, so without this sweep a long-lived socket would keep streaming live quotes after its
+     * token died. Sockets opened while WS auth was disabled carry no expiry attribute and are left
+     * untouched. Returns the number of sockets closed (for logging/tests).
+     */
+    public int closeExpiredAuthSessions(long nowMs) {
+        int closed = 0;
+        for (WebSocketSession session : clients) {
+            Object expiry = session.getAttributes().get(WsJwtHandshakeInterceptor.AUTH_EXPIRES_AT_ATTR);
+            if (!(expiry instanceof Long expiresAtMs) || nowMs < expiresAtMs) {
+                continue;
+            }
+            clients.remove(session);
+            try {
+                if (session.isOpen()) {
+                    session.close(TOKEN_EXPIRED_STATUS);
+                }
+            } catch (IOException | IllegalStateException ignored) {
+                // Removing the session from the fanout set is sufficient.
+            }
+            closed++;
+        }
+        return closed;
     }
 
     public String healthJson() {
@@ -1168,14 +1199,18 @@ public class FeedGatewayService implements ReplayRunner {
         String key = record.key() == null || record.key().isBlank()
                 ? record.topic() + ":" + record.partition()
                 : record.key();
-        if ("directional-pressure".equals(event)) {
+        if ("pace".equals(event)) {
+            key = paceCacheKey(json, key);
+        } else if ("directional-pressure".equals(event)) {
             key = directionalPressureCacheKey(json, key);
         } else if ("vix-price".equals(event) || "index-price".equals(event)) {
             key = indexPriceCacheKey(json, key);
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
         }
-        key = binding.source() + "|" + key;
+        if (!"pace".equals(event)) {
+            key = binding.source() + "|" + key;
+        }
         String versionKey = event + ":" + key;
         long eventTime = cacheTimestamp(record);
         Long previousEventTime = cacheEventTimes.get(versionKey);
@@ -1632,6 +1667,25 @@ public class FeedGatewayService implements ReplayRunner {
         return fallback;
     }
 
+    private String paceCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String source = GatewaySettings.normalizeSource(text(root, "marketDataSource"));
+            if (source.isBlank()) {
+                source = GatewaySettings.normalizeSource(text(root, "source"));
+            }
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            double strike = doubleField(root, "strike", Double.NaN);
+            if (!source.isBlank() && !symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike)) {
+                return source + "|" + symbol + "|" + expiry + "|" + formatStrike(strike);
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
     private String strikeFlowCacheKey(String json, String fallback) {
         try {
             JsonNode root = mapper.readTree(json);
@@ -1693,6 +1747,28 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (NumberFormatException ignored) {
             return fallback;
         }
+    }
+
+    private static double doubleField(JsonNode root, String field, double fallback) {
+        JsonNode value = root == null ? null : root.get(field);
+        if (value == null || value.isNull()) {
+            return fallback;
+        }
+        if (value.isNumber()) {
+            return value.asDouble();
+        }
+        try {
+            return Double.parseDouble(value.asText("").trim());
+        } catch (NumberFormatException ignored) {
+            return fallback;
+        }
+    }
+
+    private static String formatStrike(double strike) {
+        if (strike == Math.rint(strike)) {
+            return Long.toString((long) strike);
+        }
+        return Double.toString(strike);
     }
 
     private static long parseInstantMs(String value, long fallback) {
