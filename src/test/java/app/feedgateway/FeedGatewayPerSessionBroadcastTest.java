@@ -15,6 +15,7 @@ import app.feedgateway.mtsession.SessionRoutingEngine;
 import app.feedgateway.mtsession.StrikeWindow;
 import app.feedgateway.mtsession.SubscriptionManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
@@ -123,6 +124,78 @@ class FeedGatewayPerSessionBroadcastTest {
                 "{\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":7500,\"marketDataSource\":\"DATABENTO\"}");
         assertEquals(1, u1.size());
         assertTrue(u2.isEmpty());
+    }
+
+    // ---- P0: HPSF signals/audit must route per-session, never via the all-client batch ----
+
+    private void routeHpsf(String event, String key, String json, String expiry) throws Exception {
+        Class<?> updateCls = Class.forName("app.feedgateway.FeedGatewayService$HpsfCacheUpdate");
+        Constructor<?> ctor = updateCls.getDeclaredConstructor(
+                String.class, String.class, String.class, String.class);
+        ctor.setAccessible(true);
+        Object update = ctor.newInstance(event, key, json, expiry);
+        Method m = FeedGatewayService.class.getDeclaredMethod("routeHpsfPerSession", updateCls);
+        m.setAccessible(true);
+        m.invoke(svc, update);
+    }
+
+    private void enqueuePending(String event, String key, String json) throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod(
+                "enqueuePending", String.class, String.class, String.class);
+        m.setAccessible(true);
+        m.invoke(svc, event, key, json);
+    }
+
+    private void flushPendingBatch() throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod("flushPendingBatch");
+        m.setAccessible(true);
+        m.invoke(svc);
+    }
+
+    @Test
+    void hpsfSignalRoutesOnlyToTheMatchingExpirySession() throws Exception {
+        // hpsf-latest-signal for the 20260612 chain — only u1 selected that expiry.
+        routeHpsf("hpsf-latest-signal", "20260612", "{\"action\":\"BUY_CALL_CONFIRMED\"}", "20260612");
+        assertEquals(1, u1.size(), "HPSF signal must reach the session on its chain");
+        assertTrue(u2.isEmpty(), "HPSF signal must NOT leak to a session on a different expiry");
+    }
+
+    @Test
+    void hpsfAuditAndExitIntentRouteByExpiry() throws Exception {
+        // Audit + exit-intent carry sensitive decision internals — they must follow the same routing.
+        routeHpsf("hpsf-audit", "20260620", "{\"selectedAction\":\"NO_TRADE\"}", "20260620");
+        routeHpsf("hpsf-exit-intent", "20260620", "{\"exitAction\":\"EXIT_NOW\"}", "20260620");
+        assertEquals(2, u2.size(), "audit + exit-intent reach the matching session");
+        assertTrue(u1.isEmpty(), "audit/exit-intent must NOT leak to another tenant's session");
+    }
+
+    @Test
+    void hpsfMarketFlowRoutesToEverySessionOfTheUnderlying() throws Exception {
+        // Market-flow is a whole-underlying summary (no expiry) — both SPX sessions receive it, but it
+        // still flows through the engine + entitlement checks (not the all-client batch).
+        routeHpsf("hpsf-market-flow", "SPX", "{\"marketBias\":\"BULLISH\"}", null);
+        assertEquals(1, u1.size());
+        assertEquals(1, u2.size());
+    }
+
+    @Test
+    void hpsfWithoutExpiryIsDroppedNotBroadcast() throws Exception {
+        // A contract-scoped HPSF event with no chain key cannot be routed — it must be dropped, never
+        // fanned out to every socket.
+        routeHpsf("hpsf-latest-signal", "k", "{\"action\":\"NO_TRADE\"}", "  ");
+        assertTrue(u1.isEmpty(), "unroutable HPSF event must not reach any session");
+        assertTrue(u2.isEmpty(), "unroutable HPSF event must not broadcast");
+    }
+
+    @Test
+    void allClientBatchPathIsUnreachableInTenantMode() throws Exception {
+        // Even if something reaches the legacy batch, enqueue is a no-op and the flush sends nothing in
+        // per-session mode — the cross-tenant broadcast path is dead.
+        enqueuePending("hpsf-latest-signal", "20260612", "{\"action\":\"BUY_CALL_CONFIRMED\"}");
+        enqueuePending("snapshot", "20260612|7500", "{\"symbol\":\"SPX\",\"expiry\":\"20260612\"}");
+        flushPendingBatch();
+        assertTrue(u1.isEmpty(), "batch flush must send nothing in tenant mode");
+        assertTrue(u2.isEmpty(), "batch flush must send nothing in tenant mode");
     }
 
     @Test

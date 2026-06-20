@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import app.feedgateway.mtsession.RoutableRecord;
 import app.feedgateway.mtsession.AppSession;
+import app.feedgateway.mtsession.EventType;
 import app.feedgateway.mtsession.MarketDataSource;
 import app.feedgateway.mtsession.SessionRoutingEngine;
 import app.feedgateway.mtsession.gateway.ReplayParams;
@@ -13,6 +14,7 @@ import app.feedgateway.mtsession.gateway.ReplayTopicResolver;
 import app.feedgateway.mtsession.gateway.ReplayRunner;
 import app.feedgateway.mtsession.gateway.GatewayRecordMapper;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import org.springframework.lang.Nullable;
 import com.optionsedge.contracts.hpsf.HpsfAuditEvent;
 import com.optionsedge.contracts.hpsf.HpsfExitIntentEvent;
@@ -129,7 +131,9 @@ public class FeedGatewayService implements ReplayRunner {
     private record RecordPosition(TopicPartition partition, long offset) {
     }
 
-    private record HpsfCacheUpdate(String event, String key, String json) {
+    // expiry is the (symbol,expiry)-chain this HPSF view belongs to, used as the per-session routing
+    // key (null for market-flow, which is whole-underlying). The legacy batch path ignores it.
+    private record HpsfCacheUpdate(String event, String key, String json, String expiry) {
     }
 
     private record ActiveSelection(String source, String symbol, String expiry, long selectionEpoch, long selectedAtMs) {
@@ -618,7 +622,14 @@ public class FeedGatewayService implements ReplayRunner {
                 for (ConsumerRecord<String, String> record : records) {
                     HpsfCacheUpdate update = updateHpsfCache(record);
                     if (update != null && hpsfCaughtUp.get()) {
-                        enqueuePending(update.event(), update.key(), update.json());
+                        // P0 (HPSF bypass): in tenant mode route per-session by the record's chain key
+                        // so HPSF signals/audit reach only entitled sessions; the all-client batch path
+                        // is unreachable. Legacy single-tenant mode keeps the coalesced batch.
+                        if (perSessionRouting()) {
+                            routeHpsfPerSession(update);
+                        } else {
+                            enqueuePending(update.event(), update.key(), update.json());
+                        }
                         forwardedEvents.incrementAndGet();
                     } else if (update != null) {
                         inactiveDroppedEvents.incrementAndGet();
@@ -1327,14 +1338,19 @@ public class FeedGatewayService implements ReplayRunner {
             String groupKey = hpsfGroupKey(signal.tradeDate(), signal.expiry(), fallbackKey(record));
             hpsfLatestEvaluationIds.put(groupKey, signal.evaluationId());
             String json = write(hpsfViewMapper.latestSignalView(HpsfTopics.HPSF_LATEST_SIGNAL, signal));
-            HpsfCacheUpdate update = new HpsfCacheUpdate("hpsf-latest-signal", groupKey, json);
-            HpsfCacheUpdate candidates = topCandidatesUpdate(groupKey);
+            HpsfCacheUpdate update = new HpsfCacheUpdate("hpsf-latest-signal", groupKey, json, signal.expiry());
+            HpsfCacheUpdate candidates = topCandidatesUpdate(groupKey, signal.expiry());
             if (candidates != null) {
                 cacheEventTimes.put(candidates.event() + ":" + candidates.key(), cacheTimestamp(record));
                 cachePositions.put(candidates.event() + ":" + candidates.key(), recordPosition(record));
                 putHpsfView(candidates);
                 if (hpsfCaughtUp.get()) {
-                    enqueuePending(candidates.event(), candidates.key(), candidates.json());
+                    // Same P0 gate as the live consumer: route per-session in tenant mode, batch in legacy.
+                    if (perSessionRouting()) {
+                        routeHpsfPerSession(candidates);
+                    } else {
+                        enqueuePending(candidates.event(), candidates.key(), candidates.json());
+                    }
                 }
             }
             return update;
@@ -1342,28 +1358,28 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.hpsfMarketFlowTopic().equals(topic)) {
             MarketFlowSnapshot snapshot = read(rawJson, MarketFlowSnapshot.class);
             String key = fallbackKey(record);
-            return new HpsfCacheUpdate("hpsf-market-flow", key, write(hpsfViewMapper.marketFlowView(snapshot)));
+            return new HpsfCacheUpdate("hpsf-market-flow", key, write(hpsfViewMapper.marketFlowView(snapshot)), null);
         }
         if (settings.hpsfStrikeScoreTopic().equals(topic)) {
             StrikeScoreSnapshot score = read(rawJson, StrikeScoreSnapshot.class);
             String groupKey = hpsfGroupKey(score.tradeDate(), score.expiry(), fallbackKey(record));
             hpsfStrikeScores.put(groupKey + "|" + fallbackKey(record), score);
-            return topCandidatesUpdate(groupKey);
+            return topCandidatesUpdate(groupKey, score.expiry());
         }
         if (settings.hpsfAuditTopic().equals(topic)) {
             HpsfAuditEvent audit = read(rawJson, HpsfAuditEvent.class);
             String key = hpsfGroupKey(audit.tradeDate(), audit.expiry(), fallbackKey(record));
-            return new HpsfCacheUpdate("hpsf-audit", key, write(hpsfViewMapper.auditView(audit)));
+            return new HpsfCacheUpdate("hpsf-audit", key, write(hpsfViewMapper.auditView(audit)), audit.expiry());
         }
         if (settings.hpsfExitSignalTopic().equals(topic)) {
             HpsfExitIntentEvent event = read(rawJson, HpsfExitIntentEvent.class);
             String key = hpsfGroupKey(event.tradeDate(), event.expiry(), fallbackKey(record));
-            return new HpsfCacheUpdate("hpsf-exit-intent", key, write(hpsfViewMapper.exitIntentView(event)));
+            return new HpsfCacheUpdate("hpsf-exit-intent", key, write(hpsfViewMapper.exitIntentView(event)), event.expiry());
         }
         return null;
     }
 
-    private HpsfCacheUpdate topCandidatesUpdate(String groupKey) {
+    private HpsfCacheUpdate topCandidatesUpdate(String groupKey, String expiry) {
         String latestEvaluationId = hpsfLatestEvaluationIds.get(groupKey);
         List<StrikeScoreSnapshot> scores = hpsfStrikeScores.entrySet().stream()
                 .filter(entry -> entry.getKey().startsWith(groupKey + "|"))
@@ -1373,7 +1389,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (scores.isEmpty()) {
             return null;
         }
-        return new HpsfCacheUpdate("hpsf-top-candidates", groupKey, write(hpsfViewMapper.topCandidatesView(scores)));
+        return new HpsfCacheUpdate("hpsf-top-candidates", groupKey, write(hpsfViewMapper.topCandidatesView(scores)), expiry);
     }
 
     private void putHpsfView(HpsfCacheUpdate update) {
@@ -2209,7 +2225,62 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /**
+     * P0 (HPSF bypass fix): route a single HPSF view to exactly the sessions entitled to its chain,
+     * through the SAME {@link SessionRoutingEngine} + entitlement checks as live contract events.
+     * Contract-scoped HPSF events (signal/candidates/audit/exit-intent) route by {@code source|symbol|
+     * expiry} with no strike filter (whole-chain decisions); market-flow routes by the underlying.
+     * Unroutable records (unknown source/event or missing expiry) are dropped — NEVER broadcast.
+     */
+    private void routeHpsfPerSession(HpsfCacheUpdate update) {
+        SessionRoutingEngine engine = routingEngine;
+        if (engine == null) {
+            return;
+        }
+        EventType type = hpsfEventType(update.event());
+        Optional<MarketDataSource> source = MarketDataSource.parse(settings.initialMarketDataSource());
+        if (type == null || source.isEmpty()) {
+            droppedNonRoutableEvents.incrementAndGet();
+            return;
+        }
+        RoutableRecord record;
+        if (type.isUnderlying()) {
+            record = RoutableRecord.underlying(source.get(), type, 0L);
+        } else {
+            if (update.expiry() == null || update.expiry().isBlank()) {
+                droppedNonRoutableEvents.incrementAndGet();
+                return;
+            }
+            record = new RoutableRecord(source.get(), type, settings.initialSymbol(), update.expiry(),
+                    OptionalDouble.empty(), 0L, null, null);
+        }
+        for (String socketId : engine.route(record)) {
+            WebSocketSession s = clientsById.get(socketId);
+            if (s != null) {
+                send(s, update.event(), update.json());
+            }
+        }
+    }
+
+    private static EventType hpsfEventType(String event) {
+        return switch (event) {
+            case "hpsf-latest-signal" -> EventType.HPSF_LATEST_SIGNAL;
+            case "hpsf-top-candidates" -> EventType.HPSF_TOP_CANDIDATES;
+            case "hpsf-audit" -> EventType.HPSF_AUDIT;
+            case "hpsf-exit-intent" -> EventType.HPSF_EXIT_INTENT;
+            case "hpsf-market-flow" -> EventType.HPSF_MARKET_FLOW;
+            default -> null;
+        };
+    }
+
     private void enqueuePending(String event, String key, String json) {
+        // Defense in depth (P0): the coalesced all-client batch is the LEGACY single-tenant path only.
+        // In tenant-routing mode every consume site routes per-session, so this must be unreachable —
+        // drop rather than risk a cross-tenant broadcast if any future call site forgets the gate.
+        if (perSessionRouting()) {
+            droppedNonRoutableEvents.incrementAndGet();
+            return;
+        }
         if (clients.isEmpty()) {
             return;
         }
@@ -2245,6 +2316,15 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void flushPendingBatch() {
+        // P0 (HPSF bypass): the all-client batch broadcasts one envelope to EVERY socket with no routing.
+        // In tenant-routing mode that is a cross-tenant leak, so the path is unreachable here: drain any
+        // residue and return without sending. All events route per-session at their consume sites instead.
+        if (perSessionRouting()) {
+            synchronized (batchLock) {
+                clearPendingLocked();
+            }
+            return;
+        }
         try {
             String envelope;
             synchronized (batchLock) {

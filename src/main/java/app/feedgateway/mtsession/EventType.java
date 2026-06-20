@@ -16,7 +16,17 @@ public enum EventType {
     GEX_BY_STRIKE(Scope.CONTRACT),
     VIX_PRICE(Scope.UNDERLYING),
     INDEX_PRICE(Scope.UNDERLYING),
-    SPX_PRICE(Scope.UNDERLYING);
+    SPX_PRICE(Scope.UNDERLYING),
+
+    // HPSF decision signals carry no per-strike routing key — a signal/audit/exit-intent/top-candidates
+    // set is computed for a whole (symbol, expiry) chain, so they route contract-scoped by source|symbol|
+    // expiry with NO strike filter (every session on that chain receives them, review P0 — HPSF bypass).
+    // HPSF market-flow is a whole-underlying summary with no expiry, so it routes underlying-scoped.
+    HPSF_LATEST_SIGNAL(Scope.CONTRACT),
+    HPSF_TOP_CANDIDATES(Scope.CONTRACT),
+    HPSF_AUDIT(Scope.CONTRACT),
+    HPSF_EXIT_INTENT(Scope.CONTRACT),
+    HPSF_MARKET_FLOW(Scope.UNDERLYING);
 
     private enum Scope { CONTRACT, UNDERLYING }
 
@@ -43,7 +53,7 @@ public enum EventType {
     public String underlyingSymbol() {
         return switch (this) {
             case VIX_PRICE -> "VIX";
-            case INDEX_PRICE, SPX_PRICE -> "SPX";
+            case INDEX_PRICE, SPX_PRICE, HPSF_MARKET_FLOW -> "SPX";
             default -> throw new IllegalStateException("Not an underlying event: " + this);
         };
     }
