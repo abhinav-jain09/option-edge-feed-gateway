@@ -10,10 +10,16 @@ import java.util.Set;
  * @param roles    realm roles from {@code realm_access.roles}
  * @param clientId the authorized party ({@code azp} claim)
  */
-public record VerifiedPrincipal(String userId, String username, Set<String> roles, String clientId) {
+public record VerifiedPrincipal(String userId, String username, Set<String> roles, String clientId,
+                               java.time.Instant expiresAt) {
 
     public VerifiedPrincipal {
         roles = roles == null ? Set.of() : Set.copyOf(roles);
+    }
+
+    /** Back-compat: principal without a token-expiry (the socket reaper simply won't time-bound it). */
+    public VerifiedPrincipal(String userId, String username, Set<String> roles, String clientId) {
+        this(userId, username, roles, clientId, null);
     }
 
     public boolean hasRole(String role) {

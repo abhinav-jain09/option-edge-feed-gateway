@@ -1,6 +1,7 @@
 package app.feedgateway.mtsession.gateway;
 
 import java.util.Map;
+import app.feedgateway.WsJwtHandshakeInterceptor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.server.ServerHttpRequest;
 import org.springframework.http.server.ServerHttpResponse;
@@ -42,6 +43,11 @@ public final class TicketHandshakeInterceptor implements HandshakeInterceptor {
         if (!d.passthrough()) {
             attributes.put(ATTR_APP_SESSION_ID, d.appSessionId());
             attributes.put(ATTR_USER_ID, d.userId());
+            // Bind the backing token's expiry so WsTokenExpiryReaper closes the socket when the access
+            // token expires — a ticket-redeemed socket must not outlive its token (review finding #11).
+            if (d.tokenExpiresAt() != null) {
+                attributes.put(WsJwtHandshakeInterceptor.AUTH_EXPIRES_AT_ATTR, d.tokenExpiresAt().toEpochMilli());
+            }
         }
         return true;
     }

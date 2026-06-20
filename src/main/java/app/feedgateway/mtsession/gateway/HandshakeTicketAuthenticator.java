@@ -16,18 +16,19 @@ import java.util.Optional;
 public final class HandshakeTicketAuthenticator {
 
     /** Outcome of a handshake authentication attempt. */
-    public record Decision(boolean accept, boolean passthrough, String appSessionId, String userId, String reason) {
+    public record Decision(boolean accept, boolean passthrough, String appSessionId, String userId,
+                           java.time.Instant tokenExpiresAt, String reason) {
 
         static Decision disabled() {
-            return new Decision(true, true, null, null, "auth-disabled");
+            return new Decision(true, true, null, null, null, "auth-disabled");
         }
 
-        static Decision accepted(String appSessionId, String userId) {
-            return new Decision(true, false, appSessionId, userId, "ok");
+        static Decision accepted(String appSessionId, String userId, java.time.Instant tokenExpiresAt) {
+            return new Decision(true, false, appSessionId, userId, tokenExpiresAt, "ok");
         }
 
         static Decision rejected(String reason) {
-            return new Decision(false, false, null, null, reason);
+            return new Decision(false, false, null, null, null, reason);
         }
     }
 
@@ -55,6 +56,6 @@ public final class HandshakeTicketAuthenticator {
             return Decision.rejected("invalid or already-used ticket");
         }
         WsTicket ticket = redeemed.get();
-        return Decision.accepted(ticket.appSessionId(), ticket.userId());
+        return Decision.accepted(ticket.appSessionId(), ticket.userId(), ticket.tokenExpiresAt());
     }
 }

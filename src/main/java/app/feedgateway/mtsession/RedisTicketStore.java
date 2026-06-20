@@ -36,12 +36,12 @@ public final class RedisTicketStore implements TicketStore {
     }
 
     @Override
-    public WsTicket mint(String userId, String appSessionId, Duration ttl) {
+    public WsTicket mint(String userId, String appSessionId, Duration ttl, Instant tokenExpiresAt) {
         if (ttl.isNegative() || ttl.isZero()) {
             throw new IllegalArgumentException("ticket ttl must be positive");
         }
         Instant expiresAt = clock.instant().plus(ttl);
-        WsTicket ticket = new WsTicket(idGenerator.get(), userId, appSessionId, expiresAt);
+        WsTicket ticket = new WsTicket(idGenerator.get(), userId, appSessionId, expiresAt, tokenExpiresAt);
         redis.set(key(ticket.ticketId()), serialize(ticket),
                 SetArgs.Builder.px(ttl.toMillis()));
         return ticket;
@@ -70,7 +70,8 @@ public final class RedisTicketStore implements TicketStore {
     private static String serialize(WsTicket t) {
         try {
             return MAPPER.writeValueAsString(
-                    new Dto(t.ticketId(), t.userId(), t.appSessionId(), t.expiresAt().toEpochMilli()));
+                    new Dto(t.ticketId(), t.userId(), t.appSessionId(), t.expiresAt().toEpochMilli(),
+                            t.tokenExpiresAt() == null ? -1L : t.tokenExpiresAt().toEpochMilli()));
         } catch (Exception e) {
             throw new IllegalStateException("failed to serialize ticket", e);
         }
@@ -79,7 +80,8 @@ public final class RedisTicketStore implements TicketStore {
     private static WsTicket deserialize(String json) {
         try {
             Dto d = MAPPER.readValue(json, Dto.class);
-            return new WsTicket(d.ticketId(), d.userId(), d.appSessionId(), Instant.ofEpochMilli(d.expiresAtMs()));
+            return new WsTicket(d.ticketId(), d.userId(), d.appSessionId(), Instant.ofEpochMilli(d.expiresAtMs()),
+                    d.tokenExpiresAtMs() < 0 ? null : Instant.ofEpochMilli(d.tokenExpiresAtMs()));
         } catch (Exception e) {
             return null;
         }
@@ -89,6 +91,7 @@ public final class RedisTicketStore implements TicketStore {
             @JsonProperty("t") String ticketId,
             @JsonProperty("u") String userId,
             @JsonProperty("a") String appSessionId,
-            @JsonProperty("e") long expiresAtMs) {
+            @JsonProperty("e") long expiresAtMs,
+            @JsonProperty("te") long tokenExpiresAtMs) {
     }
 }

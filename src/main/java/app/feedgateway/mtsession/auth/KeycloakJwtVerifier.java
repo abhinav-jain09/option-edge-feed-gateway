@@ -154,7 +154,8 @@ public final class KeycloakJwtVerifier implements TokenVerifier {
         } catch (java.text.ParseException e) {
             username = null;
         }
-        return new VerifiedPrincipal(claims.getSubject(), username, extractRealmRoles(claims), azp);
+        java.time.Instant exp = claims.getExpirationTime() == null ? null : claims.getExpirationTime().toInstant();
+        return new VerifiedPrincipal(claims.getSubject(), username, extractRealmRoles(claims), azp, exp);
     }
 
     public String issuer() {

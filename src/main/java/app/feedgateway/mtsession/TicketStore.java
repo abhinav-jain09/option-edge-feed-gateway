@@ -10,7 +10,12 @@ import java.util.Optional;
 public interface TicketStore {
 
     /** Mint a single-use ticket valid for {@code ttl}. */
-    WsTicket mint(String userId, String appSessionId, Duration ttl);
+    WsTicket mint(String userId, String appSessionId, Duration ttl, java.time.Instant tokenExpiresAt);
+
+    /** Back-compat: mint without a backing-token expiry. */
+    default WsTicket mint(String userId, String appSessionId, Duration ttl) {
+        return mint(userId, appSessionId, ttl, null);
+    }
 
     /**
      * Atomically redeem a ticket: returns it exactly once if present and unexpired, removing it so

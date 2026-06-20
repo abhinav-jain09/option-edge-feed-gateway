@@ -26,11 +26,11 @@ public final class InMemoryTicketStore implements TicketStore {
     }
 
     @Override
-    public WsTicket mint(String userId, String appSessionId, Duration ttl) {
+    public WsTicket mint(String userId, String appSessionId, Duration ttl, java.time.Instant tokenExpiresAt) {
         if (ttl.isNegative() || ttl.isZero()) {
             throw new IllegalArgumentException("ticket ttl must be positive");
         }
-        WsTicket ticket = new WsTicket(idGenerator.get(), userId, appSessionId, clock.instant().plus(ttl));
+        WsTicket ticket = new WsTicket(idGenerator.get(), userId, appSessionId, clock.instant().plus(ttl), tokenExpiresAt);
         tickets.put(ticket.ticketId(), ticket);
         return ticket;
     }

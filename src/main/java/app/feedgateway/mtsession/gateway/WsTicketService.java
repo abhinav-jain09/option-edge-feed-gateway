@@ -59,7 +59,7 @@ public final class WsTicketService {
         } else {
             engine.registerAppSession(appSessionId, userId, selection, principal.roles());
         }
-        WsTicket ticket = ticketStore.mint(userId, appSessionId, ticketTtl);
+        WsTicket ticket = ticketStore.mint(userId, appSessionId, ticketTtl, principal.expiresAt());
         return new TicketIssued(ticket.ticketId(), appSessionId, ticketTtl.toMillis());
     }
 
