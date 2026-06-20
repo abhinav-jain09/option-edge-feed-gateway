@@ -1,7 +1,7 @@
 pipeline {
   agent any
   parameters {
-    string(name: 'IMAGE_REGISTRY', defaultValue: '192.168.100.252:5000', description: 'Docker registry namespace')
+    string(name: 'IMAGE_REGISTRY', defaultValue: 'host.docker.internal:5001', description: 'Docker registry namespace. Dev default is the LOCAL Mac registry (host.docker.internal:5001) — the buildkitd config below trusts it as insecure and the local-docker k8s pulls from it. Prod deploy jobs override this with the prod registry.')
     string(name: 'IMAGE_TAG', defaultValue: '', description: 'Docker tag. Defaults to current git SHA.')
     string(name: 'DEV_IMAGE_TAG', defaultValue: 'dev', description: 'Also publish this mutable dev tag for the deploy job. Empty disables it.')
     string(name: 'BUILD_PLATFORM', defaultValue: 'linux/arm64', description: 'Docker platform for local dev Jenkins. Production deploy jobs force linux/amd64.')
