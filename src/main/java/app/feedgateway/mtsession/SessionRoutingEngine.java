@@ -178,6 +178,20 @@ public final class SessionRoutingEngine {
      * Change a session's selection: reindex, release/acquire Databento subscriptions, and raise the
      * per-session epoch so stale pre-switch records are dropped for this session only (§8.3).
      */
+    /**
+     * Atomically replace a session's entitlements with the roles from a freshly-verified token (FR-12).
+     * The router's per-record entitlement double-check ({@code canReceive}) then enforces the new roles
+     * immediately; a periodic revalidation tears the session down when its selection is no longer permitted.
+     */
+    public void refreshEntitlements(String appSessionId, Set<String> newEntitlements) {
+        runWrite(() -> {
+            AppSession app = appSessions.get(appSessionId);
+            if (app != null) {
+                app.setEntitlements(newEntitlements);
+            }
+        });
+    }
+
     public void changeSelection(String appSessionId, Selection newSelection) {
         Objects.requireNonNull(newSelection, "newSelection");
         runWrite(() -> {

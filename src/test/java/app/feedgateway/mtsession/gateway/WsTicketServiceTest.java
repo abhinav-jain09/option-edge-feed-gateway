@@ -82,6 +82,28 @@ class WsTicketServiceTest {
     }
 
     @Test
+    void reissueRefreshesEntitlementsSoRevokedRolesDoNotPersist() throws Exception {
+        // First token has ibkr-user; a later token for the same user no longer does (role revoked).
+        VerifiedPrincipal withIbkr = new VerifiedPrincipal("u1", "t", Set.of("user", "ibkr-user"), "c");
+        VerifiedPrincipal withoutIbkr = new VerifiedPrincipal("u1", "t", Set.of("user"), "c");
+        java.util.Map<String, VerifiedPrincipal> tokens = new java.util.HashMap<>();
+        tokens.put("t1", withIbkr);
+        tokens.put("t2", withoutIbkr);
+        WsTicketService svc = service(new FakeVerifier(tokens));
+
+        svc.issue("t1", dbnto("SPX", "20260612"));
+        org.junit.jupiter.api.Assertions.assertTrue(
+                svc.appSessionForUser("u1").entitlements().contains("ibkr-user"));
+
+        // Re-issue with the revoked-role token: entitlements are refreshed, so an IBKR selection is now rejected.
+        Selection ibkr = new Selection(MarketDataSource.IBKR, "SPX", "20260617", StrikeWindow.ALL);
+        assertThrows(NotEntitledException.class, () -> svc.issue("t2", ibkr));
+        org.junit.jupiter.api.Assertions.assertFalse(
+                svc.appSessionForUser("u1").entitlements().contains("ibkr-user"),
+                "the revoked ibkr-user entitlement must not persist on the existing session");
+    }
+
+    @Test
     void invalidTokenRejected() {
         WsTicketService svc = service(new FakeVerifier(Map.of()));
         assertThrows(JwtVerificationException.class, () -> svc.issue("nope", dbnto("SPX", "20260612")));

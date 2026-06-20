@@ -1,6 +1,7 @@
 package app.feedgateway;
 
 import app.feedgateway.mtsession.AppSession;
+import app.feedgateway.mtsession.EntitlementPolicy;
 import app.feedgateway.mtsession.SessionRoutingEngine;
 import app.feedgateway.mtsession.approval.ApprovalAuthority;
 import org.slf4j.Logger;
@@ -44,7 +45,12 @@ public class ApprovalReaper {
         recheckOnce(System.currentTimeMillis());
     }
 
-    /** Re-evaluate every active session; tear down those no longer approved. Returns the count revoked. */
+    /**
+     * Re-evaluate every active session and tear down those no longer permitted — because approval was
+     * suspended/expired/withdrawn (fail-closed on authority error) OR because the session's entitlements no
+     * longer allow its current selection (role revocation: entitlements are refreshed from each verified
+     * token, so a revoked role surfaces here). Returns the count revoked.
+     */
     int recheckOnce(long nowMs) {
         int revoked = 0;
         for (AppSession app : engine.activeAppSessions()) {
@@ -55,13 +61,15 @@ public class ApprovalReaper {
             } catch (RuntimeException e) {
                 decision = ApprovalAuthority.ApprovalDecision.DENY; // fail-closed
             }
-            if (decision == null || !decision.grantsAccess(nowMs)) {
+            boolean approved = decision != null && decision.grantsAccess(nowMs);
+            boolean entitled = EntitlementPolicy.canSelect(app.selection().source(), app.entitlements());
+            if (!approved || !entitled) {
                 gatewayService.logout(app.id()); // cancel replay + close every socket of this session
                 revoked++;
             }
         }
         if (revoked > 0) {
-            LOG.info("Revoked {} session(s) no longer approved", revoked);
+            LOG.info("Revoked {} session(s) — approval withdrawn or entitlement no longer permits the selection", revoked);
         }
         return revoked;
     }

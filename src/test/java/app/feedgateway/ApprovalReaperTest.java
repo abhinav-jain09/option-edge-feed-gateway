@@ -82,6 +82,24 @@ class ApprovalReaperTest {
     }
 
     @Test
+    void revokedRoleTearsDownASessionWhoseSelectionIsNoLongerEntitled() throws Exception {
+        SessionRoutingEngine engine =
+                new SessionRoutingEngine(new ConcurrencyLimits(5, 5, 100), new SubscriptionManager());
+        engine.registerAppSession("app:u1", "u1",
+                new Selection(MarketDataSource.IBKR, "SPX", "20260617", StrikeWindow.ALL), Set.of("user", "ibkr-user"));
+        engine.attachSocket("app:u1", "s1");
+        WebSocketSession ws = socket();
+        FeedGatewayService gateway = gateway(engine, ws);
+        // Approval is fine, but the ibkr-user role was revoked — the IBKR selection is no longer entitled.
+        engine.refreshEntitlements("app:u1", Set.of("user"));
+        ApprovalReaper reaper = reaper(engine, gateway, query -> ApprovalAuthority.ApprovalDecision.approved(0L));
+
+        assertEquals(1, reaper.recheckOnce(System.currentTimeMillis()));
+        assertTrue(engine.appSession("app:u1").isEmpty(), "a session whose role was revoked is torn down");
+        verify(ws).close();
+    }
+
+    @Test
     void authorityErrorFailsClosedAndRevokes() throws Exception {
         SessionRoutingEngine engine = engineWithSession();
         WebSocketSession ws = socket();

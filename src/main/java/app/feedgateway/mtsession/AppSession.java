@@ -15,7 +15,9 @@ public final class AppSession {
 
     private final String id;
     private final String userId;
-    private final Set<String> entitlements;
+    // Refreshed atomically from every verified token (role revocation must not persist for the session's
+    // life). Mutated only under the engine write lock; volatile so the read in route() always sees the latest.
+    private volatile Set<String> entitlements;
     private final Set<String> socketIds = new LinkedHashSet<>();
     private final UserSessionPolicy policy;
     private final long createdAtMillis;
@@ -109,6 +111,11 @@ public final class AppSession {
 
     void setSelection(Selection selection) {
         this.selection = selection;
+    }
+
+    /** Replace entitlements with the roles from a freshly-verified token (FR-12 role revocation). */
+    void setEntitlements(Set<String> entitlements) {
+        this.entitlements = entitlements == null ? Set.of() : Set.copyOf(entitlements);
     }
 
     void bumpEpoch() {

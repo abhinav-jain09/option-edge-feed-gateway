@@ -72,7 +72,10 @@ public final class WsTicketService {
 
         String appSessionId = "app:" + userId;
         if (engine.appSession(appSessionId).isPresent()) {
-            engine.changeSelection(appSessionId, selection); // also re-validates entitlement
+            // P0 (role revocation): refresh entitlements from THIS verified token before re-validating, so a
+            // revoked role (e.g. ibkr-user) cannot persist for the life of the session.
+            engine.refreshEntitlements(appSessionId, principal.roles());
+            engine.changeSelection(appSessionId, selection); // re-validates the selection vs the fresh roles
         } else {
             engine.registerAppSession(appSessionId, userId, selection, principal.roles(),
                     ApprovalState.APPROVED, UserSessionPolicy.systemDefault());

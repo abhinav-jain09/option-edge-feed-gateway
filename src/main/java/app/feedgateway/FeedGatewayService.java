@@ -397,6 +397,40 @@ public class FeedGatewayService implements ReplayRunner {
         return sockets.size();
     }
 
+    /**
+     * Close a set of sockets the engine has ALREADY detached from routing (used by the expiry / revocation
+     * sweeps). Idempotent per socket; safe if a socket was concurrently closed.
+     */
+    public void closeSockets(java.util.Collection<String> socketIds) {
+        if (socketIds == null) {
+            return;
+        }
+        for (String socketId : socketIds) {
+            OutboundChannel channel = outbound.remove(socketId);
+            WebSocketSession stored = clientsById.remove(socketId);
+            if (stored != null) {
+                clients.remove(stored);
+            }
+            if (channel != null) {
+                channel.shutdown();
+            }
+            closeQuietly(stored != null ? stored : (channel != null ? channel.session() : null));
+        }
+    }
+
+    /**
+     * P0 (FR-18, evidenced scheduler): tear down every idle- or max-session-expired AppSession atomically
+     * and force-close its sockets. Returns the number of sessions expired. Driven by {@code SessionExpiryReaper}.
+     */
+    public int sweepExpiredSessions() {
+        if (routingEngine == null) {
+            return 0;
+        }
+        SessionRoutingEngine.SweepResult result = routingEngine.sweepExpired();
+        closeSockets(result.closedSocketIds());
+        return result.expiredAppSessionIds().size();
+    }
+
     /** Detach a client the channel just disconnected for being too slow (the socket is already closed). */
     private void onSlowDisconnect(OutboundChannel channel) {
         outbound.remove(channel.socketId(), channel);
