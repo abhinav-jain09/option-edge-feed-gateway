@@ -26,17 +26,23 @@ public class WebSocketConfig implements WebSocketConfigurer {
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
         registry.addHandler(handler, "/ws/events")
                 .addInterceptors(jwtInterceptor)
-                .setAllowedOrigins(allowedOrigins());
+                .setAllowedOrigins(resolveAllowedOrigins(settings.wsAuthEnabled(), settings.wsAllowedOrigins()));
     }
 
     /**
      * Locked-down origins from WS_ALLOWED_ORIGINS. A wildcard is only sane while auth is disabled (dev);
-     * once WS_AUTH_ENABLED is on, an explicit allow-list must be configured or the handshake is wide open.
+     * once WS_AUTH_ENABLED is on, a wildcard would let any site open an authenticated socket, so we fail
+     * closed at startup and demand an explicit allow-list (mirrors the web app's issuer invariant).
      */
-    private String[] allowedOrigins() {
-        return Arrays.stream(settings.wsAllowedOrigins().split(","))
+    static String[] resolveAllowedOrigins(boolean authEnabled, String csv) {
+        String[] origins = Arrays.stream(csv.split(","))
                 .map(String::trim)
                 .filter(origin -> !origin.isEmpty())
                 .toArray(String[]::new);
+        if (authEnabled && Arrays.stream(origins).anyMatch(o -> o.equals("*"))) {
+            throw new IllegalStateException(
+                    "WS_ALLOWED_ORIGINS must be an explicit allow-list (not '*') when WS_AUTH_ENABLED=true");
+        }
+        return origins;
     }
 }
