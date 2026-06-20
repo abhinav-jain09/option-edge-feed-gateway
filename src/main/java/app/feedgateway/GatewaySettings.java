@@ -340,6 +340,16 @@ public final class GatewaySettings {
         return longValue("GATEWAY_REPLAY_ORCHESTRATOR_TIMEOUT_MS", 3_000L, 200L);
     }
 
+    /**
+     * Max wall-clock a replay read may go WITHOUT progress (a polled record or a partition reaching its
+     * captured target offset) before the run is declared INCOMPLETE rather than complete. Empty polls are
+     * ordinary (fetch latency, broker load, jitter), so they are retried until this deadline; only then is
+     * the run failed. Reset on every unit of progress, so a long but live read is never timed out.
+     */
+    public long replayIdleTimeoutMs() {
+        return longValue("GATEWAY_REPLAY_IDLE_TIMEOUT_MS", 30_000L, 100L);
+    }
+
     public static String value(String key, String fallback) {
         String env = System.getenv(key);
         if (env != null && !env.isBlank()) {

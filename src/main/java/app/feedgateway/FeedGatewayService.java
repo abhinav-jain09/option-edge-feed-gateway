@@ -1942,6 +1942,8 @@ public class FeedGatewayService implements ReplayRunner {
         MarketDataSource source = routingEngine.appSession(appSessionId)
                 .map(app -> app.selection().source()).orElse(null);
         long delivered = 0L;
+        ReplayOutcome outcome = ReplayOutcome.COMPLETE;
+        String error = null;
         if (source != null) {
             Map<String, String> avroTopics = new LinkedHashMap<>();
             Map<String, String> stringTopics = new LinkedHashMap<>();
@@ -1967,14 +1969,33 @@ public class FeedGatewayService implements ReplayRunner {
                 // P0 (replay chronology): a SINGLE deterministic k-way merge across ALL topics (avro +
                 // string) by canonical event time — never topic-by-topic, which would surface "all
                 // snapshots then all strike-flow" and let the record cap drain entirely in one phase.
-                delivered += replayMerged(appSessionId, params, source, avroTopics, stringTopics, flag);
+                ReplayResult result = replayMerged(appSessionId, params, source, avroTopics, stringTopics, flag);
+                delivered = result.delivered();
+                outcome = result.outcome();
             } catch (RuntimeException e) {
-                sendToAppSession(appSessionId, "replay-status", "{\"mode\":\"REPLAY_COMPLETE\",\"error\":\""
-                        + escapeJson(String.valueOf(e.getMessage())) + "\"}");
+                outcome = ReplayOutcome.INCOMPLETE;
+                error = String.valueOf(e.getMessage());
             }
         }
         replayRunning.remove(appSessionId, flag);
-        sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_COMPLETE", params, delivered));
+        // P0 (empty poll ≠ end of replay): only report success when the read genuinely reached every
+        // captured target offset. A deadline timeout or read error is surfaced as REPLAY_INCOMPLETE so a
+        // partial run is never shown as complete.
+        if (outcome == ReplayOutcome.INCOMPLETE) {
+            sendToAppSession(appSessionId, "replay-status", replayIncompleteJson(params, delivered,
+                    error != null ? error : "replay timed out before all captured data was read"));
+        } else {
+            sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_COMPLETE", params, delivered));
+        }
+    }
+
+    /** Status for a replay that did NOT reach every captured target offset (timeout or read error). */
+    private String replayIncompleteJson(ReplayParams params, long delivered, String reason) {
+        return "{\"mode\":\"REPLAY_INCOMPLETE\",\"complete\":false,\"symbol\":\"" + escapeJson(params.symbol())
+                + "\",\"expiry\":\"" + escapeJson(params.expiry())
+                + "\",\"startUtcMs\":" + params.startUtcMs() + ",\"endUtcMs\":" + params.endUtcMs()
+                + ",\"records\":" + delivered + ",\"maxRecords\":" + params.maxRecords()
+                + ",\"error\":\"" + escapeJson(reason) + "\"}";
     }
 
     /**
@@ -1985,11 +2006,18 @@ public class FeedGatewayService implements ReplayRunner {
      * being exhausted by whichever topic is read first. Each outbound event keeps its source timestamp,
      * topic, partition and offset.
      */
-    private long replayMerged(String appSessionId, ReplayParams params, MarketDataSource source,
-                              Map<String, String> avroTopics, Map<String, String> stringTopics,
-                              AtomicBoolean flag) {
+    /** Outcome of a replay read: COMPLETE means every active partition reached its captured target offset
+     *  (or the cap/stop was hit); INCOMPLETE means a poll deadline expired short of target — a failure. */
+    enum ReplayOutcome { COMPLETE, INCOMPLETE }
+
+    record ReplayResult(long delivered, ReplayOutcome outcome) {
+    }
+
+    private ReplayResult replayMerged(String appSessionId, ReplayParams params, MarketDataSource source,
+                                      Map<String, String> avroTopics, Map<String, String> stringTopics,
+                                      AtomicBoolean flag) {
         if (avroTopics.isEmpty() && stringTopics.isEmpty()) {
-            return 0L;
+            return new ReplayResult(0L, ReplayOutcome.COMPLETE);
         }
         KafkaConsumer<String, Object> avro = null;
         KafkaConsumer<String, Object> str = null;
@@ -2004,7 +2032,7 @@ public class FeedGatewayService implements ReplayRunner {
                 openReplayPartitions(str, params, stringTopics, false, parts);
             }
             if (parts.isEmpty()) {
-                return 0L;
+                return new ReplayResult(0L, ReplayOutcome.COMPLETE);
             }
             return mergeReplayPartitions(appSessionId, params, source, avro, str, parts, flag);
         } finally {
@@ -2018,7 +2046,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** Per-partition cursor for the replay merge: a buffer of in-order records plus its window end. */
-    private static final class ReplayPartitionState {
+    static final class ReplayPartitionState {
         final boolean avro;
         final String event;
         final long endTarget;                          // exclusive: read offsets < endTarget
@@ -2096,49 +2124,56 @@ public class FeedGatewayService implements ReplayRunner {
      * The chronological merge core. Holds a small per-partition buffer for both consumers and always emits
      * the globally-earliest available record ({@link ReplayChronology#ORDER}). A not-yet-drained partition
      * with an empty buffer BLOCKS emission until it is polled, so no later-but-first-read record can jump
-     * ahead of an earlier one on another topic/partition. The cap bounds DELIVERED (matched) records, taken
-     * from the front of the merged timeline.
+     * ahead of an earlier one on another topic/partition. The cap bounds DELIVERED (matched) records.
+     *
+     * <p>P0 (empty poll ≠ end of replay): completion is decided ONLY by every active partition's consumer
+     * position reaching its captured target offset. An empty poll proves nothing (fetch latency, broker
+     * load, jitter), so empty polls are retried until a bounded no-progress deadline; if that deadline
+     * expires while any partition is still short of target the run is reported INCOMPLETE (a failure), never
+     * a silent REPLAY_COMPLETE. Progress (a buffered record or a partition reaching target) resets the
+     * deadline, so an ongoing-but-slow read is never timed out.
      */
-    private long mergeReplayPartitions(String appSessionId, ReplayParams params, MarketDataSource source,
+    ReplayResult mergeReplayPartitions(String appSessionId, ReplayParams params, MarketDataSource source,
                                        KafkaConsumer<String, Object> avro, KafkaConsumer<String, Object> str,
                                        Map<TopicPartition, ReplayPartitionState> parts, AtomicBoolean flag) {
         long delivered = 0L;
         int maxRecords = params.maxRecords();
-        int idlePolls = 0;
-        final int maxIdlePolls = 50;
+        long idleTimeoutMs = settings.replayIdleTimeoutMs();
+        long lastProgressMs = System.currentTimeMillis();
         while (flag.get() && running.get() && delivered < maxRecords) {
             if (hasUnbufferedActivePartition(parts)) {
-                boolean got = pollIntoBuffers(avro, parts) | pollIntoBuffers(str, parts);
+                // Only blocking partitions (empty buffer, not yet at target) need fetching — pause the rest
+                // so buffers stay bounded and an empty poll reflects ONLY the partitions we are waiting on.
+                int satisfiedBefore = countSatisfied(parts);
+                tunePauses(avro, true, parts);
+                tunePauses(str, false, parts);
+                pollIntoBuffers(avro, parts);
+                pollIntoBuffers(str, parts);
                 refreshDrained(avro, true, parts);
                 refreshDrained(str, false, parts);
                 if (hasUnbufferedActivePartition(parts)) {
-                    if (got) {
-                        idlePolls = 0;
-                        continue; // poll again until every active partition has a head buffered
-                    }
-                    if (++idlePolls <= maxIdlePolls) {
+                    if (countSatisfied(parts) > satisfiedBefore) {
+                        lastProgressMs = System.currentTimeMillis(); // a blocking partition advanced
                         continue;
                     }
-                    // No data is forthcoming for the still-empty partitions; treat them as exhausted so the
-                    // merge can drain the buffered remainder deterministically.
-                    for (ReplayPartitionState st : parts.values()) {
-                        if (st.buffer.isEmpty()) {
-                            st.drained = true;
-                        }
+                    if (System.currentTimeMillis() - lastProgressMs > idleTimeoutMs) {
+                        // A partition has not reached its captured target offset within the deadline.
+                        return new ReplayResult(delivered, ReplayOutcome.INCOMPLETE);
                     }
-                } else {
-                    idlePolls = 0;
+                    continue; // ordinary empty poll — keep retrying until target or deadline
                 }
+                lastProgressMs = System.currentTimeMillis();
             }
             MergeRecord next = pollGlobalMinimum(parts);
             if (next == null) {
-                break; // every partition drained and emptied
+                break; // every active partition reached target AND its buffer is drained → genuine completion
             }
             if (emitReplayRecord(appSessionId, params, source, next)) {
                 delivered++;
             }
+            lastProgressMs = System.currentTimeMillis();
         }
-        return delivered;
+        return new ReplayResult(delivered, ReplayOutcome.COMPLETE);
     }
 
     private static boolean hasUnbufferedActivePartition(Map<TopicPartition, ReplayPartitionState> parts) {
@@ -2148,6 +2183,44 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
         return false;
+    }
+
+    /** A partition is "satisfied" for the merge when it has reached target (drained) or has a buffered head. */
+    private static int countSatisfied(Map<TopicPartition, ReplayPartitionState> parts) {
+        int n = 0;
+        for (ReplayPartitionState st : parts.values()) {
+            if (st.drained || !st.buffer.isEmpty()) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /** Fetch only from partitions we are still waiting on; pause those already satisfied (bounds buffers). */
+    private void tunePauses(KafkaConsumer<String, Object> consumer, boolean avro,
+                            Map<TopicPartition, ReplayPartitionState> parts) {
+        if (consumer == null) {
+            return;
+        }
+        List<TopicPartition> pause = new ArrayList<>();
+        List<TopicPartition> resume = new ArrayList<>();
+        for (Map.Entry<TopicPartition, ReplayPartitionState> e : parts.entrySet()) {
+            ReplayPartitionState st = e.getValue();
+            if (st.avro != avro) {
+                continue;
+            }
+            if (!st.drained && st.buffer.isEmpty()) {
+                resume.add(e.getKey());
+            } else {
+                pause.add(e.getKey());
+            }
+        }
+        if (!pause.isEmpty()) {
+            consumer.pause(pause);
+        }
+        if (!resume.isEmpty()) {
+            consumer.resume(resume);
+        }
     }
 
     /** Poll one consumer and append every in-window record to its partition buffer. */
