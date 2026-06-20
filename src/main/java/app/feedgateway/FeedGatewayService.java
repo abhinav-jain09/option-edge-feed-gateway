@@ -2034,14 +2034,21 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                         advanced = true;
                         String event = topicEvents.get(tp.topic());
-                        String json = enrichJson(avro ? avroJson(rec.value()) : stringJson(rec.value()),
-                                new TopicBinding(source.name(), event));
-                        if (json == null || json.isBlank()) {
-                            continue;
-                        }
-                        if (replayMatches(params, event, json)) {
-                            sendToAppSession(appSessionId, event, json);
-                            delivered++;
+                        // A single malformed/poison record must NOT abort the whole windowed replay
+                        // (review finding #12). Convert+match+send is guarded per-record: on failure we
+                        // skip that one record and keep streaming the remaining good ones.
+                        try {
+                            String json = enrichJson(avro ? avroJson(rec.value()) : stringJson(rec.value()),
+                                    new TopicBinding(source.name(), event));
+                            if (json == null || json.isBlank()) {
+                                continue;
+                            }
+                            if (replayMatches(params, event, json)) {
+                                sendToAppSession(appSessionId, event, json);
+                                delivered++;
+                            }
+                        } catch (RuntimeException poison) {
+                            // skip the poison record; the replay continues with the next record
                         }
                     }
                     if (consumer.position(tp) >= endTarget.get(tp)) {
