@@ -445,6 +445,11 @@ public final class SessionRoutingEngine {
         return callRead(appSessions::size);
     }
 
+    /** Snapshot of the currently-active AppSessions (for periodic approval re-checks, FR-15). */
+    public List<AppSession> activeAppSessions() {
+        return callRead(() -> new ArrayList<>(appSessions.values()));
+    }
+
     public int appSessionCountForUser(String userId) {
         return callRead(() -> {
             Set<String> apps = userToApps.get(userId);

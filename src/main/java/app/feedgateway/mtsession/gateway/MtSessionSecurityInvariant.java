@@ -68,6 +68,15 @@ public class MtSessionSecurityInvariant implements InitializingBean {
             errors.add("GATEWAY_REPLAY_ORCHESTRATOR_URL must be set when DATABENTO_REPLAY_UI_ENABLED=true"
                     + " (runId ownership is authorized against the orchestrator before any topic is read)");
         }
+        // Approval must be enforced against an authoritative record — a valid token is not approval (the realm
+        // allows public self-registration). Require an approval SOURCE so the gateway can never silently
+        // approve everyone; with neither configured the authority denies all, which is a misconfiguration.
+        boolean hasApprovalUrl = settings.approvalUrl() != null && !settings.approvalUrl().isBlank();
+        boolean hasApprovalRole = settings.approvalRole() != null && !settings.approvalRole().isBlank();
+        if (!hasApprovalUrl && !hasApprovalRole) {
+            errors.add("an approval source is required: set GATEWAY_APPROVAL_URL (authoritative platform)"
+                    + " or GATEWAY_APPROVAL_ROLE (admin-granted role opt-in) — a valid token is not approval");
+        }
 
         if (!errors.isEmpty()) {
             throw new IllegalStateException(

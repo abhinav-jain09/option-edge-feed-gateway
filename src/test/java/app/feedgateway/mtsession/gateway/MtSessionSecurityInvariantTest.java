@@ -26,6 +26,7 @@ class MtSessionSecurityInvariantTest {
         m.put("WS_ALLOWED_ORIGINS", "https://optionsedge.prod");
         m.put("GATEWAY_REDIS_URI", "rediss://redis.prod:6379");
         m.put("GATEWAY_KAFKA_SECURITY_PROTOCOL", "SASL_SSL");
+        m.put("GATEWAY_APPROVAL_URL", "https://config-control.prod");
         return m;
     }
 
@@ -92,6 +93,25 @@ class MtSessionSecurityInvariantTest {
         m.put("WS_ALLOWED_ORIGINS", "http://localhost:8090");
         m.put("GATEWAY_ALLOW_INMEMORY_TICKETS", "true");
         m.put("GATEWAY_ALLOW_INSECURE_KAFKA", "true");
+        m.put("GATEWAY_APPROVAL_ROLE", "oe-approved"); // approval source still mandatory in dev
+        withProps(m, () -> assertDoesNotThrow(MtSessionSecurityInvariantTest::check));
+    }
+
+    @Test
+    void missingApprovalSourceFailsStartup() {
+        // A valid token is not approval. With neither an approval URL nor the role opt-in, refuse to start
+        // (otherwise the gateway would silently approve every authenticated, self-registered user).
+        Map<String, String> m = prodProps();
+        m.remove("GATEWAY_APPROVAL_URL");
+        withProps(m, () -> assertTrue(msg(assertThrows(IllegalStateException.class,
+                MtSessionSecurityInvariantTest::check)).contains("approval source")));
+    }
+
+    @Test
+    void approvalRoleOptInSatisfiesTheApprovalRequirement() {
+        Map<String, String> m = prodProps();
+        m.remove("GATEWAY_APPROVAL_URL");
+        m.put("GATEWAY_APPROVAL_ROLE", "oe-approved");
         withProps(m, () -> assertDoesNotThrow(MtSessionSecurityInvariantTest::check));
     }
 

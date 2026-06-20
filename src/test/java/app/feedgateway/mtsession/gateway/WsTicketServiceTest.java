@@ -7,8 +7,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import app.feedgateway.mtsession.ConcurrencyLimits;
 import app.feedgateway.mtsession.InMemoryTicketStore;
 import app.feedgateway.mtsession.MarketDataSource;
+import app.feedgateway.mtsession.NotApprovedException;
 import app.feedgateway.mtsession.NotEntitledException;
 import app.feedgateway.mtsession.Selection;
+import app.feedgateway.mtsession.approval.ApprovalAuthority;
 import app.feedgateway.mtsession.SessionRoutingEngine;
 import app.feedgateway.mtsession.StrikeWindow;
 import app.feedgateway.mtsession.SubscriptionManager;
@@ -37,12 +39,20 @@ class WsTicketServiceTest {
         }
     }
 
+    private static final ApprovalAuthority APPROVE_ALL =
+            query -> ApprovalAuthority.ApprovalDecision.approved(0L);
+
     private WsTicketService service(TokenVerifier verifier) {
+        return service(verifier, APPROVE_ALL);
+    }
+
+    private WsTicketService service(TokenVerifier verifier, ApprovalAuthority approvalAuthority) {
         SessionRoutingEngine engine = new SessionRoutingEngine(
                 new ConcurrencyLimits(1, 4, 100), new SubscriptionManager());
         AtomicInteger seq = new AtomicInteger();
         InMemoryTicketStore store = new InMemoryTicketStore(Clock.systemUTC(), () -> "tk-" + seq.incrementAndGet());
-        return new WsTicketService(verifier, store, engine, Duration.ofSeconds(10));
+        return new WsTicketService(verifier, store, engine, approvalAuthority,
+                "https://kc.test/realms/optionsedge", Duration.ofSeconds(10));
     }
 
     private static Selection dbnto(String symbol, String expiry) {
@@ -75,6 +85,26 @@ class WsTicketServiceTest {
     void invalidTokenRejected() {
         WsTicketService svc = service(new FakeVerifier(Map.of()));
         assertThrows(JwtVerificationException.class, () -> svc.issue("nope", dbnto("SPX", "20260612")));
+    }
+
+    @Test
+    void unapprovedUserIsRejectedEvenWithAValidToken() {
+        // P0: a valid token is NOT approval. With the authority denying (default-deny), no ticket is issued
+        // and no AppSession is created — the self-registered user gets no Databento data.
+        VerifiedPrincipal validUser = new VerifiedPrincipal("u9", "selfsignup", Set.of("user"), "c");
+        WsTicketService svc = service(new FakeVerifier(Map.of("good", validUser)), new ApprovalAuthority.DenyAll());
+        assertThrows(NotApprovedException.class, () -> svc.issue("good", dbnto("SPX", "20260612")));
+        org.junit.jupiter.api.Assertions.assertNull(svc.appSessionForUser("u9"), "no session for an unapproved user");
+    }
+
+    @Test
+    void expiredApprovalIsRejected() {
+        VerifiedPrincipal validUser = new VerifiedPrincipal("u8", "lapsed", Set.of("user"), "c");
+        // Authority returns APPROVED but with an expiry in the past → grantsAccess(now) is false → denied.
+        ApprovalAuthority expired = query -> new ApprovalAuthority.ApprovalDecision(
+                app.feedgateway.mtsession.ApprovalState.APPROVED, 1L);
+        WsTicketService svc = service(new FakeVerifier(Map.of("good", validUser)), expired);
+        assertThrows(NotApprovedException.class, () -> svc.issue("good", dbnto("SPX", "20260612")));
     }
 
     @Test

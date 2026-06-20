@@ -7,6 +7,9 @@ import app.feedgateway.mtsession.RedisTicketStore;
 import app.feedgateway.mtsession.SessionRoutingEngine;
 import app.feedgateway.mtsession.SubscriptionManager;
 import app.feedgateway.mtsession.TicketStore;
+import app.feedgateway.mtsession.approval.ApprovalAuthority;
+import app.feedgateway.mtsession.approval.HttpApprovalAuthority;
+import app.feedgateway.mtsession.approval.RoleClaimApprovalAuthority;
 import app.feedgateway.mtsession.auth.JwtVerificationException;
 import app.feedgateway.mtsession.auth.KeycloakJwtVerifier;
 import app.feedgateway.mtsession.auth.TokenVerifier;
@@ -89,9 +92,30 @@ public class MtSessionAuthConfig {
 
     @Bean
     public WsTicketService wsTicketService(TokenVerifier tokenVerifier, TicketStore ticketStore,
-                                           SessionRoutingEngine engine, GatewaySettings settings) {
-        return new WsTicketService(tokenVerifier, ticketStore, engine,
-                Duration.ofSeconds(settings.wsTicketTtlSeconds()));
+                                           SessionRoutingEngine engine, ApprovalAuthority approvalAuthority,
+                                           GatewaySettings settings) {
+        return new WsTicketService(tokenVerifier, ticketStore, engine, approvalAuthority,
+                settings.keycloakIssuer(), Duration.ofSeconds(settings.wsTicketTtlSeconds()));
+    }
+
+    /**
+     * The authoritative approval gate (P0 — approval enforcement). Prefer the Config-Control platform
+     * (GATEWAY_APPROVAL_URL); else fall back to an admin-granted realm role (GATEWAY_APPROVAL_ROLE, explicit
+     * opt-in); else DENY EVERYONE (fail closed). {@link MtSessionSecurityInvariant} refuses startup if
+     * neither is configured, so an auth-enabled gateway can never silently approve every user.
+     */
+    @Bean
+    public ApprovalAuthority approvalAuthority(GatewaySettings settings) {
+        String url = settings.approvalUrl();
+        if (url != null && !url.isBlank()) {
+            return new HttpApprovalAuthority(url, settings.approvalApiKey(),
+                    Duration.ofMillis(settings.approvalTimeoutMs()));
+        }
+        String role = settings.approvalRole();
+        if (role != null && !role.isBlank()) {
+            return new RoleClaimApprovalAuthority(role);
+        }
+        return new ApprovalAuthority.DenyAll();
     }
 
     @Bean

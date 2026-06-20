@@ -384,6 +384,33 @@ public final class GatewaySettings {
         return longValue("GATEWAY_REPLAY_SHUTDOWN_AWAIT_MS", 2_000L, 100L);
     }
 
+    // P0 (approval enforcement): an authoritative approval record is consulted before any data access and is
+    // re-checked during sessions. Default-deny: with NEITHER an approval URL nor the role opt-in configured,
+    // the authority denies everyone and MtSessionSecurityInvariant refuses to start (no silent allow).
+
+    /** Config-Control approval platform base URL; the source of truth for live approval/suspension. */
+    public String approvalUrl() {
+        return value("GATEWAY_APPROVAL_URL", "");
+    }
+
+    /** Optional shared-secret header sent to the approval platform. */
+    public String approvalApiKey() {
+        return value("GATEWAY_APPROVAL_API_KEY", "");
+    }
+
+    /** Timeout for an approval lookup; on timeout the decision is DENY (fail closed). */
+    public long approvalTimeoutMs() {
+        return longValue("GATEWAY_APPROVAL_TIMEOUT_MS", 3_000L, 200L);
+    }
+
+    /**
+     * Dev/simple opt-in: treat this admin-granted realm role as the approval record (must NOT be a Keycloak
+     * default role). Blank disables the role fallback. Ignored when GATEWAY_APPROVAL_URL is set.
+     */
+    public String approvalRole() {
+        return value("GATEWAY_APPROVAL_ROLE", "");
+    }
+
     public static String value(String key, String fallback) {
         String env = System.getenv(key);
         if (env != null && !env.isBlank()) {
