@@ -1,5 +1,6 @@
 package app.feedgateway;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.server.ServerHttpRequest;
@@ -37,6 +38,9 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
     private final GatewaySettings settings;
     private volatile JwtDecoder decoder; // lazily built from settings; injectable for tests
 
+    // @Autowired disambiguates this from the test-only two-arg constructor: with two constructors and no
+    // marker, Spring looks for a no-arg default (which doesn't exist) and the whole context fails to start.
+    @Autowired
     public WsJwtHandshakeInterceptor(GatewaySettings settings) {
         this.settings = settings;
     }
