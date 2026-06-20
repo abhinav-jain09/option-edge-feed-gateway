@@ -350,6 +350,16 @@ public final class GatewaySettings {
         return longValue("GATEWAY_REPLAY_IDLE_TIMEOUT_MS", 30_000L, 100L);
     }
 
+    /** Max concurrent per-session replay readers; the next start is rejected rather than unbounded-threaded. */
+    public int replayMaxConcurrent() {
+        return intValue("GATEWAY_REPLAY_MAX_CONCURRENT", 16, 1);
+    }
+
+    /** How long a start/stop/return-to-live call awaits the prior reader's termination before proceeding. */
+    public long replayShutdownAwaitMs() {
+        return longValue("GATEWAY_REPLAY_SHUTDOWN_AWAIT_MS", 2_000L, 100L);
+    }
+
     public static String value(String key, String fallback) {
         String env = System.getenv(key);
         if (env != null && !env.isBlank()) {

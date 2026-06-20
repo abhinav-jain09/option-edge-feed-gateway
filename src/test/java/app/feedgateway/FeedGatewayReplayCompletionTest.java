@@ -64,6 +64,10 @@ class FeedGatewayReplayCompletionTest {
         return consumer;
     }
 
+    private static FeedGatewayService.ReplayHandle ownerHandle(FeedGatewayService svc, String appSessionId) {
+        return svc.registerOwnerHandleForTest(appSessionId);
+    }
+
     @AfterEach
     void clearTimeout() {
         System.clearProperty("GATEWAY_REPLAY_IDLE_TIMEOUT_MS");
@@ -81,9 +85,9 @@ class FeedGatewayReplayCompletionTest {
 
         FeedGatewayService.ReplayResult result = svc.mergeReplayPartitions(
                 "app:u1", params(), MarketDataSource.DATABENTO,
-                null, emptyPollingConsumer(tp, 0L), parts, new AtomicBoolean(true));
+                null, emptyPollingConsumer(tp, 0L), parts, ownerHandle(svc, "app:u1"));
 
-        assertEquals(FeedGatewayService.ReplayOutcome.INCOMPLETE, result.outcome());
+        assertEquals(FeedGatewayService.ReplayOutcome.TIMED_OUT, result.outcome());
         assertEquals(0L, result.delivered());
     }
 
@@ -99,9 +103,9 @@ class FeedGatewayReplayCompletionTest {
 
         FeedGatewayService.ReplayResult result = svc.mergeReplayPartitions(
                 "app:u1", params(), MarketDataSource.DATABENTO,
-                null, emptyPollingConsumer(tp, 5L), parts, new AtomicBoolean(true));
+                null, emptyPollingConsumer(tp, 5L), parts, ownerHandle(svc, "app:u1"));
 
-        assertEquals(FeedGatewayService.ReplayOutcome.COMPLETE, result.outcome());
+        assertEquals(FeedGatewayService.ReplayOutcome.COMPLETED, result.outcome());
         assertEquals(0L, result.delivered());
     }
 }

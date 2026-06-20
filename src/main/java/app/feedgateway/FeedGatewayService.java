@@ -55,12 +55,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -240,6 +247,20 @@ public class FeedGatewayService implements ReplayRunner {
             currentBatchExecutor.shutdownNow();
             try {
                 currentBatchExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        // Wake and stop any in-flight replay readers so shutdown is not held up by a blocking poll.
+        for (ReplayHandle handle : replayHandles.values()) {
+            handle.active.set(false);
+            handle.wakeConsumers();
+        }
+        ExecutorService currentReplayExecutor = replayExecutor;
+        if (currentReplayExecutor != null) {
+            currentReplayExecutor.shutdownNow();
+            try {
+                currentReplayExecutor.awaitTermination(5, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -1895,7 +1916,110 @@ public class FeedGatewayService implements ReplayRunner {
     // users keep receiving live data uninterrupted (req. 7).
     // =====================================================================
 
-    private final Map<String, AtomicBoolean> replayRunning = new ConcurrentHashMap<>();
+    // P0 (cancellation/generation barrier). Each control action (start/stop/return-to-live) is serialized
+    // per service and assigns a monotonic GENERATION that "owns" the session's replay output. A reader may
+    // emit data or a terminal status ONLY while its generation is still the owner; the instant a newer
+    // generation is installed (or the run is canceled) the old reader goes silent — so a stale poll batch,
+    // or a late terminal status, can never reach the UI after the user moved on.
+    private final Object replayControlLock = new Object();
+    private final Map<String, ReplayHandle> replayHandles = new ConcurrentHashMap<>();
+    private final Map<String, Long> replayOwnerGeneration = new ConcurrentHashMap<>();
+    private final AtomicLong replayGenerationSeq = new AtomicLong();
+    private volatile ExecutorService replayExecutor;
+
+    /** Handle to one running reader: its generation, cooperative cancel flag, Future, and live consumers. */
+    static final class ReplayHandle {
+        final long generation;
+        final AtomicBoolean active = new AtomicBoolean(true);
+        volatile Future<?> future;
+        volatile KafkaConsumer<?, ?> avroConsumer;
+        volatile KafkaConsumer<?, ?> stringConsumer;
+
+        ReplayHandle(long generation) {
+            this.generation = generation;
+        }
+
+        /** Break a blocking poll/offsetsForTimes immediately (WakeupException), without interrupting I/O. */
+        void wakeConsumers() {
+            KafkaConsumer<?, ?> a = avroConsumer;
+            KafkaConsumer<?, ?> s = stringConsumer;
+            if (a != null) {
+                a.wakeup();
+            }
+            if (s != null) {
+                s.wakeup();
+            }
+        }
+    }
+
+    private ExecutorService replayExecutor() {
+        ExecutorService e = replayExecutor;
+        if (e == null) {
+            synchronized (replayControlLock) {
+                e = replayExecutor;
+                if (e == null) {
+                    // Bounded: at most replayMaxConcurrent readers; further starts are REJECTED (never an
+                    // unbounded fan-out of daemon threads).
+                    e = new ThreadPoolExecutor(0, settings.replayMaxConcurrent(), 60L, TimeUnit.SECONDS,
+                            new SynchronousQueue<>(),
+                            r -> {
+                                Thread t = new Thread(r, "options-edge-replay");
+                                t.setDaemon(true);
+                                return t;
+                            },
+                            new ThreadPoolExecutor.AbortPolicy());
+                    replayExecutor = e;
+                }
+            }
+        }
+        return e;
+    }
+
+    /** Visible for tests: a handle pre-registered as the current owner of the session's replay output. */
+    ReplayHandle registerOwnerHandleForTest(String appSessionId) {
+        long gen = replayGenerationSeq.incrementAndGet();
+        replayOwnerGeneration.put(appSessionId, gen);
+        return new ReplayHandle(gen);
+    }
+
+    /** True while {@code generation} is still the owner entitled to emit for {@code appSessionId}. */
+    private boolean isReplayOwner(String appSessionId, long generation) {
+        Long owner = replayOwnerGeneration.get(appSessionId);
+        return owner != null && owner == generation;
+    }
+
+    /**
+     * Cancel any in-flight reader for the session and BARRIER on its termination: install a fresh owner
+     * generation (so the old reader is no longer entitled to emit anything), wake its consumers, interrupt
+     * its Future, and await the thread leaving before returning. After this the caller may safely install
+     * the next state. Must be called holding {@link #replayControlLock}.
+     */
+    private void cancelActiveReplay(String appSessionId) {
+        // Invalidate the current owner FIRST so even a reader mid-emit stops being entitled to send.
+        replayOwnerGeneration.put(appSessionId, replayGenerationSeq.incrementAndGet());
+        ReplayHandle prev = replayHandles.remove(appSessionId);
+        if (prev == null) {
+            return;
+        }
+        prev.active.set(false);
+        prev.wakeConsumers();
+        Future<?> f = prev.future;
+        if (f != null) {
+            f.cancel(true);
+            try {
+                f.get(settings.replayShutdownAwaitMs(), TimeUnit.MILLISECONDS);
+            } catch (TimeoutException te) {
+                // Reader did not exit in time; the generation barrier already prevents any further emits,
+                // so it is harmless — log and move on rather than blocking the control call forever.
+                System.err.println("Feed gateway replay reader for " + appSessionId + " did not stop within "
+                        + settings.replayShutdownAwaitMs() + "ms; proceeding (output already barriered).");
+            } catch (CancellationException | ExecutionException ignored) {
+                // canceled / threw on the way out — fine, it is no longer the owner
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
 
     @Override
     public ReplayRunner.Mode startReplay(ReplayParams params) {
@@ -1903,46 +2027,62 @@ public class FeedGatewayService implements ReplayRunner {
             throw new IllegalStateException("per-session routing is not enabled");
         }
         String appSessionId = params.sessionId();
-        stopReplay(appSessionId); // cancel any prior run for this session
-        routingEngine.setReplayMode(appSessionId, true);
-        // Clear the live rows and flip the UI badge (reqs 9).
-        sendToAppSession(appSessionId, "reset", "{\"reason\":\"replay-start\"}");
-        sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_RUNNING", params, 0L));
-        AtomicBoolean flag = new AtomicBoolean(true);
-        replayRunning.put(appSessionId, flag);
-        Thread thread = new Thread(() -> runReplay(appSessionId, params, flag), "replay-" + appSessionId);
-        thread.setDaemon(true);
-        thread.start();
-        return ReplayRunner.Mode.REPLAY_RUNNING;
+        synchronized (replayControlLock) {
+            cancelActiveReplay(appSessionId); // cancel + wake + await any prior run for this session
+            long generation = replayGenerationSeq.incrementAndGet();
+            ReplayHandle handle = new ReplayHandle(generation);
+            replayOwnerGeneration.put(appSessionId, generation);
+            replayHandles.put(appSessionId, handle);
+            routingEngine.setReplayMode(appSessionId, true);
+            // Clear the live rows and flip the UI badge (reqs 9).
+            sendToAppSession(appSessionId, "reset", "{\"reason\":\"replay-start\"}");
+            sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_RUNNING", params, 0L));
+            try {
+                handle.future = replayExecutor().submit(() -> runReplay(appSessionId, params, handle));
+            } catch (RejectedExecutionException tooMany) {
+                replayHandles.remove(appSessionId, handle);
+                replayOwnerGeneration.put(appSessionId, replayGenerationSeq.incrementAndGet());
+                routingEngine.setReplayMode(appSessionId, false);
+                throw new IllegalStateException("replay capacity reached; please retry shortly");
+            }
+            return ReplayRunner.Mode.REPLAY_RUNNING;
+        }
     }
 
     @Override
     public ReplayRunner.Mode stopReplay(String appSessionId) {
-        AtomicBoolean flag = replayRunning.remove(appSessionId);
-        if (flag != null) {
-            flag.set(false); // signal the reader thread to halt
+        synchronized (replayControlLock) {
+            boolean wasRunning = replayHandles.containsKey(appSessionId);
+            cancelActiveReplay(appSessionId);
+            if (wasRunning) {
+                // Authoritative terminal status from the control thread (the reader is now barriered silent).
+                sendToAppSession(appSessionId, "replay-status",
+                        replayTerminalJson(ReplayOutcome.CANCELED, appSessionId));
+            }
+            return ReplayRunner.Mode.REPLAY_COMPLETE; // stays in replay mode until the user returns to live
         }
-        return ReplayRunner.Mode.REPLAY_COMPLETE; // stays in replay mode until the user returns to live
     }
 
     @Override
     public ReplayRunner.Mode resumeLive(String appSessionId) {
-        stopReplay(appSessionId);
-        if (routingEngine != null) {
-            routingEngine.setReplayMode(appSessionId, false);
+        synchronized (replayControlLock) {
+            cancelActiveReplay(appSessionId);
+            if (routingEngine != null) {
+                routingEngine.setReplayMode(appSessionId, false);
+            }
+            // Clear replay rows and re-seed the latest live cache, then live routing resumes (req. 10).
+            sendToAppSession(appSessionId, "reset", "{\"reason\":\"return-to-live\"}");
+            replayLiveCacheToAppSession(appSessionId);
+            sendToAppSession(appSessionId, "replay-status", "{\"mode\":\"LIVE\"}");
+            return ReplayRunner.Mode.LIVE;
         }
-        // Clear replay rows and re-seed the latest live cache, then live routing resumes (req. 10).
-        sendToAppSession(appSessionId, "reset", "{\"reason\":\"return-to-live\"}");
-        replayLiveCacheToAppSession(appSessionId);
-        sendToAppSession(appSessionId, "replay-status", "{\"mode\":\"LIVE\"}");
-        return ReplayRunner.Mode.LIVE;
     }
 
-    private void runReplay(String appSessionId, ReplayParams params, AtomicBoolean flag) {
+    private void runReplay(String appSessionId, ReplayParams params, ReplayHandle handle) {
         MarketDataSource source = routingEngine.appSession(appSessionId)
                 .map(app -> app.selection().source()).orElse(null);
         long delivered = 0L;
-        ReplayOutcome outcome = ReplayOutcome.COMPLETE;
+        ReplayOutcome outcome = ReplayOutcome.COMPLETED;
         String error = null;
         if (source != null) {
             Map<String, String> avroTopics = new LinkedHashMap<>();
@@ -1969,33 +2109,70 @@ public class FeedGatewayService implements ReplayRunner {
                 // P0 (replay chronology): a SINGLE deterministic k-way merge across ALL topics (avro +
                 // string) by canonical event time — never topic-by-topic, which would surface "all
                 // snapshots then all strike-flow" and let the record cap drain entirely in one phase.
-                ReplayResult result = replayMerged(appSessionId, params, source, avroTopics, stringTopics, flag);
+                ReplayResult result = replayMerged(appSessionId, params, source, avroTopics, stringTopics, handle);
                 delivered = result.delivered();
                 outcome = result.outcome();
+            } catch (WakeupException canceled) {
+                outcome = ReplayOutcome.CANCELED; // a control call woke the consumer to stop this run
             } catch (RuntimeException e) {
-                outcome = ReplayOutcome.INCOMPLETE;
+                outcome = ReplayOutcome.FAILED;
                 error = String.valueOf(e.getMessage());
             }
         }
-        replayRunning.remove(appSessionId, flag);
-        // P0 (empty poll ≠ end of replay): only report success when the read genuinely reached every
-        // captured target offset. A deadline timeout or read error is surfaced as REPLAY_INCOMPLETE so a
-        // partial run is never shown as complete.
-        if (outcome == ReplayOutcome.INCOMPLETE) {
-            sendToAppSession(appSessionId, "replay-status", replayIncompleteJson(params, delivered,
-                    error != null ? error : "replay timed out before all captured data was read"));
-        } else {
-            sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_COMPLETE", params, delivered));
+        // Free our handle only if it is still ours (a newer generation may have replaced it already).
+        replayHandles.remove(appSessionId, handle);
+        // P0 (cancellation/generation barrier): emit a terminal status ONLY if this reader is still the
+        // owner. A canceled/superseded reader stays silent — the control call that replaced it sends the
+        // authoritative next status — so a stale terminal can never overwrite the live/new-replay state.
+        // Exactly ONE terminal status is sent, with a distinct state (completed/timed-out/failed).
+        if (outcome == ReplayOutcome.CANCELED || !isReplayOwner(appSessionId, handle.generation)) {
+            return;
+        }
+        synchronized (replayControlLock) {
+            if (!isReplayOwner(appSessionId, handle.generation)) {
+                return; // a control call slipped in between the check and the lock — defer to it
+            }
+            // This reader finished on its own and is still the owner; retire the generation and report.
+            replayOwnerGeneration.put(appSessionId, replayGenerationSeq.incrementAndGet());
+            sendToAppSession(appSessionId, "replay-status",
+                    replayTerminalJson(outcome, params, delivered, error));
         }
     }
 
-    /** Status for a replay that did NOT reach every captured target offset (timeout or read error). */
-    private String replayIncompleteJson(ReplayParams params, long delivered, String reason) {
-        return "{\"mode\":\"REPLAY_INCOMPLETE\",\"complete\":false,\"symbol\":\"" + escapeJson(params.symbol())
-                + "\",\"expiry\":\"" + escapeJson(params.expiry())
-                + "\",\"startUtcMs\":" + params.startUtcMs() + ",\"endUtcMs\":" + params.endUtcMs()
-                + ",\"records\":" + delivered + ",\"maxRecords\":" + params.maxRecords()
-                + ",\"error\":\"" + escapeJson(reason) + "\"}";
+    /** Map a terminal outcome to its distinct UI status (completed/canceled/timed-out/failed). */
+    private static String terminalMode(ReplayOutcome outcome) {
+        return switch (outcome) {
+            case COMPLETED -> "REPLAY_COMPLETE";
+            case CANCELED -> "REPLAY_CANCELED";
+            case TIMED_OUT -> "REPLAY_TIMED_OUT";
+            case FAILED -> "REPLAY_FAILED";
+        };
+    }
+
+    /** Terminal status used by the control thread for an explicit cancel (no window/record context). */
+    private String replayTerminalJson(ReplayOutcome outcome, String appSessionId) {
+        return "{\"mode\":\"" + terminalMode(outcome) + "\",\"complete\":"
+                + (outcome == ReplayOutcome.COMPLETED) + "}";
+    }
+
+    /** Terminal status used by the reader: carries the window, delivered count, and any error. */
+    private String replayTerminalJson(ReplayOutcome outcome, ReplayParams params, long delivered, String error) {
+        StringBuilder b = new StringBuilder()
+                .append("{\"mode\":\"").append(terminalMode(outcome))
+                .append("\",\"complete\":").append(outcome == ReplayOutcome.COMPLETED)
+                .append(",\"symbol\":\"").append(escapeJson(params.symbol()))
+                .append("\",\"expiry\":\"").append(escapeJson(params.expiry()))
+                .append("\",\"startUtcMs\":").append(params.startUtcMs())
+                .append(",\"endUtcMs\":").append(params.endUtcMs())
+                .append(",\"records\":").append(delivered)
+                .append(",\"maxRecords\":").append(params.maxRecords());
+        if (outcome == ReplayOutcome.TIMED_OUT && error == null) {
+            error = "replay timed out before all captured data was read";
+        }
+        if (error != null) {
+            b.append(",\"error\":\"").append(escapeJson(error)).append("\"");
+        }
+        return b.append("}").toString();
     }
 
     /**
@@ -2006,18 +2183,22 @@ public class FeedGatewayService implements ReplayRunner {
      * being exhausted by whichever topic is read first. Each outbound event keeps its source timestamp,
      * topic, partition and offset.
      */
-    /** Outcome of a replay read: COMPLETE means every active partition reached its captured target offset
-     *  (or the cap/stop was hit); INCOMPLETE means a poll deadline expired short of target — a failure. */
-    enum ReplayOutcome { COMPLETE, INCOMPLETE }
+    /**
+     * Distinct terminal states of a replay read (P0): {@code COMPLETED} — every active partition reached
+     * its captured target offset (or the record cap was hit); {@code CANCELED} — superseded by a newer
+     * generation or an explicit stop/return-to-live; {@code TIMED_OUT} — a poll deadline expired short of
+     * target; {@code FAILED} — a read error. Only COMPLETED is "success".
+     */
+    enum ReplayOutcome { COMPLETED, CANCELED, TIMED_OUT, FAILED }
 
     record ReplayResult(long delivered, ReplayOutcome outcome) {
     }
 
     private ReplayResult replayMerged(String appSessionId, ReplayParams params, MarketDataSource source,
                                       Map<String, String> avroTopics, Map<String, String> stringTopics,
-                                      AtomicBoolean flag) {
+                                      ReplayHandle handle) {
         if (avroTopics.isEmpty() && stringTopics.isEmpty()) {
-            return new ReplayResult(0L, ReplayOutcome.COMPLETE);
+            return new ReplayResult(0L, ReplayOutcome.COMPLETED);
         }
         KafkaConsumer<String, Object> avro = null;
         KafkaConsumer<String, Object> str = null;
@@ -2025,17 +2206,25 @@ public class FeedGatewayService implements ReplayRunner {
             Map<TopicPartition, ReplayPartitionState> parts = new LinkedHashMap<>();
             if (!avroTopics.isEmpty()) {
                 avro = new KafkaConsumer<>(replayConsumerProps(appSessionId, true));
+                handle.avroConsumer = avro; // publish for wakeup() before any blocking call
                 openReplayPartitions(avro, params, avroTopics, true, parts);
             }
             if (!stringTopics.isEmpty()) {
                 str = new KafkaConsumer<>(replayConsumerProps(appSessionId, false));
+                handle.stringConsumer = str;
                 openReplayPartitions(str, params, stringTopics, false, parts);
             }
             if (parts.isEmpty()) {
-                return new ReplayResult(0L, ReplayOutcome.COMPLETE);
+                return new ReplayResult(0L, ReplayOutcome.COMPLETED);
             }
-            return mergeReplayPartitions(appSessionId, params, source, avro, str, parts, flag);
+            return mergeReplayPartitions(appSessionId, params, source, avro, str, parts, handle);
+        } catch (WakeupException woken) {
+            // A control call (stop/return-to-live/new replay) woke the consumer — cancel cleanly.
+            return new ReplayResult(0L, ReplayOutcome.CANCELED);
         } finally {
+            // Detach BEFORE close so a concurrent wakeup() can never touch a closed consumer.
+            handle.avroConsumer = null;
+            handle.stringConsumer = null;
             if (avro != null) {
                 avro.close();
             }
@@ -2061,7 +2250,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** One buffered record awaiting chronological emission. */
-    private record MergeRecord(ReplayChronology.Cursor cursor, String event, Object value, boolean avro) {
+    record MergeRecord(ReplayChronology.Cursor cursor, String event, Object value, boolean avro) {
     }
 
     private Properties replayConsumerProps(String appSessionId, boolean avro) {
@@ -2135,12 +2324,16 @@ public class FeedGatewayService implements ReplayRunner {
      */
     ReplayResult mergeReplayPartitions(String appSessionId, ReplayParams params, MarketDataSource source,
                                        KafkaConsumer<String, Object> avro, KafkaConsumer<String, Object> str,
-                                       Map<TopicPartition, ReplayPartitionState> parts, AtomicBoolean flag) {
+                                       Map<TopicPartition, ReplayPartitionState> parts, ReplayHandle handle) {
         long delivered = 0L;
         int maxRecords = params.maxRecords();
         long idleTimeoutMs = settings.replayIdleTimeoutMs();
         long lastProgressMs = System.currentTimeMillis();
-        while (flag.get() && running.get() && delivered < maxRecords) {
+        boolean drainedToEnd = false;
+        // P0 (generation barrier): stop the moment this reader is no longer the session's owner — a stop,
+        // return-to-live, or newer replay has taken over, so nothing more may be emitted.
+        while (handle.active.get() && running.get() && isReplayOwner(appSessionId, handle.generation)
+                && delivered < maxRecords) {
             if (hasUnbufferedActivePartition(parts)) {
                 // Only blocking partitions (empty buffer, not yet at target) need fetching — pause the rest
                 // so buffers stay bounded and an empty poll reflects ONLY the partitions we are waiting on.
@@ -2158,7 +2351,7 @@ public class FeedGatewayService implements ReplayRunner {
                     }
                     if (System.currentTimeMillis() - lastProgressMs > idleTimeoutMs) {
                         // A partition has not reached its captured target offset within the deadline.
-                        return new ReplayResult(delivered, ReplayOutcome.INCOMPLETE);
+                        return new ReplayResult(delivered, ReplayOutcome.TIMED_OUT);
                     }
                     continue; // ordinary empty poll — keep retrying until target or deadline
                 }
@@ -2166,14 +2359,20 @@ public class FeedGatewayService implements ReplayRunner {
             }
             MergeRecord next = pollGlobalMinimum(parts);
             if (next == null) {
-                break; // every active partition reached target AND its buffer is drained → genuine completion
+                drainedToEnd = true; // every active partition reached target AND its buffer is drained
+                break;
             }
-            if (emitReplayRecord(appSessionId, params, source, next)) {
+            if (emitReplayRecord(appSessionId, params, source, next, handle)) {
                 delivered++;
             }
             lastProgressMs = System.currentTimeMillis();
         }
-        return new ReplayResult(delivered, ReplayOutcome.COMPLETE);
+        // COMPLETED only when the read genuinely finished (all partitions at target) or hit the record cap.
+        // Any other loop exit — ownership lost, cancel flag cleared, gateway shutdown — is a cancellation.
+        if (drainedToEnd || delivered >= maxRecords) {
+            return new ReplayResult(delivered, ReplayOutcome.COMPLETED);
+        }
+        return new ReplayResult(delivered, ReplayOutcome.CANCELED);
     }
 
     private static boolean hasUnbufferedActivePartition(Map<TopicPartition, ReplayPartitionState> parts) {
@@ -2284,7 +2483,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** Convert, stamp provenance, filter to the session, and stream one merged record. */
     private boolean emitReplayRecord(String appSessionId, ReplayParams params, MarketDataSource source,
-                                     MergeRecord r) {
+                                     MergeRecord r, ReplayHandle handle) {
         // A single malformed/poison record must NOT abort the windowed replay (review finding #12).
         try {
             String raw = r.avro() ? avroJson(r.value()) : stringJson(r.value());
@@ -2294,6 +2493,12 @@ public class FeedGatewayService implements ReplayRunner {
             }
             json = withReplayProvenance(json, r.cursor());
             if (replayMatches(params, r.event(), json)) {
+                // P0 (generation barrier): re-verify ownership IMMEDIATELY before the send. A record already
+                // returned by an earlier poll must never reach the socket after the user started a different
+                // replay or returned to live — the barrier closes that exact window.
+                if (!handle.active.get() || !isReplayOwner(appSessionId, handle.generation)) {
+                    return false;
+                }
                 sendToAppSession(appSessionId, r.event(), json);
                 return true;
             }
