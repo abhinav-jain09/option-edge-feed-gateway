@@ -5,12 +5,14 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -290,6 +292,66 @@ class FeedGatewayServiceTest {
         assertTrue(service.metrics().contains("options_edge_feed_gateway_strike_flows 1"));
     }
 
+    @Test
+    void databentoGexGatewayContractConsumesCachesAndExposesUiBatchHealthAndMetrics() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        String payload = "{\"source\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260612\","
+                + "\"strike\":6005,\"callGex\":1.0,\"putGex\":-2.0,\"netGex\":-1.0,"
+                + "\"gammaSign\":\"NEGATIVE\",\"updatedAt\":\"2026-06-12T14:31:00Z\"}";
+        Object binding = topicBinding("DATABENTO", "gex-by-strike");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.databentoGexTopic(),
+                0,
+                12L,
+                "SPX|20260612|6005",
+                payload
+        );
+
+        String cacheKey = updateCache(service, binding, record, payload);
+        String eventEnvelope = envelopeJson(service, "gex-by-strike", payload);
+        String batchEnvelope = uiBatchEnvelopeJsonGex(service, List.of(payload));
+
+        assertEquals("options.databento.gex.strike", settings.databentoGexTopic());
+        assertTrue(source.contains("topicEvents.put(settings.databentoGexTopic(), new TopicBinding(\"DATABENTO\", \"gex-by-strike\"));"));
+        assertEquals("DATABENTO|SPX|20260612|6005", cacheKey);
+        assertTrue(eventEnvelope.contains("\"type\":\"gex-by-strike\""));
+        assertTrue(batchEnvelope.contains("\"gexByStrike\":[{"));
+        assertTrue(service.healthJson().contains("\"gexByStrike\":1"));
+        assertTrue(service.metrics().contains("options_edge_feed_gateway_gex_by_strike 1"));
+    }
+
+    @Test
+    void databentoGexPassesShouldForwardForActiveDatabentoSelection() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260612");
+        String payload = "{\"source\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":6005,\"netGex\":-1.0}";
+        Object binding = topicBinding("DATABENTO", "gex-by-strike");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.databentoGexTopic(), 0, 12L, "SPX|20260612|6005", payload);
+
+        assertTrue(shouldForward(service, binding, payload, record));
+    }
+
+    @Test
+    void gexByStrikeIsIsolatedBetweenIbkrAndDatabento() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String payload = "{\"source\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":6005,\"netGex\":-1.0}";
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.databentoGexTopic(), 0, 12L, "SPX|20260612|6005", payload);
+
+        // Active source DATABENTO must not forward an IBKR-bound GEX record...
+        setActiveSelection(service, "DATABENTO", "SPX", "20260612");
+        assertFalse(shouldForward(service, topicBinding("IBKR", "gex-by-strike"), payload, record));
+
+        // ...and active source IBKR must not forward a DATABENTO-bound GEX record.
+        setActiveSelection(service, "IBKR", "SPX", "20260612");
+        assertFalse(shouldForward(service, topicBinding("DATABENTO", "gex-by-strike"), payload, record));
+    }
+
     private static void withSystemProperty(String key, String value, Runnable assertion) {
         String previous = System.getProperty(key);
         try {
@@ -342,6 +404,43 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod("updateCache", bindingType, ConsumerRecord.class, String.class);
         method.setAccessible(true);
         return (String) method.invoke(service, binding, record, json);
+    }
+
+    private static boolean shouldForward(
+            FeedGatewayService service,
+            Object binding,
+            String json,
+            ConsumerRecord<String, String> record
+    ) throws Exception {
+        Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Method method = FeedGatewayService.class.getDeclaredMethod("shouldForward", bindingType, String.class, ConsumerRecord.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, binding, json, record);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void setActiveSelection(FeedGatewayService service, String src, String symbol, String expiry) throws Exception {
+        Class<?> selType = Class.forName("app.feedgateway.FeedGatewayService$ActiveSelection");
+        Constructor<?> constructor = selType.getDeclaredConstructor(String.class, String.class, String.class, long.class, long.class);
+        constructor.setAccessible(true);
+        Object selection = constructor.newInstance(src, symbol, expiry, 0L, 0L);
+        Field field = FeedGatewayService.class.getDeclaredField("activeSelection");
+        field.setAccessible(true);
+        ((AtomicReference<Object>) field.get(service)).set(selection);
+    }
+
+    private static String uiBatchEnvelopeJsonGex(FeedGatewayService service, List<String> gexByStrike) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "uiBatchEnvelopeJson",
+                List.class, List.class, List.class, List.class, List.class, List.class,
+                List.class, List.class, List.class, List.class, List.class, List.class
+        );
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of()
+        );
     }
 
     private static String envelopeJson(FeedGatewayService service, String event, String json) throws Exception {
