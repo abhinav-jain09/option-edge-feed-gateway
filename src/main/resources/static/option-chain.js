@@ -526,6 +526,7 @@
                             const replayUiVisible = isDevProfile(config) && Boolean(config.databentoReplayUiEnabled);
                             const gexOptional = !databentoMode && data.length > 0 && gexSummary.visibleCount === 0;
                             const gexSourceLabel = databentoMode ? 'DBN' : 'UW';
+                            const gexSourceName = databentoMode ? 'databento' : 'unusual-whales';
                             const gexStatusClass = gexOptional
                               ? 'disabled'
                               : gexSummary.staleCount > 0
@@ -538,6 +539,20 @@
         ? `${config.symbol} ${formatExpiry(config.expiry)} | ${String(config.marketDataSource || '').toUpperCase()} market data | ${String(config.provider || '').toUpperCase()} orders`
         : 'Loading config...';
     const selectedExpiryDate = formatExpiryDisplay(config.expiry);
+    const gexStatusJson = JSON.stringify({
+      source: gexSourceName,
+      sourceLabel: gexSourceLabel,
+      marketDataSource: config.marketDataSource,
+      expiry: normalizeExpiry(config.expiry),
+      date: selectedExpiryDate,
+      visibleStrikeCount: data.length,
+      visibleGexCount: gexSummary.visibleCount,
+      staleGexCount: gexSummary.staleCount,
+      missingGexCount: gexSummary.missingCount,
+      disabled: false,
+      optional: gexOptional,
+      unavailable: gexOptional
+    });
 
     useEffect(() => {
       if (!didInitialCenterRef.current && data.length > 0 && atmIndex >= 0 && Number.isFinite(Number(spot))) {
@@ -670,19 +685,9 @@
 	        h('span', {
 	          id: 'unusualWhalesGexStatus',
 	          className: `gex-status ${gexStatusClass}`.trim(),
-	          'data-uw-gex-json': JSON.stringify({
-	            source: 'unusual-whales',
-	            marketDataSource: config.marketDataSource,
-	            expiry: normalizeExpiry(config.expiry),
-	            date: selectedExpiryDate,
-	            visibleStrikeCount: data.length,
-	            visibleGexCount: gexSummary.visibleCount,
-	            staleGexCount: gexSummary.staleCount,
-	            missingGexCount: gexSummary.missingCount,
-	            disabled: false,
-              optional: gexOptional,
-              unavailable: gexOptional
-	          })
+	          'data-gex-source': gexSourceName,
+	          'data-gex-json': gexStatusJson,
+	          'data-uw-gex-json': gexStatusJson
 	        }, gexStatusLabel),
 	        h('span', { id: 'rowCount' }, `${data.length.toLocaleString()} records`)
 				                      ),
@@ -1471,7 +1476,8 @@
 				                      className: `strike-cell ${gex.className}`.trim(),
 				                      title: gex.title,
 				                      style: gex.visible ? gex.style : undefined,
-				                      'data-uw-gex-source': gex.visible ? 'unusual-whales' : '',
+				                      'data-gex-source': gex.visible ? gexSourceMeta(row).name : '',
+				                      'data-uw-gex-source': gex.visible ? gexSourceMeta(row).name : '',
 				                      'data-uw-gex-timeframe': gex.visible ? timeframe : '',
 				                      'data-uw-gex-expiry': gexExpiry,
 				                      'data-uw-gex-date': formatExpiryDisplay(gexExpiry),
@@ -1495,14 +1501,14 @@
 				                        )
 				                      ),
 				                      gex.visible ? h(GexHistoryPopover, { row, gex }) : null,
-				                      gex.stale ? h('sup', { className: 'gamma-stale-marker', title: 'Unusual Whales exposure is stale' }, '?') : null
+				                      gex.stale ? h('sup', { className: 'gamma-stale-marker', title: `${gexSourceMeta(row).display} exposure is stale` }, '?') : null
 			                    );
 			                  }
 
 			                  function GexHistoryPopover({ row, gex }) {
 			                    const rows = gexHistoryRows(row);
 				                    return h('div', { className: 'uw-gex-popover', role: 'tooltip' },
-				                      h('strong', null, 'Unusual Whales 1D'),
+				                      h('strong', null, `${gexSourceMeta(row).display} ${String(row.uwGexTimeframe || '1D').toUpperCase()}`),
 				                      h('span', { className: 'uw-gex-popover-strike' }, `Strike ${row.strike}`),
 				                      h('span', { className: 'uw-gex-popover-meta' },
 				                        `${row.symbol || '--'} ${formatExpiryDisplay(row.uwGexExpiry || row.expiry)}`
@@ -2972,10 +2978,18 @@
     return strike;
   }
 
+	  function gexSourceMeta(row) {
+	    const src = String((row && (row.source || row.marketDataSource)) || '').toUpperCase();
+	    if (src === 'DATABENTO') {
+	      return { name: 'databento', short: 'DBN', display: 'Databento' };
+	    }
+	    return { name: 'unusual-whales', short: 'UW', display: 'Unusual Whales' };
+	  }
+
 	  function gexStrikeState(row, maxAbsGex) {
 	    const hasGex = row?.uwGexUpdatedAt || row?.uwGammaSign || Number.isFinite(Number(row?.uwNetGex));
 	    if (!hasGex) {
-	      return { className: '', stale: false, visible: false, text: '', title: 'Waiting for Unusual Whales exposure' };
+	      return { className: '', stale: false, visible: false, text: '', title: 'Waiting for gamma exposure' };
 	    }
 	    const updatedAtMs = Date.parse(row.uwGexUpdatedAt || '');
 	    const staleAfterMs = Number(row.uwGexStaleAfterMs || 90_000);
@@ -2999,7 +3013,7 @@
 	        : sign === 'POSITIVE'
 	          ? 'gamma-positive'
 	          : 'gamma-neutral';
-	    const title = `Unusual Whales 1D ${sign || 'UNKNOWN'} net ${fmtSignedUsdGex(netGex)} | ${changeTitle} | updated ${row.uwGexUpdatedAt || 'unknown'}`;
+	    const title = `${gexSourceMeta(row).display} ${timeframe} ${sign || 'UNKNOWN'} net ${fmtSignedUsdGex(netGex)} | ${changeTitle} | updated ${row.uwGexUpdatedAt || 'unknown'}`;
 	    return {
 	      className,
 	      stale,
