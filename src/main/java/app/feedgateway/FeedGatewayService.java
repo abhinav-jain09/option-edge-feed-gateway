@@ -596,6 +596,16 @@ public class FeedGatewayService implements ReplayRunner {
             } catch (IOException | IllegalStateException ignored) {
                 // Removing the session from the fanout set is sufficient.
             }
+            // Mirror removeClient/onSlowDisconnect: detach this socket from routing so socketsForAppSession
+            // is accurate, then cancel replay if it was its AppSession's last socket. Without this, an
+            // expired-token close would orphan an in-flight replay reader — and, because the socket stays
+            // "attached" in the engine, a later cancelReplayIfNoSockets would wrongly see a non-empty socket
+            // set and decline. This is the same delayed/suppressed-callback hazard sweepExpiredSessions was
+            // hardened against; the token-expiry reaper needs the same treatment.
+            if (routingEngine != null) {
+                routingEngine.detachSocket(session.getId());
+                cancelReplayIfNoSockets(appSessionIdOf(session));
+            }
             closed++;
         }
         return closed;
