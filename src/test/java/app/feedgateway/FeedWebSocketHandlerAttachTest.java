@@ -64,7 +64,7 @@ class FeedWebSocketHandlerAttachTest {
     void successfulAttachAdmitsTheClient() throws Exception {
         SessionRoutingEngine engine = new SessionRoutingEngine(new ConcurrencyLimits(5, 5, 100), new SubscriptionManager());
         engine.registerAppSession("app:u1", "u1", SPX, Set.of());
-        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(engine), lifecycle());
+        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(engine));
         WebSocketSession ws = socket("s1", "app:u1");
 
         handler.afterConnectionEstablished(ws);
@@ -78,7 +78,7 @@ class FeedWebSocketHandlerAttachTest {
     void expiredAppSessionIsRejectedNotAdmitted() throws Exception {
         // No AppSession registered for the bound id (mint→connect gap / idle teardown).
         SessionRoutingEngine engine = new SessionRoutingEngine(new ConcurrencyLimits(5, 5, 100), new SubscriptionManager());
-        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(engine), lifecycle());
+        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(engine));
         WebSocketSession ws = socket("s1", "app:ghost");
 
         handler.afterConnectionEstablished(ws);
@@ -92,7 +92,7 @@ class FeedWebSocketHandlerAttachTest {
         SessionRoutingEngine engine = new SessionRoutingEngine(new ConcurrencyLimits(5, 1, 100), new SubscriptionManager());
         engine.registerAppSession("app:u1", "u1", SPX, Set.of());
         engine.attachSocket("app:u1", "existing");         // fill the single-socket cap
-        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(engine), lifecycle());
+        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(engine));
         WebSocketSession ws = socket("s2", "app:u1");
 
         handler.afterConnectionEstablished(ws);
@@ -105,7 +105,7 @@ class FeedWebSocketHandlerAttachTest {
     @Test
     void authOnButNoBoundSessionIsRejected() throws Exception {
         SessionRoutingEngine engine = new SessionRoutingEngine(new ConcurrencyLimits(5, 5, 100), new SubscriptionManager());
-        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(engine), lifecycle());
+        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(engine));
         WebSocketSession ws = socket("s1", null);          // engine present (auth on) but no bound id
 
         handler.afterConnectionEstablished(ws);
@@ -116,7 +116,7 @@ class FeedWebSocketHandlerAttachTest {
 
     @Test
     void legacyModeWithoutEngineStillAdmits() throws Exception {
-        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(null), lifecycle()); // auth off
+        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(null)); // auth off
         WebSocketSession ws = socket("s1", null);
 
         handler.afterConnectionEstablished(ws);
@@ -125,10 +125,4 @@ class FeedWebSocketHandlerAttachTest {
         verify(ws).sendMessage(any());                     // admitted as before
     }
 
-    private static app.feedgateway.replay.ReplaySessionLifecycle lifecycle() {
-        return new app.feedgateway.replay.ReplaySessionLifecycle(
-                new app.feedgateway.replay.ReplaySessionOwnership(),
-                new app.feedgateway.replay.ReplaySessionBindings(),
-                new app.feedgateway.replay.ReplaySessionRegistry());
-    }
 }

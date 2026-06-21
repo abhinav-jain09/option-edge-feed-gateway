@@ -2,7 +2,6 @@ package app.feedgateway;
 
 import app.feedgateway.mtsession.SessionRoutingEngine;
 import app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor;
-import app.feedgateway.replay.ReplaySessionLifecycle;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
@@ -16,14 +15,11 @@ import java.util.List;
 public class FeedWebSocketHandler extends TextWebSocketHandler implements SubProtocolCapable {
     private final FeedGatewayService gatewayService;
     private final ObjectProvider<SessionRoutingEngine> engineProvider;
-    private final ReplaySessionLifecycle replayLifecycle;
 
     public FeedWebSocketHandler(FeedGatewayService gatewayService,
-                                ObjectProvider<SessionRoutingEngine> engineProvider,
-                                ReplaySessionLifecycle replayLifecycle) {
+                                ObjectProvider<SessionRoutingEngine> engineProvider) {
         this.gatewayService = gatewayService;
         this.engineProvider = engineProvider;
-        this.replayLifecycle = replayLifecycle;
     }
 
     /**
@@ -60,10 +56,6 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
             }
         }
         gatewayService.addClient(session);
-        // Bind the session to its authenticated owner (the JWT 'sub' set at handshake) so replay control
-        // requests can be authorized to the owning user only. No 'sub' (auth off) leaves it unbound.
-        Object sub = session.getAttributes().get("sub");
-        replayLifecycle.onConnect(session.getId(), sub == null ? null : sub.toString());
     }
 
     /** Best-effort close of a socket we refuse to admit, so no unattached client lingers. */
@@ -79,14 +71,12 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         detach(session);
         gatewayService.removeClient(session);
-        replayLifecycle.onDisconnect(session.getId()); // tear down ALL replay state for the socket
     }
 
     @Override
     public void handleTransportError(WebSocketSession session, Throwable exception) {
         detach(session);
         gatewayService.removeClient(session);
-        replayLifecycle.onDisconnect(session.getId());
     }
 
     private void detach(WebSocketSession session) {

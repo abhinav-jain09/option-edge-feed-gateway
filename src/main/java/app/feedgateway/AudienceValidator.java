@@ -6,11 +6,11 @@ import org.springframework.security.oauth2.core.OAuth2TokenValidatorResult;
 import org.springframework.security.oauth2.jwt.Jwt;
 
 /** Rejects a JWT whose {@code aud} does not include the expected audience (audience-binding). */
-public final class AudienceValidator implements OAuth2TokenValidator<Jwt> {
+final class AudienceValidator implements OAuth2TokenValidator<Jwt> {
 
     private final String audience;
 
-    public AudienceValidator(String audience) {
+    AudienceValidator(String audience) {
         this.audience = audience;
     }
 
