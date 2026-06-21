@@ -436,6 +436,16 @@ public class FeedGatewayService implements ReplayRunner {
             return 0;
         }
         SessionRoutingEngine.SweepResult result = routingEngine.sweepExpired();
+        // The sweep has already removed these AppSessions from the engine. Finalize any in-flight replay
+        // for each one EXPLICITLY here rather than relying on the eventual socket-close callbacks
+        // (removeClient/onSlowDisconnect) — those may be delayed or suppressed, which would otherwise let a
+        // replay reader keep consuming Kafka past the session's expiry. cancelActiveReplay is keyed by the
+        // appSessionId and works regardless of the session already being gone from the engine.
+        for (String appSessionId : result.expiredAppSessionIds()) {
+            synchronized (replayControlLock) {
+                cancelActiveReplay(appSessionId);
+            }
+        }
         closeSockets(result.closedSocketIds());
         return result.expiredAppSessionIds().size();
     }
@@ -489,12 +499,11 @@ public class FeedGatewayService implements ReplayRunner {
                 return; // nothing in flight to cancel
             }
             cancelActiveReplay(appSessionId);
-            // The AppSession may already be gone — a logout/expiry teardown can race ahead of this socket's
-            // close. setReplayMode requires a live session (it throws otherwise), so only flip the flag when
-            // the session still exists; cancelActiveReplay above already stopped the reader regardless.
-            if (routingEngine.appSession(appSessionId).isPresent()) {
-                routingEngine.setReplayMode(appSessionId, false);
-            }
+            // The AppSession may already be gone — a logout or expiry sweep can race ahead of this socket's
+            // close and remove it WITHOUT holding replayControlLock. setReplayModeIfPresent does the
+            // lookup-and-clear atomically under the engine write lock, so it can never throw on an
+            // absent session (unlike setReplayMode); cancelActiveReplay above already stopped the reader.
+            routingEngine.setReplayModeIfPresent(appSessionId, false);
         }
     }
 

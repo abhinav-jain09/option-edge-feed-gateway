@@ -57,6 +57,28 @@ class SessionRoutingEngineReplayTest {
     }
 
     @Test
+    void setReplayModeIfPresentIsANoOpForAbsentSession() {
+        SessionRoutingEngine e = engine();
+        // No such session: the teardown-cleanup variant must NOT throw (unlike setReplayMode, which
+        // requires a live session), so a disconnect racing an expiry/logout teardown can never blow up.
+        e.setReplayModeIfPresent("app:gone", false);
+        assertFalse(e.isReplaying("app:gone"));
+    }
+
+    @Test
+    void setReplayModeIfPresentClearsTheFlagForALiveSession() {
+        SessionRoutingEngine e = engine();
+        e.registerAppSession("app:u1", "u1", spx(), DBNTO);
+        e.attachSocket("app:u1", "s1");
+        e.setReplayMode("app:u1", true);
+        assertTrue(e.isReplaying("app:u1"));
+
+        e.setReplayModeIfPresent("app:u1", false);
+        assertFalse(e.isReplaying("app:u1"), "the flag is cleared when the session is present");
+        assertEquals(Set.of("s1"), e.route(pace()), "live delivery resumes");
+    }
+
+    @Test
     void oneUserReplaysWhileAnotherStaysLive() {
         SessionRoutingEngine e = engine();
         e.registerAppSession("app:u1", "u1", spx(), DBNTO);

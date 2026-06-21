@@ -16,11 +16,13 @@ import app.feedgateway.mtsession.StrikeWindow;
 import app.feedgateway.mtsession.SubscriptionManager;
 import app.feedgateway.mtsession.UserSessionPolicy;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.lang.reflect.Field;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.WebSocketSession;
@@ -92,5 +94,46 @@ class SessionExpirySweepTest {
         clock.advance(Duration.ofMinutes(5)); // within idle (10m) and max (60m)
         assertEquals(0, svc.sweepExpiredSessions());
         assertFalse(engine.appSession("app:u1").isEmpty());
+    }
+
+    /**
+     * P0 (replay resource safety on expiry): when the expiry sweep tears a session down, an in-flight
+     * replay must be finalized explicitly — not left for an eventual socket-close callback — so the reader
+     * cannot keep consuming Kafka after the session is gone.
+     */
+    @Test
+    void expirySweepCancelsInFlightReplay() throws Exception {
+        MutableClock clock = new MutableClock(Instant.parse("2026-06-12T14:00:00Z"));
+        SessionRoutingEngine engine =
+                new SessionRoutingEngine(new ConcurrencyLimits(5, 5, 100), new SubscriptionManager(), clock);
+        UserSessionPolicy oneMinute = new UserSessionPolicy(10, 1, false);
+        engine.registerAppSession("app:u1", "u1",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260612", StrikeWindow.ALL),
+                Set.of("user"), ApprovalState.APPROVED, oneMinute);
+        engine.attachSocket("app:u1", "s1");
+        FeedGatewayService svc =
+                new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), engine);
+        svc.runOutboundWritesInline();
+        svc.addClient(socket());
+
+        // An in-flight replay for the session (the state startReplay installs before its reader runs).
+        FeedGatewayService.ReplayHandle handle = svc.registerOwnerHandleForTest("app:u1");
+        replayHandlesOf(svc).put("app:u1", handle);
+        engine.setReplayMode("app:u1", true);
+
+        clock.advance(Duration.ofSeconds(61)); // past the 1-minute max-session deadline
+        assertEquals(1, svc.sweepExpiredSessions());
+
+        assertFalse(handle.active.get(), "expiry sweep cancels the in-flight reader");
+        assertFalse(replayHandlesOf(svc).containsKey("app:u1"), "replay handle removed on expiry");
+        assertTrue(engine.appSession("app:u1").isEmpty(), "expired session removed from routing");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, FeedGatewayService.ReplayHandle> replayHandlesOf(FeedGatewayService svc)
+            throws Exception {
+        Field f = FeedGatewayService.class.getDeclaredField("replayHandles");
+        f.setAccessible(true);
+        return (Map<String, FeedGatewayService.ReplayHandle>) f.get(svc);
     }
 }
