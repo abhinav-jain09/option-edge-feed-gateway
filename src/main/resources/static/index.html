@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- P0/P1 (XSS + portability): the restrictive, DEPLOYMENT-AWARE CSP is emitted as a response header by
+       SecurityHeadersFilter (connect-src is derived from the configured Keycloak issuer), so it is correct
+       across dev/prod without hardcoding an origin here. Scripts are self-hosted only (no inline JS/CDN). -->
+  <meta name="referrer" content="no-referrer">
+  <title>OptionsEdge — Sign in</title>
+  <style>
+    :root { --bg:#0f172a; --panel:#1e293b; --accent:#2563eb; --green:#16a34a; --text:#e2e8f0; --muted:#94a3b8; --line:#334155; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:14px 22px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; }
+    header h1 { font-size:18px; margin:0; font-weight:700; } header .sp { flex:1; }
+    .pill { font-size:12px; color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:3px 10px; }
+    main { max-width:980px; margin:36px auto; padding:0 20px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:26px; }
+    .narrow { max-width:380px; margin:60px auto; }
+    .center { text-align:center; }
+    h2 { margin:0 0 6px; } p.muted { color:var(--muted); margin:6px 0 18px; font-size:14px; }
+    button { font:inherit; border:0; border-radius:9px; padding:11px 18px; cursor:pointer; font-weight:600; }
+    .primary { background:var(--accent); color:#fff; width:100%; } .ghost { background:transparent; color:var(--text); border:1px solid var(--line); }
+    label { display:block; color:var(--muted); font-size:12px; margin:12px 0 4px; }
+    input,select { width:100%; padding:10px; background:#0b1220; color:var(--text); border:1px solid var(--line); border-radius:8px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin:18px 0; }
+    .stat { background:#0b1220; border:1px solid var(--line); border-radius:10px; padding:14px; }
+    .stat .k { color:var(--muted); font-size:12px; } .stat .v { font-size:20px; font-weight:700; margin-top:4px; }
+    .controls { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:12px; align-items:end; }
+    table { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
+    th,td { text-align:right; padding:6px 10px; border-bottom:1px solid var(--line); } th:first-child,td:first-child { text-align:left; }
+    .ok { color:var(--green); } .err { color:#f87171; } .msg { font-size:13px; margin-top:10px; min-height:18px; }
+    a { color:#60a5fa; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>OptionsEdge</h1><span class="pill">multi-tenant gateway</span>
+    <span class="sp"></span>
+    <span class="pill" id="who" style="display:none"></span>
+    <button class="ghost" id="logout" style="display:none">Sign out</button>
+  </header>
+  <main id="main"></main>
+
+<script src="/login.js"></script>
+</body>
+</html>

@@ -4,6 +4,19 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import app.feedgateway.mtsession.RoutableRecord;
+import app.feedgateway.mtsession.AppSession;
+import app.feedgateway.mtsession.EventType;
+import app.feedgateway.mtsession.MarketDataSource;
+import app.feedgateway.mtsession.SessionRoutingEngine;
+import app.feedgateway.mtsession.gateway.ReplayChronology;
+import app.feedgateway.mtsession.gateway.ReplayParams;
+import app.feedgateway.mtsession.gateway.ReplayTopicResolver;
+import app.feedgateway.mtsession.gateway.ReplayRunner;
+import app.feedgateway.mtsession.gateway.GatewayRecordMapper;
+import java.util.Optional;
+import java.util.OptionalDouble;
+import org.springframework.lang.Nullable;
 import com.optionsedge.contracts.hpsf.HpsfAuditEvent;
 import com.optionsedge.contracts.hpsf.HpsfExitIntentEvent;
 import com.optionsedge.contracts.hpsf.HpsfSignal;
@@ -31,36 +44,75 @@ import org.springframework.web.socket.WebSocketSession;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Service
-public class FeedGatewayService {
+public class FeedGatewayService implements ReplayRunner {
     private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
     private final ObjectMapper mapper;
     private final HpsfGatewayViewMapper hpsfViewMapper;
     private final Set<WebSocketSession> clients = new CopyOnWriteArraySet<>();
+    private final Map<String, WebSocketSession> clientsById = new ConcurrentHashMap<>();
+    // P0 (slow-client isolation): per-socket bounded async outbound queues. The Kafka thread enqueues here
+    // and returns; dedicated writers do the network I/O, so one slow client never stalls polling.
+    private final Map<String, OutboundChannel> outbound = new ConcurrentHashMap<>();
+    private volatile ExecutorService outboundWriters;
+    private volatile java.util.concurrent.Executor outboundWriterOverride; // test seam (caller-runs)
+    private final AtomicLong wsEnqueued = new AtomicLong();
+    private final AtomicLong wsCoalesced = new AtomicLong();
+    private final AtomicLong wsSent = new AtomicLong();
+    private final AtomicLong wsSlowDisconnects = new AtomicLong();
+    private final AtomicLong wsWriteErrors = new AtomicLong();
+    private final AtomicLong wsDroppedOnClose = new AtomicLong();
+    private final OutboundChannel.Metrics outboundMetrics = new OutboundChannel.Metrics() {
+        @Override public void enqueued(int bytes) { wsEnqueued.incrementAndGet(); }
+        @Override public void coalesced() { wsCoalesced.incrementAndGet(); }
+        @Override public void sent(int bytes) { wsSent.incrementAndGet(); }
+        @Override public void disconnectedSlow() { wsSlowDisconnects.incrementAndGet(); }
+        @Override public void writeError() { wsWriteErrors.incrementAndGet(); }
+        @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
+    };
+    private static final Set<String> COALESCABLE_EVENTS = Set.of(
+            "snapshot", "pace", "directional-pressure", "strike-flow", "volume-sandwich", "gex-by-strike",
+            "index-price", "vix-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
+            "hpsf-audit", "hpsf-exit-intent");
+    private final SessionRoutingEngine routingEngine;
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
     private final Map<String, String> strikeFlows = new ConcurrentHashMap<>();
     private final Map<String, String> indexPrices = new ConcurrentHashMap<>();
+    // P1 (VIX/underlying consistency): VIX is cached SEPARATELY from ES/index so each cache entry keeps its
+    // ORIGINAL event type (vix-price vs index-price) on replay, instead of being flattened to index-price.
+    // This map is also the "last known VIX" — replayed when present, omitted when absent (VIX is optional).
+    private final Map<String, String> vixPrices = new ConcurrentHashMap<>();
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfLatestSignals = new ConcurrentHashMap<>();
@@ -97,6 +149,7 @@ public class FeedGatewayService {
     private final AtomicLong consumerRestarts = new AtomicLong();
     private final AtomicLong forwardedEvents = new AtomicLong();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
+    private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
     private final AtomicLong seekToLatestEvents = new AtomicLong();
     private final AtomicLong sourceStaleEvents = new AtomicLong();
@@ -115,7 +168,9 @@ public class FeedGatewayService {
     private record RecordPosition(TopicPartition partition, long offset) {
     }
 
-    private record HpsfCacheUpdate(String event, String key, String json) {
+    // expiry is the (symbol,expiry)-chain this HPSF view belongs to, used as the per-session routing
+    // key (null for market-flow, which is whole-underlying). The legacy batch path ignores it.
+    private record HpsfCacheUpdate(String event, String key, String json, String expiry) {
     }
 
     private record ActiveSelection(String source, String symbol, String expiry, long selectionEpoch, long selectedAtMs) {
@@ -146,11 +201,29 @@ public class FeedGatewayService {
         void run(boolean retry) throws RuntimeException;
     }
 
-    public FeedGatewayService(GatewaySettings settings, ObjectMapper mapper, HpsfGatewayViewMapper hpsfViewMapper) {
+    public FeedGatewayService(GatewaySettings settings, ObjectMapper mapper, HpsfGatewayViewMapper hpsfViewMapper,
+                              @Nullable SessionRoutingEngine routingEngine) {
         this.settings = settings;
         this.mapper = mapper;
         this.hpsfViewMapper = hpsfViewMapper;
+        this.routingEngine = routingEngine;
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
+    }
+
+    /**
+     * True when the live data path is routed per-session instead of broadcast.
+     *
+     * <p>Isolation is COUPLED to auth (review finding #2 / C-2): whenever the routing engine is wired —
+     * which is exactly when {@code GATEWAY_AUTH_ENABLED=true} (MtSessionAuthConfig only creates the
+     * SessionRoutingEngine bean then) — per-session routing is forced ON. Otherwise an authenticated
+     * socket would receive the global broadcast of EVERY user's data. The legacy
+     * {@code GATEWAY_ROUTING_PER_SESSION} flag can only be used to force routing on; it can no longer be
+     * used to leave an auth-enabled gateway in broadcast mode.
+     */
+    private boolean perSessionRouting() {
+        // Intrinsic to auth (P0): the routing engine exists exactly when GATEWAY_AUTH_ENABLED=true, so an
+        // authenticated gateway ALWAYS routes per-session. There is no separate routing flag to leave off.
+        return routingEngine != null;
     }
 
     @PostConstruct
@@ -182,6 +255,26 @@ public class FeedGatewayService {
                 settings.webSocketBatchMs(),
                 TimeUnit.MILLISECONDS
         );
+        // P0 (write deadline): force-close any socket whose send has been stuck past the deadline, freeing
+        // its writer-pool thread so a few stuck/adversarial clients can never starve the healthy ones.
+        batchExecutor.scheduleAtFixedRate(
+                this::enforceOutboundWriteDeadlines,
+                settings.wsWriteDeadlineMs(),
+                Math.max(100L, settings.wsWriteDeadlineMs() / 2),
+                TimeUnit.MILLISECONDS
+        );
+    }
+
+    private void enforceOutboundWriteDeadlines() {
+        long now = System.currentTimeMillis();
+        long deadline = settings.wsWriteDeadlineMs();
+        for (OutboundChannel channel : outbound.values()) {
+            try {
+                channel.enforceWriteDeadline(now, deadline);
+            } catch (RuntimeException ignored) {
+                // a single channel must not break the sweep
+            }
+        }
     }
 
     @PreDestroy
@@ -205,13 +298,51 @@ public class FeedGatewayService {
                 Thread.currentThread().interrupt();
             }
         }
+        // Wake and stop any in-flight replay readers so shutdown is not held up by a blocking poll.
+        for (ReplayHandle handle : replayHandles.values()) {
+            handle.active.set(false);
+            handle.wakeConsumers();
+        }
+        ExecutorService currentReplayExecutor = replayExecutor;
+        if (currentReplayExecutor != null) {
+            currentReplayExecutor.shutdownNow();
+            try {
+                currentReplayExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        for (OutboundChannel channel : outbound.values()) {
+            channel.shutdown();
+        }
+        outbound.clear();
+        ExecutorService currentOutboundWriters = outboundWriters;
+        if (currentOutboundWriters != null) {
+            currentOutboundWriters.shutdownNow();
+            try {
+                currentOutboundWriters.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     public void addClient(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
+        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(),
+                settings.wsMaxQueuedMessages(), settings.wsMaxQueuedBytes(), outboundMetrics, this::onSlowDisconnect);
+        outbound.put(session.getId(), channel);
         clients.add(session);
+        clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
+        // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
+        // each socket gets only the cached state matching its own AppSession selection (no cross-
+        // contract leak), then live routed data (FR-11).
+        if (perSessionRouting()) {
+            replayCachedToSocket(session);
+            return;
+        }
         if (avroCaughtUp.get()) {
             sendCachedState(session, List.of("snapshot", "pace", "directional-pressure"));
         }
@@ -230,14 +361,139 @@ public class FeedGatewayService {
     }
 
     public void removeClient(WebSocketSession session) {
-        clients.remove(session);
+        String id = session.getId();
+        OutboundChannel channel = outbound.remove(id);
+        WebSocketSession stored = clientsById.remove(id);
+        if (stored != null) {
+            clients.remove(stored);
+        }
+        if (channel != null) {
+            channel.shutdown(); // quiet teardown — normal disconnect, not a slow-client eviction
+        }
+        closeQuietly(stored != null ? stored : session);
+    }
+
+    /**
+     * P0 (logout completeness): tear down a user's entire server-side session. Cancels any in-flight
+     * replay, removes the AppSession from the routing engine (so no further live/replay data can be routed
+     * to it), and force-closes EVERY socket attached to it. Returns the number of sockets closed. Safe to
+     * call when nothing is attached (returns 0).
+     */
+    public int logout(String appSessionId) {
+        if (routingEngine == null || appSessionId == null || appSessionId.isBlank()) {
+            return 0;
+        }
+        synchronized (replayControlLock) {
+            cancelActiveReplay(appSessionId); // stop any in-flight replay reader for this session
+        }
+        Set<String> sockets = routingEngine.teardownAppSession(appSessionId);
+        for (String socketId : sockets) {
+            OutboundChannel channel = outbound.remove(socketId);
+            WebSocketSession stored = clientsById.remove(socketId);
+            if (stored != null) {
+                clients.remove(stored);
+            }
+            if (channel != null) {
+                channel.shutdown();
+            }
+            closeQuietly(stored != null ? stored : (channel != null ? channel.session() : null));
+        }
+        return sockets.size();
+    }
+
+    /**
+     * Close a set of sockets the engine has ALREADY detached from routing (used by the expiry / revocation
+     * sweeps). Idempotent per socket; safe if a socket was concurrently closed.
+     */
+    public void closeSockets(java.util.Collection<String> socketIds) {
+        if (socketIds == null) {
+            return;
+        }
+        for (String socketId : socketIds) {
+            OutboundChannel channel = outbound.remove(socketId);
+            WebSocketSession stored = clientsById.remove(socketId);
+            if (stored != null) {
+                clients.remove(stored);
+            }
+            if (channel != null) {
+                channel.shutdown();
+            }
+            closeQuietly(stored != null ? stored : (channel != null ? channel.session() : null));
+        }
+    }
+
+    /**
+     * P0 (FR-18, evidenced scheduler): tear down every idle- or max-session-expired AppSession atomically
+     * and force-close its sockets. Returns the number of sessions expired. Driven by {@code SessionExpiryReaper}.
+     */
+    public int sweepExpiredSessions() {
+        if (routingEngine == null) {
+            return 0;
+        }
+        SessionRoutingEngine.SweepResult result = routingEngine.sweepExpired();
+        closeSockets(result.closedSocketIds());
+        return result.expiredAppSessionIds().size();
+    }
+
+    /** Detach a client the channel just disconnected for being too slow (the socket is already closed). */
+    private void onSlowDisconnect(OutboundChannel channel) {
+        outbound.remove(channel.socketId(), channel);
+        WebSocketSession stored = clientsById.remove(channel.socketId());
+        if (stored != null) {
+            clients.remove(stored);
+        }
+    }
+
+    private static void closeQuietly(WebSocketSession session) {
         try {
-            if (session.isOpen()) {
+            if (session != null && session.isOpen()) {
                 session.close();
             }
-        } catch (IOException | IllegalStateException ignored) {
-            // Removing the session from the fanout set is sufficient.
+        } catch (IOException | RuntimeException ignored) {
+            // best effort
         }
+    }
+
+    /** Deployment-injected Keycloak config for the bundled sign-in pages (issuer + client id; no secrets). */
+    public String authConfigJson() {
+        return "{\"issuer\":\"" + escapeJson(settings.keycloakIssuer())
+                + "\",\"clientId\":\"" + escapeJson(settings.keycloakClientId()) + "\"}";
+    }
+
+    private int totalOutboundQueued() {
+        int sum = 0;
+        for (OutboundChannel channel : outbound.values()) {
+            sum += channel.queueDepth();
+        }
+        return sum;
+    }
+
+    /** Visible for tests: run outbound writes inline (caller-runs) so delivery is synchronous + deterministic. */
+    void runOutboundWritesInline() {
+        outboundWriterOverride = Runnable::run;
+    }
+
+    private java.util.concurrent.Executor outboundWriterExecutor() {
+        java.util.concurrent.Executor override = outboundWriterOverride;
+        return override != null ? override : outboundWriters();
+    }
+
+    private ExecutorService outboundWriters() {
+        ExecutorService e = outboundWriters;
+        if (e == null) {
+            synchronized (this) {
+                e = outboundWriters;
+                if (e == null) {
+                    e = Executors.newFixedThreadPool(settings.wsWriterThreads(), r -> {
+                        Thread t = new Thread(r, "options-edge-ws-writer");
+                        t.setDaemon(true);
+                        return t;
+                    });
+                    outboundWriters = e;
+                }
+            }
+        }
+        return e;
     }
 
     // 4001 is in the application-private close-code range (4000-4999); the browser client reads it,
@@ -258,6 +514,11 @@ public class FeedGatewayService {
                 continue;
             }
             clients.remove(session);
+            clientsById.remove(session.getId());
+            OutboundChannel channel = outbound.remove(session.getId());
+            if (channel != null) {
+                channel.shutdown();
+            }
             try {
                 if (session.isOpen()) {
                     session.close(TOKEN_EXPIRED_STATUS);
@@ -282,12 +543,19 @@ public class FeedGatewayService {
                 + "\"avroCaughtUp\":" + avroCaughtUp.get() + ","
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
                 + "\"hpsfCaughtUp\":" + hpsfCaughtUp.get() + ","
+                + "\"instanceId\":\"" + escapeJson(settings.instanceId()) + "\","
                 + "\"clients\":" + clients.size() + ","
+                + "\"outboundQueued\":" + totalOutboundQueued() + ","
+                + "\"outboundCoalesced\":" + wsCoalesced.get() + ","
+                + "\"outboundSlowDisconnects\":" + wsSlowDisconnects.get() + ","
+                + "\"outboundWriteErrors\":" + wsWriteErrors.get() + ","
+                + "\"outboundDroppedOnClose\":" + wsDroppedOnClose.get() + ","
                 + "\"snapshots\":" + snapshots.size() + ","
                 + "\"paces\":" + paces.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"indexPrices\":" + indexPrices.size() + ","
+                + "\"vixPrices\":" + vixPrices.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
@@ -301,6 +569,7 @@ public class FeedGatewayService {
                 + "\"batchesSent\":" + batchesSent.get() + ","
                 + "\"forwardedEvents\":" + forwardedEvents.get() + ","
                 + "\"inactiveDroppedEvents\":" + inactiveDroppedEvents.get() + ","
+                + "\"droppedNonRoutableEvents\":" + droppedNonRoutableEvents.get() + ","
                 + "\"staleDroppedEvents\":" + staleDroppedEvents.get() + ","
                 + "\"seekToLatestEvents\":" + seekToLatestEvents.get() + ","
                 + "\"sourceStaleEvents\":" + sourceStaleEvents.get() + ","
@@ -333,6 +602,21 @@ public class FeedGatewayService {
                 + "# HELP options_edge_feed_gateway_clients Connected WebSocket client count.\n"
                 + "# TYPE options_edge_feed_gateway_clients gauge\n"
                 + "options_edge_feed_gateway_clients " + clients.size() + "\n"
+                + "# HELP options_edge_gateway_ws_queued Outbound messages currently buffered across all sockets.\n"
+                + "# TYPE options_edge_gateway_ws_queued gauge\n"
+                + "options_edge_gateway_ws_queued " + totalOutboundQueued() + "\n"
+                + "# HELP options_edge_gateway_ws_coalesced_total Replaceable snapshots collapsed by coalescing.\n"
+                + "# TYPE options_edge_gateway_ws_coalesced_total counter\n"
+                + "options_edge_gateway_ws_coalesced_total " + wsCoalesced.get() + "\n"
+                + "# HELP options_edge_gateway_ws_slow_disconnects_total Clients disconnected for exceeding outbound limits.\n"
+                + "# TYPE options_edge_gateway_ws_slow_disconnects_total counter\n"
+                + "options_edge_gateway_ws_slow_disconnects_total " + wsSlowDisconnects.get() + "\n"
+                + "# HELP options_edge_gateway_ws_write_errors_total Outbound write failures/timeouts.\n"
+                + "# TYPE options_edge_gateway_ws_write_errors_total counter\n"
+                + "options_edge_gateway_ws_write_errors_total " + wsWriteErrors.get() + "\n"
+                + "# HELP options_edge_gateway_ws_dropped_on_close_total Queued messages discarded when a slow client was dropped.\n"
+                + "# TYPE options_edge_gateway_ws_dropped_on_close_total counter\n"
+                + "options_edge_gateway_ws_dropped_on_close_total " + wsDroppedOnClose.get() + "\n"
                 + "# HELP options_edge_feed_gateway_snapshots Cached option snapshot count.\n"
                 + "# TYPE options_edge_feed_gateway_snapshots gauge\n"
                 + "options_edge_feed_gateway_snapshots " + snapshots.size() + "\n"
@@ -348,6 +632,9 @@ public class FeedGatewayService {
                 + "# HELP options_edge_feed_gateway_index_prices Cached index price count.\n"
                 + "# TYPE options_edge_feed_gateway_index_prices gauge\n"
                 + "options_edge_feed_gateway_index_prices " + indexPrices.size() + "\n"
+                + "# HELP options_edge_feed_gateway_vix_prices Cached shared VIX (last-known) entry count.\n"
+                + "# TYPE options_edge_feed_gateway_vix_prices gauge\n"
+                + "options_edge_feed_gateway_vix_prices " + vixPrices.size() + "\n"
                 + "# HELP options_edge_feed_gateway_current_states Cached current-state count.\n"
                 + "# TYPE options_edge_feed_gateway_current_states gauge\n"
                 + "options_edge_feed_gateway_current_states " + currentStates.size() + "\n"
@@ -391,6 +678,9 @@ public class FeedGatewayService {
                 + "# HELP options_edge_gateway_inactive_dropped_total Inactive-source records consumed but not forwarded.\n"
                 + "# TYPE options_edge_gateway_inactive_dropped_total counter\n"
                 + "options_edge_gateway_inactive_dropped_total " + inactiveDroppedEvents.get() + "\n"
+                + "# HELP options_edge_gateway_dropped_non_routable_total Malformed/unroutable market-data events dropped (per-session mode, not broadcast).\n"
+                + "# TYPE options_edge_gateway_dropped_non_routable_total counter\n"
+                + "options_edge_gateway_dropped_non_routable_total " + droppedNonRoutableEvents.get() + "\n"
                 + "# HELP options_edge_gateway_stale_dropped_total Selected-source records dropped behind the active switch barrier.\n"
                 + "# TYPE options_edge_gateway_stale_dropped_total counter\n"
                 + "options_edge_gateway_stale_dropped_total " + staleDroppedEvents.get() + "\n"
@@ -489,6 +779,7 @@ public class FeedGatewayService {
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
+        topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
@@ -512,6 +803,7 @@ public class FeedGatewayService {
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
+        topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
@@ -573,7 +865,14 @@ public class FeedGatewayService {
                 for (ConsumerRecord<String, String> record : records) {
                     HpsfCacheUpdate update = updateHpsfCache(record);
                     if (update != null && hpsfCaughtUp.get()) {
-                        enqueuePending(update.event(), update.key(), update.json());
+                        // P0 (HPSF bypass): in tenant mode route per-session by the record's chain key
+                        // so HPSF signals/audit reach only entitled sessions; the all-client batch path
+                        // is unreachable. Legacy single-tenant mode keeps the coalesced batch.
+                        if (perSessionRouting()) {
+                            routeHpsfPerSession(update);
+                        } else {
+                            enqueuePending(update.event(), update.key(), update.json());
+                        }
                         forwardedEvents.incrementAndGet();
                     } else if (update != null) {
                         inactiveDroppedEvents.incrementAndGet();
@@ -614,8 +913,8 @@ public class FeedGatewayService {
                 for (ConsumerRecord<String, String> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = binding == null ? null : enrichJson(record.value(), binding);
-                    if (json != null && !json.isBlank() && shouldForward(binding, json, record)) {
-                        broadcast(binding.event(), json);
+                    if (json != null && !json.isBlank() && (perSessionRouting() || shouldForward(binding, json, record))) {
+                        routeOrBroadcast(binding.source(), binding.event(), json);
                         forwardedEvents.incrementAndGet();
                         recordSelectedForward(binding, json);
                     } else {
@@ -724,7 +1023,13 @@ public class FeedGatewayService {
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
-                    if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json, record)) {
+                    // Per-session mode: route directly via the engine using the authoritative
+                    // topic-binding source (bypasses the global single-source/selection/barrier gate;
+                    // supports IBKR + Databento users simultaneously). shouldForward gates legacy mode.
+                    if (perSessionRouting()) {
+                        routeOrBroadcast(binding.source(), binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                    } else if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json, record)) {
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
                         recordSelectedForward(binding, json);
@@ -1002,6 +1307,7 @@ public class FeedGatewayService {
                     settings.ibkrVixPriceTopic(),
                     settings.databentoEsTradesTopic(),
                     settings.databentoStrikeFlowTopic(),
+                    settings.databentoGexTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic()
             );
@@ -1025,9 +1331,6 @@ public class FeedGatewayService {
             return "DATABENTO".equals(selection.source()) && passesSelectionBarrier(record, selection);
         }
         if (!binding.source().equals(selection.source())) {
-            return false;
-        }
-        if ("gex-by-strike".equals(binding.event()) && !"IBKR".equals(selection.source())) {
             return false;
         }
         if (!passesSelectionBarrier(record, selection)) {
@@ -1167,6 +1470,8 @@ public class FeedGatewayService {
             key = indexPriceCacheKey(json, key);
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
+        } else if ("gex-by-strike".equals(event)) {
+            key = gexCacheKey(json, key);
         }
         if (!"pace".equals(event)) {
             key = binding.source() + "|" + key;
@@ -1207,7 +1512,13 @@ public class FeedGatewayService {
                 directionalPressures.put(key, json);
                 return key;
             }
-            case "vix-price", "index-price" -> {
+            case "vix-price" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                vixPrices.put(key, json); // SHARED last-known VIX, kept distinct from ES/index
+                return key;
+            }
+            case "index-price" -> {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 indexPrices.put(key, json);
@@ -1276,14 +1587,19 @@ public class FeedGatewayService {
             String groupKey = hpsfGroupKey(signal.tradeDate(), signal.expiry(), fallbackKey(record));
             hpsfLatestEvaluationIds.put(groupKey, signal.evaluationId());
             String json = write(hpsfViewMapper.latestSignalView(HpsfTopics.HPSF_LATEST_SIGNAL, signal));
-            HpsfCacheUpdate update = new HpsfCacheUpdate("hpsf-latest-signal", groupKey, json);
-            HpsfCacheUpdate candidates = topCandidatesUpdate(groupKey);
+            HpsfCacheUpdate update = new HpsfCacheUpdate("hpsf-latest-signal", groupKey, json, signal.expiry());
+            HpsfCacheUpdate candidates = topCandidatesUpdate(groupKey, signal.expiry());
             if (candidates != null) {
                 cacheEventTimes.put(candidates.event() + ":" + candidates.key(), cacheTimestamp(record));
                 cachePositions.put(candidates.event() + ":" + candidates.key(), recordPosition(record));
                 putHpsfView(candidates);
                 if (hpsfCaughtUp.get()) {
-                    enqueuePending(candidates.event(), candidates.key(), candidates.json());
+                    // Same P0 gate as the live consumer: route per-session in tenant mode, batch in legacy.
+                    if (perSessionRouting()) {
+                        routeHpsfPerSession(candidates);
+                    } else {
+                        enqueuePending(candidates.event(), candidates.key(), candidates.json());
+                    }
                 }
             }
             return update;
@@ -1291,28 +1607,28 @@ public class FeedGatewayService {
         if (settings.hpsfMarketFlowTopic().equals(topic)) {
             MarketFlowSnapshot snapshot = read(rawJson, MarketFlowSnapshot.class);
             String key = fallbackKey(record);
-            return new HpsfCacheUpdate("hpsf-market-flow", key, write(hpsfViewMapper.marketFlowView(snapshot)));
+            return new HpsfCacheUpdate("hpsf-market-flow", key, write(hpsfViewMapper.marketFlowView(snapshot)), null);
         }
         if (settings.hpsfStrikeScoreTopic().equals(topic)) {
             StrikeScoreSnapshot score = read(rawJson, StrikeScoreSnapshot.class);
             String groupKey = hpsfGroupKey(score.tradeDate(), score.expiry(), fallbackKey(record));
             hpsfStrikeScores.put(groupKey + "|" + fallbackKey(record), score);
-            return topCandidatesUpdate(groupKey);
+            return topCandidatesUpdate(groupKey, score.expiry());
         }
         if (settings.hpsfAuditTopic().equals(topic)) {
             HpsfAuditEvent audit = read(rawJson, HpsfAuditEvent.class);
             String key = hpsfGroupKey(audit.tradeDate(), audit.expiry(), fallbackKey(record));
-            return new HpsfCacheUpdate("hpsf-audit", key, write(hpsfViewMapper.auditView(audit)));
+            return new HpsfCacheUpdate("hpsf-audit", key, write(hpsfViewMapper.auditView(audit)), audit.expiry());
         }
         if (settings.hpsfExitSignalTopic().equals(topic)) {
             HpsfExitIntentEvent event = read(rawJson, HpsfExitIntentEvent.class);
             String key = hpsfGroupKey(event.tradeDate(), event.expiry(), fallbackKey(record));
-            return new HpsfCacheUpdate("hpsf-exit-intent", key, write(hpsfViewMapper.exitIntentView(event)));
+            return new HpsfCacheUpdate("hpsf-exit-intent", key, write(hpsfViewMapper.exitIntentView(event)), event.expiry());
         }
         return null;
     }
 
-    private HpsfCacheUpdate topCandidatesUpdate(String groupKey) {
+    private HpsfCacheUpdate topCandidatesUpdate(String groupKey, String expiry) {
         String latestEvaluationId = hpsfLatestEvaluationIds.get(groupKey);
         List<StrikeScoreSnapshot> scores = hpsfStrikeScores.entrySet().stream()
                 .filter(entry -> entry.getKey().startsWith(groupKey + "|"))
@@ -1322,7 +1638,7 @@ public class FeedGatewayService {
         if (scores.isEmpty()) {
             return null;
         }
-        return new HpsfCacheUpdate("hpsf-top-candidates", groupKey, write(hpsfViewMapper.topCandidatesView(scores)));
+        return new HpsfCacheUpdate("hpsf-top-candidates", groupKey, write(hpsfViewMapper.topCandidatesView(scores)), expiry);
     }
 
     private void putHpsfView(HpsfCacheUpdate update) {
@@ -1386,9 +1702,15 @@ public class FeedGatewayService {
         if (cachedEvents.isEmpty()) {
             return false;
         }
-        String envelope = uiBatchEnvelopeJson(cachedEvents);
-        for (WebSocketSession client : clients) {
-            sendEnvelope(client, envelope);
+        // Per-session mode: cached market-data state is replayed per-socket on connect
+        // (replayCachedToSocket, FR-11); never fan a global ui-batch of snapshots/paces to all.
+        if (perSessionRouting()) {
+            droppedNonRoutableEvents.addAndGet(cachedEvents.size());
+        } else {
+            String envelope = uiBatchEnvelopeJson(cachedEvents);
+            for (WebSocketSession client : clients) {
+                sendEnvelope(client, envelope);
+            }
         }
         return cachedEvents.stream().anyMatch(cachedEvent -> "snapshot".equals(cachedEvent.event()));
     }
@@ -1432,7 +1754,9 @@ public class FeedGatewayService {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("directional-pressure", entry.getValue()))
                         .forEach(cachedEvents::add);
-                case "vix-price" -> indexPrices.entrySet().stream()
+                case "vix-price" -> vixPrices.entrySet().stream()
+                        // VIX is SHARED + optional: replay the last-known value to every session (any source);
+                        // an empty map simply omits VIX.
                         .filter(entry -> isCacheFresh("vix-price:" + entry.getKey(), nowMs))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("vix-price", entry.getValue()))
@@ -1585,7 +1909,7 @@ public class FeedGatewayService {
         } else if (versionKey.startsWith("directional-pressure:")) {
             directionalPressures.remove(versionKey.substring("directional-pressure:".length()));
         } else if (versionKey.startsWith("vix-price:")) {
-            indexPrices.remove(versionKey.substring("vix-price:".length()));
+            vixPrices.remove(versionKey.substring("vix-price:".length()));
         } else if (versionKey.startsWith("index-price:")) {
             indexPrices.remove(versionKey.substring("index-price:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
@@ -1647,6 +1971,24 @@ public class FeedGatewayService {
             String expiry = normalizeExpiry(text(root, "expiry"));
             if (!symbol.isBlank() && !expiry.isBlank()) {
                 return symbol + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    private String gexCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            double strike = doubleField(root, "strike", Double.NaN);
+            // Derive a deterministic per-strike key from payload identity instead of
+            // trusting the producer's Kafka key. Source is prepended by updateCache, so
+            // the cache key matches the UI contract (source|symbol|expiry|strike).
+            if (!symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike)) {
+                return symbol + "|" + expiry + "|" + formatStrike(strike);
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
@@ -1761,36 +2103,920 @@ public class FeedGatewayService {
     }
 
     private void broadcast(String event, String json) {
+        // Per-session routing: only explicitly allowlisted global events may fan out to every
+        // socket. Any other event reaching here (e.g. a market-data event via a fallback path) is
+        // dropped so it can never leak to another user. Legacy mode broadcasts everything.
+        if (perSessionRouting() && !isGlobalBroadcastEvent(event)) {
+            droppedNonRoutableEvents.incrementAndGet();
+            return;
+        }
         for (WebSocketSession client : clients) {
             send(client, event, json);
         }
     }
 
+    /** Per-session filtered replay of cached state to a newly-connected socket (FR-11). */
+    private void replayCachedToSocket(WebSocketSession session) {
+        replayCacheMap(session, "snapshot", snapshots);
+        replayCacheMap(session, "pace", paces);
+        replayCacheMap(session, "directional-pressure", directionalPressures);
+        replayCacheMap(session, "strike-flow", strikeFlows);
+        replayCacheMap(session, "gex-by-strike", gexByStrike);
+        // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
+        // as index-price — so a VIX record is never delivered mislabelled as index-price.
+        replayCacheMap(session, "vix-price", vixPrices);
+        replayCacheMap(session, "index-price", indexPrices);
+    }
+
+    private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {
+        if (routingEngine == null) {
+            return;
+        }
+        String socketId = session.getId();
+        for (Map.Entry<String, String> entry : cache.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            try {
+                JsonNode root = mapper.readTree(json);
+                // Cache keys are "SOURCE|..." (see updateCache); use that as the authoritative source
+                // since Avro contract payloads carry no marketDataSource field.
+                String key = entry.getKey();
+                int bar = key == null ? -1 : key.indexOf('|');
+                String source = bar > 0 ? key.substring(0, bar)
+                        : (root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "");
+                Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
+                if (rec.isPresent() && routingEngine.shouldDeliverToSocket(rec.get(), socketId)) {
+                    send(session, event, json);
+                }
+            } catch (JsonProcessingException ignored) {
+                // skip malformed cached entry
+            }
+        }
+    }
+
+    // =====================================================================
+    // Per-session historical replay (ReplayRunner, reqs 7/8). Reads historical
+    // records READ-ONLY (assign + seek, auto-commit off) and streams them ONLY to
+    // the requesting session's sockets. Nothing is ever published to live topics.
+    // While a session replays, SessionRoutingEngine.route() skips it, so other
+    // users keep receiving live data uninterrupted (req. 7).
+    // =====================================================================
+
+    // P0 (cancellation/generation barrier). Each control action (start/stop/return-to-live) is serialized
+    // per service and assigns a monotonic GENERATION that "owns" the session's replay output. A reader may
+    // emit data or a terminal status ONLY while its generation is still the owner; the instant a newer
+    // generation is installed (or the run is canceled) the old reader goes silent — so a stale poll batch,
+    // or a late terminal status, can never reach the UI after the user moved on.
+    private final Object replayControlLock = new Object();
+    private final Map<String, ReplayHandle> replayHandles = new ConcurrentHashMap<>();
+    private final Map<String, Long> replayOwnerGeneration = new ConcurrentHashMap<>();
+    private final AtomicLong replayGenerationSeq = new AtomicLong();
+    private volatile ExecutorService replayExecutor;
+
+    /** Handle to one running reader: its generation, cooperative cancel flag, Future, and live consumers. */
+    static final class ReplayHandle {
+        final long generation;
+        final AtomicBoolean active = new AtomicBoolean(true);
+        volatile Future<?> future;
+        volatile KafkaConsumer<?, ?> avroConsumer;
+        volatile KafkaConsumer<?, ?> stringConsumer;
+
+        ReplayHandle(long generation) {
+            this.generation = generation;
+        }
+
+        /** Break a blocking poll/offsetsForTimes immediately (WakeupException), without interrupting I/O. */
+        void wakeConsumers() {
+            KafkaConsumer<?, ?> a = avroConsumer;
+            KafkaConsumer<?, ?> s = stringConsumer;
+            if (a != null) {
+                a.wakeup();
+            }
+            if (s != null) {
+                s.wakeup();
+            }
+        }
+    }
+
+    private ExecutorService replayExecutor() {
+        ExecutorService e = replayExecutor;
+        if (e == null) {
+            synchronized (replayControlLock) {
+                e = replayExecutor;
+                if (e == null) {
+                    // Bounded: at most replayMaxConcurrent readers; further starts are REJECTED (never an
+                    // unbounded fan-out of daemon threads).
+                    e = new ThreadPoolExecutor(0, settings.replayMaxConcurrent(), 60L, TimeUnit.SECONDS,
+                            new SynchronousQueue<>(),
+                            r -> {
+                                Thread t = new Thread(r, "options-edge-replay");
+                                t.setDaemon(true);
+                                return t;
+                            },
+                            new ThreadPoolExecutor.AbortPolicy());
+                    replayExecutor = e;
+                }
+            }
+        }
+        return e;
+    }
+
+    /** Visible for tests: a handle pre-registered as the current owner of the session's replay output. */
+    ReplayHandle registerOwnerHandleForTest(String appSessionId) {
+        long gen = replayGenerationSeq.incrementAndGet();
+        replayOwnerGeneration.put(appSessionId, gen);
+        return new ReplayHandle(gen);
+    }
+
+    /** True while {@code generation} is still the owner entitled to emit for {@code appSessionId}. */
+    private boolean isReplayOwner(String appSessionId, long generation) {
+        Long owner = replayOwnerGeneration.get(appSessionId);
+        return owner != null && owner == generation;
+    }
+
+    /**
+     * Cancel any in-flight reader for the session and BARRIER on its termination: install a fresh owner
+     * generation (so the old reader is no longer entitled to emit anything), wake its consumers, interrupt
+     * its Future, and await the thread leaving before returning. After this the caller may safely install
+     * the next state. Must be called holding {@link #replayControlLock}.
+     */
+    private void cancelActiveReplay(String appSessionId) {
+        // Invalidate the current owner FIRST so even a reader mid-emit stops being entitled to send.
+        replayOwnerGeneration.put(appSessionId, replayGenerationSeq.incrementAndGet());
+        ReplayHandle prev = replayHandles.remove(appSessionId);
+        if (prev == null) {
+            return;
+        }
+        prev.active.set(false);
+        prev.wakeConsumers();
+        Future<?> f = prev.future;
+        if (f != null) {
+            f.cancel(true);
+            try {
+                f.get(settings.replayShutdownAwaitMs(), TimeUnit.MILLISECONDS);
+            } catch (TimeoutException te) {
+                // Reader did not exit in time; the generation barrier already prevents any further emits,
+                // so it is harmless — log and move on rather than blocking the control call forever.
+                System.err.println("Feed gateway replay reader for " + appSessionId + " did not stop within "
+                        + settings.replayShutdownAwaitMs() + "ms; proceeding (output already barriered).");
+            } catch (CancellationException | ExecutionException ignored) {
+                // canceled / threw on the way out — fine, it is no longer the owner
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    @Override
+    public ReplayRunner.Mode startReplay(ReplayParams params) {
+        if (routingEngine == null) {
+            throw new IllegalStateException("per-session routing is not enabled");
+        }
+        String appSessionId = params.sessionId();
+        synchronized (replayControlLock) {
+            cancelActiveReplay(appSessionId); // cancel + wake + await any prior run for this session
+            long generation = replayGenerationSeq.incrementAndGet();
+            ReplayHandle handle = new ReplayHandle(generation);
+            replayOwnerGeneration.put(appSessionId, generation);
+            replayHandles.put(appSessionId, handle);
+            routingEngine.setReplayMode(appSessionId, true);
+            // Clear the live rows and flip the UI badge (reqs 9).
+            sendToAppSession(appSessionId, "reset", "{\"reason\":\"replay-start\"}");
+            sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_RUNNING", params, 0L));
+            try {
+                handle.future = replayExecutor().submit(() -> runReplay(appSessionId, params, handle));
+            } catch (RejectedExecutionException tooMany) {
+                replayHandles.remove(appSessionId, handle);
+                replayOwnerGeneration.put(appSessionId, replayGenerationSeq.incrementAndGet());
+                routingEngine.setReplayMode(appSessionId, false);
+                throw new IllegalStateException("replay capacity reached; please retry shortly");
+            }
+            return ReplayRunner.Mode.REPLAY_RUNNING;
+        }
+    }
+
+    @Override
+    public ReplayRunner.Mode stopReplay(String appSessionId) {
+        synchronized (replayControlLock) {
+            boolean wasRunning = replayHandles.containsKey(appSessionId);
+            cancelActiveReplay(appSessionId);
+            if (wasRunning) {
+                // Authoritative terminal status from the control thread (the reader is now barriered silent).
+                sendToAppSession(appSessionId, "replay-status",
+                        replayTerminalJson(ReplayOutcome.CANCELED, appSessionId));
+            }
+            return ReplayRunner.Mode.REPLAY_COMPLETE; // stays in replay mode until the user returns to live
+        }
+    }
+
+    @Override
+    public ReplayRunner.Mode resumeLive(String appSessionId) {
+        synchronized (replayControlLock) {
+            cancelActiveReplay(appSessionId);
+            if (routingEngine != null) {
+                routingEngine.setReplayMode(appSessionId, false);
+            }
+            // Clear replay rows and re-seed the latest live cache, then live routing resumes (req. 10).
+            sendToAppSession(appSessionId, "reset", "{\"reason\":\"return-to-live\"}");
+            replayLiveCacheToAppSession(appSessionId);
+            sendToAppSession(appSessionId, "replay-status", "{\"mode\":\"LIVE\"}");
+            return ReplayRunner.Mode.LIVE;
+        }
+    }
+
+    private void runReplay(String appSessionId, ReplayParams params, ReplayHandle handle) {
+        MarketDataSource source = routingEngine.appSession(appSessionId)
+                .map(app -> app.selection().source()).orElse(null);
+        long delivered = 0L;
+        ReplayOutcome outcome = ReplayOutcome.COMPLETED;
+        String error = null;
+        if (source != null) {
+            Map<String, String> avroTopics = new LinkedHashMap<>();
+            Map<String, String> stringTopics = new LinkedHashMap<>();
+            if (source == MarketDataSource.DATABENTO) {
+                avroTopics.put(settings.databentoDisplayTopic(), "snapshot");
+                avroTopics.put(settings.databentoPaceTopic(), "pace");
+                avroTopics.put(settings.databentoDirectionalPressureTopic(), "directional-pressure");
+                stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
+                stringTopics.put(settings.databentoGexTopic(), "gex-by-strike");
+                stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
+            } else {
+                avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
+                avroTopics.put(settings.ibkrPaceTopic(), "pace");
+                avroTopics.put(settings.ibkrDirectionalPressureTopic(), "directional-pressure");
+                stringTopics.put(settings.ibkrUnusualWhalesGexTopic(), "gex-by-strike");
+                stringTopics.put(settings.ibkrVixPriceTopic(), "vix-price");
+            }
+            if (params.hasRun()) {
+                // Read the orchestrated run's LOCAL replay topics instead of the live topics.
+                avroTopics = toReplayTopics(avroTopics, params.runId());
+                stringTopics = toReplayTopics(stringTopics, params.runId());
+            }
+            try {
+                // P0 (replay chronology): a SINGLE deterministic k-way merge across ALL topics (avro +
+                // string) by canonical event time — never topic-by-topic, which would surface "all
+                // snapshots then all strike-flow" and let the record cap drain entirely in one phase.
+                ReplayResult result = replayMerged(appSessionId, params, source, avroTopics, stringTopics, handle);
+                delivered = result.delivered();
+                outcome = result.outcome();
+            } catch (WakeupException canceled) {
+                outcome = ReplayOutcome.CANCELED; // a control call woke the consumer to stop this run
+            } catch (RuntimeException e) {
+                outcome = ReplayOutcome.FAILED;
+                error = String.valueOf(e.getMessage());
+            }
+        }
+        // Free our handle only if it is still ours (a newer generation may have replaced it already).
+        replayHandles.remove(appSessionId, handle);
+        // P0 (cancellation/generation barrier): emit a terminal status ONLY if this reader is still the
+        // owner. A canceled/superseded reader stays silent — the control call that replaced it sends the
+        // authoritative next status — so a stale terminal can never overwrite the live/new-replay state.
+        // Exactly ONE terminal status is sent, with a distinct state (completed/timed-out/failed).
+        if (outcome == ReplayOutcome.CANCELED || !isReplayOwner(appSessionId, handle.generation)) {
+            return;
+        }
+        synchronized (replayControlLock) {
+            if (!isReplayOwner(appSessionId, handle.generation)) {
+                return; // a control call slipped in between the check and the lock — defer to it
+            }
+            // This reader finished on its own and is still the owner; retire the generation and report.
+            replayOwnerGeneration.put(appSessionId, replayGenerationSeq.incrementAndGet());
+            sendToAppSession(appSessionId, "replay-status",
+                    replayTerminalJson(outcome, params, delivered, error));
+        }
+    }
+
+    /** Map a terminal outcome to its distinct UI status (completed/canceled/timed-out/failed). */
+    private static String terminalMode(ReplayOutcome outcome) {
+        return switch (outcome) {
+            case COMPLETED -> "REPLAY_COMPLETE";
+            case CANCELED -> "REPLAY_CANCELED";
+            case TIMED_OUT -> "REPLAY_TIMED_OUT";
+            case FAILED -> "REPLAY_FAILED";
+        };
+    }
+
+    /** Terminal status used by the control thread for an explicit cancel (no window/record context). */
+    private String replayTerminalJson(ReplayOutcome outcome, String appSessionId) {
+        return "{\"mode\":\"" + terminalMode(outcome) + "\",\"complete\":"
+                + (outcome == ReplayOutcome.COMPLETED) + "}";
+    }
+
+    /** Terminal status used by the reader: carries the window, delivered count, and any error. */
+    private String replayTerminalJson(ReplayOutcome outcome, ReplayParams params, long delivered, String error) {
+        StringBuilder b = new StringBuilder()
+                .append("{\"mode\":\"").append(terminalMode(outcome))
+                .append("\",\"complete\":").append(outcome == ReplayOutcome.COMPLETED)
+                .append(",\"symbol\":\"").append(escapeJson(params.symbol()))
+                .append("\",\"expiry\":\"").append(escapeJson(params.expiry()))
+                .append("\",\"startUtcMs\":").append(params.startUtcMs())
+                .append(",\"endUtcMs\":").append(params.endUtcMs())
+                .append(",\"records\":").append(delivered)
+                .append(",\"maxRecords\":").append(params.maxRecords());
+        if (outcome == ReplayOutcome.TIMED_OUT && error == null) {
+            error = "replay timed out before all captured data was read";
+        }
+        if (error != null) {
+            b.append(",\"error\":\"").append(escapeJson(error)).append("\"");
+        }
+        return b.append("}").toString();
+    }
+
+    /**
+     * Deterministic chronological replay (P0 — replay chronology). Reads the session's avro AND string
+     * replay topics together and merges every partition by canonical event time
+     * ({@code eventTimestamp → topic → partition → offset}; see {@link ReplayChronology}), so the outbound
+     * stream reproduces the real market sequence and the record cap bounds the merged timeline instead of
+     * being exhausted by whichever topic is read first. Each outbound event keeps its source timestamp,
+     * topic, partition and offset.
+     */
+    /**
+     * Distinct terminal states of a replay read (P0): {@code COMPLETED} — every active partition reached
+     * its captured target offset (or the record cap was hit); {@code CANCELED} — superseded by a newer
+     * generation or an explicit stop/return-to-live; {@code TIMED_OUT} — a poll deadline expired short of
+     * target; {@code FAILED} — a read error. Only COMPLETED is "success".
+     */
+    enum ReplayOutcome { COMPLETED, CANCELED, TIMED_OUT, FAILED }
+
+    record ReplayResult(long delivered, ReplayOutcome outcome) {
+    }
+
+    private ReplayResult replayMerged(String appSessionId, ReplayParams params, MarketDataSource source,
+                                      Map<String, String> avroTopics, Map<String, String> stringTopics,
+                                      ReplayHandle handle) {
+        if (avroTopics.isEmpty() && stringTopics.isEmpty()) {
+            return new ReplayResult(0L, ReplayOutcome.COMPLETED);
+        }
+        KafkaConsumer<String, Object> avro = null;
+        KafkaConsumer<String, Object> str = null;
+        try {
+            Map<TopicPartition, ReplayPartitionState> parts = new LinkedHashMap<>();
+            if (!avroTopics.isEmpty()) {
+                avro = new KafkaConsumer<>(replayConsumerProps(appSessionId, true));
+                handle.avroConsumer = avro; // publish for wakeup() before any blocking call
+                openReplayPartitions(avro, params, avroTopics, true, parts);
+            }
+            if (!stringTopics.isEmpty()) {
+                str = new KafkaConsumer<>(replayConsumerProps(appSessionId, false));
+                handle.stringConsumer = str;
+                openReplayPartitions(str, params, stringTopics, false, parts);
+            }
+            if (parts.isEmpty()) {
+                return new ReplayResult(0L, ReplayOutcome.COMPLETED);
+            }
+            return mergeReplayPartitions(appSessionId, params, source, avro, str, parts, handle);
+        } catch (WakeupException woken) {
+            // A control call (stop/return-to-live/new replay) woke the consumer — cancel cleanly.
+            return new ReplayResult(0L, ReplayOutcome.CANCELED);
+        } finally {
+            // Detach BEFORE close so a concurrent wakeup() can never touch a closed consumer.
+            handle.avroConsumer = null;
+            handle.stringConsumer = null;
+            if (avro != null) {
+                avro.close();
+            }
+            if (str != null) {
+                str.close();
+            }
+        }
+    }
+
+    /** Per-partition cursor for the replay merge: a buffer of in-order records plus its window end. */
+    static final class ReplayPartitionState {
+        final boolean avro;
+        final String event;
+        final long endTarget;                          // exclusive: read offsets < endTarget
+        final ArrayDeque<MergeRecord> buffer = new ArrayDeque<>();
+        boolean drained;                               // consumer position reached endTarget — nothing more to poll
+
+        ReplayPartitionState(boolean avro, String event, long endTarget) {
+            this.avro = avro;
+            this.event = event;
+            this.endTarget = endTarget;
+        }
+    }
+
+    /** One buffered record awaiting chronological emission. */
+    record MergeRecord(ReplayChronology.Cursor cursor, String event, Object value, boolean avro) {
+    }
+
+    private Properties replayConsumerProps(String appSessionId, boolean avro) {
+        Properties props = avro
+                ? avroConsumerProperties("replay-" + appSessionId)
+                : stringObjectConsumerProperties("replay-" + appSessionId);
+        // Unique group per run so the windowed read is independent and commits nothing (read-only).
+        props.put(ConsumerConfig.GROUP_ID_CONFIG,
+                settings.groupIdBase() + "-replay-" + appSessionId + "-" + (avro ? "avro" : "str"));
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        return props;
+    }
+
+    /** Assign + seek this consumer's partitions for the window (or full runId topics) and register state. */
+    private void openReplayPartitions(KafkaConsumer<String, Object> consumer, ReplayParams params,
+                                      Map<String, String> topicEvents, boolean avro,
+                                      Map<TopicPartition, ReplayPartitionState> parts) {
+        List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
+        consumer.assign(partitions);
+        Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
+        if (params.hasRun()) {
+            // Orchestrated run: the *.replay.<runId>.* topics already contain exactly the windowed data,
+            // so read each partition in full (beginning..log-end) — no timestamp slicing.
+            Map<TopicPartition, Long> begin = consumer.beginningOffsets(partitions);
+            for (TopicPartition tp : partitions) {
+                long start = begin.getOrDefault(tp, 0L);
+                long target = logEnd.getOrDefault(tp, start);
+                if (target <= start) {
+                    continue; // empty partition
+                }
+                consumer.seek(tp, start);
+                parts.put(tp, new ReplayPartitionState(avro, topicEvents.get(tp.topic()), target));
+            }
+        } else {
+            Map<TopicPartition, Long> startQuery = new HashMap<>();
+            Map<TopicPartition, Long> endQuery = new HashMap<>();
+            for (TopicPartition tp : partitions) {
+                startQuery.put(tp, params.startUtcMs());
+                endQuery.put(tp, params.endUtcMs());
+            }
+            Map<TopicPartition, OffsetAndTimestamp> startOffsets = consumer.offsetsForTimes(startQuery);
+            Map<TopicPartition, OffsetAndTimestamp> endOffsets = consumer.offsetsForTimes(endQuery);
+            for (TopicPartition tp : partitions) {
+                OffsetAndTimestamp start = startOffsets.get(tp);
+                if (start == null) {
+                    continue; // no records at/after the window start
+                }
+                OffsetAndTimestamp end = endOffsets.get(tp);
+                long target = end != null ? end.offset() : logEnd.getOrDefault(tp, start.offset());
+                if (target <= start.offset()) {
+                    continue; // empty window on this partition
+                }
+                consumer.seek(tp, start.offset());
+                parts.put(tp, new ReplayPartitionState(avro, topicEvents.get(tp.topic()), target));
+            }
+        }
+    }
+
+    /**
+     * The chronological merge core. Holds a small per-partition buffer for both consumers and always emits
+     * the globally-earliest available record ({@link ReplayChronology#ORDER}). A not-yet-drained partition
+     * with an empty buffer BLOCKS emission until it is polled, so no later-but-first-read record can jump
+     * ahead of an earlier one on another topic/partition. The cap bounds DELIVERED (matched) records.
+     *
+     * <p>P0 (empty poll ≠ end of replay): completion is decided ONLY by every active partition's consumer
+     * position reaching its captured target offset. An empty poll proves nothing (fetch latency, broker
+     * load, jitter), so empty polls are retried until a bounded no-progress deadline; if that deadline
+     * expires while any partition is still short of target the run is reported INCOMPLETE (a failure), never
+     * a silent REPLAY_COMPLETE. Progress (a buffered record or a partition reaching target) resets the
+     * deadline, so an ongoing-but-slow read is never timed out.
+     */
+    ReplayResult mergeReplayPartitions(String appSessionId, ReplayParams params, MarketDataSource source,
+                                       KafkaConsumer<String, Object> avro, KafkaConsumer<String, Object> str,
+                                       Map<TopicPartition, ReplayPartitionState> parts, ReplayHandle handle) {
+        long delivered = 0L;
+        int maxRecords = params.maxRecords();
+        long idleTimeoutMs = settings.replayIdleTimeoutMs();
+        long lastProgressMs = System.currentTimeMillis();
+        boolean drainedToEnd = false;
+        // P0 (generation barrier): stop the moment this reader is no longer the session's owner — a stop,
+        // return-to-live, or newer replay has taken over, so nothing more may be emitted.
+        while (handle.active.get() && running.get() && isReplayOwner(appSessionId, handle.generation)
+                && delivered < maxRecords) {
+            if (hasUnbufferedActivePartition(parts)) {
+                // Only blocking partitions (empty buffer, not yet at target) need fetching — pause the rest
+                // so buffers stay bounded and an empty poll reflects ONLY the partitions we are waiting on.
+                int satisfiedBefore = countSatisfied(parts);
+                tunePauses(avro, true, parts);
+                tunePauses(str, false, parts);
+                pollIntoBuffers(avro, parts);
+                pollIntoBuffers(str, parts);
+                refreshDrained(avro, true, parts);
+                refreshDrained(str, false, parts);
+                if (hasUnbufferedActivePartition(parts)) {
+                    if (countSatisfied(parts) > satisfiedBefore) {
+                        lastProgressMs = System.currentTimeMillis(); // a blocking partition advanced
+                        continue;
+                    }
+                    if (System.currentTimeMillis() - lastProgressMs > idleTimeoutMs) {
+                        // A partition has not reached its captured target offset within the deadline.
+                        return new ReplayResult(delivered, ReplayOutcome.TIMED_OUT);
+                    }
+                    continue; // ordinary empty poll — keep retrying until target or deadline
+                }
+                lastProgressMs = System.currentTimeMillis();
+            }
+            MergeRecord next = pollGlobalMinimum(parts);
+            if (next == null) {
+                drainedToEnd = true; // every active partition reached target AND its buffer is drained
+                break;
+            }
+            if (emitReplayRecord(appSessionId, params, source, next, handle)) {
+                delivered++;
+            }
+            lastProgressMs = System.currentTimeMillis();
+        }
+        // COMPLETED only when the read genuinely finished (all partitions at target) or hit the record cap.
+        // Any other loop exit — ownership lost, cancel flag cleared, gateway shutdown — is a cancellation.
+        if (drainedToEnd || delivered >= maxRecords) {
+            return new ReplayResult(delivered, ReplayOutcome.COMPLETED);
+        }
+        return new ReplayResult(delivered, ReplayOutcome.CANCELED);
+    }
+
+    private static boolean hasUnbufferedActivePartition(Map<TopicPartition, ReplayPartitionState> parts) {
+        for (ReplayPartitionState st : parts.values()) {
+            if (!st.drained && st.buffer.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** A partition is "satisfied" for the merge when it has reached target (drained) or has a buffered head. */
+    private static int countSatisfied(Map<TopicPartition, ReplayPartitionState> parts) {
+        int n = 0;
+        for (ReplayPartitionState st : parts.values()) {
+            if (st.drained || !st.buffer.isEmpty()) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /** Fetch only from partitions we are still waiting on; pause those already satisfied (bounds buffers). */
+    private void tunePauses(KafkaConsumer<String, Object> consumer, boolean avro,
+                            Map<TopicPartition, ReplayPartitionState> parts) {
+        if (consumer == null) {
+            return;
+        }
+        List<TopicPartition> pause = new ArrayList<>();
+        List<TopicPartition> resume = new ArrayList<>();
+        for (Map.Entry<TopicPartition, ReplayPartitionState> e : parts.entrySet()) {
+            ReplayPartitionState st = e.getValue();
+            if (st.avro != avro) {
+                continue;
+            }
+            if (!st.drained && st.buffer.isEmpty()) {
+                resume.add(e.getKey());
+            } else {
+                pause.add(e.getKey());
+            }
+        }
+        if (!pause.isEmpty()) {
+            consumer.pause(pause);
+        }
+        if (!resume.isEmpty()) {
+            consumer.resume(resume);
+        }
+    }
+
+    /** Poll one consumer and append every in-window record to its partition buffer. */
+    private boolean pollIntoBuffers(KafkaConsumer<String, Object> consumer,
+                                    Map<TopicPartition, ReplayPartitionState> parts) {
+        if (consumer == null) {
+            return false;
+        }
+        ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+        boolean appended = false;
+        for (ConsumerRecord<String, Object> rec : records) {
+            TopicPartition tp = new TopicPartition(rec.topic(), rec.partition());
+            ReplayPartitionState st = parts.get(tp);
+            if (st == null || rec.offset() >= st.endTarget) {
+                continue; // beyond the window end — ignore (position still advances past it)
+            }
+            ReplayChronology.Cursor cursor =
+                    new ReplayChronology.Cursor(rec.timestamp(), rec.topic(), rec.partition(), rec.offset());
+            st.buffer.addLast(new MergeRecord(cursor, st.event, rec.value(), st.avro));
+            appended = true;
+        }
+        return appended;
+    }
+
+    /** Mark this consumer's partitions whose position reached the window end (nothing more will be polled). */
+    private void refreshDrained(KafkaConsumer<String, Object> consumer, boolean avro,
+                                Map<TopicPartition, ReplayPartitionState> parts) {
+        if (consumer == null) {
+            return;
+        }
+        for (Map.Entry<TopicPartition, ReplayPartitionState> e : parts.entrySet()) {
+            ReplayPartitionState st = e.getValue();
+            if (st.drained || st.avro != avro) {
+                continue;
+            }
+            if (consumer.position(e.getKey()) >= st.endTarget) {
+                st.drained = true;
+            }
+        }
+    }
+
+    /** Pop the globally-earliest buffered record across all partitions ({@link ReplayChronology#ORDER}). */
+    private MergeRecord pollGlobalMinimum(Map<TopicPartition, ReplayPartitionState> parts) {
+        ReplayPartitionState minState = null;
+        MergeRecord min = null;
+        for (ReplayPartitionState st : parts.values()) {
+            MergeRecord head = st.buffer.peek();
+            if (head == null) {
+                continue;
+            }
+            if (min == null || ReplayChronology.ORDER.compare(head.cursor(), min.cursor()) < 0) {
+                min = head;
+                minState = st;
+            }
+        }
+        if (minState != null) {
+            minState.buffer.pollFirst();
+        }
+        return min;
+    }
+
+    /** Convert, stamp provenance, filter to the session, and stream one merged record. */
+    private boolean emitReplayRecord(String appSessionId, ReplayParams params, MarketDataSource source,
+                                     MergeRecord r, ReplayHandle handle) {
+        // A single malformed/poison record must NOT abort the windowed replay (review finding #12).
+        try {
+            String raw = r.avro() ? avroJson(r.value()) : stringJson(r.value());
+            String json = enrichJson(raw, new TopicBinding(source.name(), r.event()));
+            if (json == null || json.isBlank()) {
+                return false;
+            }
+            json = withReplayProvenance(json, r.cursor());
+            if (replayMatches(params, r.event(), json)) {
+                // P0 (generation barrier): re-verify ownership IMMEDIATELY before the send. A record already
+                // returned by an earlier poll must never reach the socket after the user started a different
+                // replay or returned to live — the barrier closes that exact window.
+                if (!handle.active.get() || !isReplayOwner(appSessionId, handle.generation)) {
+                    return false;
+                }
+                sendToAppSession(appSessionId, r.event(), json);
+                return true;
+            }
+            return false;
+        } catch (RuntimeException poison) {
+            return false; // skip the poison record; the merge continues with the next
+        }
+    }
+
+    /** Retain the record's canonical event time, topic, partition and offset on the outbound event. */
+    private String withReplayProvenance(String json, ReplayChronology.Cursor cursor) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            if (root instanceof ObjectNode object) {
+                object.put("replaySourceTimestamp", cursor.eventTimestamp());
+                object.put("replaySourceTopic", cursor.topic());
+                object.put("replaySourcePartition", cursor.partition());
+                object.put("replaySourceOffset", cursor.offset());
+                return mapper.writeValueAsString(object);
+            }
+        } catch (JsonProcessingException ignored) {
+            // fall through with the unannotated json
+        }
+        return json;
+    }
+
+    /** Map each live topic in {@code topicEvents} to its per-runId replay-namespace equivalent. */
+    private static Map<String, String> toReplayTopics(Map<String, String> topicEvents, String runId) {
+        Map<String, String> resolved = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : topicEvents.entrySet()) {
+            resolved.put(ReplayTopicResolver.toReplayTopic(e.getKey(), runId), e.getValue());
+        }
+        return resolved;
+    }
+
+    /** A replay record matches the session: same contract (symbol+expiry) and inside the strike window. */
+    private boolean replayMatches(ReplayParams params, String event, String json) {
+        if ("index-price".equals(event) || "vix-price".equals(event)) {
+            return true; // underlying/vix carry no strike and a different symbol — always relevant
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
+            String expiry = root.hasNonNull("expiry") ? GatewaySettings.normalizeExpiry(root.get("expiry").asText("")) : "";
+            if (!params.symbol().equalsIgnoreCase(symbol) || !params.expiry().equals(expiry)) {
+                return false;
+            }
+            if (routingEngine != null && root.hasNonNull("strike") && root.get("strike").isNumber()) {
+                AppSession app = routingEngine.appSession(params.sessionId()).orElse(null);
+                if (app != null && !app.selection().strikeWindow().contains(root.get("strike").asDouble())) {
+                    return false; // per-user strike-window filter (same as live)
+                }
+            }
+            return true;
+        } catch (JsonProcessingException e) {
+            return false;
+        }
+    }
+
+    private void sendToAppSession(String appSessionId, String event, String json) {
+        if (routingEngine == null) {
+            return;
+        }
+        for (String socketId : routingEngine.socketsForAppSession(appSessionId)) {
+            WebSocketSession s = clientsById.get(socketId);
+            if (s != null) {
+                send(s, event, json);
+            }
+        }
+    }
+
+    private void replayLiveCacheToAppSession(String appSessionId) {
+        if (routingEngine == null) {
+            return;
+        }
+        for (String socketId : routingEngine.socketsForAppSession(appSessionId)) {
+            WebSocketSession s = clientsById.get(socketId);
+            if (s != null) {
+                replayCachedToSocket(s);
+            }
+        }
+    }
+
+    private String replayStatusJson(String mode, ReplayParams params, long delivered) {
+        return "{\"mode\":\"" + mode + "\",\"symbol\":\"" + escapeJson(params.symbol())
+                + "\",\"expiry\":\"" + escapeJson(params.expiry())
+                + "\",\"startUtcMs\":" + params.startUtcMs() + ",\"endUtcMs\":" + params.endUtcMs()
+                + ",\"records\":" + delivered + ",\"maxRecords\":" + params.maxRecords() + "}";
+    }
+
+    /**
+     * Events that may legitimately fan out to every connected socket while per-session routing is
+     * active. These are connection/selection lifecycle signals — identical for all users and
+     * carrying no per-user market data. Everything else (snapshot/pace/strike-flow/etc., and any
+     * malformed or unroutable payload) is DROPPED rather than broadcast in per-session mode, so a
+     * per-user market-data event can never reach another user's socket.
+     */
+    static final Set<String> GLOBAL_BROADCAST_EVENTS = Set.of(
+            "status", "reset", "source-switching", "source-ready", "source-stale");
+
+    static boolean isGlobalBroadcastEvent(String event) {
+        return GLOBAL_BROADCAST_EVENTS.contains(event);
+    }
+
+    /**
+     * Per-session routing cutover (OE-DDD-001 §8, finding #3): when enabled, deliver an event only
+     * to the sockets whose AppSession selection matches it (via {@link SessionRoutingEngine}).
+     *
+     * <p>In per-session mode there is NO broadcast fallback for market data: if the payload is
+     * malformed, or maps to no routable key (a known market-data event we couldn't key), it is
+     * dropped — never broadcast — unless it is an explicitly {@linkplain #GLOBAL_BROADCAST_EVENTS
+     * allowlisted global event}. In legacy mode the behaviour is unchanged (broadcast).
+     */
+    private void routeOrBroadcast(String bindingSource, String event, String json) {
+        if (perSessionRouting()) {
+            SessionRoutingEngine engine = routingEngine;
+            try {
+                JsonNode root = mapper.readTree(json);
+                // Source is authoritative from the TOPIC BINDING (OE-DDD-001 §8.6): Avro contract
+                // events (display/pace) carry no marketDataSource field, so the payload alone cannot
+                // identify the source. Fall back to the payload only if the binding source is absent.
+                String source = (bindingSource != null && !bindingSource.isBlank())
+                        ? bindingSource
+                        : (root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "");
+                Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
+                if (rec.isPresent()) {
+                    for (String socketId : engine.route(rec.get())) {
+                        WebSocketSession s = clientsById.get(socketId);
+                        if (s != null) {
+                            send(s, event, json);
+                        }
+                    }
+                    return;
+                }
+                // Unroutable while per-session: drop unless it is an allowlisted global event.
+                if (isGlobalBroadcastEvent(event)) {
+                    broadcast(event, json);
+                } else {
+                    droppedNonRoutableEvents.incrementAndGet();
+                }
+            } catch (JsonProcessingException malformed) {
+                // Malformed payload while per-session: drop, never broadcast.
+                droppedNonRoutableEvents.incrementAndGet();
+            }
+            return;
+        }
+        broadcast(event, json);
+    }
+
     private void send(WebSocketSession session, String event, String json) {
-        sendEnvelope(session, envelopeJson(event, json));
+        enqueueOutbound(session, envelopeJson(event, json), coalesceKeyFor(event, json));
     }
 
     private void sendEnvelope(WebSocketSession session, String envelope) {
+        // Control / batch / cached-state envelopes are never coalesced — every one must be delivered.
+        enqueueOutbound(session, envelope, null);
+    }
+
+    /**
+     * Hand an envelope to the socket's bounded async channel and return immediately (P0 — the Kafka thread
+     * NEVER blocks on browser I/O). A non-null {@code coalesceKey} collapses replaceable snapshots to
+     * latest-wins. Untracked sessions (never added via {@link #addClient}) fall back to a guarded direct
+     * send — that path is never on the Kafka hot loop.
+     */
+    private void enqueueOutbound(WebSocketSession session, String envelope, String coalesceKey) {
+        if (session == null || envelope == null) {
+            return;
+        }
+        OutboundChannel channel = outbound.get(session.getId());
+        if (channel != null) {
+            channel.enqueue(envelope, coalesceKey);
+            return;
+        }
         if (!session.isOpen()) {
-            removeClient(session);
             return;
         }
         try {
             synchronized (session) {
                 session.sendMessage(new TextMessage(envelope));
             }
-            if (GatewaySettings.boolValue("GATEWAY_WS_LOG_MESSAGES", false)) {
-                System.out.println("goes to UI ->>> " + envelope);
-            }
-        } catch (IOException | IllegalStateException ignored) {
-            removeClient(session);
+        } catch (IOException | RuntimeException ignored) {
+            closeQuietly(session);
         }
     }
 
+    /**
+     * Coalescing key for replaceable market-data snapshots: {@code event|symbol|expiry|strike}. Returns
+     * null (never coalesce) for non-replaceable events, and for REPLAY records — those are distinct
+     * historical events (stamped with {@code replaySourceOffset}), so every one must be delivered in order.
+     */
+    private String coalesceKeyFor(String event, String json) {
+        if (event == null || !COALESCABLE_EVENTS.contains(event)) {
+            return null;
+        }
+        if (json == null || json.contains("\"replaySourceOffset\"")) {
+            return null; // replay record (or empty) — do not coalesce
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
+            String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
+            String strike = root.hasNonNull("strike") ? root.get("strike").asText("") : "";
+            return event + "|" + symbol + "|" + expiry + "|" + strike;
+        } catch (JsonProcessingException unparseable) {
+            return null; // when in doubt, deliver it
+        }
+    }
+
+    /**
+     * P0 (HPSF bypass fix): route a single HPSF view to exactly the sessions entitled to its chain,
+     * through the SAME {@link SessionRoutingEngine} + entitlement checks as live contract events.
+     * Contract-scoped HPSF events (signal/candidates/audit/exit-intent) route by {@code source|symbol|
+     * expiry} with no strike filter (whole-chain decisions); market-flow routes by the underlying.
+     * Unroutable records (unknown source/event or missing expiry) are dropped — NEVER broadcast.
+     */
+    private void routeHpsfPerSession(HpsfCacheUpdate update) {
+        SessionRoutingEngine engine = routingEngine;
+        if (engine == null) {
+            return;
+        }
+        EventType type = hpsfEventType(update.event());
+        Optional<MarketDataSource> source = MarketDataSource.parse(settings.initialMarketDataSource());
+        if (type == null || source.isEmpty()) {
+            droppedNonRoutableEvents.incrementAndGet();
+            return;
+        }
+        RoutableRecord record;
+        if (type.isUnderlying()) {
+            record = RoutableRecord.underlying(source.get(), type, 0L);
+        } else {
+            if (update.expiry() == null || update.expiry().isBlank()) {
+                droppedNonRoutableEvents.incrementAndGet();
+                return;
+            }
+            record = new RoutableRecord(source.get(), type, settings.initialSymbol(), update.expiry(),
+                    OptionalDouble.empty(), 0L, null, null);
+        }
+        for (String socketId : engine.route(record)) {
+            WebSocketSession s = clientsById.get(socketId);
+            if (s != null) {
+                send(s, update.event(), update.json());
+            }
+        }
+    }
+
+    private static EventType hpsfEventType(String event) {
+        return switch (event) {
+            case "hpsf-latest-signal" -> EventType.HPSF_LATEST_SIGNAL;
+            case "hpsf-top-candidates" -> EventType.HPSF_TOP_CANDIDATES;
+            case "hpsf-audit" -> EventType.HPSF_AUDIT;
+            case "hpsf-exit-intent" -> EventType.HPSF_EXIT_INTENT;
+            case "hpsf-market-flow" -> EventType.HPSF_MARKET_FLOW;
+            default -> null;
+        };
+    }
+
     private void enqueuePending(String event, String key, String json) {
+        // Defense in depth (P0): the coalesced all-client batch is the LEGACY single-tenant path only.
+        // In tenant-routing mode every consume site routes per-session, so this must be unreachable —
+        // drop rather than risk a cross-tenant broadcast if any future call site forgets the gate.
+        if (perSessionRouting()) {
+            droppedNonRoutableEvents.incrementAndGet();
+            return;
+        }
         if (clients.isEmpty()) {
             return;
         }
+        // Per-session routing is handled at the consume sites (with the authoritative binding source);
+        // enqueuePending is the legacy batched path only.
         synchronized (batchLock) {
             Map<String, String> pending = pendingMap(event);
             if (pending == null) {
@@ -1821,6 +3047,15 @@ public class FeedGatewayService {
     }
 
     private void flushPendingBatch() {
+        // P0 (HPSF bypass): the all-client batch broadcasts one envelope to EVERY socket with no routing.
+        // In tenant-routing mode that is a cross-tenant leak, so the path is unreachable here: drain any
+        // residue and return without sending. All events route per-session at their consume sites instead.
+        if (perSessionRouting()) {
+            synchronized (batchLock) {
+                clearPendingLocked();
+            }
+            return;
+        }
         try {
             String envelope;
             synchronized (batchLock) {
@@ -2070,6 +3305,7 @@ public class FeedGatewayService {
         properties.put(ConsumerConfig.FETCH_MAX_BYTES_CONFIG, Integer.toString(settings.fetchMaxBytes()));
         properties.put(ConsumerConfig.MAX_PARTITION_FETCH_BYTES_CONFIG, Integer.toString(settings.maxPartitionFetchBytes()));
         properties.put(ConsumerConfig.RECEIVE_BUFFER_CONFIG, Integer.toString(settings.receiveBufferBytes()));
+        settings.applyKafkaSecurity(properties); // TLS/SASL when configured (required under auth — P0)
         return properties;
     }
 

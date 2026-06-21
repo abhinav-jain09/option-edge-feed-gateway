@@ -20,7 +20,10 @@ class WsTokenExpiryTest {
     private static final long NOW = 1_700_000_000_000L;
 
     private FeedGatewayService newService() {
-        return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper());
+        FeedGatewayService svc =
+                new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+        svc.runOutboundWritesInline();
+        return svc;
     }
 
     private static WebSocketSession sessionWithExpiry(Long expiresAtMs) {
@@ -31,6 +34,7 @@ class WsTokenExpiryTest {
         }
         when(session.getAttributes()).thenReturn(attrs);
         when(session.isOpen()).thenReturn(true);
+        when(session.getId()).thenReturn(java.util.UUID.randomUUID().toString());
         return session;
     }
 
