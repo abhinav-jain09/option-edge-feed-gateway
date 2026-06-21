@@ -38,7 +38,7 @@
     <label>date</label><input id="oe-rp-date" class="d" type="date" value="2026-06-12">
     <label>ET</label><input id="oe-rp-start" type="time" value="14:00">
     <span>–</span><input id="oe-rp-end" type="time" value="14:20">
-    <label for="oe-rp-run-id">runId</label><input id="oe-rp-run-id" class="runid" type="text" placeholder="optional (orchestrated run)" autocomplete="off" spellcheck="false" aria-label="orchestrated replay run id">
+    <label for="oe-rp-run-id">runId</label><input id="oe-rp-run-id" class="runid" type="text" list="oe-rp-run-list" placeholder="optional (orchestrated run)" autocomplete="off" spellcheck="false" aria-label="orchestrated replay run id"><datalist id="oe-rp-run-list"></datalist>
     <button class="go" id="oe-rp-start-btn">Start Replay</button>
     <button class="stop" id="oe-rp-stop-btn" disabled>Stop</button>
     <button class="live" id="oe-rp-live-btn" disabled>Return to Live</button>

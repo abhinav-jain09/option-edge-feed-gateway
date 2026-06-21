@@ -136,11 +136,28 @@ public class MtSessionAuthConfig {
     @Bean
     public ReplayService replayService(TokenVerifier tokenVerifier, SessionRoutingEngine engine,
                                        ReplayRunner replayRunner, ReplayRunAuthorizer replayRunAuthorizer,
-                                       GatewaySettings settings) {
+                                       ReplayRunLister replayRunLister, GatewaySettings settings) {
         boolean prodBlocked = settings.isProd() && !settings.replayAllowInProd();
-        return new ReplayService(tokenVerifier, engine, replayRunner, replayRunAuthorizer,
+        return new ReplayService(tokenVerifier, engine, replayRunner, replayRunAuthorizer, replayRunLister,
                 settings.replayUiEnabled(), prodBlocked,
                 settings.replayMaxWindowMs(), settings.replayMaxRecords());
+    }
+
+    /**
+     * Lists the caller's orchestrated replay runs for the UI run-picker (PR-2). Mirrors the run authorizer:
+     * forwards the bearer to the orchestrator (which filters by ownership) and is fail-closed. With no
+     * {@code GATEWAY_REPLAY_ORCHESTRATOR_URL} configured there is nothing to list, so it returns an empty
+     * list — manual runId entry still works, and a runId-backed start is independently denied by the
+     * authorizer in that posture.
+     */
+    @Bean
+    public ReplayRunLister replayRunLister(GatewaySettings settings) {
+        String base = settings.replayOrchestratorBaseUrl();
+        if (base == null || base.isBlank()) {
+            return token -> java.util.List.of();
+        }
+        return new OrchestratorReplayRunLister(base,
+                Duration.ofMillis(settings.replayOrchestratorTimeoutMs()));
     }
 
     /**

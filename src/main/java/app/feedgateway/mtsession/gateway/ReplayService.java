@@ -20,18 +20,20 @@ public final class ReplayService {
     private final SessionRoutingEngine engine;
     private final ReplayRunner runner;
     private final ReplayRunAuthorizer runAuthorizer;
+    private final ReplayRunLister runLister;
     private final boolean enabled;
     private final boolean prodBlocked;
     private final long maxWindowMs;
     private final int maxRecordsCap;
 
     public ReplayService(TokenVerifier verifier, SessionRoutingEngine engine, ReplayRunner runner,
-                         ReplayRunAuthorizer runAuthorizer, boolean enabled, boolean prodBlocked,
-                         long maxWindowMs, int maxRecordsCap) {
+                         ReplayRunAuthorizer runAuthorizer, ReplayRunLister runLister, boolean enabled,
+                         boolean prodBlocked, long maxWindowMs, int maxRecordsCap) {
         this.verifier = Objects.requireNonNull(verifier, "verifier");
         this.engine = Objects.requireNonNull(engine, "engine");
         this.runner = Objects.requireNonNull(runner, "runner");
         this.runAuthorizer = Objects.requireNonNull(runAuthorizer, "runAuthorizer");
+        this.runLister = Objects.requireNonNull(runLister, "runLister");
         this.enabled = enabled;
         this.prodBlocked = prodBlocked;
         this.maxWindowMs = maxWindowMs;
@@ -89,6 +91,19 @@ public final class ReplayService {
         ensureEnabled();
         String appSessionId = ownedSession(bearerToken, sessionId);
         return runner.resumeLive(appSessionId);
+    }
+
+    /**
+     * List the CALLER's orchestrated replay runs for the UI run-picker (PR-2 of the runId bridge). Applies
+     * the SAME gates as {@link #start}: the enabled/non-prod flags, then bearer verification (so an
+     * unverified token never reaches the orchestrator). Delegates to the fail-closed {@link ReplayRunLister},
+     * which forwards the bearer to the orchestrator (the orchestrator filters by ownership). Returns an empty
+     * list — never an error — when the orchestrator is unreachable or returns nothing.
+     */
+    public java.util.List<ReplayRunView> listRuns(String bearerToken) throws JwtVerificationException {
+        ensureEnabled();
+        authenticatedSession(bearerToken); // verify the token resolves to a real subject before forwarding
+        return runLister.listRuns(bearerToken);
     }
 
     private void ensureEnabled() {

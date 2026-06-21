@@ -74,6 +74,7 @@ class ReplayServiceTest {
     }
 
     private static final ReplayRunAuthorizer ALLOW_ALL = (token, runId) -> { };
+    private static final ReplayRunLister EMPTY_LISTER = token -> List.of();
 
     private ReplayService service(SessionRoutingEngine engine, ReplayRunner runner, String userId,
                                   boolean enabled, boolean prodBlocked) {
@@ -83,8 +84,8 @@ class ReplayServiceTest {
     private ReplayService service(SessionRoutingEngine engine, ReplayRunner runner,
                                   ReplayRunAuthorizer authorizer, String userId,
                                   boolean enabled, boolean prodBlocked) {
-        return new ReplayService(verifierFor(userId), engine, runner, authorizer, enabled, prodBlocked,
-                MAX_WINDOW_MS, MAX_RECORDS);
+        return new ReplayService(verifierFor(userId), engine, runner, authorizer, EMPTY_LISTER, enabled,
+                prodBlocked, MAX_WINDOW_MS, MAX_RECORDS);
     }
 
     private static ReplayService.ReplayRequest req(String sessionId) {
@@ -215,9 +216,45 @@ class ReplayServiceTest {
         TokenVerifier failing = token -> {
             throw new JwtVerificationException("bad");
         };
-        ReplayService svc = new ReplayService(failing, engine, new RecordingRunner(), ALLOW_ALL, true, false,
-                MAX_WINDOW_MS, MAX_RECORDS);
+        ReplayService svc = new ReplayService(failing, engine, new RecordingRunner(), ALLOW_ALL, EMPTY_LISTER,
+                true, false, MAX_WINDOW_MS, MAX_RECORDS);
         assertThrows(JwtVerificationException.class, () -> svc.start("tok", req("app:u1")));
+    }
+
+    @Test
+    void listRunsVerifiesTokenThenDelegatesToLister() throws Exception {
+        SessionRoutingEngine engine = engineWith("app:u1", "u1");
+        ReplayRunView view = new ReplayRunView("r-1", "RUNNING", "2026-06-12", "14:00", "14:20");
+        ReplayRunLister lister = token -> List.of(view);
+        ReplayService svc = new ReplayService(verifierFor("u1"), engine, new RecordingRunner(), ALLOW_ALL,
+                lister, true, false, MAX_WINDOW_MS, MAX_RECORDS);
+
+        assertEquals(List.of(view), svc.listRuns("tok"));
+    }
+
+    @Test
+    void listRunsRejectsAnInvalidToken() {
+        SessionRoutingEngine engine = engineWith("app:u1", "u1");
+        TokenVerifier failing = token -> {
+            throw new JwtVerificationException("bad");
+        };
+        ReplayRunLister boom = token -> {
+            throw new AssertionError("lister must not be called when the token is invalid");
+        };
+        ReplayService svc = new ReplayService(failing, engine, new RecordingRunner(), ALLOW_ALL, boom,
+                true, false, MAX_WINDOW_MS, MAX_RECORDS);
+        assertThrows(JwtVerificationException.class, () -> svc.listRuns("tok"));
+    }
+
+    @Test
+    void listRunsIsBlockedWhenReplayDisabled() {
+        SessionRoutingEngine engine = engineWith("app:u1", "u1");
+        ReplayRunLister boom = token -> {
+            throw new AssertionError("lister must not be called when replay is disabled");
+        };
+        ReplayService svc = new ReplayService(verifierFor("u1"), engine, new RecordingRunner(), ALLOW_ALL,
+                boom, false, false, MAX_WINDOW_MS, MAX_RECORDS);
+        assertThrows(ReplayService.ReplayDisabledException.class, () -> svc.listRuns("tok"));
     }
 
     @Test
