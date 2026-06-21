@@ -779,6 +779,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
+        topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
@@ -802,6 +803,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
+        topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
@@ -1305,6 +1307,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.ibkrVixPriceTopic(),
                     settings.databentoEsTradesTopic(),
                     settings.databentoStrikeFlowTopic(),
+                    settings.databentoGexTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic()
             );
@@ -1328,9 +1331,6 @@ public class FeedGatewayService implements ReplayRunner {
             return "DATABENTO".equals(selection.source()) && passesSelectionBarrier(record, selection);
         }
         if (!binding.source().equals(selection.source())) {
-            return false;
-        }
-        if ("gex-by-strike".equals(binding.event()) && !"IBKR".equals(selection.source())) {
             return false;
         }
         if (!passesSelectionBarrier(record, selection)) {
@@ -1470,6 +1470,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = indexPriceCacheKey(json, key);
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
+        } else if ("gex-by-strike".equals(event)) {
+            key = gexCacheKey(json, key);
         }
         if (!"pace".equals(event)) {
             key = binding.source() + "|" + key;
@@ -1976,6 +1978,24 @@ public class FeedGatewayService implements ReplayRunner {
         return fallback;
     }
 
+    private String gexCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            double strike = doubleField(root, "strike", Double.NaN);
+            // Derive a deterministic per-strike key from payload identity instead of
+            // trusting the producer's Kafka key. Source is prepended by updateCache, so
+            // the cache key matches the UI contract (source|symbol|expiry|strike).
+            if (!symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike)) {
+                return symbol + "|" + expiry + "|" + formatStrike(strike);
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
     String indexPriceCacheKey(String json, String fallback) {
         try {
             JsonNode root = mapper.readTree(json);
@@ -2320,6 +2340,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.databentoPaceTopic(), "pace");
                 avroTopics.put(settings.databentoDirectionalPressureTopic(), "directional-pressure");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
+                stringTopics.put(settings.databentoGexTopic(), "gex-by-strike");
                 stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
             } else {
                 avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
