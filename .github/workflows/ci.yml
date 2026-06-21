@@ -24,6 +24,23 @@ jobs:
           java -version
           mvn -version
 
+      # The gateway depends on the private internal artifact
+      # com.optionsedge:options-edge-contracts:0.1.0-SNAPSHOT, which is not
+      # published to any public Maven repository. Build and install it from
+      # source so the gateway build is reproducible in a clean runner.
+      # Requires a repo secret CONTRACTS_PAT: a PAT with read access to
+      # abhinav-jain09/options-edge-contracts.
+      - name: Build internal dependency (options-edge-contracts)
+        env:
+          CONTRACTS_PAT: ${{ secrets.CONTRACTS_PAT }}
+        run: |
+          if [ -z "${CONTRACTS_PAT}" ]; then
+            echo "::error::CONTRACTS_PAT secret is required to resolve the private com.optionsedge:options-edge-contracts dependency. Add a PAT with read access to abhinav-jain09/options-edge-contracts."
+            exit 1
+          fi
+          git clone --depth 1 "https://x-access-token:${CONTRACTS_PAT}@github.com/abhinav-jain09/options-edge-contracts.git" "${RUNNER_TEMP}/options-edge-contracts"
+          mvn -B -q -f "${RUNNER_TEMP}/options-edge-contracts/pom.xml" install -DskipTests
+
       - name: Build and test
         run: mvn -B clean test
 
