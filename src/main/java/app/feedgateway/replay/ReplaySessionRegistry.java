@@ -57,14 +57,19 @@ public final class ReplaySessionRegistry {
         return apply(sessionId, ReplaySessionStateMachine::liveResumed);
     }
 
-    /** Apply a transition atomically; store the new state only if it was accepted. */
+    /**
+     * Apply a transition atomically. Stores the new state ONLY on an accepted transition; a rejected
+     * transition leaves the mapping exactly as it was — in particular a rejected transition on an unknown
+     * session does NOT insert any entry (fail closed: a refused/unauthorized request creates no state). A
+     * synthetic LIVE base is used purely to validate the transition, never stored on rejection.
+     */
     private Transition apply(String sessionId, Function<ReplaySessionState, Transition> transition) {
         Transition[] out = new Transition[1];
         sessions.compute(sessionId, (id, cur) -> {
-            ReplaySessionState current = cur != null ? cur : ReplaySessionState.live(id);
-            Transition t = transition.apply(current);
+            ReplaySessionState base = cur != null ? cur : ReplaySessionState.live(id);
+            Transition t = transition.apply(base);
             out[0] = t;
-            return t.accepted() ? t.state() : current;
+            return t.accepted() ? t.state() : cur; // rejected ⇒ leave as-was (absent stays absent)
         });
         return out[0];
     }

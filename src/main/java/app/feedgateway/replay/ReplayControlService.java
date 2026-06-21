@@ -45,10 +45,13 @@ public final class ReplayControlService {
         this.listener = Objects.requireNonNull(listener, "listener");
     }
 
-    /** Attach (or re-attach) the session to {@code runId}, re-authorizing first. Returns the new mode. */
+    /**
+     * Attach (or re-attach) the session to {@code runId}. Re-authorizes FIRST and creates NO session state
+     * on a negative — an unauthorized attach leaves the registry untouched (fail closed). Returns the new
+     * mode on success.
+     */
     public ReplayMode attach(String sessionId, String runId, String principal) {
-        registry.register(sessionId);
-        boolean authorized = authorizer.canAttach(sessionId, runId, principal); // re-auth EVERY attach
+        boolean authorized = authorizer.canAttach(sessionId, runId, principal); // re-auth EVERY attach, BEFORE any state
         Transition t = registry.attach(sessionId, runId, authorized);
         return commit(sessionId, t);
     }
