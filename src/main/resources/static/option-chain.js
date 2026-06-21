@@ -726,7 +726,7 @@
         h('input', { type: 'text', maxLength: 12, value: form.symbol || '', onChange: event => updateForm('symbol', event.target.value.toUpperCase()), onKeyDown: submitOnEnter })
       ),
       h('label', null, 'Expiry',
-        h('input', { type: 'date', value: toDateInput(form.expiry), onChange: event => {
+        h('input', { type: 'date', value: toDateInput(form.expiry), min: marketTodayIso(), onChange: event => {
           const expiry = nextWeekdayExpiry(toIbExpiry(event.target.value));
           const nextForm = { ...form, expiry };
           updateForm('expiry', expiry);
@@ -2120,6 +2120,14 @@
   function toDateInput(expiry) {
     const formatted = formatExpiry(expiry);
     return formatted === '--' ? '' : formatted;
+  }
+
+  // Today's exchange-local (ET) date as an ISO "YYYY-MM-DD" string for date-input min/max bounds, or ''
+  // when the calendar can't resolve it. A LIVE expiry must be today or a future trading day — a past
+  // expiry has no live data — so the Expiry picker uses this as its min.
+  function marketTodayIso() {
+    const t = MarketCalendar.marketDateTimeParts(new Date());
+    return t ? `${t.year}-${t.month}-${t.day}` : '';
   }
 
   function toIbExpiry(value) {
