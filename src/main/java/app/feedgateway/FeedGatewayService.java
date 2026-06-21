@@ -489,7 +489,12 @@ public class FeedGatewayService implements ReplayRunner {
                 return; // nothing in flight to cancel
             }
             cancelActiveReplay(appSessionId);
-            routingEngine.setReplayMode(appSessionId, false);
+            // The AppSession may already be gone — a logout/expiry teardown can race ahead of this socket's
+            // close. setReplayMode requires a live session (it throws otherwise), so only flip the flag when
+            // the session still exists; cancelActiveReplay above already stopped the reader regardless.
+            if (routingEngine.appSession(appSessionId).isPresent()) {
+                routingEngine.setReplayMode(appSessionId, false);
+            }
         }
     }
 

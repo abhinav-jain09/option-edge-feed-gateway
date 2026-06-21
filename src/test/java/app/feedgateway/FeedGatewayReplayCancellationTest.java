@@ -18,6 +18,7 @@ import app.feedgateway.mtsession.gateway.ReplayChronology;
 import app.feedgateway.mtsession.gateway.ReplayParams;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -173,6 +174,78 @@ class FeedGatewayReplayCancellationTest {
         assertTrue(engine.isReplaying("app:u1"), "session stays in replay mode");
     }
 
+    /**
+     * P0 (replay resource safety, slow-client path): a slow client force-evicted by its OutboundChannel
+     * routes through onSlowDisconnect; if it was its AppSession's last socket the in-flight replay must be
+     * canceled too — not just on a normal close.
+     */
+    @Test
+    void slowDisconnectOfLastSocketCancelsInFlightReplay() throws Exception {
+        FeedGatewayService svc = svc();
+        SessionRoutingEngine engine = engineOf(svc);
+        // Replace s1's outbound channel with one whose session carries the AppSession attribute the real
+        // handshake binds, so onSlowDisconnect can resolve the AppSession id from channel.session().
+        svc.addClient(sessionWith("s1", "app:u1"));
+
+        FeedGatewayService.ReplayHandle handle = svc.registerOwnerHandleForTest("app:u1");
+        replayHandlesOf(svc).put("app:u1", handle);
+        engine.setReplayMode("app:u1", true);
+
+        invokeOnSlowDisconnect(svc, outboundOf(svc).get("s1"));
+
+        assertFalse(handle.active.get(), "slow-evicted last socket cancels the in-flight reader");
+        assertFalse(replayHandlesOf(svc).containsKey("app:u1"), "in-flight replay handle removed");
+        assertFalse(engine.isReplaying("app:u1"), "session left replay mode");
+    }
+
+    /** A disconnect with NO active replay must be a clean no-op: no exception, no state change. */
+    @Test
+    void disconnectWithNoActiveReplayIsANoOp() throws Exception {
+        FeedGatewayService svc = svc();
+        SessionRoutingEngine engine = engineOf(svc);
+        engine.detachSocket("s1");
+
+        svc.removeClient(sessionWith("s1", "app:u1")); // must not throw
+
+        assertTrue(replayHandlesOf(svc).isEmpty(), "no replay handle created or left behind");
+        assertFalse(engine.isReplaying("app:u1"), "session was never in replay mode");
+    }
+
+    /**
+     * Regression for the teardown race: a logout/expiry sweep can remove the AppSession BEFORE the socket's
+     * removeClient runs. Cancelling the reader must still succeed and must NOT throw when the now-absent
+     * session can no longer accept setReplayMode.
+     */
+    @Test
+    void lastSocketCloseAfterSessionTeardownDoesNotThrow() throws Exception {
+        FeedGatewayService svc = svc();
+        SessionRoutingEngine engine = engineOf(svc);
+        FeedGatewayService.ReplayHandle handle = svc.registerOwnerHandleForTest("app:u1");
+        replayHandlesOf(svc).put("app:u1", handle);
+        engine.setReplayMode("app:u1", true);
+
+        engine.teardownAppSession("app:u1"); // session gone before the socket close is processed
+
+        svc.removeClient(sessionWith("s1", "app:u1")); // must not throw on the absent-session setReplayMode
+
+        assertFalse(handle.active.get(), "reader still canceled despite the session being gone");
+        assertFalse(replayHandlesOf(svc).containsKey("app:u1"), "in-flight replay handle removed");
+    }
+
+    private static void invokeOnSlowDisconnect(FeedGatewayService svc, OutboundChannel channel)
+            throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod("onSlowDisconnect", OutboundChannel.class);
+        m.setAccessible(true);
+        m.invoke(svc, channel);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, OutboundChannel> outboundOf(FeedGatewayService svc) throws Exception {
+        Field f = FeedGatewayService.class.getDeclaredField("outbound");
+        f.setAccessible(true);
+        return (Map<String, OutboundChannel>) f.get(svc);
+    }
+
     private static SessionRoutingEngine engineOf(FeedGatewayService svc) throws Exception {
         Field f = FeedGatewayService.class.getDeclaredField("routingEngine");
         f.setAccessible(true);
@@ -188,9 +261,14 @@ class FeedGatewayReplayCancellationTest {
     }
 
     /** A socket mock carrying the AppSession id in its handshake attributes (as the interceptor binds it). */
-    private static WebSocketSession sessionWith(String socketId, String appSessionId) {
+    private WebSocketSession sessionWith(String socketId, String appSessionId) throws Exception {
         WebSocketSession ws = mock(WebSocketSession.class);
         when(ws.getId()).thenReturn(socketId);
+        when(ws.isOpen()).thenReturn(true);
+        doAnswer(inv -> {
+            sink.add(((TextMessage) inv.getArgument(0)).getPayload());
+            return null;
+        }).when(ws).sendMessage(any());
         Map<String, Object> attrs = new LinkedHashMap<>();
         attrs.put(app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor.ATTR_APP_SESSION_ID, appSessionId);
         when(ws.getAttributes()).thenReturn(attrs);
