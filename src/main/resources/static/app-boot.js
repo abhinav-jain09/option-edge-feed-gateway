@@ -238,12 +238,14 @@
   // datalist. Built with DOM nodes (value/label as properties, NEVER innerHTML) so a run field can't inject.
   function loadReplayRuns() {
     var list = el("oe-rp-run-list"); if (!list) { return; }
+    // Clear FIRST so a failed/empty refresh degrades to plain free-text (no stale suggestions survive);
+    // a successful fetch repopulates below.
+    list.textContent = "";
     ensureToken().then(function (t) {
       if (!t) { return; }
       return fetch("/api/replay/historical/runs", { headers: { "Authorization": "Bearer " + t } })
         .then(function (r) { return r.ok ? r.json() : []; })
         .then(function (runs) {
-          list.textContent = "";
           (Array.isArray(runs) ? runs : []).forEach(function (run) {
             if (!run || !run.runId) { return; }
             var opt = document.createElement("option");

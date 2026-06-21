@@ -1,6 +1,8 @@
 package app.feedgateway.mtsession.gateway;
 
 import app.feedgateway.mtsession.auth.JwtVerificationException;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
@@ -21,6 +23,8 @@ import org.springframework.web.bind.annotation.RestController;
 @RestController
 @ConditionalOnProperty(name = {"gateway.auth.enabled", "databento.replay.ui.enabled"}, havingValue = "true")
 public final class ReplayController {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final ReplayService replayService;
 
@@ -71,25 +75,20 @@ public final class ReplayController {
             @RequestHeader(value = "Authorization", required = false) String authorization) {
         return guarded(authorization, token -> {
             List<ReplayRunView> runs = replayService.listRuns(token);
-            StringBuilder sb = new StringBuilder("[");
-            for (int i = 0; i < runs.size(); i++) {
-                ReplayRunView r = runs.get(i);
-                if (i > 0) {
-                    sb.append(',');
-                }
-                sb.append("{\"runId\":\"").append(esc(r.runId()))
-                        .append("\",\"state\":\"").append(esc(r.state()))
-                        .append("\",\"replayDate\":\"").append(esc(r.replayDate()))
-                        .append("\",\"startTime\":\"").append(esc(r.startTime()))
-                        .append("\",\"endTime\":\"").append(esc(r.endTime())).append("\"}");
+            String body;
+            try {
+                // Serialize with Jackson, not hand-built JSON: it escapes control chars / quotes / backslashes
+                // correctly so an adversarial run field can never produce invalid (or injectable) JSON.
+                body = MAPPER.writeValueAsString(runs);
+            } catch (JsonProcessingException e) {
+                body = "[]"; // fail-closed: never emit a partial/invalid array
             }
-            sb.append(']');
             return ResponseEntity.ok()
                     .header("Cache-Control", "no-store, no-cache, must-revalidate")
                     .header("Pragma", "no-cache")
                     .header("Vary", "Authorization")
                     .contentType(MediaType.APPLICATION_JSON)
-                    .body(sb.toString());
+                    .body(body);
         });
     }
 
