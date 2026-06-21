@@ -159,10 +159,35 @@
   }
   function authHeaders(t) { return { "Authorization": "Bearer " + t, "Content-Type": "application/json" }; }
 
+  // Today's exchange-local (ET) date as "YYYYMMDD", or "" if the market calendar isn't loaded yet.
+  function todayMarketKey() {
+    var cal = window.OptionChainMarketCalendar;
+    if (!cal || !cal.marketDateTimeParts) { return ""; }
+    var t = cal.marketDateTimeParts(new Date());
+    return t ? ("" + t.year + t.month + t.day) : "";
+  }
+
+  // Market-calendar validation for the REPLAY date (req: past or today's session). A weekend, a market
+  // holiday, or a FUTURE date has no historical Databento data and would crash the per-run feed, so this
+  // blocks Start before the request is sent. Returns "" when valid, else a human message. Falls OPEN only
+  // when the calendar script has not loaded yet (the gateway still validates server-side).
+  function replayDateError(dateStr) {
+    var key = String(dateStr || "").replace(/-/g, "");
+    if (!/^\d{8}$/.test(key)) { return "pick a replay date"; }
+    var cal = window.OptionChainMarketCalendar;
+    if (!cal || !cal.isTradingDay) { return ""; }
+    if (!cal.isTradingDay(key)) { return "replay date must be a trading day (not a weekend or market holiday)"; }
+    var today = todayMarketKey();
+    if (today && key > today) { return "replay date can't be in the future — pick today or a past trading day"; }
+    return "";
+  }
+
   function startReplay() {
     rpMsg("");
     if (!appSessionId) { rpMsg("no session yet"); return; }
     var date = el("oe-rp-date").value, expiry = date.replace(/-/g, "");
+    var dateErr = replayDateError(date);
+    if (dateErr) { rpMsg(dateErr); return; }
     var startUtc, endUtc;
     try { startUtc = etToUtc(date, el("oe-rp-start").value); endUtc = etToUtc(date, el("oe-rp-end").value); }
     catch (e) { rpMsg(e.message); return; }
@@ -227,11 +252,28 @@
     el("oe-rp-stop-btn").onclick = function () { modeCall("/api/replay/historical/stop", "REPLAY_COMPLETE", "stop"); };
     el("oe-rp-live-btn").onclick = function () { setMode("RETURNING_TO_LIVE"); modeCall("/api/replay/live/resume", "LIVE", "return to live"); };
     if (el("oe-signout-btn")) el("oe-signout-btn").onclick = doLogout;
+    initReplayDate();
     // Populate the runId datalist with the caller's orchestrated runs (PR-2). Best-effort: on any failure
     // the field stays a plain free-text input (PR-1 behavior). Refresh on focus so the list stays current.
     var runIdField = el("oe-rp-run-id");
     if (runIdField) { runIdField.addEventListener("focus", loadReplayRuns); }
     loadReplayRuns();
+  }
+
+  // Constrain the native replay-date picker to past/today trading sessions and default it to the most
+  // recent trading day (which has complete data), instead of a hard-coded date. Validation on Start
+  // (replayDateError) is the authoritative guard; max= just stops the picker from offering future dates.
+  function initReplayDate() {
+    var d = el("oe-rp-date"); if (!d) { return; }
+    var cal = window.OptionChainMarketCalendar;
+    var today = todayMarketKey();
+    if (today) { d.max = today.slice(0, 4) + "-" + today.slice(4, 6) + "-" + today.slice(6, 8); }
+    if (cal && cal.previousTradingDay) {
+      var prev = cal.previousTradingDay(new Date());
+      if (prev && prev.key && /^\d{8}$/.test(prev.key)) {
+        d.value = prev.key.slice(0, 4) + "-" + prev.key.slice(4, 6) + "-" + prev.key.slice(6, 8);
+      }
+    }
   }
 
   // Fetch the caller's orchestrated replay runs from the gateway proxy and fill the #oe-rp-run-list
