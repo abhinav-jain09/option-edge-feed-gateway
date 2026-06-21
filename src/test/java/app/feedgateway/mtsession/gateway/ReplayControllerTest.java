@@ -28,7 +28,42 @@ class ReplayControllerTest {
         assertEquals(HttpStatus.UNAUTHORIZED, c.start(null, REQ).getStatusCode());
         assertEquals(HttpStatus.UNAUTHORIZED, c.stop(null, new ReplayController.ModeRequest("app:u1")).getStatusCode());
         assertEquals(HttpStatus.UNAUTHORIZED, c.resume(null, new ReplayController.ModeRequest("app:u1")).getStatusCode());
+        assertEquals(HttpStatus.UNAUTHORIZED, c.runs(null).getStatusCode());
         verifyNoInteractions(svc);
+    }
+
+    @Test
+    void runsReturnsProjectedListWithNoStoreHeaders() throws Exception {
+        ReplayService svc = mock(ReplayService.class);
+        when(svc.listRuns(eq("tok"))).thenReturn(java.util.List.of(
+                new ReplayRunView("r-1", "RUNNING", "2026-06-12", "14:00", "14:20"),
+                new ReplayRunView("r-2", "COMPLETE", "2026-06-11", "09:30", "10:00")));
+        ResponseEntity<String> resp = new ReplayController(svc).runs("Bearer tok");
+
+        assertEquals(HttpStatus.OK, resp.getStatusCode());
+        String body = resp.getBody();
+        assertTrue(body.contains("\"runId\":\"r-1\""));
+        assertTrue(body.contains("\"state\":\"RUNNING\""));
+        assertTrue(body.contains("\"runId\":\"r-2\""));
+        assertTrue(body.startsWith("[") && body.endsWith("]"));
+        assertEquals(false, body.contains("ownerId")); // projection drops ownership/internals
+        assertTrue(resp.getHeaders().getFirst("Cache-Control").contains("no-store"));
+    }
+
+    @Test
+    void runsEmptyListSerializesAsEmptyArray() throws Exception {
+        ReplayService svc = mock(ReplayService.class);
+        when(svc.listRuns(eq("tok"))).thenReturn(java.util.List.of());
+        ResponseEntity<String> resp = new ReplayController(svc).runs("Bearer tok");
+        assertEquals(HttpStatus.OK, resp.getStatusCode());
+        assertEquals("[]", resp.getBody());
+    }
+
+    @Test
+    void runsMapsDisabledTo403() throws Exception {
+        ReplayService svc = mock(ReplayService.class);
+        when(svc.listRuns(any())).thenThrow(new ReplayService.ReplayDisabledException("disabled"));
+        assertEquals(HttpStatus.FORBIDDEN, new ReplayController(svc).runs("Bearer tok").getStatusCode());
     }
 
     @Test

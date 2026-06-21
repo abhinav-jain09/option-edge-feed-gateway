@@ -1,10 +1,12 @@
 package app.feedgateway.mtsession.gateway;
 
 import app.feedgateway.mtsession.auth.JwtVerificationException;
+import java.util.List;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
@@ -56,6 +58,39 @@ public final class ReplayController {
             @RequestBody ModeRequest request) {
         return guarded(authorization, token ->
                 ResponseEntity.ok("{\"mode\":\"" + replayService.resume(token, request.sessionId()) + "\"}"));
+    }
+
+    /**
+     * Run-picker source (PR-2 of the runId bridge): the CALLER's orchestrated replay runs, projected to an
+     * ownership-safe view (no ownerId / no internals). The gateway forwards the bearer to the orchestrator,
+     * which filters by ownership; the lister is fail-closed (an unreachable/erroring orchestrator yields an
+     * empty array, never a raw error). Per-token, so never shared-cached.
+     */
+    @GetMapping(value = "/api/replay/historical/runs", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<String> runs(
+            @RequestHeader(value = "Authorization", required = false) String authorization) {
+        return guarded(authorization, token -> {
+            List<ReplayRunView> runs = replayService.listRuns(token);
+            StringBuilder sb = new StringBuilder("[");
+            for (int i = 0; i < runs.size(); i++) {
+                ReplayRunView r = runs.get(i);
+                if (i > 0) {
+                    sb.append(',');
+                }
+                sb.append("{\"runId\":\"").append(esc(r.runId()))
+                        .append("\",\"state\":\"").append(esc(r.state()))
+                        .append("\",\"replayDate\":\"").append(esc(r.replayDate()))
+                        .append("\",\"startTime\":\"").append(esc(r.startTime()))
+                        .append("\",\"endTime\":\"").append(esc(r.endTime())).append("\"}");
+            }
+            sb.append(']');
+            return ResponseEntity.ok()
+                    .header("Cache-Control", "no-store, no-cache, must-revalidate")
+                    .header("Pragma", "no-cache")
+                    .header("Vary", "Authorization")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(sb.toString());
+        });
     }
 
     private interface Action {

@@ -227,6 +227,33 @@
     el("oe-rp-stop-btn").onclick = function () { modeCall("/api/replay/historical/stop", "REPLAY_COMPLETE", "stop"); };
     el("oe-rp-live-btn").onclick = function () { setMode("RETURNING_TO_LIVE"); modeCall("/api/replay/live/resume", "LIVE", "return to live"); };
     if (el("oe-signout-btn")) el("oe-signout-btn").onclick = doLogout;
+    // Populate the runId datalist with the caller's orchestrated runs (PR-2). Best-effort: on any failure
+    // the field stays a plain free-text input (PR-1 behavior). Refresh on focus so the list stays current.
+    var runIdField = el("oe-rp-run-id");
+    if (runIdField) { runIdField.addEventListener("focus", loadReplayRuns); }
+    loadReplayRuns();
+  }
+
+  // Fetch the caller's orchestrated replay runs from the gateway proxy and fill the #oe-rp-run-list
+  // datalist. Built with DOM nodes (value/label as properties, NEVER innerHTML) so a run field can't inject.
+  function loadReplayRuns() {
+    var list = el("oe-rp-run-list"); if (!list) { return; }
+    ensureToken().then(function (t) {
+      if (!t) { return; }
+      return fetch("/api/replay/historical/runs", { headers: { "Authorization": "Bearer " + t } })
+        .then(function (r) { return r.ok ? r.json() : []; })
+        .then(function (runs) {
+          list.textContent = "";
+          (Array.isArray(runs) ? runs : []).forEach(function (run) {
+            if (!run || !run.runId) { return; }
+            var opt = document.createElement("option");
+            opt.value = run.runId;
+            var windowLabel = (run.startTime && run.endTime) ? (run.startTime + "-" + run.endTime) : "";
+            opt.label = [run.state, run.replayDate, windowLabel].filter(Boolean).join(" ");
+            list.appendChild(opt);
+          });
+        });
+    }).catch(function () { /* degrade silently to free-text entry */ });
   }
 
   // Build the boot-error box with DOM nodes + textContent (NEVER innerHTML) so an error message can't inject.
