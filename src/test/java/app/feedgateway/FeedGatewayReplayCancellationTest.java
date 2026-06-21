@@ -269,6 +269,26 @@ class FeedGatewayReplayCancellationTest {
         assertTrue(engine.appSession("app:u1").isEmpty(), "session torn down");
     }
 
+    /**
+     * Critic [LOW]: a control call must not throw "Unknown AppSession" when the session was already torn
+     * down (e.g. by a max-expiry sweep, which removes engine sessions without replayControlLock). startReplay
+     * fails CLEANLY (clear 409 reason, no phantom handle); resumeLive is a graceful no-op.
+     */
+    @Test
+    void controlCallsOnTornDownSessionFailCleanly() throws Exception {
+        FeedGatewayService svc = svc();
+        SessionRoutingEngine engine = engineOf(svc);
+        engine.teardownAppSession("app:u1"); // session gone before the control call
+
+        IllegalStateException startEx =
+                assertThrows(IllegalStateException.class, () -> svc.startReplay(params()));
+        assertFalse(startEx.getMessage().contains("Unknown AppSession"), "clean reason, not the internal one");
+        assertFalse(replayHandlesOf(svc).containsKey("app:u1"), "no phantom handle installed");
+
+        // resumeLive on an absent session must not throw.
+        assertEquals(app.feedgateway.mtsession.gateway.ReplayRunner.Mode.LIVE, svc.resumeLive("app:u1"));
+    }
+
     private static void invokeOnSlowDisconnect(FeedGatewayService svc, OutboundChannel channel)
             throws Exception {
         Method m = FeedGatewayService.class.getDeclaredMethod("onSlowDisconnect", OutboundChannel.class);

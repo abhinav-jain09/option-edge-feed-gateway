@@ -2356,11 +2356,20 @@ public class FeedGatewayService implements ReplayRunner {
                 throw new IllegalStateException("no active socket for session " + appSessionId);
             }
             cancelActiveReplay(appSessionId); // cancel + wake + await any prior run for this session
+            // Enter replay mode BEFORE installing any handle/generation. If the session vanished between the
+            // socket-presence check above and here (a max-expiry sweep removes engine sessions WITHOUT
+            // holding replayControlLock), this throws with nothing yet to roll back — rethrown as a clean
+            // 409. Doing it first also guarantees we never install a handle or submit a reader for an absent
+            // session (which would otherwise be an orphaned Kafka reader).
+            try {
+                routingEngine.setReplayMode(appSessionId, true);
+            } catch (IllegalStateException sessionGone) {
+                throw new IllegalStateException("no active session to replay; it was just torn down");
+            }
             long generation = replayGenerationSeq.incrementAndGet();
             ReplayHandle handle = new ReplayHandle(generation);
             replayOwnerGeneration.put(appSessionId, generation);
             replayHandles.put(appSessionId, handle);
-            routingEngine.setReplayMode(appSessionId, true);
             // Clear the live rows and flip the UI badge (reqs 9).
             sendToAppSession(appSessionId, "reset", "{\"reason\":\"replay-start\"}");
             sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_RUNNING", params, 0L));
@@ -2369,7 +2378,7 @@ public class FeedGatewayService implements ReplayRunner {
             } catch (RejectedExecutionException tooMany) {
                 replayHandles.remove(appSessionId, handle);
                 replayOwnerGeneration.put(appSessionId, replayGenerationSeq.incrementAndGet());
-                routingEngine.setReplayMode(appSessionId, false);
+                routingEngine.setReplayModeIfPresent(appSessionId, false); // rollback; no-op if torn down
                 throw new IllegalStateException("replay capacity reached; please retry shortly");
             }
             return ReplayRunner.Mode.REPLAY_RUNNING;
@@ -2395,7 +2404,9 @@ public class FeedGatewayService implements ReplayRunner {
         synchronized (replayControlLock) {
             cancelActiveReplay(appSessionId);
             if (routingEngine != null) {
-                routingEngine.setReplayMode(appSessionId, false);
+                // IfPresent: a max-expiry sweep / logout may have removed the session concurrently (it does
+                // not hold replayControlLock); returning to live for an absent session is a no-op, not an error.
+                routingEngine.setReplayModeIfPresent(appSessionId, false);
             }
             // Clear replay rows and re-seed the latest live cache, then live routing resumes (req. 10).
             sendToAppSession(appSessionId, "reset", "{\"reason\":\"return-to-live\"}");
