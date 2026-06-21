@@ -14,6 +14,7 @@ import app.feedgateway.mtsession.gateway.ReplayParams;
 import app.feedgateway.mtsession.gateway.ReplayTopicResolver;
 import app.feedgateway.mtsession.gateway.ReplayRunner;
 import app.feedgateway.mtsession.gateway.GatewayRecordMapper;
+import app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor;
 import java.util.Optional;
 import java.util.OptionalDouble;
 import org.springframework.lang.Nullable;
@@ -371,6 +372,10 @@ public class FeedGatewayService implements ReplayRunner {
             channel.shutdown(); // quiet teardown — normal disconnect, not a slow-client eviction
         }
         closeQuietly(stored != null ? stored : session);
+        // The handler detaches this socket from the routing engine BEFORE calling removeClient, so if its
+        // AppSession is now left with no sockets, end any in-flight replay (a reader must never keep
+        // consuming Kafka for a session nobody is listening to).
+        cancelReplayIfNoSockets(appSessionIdOf(session));
     }
 
     /**
@@ -441,6 +446,50 @@ public class FeedGatewayService implements ReplayRunner {
         WebSocketSession stored = clientsById.remove(channel.socketId());
         if (stored != null) {
             clients.remove(stored);
+        }
+        // A slow client is force-closed here, ahead of the container's afterConnectionClosed. Detach it
+        // from routing now (idempotent — the later afterConnectionClosed detach is then a no-op) so the
+        // no-sockets check is accurate, then cancel replay if this was its AppSession's last socket.
+        if (routingEngine != null) {
+            routingEngine.detachSocket(channel.socketId());
+        }
+        cancelReplayIfNoSockets(appSessionIdOf(channel.session()));
+    }
+
+    /** The AppSession id bound to a socket at handshake (per-session mode), or null if absent/blank. */
+    private static String appSessionIdOf(WebSocketSession session) {
+        if (session == null) {
+            return null;
+        }
+        Object attr = session.getAttributes().get(TicketHandshakeInterceptor.ATTR_APP_SESSION_ID);
+        return attr instanceof String s && !s.isBlank() ? s : null;
+    }
+
+    /**
+     * P0 (replay resource safety): when a socket goes away and its AppSession is left with NO attached
+     * sockets, cancel any in-flight per-session replay and leave replay mode. Otherwise a historical-replay
+     * reader would keep consuming Kafka for a session nobody is listening to until its window expires. Must
+     * be called AFTER the socket has been detached from the routing engine so the socketsForAppSession check
+     * reflects the removal. Idempotent; a no-op when nothing is replaying.
+     */
+    private void cancelReplayIfNoSockets(String appSessionId) {
+        if (routingEngine == null || appSessionId == null || appSessionId.isBlank()) {
+            return;
+        }
+        if (!routingEngine.socketsForAppSession(appSessionId).isEmpty()) {
+            return; // another socket for this AppSession is still attached — keep replaying
+        }
+        synchronized (replayControlLock) {
+            // Re-check under the lock: a socket may have (re)attached, or a new replay started, between the
+            // unlocked check above and acquiring the lock. Only cancel if still nobody is listening.
+            if (!routingEngine.socketsForAppSession(appSessionId).isEmpty()) {
+                return;
+            }
+            if (!replayHandles.containsKey(appSessionId) && !routingEngine.isReplaying(appSessionId)) {
+                return; // nothing in flight to cancel
+            }
+            cancelActiveReplay(appSessionId);
+            routingEngine.setReplayMode(appSessionId, false);
         }
     }
 

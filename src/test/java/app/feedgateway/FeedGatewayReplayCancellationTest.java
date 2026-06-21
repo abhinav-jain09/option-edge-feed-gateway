@@ -1,6 +1,7 @@
 package app.feedgateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
@@ -123,5 +124,76 @@ class FeedGatewayReplayCancellationTest {
 
         assertEquals(FeedGatewayService.ReplayOutcome.CANCELED, result.outcome());
         assertTrue(sink.isEmpty(), "a stopped reader must deliver no records");
+    }
+
+    /**
+     * P0 (replay resource safety): when the LAST socket of an AppSession disconnects, an in-flight replay
+     * must be canceled and the session left replay mode — otherwise the reader keeps consuming Kafka unheard.
+     */
+    @Test
+    void lastSocketCloseCancelsInFlightReplay() throws Exception {
+        FeedGatewayService svc = svc();
+        SessionRoutingEngine engine = engineOf(svc);
+
+        // Simulate an in-flight replay for app:u1: a handle registered as the owner AND in replayHandles,
+        // with the session in replay mode (exactly the state startReplay installs before the reader runs).
+        FeedGatewayService.ReplayHandle handle = svc.registerOwnerHandleForTest("app:u1");
+        replayHandlesOf(svc).put("app:u1", handle);
+        engine.setReplayMode("app:u1", true);
+        assertTrue(engine.isReplaying("app:u1"));
+
+        // The sole socket disconnects: the handler detaches it from routing, then removeClient runs.
+        engine.detachSocket("s1");
+        svc.removeClient(sessionWith("s1", "app:u1"));
+
+        assertFalse(handle.active.get(), "in-flight reader was woken/canceled");
+        assertFalse(replayHandlesOf(svc).containsKey("app:u1"), "in-flight replay handle removed");
+        assertFalse(engine.isReplaying("app:u1"), "session left replay mode");
+    }
+
+    /**
+     * The replay must survive a NON-last socket closing: with a second socket still attached, closing one
+     * socket leaves the in-flight reader running for the remaining listener.
+     */
+    @Test
+    void nonLastSocketCloseKeepsReplayRunning() throws Exception {
+        FeedGatewayService svc = svc();
+        SessionRoutingEngine engine = engineOf(svc);
+        engine.attachSocket("app:u1", "s2"); // a second live socket for the same session
+
+        FeedGatewayService.ReplayHandle handle = svc.registerOwnerHandleForTest("app:u1");
+        replayHandlesOf(svc).put("app:u1", handle);
+        engine.setReplayMode("app:u1", true);
+
+        engine.detachSocket("s1");
+        svc.removeClient(sessionWith("s1", "app:u1"));
+
+        assertTrue(handle.active.get(), "reader still active — another socket is listening");
+        assertTrue(replayHandlesOf(svc).containsKey("app:u1"), "replay handle retained");
+        assertTrue(engine.isReplaying("app:u1"), "session stays in replay mode");
+    }
+
+    private static SessionRoutingEngine engineOf(FeedGatewayService svc) throws Exception {
+        Field f = FeedGatewayService.class.getDeclaredField("routingEngine");
+        f.setAccessible(true);
+        return (SessionRoutingEngine) f.get(svc);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, FeedGatewayService.ReplayHandle> replayHandlesOf(FeedGatewayService svc)
+            throws Exception {
+        Field f = FeedGatewayService.class.getDeclaredField("replayHandles");
+        f.setAccessible(true);
+        return (Map<String, FeedGatewayService.ReplayHandle>) f.get(svc);
+    }
+
+    /** A socket mock carrying the AppSession id in its handshake attributes (as the interceptor binds it). */
+    private static WebSocketSession sessionWith(String socketId, String appSessionId) {
+        WebSocketSession ws = mock(WebSocketSession.class);
+        when(ws.getId()).thenReturn(socketId);
+        Map<String, Object> attrs = new LinkedHashMap<>();
+        attrs.put(app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor.ATTR_APP_SESSION_ID, appSessionId);
+        when(ws.getAttributes()).thenReturn(attrs);
+        return ws;
     }
 }
