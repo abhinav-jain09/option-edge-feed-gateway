@@ -109,6 +109,24 @@ body {
     color: #5c6b63;
 }
 
+.gex-status.waiting {
+    border-color: rgba(92, 107, 99, 0.28);
+    background: rgba(229, 234, 231, 0.76);
+    color: #5c6b63;
+}
+
+.gex-status.partial {
+    border-color: rgba(255, 159, 64, 0.72);
+    background: #ffe2c2;
+    color: #7a3e00;
+}
+
+.gex-status.unavailable {
+    border-color: rgba(255, 123, 123, 0.72);
+    background: #ffd9d9;
+    color: #7a1f1f;
+}
+
 .status-pill {
     border-radius: 999px;
     padding: 4px 8px;

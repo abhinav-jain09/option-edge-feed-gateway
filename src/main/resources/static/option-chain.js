@@ -524,17 +524,12 @@
 			                    const feedUnavailable = status.text === 'Feed unavailable';
 			                    const databentoMode = isDatabentoMarketData(config);
                             const replayUiVisible = isDevProfile(config) && Boolean(config.databentoReplayUiEnabled);
-                            const gexOptional = !databentoMode && data.length > 0 && gexSummary.visibleCount === 0;
                             const gexSourceLabel = databentoMode ? 'DBN' : 'UW';
                             const gexSourceName = databentoMode ? 'databento' : 'unusual-whales';
-                            const gexStatusClass = gexOptional
-                              ? 'disabled'
-                              : gexSummary.staleCount > 0
-                                ? 'stale'
-                                : gexSummary.visibleCount === data.length && data.length > 0 ? 'ready' : '';
-                            const gexStatusLabel = gexOptional
-                              ? `GEX optional 0/${data.length}`
-                              : `GEX ${gexSummary.visibleCount}/${data.length} ${gexSourceLabel}${gexSummary.staleCount ? ` stale ${gexSummary.staleCount}` : ''}`;
+                            const gexStatus = computeGexStatus(databentoMode, data.length, gexSummary);
+                            const gexStatusClass = gexStatus.className;
+                            const gexStatusLabel = gexStatus.label;
+                            const gexOptional = gexStatus.state === 'optional';
 		                    const subtitle = config.symbol
         ? `${config.symbol} ${formatExpiry(config.expiry)} | ${String(config.marketDataSource || '').toUpperCase()} market data | ${String(config.provider || '').toUpperCase()} orders`
         : 'Loading config...';
@@ -545,13 +540,15 @@
       marketDataSource: config.marketDataSource,
       expiry: normalizeExpiry(config.expiry),
       date: selectedExpiryDate,
+      state: gexStatus.state,
+      reason: gexStatus.reason,
       visibleStrikeCount: data.length,
       visibleGexCount: gexSummary.visibleCount,
       staleGexCount: gexSummary.staleCount,
       missingGexCount: gexSummary.missingCount,
-      disabled: false,
-      optional: gexOptional,
-      unavailable: gexOptional
+      disabled: gexStatus.state === 'optional',
+      optional: gexStatus.state === 'optional',
+      unavailable: gexStatus.state === 'unavailable'
     });
 
     useEffect(() => {
@@ -685,7 +682,9 @@
 	        h('span', {
 	          id: 'unusualWhalesGexStatus',
 	          className: `gex-status ${gexStatusClass}`.trim(),
+	          title: gexStatus.reason || gexStatusLabel,
 	          'data-gex-source': gexSourceName,
+	          'data-gex-state': gexStatus.state,
 	          'data-gex-json': gexStatusJson,
 	          'data-uw-gex-json': gexStatusJson
 	        }, gexStatusLabel),
@@ -2977,6 +2976,37 @@
     if (Number.isFinite(number) && map.has(number)) return number;
     return strike;
   }
+
+	  function computeGexStatus(databentoMode, total, summary) {
+	    const visible = summary.visibleCount;
+	    const stale = summary.staleCount;
+	    if (!databentoMode) {
+	      // Unusual Whales GEX is an optional overlay; preserve legacy semantics.
+	      if (total > 0 && visible === 0) {
+	        return { state: 'optional', className: 'disabled', label: `GEX optional 0/${total}`, reason: 'no Unusual Whales exposure' };
+	      }
+	      const className = stale > 0 ? 'stale' : (visible === total && total > 0 ? 'ready' : '');
+	      const state = stale > 0 ? 'stale' : (visible === total && total > 0 ? 'ready' : 'waiting');
+	      return { state, className, label: `GEX ${visible}/${total} UW${stale ? ` stale ${stale}` : ''}`, reason: '' };
+	    }
+	    // Databento GEX: explicit, operator-readable status states.
+	    if (total === 0) {
+	      return { state: 'waiting', className: 'waiting', label: 'GEX waiting DBN', reason: 'waiting for option chain' };
+	    }
+	    if (visible === 0) {
+	      return { state: 'unavailable', className: 'unavailable', label: `GEX unavailable 0/${total} DBN`, reason: 'no Databento GEX records (producer not running or topic empty)' };
+	    }
+	    if (stale >= visible) {
+	      return { state: 'stale', className: 'stale', label: `GEX stale ${visible}/${total} DBN`, reason: 'all GEX records stale' };
+	    }
+	    if (visible < total) {
+	      return { state: 'partial', className: 'partial', label: `GEX partial ${visible}/${total} DBN${stale ? ` stale ${stale}` : ''}`, reason: `partial strike coverage${stale ? `, ${stale} stale` : ''}` };
+	    }
+	    if (stale > 0) {
+	      return { state: 'partial', className: 'partial', label: `GEX ${visible}/${total} DBN stale ${stale}`, reason: `${stale} stale records` };
+	    }
+	    return { state: 'ready', className: 'ready', label: `GEX ${visible}/${total} DBN`, reason: '' };
+	  }
 
 	  function gexSourceMeta(row) {
 	    const src = String((row && (row.source || row.marketDataSource)) || '').toUpperCase();
