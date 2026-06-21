@@ -163,7 +163,8 @@ class WsJwtHandshakeInterceptorTest {
 
     @Test
     void subProtocolIsAdvertisedByHandler() {
-        FeedWebSocketHandler handler = new FeedWebSocketHandler(mock(FeedGatewayService.class));
+        FeedWebSocketHandler handler = new FeedWebSocketHandler(mock(FeedGatewayService.class),
+                new app.feedgateway.replay.ReplaySessionOwnership());
         assertEquals(List.of("oc.bearer"), handler.getSubProtocols());
     }
 }

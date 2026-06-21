@@ -50,6 +50,16 @@ public final class GatewaySettings {
         return value("WS_ALLOWED_ORIGINS", "*");
     }
 
+    /** Per-session replay control endpoints are opt-in (default off). */
+    public boolean replayEnabled() {
+        return boolValue("GATEWAY_REPLAY_ENABLED", false);
+    }
+
+    /** Base URL of the replay orchestrator the UI/gateway coordinate with (informational; "" if unset). */
+    public String replayOrchestratorUrl() {
+        return value("GATEWAY_REPLAY_ORCHESTRATOR_URL", "");
+    }
+
     public String groupIdBase() {
         return value("GATEWAY_KAFKA_GROUP_ID", "options-edge-feed-gateway");
     }
