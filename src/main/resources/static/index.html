@@ -3,10 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- P0 (XSS hardening): restrictive CSP. Scripts are self-hosted only (no inline JS, no third-party CDN),
-       so a reflected error_description / token claim cannot execute even if it reached the DOM. connect-src
-       allows this dev stub's Keycloak origin; update it together with the KC constant in login.js for prod. -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://localhost:8080; form-action 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <!-- P0/P1 (XSS + portability): the restrictive, DEPLOYMENT-AWARE CSP is emitted as a response header by
+       SecurityHeadersFilter (connect-src is derived from the configured Keycloak issuer), so it is correct
+       across dev/prod without hardcoding an origin here. Scripts are self-hosted only (no inline JS/CDN). -->
   <meta name="referrer" content="no-referrer">
   <title>OptionsEdge — Sign in</title>
   <style>

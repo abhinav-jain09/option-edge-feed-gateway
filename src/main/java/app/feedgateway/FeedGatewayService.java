@@ -454,6 +454,12 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** Deployment-injected Keycloak config for the bundled sign-in pages (issuer + client id; no secrets). */
+    public String authConfigJson() {
+        return "{\"issuer\":\"" + escapeJson(settings.keycloakIssuer())
+                + "\",\"clientId\":\"" + escapeJson(settings.keycloakClientId()) + "\"}";
+    }
+
     private int totalOutboundQueued() {
         int sum = 0;
         for (OutboundChannel channel : outbound.values()) {

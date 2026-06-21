@@ -28,25 +28,6 @@ class StaticAssetSecurityTest {
         return Files.readString(STATIC.resolve(name));
     }
 
-    private static String cspOf(String html) {
-        var m = Pattern.compile("Content-Security-Policy\"\\s+content=\"([^\"]+)\"").matcher(html);
-        assertTrue(m.find(), "page must declare a Content-Security-Policy");
-        return m.group(1);
-    }
-
-    private void assertRestrictiveCsp(String page) throws IOException {
-        String csp = cspOf(read(page));
-        assertTrue(csp.contains("default-src 'none'"), page + " CSP must default-deny");
-        assertTrue(csp.contains("script-src 'self'"), page + " CSP must restrict scripts to self");
-        assertTrue(csp.contains("frame-ancestors 'none'"), page + " CSP must block framing");
-        assertTrue(csp.contains("base-uri 'none'"), page + " CSP must lock base-uri");
-        // The script-src directive must not weaken to inline/eval/CDN.
-        String scriptSrc = csp.replaceAll(".*script-src([^;]*);.*", "$1");
-        assertFalse(scriptSrc.contains("'unsafe-inline'"), page + " script-src must not allow unsafe-inline");
-        assertFalse(scriptSrc.contains("'unsafe-eval'"), page + " script-src must not allow unsafe-eval");
-        assertFalse(scriptSrc.contains("unpkg") || scriptSrc.contains("http"), page + " script-src must be self-only");
-    }
-
     private void assertNoInlineScript(String page) throws IOException {
         String html = read(page);
         // Every <script ...> must carry a src= (no inline JS body).
@@ -58,17 +39,35 @@ class StaticAssetSecurityTest {
     }
 
     @Test
-    void loginPageHasRestrictiveCspAndNoInlineScriptOrCdn() throws IOException {
-        assertRestrictiveCsp("index.html");
-        assertNoInlineScript("index.html");
-        assertFalse(read("index.html").contains("unpkg"), "login page must not load third-party scripts");
+    void pagesHaveNoInlineScriptOrCdn() throws IOException {
+        // The restrictive CSP is now a deployment-aware response header (SecurityHeadersFilter, tested
+        // separately); the static guards here ensure the pages stay self-hosted with no inline JS / CDN.
+        for (String page : new String[]{"index.html", "app.html"}) {
+            assertNoInlineScript(page);
+            assertFalse(read(page).contains("unpkg"), page + " must not load third-party scripts");
+        }
     }
 
     @Test
-    void appPageHasRestrictiveCspAndNoInlineScriptOrCdn() throws IOException {
-        assertRestrictiveCsp("app.html");
-        assertNoInlineScript("app.html");
-        assertFalse(read("app.html").contains("unpkg"), "app page must not load React from a CDN");
+    void keycloakConfigIsInjectedNotHardcoded() throws IOException {
+        // P1 (portability): a remote browser must talk to the DEPLOYED Keycloak, not localhost. The pages
+        // fetch issuer + client id from /auth-config instead of hardcoding an origin.
+        for (String js : new String[]{"login.js", "app-boot.js"}) {
+            String src = read(js);
+            assertTrue(src.contains("/auth-config"), js + " must fetch Keycloak config from /auth-config");
+            assertFalse(src.contains("localhost:8080"), js + " must not hardcode a Keycloak origin");
+        }
+    }
+
+    @Test
+    void signInUsesPkceAuthorizationCodeOnlyNoPasswordGrant() throws IOException {
+        // P1: no direct password grant — the password is entered only on Keycloak's hosted login (PKCE).
+        String login = read("login.js");
+        assertFalse(login.contains("grant_type:\"password\"") || login.contains("grant_type=password"),
+                "login.js must not use the Resource Owner Password grant");
+        assertFalse(login.contains("type=\"password\""), "login.js must not render a password field");
+        assertTrue(login.contains("code_challenge_method") && login.contains("authorization_code"),
+                "login.js must use authorization-code PKCE");
     }
 
     @Test

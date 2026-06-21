@@ -13,8 +13,21 @@
   var sel = null; try { sel = JSON.parse(S.getItem("oe_sel") || "null"); } catch (e) {}
   if (!tok || !sel) { location.replace("/index.html"); return; }
 
-  var KC = "http://localhost:8080/realms/optionsedge", CLIENT = "options-edge-web";
-  var TOKEN_URL = KC + "/protocol/openid-connect/token";
+  // P1 (environment portability): Keycloak config is INJECTED by the deployment via /auth-config — never
+  // hardcoded — so token refresh / revoke / logout target the deployed Keycloak, not the user's localhost.
+  var KC = null, CLIENT = null, TOKEN_URL = null, REVOKE_URL = null, LOGOUT_URL = null;
+  function loadAuthConfig() {
+    return fetch("/auth-config", { headers: { "Accept": "application/json" } })
+      .then(function (r) { if (!r.ok) throw new Error("auth-config " + r.status); return r.json(); })
+      .then(function (c) {
+        if (!c.issuer || !c.clientId) throw new Error("auth-config incomplete");
+        KC = String(c.issuer).replace(/\/+$/, "");
+        CLIENT = c.clientId;
+        TOKEN_URL = KC + "/protocol/openid-connect/token";
+        REVOKE_URL = KC + "/protocol/openid-connect/revoke";
+        LOGOUT_URL = KC + "/protocol/openid-connect/logout";
+      });
+  }
 
   function persist() { S.setItem("oe_tok", tok); S.setItem("oe_refresh", refresh); S.setItem("oe_expAt", String(expAt)); }
 
@@ -172,8 +185,7 @@
 
   // P0 (real sign-out): tear down the server AppSession (closes the WS), revoke the refresh token, wipe all
   // stored credentials + selection, then end the Keycloak SSO session — leaving nothing to resume.
-  var REVOKE_URL = KC + "/protocol/openid-connect/revoke";
-  var LOGOUT_URL = KC + "/protocol/openid-connect/logout";
+  // (REVOKE_URL / LOGOUT_URL are set from the injected config in loadAuthConfig.)
   var SESSION_KEYS = ["oe_tok", "oe_refresh", "oe_expAt", "oe_sel", "pkce_verifier", "pkce_state"];
   function doLogout() {
     var accessTok = tok, refreshTok = refresh;
@@ -221,10 +233,12 @@
     root.appendChild(box);
   }
 
-  // Boot: mint the first ticket, load self-hosted React (SRI-pinned), then the option-chain app.
+  // Boot: load the injected Keycloak config, mint the first ticket, load self-hosted React (SRI-pinned),
+  // then the option-chain app.
   var REACT_SRI = "sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z";
   var REACT_DOM_SRI = "sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1";
-  refreshTicket()
+  loadAuthConfig()
+    .then(function () { return refreshTicket(); })
     .then(function () { return loadScript("/vendor/react.production.min.js", REACT_SRI); })
     .then(function () { return loadScript("/vendor/react-dom.production.min.js", REACT_DOM_SRI); })
     .then(function () { return loadScript("/option-chain.js"); })

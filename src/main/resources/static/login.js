@@ -6,14 +6,25 @@
 // A restrictive CSP (see index.html) and self-hosted scripts back this up. Do not reintroduce
 // `innerHTML = ... + external + ...`.
 
-const KC = "http://localhost:8080/realms/optionsedge", CLIENT = "options-edge-web";
-const TOKEN_URL = KC + "/protocol/openid-connect/token";
-const AUTH_URL = KC + "/protocol/openid-connect/auth";
-const REG_URL = KC + "/protocol/openid-connect/registrations";
-const REVOKE_URL = KC + "/protocol/openid-connect/revoke";
-const LOGOUT_URL = KC + "/protocol/openid-connect/logout";
+// P1 (environment portability): the Keycloak issuer + client id are INJECTED by the deployment via
+// /auth-config — never hardcoded — so a remote browser talks to the deployed Keycloak, not localhost.
+let KC = null, CLIENT = null, TOKEN_URL, AUTH_URL, REG_URL, REVOKE_URL, LOGOUT_URL;
 const SESSION_KEYS = ["oe_tok", "oe_refresh", "oe_expAt", "oe_sel", "pkce_verifier", "pkce_state"];
 const REDIRECT_URI = location.origin + "/";
+
+async function loadAuthConfig() {
+  const r = await fetch("/auth-config", { headers: { "Accept": "application/json" } });
+  if (!r.ok) throw new Error("auth-config " + r.status);
+  const c = await r.json();
+  if (!c.issuer || !c.clientId) throw new Error("auth-config incomplete");
+  KC = c.issuer.replace(/\/+$/, "");
+  CLIENT = c.clientId;
+  TOKEN_URL = KC + "/protocol/openid-connect/token";
+  AUTH_URL = KC + "/protocol/openid-connect/auth";
+  REG_URL = KC + "/protocol/openid-connect/registrations";
+  REVOKE_URL = KC + "/protocol/openid-connect/revoke";
+  LOGOUT_URL = KC + "/protocol/openid-connect/logout";
+}
 let tok = null, refresh = null, expAt = 0, ws = null;
 const main = document.getElementById("main");
 const el = id => document.getElementById(id);
@@ -67,37 +78,22 @@ async function handleRedirectCallback() {
 
 function viewLogin(err) {
   el("who").style.display="none"; el("logout").style.display="none";
-  // CONSTANT template — no external data. The error message is filled below via textContent only.
+  // CONSTANT template — no external data. P1: PKCE authorization-code ONLY — no password field, no password
+  // grant. "Sign in" redirects to Keycloak's hosted login (the only place the password is entered).
   main.innerHTML =
     '<div class="card narrow">' +
       '<h2 class="center">Sign in</h2>' +
       '<p class="muted center">Access the OptionsEdge live feed.</p>' +
-      '<label>Username</label><input id="u" autocomplete="username">' +
-      '<label>Password</label><input id="p" type="password" autocomplete="current-password">' +
-      '<div style="height:14px"></div>' +
-      '<button class="primary" id="login">Sign in</button>' +
+      '<div style="height:6px"></div>' +
+      '<button class="primary" id="login">Sign in with Keycloak</button>' +
       '<div class="msg" id="m"></div>' +
       '<p class="muted center" style="margin-top:18px">No account? <a href="#" id="register">Create one</a></p>' +
     '</div>';
   const m = el("m");
   m.textContent = err || "";                  // external/reflected data — textContent, never HTML
   m.className = "msg" + (err ? " err" : "");
-  el("login").onclick = doLogin;
+  el("login").onclick = () => startRedirect(AUTH_URL);
   el("register").onclick = e => { e.preventDefault(); startRedirect(REG_URL); };
-  el("p").addEventListener("keydown", e => { if (e.key==="Enter") doLogin(); });
-}
-
-async function doLogin() {
-  const u = el("u").value.trim(), p = el("p").value;
-  el("m").textContent = "Signing in…"; el("m").className = "msg";
-  try {
-    const body = new URLSearchParams({ grant_type:"password", client_id:CLIENT, username:u, password:p, scope:"openid" });
-    const r = await fetch(TOKEN_URL, { method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body });
-    if (!r.ok) { viewLogin("Invalid username or password."); return; }
-    const j = await r.json();
-    tok = j.access_token; refresh = j.refresh_token; expAt = Date.now() + (j.expires_in-30)*1000;
-    viewApp();
-  } catch (e) { viewLogin("Cannot reach Keycloak ("+KC+")."); }
 }
 
 async function ensureToken() {
@@ -174,4 +170,7 @@ async function enterApp() {
   location.assign("/app.html");
 }
 
-handleRedirectCallback().then(handled => { if (!handled) viewLogin(); });
+// Load the deployment's Keycloak config first, then run the PKCE callback / show the sign-in view.
+loadAuthConfig()
+  .then(() => handleRedirectCallback().then(handled => { if (!handled) viewLogin(); }))
+  .catch(() => { main.textContent = "Sign-in is temporarily unavailable (could not load configuration)."; });
