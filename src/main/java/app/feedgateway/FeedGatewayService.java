@@ -1470,6 +1470,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = indexPriceCacheKey(json, key);
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
+        } else if ("gex-by-strike".equals(event)) {
+            key = gexCacheKey(json, key);
         }
         if (!"pace".equals(event)) {
             key = binding.source() + "|" + key;
@@ -1969,6 +1971,24 @@ public class FeedGatewayService implements ReplayRunner {
             String expiry = normalizeExpiry(text(root, "expiry"));
             if (!symbol.isBlank() && !expiry.isBlank()) {
                 return symbol + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    private String gexCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            double strike = doubleField(root, "strike", Double.NaN);
+            // Derive a deterministic per-strike key from payload identity instead of
+            // trusting the producer's Kafka key. Source is prepended by updateCache, so
+            // the cache key matches the UI contract (source|symbol|expiry|strike).
+            if (!symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike)) {
+                return symbol + "|" + expiry + "|" + formatStrike(strike);
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.

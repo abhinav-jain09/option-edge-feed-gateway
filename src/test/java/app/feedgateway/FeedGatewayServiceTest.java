@@ -93,6 +93,40 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void gexCacheKeyUsesPayloadIdentity() throws Exception {
+        FeedGatewayService service = service();
+
+        // Source is prepended by updateCache, so the helper returns symbol|expiry|strike.
+        assertEquals("SPX|20260612|6005", gexCacheKey(
+                service,
+                "{\"source\":\"DATABENTO\",\"symbol\":\"spx\",\"expiry\":\"2026-06-12\",\"strike\":6005}",
+                "fallback"
+        ));
+    }
+
+    @Test
+    void gexCacheKeyPreservesDecimalStrikePayloadIdentity() throws Exception {
+        FeedGatewayService service = service();
+
+        assertEquals("SPX|20260612|6005.5", gexCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":6005.5}",
+                "fallback"
+        ));
+    }
+
+    @Test
+    void gexCacheKeyFallsBackWhenStrikeMissing() throws Exception {
+        FeedGatewayService service = service();
+
+        assertEquals("fallback-key", gexCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"expiry\":\"20260612\"}",
+                "fallback-key"
+        ));
+    }
+
+    @Test
     void paceCacheStoresSameStrikeSeparatelyBySource() throws Exception {
         FeedGatewayService service = service();
         Object ibkrBinding = topicBinding("IBKR", "pace");
@@ -288,6 +322,12 @@ class FeedGatewayServiceTest {
 
     private static String paceCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
         Method method = FeedGatewayService.class.getDeclaredMethod("paceCacheKey", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, fallback);
+    }
+
+    private static String gexCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("gexCacheKey", String.class, String.class);
         method.setAccessible(true);
         return (String) method.invoke(service, json, fallback);
     }
