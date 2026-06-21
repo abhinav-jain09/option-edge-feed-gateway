@@ -26,6 +26,11 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void databentoGexTopicHasExpectedDefault() {
+        assertEquals("options.databento.gex.strike", new GatewaySettings().databentoGexTopic());
+    }
+
+    @Test
     void indexPriceCacheKeyUsesPayloadSymbolInsteadOfKafkaTradeKey() {
         FeedGatewayService service = new FeedGatewayService(
                 new GatewaySettings(),

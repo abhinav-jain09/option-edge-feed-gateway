@@ -525,16 +525,15 @@
 			                    const databentoMode = isDatabentoMarketData(config);
                             const replayUiVisible = isDevProfile(config) && Boolean(config.databentoReplayUiEnabled);
                             const gexOptional = !databentoMode && data.length > 0 && gexSummary.visibleCount === 0;
-                            const gexStatusClass = databentoMode || gexOptional
+                            const gexSourceLabel = databentoMode ? 'DBN' : 'UW';
+                            const gexStatusClass = gexOptional
                               ? 'disabled'
                               : gexSummary.staleCount > 0
                                 ? 'stale'
                                 : gexSummary.visibleCount === data.length && data.length > 0 ? 'ready' : '';
-                            const gexStatusLabel = databentoMode
-                              ? 'GEX IBKR-only'
-                              : gexOptional
-                                ? `GEX optional 0/${data.length}`
-                                : `GEX ${gexSummary.visibleCount}/${data.length} UW${gexSummary.staleCount ? ` stale ${gexSummary.staleCount}` : ''}`;
+                            const gexStatusLabel = gexOptional
+                              ? `GEX optional 0/${data.length}`
+                              : `GEX ${gexSummary.visibleCount}/${data.length} ${gexSourceLabel}${gexSummary.staleCount ? ` stale ${gexSummary.staleCount}` : ''}`;
 		                    const subtitle = config.symbol
         ? `${config.symbol} ${formatExpiry(config.expiry)} | ${String(config.marketDataSource || '').toUpperCase()} market data | ${String(config.provider || '').toUpperCase()} orders`
         : 'Loading config...';
@@ -679,9 +678,9 @@
 	            visibleStrikeCount: data.length,
 	            visibleGexCount: gexSummary.visibleCount,
 	            staleGexCount: gexSummary.staleCount,
-	            missingGexCount: databentoMode ? data.length : gexSummary.missingCount,
-	            disabled: databentoMode,
-              optional: !databentoMode,
+	            missingGexCount: gexSummary.missingCount,
+	            disabled: false,
+              optional: gexOptional,
               unavailable: gexOptional
 	          })
 	        }, gexStatusLabel),

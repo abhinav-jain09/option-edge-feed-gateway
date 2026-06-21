@@ -218,6 +218,10 @@ public final class GatewaySettings {
                 value("KAFKA_UNUSUAL_WHALES_GEX_HISTORY_TOPIC", "options.ibkr.unusualwhales.gex.strike.history"));
     }
 
+    public String databentoGexTopic() {
+        return value("KAFKA_DATABENTO_GEX_TOPIC", "options.databento.gex.strike");
+    }
+
     public String hpsfLatestSignalTopic() {
         return value("KAFKA_HPSF_LATEST_SIGNAL_TOPIC", "options.hpsf.latest-signal");
     }
