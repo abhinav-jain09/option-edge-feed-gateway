@@ -137,6 +137,14 @@
     if (el("oe-rp-start-btn")) el("oe-rp-start-btn").disabled = running;
     if (el("oe-rp-stop-btn")) el("oe-rp-stop-btn").disabled = !running;
     if (el("oe-rp-live-btn")) el("oe-rp-live-btn").disabled = !replayShown;
+    // A runId is one-shot. Once a replay ENDS — returned to live (LIVE) or finished/stopped
+    // (REPLAY_COMPLETE) — clear the field so a stale orchestrated-run id can never silently turn the NEXT
+    // replay into a run-backed one, including a fresh Start issued from the completed state without first
+    // returning to live. startReplay() captures the value before any mode change, so this never races the
+    // user's input for the current start.
+    if (next === "LIVE" || next === "REPLAY_COMPLETE") {
+      var ri = el("oe-rp-run-id"); if (ri) { ri.value = ""; }
+    }
   }
   function rpMsg(text) { var m = el("oe-rp-msg"); if (m) m.textContent = text || ""; }
 
