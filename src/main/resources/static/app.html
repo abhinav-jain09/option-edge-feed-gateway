@@ -17,6 +17,7 @@
       font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#e2e8f0;font-size:12px;box-shadow:0 4px 16px #0008}
     #oe-replay-bar input{width:118px;padding:5px 6px;background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:6px;font:inherit}
     #oe-replay-bar input.d{width:128px}
+    #oe-replay-bar input.runid{width:172px}
     #oe-replay-bar button{font:inherit;font-weight:600;border:0;border-radius:6px;padding:6px 11px;cursor:pointer}
     #oe-replay-bar .go{background:#2563eb;color:#fff}
     #oe-replay-bar .stop{background:#7c2d12;color:#fed7aa}
@@ -37,6 +38,7 @@
     <label>date</label><input id="oe-rp-date" class="d" type="date" value="2026-06-12">
     <label>ET</label><input id="oe-rp-start" type="time" value="14:00">
     <span>–</span><input id="oe-rp-end" type="time" value="14:20">
+    <label for="oe-rp-run-id">runId</label><input id="oe-rp-run-id" class="runid" type="text" placeholder="optional (orchestrated run)" autocomplete="off" spellcheck="false" aria-label="orchestrated replay run id">
     <button class="go" id="oe-rp-start-btn">Start Replay</button>
     <button class="stop" id="oe-rp-stop-btn" disabled>Stop</button>
     <button class="live" id="oe-rp-live-btn" disabled>Return to Live</button>
