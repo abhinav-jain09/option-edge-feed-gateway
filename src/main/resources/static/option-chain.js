@@ -1,10 +1,6 @@
 (() => {
   const MarketCalendar = createMarketCalendar();
   window.OptionChainMarketCalendar = MarketCalendar;
-  window.OptionChainReplay = {
-    defaultReplayForm: (now) => defaultReplayForm(now),
-    toUtcReplayInstant: (value) => toUtcReplayInstant(value)
-  };
 
   const rootElement = document.getElementById('optionChainRoot');
   if (!window.React || !window.ReactDOM) {
@@ -60,8 +56,6 @@
 
     const [config, setConfig] = useState(defaultConfig);
     const [form, setForm] = useState(defaultConfig);
-    const [replayForm, setReplayForm] = useState(defaultReplayForm());
-    const [replayPending, setReplayPending] = useState(false);
     const [configReady, setConfigReady] = useState(false);
     const [status, setStatus] = useState({ text: 'Starting', mode: '' });
 	                    const [notice, setNotice] = useState('');
@@ -523,7 +517,6 @@
 			                    const maxAbsGex = useMemo(() => maxAbsNetGex(data), [data]);
 			                    const feedUnavailable = status.text === 'Feed unavailable';
 			                    const databentoMode = isDatabentoMarketData(config);
-                            const replayUiVisible = isDevProfile(config) && Boolean(config.databentoReplayUiEnabled);
                             const gexSourceLabel = databentoMode ? 'DBN' : 'UW';
                             const gexSourceName = databentoMode ? 'databento' : 'unusual-whales';
                             const gexStatus = computeGexStatus(databentoMode, data.length, gexSummary);
@@ -559,7 +552,6 @@
     }, [atmIndex, data.length, spot]);
 
     const updateForm = (name, value) => setForm(current => ({ ...current, [name]: value }));
-    const updateReplayForm = (name, value) => setReplayForm(current => ({ ...current, [name]: value }));
     const reconnect = async (overrides = {}) => {
       const requestForm = { ...form, ...overrides };
       setConnectPending(true);
@@ -629,46 +621,6 @@
 	                      }
 	                    };
 
-		                    const runHistoricalReplay = async () => {
-		                      if (!isDevProfile(config) || !config.databentoReplayUiEnabled) {
-		                        setNotice('Historical replay is disabled.');
-		                        return;
-		                      }
-		                      let replayWindow;
-		                      try {
-		                        replayWindow = MarketCalendar.validateReplayWindow(replayForm.start, replayForm.end);
-		                      } catch (error) {
-		                        setStatus({ text: 'Invalid replay window', mode: 'error' });
-		                        setNotice(error.message);
-		                        return;
-		                      }
-		                      setReplayPending(true);
-		                      setStatus({ text: 'Replaying', mode: '' });
-		                      setNotice(`Replaying Databento history for ${formatExpiry(config.expiry)}...`);
-		                      try {
-		                        const response = await fetch(apiUrl('/api/replay/historical'), {
-		                          method: 'POST',
-		                          headers: { 'Content-Type': 'application/json' },
-		                          body: JSON.stringify({
-		                            start: replayWindow.startUtc,
-		                            end: replayWindow.endUtc,
-		                            maxRecords: Number(replayForm.maxRecords || 1000),
-		                            expiry: config.expiry
-		                          })
-		                        });
-		                        const payload = await response.json().catch(() => ({}));
-		                        if (!response.ok) {
-		                          throw new Error(payload.error || 'Historical replay failed');
-		                        }
-		                        setNotice(`Replay complete: ${payload.start} to ${payload.end}, max ${payload.maxRecords} records.`);
-		                      } catch (error) {
-		                        setStatus({ text: 'Failed', mode: 'error' });
-		                        setNotice(error.message);
-		                      } finally {
-		                        setReplayPending(false);
-		                      }
-		                    };
-
 	                    return h('main', { className: 'chain-shell' },
 			                      h('header', { className: 'chain-header' },
 	        h('a', { className: 'back-link', href: '/' }, 'OptionsEdge'),
@@ -691,9 +643,6 @@
 	        h('span', { id: 'rowCount' }, `${data.length.toLocaleString()} records`)
 				                      ),
 				                      h(Controls, { form, updateForm, reconnect, connectPending }),
-                              replayUiVisible
-                                ? h(HistoricalReplayPanel, { replayForm, updateReplayForm, runHistoricalReplay, replayPending })
-                                : null,
 				                      notice ? h('div', { className: `feed-notice ${feedUnavailable ? 'unavailable' : ''}`.trim() }, notice) : null,
                               h(HpsfDashboard, { hpsfState, pulse: hpsfPulse, spotFallback: spot, config, status }),
 						                      h(SummaryGrid, { spot, vixPrice, esPrice, totalCallVolume, totalPutVolume, totalPace, paceWindow, directionalPressure, pressureWindow, onPressureWindowChange: setPressureWindow }),
@@ -800,50 +749,6 @@
       h('button', { id: 'connect', type: 'button', disabled: connectPending, onClick: reconnect }, connectPending ? 'Connecting' : 'Connect')
     );
 	  }
-
-                  function HistoricalReplayPanel({ replayForm, updateReplayForm, runHistoricalReplay, replayPending }) {
-                    const submitOnEnter = event => {
-                      if (event.key === 'Enter') runHistoricalReplay();
-                    };
-                    return h('section', { className: 'replay-controls', 'aria-label': 'Historical replay controls' },
-                      h('label', null, 'Replay Start',
-                        h('input', {
-                          id: 'historicalReplayStart',
-                          type: 'datetime-local',
-                          value: replayForm.start,
-                          onChange: event => updateReplayForm('start', event.target.value),
-                          onKeyDown: submitOnEnter
-                        })
-                      ),
-                      h('label', null, 'Replay End',
-                        h('input', {
-                          id: 'historicalReplayEnd',
-                          type: 'datetime-local',
-                          value: replayForm.end,
-                          onChange: event => updateReplayForm('end', event.target.value),
-                          onKeyDown: submitOnEnter
-                        })
-                      ),
-                      h('label', null, 'Max Records',
-                        h('input', {
-                          id: 'historicalReplayMaxRecords',
-                          type: 'number',
-                          min: '1',
-                          max: '100000',
-                          value: replayForm.maxRecords,
-                          onChange: event => updateReplayForm('maxRecords', event.target.value),
-                          onKeyDown: submitOnEnter
-                        })
-                      ),
-                      h('button', {
-                        id: 'runHistoricalReplay',
-                        className: 'replay-button',
-                        type: 'button',
-                        disabled: replayPending,
-                        onClick: runHistoricalReplay
-                      }, replayPending ? 'Replaying' : 'Replay Databento')
-                    );
-                  }
 
                   function PaceWindowSelect({ value, onChange }) {
                     return h('label', { className: 'pace-window-control' }, 'Pace',
@@ -2221,19 +2126,6 @@
     return String(value || '').replaceAll('-', '');
   }
 
-  function defaultReplayForm(now = new Date()) {
-    const replayWindow = MarketCalendar.defaultReplayWindow(now);
-    return {
-      start: replayWindow.start,
-      end: replayWindow.end,
-      maxRecords: '1000'
-    };
-  }
-
-  function toUtcReplayInstant(value) {
-    return MarketCalendar.exchangeLocalToUtcInstant(value);
-  }
-
   function nextWeekdayExpiry(expiry) {
     const normalized = normalizeExpiry(expiry);
     if (!/^\d{8}$/.test(normalized)) return normalized;
@@ -2293,13 +2185,11 @@
 
     return {
       previousTradingDay,
-      defaultReplayWindow,
       isTradingDay,
       isWeekend,
       isFullMarketHoliday,
       isEarlyClose,
       observedDateForHoliday,
-      validateReplayWindow,
       marketDateTimeParts,
       exchangeLocalToUtcInstant,
       fullCloseMinute: FULL_CLOSE_MINUTE,
@@ -2313,55 +2203,6 @@
         candidate = addDays(candidate, -1);
       }
       return candidate;
-    }
-
-    function defaultReplayWindow(now = new Date()) {
-      const day = previousTradingDay(now);
-      const dateText = formatDate(day);
-      return {
-        tradingDay: day.key,
-        start: `${dateText}T${pad(DEFAULT_START_HOUR)}:${pad(DEFAULT_START_MINUTE)}`,
-        end: `${dateText}T${pad(DEFAULT_END_HOUR)}:${pad(DEFAULT_END_MINUTE)}`
-      };
-    }
-
-    function validateReplayWindow(startLocal, endLocal) {
-      const startParts = requireExchangeLocalDateTime(startLocal, 'Replay start');
-      const endParts = requireExchangeLocalDateTime(endLocal, 'Replay end');
-      if (dateKey(startParts) !== dateKey(endParts)) {
-        throw new Error('Replay window must stay within one trading day.');
-      }
-      const tradingDay = marketDate(startParts.year, startParts.month, startParts.day);
-      if (!isTradingDay(tradingDay)) {
-        if (isWeekend(tradingDay)) {
-          throw new Error('Replay window must use a regular trading day, not a weekend.');
-        }
-        throw new Error('Replay window must use a regular trading day, not a market holiday.');
-      }
-      const startMinute = startParts.hour * 60 + startParts.minute;
-      const endMinute = endParts.hour * 60 + endParts.minute;
-      const closeMinute = isEarlyClose(tradingDay) ? EARLY_CLOSE_MINUTE : 16 * 60;
-      if (startMinute < DEFAULT_START_HOUR * 60 + DEFAULT_START_MINUTE || endMinute < DEFAULT_START_HOUR * 60 + DEFAULT_START_MINUTE) {
-        throw new Error('Replay window must be during regular market hours after 09:30 ET.');
-      }
-      if (startMinute > closeMinute || endMinute > closeMinute) {
-        throw new Error(`Replay window must end by ${isEarlyClose(tradingDay) ? '13:00' : '16:00'} ET.`);
-      }
-      const startUtc = exchangeLocalToUtcInstant(startLocal);
-      const endUtc = exchangeLocalToUtcInstant(endLocal);
-      const durationMs = Date.parse(endUtc) - Date.parse(startUtc);
-      if (durationMs <= 0) {
-        throw new Error('Replay end must be after replay start.');
-      }
-      if (durationMs > 30 * 60 * 1000) {
-        throw new Error('Replay window must not exceed 30 minutes.');
-      }
-      return {
-        startUtc,
-        endUtc,
-        durationMinutes: durationMs / 60000,
-        tradingDay: tradingDay.key
-      };
     }
 
     function isTradingDay(date) {
@@ -2600,10 +2441,6 @@
       return parts;
     }
 
-    function dateKey(parts) {
-      return `${parts.year}${pad(parts.month)}${pad(parts.day)}`;
-    }
-
     function marketDate(year, month, day) {
       const normalized = new Date(Date.UTC(year, month - 1, day, 12, 0, 0, 0));
       const value = {
@@ -2613,11 +2450,6 @@
       };
       value.key = `${value.year}${pad(value.month)}${pad(value.day)}`;
       return value;
-    }
-
-    function formatDate(date) {
-      const marketDate = normalizeMarketDate(date);
-      return `${marketDate.year}-${pad(marketDate.month)}-${pad(marketDate.day)}`;
     }
 
     function pad(value) {

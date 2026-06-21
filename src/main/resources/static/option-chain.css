@@ -158,7 +158,7 @@ body {
     color: #54231d;
 }
 
-.controls, .replay-controls, .summary-card, .chain-card {
+.controls, .summary-card, .chain-card {
     border: 1px solid rgba(255, 255, 255, 0.78);
     border-radius: 14px;
     background: var(--panel);
@@ -172,19 +172,6 @@ body {
     gap: 5px;
     align-items: end;
     padding: 5px;
-}
-
-.replay-controls {
-    display: grid;
-    grid-template-columns: minmax(180px, 1.1fr) minmax(180px, 1.1fr) minmax(100px, 0.7fr) minmax(130px, 0.7fr);
-    gap: 5px;
-    align-items: end;
-    margin-top: 5px;
-    padding: 5px;
-}
-
-.replay-button {
-    background: linear-gradient(135deg, #3976c9, #2456a4);
 }
 
 label {
