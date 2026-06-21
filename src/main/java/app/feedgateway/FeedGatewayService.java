@@ -14,6 +14,7 @@ import app.feedgateway.mtsession.gateway.ReplayParams;
 import app.feedgateway.mtsession.gateway.ReplayTopicResolver;
 import app.feedgateway.mtsession.gateway.ReplayRunner;
 import app.feedgateway.mtsession.gateway.GatewayRecordMapper;
+import app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor;
 import java.util.Optional;
 import java.util.OptionalDouble;
 import org.springframework.lang.Nullable;
@@ -371,6 +372,10 @@ public class FeedGatewayService implements ReplayRunner {
             channel.shutdown(); // quiet teardown — normal disconnect, not a slow-client eviction
         }
         closeQuietly(stored != null ? stored : session);
+        // The handler detaches this socket from the routing engine BEFORE calling removeClient, so if its
+        // AppSession is now left with no sockets, end any in-flight replay (a reader must never keep
+        // consuming Kafka for a session nobody is listening to).
+        cancelReplayIfNoSockets(appSessionIdOf(session));
     }
 
     /**
@@ -383,10 +388,17 @@ public class FeedGatewayService implements ReplayRunner {
         if (routingEngine == null || appSessionId == null || appSessionId.isBlank()) {
             return 0;
         }
+        Set<String> sockets;
         synchronized (replayControlLock) {
             cancelActiveReplay(appSessionId); // stop any in-flight replay reader for this session
+            // Remove the session+sockets WHILE STILL HOLDING the lock so a concurrent startReplay cannot
+            // install a fresh reader in the gap between cancel and teardown (startReplay needs this same
+            // lock). Without this, a /replay/start racing logout could strand an orphaned Kafka-consuming
+            // reader for a session that is about to be torn down. (Lock order replayControlLock -> engine
+            // write lock matches startReplay/sweepExpiredSessions; the cancelled reader exits without
+            // taking replayControlLock, so awaiting it here cannot deadlock.)
+            sockets = routingEngine.teardownAppSession(appSessionId);
         }
-        Set<String> sockets = routingEngine.teardownAppSession(appSessionId);
         for (String socketId : sockets) {
             OutboundChannel channel = outbound.remove(socketId);
             WebSocketSession stored = clientsById.remove(socketId);
@@ -431,6 +443,16 @@ public class FeedGatewayService implements ReplayRunner {
             return 0;
         }
         SessionRoutingEngine.SweepResult result = routingEngine.sweepExpired();
+        // The sweep has already removed these AppSessions from the engine. Finalize any in-flight replay
+        // for each one EXPLICITLY here rather than relying on the eventual socket-close callbacks
+        // (removeClient/onSlowDisconnect) — those may be delayed or suppressed, which would otherwise let a
+        // replay reader keep consuming Kafka past the session's expiry. cancelActiveReplay is keyed by the
+        // appSessionId and works regardless of the session already being gone from the engine.
+        for (String appSessionId : result.expiredAppSessionIds()) {
+            synchronized (replayControlLock) {
+                cancelActiveReplay(appSessionId);
+            }
+        }
         closeSockets(result.closedSocketIds());
         return result.expiredAppSessionIds().size();
     }
@@ -441,6 +463,54 @@ public class FeedGatewayService implements ReplayRunner {
         WebSocketSession stored = clientsById.remove(channel.socketId());
         if (stored != null) {
             clients.remove(stored);
+        }
+        // A slow client is force-closed here, ahead of the container's afterConnectionClosed. Detach it
+        // from routing now (idempotent — the later afterConnectionClosed detach is then a no-op) so the
+        // no-sockets check is accurate, then cancel replay if this was its AppSession's last socket.
+        if (routingEngine != null) {
+            routingEngine.detachSocket(channel.socketId());
+        }
+        cancelReplayIfNoSockets(appSessionIdOf(channel.session()));
+    }
+
+    /** The AppSession id bound to a socket at handshake (per-session mode), or null if absent/blank. */
+    private static String appSessionIdOf(WebSocketSession session) {
+        if (session == null) {
+            return null;
+        }
+        Object attr = session.getAttributes().get(TicketHandshakeInterceptor.ATTR_APP_SESSION_ID);
+        return attr instanceof String s && !s.isBlank() ? s : null;
+    }
+
+    /**
+     * P0 (replay resource safety): when a socket goes away and its AppSession is left with NO attached
+     * sockets, cancel any in-flight per-session replay and leave replay mode. Otherwise a historical-replay
+     * reader would keep consuming Kafka for a session nobody is listening to until its window expires. Must
+     * be called AFTER the socket has been detached from the routing engine so the socketsForAppSession check
+     * reflects the removal. Idempotent; a no-op when nothing is replaying.
+     */
+    private void cancelReplayIfNoSockets(String appSessionId) {
+        if (routingEngine == null || appSessionId == null || appSessionId.isBlank()) {
+            return;
+        }
+        if (!routingEngine.socketsForAppSession(appSessionId).isEmpty()) {
+            return; // another socket for this AppSession is still attached — keep replaying
+        }
+        synchronized (replayControlLock) {
+            // Re-check under the lock: a socket may have (re)attached, or a new replay started, between the
+            // unlocked check above and acquiring the lock. Only cancel if still nobody is listening.
+            if (!routingEngine.socketsForAppSession(appSessionId).isEmpty()) {
+                return;
+            }
+            if (!replayHandles.containsKey(appSessionId) && !routingEngine.isReplaying(appSessionId)) {
+                return; // nothing in flight to cancel
+            }
+            cancelActiveReplay(appSessionId);
+            // The AppSession may already be gone — a logout or expiry sweep can race ahead of this socket's
+            // close and remove it WITHOUT holding replayControlLock. setReplayModeIfPresent does the
+            // lookup-and-clear atomically under the engine write lock, so it can never throw on an
+            // absent session (unlike setReplayMode); cancelActiveReplay above already stopped the reader.
+            routingEngine.setReplayModeIfPresent(appSessionId, false);
         }
     }
 
@@ -525,6 +595,16 @@ public class FeedGatewayService implements ReplayRunner {
                 }
             } catch (IOException | IllegalStateException ignored) {
                 // Removing the session from the fanout set is sufficient.
+            }
+            // Mirror removeClient/onSlowDisconnect: detach this socket from routing so socketsForAppSession
+            // is accurate, then cancel replay if it was its AppSession's last socket. Without this, an
+            // expired-token close would orphan an in-flight replay reader — and, because the socket stays
+            // "attached" in the engine, a later cancelReplayIfNoSockets would wrongly see a non-empty socket
+            // set and decline. This is the same delayed/suppressed-callback hazard sweepExpiredSessions was
+            // hardened against; the token-expiry reaper needs the same treatment.
+            if (routingEngine != null) {
+                routingEngine.detachSocket(session.getId());
+                cancelReplayIfNoSockets(appSessionIdOf(session));
             }
             closed++;
         }
@@ -2276,12 +2356,30 @@ public class FeedGatewayService implements ReplayRunner {
         }
         String appSessionId = params.sessionId();
         synchronized (replayControlLock) {
+            // Resource safety (symmetric to cancelReplayIfNoSockets): never install a Kafka-consuming reader
+            // for a session with NO attached sockets. A /replay/start that raced just behind the last
+            // socket's disconnect would otherwise strand a reader polling Kafka for nobody until the window
+            // or idle-expiry ends. Checked under the SAME lock the disconnect path takes, so the two
+            // orderings are mutually exclusive: either the close ran first (we see empty sockets and refuse)
+            // or we ran first (the close path's re-check finds our handle and cancels it). Maps to HTTP 409.
+            if (routingEngine.socketsForAppSession(appSessionId).isEmpty()) {
+                throw new IllegalStateException("no active socket for session " + appSessionId);
+            }
             cancelActiveReplay(appSessionId); // cancel + wake + await any prior run for this session
+            // Enter replay mode BEFORE installing any handle/generation. If the session vanished between the
+            // socket-presence check above and here (a max-expiry sweep removes engine sessions WITHOUT
+            // holding replayControlLock), this throws with nothing yet to roll back — rethrown as a clean
+            // 409. Doing it first also guarantees we never install a handle or submit a reader for an absent
+            // session (which would otherwise be an orphaned Kafka reader).
+            try {
+                routingEngine.setReplayMode(appSessionId, true);
+            } catch (IllegalStateException sessionGone) {
+                throw new IllegalStateException("no active session to replay; it was just torn down");
+            }
             long generation = replayGenerationSeq.incrementAndGet();
             ReplayHandle handle = new ReplayHandle(generation);
             replayOwnerGeneration.put(appSessionId, generation);
             replayHandles.put(appSessionId, handle);
-            routingEngine.setReplayMode(appSessionId, true);
             // Clear the live rows and flip the UI badge (reqs 9).
             sendToAppSession(appSessionId, "reset", "{\"reason\":\"replay-start\"}");
             sendToAppSession(appSessionId, "replay-status", replayStatusJson("REPLAY_RUNNING", params, 0L));
@@ -2290,7 +2388,7 @@ public class FeedGatewayService implements ReplayRunner {
             } catch (RejectedExecutionException tooMany) {
                 replayHandles.remove(appSessionId, handle);
                 replayOwnerGeneration.put(appSessionId, replayGenerationSeq.incrementAndGet());
-                routingEngine.setReplayMode(appSessionId, false);
+                routingEngine.setReplayModeIfPresent(appSessionId, false); // rollback; no-op if torn down
                 throw new IllegalStateException("replay capacity reached; please retry shortly");
             }
             return ReplayRunner.Mode.REPLAY_RUNNING;
@@ -2316,7 +2414,9 @@ public class FeedGatewayService implements ReplayRunner {
         synchronized (replayControlLock) {
             cancelActiveReplay(appSessionId);
             if (routingEngine != null) {
-                routingEngine.setReplayMode(appSessionId, false);
+                // IfPresent: a max-expiry sweep / logout may have removed the session concurrently (it does
+                // not hold replayControlLock); returning to live for an absent session is a no-op, not an error.
+                routingEngine.setReplayModeIfPresent(appSessionId, false);
             }
             // Clear replay rows and re-seed the latest live cache, then live routing resumes (req. 10).
             sendToAppSession(appSessionId, "reset", "{\"reason\":\"return-to-live\"}");

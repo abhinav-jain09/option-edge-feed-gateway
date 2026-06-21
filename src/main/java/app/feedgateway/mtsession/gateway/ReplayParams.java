@@ -44,8 +44,10 @@ public record ReplayParams(
     }
 
     /**
-     * Parse and validate a replay request. {@code startUtc}/{@code endUtc} are ISO-8601 instants
-     * (as produced by the UI's {@code MarketCalendar.validateReplayWindow}).
+     * Parse and validate a replay request. {@code startUtc}/{@code endUtc} are ISO-8601 instants supplied
+     * by the caller (the UI's replay bar derives them from the chosen exchange-local window via
+     * {@code OptionChainMarketCalendar.exchangeLocalToUtcInstant}); this method performs the authoritative
+     * server-side validation — parse, ordering, and maximum-window enforcement — independently of the UI.
      *
      * @throws IllegalArgumentException on any blank field, unparseable instant, non-positive or
      *                                  over-long window, or non-positive record cap.

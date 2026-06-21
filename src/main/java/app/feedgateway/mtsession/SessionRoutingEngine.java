@@ -386,6 +386,22 @@ public final class SessionRoutingEngine {
         });
     }
 
+    /**
+     * Like {@link #setReplayMode} but a NO-OP when the AppSession is gone, performed atomically under the
+     * write lock (no check-then-act race). Used by disconnect/teardown cleanup, where a logout or expiry
+     * sweep may have removed the session concurrently — there a missing session is not an error, it just
+     * means there is no replay flag left to clear.
+     */
+    public void setReplayModeIfPresent(String appSessionId, boolean replaying) {
+        runWrite(() -> {
+            AppSession app = appSessions.get(appSessionId);
+            if (app != null) {
+                app.setReplaying(replaying);
+                app.touch(clock.millis());
+            }
+        });
+    }
+
     public boolean isReplaying(String appSessionId) {
         return callRead(() -> {
             AppSession app = appSessions.get(appSessionId);
