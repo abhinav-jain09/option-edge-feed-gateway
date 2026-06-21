@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- P0/P1 (XSS + portability): the restrictive, DEPLOYMENT-AWARE CSP is emitted as a response header by
+       SecurityHeadersFilter (connect-src derived from the configured Keycloak issuer). Scripts are
+       self-hosted only ('self'), including React/ReactDOM under /vendor with Subresource Integrity. -->
+  <meta name="referrer" content="no-referrer">
+  <title>OptionsEdge — Option Chain</title>
+  <link rel="stylesheet" href="/option-chain.css">
+  <style>
+    #oe-booterr{font-family:system-ui,sans-serif;color:#e2e8f0;background:#0f172a;padding:40px;text-align:center}
+    #oe-booterr a{color:#60a5fa}
+    #oe-replay-bar{position:fixed;top:8px;right:8px;z-index:9999;display:none;gap:8px;align-items:center;
+      background:#0b1220ee;border:1px solid #334155;border-radius:10px;padding:8px 10px;
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#e2e8f0;font-size:12px;box-shadow:0 4px 16px #0008}
+    #oe-replay-bar input{width:118px;padding:5px 6px;background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:6px;font:inherit}
+    #oe-replay-bar input.d{width:128px}
+    #oe-replay-bar button{font:inherit;font-weight:600;border:0;border-radius:6px;padding:6px 11px;cursor:pointer}
+    #oe-replay-bar .go{background:#2563eb;color:#fff}
+    #oe-replay-bar .stop{background:#7c2d12;color:#fed7aa}
+    #oe-replay-bar .live{background:#166534;color:#dcfce7}
+    #oe-replay-bar button:disabled{opacity:.4;cursor:not-allowed}
+    #oe-replay-badge{font-weight:700;letter-spacing:.04em;padding:4px 9px;border-radius:999px;border:1px solid #334155}
+    #oe-replay-badge.LIVE{background:#052e16;color:#4ade80;border-color:#166534}
+    #oe-replay-badge.REPLAY_RUNNING{background:#1e1b4b;color:#a5b4fc;border-color:#4338ca}
+    #oe-replay-badge.REPLAY_COMPLETE{background:#422006;color:#fbbf24;border-color:#92400e}
+    #oe-replay-badge.RETURNING_TO_LIVE{background:#1e293b;color:#94a3b8}
+    #oe-replay-bar .msg{color:#f87171;max-width:200px}
+    #oe-replay-bar label{color:#94a3b8}
+  </style>
+</head>
+<body>
+  <div id="oe-replay-bar">
+    <span id="oe-replay-badge" class="LIVE">LIVE</span>
+    <label>date</label><input id="oe-rp-date" class="d" type="date" value="2026-06-12">
+    <label>ET</label><input id="oe-rp-start" type="time" value="14:00">
+    <span>–</span><input id="oe-rp-end" type="time" value="14:20">
+    <button class="go" id="oe-rp-start-btn">Start Replay</button>
+    <button class="stop" id="oe-rp-stop-btn" disabled>Stop</button>
+    <button class="live" id="oe-rp-live-btn" disabled>Return to Live</button>
+    <button class="stop" id="oe-signout-btn">Sign out</button>
+    <span class="msg" id="oe-rp-msg"></span>
+  </div>
+  <div id="optionChainRoot"></div>
+  <noscript>Enable JavaScript to view the option chain.</noscript>
+  <script src="/app-boot.js"></script>
+</body>
+</html>

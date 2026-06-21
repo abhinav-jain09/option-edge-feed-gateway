@@ -32,7 +32,7 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
 
     static final String BEARER_SUBPROTOCOL = "oc.bearer";
     /** Session attribute holding the token's expiry (epoch ms), so the reaper can close it when it lapses. */
-    static final String AUTH_EXPIRES_AT_ATTR = "authExpiresAtEpochMs";
+    public static final String AUTH_EXPIRES_AT_ATTR = "authExpiresAtEpochMs";
     private static final String SEC_WEBSOCKET_PROTOCOL = "Sec-WebSocket-Protocol";
 
     private final GatewaySettings settings;
