@@ -158,12 +158,19 @@
     var startUtc, endUtc;
     try { startUtc = etToUtc(date, el("oe-rp-start").value); endUtc = etToUtc(date, el("oe-rp-end").value); }
     catch (e) { rpMsg(e.message); return; }
+    // Optional orchestrated-run id: when present the gateway authorizes it against the orchestrator and
+    // streams that run's *.replay.<runId>.* topics instead of slicing the live topics by time. Sent only
+    // when non-empty so a blank field stays a plain live-slice replay.
+    var runIdInput = el("oe-rp-run-id");
+    var runId = runIdInput && runIdInput.value ? runIdInput.value.trim() : "";
     setMode("REPLAY_RUNNING");
     ensureToken().then(function (t) {
       if (!t) { rpMsg("session expired"); setMode("LIVE"); return; }
+      var body = { sessionId: appSessionId, symbol: sel.symbol, expiry: expiry, startUtc: startUtc, endUtc: endUtc, maxRecords: 50000 };
+      if (runId) { body.runId = runId; }
       return fetch("/api/replay/historical/start", {
         method: "POST", headers: authHeaders(t),
-        body: JSON.stringify({ sessionId: appSessionId, symbol: sel.symbol, expiry: expiry, startUtc: startUtc, endUtc: endUtc, maxRecords: 50000 })
+        body: JSON.stringify(body)
       }).then(function (r) {
         return r.json().catch(function () { return {}; }).then(function (j) {
           if (!r.ok) { rpMsg(j.error || ("replay failed (" + r.status + ")")); setMode("LIVE"); }
