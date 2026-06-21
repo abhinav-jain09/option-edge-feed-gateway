@@ -388,10 +388,17 @@ public class FeedGatewayService implements ReplayRunner {
         if (routingEngine == null || appSessionId == null || appSessionId.isBlank()) {
             return 0;
         }
+        Set<String> sockets;
         synchronized (replayControlLock) {
             cancelActiveReplay(appSessionId); // stop any in-flight replay reader for this session
+            // Remove the session+sockets WHILE STILL HOLDING the lock so a concurrent startReplay cannot
+            // install a fresh reader in the gap between cancel and teardown (startReplay needs this same
+            // lock). Without this, a /replay/start racing logout could strand an orphaned Kafka-consuming
+            // reader for a session that is about to be torn down. (Lock order replayControlLock -> engine
+            // write lock matches startReplay/sweepExpiredSessions; the cancelled reader exits without
+            // taking replayControlLock, so awaiting it here cannot deadlock.)
+            sockets = routingEngine.teardownAppSession(appSessionId);
         }
-        Set<String> sockets = routingEngine.teardownAppSession(appSessionId);
         for (String socketId : sockets) {
             OutboundChannel channel = outbound.remove(socketId);
             WebSocketSession stored = clientsById.remove(socketId);
@@ -2339,6 +2346,15 @@ public class FeedGatewayService implements ReplayRunner {
         }
         String appSessionId = params.sessionId();
         synchronized (replayControlLock) {
+            // Resource safety (symmetric to cancelReplayIfNoSockets): never install a Kafka-consuming reader
+            // for a session with NO attached sockets. A /replay/start that raced just behind the last
+            // socket's disconnect would otherwise strand a reader polling Kafka for nobody until the window
+            // or idle-expiry ends. Checked under the SAME lock the disconnect path takes, so the two
+            // orderings are mutually exclusive: either the close ran first (we see empty sockets and refuse)
+            // or we ran first (the close path's re-check finds our handle and cancels it). Maps to HTTP 409.
+            if (routingEngine.socketsForAppSession(appSessionId).isEmpty()) {
+                throw new IllegalStateException("no active socket for session " + appSessionId);
+            }
             cancelActiveReplay(appSessionId); // cancel + wake + await any prior run for this session
             long generation = replayGenerationSeq.incrementAndGet();
             ReplayHandle handle = new ReplayHandle(generation);

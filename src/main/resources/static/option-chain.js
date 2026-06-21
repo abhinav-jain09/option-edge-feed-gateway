@@ -2178,10 +2178,6 @@
     const EXCHANGE_TIME_ZONE = 'America/New_York';
     const FULL_CLOSE_MINUTE = 16 * 60 + 15;
     const EARLY_CLOSE_MINUTE = 13 * 60;
-    const DEFAULT_START_HOUR = 9;
-    const DEFAULT_START_MINUTE = 30;
-    const DEFAULT_END_HOUR = 9;
-    const DEFAULT_END_MINUTE = 45;
 
     return {
       previousTradingDay,

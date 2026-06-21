@@ -2,6 +2,7 @@ package app.feedgateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
@@ -230,6 +231,42 @@ class FeedGatewayReplayCancellationTest {
 
         assertFalse(handle.active.get(), "reader still canceled despite the session being gone");
         assertFalse(replayHandlesOf(svc).containsKey("app:u1"), "in-flight replay handle removed");
+    }
+
+    /**
+     * P0 (replay resource safety, START side): a /replay/start that races just behind the last socket's
+     * disconnect must NOT install a Kafka-consuming reader for a session with no sockets. The under-lock
+     * socketsForAppSession guard in startReplay refuses it (HTTP 409).
+     */
+    @Test
+    void startReplayRefusedWhenSessionHasNoSockets() throws Exception {
+        FeedGatewayService svc = svc();
+        SessionRoutingEngine engine = engineOf(svc);
+        engine.detachSocket("s1"); // session persists (grace window) but has no attached sockets
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () -> svc.startReplay(params()));
+        assertTrue(ex.getMessage().contains("no active socket"), "refused with a clear reason");
+        assertFalse(replayHandlesOf(svc).containsKey("app:u1"), "no reader installed for a socket-less session");
+        assertFalse(engine.isReplaying("app:u1"), "session not flipped into replay mode");
+    }
+
+    /**
+     * P0 (logout completeness): logout must cancel an in-flight replay AND remove the session under one
+     * lock hold, so no reader can survive teardown and a racing start cannot strand one.
+     */
+    @Test
+    void logoutCancelsInFlightReplay() throws Exception {
+        FeedGatewayService svc = svc();
+        SessionRoutingEngine engine = engineOf(svc);
+        FeedGatewayService.ReplayHandle handle = svc.registerOwnerHandleForTest("app:u1");
+        replayHandlesOf(svc).put("app:u1", handle);
+        engine.setReplayMode("app:u1", true);
+
+        svc.logout("app:u1");
+
+        assertFalse(handle.active.get(), "logout cancels the in-flight reader");
+        assertFalse(replayHandlesOf(svc).containsKey("app:u1"), "replay handle removed on logout");
+        assertTrue(engine.appSession("app:u1").isEmpty(), "session torn down");
     }
 
     private static void invokeOnSlowDisconnect(FeedGatewayService svc, OutboundChannel channel)
