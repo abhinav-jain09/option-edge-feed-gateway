@@ -1,10 +1,14 @@
 package app.feedgateway.replay;
 
+import app.feedgateway.AudienceValidator;
 import app.feedgateway.GatewaySettings;
 import java.util.Optional;
+import org.springframework.security.oauth2.core.OAuth2TokenValidator;
+import org.springframework.security.oauth2.core.DelegatingOAuth2TokenValidator;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.JwtException;
+import org.springframework.security.oauth2.jwt.JwtValidators;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 
 /**
@@ -55,7 +59,13 @@ public final class JwtReplayPrincipalResolver implements ReplayPrincipalResolver
                     if (issuer == null || issuer.isBlank()) {
                         throw new IllegalStateException("replay control requires WS_AUTH_ISSUER_URI to be set");
                     }
-                    decoder = NimbusJwtDecoder.withIssuerLocation(issuer).build();
+                    // Equivalent trust to the WS handshake: validate signature + issuer + AUDIENCE, so a
+                    // token minted for a different audience can never drive replay control.
+                    NimbusJwtDecoder nimbus = NimbusJwtDecoder.withIssuerLocation(issuer).build();
+                    OAuth2TokenValidator<Jwt> withIssuer = JwtValidators.createDefaultWithIssuer(issuer);
+                    OAuth2TokenValidator<Jwt> audience = new AudienceValidator(settings.wsAuthAudience());
+                    nimbus.setJwtValidator(new DelegatingOAuth2TokenValidator<>(withIssuer, audience));
+                    decoder = nimbus;
                 }
                 d = decoder;
             }

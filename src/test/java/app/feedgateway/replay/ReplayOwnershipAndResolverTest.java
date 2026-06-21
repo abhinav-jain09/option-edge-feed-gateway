@@ -50,6 +50,35 @@ class ReplayOwnershipAndResolverTest {
         assertEquals(Optional.empty(), resolver.principal("NotBearer x"), "wrong scheme → empty");
     }
 
+    @Test
+    void resolverRejectsWrongAudienceAndWrongIssuerTokens() {
+        // simulate the real decoder's behavior: it rejects (throws) anything that fails issuer/audience.
+        String goodAud = "options-edge-web";
+        ReplayPrincipalResolver resolver = new JwtReplayPrincipalResolver(new GatewaySettings(), token -> {
+            // a token minted for another audience or issuer is rejected by the decoder's validators.
+            if ("wrong-aud".equals(token) || "wrong-iss".equals(token)) {
+                throw new JwtException("invalid_token");
+            }
+            return Jwt.withTokenValue(token).header("alg", "none").subject("iss|alice")
+                    .issuedAt(Instant.now()).expiresAt(Instant.now().plusSeconds(60))
+                    .audience(java.util.List.of(goodAud)).build();
+        });
+        assertEquals(Optional.of("iss|alice"), resolver.principal("Bearer good"));
+        assertEquals(Optional.empty(), resolver.principal("Bearer wrong-aud"), "wrong audience → fail closed");
+        assertEquals(Optional.empty(), resolver.principal("Bearer wrong-iss"), "wrong issuer → fail closed");
+    }
+
+    @Test
+    void audienceValidatorRejectsTokensMissingTheRequiredAudience() {
+        app.feedgateway.AudienceValidator v = new app.feedgateway.AudienceValidator("options-edge-replay");
+        Jwt right = Jwt.withTokenValue("t").header("alg", "none").subject("s")
+                .audience(java.util.List.of("options-edge-replay")).build();
+        Jwt wrong = Jwt.withTokenValue("t").header("alg", "none").subject("s")
+                .audience(java.util.List.of("some-other-api")).build();
+        assertFalse(v.validate(right).hasErrors(), "correct audience passes");
+        assertTrue(v.validate(wrong).hasErrors(), "wrong audience is rejected");
+    }
+
     private static Jwt raise() {
         throw new JwtException("bad");
     }

@@ -51,8 +51,11 @@ public class ReplayControlController {
     @PostMapping("/attach")
     public ResponseEntity<Map<String, Object>> attach(
             @RequestHeader(value = "Authorization", required = false) String auth,
-            @RequestBody AttachRequest req) {
+            @RequestBody(required = false) AttachRequest req) {
         return guarded(auth, req == null ? null : req.sessionId(), principal -> {
+            if (req.runId() == null || req.runId().isBlank()) {
+                return status(HttpStatus.BAD_REQUEST, "runId is required");
+            }
             ReplayMode mode = control.attach(req.sessionId(), req.runId(), principal);
             return ok(mode, req.runId());
         });
@@ -61,7 +64,7 @@ public class ReplayControlController {
     @PostMapping("/return-to-live")
     public ResponseEntity<Map<String, Object>> returnToLive(
             @RequestHeader(value = "Authorization", required = false) String auth,
-            @RequestBody SessionRequest req) {
+            @RequestBody(required = false) SessionRequest req) {
         return guarded(auth, req == null ? null : req.sessionId(), principal -> {
             ReplayMode mode = control.returnToLive(req.sessionId());
             return ok(mode, null);
@@ -79,7 +82,11 @@ public class ReplayControlController {
         });
     }
 
-    /** Common gate: replay-enabled → authenticated → owns the session, then run the action. */
+    /**
+     * Common gate: replay-enabled (404) → authenticated (401) → valid input (400) → owns the session
+     * (403), then run the action (409 on an illegal state-machine transition). Order keeps unauthenticated
+     * callers from probing input/ownership, and distinguishes malformed input (400) from authorization (403).
+     */
     private ResponseEntity<Map<String, Object>> guarded(String auth, String sessionId,
                                                         java.util.function.Function<String, ResponseEntity<Map<String, Object>>> action) {
         if (!settings.replayEnabled()) {
@@ -89,7 +96,10 @@ public class ReplayControlController {
         if (principal.isEmpty()) {
             return status(HttpStatus.UNAUTHORIZED, "unauthenticated");
         }
-        if (sessionId == null || sessionId.isBlank() || !ownership.owns(sessionId, principal.get())) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return status(HttpStatus.BAD_REQUEST, "sessionId is required");
+        }
+        if (!ownership.owns(sessionId, principal.get())) {
             return status(HttpStatus.FORBIDDEN, "not the owner of this session");
         }
         try {

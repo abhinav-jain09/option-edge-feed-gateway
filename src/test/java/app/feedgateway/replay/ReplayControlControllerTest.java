@@ -83,4 +83,42 @@ class ReplayControlControllerTest {
                 new ReplayControlController.SessionRequest("s1"));
         assertEquals(HttpStatus.CONFLICT, r.getStatusCode());
     }
+
+    @Test
+    void blankOrMissingInputReturns400_withNoStateCreated() {
+        ownership.bind("s1", "iss|alice");
+        ReplayControlController c = controller(true, ALICE);
+        // blank runId on attach → 400 and NO registry/binding state created
+        var blankRun = c.attach("Bearer good", new ReplayControlController.AttachRequest("s1", "  "));
+        assertEquals(HttpStatus.BAD_REQUEST, blankRun.getStatusCode());
+        org.junit.jupiter.api.Assertions.assertNull(registry.get("s1"), "no state on a 400");
+        assertEquals(Optional.empty(), bindings.runFor("s1"));
+        // null body → 400 (sessionId required), before ownership
+        assertEquals(HttpStatus.BAD_REQUEST, c.attach("Bearer good", null).getStatusCode());
+        assertEquals(HttpStatus.BAD_REQUEST,
+                c.returnToLive("Bearer good", new ReplayControlController.SessionRequest("  ")).getStatusCode());
+    }
+
+    @Test
+    void getModeIsGatedAndReportsTheSessionMode() {
+        // disabled → 404
+        assertEquals(HttpStatus.NOT_FOUND, controller(false, ALICE).mode("Bearer good", "s1").getStatusCode());
+        // unauthenticated → 401
+        assertEquals(HttpStatus.UNAUTHORIZED, controller(true, ALICE).mode(null, "s1").getStatusCode());
+        // blank session → 400
+        assertEquals(HttpStatus.BAD_REQUEST, controller(true, ALICE).mode("Bearer good", "  ").getStatusCode());
+        // a session the caller does not own (incl. unknown) → 403
+        assertEquals(HttpStatus.FORBIDDEN, controller(true, ALICE).mode("Bearer good", "ghost").getStatusCode());
+        // owner of an un-attached session → 200 LIVE
+        ownership.bind("s1", "iss|alice");
+        var live = controller(true, ALICE).mode("Bearer good", "s1");
+        assertEquals(HttpStatus.OK, live.getStatusCode());
+        assertEquals("LIVE", ((java.util.Map<?, ?>) live.getBody()).get("mode"));
+        // after attach → REPLAY_ATTACHING with the runId
+        ReplayControlController c = controller(true, ALICE);
+        c.attach("Bearer good", new ReplayControlController.AttachRequest("s1", "r-9"));
+        var rep = c.mode("Bearer good", "s1");
+        assertEquals("REPLAY_ATTACHING", ((java.util.Map<?, ?>) rep.getBody()).get("mode"));
+        assertEquals("r-9", ((java.util.Map<?, ?>) rep.getBody()).get("runId"));
+    }
 }
