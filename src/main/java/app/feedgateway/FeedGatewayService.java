@@ -1374,14 +1374,18 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
         if (caughtUpFlag.compareAndSet(false, true)) {
-            // Capture the selection ONCE, before the replay, so a roll landing between here and the
-            // readiness call cannot mark the NEW selection ready off the OLD selection's cached state.
-            // markSelectionReady re-validates against the live selection under readyLock and rejects a
-            // mismatch.
-            ActiveSelection selection = activeSelection.get();
-            broadcast("status", statusJson());
-            if (broadcastCachedState(events)) {
-                markSelectionReady(selection);
+            // Run the whole catch-up replay under readyLock so the active selection is STABLE across the
+            // capture, the cached-batch build (cachedEvents/uiBatchEnvelopeJson re-read activeSelection),
+            // and the readiness commit. Without the lock a concurrent applySelection could swap the active
+            // selection mid-replay, broadcasting a cached batch for a different selection than intended.
+            // Lock order is readyLock -> this (cachedEvents is synchronized), consistent with applySelection;
+            // markSelectionReady's readyLock is reentrant here.
+            synchronized (readyLock) {
+                ActiveSelection selection = activeSelection.get();
+                broadcast("status", statusJson());
+                if (broadcastCachedState(events)) {
+                    markSelectionReady(selection);
+                }
             }
             System.out.println("Feed gateway " + name + " cache caught up; replayed cached state to clients.");
         }
