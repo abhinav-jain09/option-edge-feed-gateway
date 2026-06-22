@@ -1026,7 +1026,7 @@ public class FeedGatewayService implements ReplayRunner {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
             List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
             consumer.assign(partitions);
-            seekToCacheWindow(consumer, partitions);
+            seekToCacheWindow(consumer, partitions, topicEvents);
             Map<TopicPartition, Long> bootstrapEndOffsets = consumer.endOffsets(partitions);
             Map<TopicPartition, Long> catchUpEndOffsets = catchUpEndOffsets(bootstrapEndOffsets, topicEvents);
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
@@ -1055,29 +1055,59 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void seekToCacheWindow(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions) {
-        long ttlMs = settings.cacheTtlMs();
-        if (ttlMs <= 0) {
-            consumer.seekToEnd(partitions);
-            return;
-        }
-        long startTimeMs = System.currentTimeMillis() - ttlMs;
+        seekToCacheWindow(consumer, partitions, null);
+    }
+
+    /**
+     * Seek each assigned partition to the start of its event's cache window so the latest cached state is
+     * bootstrapped on (re)connect. When {@code topicEvents} is supplied, the window is PER-EVENT: max-pain
+     * partitions seek to {@code now - maxPainTtlMs} (12h) while fast-ticking topics keep
+     * {@code now - cacheTtlMs} (15 min). Without this, a >15-min-old (but valid) max-pain record sits
+     * BEHIND the generic seek position and is never read — the root cause of "max-pain missing on screen".
+     *
+     * <p>A per-event TTL {@code <= 0} (or a partition whose timestamp has no offset) seeks that partition
+     * to END — unchanged from the original single-window behaviour. We deliberately do NOT seek max-pain to
+     * the beginning: under unknown (delete-retention) topic config that could create avoidable bootstrap
+     * backlog; the timestamp-bounded window reads only what the longer TTL admits.
+     */
+    private void seekToCacheWindow(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions,
+                                   Map<String, TopicBinding> topicEvents) {
+        long nowMs = System.currentTimeMillis();
         Map<TopicPartition, Long> timestamps = new HashMap<>();
-        for (TopicPartition partition : partitions) {
-            timestamps.put(partition, startTimeMs);
-        }
-        Map<TopicPartition, OffsetAndTimestamp> offsets = consumer.offsetsForTimes(timestamps);
         List<TopicPartition> seekToEnd = new ArrayList<>();
         for (TopicPartition partition : partitions) {
-            OffsetAndTimestamp offset = offsets.get(partition);
-            if (offset == null) {
+            long ttlMs = windowTtlMsFor(partition, topicEvents);
+            if (ttlMs <= 0) {
                 seekToEnd.add(partition);
             } else {
-                consumer.seek(partition, offset.offset());
+                timestamps.put(partition, nowMs - ttlMs);
+            }
+        }
+        if (!timestamps.isEmpty()) {
+            Map<TopicPartition, OffsetAndTimestamp> offsets = consumer.offsetsForTimes(timestamps);
+            for (Map.Entry<TopicPartition, Long> entry : timestamps.entrySet()) {
+                OffsetAndTimestamp offset = offsets.get(entry.getKey());
+                if (offset == null) {
+                    seekToEnd.add(entry.getKey());
+                } else {
+                    consumer.seek(entry.getKey(), offset.offset());
+                }
             }
         }
         if (!seekToEnd.isEmpty()) {
             consumer.seekToEnd(seekToEnd);
         }
+    }
+
+    /** Per-partition cache-window TTL: the bound event's effective TTL when known, else the generic one. */
+    private long windowTtlMsFor(TopicPartition partition, Map<String, TopicBinding> topicEvents) {
+        if (topicEvents != null) {
+            TopicBinding binding = topicEvents.get(partition.topic());
+            if (binding != null) {
+                return cacheTtlMsForEvent(binding.event());
+            }
+        }
+        return settings.cacheTtlMs();
     }
 
     private void runLiveConsumer(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean cacheCaughtUpFlag) {
@@ -1099,7 +1129,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
             consumer.assign(partitions);
             if (retry) {
-                seekToCacheWindow(consumer, partitions);
+                seekToCacheWindow(consumer, partitions, topicEvents);
             } else {
                 consumer.seekToEnd(partitions);
             }
@@ -1116,8 +1146,17 @@ public class FeedGatewayService implements ReplayRunner {
                     // topic-binding source (bypasses the global single-source/selection/barrier gate;
                     // supports IBKR + Databento users simultaneously). shouldForward gates legacy mode.
                     if (perSessionRouting()) {
-                        routeOrBroadcast(binding.source(), binding.event(), json);
-                        forwardedEvents.incrementAndGet();
+                        // Fail-closed for max-pain (Codex Gate-2): updateCache returns null when a
+                        // NON-terminal max-pain is stale (older than its 12h window) or SUPERSEDED (an
+                        // out-of-order/older Kafka timestamp than the cached value). Routing such a record
+                        // at the live edge would overwrite a client's view with an out-of-date level.
+                        // Terminal EXPIRED returns a non-null key, so it still forwards once. Other events
+                        // keep their existing unconditional per-session routing (this change is scoped to
+                        // max-pain per the approved requirement).
+                        if (cacheKey != null || !"max-pain".equals(binding.event())) {
+                            routeOrBroadcast(binding.source(), binding.event(), json);
+                            forwardedEvents.incrementAndGet();
+                        }
                     } else if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json, record)) {
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
@@ -1206,7 +1245,14 @@ public class FeedGatewayService implements ReplayRunner {
         List<TopicPartition> selectedPartitions = partitions.stream()
                 .filter(partition -> {
                     TopicBinding binding = topicEvents.get(partition.topic());
-                    return binding != null && selection.source().equals(binding.source());
+                    if (binding == null || !selection.source().equals(binding.source())) {
+                        return false;
+                    }
+                    // Never lag-skip max-pain: it is a slow last-value-wins signal whose latest record can
+                    // sit far behind the live edge by design, so seeking it to END on a backlog would drop
+                    // the current max-pain entirely (the very bug this change fixes). Its own 12h window
+                    // already bounds how far back it bootstraps.
+                    return !"max-pain".equals(binding.event());
                 })
                 .toList();
         if (selectedPartitions.isEmpty()) {
@@ -1596,7 +1642,7 @@ public class FeedGatewayService implements ReplayRunner {
         // case "max-pain" branch handles eviction + cache prune itself; we just must not short-circuit
         // to null here on the staleness check (which would swallow the terminal entirely).
         boolean isTerminalMaxPain = "max-pain".equals(event) && isMaxPainExpired(json);
-        if (!isTerminalMaxPain && isExpired(eventTime, System.currentTimeMillis())) {
+        if (!isTerminalMaxPain && isExpired(event, eventTime, System.currentTimeMillis())) {
             removeCacheEntry(versionKey);
             return null;
         }
@@ -1807,7 +1853,10 @@ public class FeedGatewayService implements ReplayRunner {
     private synchronized void purgeExpiredCache(long nowMs) {
         List<String> expiredKeys = new ArrayList<>();
         for (Map.Entry<String, Long> entry : cacheEventTimes.entrySet()) {
-            if (isExpired(entry.getValue(), nowMs)) {
+            // Event-aware: the versionKey is "<event>:<key>", so max-pain entries are purged on the long
+            // max-pain TTL while everything else stays on the generic 15-min window. Without this, the
+            // periodic purge would evict a perfectly valid (but >15-min-old) max-pain on the next poll.
+            if (isExpired(eventFromCacheKey(entry.getKey()), entry.getValue(), nowMs)) {
                 expiredKeys.add(entry.getKey());
             }
         }
@@ -1816,7 +1865,9 @@ public class FeedGatewayService implements ReplayRunner {
 
     private boolean isCacheFresh(String versionKey, long nowMs) {
         Long eventTime = cacheEventTimes.get(versionKey);
-        return eventTime != null && !isExpired(eventTime, nowMs);
+        // Event-aware so the cached-state snapshot sent to a newly-connected client keeps a slow but valid
+        // max-pain (12h window) while fast events still drop at the 15-min generic window.
+        return eventTime != null && !isExpired(eventFromCacheKey(versionKey), eventTime, nowMs);
     }
 
     private boolean broadcastCachedState(List<String> events) {
@@ -1915,8 +1966,16 @@ public class FeedGatewayService implements ReplayRunner {
                         .forEach(cachedEvents::add);
                 case "max-pain" -> maxPain.entrySet().stream()
                         // DATABENTO-only stream: IBKR-selected sessions never receive max pain.
+                        // isCacheFresh is event-aware (12h max-pain window); the selection barrier relaxes
+                        // the time-freshness/offset checks for max-pain (enforceCachedReplay* below) so a
+                        // valid but slow last-value-wins record still replays — while matchesCachedSelection
+                        // + the DATABENTO source filter keep per-session (symbol,expiry,source) isolation.
                         .filter(entry -> isCacheFresh("max-pain:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("max-pain:" + entry.getKey(), selection))
+                        .filter(entry -> passesSelectionBarrier(
+                                "max-pain:" + entry.getKey(),
+                                selection,
+                                enforceCachedReplayMaxStale("max-pain", selection == null ? "" : selection.source()),
+                                enforceCachedReplayOffsetBarrier("max-pain", selection == null ? "" : selection.source())))
                         .filter(entry -> "DATABENTO".equals(selection.source()))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
@@ -1957,6 +2016,23 @@ public class FeedGatewayService implements ReplayRunner {
 
     private boolean isExpired(long eventTime, long nowMs) {
         long ttlMs = settings.cacheTtlMs();
+        return ttlMs <= 0 || eventTime < nowMs - ttlMs;
+    }
+
+    /**
+     * Effective cache TTL for a given event type. All slow-vs-fast freshness policy flows through this one
+     * seam (seek window, ingest eviction, periodic purge, cached-state send-filter). {@code max-pain} is a
+     * slow daily-OI last-value-wins signal and uses its own much longer window
+     * ({@link GatewaySettings#maxPainTtlMs()}); every other event uses the generic
+     * {@link GatewaySettings#cacheTtlMs()} sized for fast-ticking quote data.
+     */
+    private long cacheTtlMsForEvent(String event) {
+        return "max-pain".equals(event) ? settings.maxPainTtlMs() : settings.cacheTtlMs();
+    }
+
+    /** Event-aware staleness: same rule as {@link #isExpired(long, long)} but with the per-event TTL. */
+    private boolean isExpired(String event, long eventTime, long nowMs) {
+        long ttlMs = cacheTtlMsForEvent(event);
         return ttlMs <= 0 || eventTime < nowMs - ttlMs;
     }
 
@@ -2009,11 +2085,19 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     static boolean enforceCachedReplayMaxStale(String event, String source) {
-        return !"snapshot".equals(event);
+        // snapshot AND max-pain are "current-state" caches replayed in full on connect. Max-pain is a slow
+        // daily-OI signal whose latest record is routinely older than maxStaleMs (15s) and older than the
+        // client's selectedAtMs — enforcing the max-stale/selected-time barrier here would re-drop it even
+        // after the TTL seam admits it. Selection isolation is still enforced by matchesCachedSelection +
+        // the DATABENTO source filter; this only relaxes the time-freshness barrier.
+        return !"snapshot".equals(event) && !"max-pain".equals(event);
     }
 
     static boolean enforceCachedReplayOffsetBarrier(String event, String source) {
-        return !"snapshot".equals(event);
+        // Same rationale as enforceCachedReplayMaxStale: a slow max-pain's latest record can sit below the
+        // session's per-partition offset barrier (set when other fast topics advanced past selection), so
+        // the offset barrier would wrongly filter the current max-pain on replay. Exempt like snapshot.
+        return !"snapshot".equals(event) && !"max-pain".equals(event);
     }
 
     private boolean passesOffsetBarrier(TopicPartition partition, long offset) {

@@ -338,6 +338,20 @@ public final class GatewaySettings {
         return intValue("GATEWAY_CACHE_TTL_MS", 900_000, 0);
     }
 
+    /**
+     * Cache TTL for the per-(symbol,expiry) max-pain stream. Max-pain is derived from DAILY OPRA open
+     * interest (a slow, last-value-wins signal that legitimately goes hours without a new record), so it
+     * must NOT use the generic {@link #cacheTtlMs()} (default 15 min, sized for fast-ticking quote data) —
+     * otherwise the latest valid max-pain is seeked-past on (re)connect, evicted on ingest, periodically
+     * purged, and filtered out of the cached-state snapshot the moment it ages past 15 minutes (which for
+     * daily data is almost always). Default 12h covers a full regular trading session plus a pre/post
+     * buffer while bounding the "show yesterday's level at next open" risk a 24h/infinite window would
+     * carry. {@code <= 0} preserves the generic "do not cache stale state" semantics (NOT infinite).
+     */
+    public long maxPainTtlMs() {
+        return longValue("GATEWAY_MAXPAIN_TTL_MS", 43_200_000L, 0L);
+    }
+
     public long maxLagRecords() {
         return longValue("MARKETDATA_GATEWAY_MAX_LAG_RECORDS", 5_000L, 0L);
     }

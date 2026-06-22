@@ -393,6 +393,180 @@ class FeedGatewayServiceTest {
         assertFalse(shouldForward(service, topicBinding("DATABENTO", "gex-by-strike"), payload, record));
     }
 
+    // ---- Max-pain last-value-wins: a slow daily-OI signal must not use the generic 15-min freshness ----
+
+    @Test
+    void maxPainTtlMsDefaultsTo12hAndIsOverridable() {
+        assertEquals(43_200_000L, new GatewaySettings().maxPainTtlMs());
+        withSystemProperty("GATEWAY_MAXPAIN_TTL_MS", "60000",
+                () -> assertEquals(60_000L, new GatewaySettings().maxPainTtlMs()));
+        // <= 0 is honored (preserves the "do not cache stale state" semantics, NOT infinite).
+        withSystemProperty("GATEWAY_MAXPAIN_TTL_MS", "0",
+                () -> assertEquals(0L, new GatewaySettings().maxPainTtlMs()));
+    }
+
+    @Test
+    void cacheTtlMsForEventUsesTheLongWindowForMaxPainOnly() throws Exception {
+        FeedGatewayService service = service();
+        assertEquals(new GatewaySettings().maxPainTtlMs(), cacheTtlMsForEvent(service, "max-pain"));
+        assertEquals(new GatewaySettings().cacheTtlMs(), cacheTtlMsForEvent(service, "snapshot"));
+        assertEquals(new GatewaySettings().cacheTtlMs(), cacheTtlMsForEvent(service, "strike-flow"));
+    }
+
+    @Test
+    void isExpiredIsEventAwareForMaxPainVersusFast() throws Exception {
+        FeedGatewayService service = service();
+        long now = 2_000_000_000_000L;
+        long thirtyFiveMinAgo = now - 35L * 60_000L;
+        // The exact scenario observed live: a 35-min-old record. Fast events expire; max-pain does not.
+        assertTrue(isExpiredEvent(service, "snapshot", thirtyFiveMinAgo, now));
+        assertFalse(isExpiredEvent(service, "max-pain", thirtyFiveMinAgo, now));
+        // Beyond the 12h max-pain window, even max-pain expires (bounded, not infinite).
+        assertTrue(isExpiredEvent(service, "max-pain", now - 13L * 3_600_000L, now));
+    }
+
+    @Test
+    void seekWindowTtlMapsMaxPainToLongWindowAndOthersToGeneric() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        java.util.Map<String, Object> topicEvents = new java.util.HashMap<>();
+        topicEvents.put(settings.databentoMaxPainTopic(), topicBinding("DATABENTO", "max-pain"));
+        topicEvents.put(settings.databentoStrikeFlowTopic(), topicBinding("DATABENTO", "strike-flow"));
+
+        assertEquals(settings.maxPainTtlMs(), windowTtlMsFor(service,
+                new org.apache.kafka.common.TopicPartition(settings.databentoMaxPainTopic(), 0), topicEvents));
+        assertEquals(settings.cacheTtlMs(), windowTtlMsFor(service,
+                new org.apache.kafka.common.TopicPartition(settings.databentoStrikeFlowTopic(), 0), topicEvents));
+        // Null map (the hpsf callers) → generic window for every partition (unchanged behaviour).
+        assertEquals(settings.cacheTtlMs(), windowTtlMsFor(service,
+                new org.apache.kafka.common.TopicPartition(settings.databentoMaxPainTopic(), 0), null));
+    }
+
+    @Test
+    void agedNonTerminalMaxPainSurvivesIngestWhileAgedFastEventIsEvicted() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        long thirtyFiveMinAgo = now - 35L * 60_000L;
+
+        String maxPainJson = "{\"messageType\":\"MAX_PAIN\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"status\":\"VALID\",\"maxPainStrike\":4500.0}";
+        String key = updateCache(service, topicBinding("DATABENTO", "max-pain"),
+                recordAt(settings.databentoMaxPainTopic(), 0, 1L, "SPX|20260622", maxPainJson, thirtyFiveMinAgo),
+                maxPainJson);
+        assertEquals("DATABENTO|SPX|20260622", key, "aged-but-valid max-pain must be cached, not evicted");
+        assertTrue(service.healthJson().contains("\"maxPain\":1"));
+
+        // Same age, a FAST event (strike-flow) is still evicted on ingest by the generic 15-min window.
+        String sfJson = "{\"eventType\":\"strike-flow\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"strikes\":[]}";
+        String sfKey = updateCache(service, topicBinding("DATABENTO", "strike-flow"),
+                recordAt(settings.databentoStrikeFlowTopic(), 0, 1L, "SPX|20260622", sfJson, thirtyFiveMinAgo),
+                sfJson);
+        assertEquals(null, sfKey, "aged fast event must still be evicted on ingest");
+        assertTrue(service.healthJson().contains("\"strikeFlows\":0"));
+    }
+
+    @Test
+    void maxPainBeyondTheTwelveHourWindowIsEvictedOnIngest() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = "{\"messageType\":\"MAX_PAIN\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"status\":\"VALID\"}";
+        String key = updateCache(service, topicBinding("DATABENTO", "max-pain"),
+                recordAt(settings.databentoMaxPainTopic(), 0, 1L, "SPX|20260622", json, now - 13L * 3_600_000L),
+                json);
+        assertEquals(null, key, "max-pain older than the 12h bound must be evicted (not infinite retention)");
+        assertTrue(service.healthJson().contains("\"maxPain\":0"));
+    }
+
+    @Test
+    void periodicPurgeKeepsAgedMaxPainButEvictsAgedFastEvent() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+
+        String maxPainJson = "{\"messageType\":\"MAX_PAIN\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"status\":\"VALID\"}";
+        updateCache(service, topicBinding("DATABENTO", "max-pain"),
+                new ConsumerRecord<>(settings.databentoMaxPainTopic(), 0, 1L, "SPX|20260622", maxPainJson), maxPainJson);
+        String sfJson = "{\"eventType\":\"strike-flow\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"strikes\":[]}";
+        updateCache(service, topicBinding("DATABENTO", "strike-flow"),
+                new ConsumerRecord<>(settings.databentoStrikeFlowTopic(), 0, 1L, "SPX|20260622", sfJson), sfJson);
+        assertTrue(service.healthJson().contains("\"maxPain\":1"));
+        assertTrue(service.healthJson().contains("\"strikeFlows\":1"));
+
+        // Run the periodic purge 20 minutes into the future: the fast event ages past 15 min and is
+        // evicted; the max-pain (12h window) survives.
+        purgeExpiredCache(service, now + 20L * 60_000L);
+        assertTrue(service.healthJson().contains("\"maxPain\":1"), "aged max-pain must survive periodic purge");
+        assertTrue(service.healthJson().contains("\"strikeFlows\":0"), "aged fast event must be purged");
+    }
+
+    @Test
+    void cachedReplayIncludesAgedMaxPainForMatchingDatabentoSelection() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        // Ingest an AGED (35-min) max-pain — older than maxStaleMs (15s) so this proves both the event-aware
+        // isCacheFresh AND the cached-replay max-stale exemption let it through to a connecting client.
+        String json = "{\"messageType\":\"MAX_PAIN\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"status\":\"VALID\",\"maxPainStrike\":4500.0}";
+        updateCache(service, topicBinding("DATABENTO", "max-pain"),
+                recordAt(settings.databentoMaxPainTopic(), 0, 1L, "SPX|20260622", json, now - 35L * 60_000L), json);
+
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        List<?> replay = cachedEvents(service, List.of("max-pain"), now);
+        assertEquals(1, replay.size(), "aged max-pain must be replayed to a freshly-connected DATABENTO client");
+
+        // An IBKR-selected session must NOT receive the DATABENTO max-pain (isolation preserved).
+        setActiveSelection(service, "IBKR", "SPX", "20260622");
+        assertTrue(cachedEvents(service, List.of("max-pain"), now).isEmpty(),
+                "IBKR selection must never receive DATABENTO max-pain");
+    }
+
+    @Test
+    void cachedReplayMaxPainBelowTheOffsetBarrierStillReplays() throws Exception {
+        // Codex Gate-2 NIT: prove the OFFSET-barrier exemption (not just the max-stale one). A slow
+        // max-pain's latest record can sit at an offset BELOW the session's per-partition barrier (set
+        // when faster topics advanced past selection); without the exemption it would be filtered.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String json = "{\"messageType\":\"MAX_PAIN\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"status\":\"VALID\",\"maxPainStrike\":4500.0}";
+        // Cache the max-pain at a LOW offset (1)...
+        updateCache(service, topicBinding("DATABENTO", "max-pain"),
+                new ConsumerRecord<>(settings.databentoMaxPainTopic(), 0, 1L, "SPX|20260622", json), json);
+        // ...then raise the offset barrier for that partition far above it (100).
+        setOffsetBarrier(service, settings.databentoMaxPainTopic(), 0, 100L);
+
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        assertEquals(1, cachedEvents(service, List.of("max-pain"), System.currentTimeMillis()).size(),
+                "max-pain below the offset barrier must still replay (offset-barrier exemption)");
+    }
+
+    @Test
+    void terminalExpiredMaxPainEvictsCacheButReturnsKeyForOneLiveForward() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        // First a VALID max-pain is cached...
+        String valid = "{\"messageType\":\"MAX_PAIN\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"status\":\"VALID\"}";
+        updateCache(service, topicBinding("DATABENTO", "max-pain"),
+                new ConsumerRecord<>(settings.databentoMaxPainTopic(), 0, 1L, "SPX|20260622", valid), valid);
+        assertTrue(service.healthJson().contains("\"maxPain\":1"));
+
+        // ...then the terminal EXPIRED must still evict the cache AND return the key for one live forward.
+        String expired = "{\"messageType\":\"MAX_PAIN\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"status\":\"EXPIRED\"}";
+        String key = updateCache(service, topicBinding("DATABENTO", "max-pain"),
+                new ConsumerRecord<>(settings.databentoMaxPainTopic(), 0, 2L, "SPX|20260622", expired), expired);
+        assertEquals("DATABENTO|SPX|20260622", key, "terminal EXPIRED must return a key for the one-time live forward");
+        assertTrue(service.healthJson().contains("\"maxPain\":0"), "terminal EXPIRED must evict the cache");
+    }
+
     private static void withSystemProperty(String key, String value, Runnable assertion) {
         String previous = System.getProperty(key);
         try {
@@ -457,6 +631,58 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod("updateCache", bindingType, ConsumerRecord.class, String.class);
         method.setAccessible(true);
         return (String) method.invoke(service, binding, record, json);
+    }
+
+    /** A ConsumerRecord with an explicit event timestamp (CREATE_TIME), for testing age-based eviction. */
+    private static ConsumerRecord<String, String> recordAt(
+            String topic, int partition, long offset, String key, String value, long timestampMs) {
+        return new ConsumerRecord<>(topic, partition, offset, timestampMs,
+                org.apache.kafka.common.record.TimestampType.CREATE_TIME, -1, -1, key, value,
+                new org.apache.kafka.common.header.internals.RecordHeaders(), java.util.Optional.empty());
+    }
+
+    private static long cacheTtlMsForEvent(FeedGatewayService service, String event) throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod("cacheTtlMsForEvent", String.class);
+        m.setAccessible(true);
+        return (long) m.invoke(service, event);
+    }
+
+    private static boolean isExpiredEvent(FeedGatewayService service, String event, long eventTime, long nowMs)
+            throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod("isExpired", String.class, long.class, long.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(service, event, eventTime, nowMs);
+    }
+
+    private static long windowTtlMsFor(FeedGatewayService service,
+            org.apache.kafka.common.TopicPartition partition, Object topicEvents) throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod(
+                "windowTtlMsFor", org.apache.kafka.common.TopicPartition.class, java.util.Map.class);
+        m.setAccessible(true);
+        return (long) m.invoke(service, partition, topicEvents);
+    }
+
+    private static void purgeExpiredCache(FeedGatewayService service, long nowMs) throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod("purgeExpiredCache", long.class);
+        m.setAccessible(true);
+        m.invoke(service, nowMs);
+    }
+
+    private static List<?> cachedEvents(FeedGatewayService service, List<String> events, long nowMs)
+            throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod("cachedEvents", List.class, long.class);
+        m.setAccessible(true);
+        return (List<?>) m.invoke(service, events, nowMs);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void setOffsetBarrier(FeedGatewayService service, String topic, int partition, long barrier)
+            throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("offsetBarriers");
+        field.setAccessible(true);
+        AtomicReference<java.util.Map<org.apache.kafka.common.TopicPartition, Long>> ref =
+                (AtomicReference<java.util.Map<org.apache.kafka.common.TopicPartition, Long>>) field.get(service);
+        ref.set(java.util.Map.of(new org.apache.kafka.common.TopicPartition(topic, partition), barrier));
     }
 
     private static boolean shouldForward(
