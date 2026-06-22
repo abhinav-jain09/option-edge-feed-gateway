@@ -1,14 +1,27 @@
+@Library('oe') _
+
 pipeline {
   agent any
   parameters {
-    string(name: 'IMAGE_REGISTRY', defaultValue: 'host.docker.internal:5001', description: 'Docker registry namespace. Dev default is the LOCAL Mac registry (host.docker.internal:5001) — the buildkitd config below trusts it as insecure and the local-docker k8s pulls from it. Prod deploy jobs override this with the prod registry.')
+    choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'production'], description: 'Target environment — drives registry + build platform from oeProfile (single source of truth)')
+    string(name: 'IMAGE_REGISTRY', defaultValue: '', description: 'Override registry. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers (e.g. bring-up-all).')
     string(name: 'IMAGE_TAG', defaultValue: '', description: 'Docker tag. Defaults to current git SHA.')
     string(name: 'DEV_IMAGE_TAG', defaultValue: 'dev', description: 'Also publish this mutable dev tag for the deploy job. Empty disables it.')
-    string(name: 'BUILD_PLATFORM', defaultValue: 'linux/arm64', description: 'Docker platform for local dev Jenkins. Production deploy jobs force linux/amd64.')
+    string(name: 'BUILD_PLATFORM', defaultValue: '', description: 'Override platform. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers.')
     string(name: 'CONTRACTS_BRANCH', defaultValue: 'main', description: 'options-edge-contracts branch to install before building the gateway')
     booleanParam(name: 'PUSH_IMAGE', defaultValue: true, description: 'Push built image to registry')
   }
   stages {
+    stage('Resolve profile') {
+      steps {
+        script {
+          def p = oeProfile(params.ENVIRONMENT)
+          env.IMAGE_REGISTRY = params.IMAGE_REGISTRY?.trim() ? params.IMAGE_REGISTRY : p.registry
+          env.BUILD_PLATFORM = params.BUILD_PLATFORM?.trim() ? params.BUILD_PLATFORM : p.platform
+          echo "resolved (env=${params.ENVIRONMENT}): registry=${env.IMAGE_REGISTRY} platform=${env.BUILD_PLATFORM}"
+        }
+      }
+    }
     stage('Install Contracts') {
       steps {
         sh '''
