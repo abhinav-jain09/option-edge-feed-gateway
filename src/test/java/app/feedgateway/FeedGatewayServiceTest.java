@@ -4,9 +4,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
 
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
+
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.ZoneId;
@@ -25,6 +31,100 @@ class FeedGatewayServiceTest {
                 List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "volume-sandwich", "gex-by-strike", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
+    }
+
+    @Test
+    void markSelectionReadyIsOneShotAndGuardedByActiveSelection() throws Exception {
+        FeedGatewayService service = service();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260623");
+        Object active = activeSelectionOf(service);
+
+        // First readiness for the active selection transitions readySelectionKey (and triggers the
+        // one-shot source-ready + cached convergence re-push; harmless here with no clients/cache).
+        invokeMarkSelectionReady(service, active);
+        String key1 = readySelectionKey(service);
+        assertFalse(key1.isEmpty(), "first ready must transition readySelectionKey");
+
+        // One-shot: a second readiness for the SAME selection must not re-transition (no client spam).
+        invokeMarkSelectionReady(service, active);
+        assertEquals(key1, readySelectionKey(service), "markSelectionReady must be one-shot per selection");
+
+        // Token guard: a readiness signal for a NON-active selection must be ignored entirely.
+        setReadySelectionKey(service, "");
+        Object superseded = newActiveSelection("DATABENTO", "SPX", "20260622");
+        invokeMarkSelectionReady(service, superseded);
+        assertTrue(readySelectionKey(service).isEmpty(),
+                "a superseded selection must never mark ready or converge dashboards");
+    }
+
+    @Test
+    void selectionReadyRepushesCachedStrikesAfterRoll() throws Exception {
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        // Convergence re-push: markSelectionReady broadcasts source-ready, THEN re-pushes cached state so
+        // open dashboards repopulate after the daily roll. Ordering matters (source-ready precedes replay).
+        int readyIdx = source.indexOf(
+                "broadcast(\"source-ready\", activeSelectionJson(selection, \"source-ready\"));");
+        assertTrue(readyIdx > 0, "markSelectionReady must broadcast source-ready");
+        int repushIdx = source.indexOf("broadcastCachedState(sourceSwitchReplayEvents());", readyIdx);
+        assertTrue(repushIdx > readyIdx, "convergence cached re-push must come AFTER source-ready");
+        // Readiness commit is atomic under readyLock with a LIVE active-selection re-check (no superseded
+        // selection can announce/converge) and a one-shot per selection key.
+        assertTrue(source.contains("synchronized (readyLock)"),
+                "markSelectionReady must commit readiness atomically under readyLock");
+        assertTrue(source.contains("!key.equals(selectionKey(activeSelection.get()))"),
+                "markSelectionReady must re-validate against the live active selection");
+        // Forward decision uses a selection captured ONCE per record (no mid-record activeSelection re-read).
+        assertTrue(source.contains("recordSelectedForward(binding, json, decided)"),
+                "forward path must carry the decided selection into recordSelectedForward");
+        assertTrue(source.contains("shouldForward(binding, json, record, ActiveSelection selection)")
+                        || source.contains("ConsumerRecord<?, ?> record, ActiveSelection selection)"),
+                "shouldForward must have a selection-carrying overload");
+        // Cache-arrival trigger: a cached-but-not-forwarded snapshot for the active selection still converges
+        // (covers the closed-market case where the seed snapshot arrives already older than maxStaleMs).
+        assertTrue(source.contains("matchesActiveSelection(json, current)"),
+                "cache-arrival path must mark ready only for snapshots matching the active selection");
+        assertTrue(source.contains("markSelectionReady(current);"),
+                "cache-arrival path must call markSelectionReady");
+    }
+
+    @Test
+    void selectionReadyDeliversSourceReadyThenCachedStrikesToOpenClient() throws Exception {
+        FeedGatewayService service = service();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260623");
+        long now = System.currentTimeMillis();
+
+        // A fresh snapshot for the active selection is cached (the post-roll seed strike).
+        String snapshotJson = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260623\",\"strike\":7000}";
+        String key = updateCache(service, topicBinding("DATABENTO", "snapshot"),
+                recordAt("options.databento.display", 0, 1L, "SPX|20260623|7000", snapshotJson, now),
+                snapshotJson);
+        assertEquals("DATABENTO|SPX|20260623|7000", key, "snapshot must be cached under source|symbol|expiry|strike");
+
+        // An already-open dashboard.
+        List<String> sent = new ArrayList<>();
+        addRecordingClient(service, sent);
+
+        // Converge: readiness for the active selection must deliver source-ready THEN the cached strike.
+        invokeMarkSelectionReady(service, activeSelectionOf(service));
+
+        int readyIdx = -1;
+        int batchIdx = -1;
+        for (int i = 0; i < sent.size(); i++) {
+            String msg = sent.get(i);
+            if (readyIdx < 0 && msg.contains("source-ready")) {
+                readyIdx = i;
+            }
+            if (batchIdx < 0 && msg.contains("\"expiry\":\"20260623\"") && msg.contains("7000")) {
+                batchIdx = i;
+            }
+        }
+        assertTrue(readyIdx >= 0, "open client must receive source-ready after a roll");
+        assertTrue(batchIdx > readyIdx, "cached strike batch must arrive AFTER source-ready (ordering)");
+
+        // One-shot: a second readiness for the same selection must NOT re-broadcast (no client spam).
+        int before = sent.size();
+        invokeMarkSelectionReady(service, activeSelectionOf(service));
+        assertEquals(before, sent.size(), "second readiness for the same selection must not re-broadcast");
     }
 
     @Test
@@ -792,13 +892,75 @@ class FeedGatewayServiceTest {
 
     @SuppressWarnings("unchecked")
     private static void setActiveSelection(FeedGatewayService service, String src, String symbol, String expiry) throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("activeSelection");
+        field.setAccessible(true);
+        ((AtomicReference<Object>) field.get(service)).set(newActiveSelection(src, symbol, expiry));
+    }
+
+    /** Registers a synchronous recording WebSocketSession (untracked -> direct send) and captures payloads. */
+    @SuppressWarnings("unchecked")
+    private static void addRecordingClient(FeedGatewayService service, List<String> sink) throws Exception {
+        WebSocketSession session = (WebSocketSession) Proxy.newProxyInstance(
+                WebSocketSession.class.getClassLoader(),
+                new Class<?>[]{WebSocketSession.class},
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "isOpen": return Boolean.TRUE;
+                        case "getId": return "rec-session";
+                        case "sendMessage":
+                            if (args[0] instanceof TextMessage tm) {
+                                sink.add(tm.getPayload());
+                            }
+                            return null;
+                        case "toString": return "RecordingSession";
+                        case "hashCode": return System.identityHashCode(proxy);
+                        case "equals": return proxy == args[0];
+                        default:
+                            Class<?> rt = method.getReturnType();
+                            if (rt == boolean.class) return Boolean.FALSE;
+                            if (rt == int.class) return 0;
+                            if (rt == long.class) return 0L;
+                            return null;
+                    }
+                });
+        Field clientsField = FeedGatewayService.class.getDeclaredField("clients");
+        clientsField.setAccessible(true);
+        ((Collection<WebSocketSession>) clientsField.get(service)).add(session);
+    }
+
+    private static Object newActiveSelection(String src, String symbol, String expiry) throws Exception {
         Class<?> selType = Class.forName("app.feedgateway.FeedGatewayService$ActiveSelection");
         Constructor<?> constructor = selType.getDeclaredConstructor(String.class, String.class, String.class, long.class, long.class);
         constructor.setAccessible(true);
-        Object selection = constructor.newInstance(src, symbol, expiry, 0L, 0L);
+        return constructor.newInstance(src, symbol, expiry, 0L, 0L);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object activeSelectionOf(FeedGatewayService service) throws Exception {
         Field field = FeedGatewayService.class.getDeclaredField("activeSelection");
         field.setAccessible(true);
-        ((AtomicReference<Object>) field.get(service)).set(selection);
+        return ((AtomicReference<Object>) field.get(service)).get();
+    }
+
+    private static void invokeMarkSelectionReady(FeedGatewayService service, Object selection) throws Exception {
+        Class<?> selType = Class.forName("app.feedgateway.FeedGatewayService$ActiveSelection");
+        Method m = FeedGatewayService.class.getDeclaredMethod("markSelectionReady", selType);
+        m.setAccessible(true);
+        m.invoke(service, selection);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String readySelectionKey(FeedGatewayService service) throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("readySelectionKey");
+        field.setAccessible(true);
+        return ((AtomicReference<String>) field.get(service)).get();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void setReadySelectionKey(FeedGatewayService service, String value) throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("readySelectionKey");
+        field.setAccessible(true);
+        ((AtomicReference<String>) field.get(service)).set(value);
     }
 
     private static String uiBatchEnvelopeJsonGex(FeedGatewayService service, List<String> gexByStrike) throws Exception {

@@ -1018,10 +1018,11 @@ public class FeedGatewayService implements ReplayRunner {
                 for (ConsumerRecord<String, String> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = binding == null ? null : enrichJson(record.value(), binding);
-                    if (json != null && !json.isBlank() && (perSessionRouting() || shouldForward(binding, json, record))) {
+                    ActiveSelection decided = activeSelection.get();
+                    if (json != null && !json.isBlank() && (perSessionRouting() || shouldForward(binding, json, record, decided))) {
                         routeOrBroadcast(binding.source(), binding.event(), json);
                         forwardedEvents.incrementAndGet();
-                        recordSelectedForward(binding, json);
+                        recordSelectedForward(binding, json, decided);
                     } else {
                         inactiveDroppedEvents.incrementAndGet();
                     }
@@ -1158,6 +1159,8 @@ public class FeedGatewayService implements ReplayRunner {
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
+                    // Selection captured ONCE for this record's forward+readiness decision (legacy mode).
+                    ActiveSelection decided = null;
                     // Per-session mode: route directly via the engine using the authoritative
                     // topic-binding source (bypasses the global single-source/selection/barrier gate;
                     // supports IBKR + Databento users simultaneously). shouldForward gates legacy mode.
@@ -1173,12 +1176,23 @@ public class FeedGatewayService implements ReplayRunner {
                             routeOrBroadcast(binding.source(), binding.event(), json);
                             forwardedEvents.incrementAndGet();
                         }
-                    } else if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json, record)) {
+                    } else if (cacheKey != null && cacheCaughtUpFlag.get()
+                            && shouldForward(binding, json, record, (decided = activeSelection.get()))) {
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
-                        recordSelectedForward(binding, json);
+                        recordSelectedForward(binding, json, decided);
                     } else if (cacheKey != null) {
                         inactiveDroppedEvents.incrementAndGet();
+                        // Cache-arrival convergence: a snapshot for the ACTIVE selection was cached but not
+                        // live-forwarded (e.g. it arrived already older than maxStaleMs on a closed market
+                        // right after the daily roll). Still mark the selection ready so markSelectionReady
+                        // fires its one-shot cached re-push and open dashboards repopulate. matchesActiveSelection
+                        // guards against off-selection data; markSelectionReady re-validates atomically.
+                        ActiveSelection current = activeSelection.get();
+                        if (cacheCaughtUpFlag.get() && "snapshot".equals(binding.event())
+                                && current != null && matchesActiveSelection(json, current)) {
+                            markSelectionReady(current);
+                        }
                     }
                 }
                 purgeExpiredCache(System.currentTimeMillis());
@@ -1360,9 +1374,18 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
         if (caughtUpFlag.compareAndSet(false, true)) {
-            broadcast("status", statusJson());
-            if (broadcastCachedState(events)) {
-                markSelectionReady(activeSelection.get());
+            // Run the whole catch-up replay under readyLock so the active selection is STABLE across the
+            // capture, the cached-batch build (cachedEvents/uiBatchEnvelopeJson re-read activeSelection),
+            // and the readiness commit. Without the lock a concurrent applySelection could swap the active
+            // selection mid-replay, broadcasting a cached batch for a different selection than intended.
+            // Lock order is readyLock -> this (cachedEvents is synchronized), consistent with applySelection;
+            // markSelectionReady's readyLock is reentrant here.
+            synchronized (readyLock) {
+                ActiveSelection selection = activeSelection.get();
+                broadcast("status", statusJson());
+                if (broadcastCachedState(events)) {
+                    markSelectionReady(selection);
+                }
             }
             System.out.println("Feed gateway " + name + " cache caught up; replayed cached state to clients.");
         }
@@ -1395,22 +1418,33 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void applySelection(ActiveSelection next) {
-        ActiveSelection previous = activeSelection.get();
-        if (!next.newerThan(previous)) {
-            return;
-        }
-        offsetBarriers.set(captureOffsetBarriers(next));
-        readySelectionKey.set("");
-        activeSelection.set(next);
-        synchronized (batchLock) {
-            clearPendingLocked();
-        }
-        String resetJson = activeSelectionJson(next);
-        broadcast("reset", resetJson);
-        broadcast("source-switching", activeSelectionJson(next, "source-switching"));
-        broadcast("status", statusJson());
-        if (broadcastCachedState(sourceSwitchReplayEvents())) {
-            markSelectionReady(next);
+        // The whole roll lifecycle — active swap, reset/source-switching broadcasts, switch-time cached
+        // replay, and readiness — runs under readyLock so it is atomic against any concurrent
+        // markSelectionReady from a consumer thread. A consumer can therefore never observe a half-rolled
+        // state (new activeSelection but old readiness, or vice versa). markSelectionReady itself locks
+        // readyLock (reentrant on this thread). Lock order is always readyLock -> {batchLock, this}, never
+        // the inverse, so there is no deadlock. Rolls are rare, so the wider critical section is cheap.
+        synchronized (readyLock) {
+            ActiveSelection previous = activeSelection.get();
+            if (!next.newerThan(previous)) {
+                return;
+            }
+            offsetBarriers.set(captureOffsetBarriers(next));
+            // NOTE: readySelectionKey is intentionally NOT reset here. markSelectionReady detects a NEW
+            // selection by key change, so resetting to "" is unnecessary and previously opened a race:
+            // a consumer could mark the OLD selection ready in the window between the reset and the
+            // activeSelection swap, burning the new selection's one-shot before it became active.
+            activeSelection.set(next);
+            synchronized (batchLock) {
+                clearPendingLocked();
+            }
+            String resetJson = activeSelectionJson(next);
+            broadcast("reset", resetJson);
+            broadcast("source-switching", activeSelectionJson(next, "source-switching"));
+            broadcast("status", statusJson());
+            if (broadcastCachedState(sourceSwitchReplayEvents())) {
+                markSelectionReady(next);
+            }
         }
         System.out.println("Feed gateway selected market data source " + next.source()
                 + " " + next.symbol() + " " + next.expiry()
@@ -1472,10 +1506,16 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
-        if (binding == null) {
+        return shouldForward(binding, json, record, activeSelection.get());
+    }
+
+    // Overload taking the selection captured ONCE at the record's decision point, so the forward gate,
+    // the forward bookkeeping, and the readiness decision all reason about the SAME selection snapshot
+    // (no mid-record activeSelection re-read race across a roll boundary).
+    private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record, ActiveSelection selection) {
+        if (binding == null || selection == null) {
             return false;
         }
-        ActiveSelection selection = activeSelection.get();
         if ("vix-price".equals(binding.event())) {
             return passesSelectionBarrier(record, selection);
         }
@@ -1497,20 +1537,49 @@ public class FeedGatewayService implements ReplayRunner {
         return matchesActiveSelection(json, selection);
     }
 
-    private void recordSelectedForward(TopicBinding binding, String json) {
-        ActiveSelection selection = activeSelection.get();
-        sourceLastForwardedAt.put(selectionKey(selection), System.currentTimeMillis());
+    // `decided` is the selection captured at the forward decision point and already proven to match the
+    // payload by shouldForward(...). Stamping sourceLastForwardedAt for THAT selection (not a fresh re-read)
+    // means a roll landing here can never record a phantom "recent forward" for the new selection and
+    // wrongly suppress its source-stale.
+    private void recordSelectedForward(TopicBinding binding, String json, ActiveSelection decided) {
+        if (decided == null) {
+            return;
+        }
+        sourceLastForwardedAt.put(selectionKey(decided), System.currentTimeMillis());
         if (!"snapshot".equals(binding.event())) {
             return;
         }
-        markSelectionReady(selection);
+        markSelectionReady(decided);
     }
 
+    private final Object readyLock = new Object();
+
     private void markSelectionReady(ActiveSelection selection) {
+        if (selection == null) {
+            return;
+        }
         String key = selectionKey(selection);
-        sourceLastForwardedAt.put(key, System.currentTimeMillis());
-        if (readySelectionKey.compareAndSet("", key) || readySelectionKey.compareAndSet(null, key)) {
+        // Atomic readiness commit. Under readyLock we (1) re-validate against the LIVE active selection so a
+        // roll since the caller's decision can never announce or converge a superseded selection, and (2)
+        // enforce the one-shot per selection key. The source-ready broadcast + cached convergence re-push
+        // happen inside the lock so no concurrent roll can interleave a stale announcement. We deliberately
+        // do NOT touch sourceLastForwardedAt here — the cache-arrival caller did not forward, and claiming a
+        // recent forward would wrongly suppress source-stale; real-forward bookkeeping lives in
+        // recordSelectedForward.
+        synchronized (readyLock) {
+            if (!key.equals(selectionKey(activeSelection.get()))) {
+                return;
+            }
+            if (key.equals(readySelectionKey.get())) {
+                return;
+            }
+            readySelectionKey.set(key);
+            // Announce readiness FIRST, then converge every open dashboard onto the new selection's cached
+            // strikes. Without this re-push, a tab that missed the live seed batch right after
+            // "source-switching" — e.g. the daily post-close expiry roll, when no further live ticks arrive —
+            // would stay blank until a manual refresh or the next market open.
             broadcast("source-ready", activeSelectionJson(selection, "source-ready"));
+            broadcastCachedState(sourceSwitchReplayEvents());
         }
     }
 
