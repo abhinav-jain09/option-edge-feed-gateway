@@ -1179,6 +1179,17 @@ public class FeedGatewayService implements ReplayRunner {
                         recordSelectedForward(binding, json);
                     } else if (cacheKey != null) {
                         inactiveDroppedEvents.incrementAndGet();
+                        // Cache-arrival convergence: a snapshot for the ACTIVE selection was cached but not
+                        // live-forwarded (e.g. it arrived already older than maxStaleMs on a closed market
+                        // right after the daily roll). Still mark the selection ready so markSelectionReady
+                        // fires its one-shot cached re-push and open dashboards repopulate. The
+                        // matchesActiveSelection guard prevents off-selection data from flipping readiness.
+                        if (cacheCaughtUpFlag.get() && "snapshot".equals(binding.event())) {
+                            ActiveSelection current = activeSelection.get();
+                            if (current != null && matchesActiveSelection(json, current)) {
+                                markSelectionReady(current);
+                            }
+                        }
                     }
                 }
                 purgeExpiredCache(System.currentTimeMillis());
@@ -1507,10 +1518,27 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void markSelectionReady(ActiveSelection selection) {
+        if (selection == null) {
+            return;
+        }
+        // Selection-token guard: a readiness signal can arrive for a selection that has since been
+        // superseded (the forward/cache decision and this call read activeSelection at different
+        // instants). Never announce readiness for — or converge dashboards onto — a stale selection.
+        ActiveSelection current = activeSelection.get();
+        if (current == null || !selectionKey(current).equals(selectionKey(selection))) {
+            return;
+        }
         String key = selectionKey(selection);
         sourceLastForwardedAt.put(key, System.currentTimeMillis());
         if (readySelectionKey.compareAndSet("", key) || readySelectionKey.compareAndSet(null, key)) {
+            // One-shot per selection (readySelectionKey is reset to "" by applySelection on every roll):
+            // announce readiness FIRST, then converge every open dashboard onto the new selection's cached
+            // strikes. Without this re-push, a tab that missed the live seed batch right after
+            // "source-switching" — e.g. the daily post-close expiry roll, when no further live ticks arrive —
+            // would stay blank until a manual refresh or the next market open. The CAS makes this fire exactly
+            // once per selection, so it never spams clients during live market hours.
             broadcast("source-ready", activeSelectionJson(selection, "source-ready"));
+            broadcastCachedState(sourceSwitchReplayEvents());
         }
     }
 

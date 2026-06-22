@@ -28,6 +28,51 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void markSelectionReadyIsOneShotAndGuardedByActiveSelection() throws Exception {
+        FeedGatewayService service = service();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260623");
+        Object active = activeSelectionOf(service);
+
+        // First readiness for the active selection transitions readySelectionKey (and triggers the
+        // one-shot source-ready + cached convergence re-push; harmless here with no clients/cache).
+        invokeMarkSelectionReady(service, active);
+        String key1 = readySelectionKey(service);
+        assertFalse(key1.isEmpty(), "first ready must transition readySelectionKey");
+
+        // One-shot: a second readiness for the SAME selection must not re-transition (no client spam).
+        invokeMarkSelectionReady(service, active);
+        assertEquals(key1, readySelectionKey(service), "markSelectionReady must be one-shot per selection");
+
+        // Token guard: a readiness signal for a NON-active selection must be ignored entirely.
+        setReadySelectionKey(service, "");
+        Object superseded = newActiveSelection("DATABENTO", "SPX", "20260622");
+        invokeMarkSelectionReady(service, superseded);
+        assertTrue(readySelectionKey(service).isEmpty(),
+                "a superseded selection must never mark ready or converge dashboards");
+    }
+
+    @Test
+    void selectionReadyRepushesCachedStrikesAfterRoll() throws Exception {
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        // Convergence re-push: markSelectionReady broadcasts source-ready, THEN re-pushes cached state so
+        // open dashboards repopulate after the daily roll. Ordering matters (source-ready precedes replay).
+        int readyIdx = source.indexOf(
+                "broadcast(\"source-ready\", activeSelectionJson(selection, \"source-ready\"));");
+        assertTrue(readyIdx > 0, "markSelectionReady must broadcast source-ready");
+        int repushIdx = source.indexOf("broadcastCachedState(sourceSwitchReplayEvents());", readyIdx);
+        assertTrue(repushIdx > readyIdx, "convergence cached re-push must come AFTER source-ready");
+        // Selection-token guard inside markSelectionReady.
+        assertTrue(source.contains("!selectionKey(current).equals(selectionKey(selection))"),
+                "markSelectionReady must guard against a superseded selection");
+        // Cache-arrival trigger: a cached-but-not-forwarded snapshot for the active selection still converges
+        // (covers the closed-market case where the seed snapshot arrives already older than maxStaleMs).
+        assertTrue(source.contains("matchesActiveSelection(json, current)"),
+                "cache-arrival path must mark ready only for snapshots matching the active selection");
+        assertTrue(source.contains("markSelectionReady(current);"),
+                "cache-arrival path must call markSelectionReady");
+    }
+
+    @Test
     void databentoGexTopicHasExpectedDefault() {
         assertEquals("options.databento.gex.strike", new GatewaySettings().databentoGexTopic());
     }
@@ -792,13 +837,44 @@ class FeedGatewayServiceTest {
 
     @SuppressWarnings("unchecked")
     private static void setActiveSelection(FeedGatewayService service, String src, String symbol, String expiry) throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("activeSelection");
+        field.setAccessible(true);
+        ((AtomicReference<Object>) field.get(service)).set(newActiveSelection(src, symbol, expiry));
+    }
+
+    private static Object newActiveSelection(String src, String symbol, String expiry) throws Exception {
         Class<?> selType = Class.forName("app.feedgateway.FeedGatewayService$ActiveSelection");
         Constructor<?> constructor = selType.getDeclaredConstructor(String.class, String.class, String.class, long.class, long.class);
         constructor.setAccessible(true);
-        Object selection = constructor.newInstance(src, symbol, expiry, 0L, 0L);
+        return constructor.newInstance(src, symbol, expiry, 0L, 0L);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object activeSelectionOf(FeedGatewayService service) throws Exception {
         Field field = FeedGatewayService.class.getDeclaredField("activeSelection");
         field.setAccessible(true);
-        ((AtomicReference<Object>) field.get(service)).set(selection);
+        return ((AtomicReference<Object>) field.get(service)).get();
+    }
+
+    private static void invokeMarkSelectionReady(FeedGatewayService service, Object selection) throws Exception {
+        Class<?> selType = Class.forName("app.feedgateway.FeedGatewayService$ActiveSelection");
+        Method m = FeedGatewayService.class.getDeclaredMethod("markSelectionReady", selType);
+        m.setAccessible(true);
+        m.invoke(service, selection);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String readySelectionKey(FeedGatewayService service) throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("readySelectionKey");
+        field.setAccessible(true);
+        return ((AtomicReference<String>) field.get(service)).get();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void setReadySelectionKey(FeedGatewayService service, String value) throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("readySelectionKey");
+        field.setAccessible(true);
+        ((AtomicReference<String>) field.get(service)).set(value);
     }
 
     private static String uiBatchEnvelopeJsonGex(FeedGatewayService service, List<String> gexByStrike) throws Exception {
