@@ -57,6 +57,28 @@ public final class WsTicketService {
      */
     public TicketIssued issue(String bearerToken, Selection selection) throws JwtVerificationException {
         VerifiedPrincipal principal = verifier.verify(bearerToken);
+        String userId = ensureAppSession(principal, selection);
+        String appSessionId = "app:" + userId;
+        WsTicket ticket = ticketStore.mint(userId, appSessionId, ticketTtl, principal.expiresAt());
+        return new TicketIssued(ticket.ticketId(), appSessionId, ticketTtl.toMillis());
+    }
+
+    /**
+     * The single source of truth for "verified principal → registered AppSession", used by BOTH the
+     * ws-ticket flow ({@link #issue}) AND the {@code oc.bearer} WS handshake (see
+     * {@code WsJwtHandshakeInterceptor} when the routing engine is active). Keeping it in one place
+     * ensures both auth paths enforce identical approval (P0 — a valid token is NOT approval),
+     * app-session-id derivation ({@code "app:" + userId}), entitlement refresh on reconnect, and
+     * selection-revalidation semantics — a divergence here would let one path silently grant access the
+     * other rejects.
+     *
+     * <p>Returns the verified {@code userId} (== JWT subject) so the caller can derive
+     * {@code appSessionId = "app:" + userId} once.
+     *
+     * @throws JwtVerificationException if the token has no usable subject
+     * @throws NotApprovedException     if the authoritative approval record does not grant access
+     */
+    public String ensureAppSession(VerifiedPrincipal principal, Selection selection) throws JwtVerificationException {
         String userId = principal.userId();
         if (userId == null || userId.isBlank()) {
             throw new JwtVerificationException("token has no subject");
@@ -80,8 +102,12 @@ public final class WsTicketService {
             engine.registerAppSession(appSessionId, userId, selection, principal.roles(),
                     ApprovalState.APPROVED, UserSessionPolicy.systemDefault());
         }
-        WsTicket ticket = ticketStore.mint(userId, appSessionId, ticketTtl, principal.expiresAt());
-        return new TicketIssued(ticket.ticketId(), appSessionId, ticketTtl.toMillis());
+        return userId;
+    }
+
+    /** Verify a bearer token without minting a ticket (used by the {@code oc.bearer} handshake path). */
+    public VerifiedPrincipal verify(String bearerToken) throws JwtVerificationException {
+        return verifier.verify(bearerToken);
     }
 
     /** Expose the (possibly newly created) AppSession for callers/tests. */

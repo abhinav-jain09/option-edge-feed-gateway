@@ -44,14 +44,18 @@ public class WebSocketConfig implements WebSocketConfigurer {
         WebSocketHandlerRegistration registration =
                 registry.addHandler(handler, "/ws/events").setAllowedOrigins(origins);
 
-        // Exactly one handshake auth is wired. The two models are mutually exclusive by design:
-        //  - GATEWAY_AUTH_ENABLED=true -> multi-tenant single-use ticket handshake (TicketHandshakeInterceptor)
-        //  - otherwise                 -> the default oc.bearer JWT handshake (WsJwtHandshakeInterceptor,
-        //                                 which itself enforces only when WS_AUTH_ENABLED=true)
+        // DUAL-AUTH (GATEWAY_AUTH_ENABLED=true): BOTH the multi-tenant ticket handshake AND the legacy
+        // {@code oc.bearer} bearer handshake are wired so the same gateway serves both UIs:
+        //   - the existing option-chain web app, which offers {@code ["oc.bearer", <accessToken>]}
+        //   - the multi-tenant replay UI, which offers {@code oe.ticket.<id>}
+        // Order matters: ticket interceptor runs first; it passes through to the JWT interceptor when no
+        // {@code oe.ticket.*} subprotocol is offered. The JWT interceptor then either binds via
+        // WsTicketService.ensureAppSession() (multi-tenant) or validates standalone (legacy).
+        // Legacy single-tenant mode (no GATEWAY_AUTH_ENABLED) wires only the JWT interceptor — the
+        // WsTicketService bean does not exist, so this interceptor has no AppSession to bind.
         if (ticketMode) {
-            // Echo the oe.ticket.<id> subprotocol so the browser can carry the ticket out of the URL.
             registration.setHandshakeHandler(new app.feedgateway.mtsession.gateway.TicketSubProtocolHandshakeHandler());
-            registration.addInterceptors(ticketInterceptor);
+            registration.addInterceptors(ticketInterceptor, jwtInterceptor);
         } else {
             registration.addInterceptors(jwtInterceptor);
         }
