@@ -18,7 +18,21 @@ pipeline {
           def p = oeProfile(params.ENVIRONMENT)
           env.IMAGE_REGISTRY = params.IMAGE_REGISTRY?.trim() ? params.IMAGE_REGISTRY : p.registry
           env.BUILD_PLATFORM = params.BUILD_PLATFORM?.trim() ? params.BUILD_PLATFORM : p.platform
-          echo "resolved (env=${params.ENVIRONMENT}): registry=${env.IMAGE_REGISTRY} platform=${env.BUILD_PLATFORM}"
+          // Build the set of plain-http registries from EVERY profile (not a hardcoded
+          // list of env names — so adding a new profile auto-extends this), normalize
+          // for robust matching (strip scheme + trailing slash + lowercase), and add
+          // dev-registry loopback aliases. The Image stage writes a buildkit insecure-
+          // registry config for the EFFECTIVE IMAGE_REGISTRY iff its normalized form is
+          // in this set (so prod pushes work via http, not just dev).
+          def normalize = { String r ->
+            r?.toString()?.trim()?.toLowerCase()?.replaceFirst(/^https?:\/\//, '')?.replaceFirst(/\/+$/, '')
+          }
+          def knownEnvs = ['dev', 'production']
+          def insecure = knownEnvs.findAll { oeProfile(it).insecureRegistry }
+                                  .collect { normalize(oeProfile(it).registry) }
+          insecure += ['localhost:5001', '127.0.0.1:5001']   // loopback aliases of the dev registry
+          env.INSECURE_REGISTRIES = insecure.unique().findAll { it }.join(' ')
+          echo "resolved (env=${params.ENVIRONMENT}): registry=${env.IMAGE_REGISTRY} platform=${env.BUILD_PLATFORM} insecureRegistries='${env.INSECURE_REGISTRIES}'"
         }
       }
     }
@@ -99,17 +113,30 @@ pipeline {
           DEV_IMAGE="$IMAGE_REGISTRY/options-edge-feed-gateway:$DEV_TAG"
           BUILDER_NAME="options-edge-feed-gateway-${BUILD_NUMBER:-local}"
           BUILDKITD_CONFIG="$(mktemp)"
-          cat > "$BUILDKITD_CONFIG" <<'EOF'
-[registry."host.docker.internal:5001"]
-  http = true
-  insecure = true
-[registry."localhost:5001"]
-  http = true
-  insecure = true
-[registry."127.0.0.1:5001"]
+          # Write a buildkit insecure-registry entry for the EFFECTIVE registry iff it
+          # (normalized: scheme stripped, trailing slash stripped, lowercased) matches
+          # any entry in $INSECURE_REGISTRIES (derived from oeProfile in Resolve profile,
+          # normalized the same way). Without this, prod pushes via docker buildx fail
+          # with 'http: server gave HTTP response to HTTPS client'.
+          normalize() {
+            printf '%s' "$1" | tr 'A-Z' 'a-z' \
+              | sed -e 's#^http://##' -e 's#^https://##' \
+              | sed -e 's#/*$##'
+          }
+          effective_norm=$(normalize "$IMAGE_REGISTRY")
+          registry_insecure=false
+          for r in $INSECURE_REGISTRIES; do
+            if [ "$effective_norm" = "$(normalize "$r")" ]; then registry_insecure=true; break; fi
+          done
+          if [ "$registry_insecure" = "true" ]; then
+            cat > "$BUILDKITD_CONFIG" <<EOF
+[registry."$IMAGE_REGISTRY"]
   http = true
   insecure = true
 EOF
+          else
+            : > "$BUILDKITD_CONFIG"
+          fi
           docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
           docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" --use >/dev/null
           cleanup() {
