@@ -1,8 +1,0 @@
-# Intentional, documented exceptions to enforce-deploy-policy.sh.
-# Each entry is the EXACT trimmed line from the Jenkinsfile that the guard flagged;
-# the guard uses literal whole-line match (grep -qxF), not regex.
-
-# buildkit insecure-registry daemon config: must name the local dev registry literally
-# so buildx can push over plain http. Build-tool requirement, not a deploy-target hardcode
-# (the actual push target IS derived from oeProfile).
-[registry."host.docker.internal:5001"]
