@@ -67,9 +67,18 @@ class FeedGatewayServiceTest {
         assertTrue(readyIdx > 0, "markSelectionReady must broadcast source-ready");
         int repushIdx = source.indexOf("broadcastCachedState(sourceSwitchReplayEvents());", readyIdx);
         assertTrue(repushIdx > readyIdx, "convergence cached re-push must come AFTER source-ready");
-        // Selection-token guard inside markSelectionReady.
-        assertTrue(source.contains("!selectionKey(current).equals(selectionKey(selection))"),
-                "markSelectionReady must guard against a superseded selection");
+        // Readiness commit is atomic under readyLock with a LIVE active-selection re-check (no superseded
+        // selection can announce/converge) and a one-shot per selection key.
+        assertTrue(source.contains("synchronized (readyLock)"),
+                "markSelectionReady must commit readiness atomically under readyLock");
+        assertTrue(source.contains("!key.equals(selectionKey(activeSelection.get()))"),
+                "markSelectionReady must re-validate against the live active selection");
+        // Forward decision uses a selection captured ONCE per record (no mid-record activeSelection re-read).
+        assertTrue(source.contains("recordSelectedForward(binding, json, decided)"),
+                "forward path must carry the decided selection into recordSelectedForward");
+        assertTrue(source.contains("shouldForward(binding, json, record, ActiveSelection selection)")
+                        || source.contains("ConsumerRecord<?, ?> record, ActiveSelection selection)"),
+                "shouldForward must have a selection-carrying overload");
         // Cache-arrival trigger: a cached-but-not-forwarded snapshot for the active selection still converges
         // (covers the closed-market case where the seed snapshot arrives already older than maxStaleMs).
         assertTrue(source.contains("matchesActiveSelection(json, current)"),

@@ -1018,10 +1018,11 @@ public class FeedGatewayService implements ReplayRunner {
                 for (ConsumerRecord<String, String> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = binding == null ? null : enrichJson(record.value(), binding);
-                    if (json != null && !json.isBlank() && (perSessionRouting() || shouldForward(binding, json, record))) {
+                    ActiveSelection decided = activeSelection.get();
+                    if (json != null && !json.isBlank() && (perSessionRouting() || shouldForward(binding, json, record, decided))) {
                         routeOrBroadcast(binding.source(), binding.event(), json);
                         forwardedEvents.incrementAndGet();
-                        recordSelectedForward(binding, json);
+                        recordSelectedForward(binding, json, decided);
                     } else {
                         inactiveDroppedEvents.incrementAndGet();
                     }
@@ -1158,6 +1159,8 @@ public class FeedGatewayService implements ReplayRunner {
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
+                    // Selection captured ONCE for this record's forward+readiness decision (legacy mode).
+                    ActiveSelection decided = null;
                     // Per-session mode: route directly via the engine using the authoritative
                     // topic-binding source (bypasses the global single-source/selection/barrier gate;
                     // supports IBKR + Databento users simultaneously). shouldForward gates legacy mode.
@@ -1173,22 +1176,22 @@ public class FeedGatewayService implements ReplayRunner {
                             routeOrBroadcast(binding.source(), binding.event(), json);
                             forwardedEvents.incrementAndGet();
                         }
-                    } else if (cacheKey != null && cacheCaughtUpFlag.get() && shouldForward(binding, json, record)) {
+                    } else if (cacheKey != null && cacheCaughtUpFlag.get()
+                            && shouldForward(binding, json, record, (decided = activeSelection.get()))) {
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
-                        recordSelectedForward(binding, json);
+                        recordSelectedForward(binding, json, decided);
                     } else if (cacheKey != null) {
                         inactiveDroppedEvents.incrementAndGet();
                         // Cache-arrival convergence: a snapshot for the ACTIVE selection was cached but not
                         // live-forwarded (e.g. it arrived already older than maxStaleMs on a closed market
                         // right after the daily roll). Still mark the selection ready so markSelectionReady
-                        // fires its one-shot cached re-push and open dashboards repopulate. The
-                        // matchesActiveSelection guard prevents off-selection data from flipping readiness.
-                        if (cacheCaughtUpFlag.get() && "snapshot".equals(binding.event())) {
-                            ActiveSelection current = activeSelection.get();
-                            if (current != null && matchesActiveSelection(json, current)) {
-                                markSelectionReady(current);
-                            }
+                        // fires its one-shot cached re-push and open dashboards repopulate. matchesActiveSelection
+                        // guards against off-selection data; markSelectionReady re-validates atomically.
+                        ActiveSelection current = activeSelection.get();
+                        if (cacheCaughtUpFlag.get() && "snapshot".equals(binding.event())
+                                && current != null && matchesActiveSelection(json, current)) {
+                            markSelectionReady(current);
                         }
                     }
                 }
@@ -1486,10 +1489,16 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
-        if (binding == null) {
+        return shouldForward(binding, json, record, activeSelection.get());
+    }
+
+    // Overload taking the selection captured ONCE at the record's decision point, so the forward gate,
+    // the forward bookkeeping, and the readiness decision all reason about the SAME selection snapshot
+    // (no mid-record activeSelection re-read race across a roll boundary).
+    private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record, ActiveSelection selection) {
+        if (binding == null || selection == null) {
             return false;
         }
-        ActiveSelection selection = activeSelection.get();
         if ("vix-price".equals(binding.event())) {
             return passesSelectionBarrier(record, selection);
         }
@@ -1511,45 +1520,47 @@ public class FeedGatewayService implements ReplayRunner {
         return matchesActiveSelection(json, selection);
     }
 
-    private void recordSelectedForward(TopicBinding binding, String json) {
-        ActiveSelection selection = activeSelection.get();
-        sourceLastForwardedAt.put(selectionKey(selection), System.currentTimeMillis());
+    // `decided` is the selection captured at the forward decision point and already proven to match the
+    // payload by shouldForward(...). Stamping sourceLastForwardedAt for THAT selection (not a fresh re-read)
+    // means a roll landing here can never record a phantom "recent forward" for the new selection and
+    // wrongly suppress its source-stale.
+    private void recordSelectedForward(TopicBinding binding, String json, ActiveSelection decided) {
+        if (decided == null) {
+            return;
+        }
+        sourceLastForwardedAt.put(selectionKey(decided), System.currentTimeMillis());
         if (!"snapshot".equals(binding.event())) {
             return;
         }
-        // Only mark ready when the forwarded PAYLOAD actually matches the current selection. shouldForward
-        // gated on the selection a moment ago, but a roll can land between that decision and here; without
-        // this re-check a stale old-expiry snapshot could burn the new selection's one-shot before its real
-        // snapshot arrives.
-        if (matchesActiveSelection(json, selection)) {
-            markSelectionReady(selection);
-        }
+        markSelectionReady(decided);
     }
+
+    private final Object readyLock = new Object();
 
     private void markSelectionReady(ActiveSelection selection) {
         if (selection == null) {
             return;
         }
-        // Selection-token guard: a readiness signal can arrive for a selection that has since been
-        // superseded (the forward/cache decision and this call read activeSelection at different
-        // instants). Never announce readiness for — or converge dashboards onto — a stale selection.
-        ActiveSelection current = activeSelection.get();
-        if (current == null || !selectionKey(current).equals(selectionKey(selection))) {
-            return;
-        }
-        // One-shot per DISTINCT selection key, via getAndSet (race-free vs the roll boundary — no reliance
-        // on readySelectionKey being reset to ""). getAndSet returns the prior key; if it differs from this
-        // selection's key, this is the first readiness for the new selection. We do NOT touch
-        // sourceLastForwardedAt here: this method is also reached from the cache-arrival path (a snapshot
-        // that was cached but NOT forwarded), and claiming a "recent forward" there would wrongly suppress
-        // source-stale. The real-forward bookkeeping stays in recordSelectedForward.
         String key = selectionKey(selection);
-        if (!key.equals(readySelectionKey.getAndSet(key))) {
+        // Atomic readiness commit. Under readyLock we (1) re-validate against the LIVE active selection so a
+        // roll since the caller's decision can never announce or converge a superseded selection, and (2)
+        // enforce the one-shot per selection key. The source-ready broadcast + cached convergence re-push
+        // happen inside the lock so no concurrent roll can interleave a stale announcement. We deliberately
+        // do NOT touch sourceLastForwardedAt here — the cache-arrival caller did not forward, and claiming a
+        // recent forward would wrongly suppress source-stale; real-forward bookkeeping lives in
+        // recordSelectedForward.
+        synchronized (readyLock) {
+            if (!key.equals(selectionKey(activeSelection.get()))) {
+                return;
+            }
+            if (key.equals(readySelectionKey.get())) {
+                return;
+            }
+            readySelectionKey.set(key);
             // Announce readiness FIRST, then converge every open dashboard onto the new selection's cached
             // strikes. Without this re-push, a tab that missed the live seed batch right after
             // "source-switching" — e.g. the daily post-close expiry roll, when no further live ticks arrive —
-            // would stay blank until a manual refresh or the next market open. The key-change gate makes this
-            // fire exactly once per selection, so it never spams clients during live market hours.
+            // would stay blank until a manual refresh or the next market open.
             broadcast("source-ready", activeSelectionJson(selection, "source-ready"));
             broadcastCachedState(sourceSwitchReplayEvents());
         }
