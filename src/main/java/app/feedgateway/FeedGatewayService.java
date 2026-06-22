@@ -348,10 +348,17 @@ public class FeedGatewayService implements ReplayRunner {
             return;
         }
         if (avroCaughtUp.get()) {
-            sendCachedState(session, List.of("snapshot", "pace", "directional-pressure"));
+            // max-pain is DATABENTO-only and Avro on the wire, so it bootstraps purely via the Avro consumer.
+            sendCachedState(session, List.of("snapshot", "pace", "directional-pressure", "max-pain"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "volume-sandwich", "gex-by-strike", "max-pain"));
+            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "volume-sandwich"));
+        }
+        // gex-by-strike is the one MULTI-SOURCE cache: IBKR/Unusual-Whales gex arrives via the JSON state
+        // consumer while DATABENTO gex arrives via the Avro consumer. Its cached replay is only complete once
+        // BOTH have caught up, so gate it on both flags (avoids a first-send that omits one source's gex).
+        if (avroCaughtUp.get() && stateCaughtUp.get()) {
+            sendCachedState(session, List.of("gex-by-strike"));
         }
         if (hpsfCaughtUp.get()) {
             sendCachedState(session, List.of(
@@ -855,6 +862,12 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoDisplayTopic(), new TopicBinding("DATABENTO", "snapshot"));
         topicEvents.put(settings.databentoPaceTopic(), new TopicBinding("DATABENTO", "pace"));
         topicEvents.put(settings.databentoDirectionalPressureTopic(), new TopicBinding("DATABENTO", "directional-pressure"));
+        // DATABENTO gex + max-pain are Avro on the wire (Confluent schema-registry framed, like
+        // display/pace), so they MUST be consumed via the Avro deserializer — reading them as JSON yields a
+        // garbled value that is cached under a fallback key but silently dropped on delivery. (IBKR/Unusual-
+        // Whales gex + gex-history stay on the JSON consumer below; those topics are genuinely JSON.)
+        topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
+        topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -866,8 +879,8 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
-        topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
-        topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
+        // NOTE: DATABENTO gex + max-pain are Avro-encoded and consumed by runAvroCacheConsumer (above), NOT
+        // here. Only genuinely-JSON topics belong on this string consumer.
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
@@ -880,6 +893,10 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoDisplayTopic(), new TopicBinding("DATABENTO", "snapshot"));
         topicEvents.put(settings.databentoPaceTopic(), new TopicBinding("DATABENTO", "pace"));
         topicEvents.put(settings.databentoDirectionalPressureTopic(), new TopicBinding("DATABENTO", "directional-pressure"));
+        // DATABENTO gex + max-pain are Avro on the wire — live-consume them via the Avro deserializer too
+        // (mirrors runAvroCacheConsumer; keep the cache + live consumer topic sets symmetric).
+        topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
+        topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -891,8 +908,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
-        topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
-        topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
+        // DATABENTO gex + max-pain are Avro — live-consumed by runAvroLiveConsumer, not here.
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
@@ -1959,7 +1975,12 @@ public class FeedGatewayService implements ReplayRunner {
                 case "gex-by-strike" -> gexByStrike.entrySet().stream()
                         .filter(entry -> isCacheFresh("gex-by-strike:" + entry.getKey(), nowMs))
                         .filter(entry -> passesSelectionBarrier("gex-by-strike:" + entry.getKey(), selection))
-                        .filter(entry -> "IBKR".equals(selection.source()))
+                        // Source-aware (not hard IBKR-only): the gexByStrike cache now holds BOTH IBKR
+                        // (Unusual-Whales, JSON) AND DATABENTO (Avro) entries, source-prefixed in the key.
+                        // matchesCachedSelection enforces (source,symbol,expiry) isolation, so an IBKR
+                        // selection gets IBKR gex and a DATABENTO selection gets DATABENTO gex — the prior
+                        // hard `"IBKR".equals(source)` filter wrongly suppressed DATABENTO gex (which used to
+                        // be garbled-on-the-JSON-consumer and never delivered anyway; it now works via Avro).
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
@@ -2615,9 +2636,12 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.databentoDisplayTopic(), "snapshot");
                 avroTopics.put(settings.databentoPaceTopic(), "pace");
                 avroTopics.put(settings.databentoDirectionalPressureTopic(), "directional-pressure");
+                // DATABENTO gex + max-pain are Avro on the wire — replay them via the Avro reader too, so a
+                // historical replay reproduces them exactly like the live Avro path (keep classification
+                // consistent across cache / live / replay).
+                avroTopics.put(settings.databentoGexTopic(), "gex-by-strike");
+                avroTopics.put(settings.databentoMaxPainTopic(), "max-pain");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
-                stringTopics.put(settings.databentoGexTopic(), "gex-by-strike");
-                stringTopics.put(settings.databentoMaxPainTopic(), "max-pain");
                 stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
             } else {
                 avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
@@ -3565,6 +3589,15 @@ public class FeedGatewayService implements ReplayRunner {
         properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, KafkaAvroDeserializer.class.getName());
         properties.put("schema.registry.url", settings.schemaRegistryUrl());
         properties.put("specific.avro.reader", "false");
+        // Every Avro topic this gateway consumes (display/pace/directional-pressure/gex/max-pain) registers
+        // its schema under a RECORD-NAME subject (e.g. app.options.maxpain.MaxPainSnapshot), NOT the default
+        // <topic>-value. The GenericRecord consume-by-id path resolves the WRITER schema by the message's
+        // embedded schema id (verified: GET /schemas/ids/{id} returns the schema even for a non-existent
+        // subject), so this is belt-and-suspenders rather than strictly required — but setting it makes the
+        // deserializer's derived subject match how these schemas are actually registered, which is the
+        // correct, fail-closed default for the record-name convention used across these topics.
+        properties.put("value.subject.name.strategy",
+                "io.confluent.kafka.serializers.subject.RecordNameStrategy");
         return properties;
     }
 

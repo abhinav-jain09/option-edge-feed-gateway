@@ -393,6 +393,99 @@ class FeedGatewayServiceTest {
         assertFalse(shouldForward(service, topicBinding("DATABENTO", "gex-by-strike"), payload, record));
     }
 
+    // ---- DATABENTO gex + max-pain are Avro on the wire: must be consumed via the Avro path, not JSON ----
+
+    @Test
+    void databentoGexAndMaxPainAreClassifiedAsAvroNotJsonAcrossCacheLiveAndReplay() throws Exception {
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        String gexBinding = "topicEvents.put(settings.databentoGexTopic(), new TopicBinding(\"DATABENTO\", \"gex-by-strike\"));";
+        String maxPainBinding = "topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding(\"DATABENTO\", \"max-pain\"));";
+
+        // Avro CACHE + LIVE consumers MUST bind both DATABENTO gex and max-pain (Avro deserialization).
+        for (String method : List.of("runAvroCacheConsumer", "runAvroLiveConsumer")) {
+            String body = methodBody(source, method);
+            assertTrue(body.contains(gexBinding), method + " must bind DATABENTO gex (Avro)");
+            assertTrue(body.contains(maxPainBinding), method + " must bind DATABENTO max-pain (Avro)");
+        }
+        // JSON/string consumers MUST NOT bind them (reading Avro as JSON garbles the value), but must keep
+        // the genuinely-JSON strike-flow.
+        for (String method : List.of("runJsonStateCacheConsumer", "runJsonStateLiveConsumer")) {
+            String body = methodBody(source, method);
+            assertFalse(body.contains(gexBinding), method + " must NOT bind DATABENTO gex on the JSON consumer");
+            assertFalse(body.contains(maxPainBinding), method + " must NOT bind DATABENTO max-pain on the JSON consumer");
+            assertTrue(body.contains("databentoStrikeFlowTopic()"), method + " keeps the JSON strike-flow binding");
+        }
+        // Replay classification must match: DATABENTO gex + max-pain in avroTopics, NOT stringTopics.
+        assertTrue(source.contains("avroTopics.put(settings.databentoGexTopic(), \"gex-by-strike\");"));
+        assertTrue(source.contains("avroTopics.put(settings.databentoMaxPainTopic(), \"max-pain\");"));
+        assertFalse(source.contains("stringTopics.put(settings.databentoGexTopic(), \"gex-by-strike\");"));
+        assertFalse(source.contains("stringTopics.put(settings.databentoMaxPainTopic(), \"max-pain\");"));
+        // Legacy caught-up gating: max-pain (DATABENTO-only Avro) under avroCaughtUp; gex-by-strike
+        // (multi-source) under BOTH flags.
+        assertTrue(source.contains(
+                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"directional-pressure\", \"max-pain\"));"));
+        assertTrue(source.contains("if (avroCaughtUp.get() && stateCaughtUp.get()) {"));
+        // gex legacy cached replay is source-aware (no hard IBKR-only filter).
+        assertFalse(source.contains(".filter(entry -> \"IBKR\".equals(selection.source()))"));
+        // The Avro consumer uses RecordNameStrategy for the record-name subjects these schemas register under.
+        assertTrue(source.contains(
+                "io.confluent.kafka.serializers.subject.RecordNameStrategy"));
+    }
+
+    @Test
+    void avroMaxPainRecordIsDeserializedCachedAndDeliverable() throws Exception {
+        // Behavioral coverage (Codex NIT): a real Avro GenericRecord for the max-pain schema must convert
+        // to JSON (avroJson), cache under DATABENTO|symbol|expiry (maxPainCacheKey), and be a valid
+        // routable/deliverable max-pain (status read by isMaxPainExpired). This is the path that was
+        // silently dropped when max-pain was read as a String.
+        org.apache.avro.Schema schema = org.apache.avro.SchemaBuilder.record("MaxPainSnapshot")
+                .namespace("app.options.maxpain").fields()
+                .name("messageType").type().stringType().noDefault()
+                .name("source").type().stringType().noDefault()
+                .name("symbol").type().stringType().noDefault()
+                .name("expiry").type().stringType().noDefault()
+                .name("status").type().stringType().noDefault()
+                .name("maxPainStrike").type().doubleType().noDefault()
+                .endRecord();
+        org.apache.avro.generic.GenericRecord rec = new org.apache.avro.generic.GenericData.Record(schema);
+        rec.put("messageType", "MAX_PAIN");
+        rec.put("source", "DATABENTO");
+        rec.put("symbol", "SPX");
+        rec.put("expiry", "20260622");
+        rec.put("status", "VALID");
+        rec.put("maxPainStrike", 4500.0);
+
+        FeedGatewayService service = service();
+        String json = avroJson(service, rec);
+        assertTrue(json.contains("\"maxPainStrike\":4500"), "avroJson must preserve maxPainStrike numerically");
+        assertEquals("SPX|20260622", maxPainCacheKey(service, json, "fallback"),
+                "avro->json max-pain must key by symbol|expiry");
+        assertFalse(isMaxPainExpired(service, json), "VALID status must not be terminal");
+
+        // And it caches + delivers via the same updateCache the Avro consumer uses (cacheKey non-null).
+        String key = updateCache(service, topicBinding("DATABENTO", "max-pain"),
+                new ConsumerRecord<>(new GatewaySettings().databentoMaxPainTopic(), 0, 1L, "SPX|20260622", json),
+                json);
+        assertEquals("DATABENTO|SPX|20260622", key);
+        assertTrue(service.healthJson().contains("\"maxPain\":1"));
+    }
+
+    private static String avroJson(FeedGatewayService service, Object genericRecord) throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod("avroJson", Object.class);
+        m.setAccessible(true);
+        return (String) m.invoke(service, genericRecord);
+    }
+
+    /** The body of a no-arg private method, from its signature to the start of the next private method. */
+    private static String methodBody(String source, String methodName) {
+        int start = source.indexOf("private void " + methodName + "()");
+        if (start < 0) {
+            throw new IllegalArgumentException("method not found: " + methodName);
+        }
+        int next = source.indexOf("\n    private ", start + 1);
+        return next < 0 ? source.substring(start) : source.substring(start, next);
+    }
+
     // ---- Max-pain last-value-wins: a slow daily-OI signal must not use the generic 15-min freshness ----
 
     @Test
