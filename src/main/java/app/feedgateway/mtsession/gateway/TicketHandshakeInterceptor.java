@@ -36,6 +36,14 @@ public final class TicketHandshakeInterceptor implements HandshakeInterceptor {
     public boolean beforeHandshake(ServerHttpRequest request, ServerHttpResponse response,
                                    WebSocketHandler wsHandler, Map<String, Object> attributes) {
         String ticket = extractTicket(request);
+        // Dual-auth passthrough: when no `oe.ticket.*` subprotocol is offered the request is the legacy
+        // `oc.bearer` bearer flow — this interceptor must NOT reject it. We return true with no attributes
+        // bound; the chained {@link app.feedgateway.WsJwtHandshakeInterceptor} runs next and either accepts
+        // the bearer (binding AppSession via WsTicketService.ensureAppSession) or rejects with 401. Without
+        // this passthrough every bearer-only client would be 401'd at the ticket stage in GATEWAY_AUTH mode.
+        if (ticket == null && authEnabled) {
+            return true;
+        }
         HandshakeTicketAuthenticator.Decision d = authenticator.authenticate(authEnabled, ticket);
         if (!d.accept()) {
             response.setStatusCode(HttpStatus.UNAUTHORIZED);

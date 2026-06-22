@@ -71,16 +71,20 @@ class TicketHandshakeInterceptorTest {
     }
 
     @Test
-    void missingTicketIsRejectedWith401() {
+    void noTicketSubprotocolPassesThroughForBearerInterceptor() {
+        // Dual-auth: when no `oe.ticket.*` subprotocol is offered, the request is a legacy `oc.bearer`
+        // bearer-flow handshake. The ticket interceptor must NOT reject it — it returns true with no
+        // attributes bound so the chained WsJwtHandshakeInterceptor runs next and decides 200/401. The
+        // ticket interceptor is no longer the sole 401 gate when auth is on.
         TicketHandshakeInterceptor interceptor = new TicketHandshakeInterceptor(authenticator, true);
         ServerHttpResponse resp = mock(ServerHttpResponse.class);
         Map<String, Object> attrs = new HashMap<>();
 
         boolean ok = interceptor.beforeHandshake(requestWithTicket(null), resp, mock(WebSocketHandler.class), attrs);
 
-        assertFalse(ok);
-        verify(resp).setStatusCode(HttpStatus.UNAUTHORIZED);
-        assertTrue(attrs.isEmpty());
+        assertTrue(ok, "no ticket subprotocol → passthrough (bearer interceptor decides)");
+        assertTrue(attrs.isEmpty(), "passthrough must not bind any AppSession attrs");
+        org.mockito.Mockito.verifyNoInteractions(resp);
     }
 
     @Test
