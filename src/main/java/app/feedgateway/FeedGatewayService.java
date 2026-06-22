@@ -1411,7 +1411,10 @@ public class FeedGatewayService implements ReplayRunner {
             return;
         }
         offsetBarriers.set(captureOffsetBarriers(next));
-        readySelectionKey.set("");
+        // NOTE: readySelectionKey is intentionally NOT reset here. markSelectionReady detects a NEW
+        // selection by key change (getAndSet), so resetting to "" is unnecessary and previously opened a
+        // race: a consumer could mark the OLD selection ready in the window between the reset and the
+        // activeSelection swap, burning the new selection's one-shot before it became active.
         activeSelection.set(next);
         synchronized (batchLock) {
             clearPendingLocked();
@@ -1514,7 +1517,13 @@ public class FeedGatewayService implements ReplayRunner {
         if (!"snapshot".equals(binding.event())) {
             return;
         }
-        markSelectionReady(selection);
+        // Only mark ready when the forwarded PAYLOAD actually matches the current selection. shouldForward
+        // gated on the selection a moment ago, but a roll can land between that decision and here; without
+        // this re-check a stale old-expiry snapshot could burn the new selection's one-shot before its real
+        // snapshot arrives.
+        if (matchesActiveSelection(json, selection)) {
+            markSelectionReady(selection);
+        }
     }
 
     private void markSelectionReady(ActiveSelection selection) {
@@ -1528,15 +1537,19 @@ public class FeedGatewayService implements ReplayRunner {
         if (current == null || !selectionKey(current).equals(selectionKey(selection))) {
             return;
         }
+        // One-shot per DISTINCT selection key, via getAndSet (race-free vs the roll boundary — no reliance
+        // on readySelectionKey being reset to ""). getAndSet returns the prior key; if it differs from this
+        // selection's key, this is the first readiness for the new selection. We do NOT touch
+        // sourceLastForwardedAt here: this method is also reached from the cache-arrival path (a snapshot
+        // that was cached but NOT forwarded), and claiming a "recent forward" there would wrongly suppress
+        // source-stale. The real-forward bookkeeping stays in recordSelectedForward.
         String key = selectionKey(selection);
-        sourceLastForwardedAt.put(key, System.currentTimeMillis());
-        if (readySelectionKey.compareAndSet("", key) || readySelectionKey.compareAndSet(null, key)) {
-            // One-shot per selection (readySelectionKey is reset to "" by applySelection on every roll):
-            // announce readiness FIRST, then converge every open dashboard onto the new selection's cached
+        if (!key.equals(readySelectionKey.getAndSet(key))) {
+            // Announce readiness FIRST, then converge every open dashboard onto the new selection's cached
             // strikes. Without this re-push, a tab that missed the live seed batch right after
             // "source-switching" — e.g. the daily post-close expiry roll, when no further live ticks arrive —
-            // would stay blank until a manual refresh or the next market open. The CAS makes this fire exactly
-            // once per selection, so it never spams clients during live market hours.
+            // would stay blank until a manual refresh or the next market open. The key-change gate makes this
+            // fire exactly once per selection, so it never spams clients during live market hours.
             broadcast("source-ready", activeSelectionJson(selection, "source-ready"));
             broadcastCachedState(sourceSwitchReplayEvents());
         }
