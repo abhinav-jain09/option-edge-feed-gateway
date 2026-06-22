@@ -1374,9 +1374,14 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
         if (caughtUpFlag.compareAndSet(false, true)) {
+            // Capture the selection ONCE, before the replay, so a roll landing between here and the
+            // readiness call cannot mark the NEW selection ready off the OLD selection's cached state.
+            // markSelectionReady re-validates against the live selection under readyLock and rejects a
+            // mismatch.
+            ActiveSelection selection = activeSelection.get();
             broadcast("status", statusJson());
             if (broadcastCachedState(events)) {
-                markSelectionReady(activeSelection.get());
+                markSelectionReady(selection);
             }
             System.out.println("Feed gateway " + name + " cache caught up; replayed cached state to clients.");
         }
@@ -1409,25 +1414,33 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void applySelection(ActiveSelection next) {
-        ActiveSelection previous = activeSelection.get();
-        if (!next.newerThan(previous)) {
-            return;
-        }
-        offsetBarriers.set(captureOffsetBarriers(next));
-        // NOTE: readySelectionKey is intentionally NOT reset here. markSelectionReady detects a NEW
-        // selection by key change (getAndSet), so resetting to "" is unnecessary and previously opened a
-        // race: a consumer could mark the OLD selection ready in the window between the reset and the
-        // activeSelection swap, burning the new selection's one-shot before it became active.
-        activeSelection.set(next);
-        synchronized (batchLock) {
-            clearPendingLocked();
-        }
-        String resetJson = activeSelectionJson(next);
-        broadcast("reset", resetJson);
-        broadcast("source-switching", activeSelectionJson(next, "source-switching"));
-        broadcast("status", statusJson());
-        if (broadcastCachedState(sourceSwitchReplayEvents())) {
-            markSelectionReady(next);
+        // The whole roll lifecycle — active swap, reset/source-switching broadcasts, switch-time cached
+        // replay, and readiness — runs under readyLock so it is atomic against any concurrent
+        // markSelectionReady from a consumer thread. A consumer can therefore never observe a half-rolled
+        // state (new activeSelection but old readiness, or vice versa). markSelectionReady itself locks
+        // readyLock (reentrant on this thread). Lock order is always readyLock -> {batchLock, this}, never
+        // the inverse, so there is no deadlock. Rolls are rare, so the wider critical section is cheap.
+        synchronized (readyLock) {
+            ActiveSelection previous = activeSelection.get();
+            if (!next.newerThan(previous)) {
+                return;
+            }
+            offsetBarriers.set(captureOffsetBarriers(next));
+            // NOTE: readySelectionKey is intentionally NOT reset here. markSelectionReady detects a NEW
+            // selection by key change, so resetting to "" is unnecessary and previously opened a race:
+            // a consumer could mark the OLD selection ready in the window between the reset and the
+            // activeSelection swap, burning the new selection's one-shot before it became active.
+            activeSelection.set(next);
+            synchronized (batchLock) {
+                clearPendingLocked();
+            }
+            String resetJson = activeSelectionJson(next);
+            broadcast("reset", resetJson);
+            broadcast("source-switching", activeSelectionJson(next, "source-switching"));
+            broadcast("status", statusJson());
+            if (broadcastCachedState(sourceSwitchReplayEvents())) {
+                markSelectionReady(next);
+            }
         }
         System.out.println("Feed gateway selected market data source " + next.source()
                 + " " + next.symbol() + " " + next.expiry()
