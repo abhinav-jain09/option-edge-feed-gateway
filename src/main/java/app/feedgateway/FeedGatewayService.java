@@ -102,6 +102,7 @@ public class FeedGatewayService implements ReplayRunner {
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
             "snapshot", "pace", "directional-pressure", "strike-flow", "volume-sandwich", "gex-by-strike",
+            "max-pain",
             "index-price", "vix-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
     private final SessionRoutingEngine routingEngine;
@@ -116,6 +117,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> vixPrices = new ConcurrentHashMap<>();
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
+    private final Map<String, String> maxPain = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfLatestSignals = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfMarketFlows = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfTopCandidates = new ConcurrentHashMap<>();
@@ -134,6 +136,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingIndexPrices = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
+    private final Map<String, String> pendingMaxPain = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfLatestSignals = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfMarketFlows = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfTopCandidates = new LinkedHashMap<>();
@@ -348,7 +351,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "directional-pressure"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "volume-sandwich", "gex-by-strike"));
+            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "volume-sandwich", "gex-by-strike", "max-pain"));
         }
         if (hpsfCaughtUp.get()) {
             sendCachedState(session, List.of(
@@ -638,6 +641,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"vixPrices\":" + vixPrices.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
+                + "\"maxPain\":" + maxPain.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
                 + "\"hpsfMarketFlows\":" + hpsfMarketFlows.size() + ","
                 + "\"hpsfTopCandidates\":" + hpsfTopCandidates.size() + ","
@@ -721,6 +725,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_gex_by_strike Cached Unusual Whales GEX strike count.\n"
                 + "# TYPE options_edge_feed_gateway_gex_by_strike gauge\n"
                 + "options_edge_feed_gateway_gex_by_strike " + gexByStrike.size() + "\n"
+                + "# HELP options_edge_feed_gateway_max_pain Cached per-(symbol,expiry) max-pain count.\n"
+                + "# TYPE options_edge_feed_gateway_max_pain gauge\n"
+                + "options_edge_feed_gateway_max_pain " + maxPain.size() + "\n"
                 + "# HELP options_edge_feed_gateway_hpsf_latest_signals Cached HPSF latest-signal view count.\n"
                 + "# TYPE options_edge_feed_gateway_hpsf_latest_signals gauge\n"
                 + "options_edge_feed_gateway_hpsf_latest_signals " + hpsfLatestSignals.size() + "\n"
@@ -860,6 +867,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
+        topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
@@ -884,6 +892,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
+        topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
@@ -1388,6 +1397,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.databentoEsTradesTopic(),
                     settings.databentoStrikeFlowTopic(),
                     settings.databentoGexTopic(),
+                    settings.databentoMaxPainTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic()
             );
@@ -1396,7 +1406,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     static List<String> sourceSwitchReplayEvents() {
-        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "volume-sandwich", "gex-by-strike");
+        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "volume-sandwich", "gex-by-strike", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -1413,7 +1423,12 @@ public class FeedGatewayService implements ReplayRunner {
         if (!binding.source().equals(selection.source())) {
             return false;
         }
-        if (!passesSelectionBarrier(record, selection)) {
+        // Terminal max-pain: bypass the selection-barrier so the EXPIRED transition is forwarded ONCE
+        // even when the producer's Kafka timestamp predates the current source-switch barrier. The
+        // selection-match check below still applies, so a terminal for a different (symbol, expiry)
+        // does NOT leak to the active selection.
+        boolean isTerminalMaxPain = "max-pain".equals(binding.event()) && isMaxPainExpired(json);
+        if (!isTerminalMaxPain && !passesSelectionBarrier(record, selection)) {
             reportSourceStale(selection, "switch-barrier");
             return false;
         }
@@ -1552,6 +1567,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = strikeFlowCacheKey(json, key);
         } else if ("gex-by-strike".equals(event)) {
             key = gexCacheKey(json, key);
+        } else if ("max-pain".equals(event)) {
+            key = maxPainCacheKey(json, key);
         }
         if (!"pace".equals(event)) {
             key = binding.source() + "|" + key;
@@ -1559,7 +1576,12 @@ public class FeedGatewayService implements ReplayRunner {
         String versionKey = event + ":" + key;
         long eventTime = cacheTimestamp(record);
         Long previousEventTime = cacheEventTimes.get(versionKey);
-        if (previousEventTime != null && previousEventTime > eventTime) {
+        // Terminal max-pain MUST always reach the EXPIRED branch (eviction + return key for the
+        // one-time live forward) regardless of timestamp ordering. Without this, an EXPIRED record
+        // with an older Kafka timestamp would be silently dropped before the UI sees the transition.
+        boolean isTerminalMaxPainShortCircuitBypass = "max-pain".equals(event) && isMaxPainExpired(json);
+        if (!isTerminalMaxPainShortCircuitBypass
+                && previousEventTime != null && previousEventTime > eventTime) {
             return null;
         }
         if ("gex-by-strike".equals(event)
@@ -1569,7 +1591,12 @@ public class FeedGatewayService implements ReplayRunner {
                 && !hasGexHistory(json)) {
             return null;
         }
-        if (isExpired(eventTime, System.currentTimeMillis())) {
+        // Terminal max-pain bypasses the generic stale-eviction so the EXPIRED transition still forwards
+        // ONCE even when the Kafka record timestamp is older than the freshness window. The downstream
+        // case "max-pain" branch handles eviction + cache prune itself; we just must not short-circuit
+        // to null here on the staleness check (which would swallow the terminal entirely).
+        boolean isTerminalMaxPain = "max-pain".equals(event) && isMaxPainExpired(json);
+        if (!isTerminalMaxPain && isExpired(eventTime, System.currentTimeMillis())) {
             removeCacheEntry(versionKey);
             return null;
         }
@@ -1620,6 +1647,21 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gexByStrike.put(key, json);
+                return key;
+            }
+            case "max-pain" -> {
+                // EXPIRED terminal records evict the cache entry instead of caching them — a stale
+                // terminal must NEVER be replayed to a freshly-connected client. The live forward of
+                // this single EXPIRED record to currently-connected matching clients still happens
+                // via the normal forward path; only the cache is pruned.
+                if (isMaxPainExpired(json)) {
+                    removeCacheEntry(versionKey);
+                    maxPain.remove(key);
+                    return key;       // still forward this terminal once to live clients
+                }
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                maxPain.put(key, json);
                 return key;
             }
             default -> {
@@ -1871,6 +1913,15 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "max-pain" -> maxPain.entrySet().stream()
+                        // DATABENTO-only stream: IBKR-selected sessions never receive max pain.
+                        .filter(entry -> isCacheFresh("max-pain:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("max-pain:" + entry.getKey(), selection))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("max-pain", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "hpsf-latest-signal" -> hpsfLatestSignals.entrySet().stream()
                         .filter(entry -> isCacheFresh("hpsf-latest-signal:" + entry.getKey(), nowMs))
                         .sorted(Map.Entry.comparingByKey())
@@ -1998,6 +2049,8 @@ public class FeedGatewayService implements ReplayRunner {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
+        } else if (versionKey.startsWith("max-pain:")) {
+            maxPain.remove(versionKey.substring("max-pain:".length()));
         } else if (versionKey.startsWith("hpsf-latest-signal:")) {
             hpsfLatestSignals.remove(versionKey.substring("hpsf-latest-signal:".length()));
         } else if (versionKey.startsWith("hpsf-market-flow:")) {
@@ -2074,6 +2127,44 @@ public class FeedGatewayService implements ReplayRunner {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
         }
         return fallback;
+    }
+
+    /**
+     * Cache key for the per-(symbol,expiry) max-pain stream. The producer key is already
+     * {@code symbol|expiry}, but we re-derive it from payload identity to be robust against
+     * producer-side key drift. Source is prepended by updateCache so the resulting cache key matches
+     * the UI contract (DATABENTO|symbol|expiry).
+     */
+    private String maxPainCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            if (!symbol.isBlank() && !expiry.isBlank()) {
+                return symbol + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    /**
+     * Whether a max-pain payload carries the terminal EXPIRED status. Terminal records evict the cache
+     * so a freshly-connected client never receives a stale terminal; the gateway still forwards a
+     * single EXPIRED to currently-connected matching clients so the UI can transition cleanly.
+     * Defensive: a malformed payload returns {@code false} (treat as non-terminal — harmless).
+     */
+    private boolean isMaxPainExpired(String json) {
+        if (json == null || json.isBlank()) {
+            return false;
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            return "EXPIRED".equals(text(root, "status"));
+        } catch (JsonProcessingException ignored) {
+            return false;
+        }
     }
 
     String indexPriceCacheKey(String json, String fallback) {
@@ -2202,6 +2293,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
         replayCacheMap(session, "gex-by-strike", gexByStrike);
+        replayCacheMap(session, "max-pain", maxPain);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
         // as index-price — so a VIX record is never delivered mislabelled as index-price.
         replayCacheMap(session, "vix-price", vixPrices);
@@ -2441,6 +2533,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.databentoDirectionalPressureTopic(), "directional-pressure");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoGexTopic(), "gex-by-strike");
+                stringTopics.put(settings.databentoMaxPainTopic(), "max-pain");
                 stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
             } else {
                 avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
@@ -3137,6 +3230,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "vix-price", "index-price" -> pendingIndexPrices;
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
+            case "max-pain" -> pendingMaxPain;
             case "hpsf-latest-signal" -> pendingHpsfLatestSignals;
             case "hpsf-market-flow" -> pendingHpsfMarketFlows;
             case "hpsf-top-candidates" -> pendingHpsfTopCandidates;
@@ -3174,6 +3268,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingIndexPrices.values()),
                         new ArrayList<>(pendingVolumeSandwiches.values()),
                         new ArrayList<>(pendingGexByStrike.values()),
+                        new ArrayList<>(pendingMaxPain.values()),
                         new ArrayList<>(pendingHpsfLatestSignals.values()),
                         new ArrayList<>(pendingHpsfMarketFlows.values()),
                         new ArrayList<>(pendingHpsfTopCandidates.values()),
@@ -3208,6 +3303,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingIndexPrices.size()
                 + pendingVolumeSandwiches.size()
                 + pendingGexByStrike.size()
+                + pendingMaxPain.size()
                 + pendingHpsfLatestSignals.size()
                 + pendingHpsfMarketFlows.size()
                 + pendingHpsfTopCandidates.size()
@@ -3223,6 +3319,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingIndexPrices.clear();
         pendingVolumeSandwiches.clear();
         pendingGexByStrike.clear();
+        pendingMaxPain.clear();
         pendingHpsfLatestSignals.clear();
         pendingHpsfMarketFlows.clear();
         pendingHpsfTopCandidates.clear();
@@ -3243,6 +3340,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> indexPriceJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
+        List<String> maxPainJsons = new ArrayList<>();
         List<String> hpsfLatestSignalJsons = new ArrayList<>();
         List<String> hpsfMarketFlowJsons = new ArrayList<>();
         List<String> hpsfTopCandidatesJsons = new ArrayList<>();
@@ -3257,6 +3355,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "vix-price", "index-price" -> indexPriceJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
+                case "max-pain" -> maxPainJsons.add(cachedEvent.json());
                 case "hpsf-latest-signal" -> hpsfLatestSignalJsons.add(cachedEvent.json());
                 case "hpsf-market-flow" -> hpsfMarketFlowJsons.add(cachedEvent.json());
                 case "hpsf-top-candidates" -> hpsfTopCandidatesJsons.add(cachedEvent.json());
@@ -3275,6 +3374,7 @@ public class FeedGatewayService implements ReplayRunner {
                 indexPriceJsons,
                 volumeSandwichJsons,
                 gexByStrikeJsons,
+                maxPainJsons,
                 hpsfLatestSignalJsons,
                 hpsfMarketFlowJsons,
                 hpsfTopCandidatesJsons,
@@ -3291,6 +3391,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> indexPriceJsons,
             List<String> volumeSandwichJsons,
             List<String> gexByStrikeJsons,
+            List<String> maxPainJsons,
             List<String> hpsfLatestSignalJsons,
             List<String> hpsfMarketFlowJsons,
             List<String> hpsfTopCandidatesJsons,
@@ -3314,6 +3415,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"indexPrices\":" + jsonArray(indexPriceJsons) + ","
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
+                + "\"maxPains\":" + jsonArray(maxPainJsons) + ","
                 + "\"hpsfLatestSignals\":" + jsonArray(hpsfLatestSignalJsons) + ","
                 + "\"hpsfMarketFlows\":" + jsonArray(hpsfMarketFlowJsons) + ","
                 + "\"hpsfTopCandidates\":" + jsonArray(hpsfTopCandidatesJsons) + ","
@@ -3348,6 +3450,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
+                + "\"maxPain\":" + maxPain.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
                 + "\"hpsfMarketFlows\":" + hpsfMarketFlows.size() + ","
                 + "\"hpsfTopCandidates\":" + hpsfTopCandidates.size() + ","

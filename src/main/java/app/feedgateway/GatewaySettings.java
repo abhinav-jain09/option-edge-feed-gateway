@@ -222,6 +222,11 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_GEX_TOPIC", "options.databento.gex.strike");
     }
 
+    /** Databento per-(symbol,expiry) max-pain output topic. Independent of GEX; consumed only by the max-pain stream. */
+    public String databentoMaxPainTopic() {
+        return value("KAFKA_DATABENTO_MAXPAIN_TOPIC", "options.databento.maxpain");
+    }
+
     public String hpsfLatestSignalTopic() {
         return value("KAFKA_HPSF_LATEST_SIGNAL_TOPIC", "options.hpsf.latest-signal");
     }

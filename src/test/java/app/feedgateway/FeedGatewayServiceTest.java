@@ -22,7 +22,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "volume-sandwich", "gex-by-strike"),
+                List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "volume-sandwich", "gex-by-strike", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -30,6 +30,47 @@ class FeedGatewayServiceTest {
     @Test
     void databentoGexTopicHasExpectedDefault() {
         assertEquals("options.databento.gex.strike", new GatewaySettings().databentoGexTopic());
+    }
+
+    @Test
+    void databentoMaxPainTopicHasExpectedDefault() {
+        assertEquals("options.databento.maxpain", new GatewaySettings().databentoMaxPainTopic());
+    }
+
+    @Test
+    void maxPainCacheKeyDerivesFromPayloadSymbolAndExpiry() throws Exception {
+        FeedGatewayService service = service();
+        String json = "{\"symbol\":\"spx\",\"expiry\":\"2026-07-10\",\"status\":\"VALID\"}";
+        assertEquals("SPX|20260710", maxPainCacheKey(service, json, "fallback"));
+        // Missing symbol -> fallback
+        assertEquals("fallback", maxPainCacheKey(service, "{\"expiry\":\"20260710\"}", "fallback"));
+        // Non-JSON -> fallback (defensive; never throws)
+        assertEquals("fallback", maxPainCacheKey(service, "not-json", "fallback"));
+    }
+
+    @Test
+    void isMaxPainExpiredReturnsTrueOnlyForTerminalStatus() throws Exception {
+        FeedGatewayService service = service();
+        assertTrue(isMaxPainExpired(service, "{\"status\":\"EXPIRED\"}"));
+        assertFalse(isMaxPainExpired(service, "{\"status\":\"VALID\"}"));
+        assertFalse(isMaxPainExpired(service, "{\"status\":\"EMPTY\"}"));
+        assertFalse(isMaxPainExpired(service, "{}"));
+        // Malformed JSON must NOT throw — defensive.
+        assertFalse(isMaxPainExpired(service, "not-json"));
+        assertFalse(isMaxPainExpired(service, null));
+        assertFalse(isMaxPainExpired(service, ""));
+    }
+
+    @Test
+    void uiBatchEnvelopeCarriesMaxPainArrayKey() throws Exception {
+        FeedGatewayService service = service();
+        // A single max-pain JSON in the batch must surface under the "maxPains" array on the wire.
+        String json = "{\"messageType\":\"MAX_PAIN\",\"symbol\":\"SPX\",\"expiry\":\"20260710\",\"status\":\"VALID\",\"maxPainStrike\":4500.0}";
+        String envelope = uiBatchEnvelopeJsonMaxPain(service, List.of(json));
+        assertTrue(envelope.contains("\"maxPains\":[" + json + "]"),
+                "batch envelope must carry the maxPains array with the record; was: " + envelope);
+        // Existing gex array must still be present (no regression).
+        assertTrue(envelope.contains("\"gexByStrike\":[]"));
     }
 
     @Test
@@ -394,6 +435,18 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(service, json, fallback);
     }
 
+    private static String maxPainCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("maxPainCacheKey", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, fallback);
+    }
+
+    private static boolean isMaxPainExpired(FeedGatewayService service, String json) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("isMaxPainExpired", String.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, json);
+    }
+
     private static String updateCache(
             FeedGatewayService service,
             Object binding,
@@ -433,13 +486,27 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of()
+                gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
+    private static String uiBatchEnvelopeJsonMaxPain(FeedGatewayService service, List<String> maxPains) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "uiBatchEnvelopeJson",
+                List.class, List.class, List.class, List.class, List.class, List.class,
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class
+        );
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -452,34 +519,14 @@ class FeedGatewayServiceTest {
     private static String uiBatchEnvelopeJson(FeedGatewayService service, List<String> strikeFlows) throws Exception {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
-                List.class,
-                List.class,
-                List.class,
-                List.class,
-                List.class,
-                List.class,
-                List.class,
-                List.class,
-                List.class,
-                List.class,
-                List.class,
-                List.class
+                List.class, List.class, List.class, List.class, List.class, List.class,
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
-                List.of(),
-                List.of(),
-                List.of(),
-                strikeFlows,
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of()
+                List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 }
