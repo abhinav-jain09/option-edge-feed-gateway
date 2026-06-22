@@ -166,6 +166,8 @@ The gateway intentionally reads compacted/current topics from the beginning on s
 
 The replay cache is bounded by `GATEWAY_CACHE_TTL_MS`, which defaults to 15 minutes. Records older than the TTL, based on the Kafka record timestamp, are not kept in the gateway cache and are not sent to new WebSocket clients. This prevents old expiries from filling the UI after restart while still allowing active strikes to populate quickly when the producer keeps emitting fresh snapshots.
 
+**Max-pain is the exception.** Max-pain is derived from *daily* OPRA open interest, so it is a slow, last-value-wins signal that legitimately goes hours without a new record. Applying the 15-minute window to it would seek past, evict, purge, and filter out a perfectly valid max-pain the moment it ages past 15 minutes (which for daily data is almost always), leaving the max-pain card empty. Max-pain therefore uses its own window, `GATEWAY_MAXPAIN_TTL_MS` (default **12 hours**): the latest non-terminal max-pain per `DATABENTO|symbol|expiry` is bootstrapped on (re)connect, retained, and replayed to new clients until superseded by a newer record or by a terminal `EXPIRED` record. The 12-hour default covers a full regular trading session plus a pre/post buffer without bridging into the next session's open. Setting `GATEWAY_MAXPAIN_TTL_MS=0` (or any value `<= 0`) reverts max-pain to the generic "do not cache stale state" behavior — it does **not** mean infinite retention.
+
 It does not broadcast old startup records one-by-one to connected WebSocket clients. While startup replay is in progress, live records update the gateway cache but are not sent to the UI yet. After each cache consumer catches up to the startup end offset, it sends the latest cached state once and then broadcasts only latest-state WebSocket batches.
 
 The alert topic starts at the end, so old alerts are not replayed.
@@ -316,7 +318,8 @@ Environment variables and matching Java system properties are supported.
 | `GATEWAY_KAFKA_METADATA_TIMEOUT_MS` | `30000` | Topic metadata wait timeout |
 | `GATEWAY_KAFKA_RETRY_INITIAL_MS` | `1000` | Initial delay before restarting a failed Kafka consumer |
 | `GATEWAY_KAFKA_RETRY_MAX_MS` | `30000` | Maximum delay between Kafka consumer restart attempts |
-| `GATEWAY_CACHE_TTL_MS` | `900000` | Maximum age for records kept in the gateway replay cache |
+| `GATEWAY_CACHE_TTL_MS` | `900000` | Maximum age for records kept in the gateway replay cache (fast-ticking events) |
+| `GATEWAY_MAXPAIN_TTL_MS` | `43200000` | Separate, longer cache window for the slow daily-OI max-pain stream (12h). `<= 0` treats max-pain as always-stale (it is not cached at all) — it does **not** fall back to the 15-min `GATEWAY_CACHE_TTL_MS`, and it does **not** mean infinite retention |
 
 Example:
 
