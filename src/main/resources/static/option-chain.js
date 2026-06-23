@@ -167,8 +167,9 @@
       strikes.forEach(strikePayload => {
         const strike = Number(strikePayload?.strike);
         if (!Number.isFinite(strike)) return;
-        const strikeFlow = normalizeStrikeFlowPayload(payload, strikePayload);
         const key = contractKey({ ...payload, strike });
+        const prevFlow = strikeFlowRef.current.get(key)?.strikeFlow;
+        const strikeFlow = normalizeStrikeFlowPayload(payload, strikePayload, prevFlow);
         strikeFlowRef.current.set(key, strikeFlow);
         const row = rowsRef.current.get(key);
         if (!row) return;
@@ -1536,10 +1537,33 @@
                     return [...keys];
                   }
 
-                  function normalizeStrikeFlowPayload(market, strikePayload) {
+                  // Reset-aware running total for a backend counter that should only ever grow within a
+                  // session. Goal (per requirement): the displayed cumulative $ must keep increasing/decreasing
+                  // but NEVER snap back to 0 just because a window/session aggregate was reset upstream or a
+                  // transient empty payload arrived.
+                  //   - incoming <= 0 (empty/quiet update): keep the prior cumulative AND the prior raw
+                  //     baseline (so a spurious 0 cannot zero the display or corrupt the delta math).
+                  //   - incoming >= baseline: normal forward progress — add the delta.
+                  //   - incoming <  baseline: upstream counter reset — treat the whole incoming as fresh flow
+                  //     and add it on top (the running total never drops to 0).
+                  function accumulateNotional(prevCum, prevRaw, incoming) {
+                    const raw = Number(incoming || 0);
+                    const cum = Number(prevCum || 0);
+                    const base = Number(prevRaw || 0);
+                    if (!(raw > 0)) return { cum, raw: base };
+                    const delta = raw >= base ? raw - base : raw;
+                    return { cum: cum + delta, raw };
+                  }
+
+                  function normalizeStrikeFlowPayload(market, strikePayload, prevFlow) {
                     const classification = String(strikePayload?.classification || 'MIXED').toUpperCase();
                     const displayColor = String(strikePayload?.displayColor || strikeFlowDisplayColor(classification)).toUpperCase();
                     const strike = Number(strikePayload?.strike);
+                    // Carry the cumulative $ forward across resets so the superscript is sticky (never 0).
+                    const callBuy = accumulateNotional(prevFlow?.callBuyNotional, prevFlow?.callBuyNotionalRaw, strikePayload?.callBuyNotional);
+                    const callSell = accumulateNotional(prevFlow?.callSellNotional, prevFlow?.callSellNotionalRaw, strikePayload?.callSellNotional);
+                    const putBuy = accumulateNotional(prevFlow?.putBuyNotional, prevFlow?.putBuyNotionalRaw, strikePayload?.putBuyNotional);
+                    const putSell = accumulateNotional(prevFlow?.putSellNotional, prevFlow?.putSellNotionalRaw, strikePayload?.putSellNotional);
                     return {
                       strikeFlow: {
                         market: {
@@ -1558,10 +1582,16 @@
                         topSellRank: Number(strikePayload?.topSellRank || 0),
                         buyBias: Number(strikePayload?.buyBias || 0),
                         sellBias: Number(strikePayload?.sellBias || 0),
-                        callBuyNotional: Number(strikePayload?.callBuyNotional || 0),
-                        callSellNotional: Number(strikePayload?.callSellNotional || 0),
-                        putBuyNotional: Number(strikePayload?.putBuyNotional || 0),
-                        putSellNotional: Number(strikePayload?.putSellNotional || 0),
+                        // Displayed value = session cumulative (sticky). *Raw = last non-zero upstream value,
+                        // kept only as the baseline for reset detection on the next update.
+                        callBuyNotional: callBuy.cum,
+                        callSellNotional: callSell.cum,
+                        putBuyNotional: putBuy.cum,
+                        putSellNotional: putSell.cum,
+                        callBuyNotionalRaw: callBuy.raw,
+                        callSellNotionalRaw: callSell.raw,
+                        putBuyNotionalRaw: putBuy.raw,
+                        putSellNotionalRaw: putSell.raw,
                         callBuyVolume: Number(strikePayload?.callBuyVolume || 0),
                         callSellVolume: Number(strikePayload?.callSellVolume || 0),
                         putBuyVolume: Number(strikePayload?.putBuyVolume || 0),
