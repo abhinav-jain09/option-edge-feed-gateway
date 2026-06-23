@@ -16,10 +16,22 @@ package app.feedgateway.mtsession.gateway;
 public interface ReplayRunAuthorizer {
 
     /**
+     * @return a description of the authorized run (its {@code replayDate} when the orchestrator response
+     *         could be parsed, else null) — used by the gateway to pin a run-backed replay to the run's
+     *         authoritative chain expiry. Returning normally means ownership was positively confirmed.
      * @throws ReplayRunAuthorizationException if the caller is not a confirmed owner of {@code runId},
      *                                         or ownership could not be confirmed.
      */
-    void authorizeRun(String bearerToken, String runId);
+    AuthorizedRun authorizeRun(String bearerToken, String runId);
+
+    /**
+     * Minimal projection of an authorized run. {@code replayDate} is the run's exchange-local session date
+     * (ISO {@code yyyy-MM-dd}) when known, else null — never an authorization signal (authorization is
+     * conveyed by returning vs throwing), only the source for the run's authoritative chain expiry.
+     */
+    record AuthorizedRun(String replayDate) {
+        public static final AuthorizedRun UNKNOWN = new AuthorizedRun(null);
+    }
 
     /** Thrown when ownership of {@code runId} cannot be positively confirmed for the caller. */
     final class ReplayRunAuthorizationException extends RuntimeException {

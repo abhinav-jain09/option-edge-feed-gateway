@@ -25,11 +25,52 @@ class OrchestratorReplayRunAuthorizerTest {
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private static HttpClient clientReturning(int status) throws Exception {
+        return clientReturning(status, "");
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static HttpClient clientReturning(int status, String body) throws Exception {
         HttpClient http = mock(HttpClient.class);
         HttpResponse resp = mock(HttpResponse.class);
         when(resp.statusCode()).thenReturn(status);
+        when(resp.body()).thenReturn(body);
         when(http.send(any(HttpRequest.class), any())).thenReturn(resp);
         return http;
+    }
+
+    @Test
+    void ownerResponseParsesTheRunReplayDate() throws Exception {
+        HttpClient http = clientReturning(200,
+                "{\"runId\":\"r-123\",\"state\":\"COMPLETED\",\"replayDate\":\"2026-06-22\"}");
+        OrchestratorReplayRunAuthorizer authz =
+                new OrchestratorReplayRunAuthorizer("http://orchestrator:8080", T, http);
+
+        ReplayRunAuthorizer.AuthorizedRun run = authz.authorizeRun("tok", "r-123");
+        assertEquals("2026-06-22", run.replayDate());
+    }
+
+    @Test
+    void malformedReplayDateIsTreatedAsUnknown() throws Exception {
+        // A bad orchestrator field must NOT pin the replay to an impossible expiry — it degrades to null
+        // (unknown) so the caller keeps the client expiry, never recreating the zero-strikes failure.
+        for (String bad : new String[] {"\"2026/06/22\"", "\"foo\"", "\"2026-13-40\"", "\"20260622\""}) {
+            HttpClient http = clientReturning(200, "{\"replayDate\":" + bad + "}");
+            OrchestratorReplayRunAuthorizer authz =
+                    new OrchestratorReplayRunAuthorizer("http://orchestrator:8080", T, http);
+            org.junit.jupiter.api.Assertions.assertNull(
+                    authz.authorizeRun("tok", "r-123").replayDate(), "bad replayDate " + bad + " must be null");
+        }
+    }
+
+    @Test
+    void ownerResponseWithNoReplayDateYieldsNullDateButStillAuthorizes() throws Exception {
+        // A 2xx with an absent/unparseable replayDate authorizes (returns) with a null date — never throws.
+        HttpClient http = clientReturning(200, "{\"runId\":\"r-123\"}");
+        OrchestratorReplayRunAuthorizer authz =
+                new OrchestratorReplayRunAuthorizer("http://orchestrator:8080", T, http);
+
+        ReplayRunAuthorizer.AuthorizedRun run = authz.authorizeRun("tok", "r-123");
+        org.junit.jupiter.api.Assertions.assertNull(run.replayDate());
     }
 
     @Test

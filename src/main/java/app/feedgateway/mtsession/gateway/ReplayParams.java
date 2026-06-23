@@ -44,6 +44,22 @@ public record ReplayParams(
     }
 
     /**
+     * A copy of these params with the option-chain {@code expiry} replaced (dashes stripped, same
+     * normalization as {@link #of}). Used to pin a run-backed replay to the AUTHORITATIVE expiry derived
+     * from the orchestrated run, so the per-record expiry filter cannot drop the run's strikes because the
+     * client supplied a mismatched expiry. All other validated fields are preserved unchanged.
+     *
+     * @throws IllegalArgumentException if {@code newExpiry} is null/blank.
+     */
+    public ReplayParams withExpiry(String newExpiry) {
+        String exp = requireText(newExpiry, "expiry").replace("-", "");
+        if (exp.equals(this.expiry)) {
+            return this;
+        }
+        return new ReplayParams(sessionId, symbol, exp, startUtcMs, endUtcMs, maxRecords, runId);
+    }
+
+    /**
      * Parse and validate a replay request. {@code startUtc}/{@code endUtc} are ISO-8601 instants supplied
      * by the caller (the UI's replay bar derives them from the chosen exchange-local window via
      * {@code OptionChainMarketCalendar.exchangeLocalToUtcInstant}); this method performs the authoritative

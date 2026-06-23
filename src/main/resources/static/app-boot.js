@@ -129,6 +129,7 @@
 
   // ---- Live↔Replay control bar ----
   var mode = "LIVE";
+  var replayRunsById = {}; // runId -> run view {runId,state,replayDate,startTime,endTime}, from loadReplayRuns
   function el(id) { return document.getElementById(id); }
   function setMode(next) {
     mode = next;
@@ -256,7 +257,13 @@
     // Populate the runId datalist with the caller's orchestrated runs (PR-2). Best-effort: on any failure
     // the field stays a plain free-text input (PR-1 behavior). Refresh on focus so the list stays current.
     var runIdField = el("oe-rp-run-id");
-    if (runIdField) { runIdField.addEventListener("focus", loadReplayRuns); }
+    if (runIdField) {
+      runIdField.addEventListener("focus", loadReplayRuns);
+      // Auto-align the replay window to the chosen run so the derived expiry matches its chain (see
+      // alignReplayWindowToRun). "change" fires on datalist pick/blur; "input" covers typed/pasted ids.
+      runIdField.addEventListener("change", alignReplayWindowToRun);
+      runIdField.addEventListener("input", alignReplayWindowToRun);
+    }
     loadReplayRuns();
   }
 
@@ -283,6 +290,7 @@
     // Clear FIRST so a failed/empty refresh degrades to plain free-text (no stale suggestions survive);
     // a successful fetch repopulates below.
     list.textContent = "";
+    replayRunsById = {};
     ensureToken().then(function (t) {
       if (!t) { return; }
       return fetch("/api/replay/historical/runs", { headers: { "Authorization": "Bearer " + t } })
@@ -290,14 +298,32 @@
         .then(function (runs) {
           (Array.isArray(runs) ? runs : []).forEach(function (run) {
             if (!run || !run.runId) { return; }
+            replayRunsById[run.runId] = run;
             var opt = document.createElement("option");
             opt.value = run.runId;
             var windowLabel = (run.startTime && run.endTime) ? (run.startTime + "-" + run.endTime) : "";
             opt.label = [run.state, run.replayDate, windowLabel].filter(Boolean).join(" ");
             list.appendChild(opt);
           });
+          // A runId typed/pasted BEFORE this async list resolved would not have aligned yet (the map was
+          // empty at change-time); align now that the runs are known.
+          alignReplayWindowToRun();
         });
     }).catch(function () { /* degrade silently to free-text entry */ });
+  }
+
+  // When the user picks an orchestrated run, the replay window MUST match that run's session: the
+  // per-record expiry filter (gateway replayMatches) drops every snapshot whose expiry != the requested
+  // expiry, and the requested expiry is DERIVED from the date field (date.replace(/-/g,"")). So a run for
+  // 2026-06-22 viewed with the date field left on another day shows the ES future (no expiry) but ZERO
+  // strikes. Align the date/start/end inputs to the selected run so the derived expiry matches its chain.
+  // (The gateway independently re-derives the authoritative expiry from the run as defense-in-depth.)
+  function alignReplayWindowToRun() {
+    var field = el("oe-rp-run-id"); if (!field) { return; }
+    var run = replayRunsById[(field.value || "").trim()]; if (!run) { return; }
+    if (run.replayDate && el("oe-rp-date")) { el("oe-rp-date").value = run.replayDate; }
+    if (run.startTime && el("oe-rp-start")) { el("oe-rp-start").value = run.startTime.slice(0, 5); }
+    if (run.endTime && el("oe-rp-end")) { el("oe-rp-end").value = run.endTime.slice(0, 5); }
   }
 
   // Build the boot-error box with DOM nodes + textContent (NEVER innerHTML) so an error message can't inject.

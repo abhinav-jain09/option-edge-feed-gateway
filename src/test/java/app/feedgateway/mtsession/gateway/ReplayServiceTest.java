@@ -63,17 +63,20 @@ class ReplayServiceTest {
     private static final class RecordingAuthorizer implements ReplayRunAuthorizer {
         final List<String> authorized = new ArrayList<>();
         boolean deny;
+        String replayDate; // when set, returned as the authorized run's authoritative chain date
 
         @Override
-        public void authorizeRun(String bearerToken, String runId) {
+        public AuthorizedRun authorizeRun(String bearerToken, String runId) {
             authorized.add(runId);
             if (deny) {
                 throw new ReplayRunAuthorizationException("denied: " + runId);
             }
+            return new AuthorizedRun(replayDate);
         }
     }
 
-    private static final ReplayRunAuthorizer ALLOW_ALL = (token, runId) -> { };
+    private static final ReplayRunAuthorizer ALLOW_ALL =
+            (token, runId) -> ReplayRunAuthorizer.AuthorizedRun.UNKNOWN;
     private static final ReplayRunLister EMPTY_LISTER = token -> List.of();
 
     private ReplayService service(SessionRoutingEngine engine, ReplayRunner runner, String userId,
@@ -115,6 +118,39 @@ class ReplayServiceTest {
 
         assertEquals("r-123", ack.params().runId());
         assertTrue(ack.params().hasRun());
+    }
+
+    @Test
+    void runBackedReplayPinsExpiryToTheAuthorizedRunDate() throws Exception {
+        // The client supplies a MISMATCHED expiry (e.g. the live 0DTE date); the gateway must override it
+        // with the owned run's session date so the per-record expiry filter cannot drop the run's strikes.
+        SessionRoutingEngine engine = engineWith("app:u1", "u1");
+        RecordingRunner runner = new RecordingRunner();
+        RecordingAuthorizer authz = new RecordingAuthorizer();
+        authz.replayDate = "2026-06-22";
+        ReplayService svc = service(engine, runner, authz, "u1", true, false);
+        ReplayService.ReplayRequest mismatched =
+                new ReplayService.ReplayRequest("app:u1", "SPX", "20260623", START, END, 1000, "r-123");
+
+        ReplayService.ReplayAck ack = svc.start("tok", mismatched);
+
+        assertEquals("20260622", ack.params().expiry(), "expiry must be pinned to the run's session date");
+        assertEquals(List.of("start:app:u1:SPX:20260622"), runner.calls);
+    }
+
+    @Test
+    void runBackedReplayKeepsClientExpiryWhenRunDateUnknown() throws Exception {
+        // Older orchestrator / unparseable body -> AuthorizedRun.replayDate is null -> no override.
+        SessionRoutingEngine engine = engineWith("app:u1", "u1");
+        RecordingRunner runner = new RecordingRunner();
+        RecordingAuthorizer authz = new RecordingAuthorizer(); // replayDate stays null
+        ReplayService svc = service(engine, runner, authz, "u1", true, false);
+        ReplayService.ReplayRequest withRun =
+                new ReplayService.ReplayRequest("app:u1", "SPX", "20260612", START, END, 1000, "r-123");
+
+        ReplayService.ReplayAck ack = svc.start("tok", withRun);
+
+        assertEquals("20260612", ack.params().expiry(), "client expiry is kept when the run date is unknown");
     }
 
     @Test
