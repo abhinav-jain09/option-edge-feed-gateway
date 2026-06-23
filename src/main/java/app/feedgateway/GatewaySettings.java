@@ -352,6 +352,81 @@ public final class GatewaySettings {
         return longValue("GATEWAY_MAXPAIN_TTL_MS", 43_200_000L, 0L);
     }
 
+    /**
+     * Freshness TTL for the structural option-chain cache (the {@code snapshot} strike ladder — see
+     * {@code FeedGatewayService.MARKET_AWARE_CHAIN_EVENTS}) DURING regular trading hours — default 10 min.
+     * Off-hours the chain is never evicted (see {@link FeedGatewayService} cache policy + {@link #marketCalendar()}),
+     * so the published strikes stay visible overnight/weekends/holidays when quotes do not tick. The fast
+     * order-flow signals (pace/directional-pressure/strike-flow/gex-by-strike) are NOT covered here — they keep
+     * the generic {@link #cacheTtlMs()} plus their own 15s selection barrier.
+     */
+    public long optionChainRthCacheTtlMs() {
+        return longValue("GATEWAY_OPTION_CHAIN_RTH_CACHE_TTL_MS", 600_000L, 0L);
+    }
+
+    /**
+     * Bounded Kafka seek-back used to rebuild the option-chain cache on (re)connect WHEN off-hours (eviction
+     * is disabled then, but the seek must stay bounded so a reconnect never reads the whole topic). Default
+     * 24h. During RTH the seek-back equals {@link #optionChainRthCacheTtlMs()}.
+     */
+    public long optionChainOffHoursSeekBackMs() {
+        return longValue("GATEWAY_OPTION_CHAIN_OFF_HOURS_SEEK_BACK_MS", 86_400_000L, 0L);
+    }
+
+    /**
+     * The US options-market session calendar that drives market-aware cache freshness. Regular hours default
+     * to 09:30–16:00 America/New_York; {@code GATEWAY_MARKET_HOLIDAYS} (CSV of {@code yyyy-MM-dd}) and
+     * {@code GATEWAY_MARKET_EARLY_CLOSES} (CSV of {@code yyyy-MM-dd=HH:mm}) are operator-supplied. Warns when
+     * no holidays are configured (the calendar still works for weekends/RTH, but treats holidays as sessions).
+     */
+    public GatewayMarketCalendar marketCalendar() {
+        LocalTime open = parseLocalTime(value("GATEWAY_MARKET_OPEN", "09:30"), LocalTime.of(9, 30));
+        LocalTime close = parseLocalTime(value("GATEWAY_MARKET_CLOSE", "16:00"), LocalTime.of(16, 0));
+        java.util.Set<LocalDate> holidays = new java.util.LinkedHashSet<>();
+        for (String token : value("GATEWAY_MARKET_HOLIDAYS", "").split(",")) {
+            String d = token.trim();
+            if (d.isEmpty()) {
+                continue;
+            }
+            try {
+                holidays.add(LocalDate.parse(d));
+            } catch (DateTimeParseException e) {
+                System.out.println("WARN: ignoring unparseable GATEWAY_MARKET_HOLIDAYS entry '" + d + "'");
+            }
+        }
+        java.util.Map<LocalDate, LocalTime> earlyCloses = new java.util.LinkedHashMap<>();
+        for (String token : value("GATEWAY_MARKET_EARLY_CLOSES", "").split(",")) {
+            String entry = token.trim();
+            if (entry.isEmpty()) {
+                continue;
+            }
+            int eq = entry.indexOf('=');
+            if (eq <= 0) {
+                System.out.println("WARN: ignoring malformed GATEWAY_MARKET_EARLY_CLOSES entry '" + entry + "'");
+                continue;
+            }
+            try {
+                earlyCloses.put(LocalDate.parse(entry.substring(0, eq).trim()),
+                        parseLocalTime(entry.substring(eq + 1).trim(), close));
+            } catch (DateTimeParseException e) {
+                System.out.println("WARN: ignoring malformed GATEWAY_MARKET_EARLY_CLOSES entry '" + entry + "'");
+            }
+        }
+        if (holidays.isEmpty()) {
+            System.out.println("WARN: GATEWAY_MARKET_HOLIDAYS is empty — market-aware cache freshness will "
+                    + "treat market holidays as regular sessions. Configure the OPRA/NYSE holiday list.");
+        }
+        return new GatewayMarketCalendar(MARKET_TIME_ZONE, open, close, holidays, earlyCloses);
+    }
+
+    private static LocalTime parseLocalTime(String raw, LocalTime fallback) {
+        try {
+            return LocalTime.parse(raw.trim());
+        } catch (RuntimeException e) {
+            return fallback;
+        }
+    }
+
     public long maxLagRecords() {
         return longValue("MARKETDATA_GATEWAY_MAX_LAG_RECORDS", 5_000L, 0L);
     }

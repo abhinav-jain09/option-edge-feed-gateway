@@ -599,19 +599,70 @@ class FeedGatewayServiceTest {
     }
 
     @Test
-    void cacheTtlMsForEventUsesTheLongWindowForMaxPainOnly() throws Exception {
+    void optionChainFreshnessIsMarketAwareTenMinDuringRthNeverOffHours() throws Exception {
         FeedGatewayService service = service();
-        assertEquals(new GatewaySettings().maxPainTtlMs(), cacheTtlMsForEvent(service, "max-pain"));
-        assertEquals(new GatewaySettings().cacheTtlMs(), cacheTtlMsForEvent(service, "snapshot"));
-        assertEquals(new GatewaySettings().cacheTtlMs(), cacheTtlMsForEvent(service, "strike-flow"));
+        GatewaySettings settings = new GatewaySettings();
+        long now = 2_000_000_000_000L;
+        long elevenMinAgo = now - 11L * 60_000L;
+        long fiveMinAgo = now - 5L * 60_000L;
+
+        java.util.Map<String, Object> displayTopic =
+                java.util.Map.of(settings.databentoDisplayTopic(), topicBinding("DATABENTO", "snapshot"));
+        org.apache.kafka.common.TopicPartition displayPart =
+                new org.apache.kafka.common.TopicPartition(settings.databentoDisplayTopic(), 0);
+
+        // DURING market hours: the structural chain (snapshot) uses the 10-min RTH TTL.
+        overrideRth(service, true);
+        assertTrue(isExpiredEvent(service, "snapshot", elevenMinAgo, now), "snapshot >10min expires in RTH");
+        assertFalse(isExpiredEvent(service, "snapshot", fiveMinAgo, now), "snapshot <10min fresh in RTH");
+        assertEquals(settings.optionChainRthCacheTtlMs(), windowTtlMsForAt(service, displayPart, displayTopic, now));
+
+        // OFF market hours: the published chain is NEVER evicted (so strikes stay visible), with a bounded seek.
+        overrideRth(service, false);
+        assertFalse(isExpiredEvent(service, "snapshot", now - 25L * 3_600_000L, now), "off-hours never evicts");
+        assertEquals(settings.optionChainOffHoursSeekBackMs(),
+                windowTtlMsForAt(service, displayPart, displayTopic, now));
+
+        // Fast order-flow signals are NOT market-aware: they keep the generic 15-min TTL, so an 11-min-old
+        // strike-flow is NOT expired (a market-aware 10-min TTL would have expired it) — proving the scope.
+        assertFalse(isExpiredEvent(service, "strike-flow", elevenMinAgo, now), "strike-flow uses generic 15min TTL");
+        assertEquals(settings.cacheTtlMs(), windowTtlMsForAt(service,
+                new org.apache.kafka.common.TopicPartition(settings.databentoStrikeFlowTopic(), 0),
+                java.util.Map.of(settings.databentoStrikeFlowTopic(), topicBinding("DATABENTO", "strike-flow")), now));
+    }
+
+    @Test
+    void offHoursStaleSnapshotStillReplaysToConnectingClientWhileFastSignalDoesNot() throws Exception {
+        // The user-facing contract: off-hours a connecting client still gets the published strikes (snapshot),
+        // even hours old; a stale fast-signal (strike-flow) does NOT replay (its freshness barrier stands).
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260623");
+        overrideRth(service, false); // off market hours
+        long now = System.currentTimeMillis();
+        long fortyMinAgo = now - 40L * 60_000L;
+
+        String snapJson = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260623\",\"strike\":7000}";
+        updateCache(service, topicBinding("DATABENTO", "snapshot"),
+                recordAt(settings.databentoDisplayTopic(), 0, 1L, "SPX|20260623|7000", snapJson, fortyMinAgo), snapJson);
+        // A 40-min-old fast strike-flow for the same selection: still cached but it must NOT replay (stale).
+        String sfJson = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260623\",\"strike\":7000,\"netFlow\":1.0}";
+        updateCache(service, topicBinding("DATABENTO", "strike-flow"),
+                recordAt(settings.databentoStrikeFlowTopic(), 0, 1L, "SPX|20260623|7000", sfJson, fortyMinAgo), sfJson);
+
+        assertEquals(1, cachedEvents(service, List.of("snapshot"), now).size(),
+                "a 40-min-old snapshot still replays off-hours (never evicted)");
+        assertEquals(0, cachedEvents(service, List.of("strike-flow"), now).size(),
+                "a 40-min-old fast strike-flow does NOT replay (generic TTL evicted it)");
     }
 
     @Test
     void isExpiredIsEventAwareForMaxPainVersusFast() throws Exception {
         FeedGatewayService service = service();
+        overrideRth(service, true); // hold market hours fixed so the fast-event TTL is deterministic
         long now = 2_000_000_000_000L;
         long thirtyFiveMinAgo = now - 35L * 60_000L;
-        // The exact scenario observed live: a 35-min-old record. Fast events expire; max-pain does not.
+        // A 35-min-old record during RTH: the structural snapshot expires (10-min TTL); max-pain does not (12h).
         assertTrue(isExpiredEvent(service, "snapshot", thirtyFiveMinAgo, now));
         assertFalse(isExpiredEvent(service, "max-pain", thirtyFiveMinAgo, now));
         // Beyond the 12h max-pain window, even max-pain expires (bounded, not infinite).
@@ -621,23 +672,30 @@ class FeedGatewayServiceTest {
     @Test
     void seekWindowTtlMapsMaxPainToLongWindowAndOthersToGeneric() throws Exception {
         FeedGatewayService service = service();
+        overrideRth(service, true); // structural snapshot seek == RTH TTL while in market hours
         GatewaySettings settings = new GatewaySettings();
+        long now = 2_000_000_000_000L;
         java.util.Map<String, Object> topicEvents = new java.util.HashMap<>();
         topicEvents.put(settings.databentoMaxPainTopic(), topicBinding("DATABENTO", "max-pain"));
+        topicEvents.put(settings.databentoDisplayTopic(), topicBinding("DATABENTO", "snapshot"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), topicBinding("DATABENTO", "strike-flow"));
 
-        assertEquals(settings.maxPainTtlMs(), windowTtlMsFor(service,
-                new org.apache.kafka.common.TopicPartition(settings.databentoMaxPainTopic(), 0), topicEvents));
-        assertEquals(settings.cacheTtlMs(), windowTtlMsFor(service,
-                new org.apache.kafka.common.TopicPartition(settings.databentoStrikeFlowTopic(), 0), topicEvents));
+        assertEquals(settings.maxPainTtlMs(), windowTtlMsForAt(service,
+                new org.apache.kafka.common.TopicPartition(settings.databentoMaxPainTopic(), 0), topicEvents, now));
+        // Structural snapshot is market-aware (RTH 10-min seek); fast strike-flow stays generic.
+        assertEquals(settings.optionChainRthCacheTtlMs(), windowTtlMsForAt(service,
+                new org.apache.kafka.common.TopicPartition(settings.databentoDisplayTopic(), 0), topicEvents, now));
+        assertEquals(settings.cacheTtlMs(), windowTtlMsForAt(service,
+                new org.apache.kafka.common.TopicPartition(settings.databentoStrikeFlowTopic(), 0), topicEvents, now));
         // Null map (the hpsf callers) → generic window for every partition (unchanged behaviour).
-        assertEquals(settings.cacheTtlMs(), windowTtlMsFor(service,
-                new org.apache.kafka.common.TopicPartition(settings.databentoMaxPainTopic(), 0), null));
+        assertEquals(settings.cacheTtlMs(), windowTtlMsForAt(service,
+                new org.apache.kafka.common.TopicPartition(settings.databentoMaxPainTopic(), 0), null, now));
     }
 
     @Test
     void agedNonTerminalMaxPainSurvivesIngestWhileAgedFastEventIsEvicted() throws Exception {
         FeedGatewayService service = service();
+        overrideRth(service, true); // ingest uses wall-clock now; hold market hours so the fast TTL applies
         GatewaySettings settings = new GatewaySettings();
         long now = System.currentTimeMillis();
         long thirtyFiveMinAgo = now - 35L * 60_000L;
@@ -834,10 +892,11 @@ class FeedGatewayServiceTest {
                 new org.apache.kafka.common.header.internals.RecordHeaders(), java.util.Optional.empty());
     }
 
-    private static long cacheTtlMsForEvent(FeedGatewayService service, String event) throws Exception {
-        Method m = FeedGatewayService.class.getDeclaredMethod("cacheTtlMsForEvent", String.class);
+    /** Force the market-hours decision so the cache POLICY is deterministic regardless of wall clock. */
+    private static void overrideRth(FeedGatewayService service, Boolean rth) throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod("overrideRegularTradingHoursForTest", Boolean.class);
         m.setAccessible(true);
-        return (long) m.invoke(service, event);
+        m.invoke(service, rth);
     }
 
     private static boolean isExpiredEvent(FeedGatewayService service, String event, long eventTime, long nowMs)
@@ -847,12 +906,12 @@ class FeedGatewayServiceTest {
         return (boolean) m.invoke(service, event, eventTime, nowMs);
     }
 
-    private static long windowTtlMsFor(FeedGatewayService service,
-            org.apache.kafka.common.TopicPartition partition, Object topicEvents) throws Exception {
+    private static long windowTtlMsForAt(FeedGatewayService service,
+            org.apache.kafka.common.TopicPartition partition, Object topicEvents, long nowMs) throws Exception {
         Method m = FeedGatewayService.class.getDeclaredMethod(
-                "windowTtlMsFor", org.apache.kafka.common.TopicPartition.class, java.util.Map.class);
+                "windowTtlMsFor", org.apache.kafka.common.TopicPartition.class, java.util.Map.class, long.class);
         m.setAccessible(true);
-        return (long) m.invoke(service, partition, topicEvents);
+        return (long) m.invoke(service, partition, topicEvents, nowMs);
     }
 
     private static void purgeExpiredCache(FeedGatewayService service, long nowMs) throws Exception {

@@ -77,6 +77,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public class FeedGatewayService implements ReplayRunner {
     private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
+    private final GatewayMarketCalendar marketCalendar;
     private final ObjectMapper mapper;
     private final HpsfGatewayViewMapper hpsfViewMapper;
     private final Set<WebSocketSession> clients = new CopyOnWriteArraySet<>();
@@ -212,6 +213,7 @@ public class FeedGatewayService implements ReplayRunner {
         this.hpsfViewMapper = hpsfViewMapper;
         this.routingEngine = routingEngine;
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
+        this.marketCalendar = settings.marketCalendar();
     }
 
     /**
@@ -1093,7 +1095,7 @@ public class FeedGatewayService implements ReplayRunner {
         Map<TopicPartition, Long> timestamps = new HashMap<>();
         List<TopicPartition> seekToEnd = new ArrayList<>();
         for (TopicPartition partition : partitions) {
-            long ttlMs = windowTtlMsFor(partition, topicEvents);
+            long ttlMs = windowTtlMsFor(partition, topicEvents, nowMs);
             if (ttlMs <= 0) {
                 seekToEnd.add(partition);
             } else {
@@ -1116,12 +1118,12 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
-    /** Per-partition cache-window TTL: the bound event's effective TTL when known, else the generic one. */
-    private long windowTtlMsFor(TopicPartition partition, Map<String, TopicBinding> topicEvents) {
+    /** Per-partition Kafka cache-rebuild seek-back: the bound event's bounded seek window, else the generic one. */
+    private long windowTtlMsFor(TopicPartition partition, Map<String, TopicBinding> topicEvents, long nowMs) {
         if (topicEvents != null) {
             TopicBinding binding = topicEvents.get(partition.topic());
             if (binding != null) {
-                return cacheTtlMsForEvent(binding.event());
+                return cachePolicyFor(binding.event(), nowMs).seekBackMs();
             }
         }
         return settings.cacheTtlMs();
@@ -2110,20 +2112,79 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * Effective cache TTL for a given event type. All slow-vs-fast freshness policy flows through this one
-     * seam (seek window, ingest eviction, periodic purge, cached-state send-filter). {@code max-pain} is a
-     * slow daily-OI last-value-wins signal and uses its own much longer window
-     * ({@link GatewaySettings#maxPainTtlMs()}); every other event uses the generic
-     * {@link GatewaySettings#cacheTtlMs()} sized for fast-ticking quote data.
+     * The structural option-chain cache events that follow market-aware freshness (10-min RTH, never
+     * off-hours). Scoped to exactly the "current-state" caches that are replayed IN FULL on connect — i.e.
+     * those EXEMPT from the cached-replay staleness/offset barrier (see {@link #enforceCachedReplayMaxStale}:
+     * {@code snapshot} + {@code max-pain}). max-pain keeps its own 12h window; the fast order-flow signals
+     * (pace/directional-pressure/strike-flow/gex-by-strike) are deliberately stale-gated by the 15s selection
+     * barrier — a 12h-old flow value is misleading — so making them never-evict would retain-but-never-deliver
+     * them. Keeping the never-evict policy aligned with what is actually delivered off-hours is the contract.
      */
-    private long cacheTtlMsForEvent(String event) {
-        return "max-pain".equals(event) ? settings.maxPainTtlMs() : settings.cacheTtlMs();
+    private static final Set<String> MARKET_AWARE_CHAIN_EVENTS = Set.of("snapshot");
+
+    /**
+     * The freshness/seek decision for a cache event. {@code neverEvict} disables staleness eviction entirely
+     * (off-hours, so the published strike structure persists) while {@code seekBackMs} keeps the Kafka
+     * cache-rebuild window BOUNDED regardless — the two concerns are deliberately decoupled.
+     */
+    private record CachePolicy(long ttlMs, boolean neverEvict, long seekBackMs) {
+        static CachePolicy expiring(long ttlMs) {
+            return new CachePolicy(ttlMs, false, ttlMs);
+        }
+
+        static CachePolicy noEviction(long seekBackMs) {
+            return new CachePolicy(0L, true, seekBackMs);
+        }
     }
 
-    /** Event-aware staleness: same rule as {@link #isExpired(long, long)} but with the per-event TTL. */
+    /**
+     * Effective cache policy for an event type — the ONE seam all freshness flows through (seek window,
+     * ingest eviction, periodic purge, cached-state send-filter):
+     * <ul>
+     *   <li>{@code max-pain}: its own long window ({@link GatewaySettings#maxPainTtlMs()}, 12h) — a slow
+     *       daily last-value-wins signal, unchanged.</li>
+     *   <li>the structural chain ({@code snapshot}, see {@link #MARKET_AWARE_CHAIN_EVENTS}): MARKET-AWARE.
+     *       During regular trading hours a short freshness TTL ({@link GatewaySettings#optionChainRthCacheTtlMs()},
+     *       10m); OFF-hours never evicted (so the published strikes stay visible overnight/weekends/holidays),
+     *       with a bounded off-hours seek-back ({@link GatewaySettings#optionChainOffHoursSeekBackMs()}, 24h).</li>
+     *   <li>everything else (pace/directional-pressure/strike-flow/gex-by-strike/index-price/vix/HPSF/...):
+     *       the generic {@link GatewaySettings#cacheTtlMs()} (fast signals also keep their 15s selection barrier).</li>
+     * </ul>
+     */
+    // Test seam: when non-null, forces the market-hours decision (true=RTH, false=off-hours) so the cache
+    // POLICY can be tested deterministically without the wall clock. The calendar date/holiday math itself
+    // is covered separately by GatewayMarketCalendarTest. Mirrors the other override*ForTest seams.
+    private volatile Boolean regularTradingHoursOverrideForTest = null;
+
+    void overrideRegularTradingHoursForTest(Boolean regularTradingHours) {
+        this.regularTradingHoursOverrideForTest = regularTradingHours;
+    }
+
+    private boolean isRegularTradingHours(long nowMs) {
+        Boolean override = regularTradingHoursOverrideForTest;
+        return override != null ? override : marketCalendar.isRegularTradingHours(Instant.ofEpochMilli(nowMs));
+    }
+
+    private CachePolicy cachePolicyFor(String event, long nowMs) {
+        if ("max-pain".equals(event)) {
+            return CachePolicy.expiring(settings.maxPainTtlMs());
+        }
+        if (MARKET_AWARE_CHAIN_EVENTS.contains(event)) {
+            if (isRegularTradingHours(nowMs)) {
+                return CachePolicy.expiring(settings.optionChainRthCacheTtlMs());
+            }
+            return CachePolicy.noEviction(settings.optionChainOffHoursSeekBackMs());
+        }
+        return CachePolicy.expiring(settings.cacheTtlMs());
+    }
+
+    /** Event-aware staleness: market-aware for the option-chain cache, generic otherwise. */
     private boolean isExpired(String event, long eventTime, long nowMs) {
-        long ttlMs = cacheTtlMsForEvent(event);
-        return ttlMs <= 0 || eventTime < nowMs - ttlMs;
+        CachePolicy policy = cachePolicyFor(event, nowMs);
+        if (policy.neverEvict()) {
+            return false;
+        }
+        return policy.ttlMs() <= 0 || eventTime < nowMs - policy.ttlMs();
     }
 
     private boolean passesSelectionBarrier(String versionKey, ActiveSelection selection) {
