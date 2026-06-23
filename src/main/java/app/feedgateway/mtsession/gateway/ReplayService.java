@@ -73,7 +73,15 @@ public final class ReplayService {
         // the orchestrator — the source of truth for run ownership. Live-slice replays (no runId) read only
         // the caller's own session/selection, so they need no run authorization.
         if (params.hasRun()) {
-            runAuthorizer.authorizeRun(bearerToken, params.runId());
+            ReplayRunAuthorizer.AuthorizedRun run = runAuthorizer.authorizeRun(bearerToken, params.runId());
+            // Pin the replay to the run's AUTHORITATIVE chain expiry (its session date). The per-record
+            // expiry filter (gateway replayMatches) drops every snapshot whose expiry != params.expiry, so a
+            // client that supplies a mismatched expiry would stream the underlying/ES (no expiry) but ZERO
+            // strikes. Deriving the expiry from the owned run here makes that mismatch impossible. A run
+            // with an unknown replayDate (older orchestrator / unparseable body) leaves the client expiry.
+            if (run != null && run.replayDate() != null && !run.replayDate().isBlank()) {
+                params = params.withExpiry(run.replayDate());
+            }
         }
         ReplayRunner.Mode mode = runner.startReplay(params);
         return new ReplayAck(mode, params);
