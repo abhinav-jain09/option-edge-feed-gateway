@@ -11,7 +11,6 @@
   const { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
   const h = React.createElement;
   const ROW_RENDER_THROTTLE_MS = 125;
-  const STRIKE_FLOW_SIDE_RATIO = 1.20;
   const GEX_HISTORY_WINDOWS = ['10m', '30m', '1h', '4h', '8h'];
   const runtimeEnv = window.__OPTIONS_EDGE_ENV__ || {};
 
@@ -1671,66 +1670,35 @@
                   function strikeFlowVolumeState(row, side) {
                     const flow = row?.strikeFlow;
                     if (!flow) return undefined;
-                    const ratio = STRIKE_FLOW_SIDE_RATIO;
-                    if (side === 'call') {
-                      const buy = Number(flow.callBuyNotional || 0);
-                      const sell = Number(flow.callSellNotional || 0);
-                      const buyVolume = Number(flow.callBuyVolume || 0);
-                      const sellVolume = Number(flow.callSellVolume || 0);
-                      const volumeText = ` | buy vol ${fmtVolume(buyVolume)} | sell vol ${fmtVolume(sellVolume)}`;
-                      if (buy > sell * ratio) {
-                        return {
-                          className: 'strike-flow-buy',
-                          pulse: Boolean(flow.blink) && Number(flow.topBuyRank || 0) > 0,
-                          superscriptNotional: fmtStrikeFlowUsd(buy),
-                          title: `Call buying | buy ${fmtStrikeFlowUsd(buy)} | sell ${fmtStrikeFlowUsd(sell)}${volumeText}`
-                        };
-                      }
-                      if (sell > buy * ratio) {
-                        return {
-                          className: 'strike-flow-sell',
-                          pulse: Boolean(flow.blink) && Number(flow.topSellRank || 0) > 0,
-                          superscriptNotional: fmtStrikeFlowUsd(sell),
-                          title: `Call selling | buy ${fmtStrikeFlowUsd(buy)} | sell ${fmtStrikeFlowUsd(sell)}${volumeText}`
-                        };
-                      }
-                      return {
-                        className: 'strike-flow-mixed',
-                        pulse: false,
-                        superscriptNotional: fmtStrikeFlowUsd(Math.max(buy, sell)),
-                        title: `Call mixed | buy ${fmtStrikeFlowUsd(buy)} | sell ${fmtStrikeFlowUsd(sell)}${volumeText}`
-                      };
-                    }
-                    if (side === 'put') {
-                      const buy = Number(flow.putBuyNotional || 0);
-                      const sell = Number(flow.putSellNotional || 0);
-                      const buyVolume = Number(flow.putBuyVolume || 0);
-                      const sellVolume = Number(flow.putSellVolume || 0);
-                      const volumeText = ` | buy vol ${fmtVolume(buyVolume)} | sell vol ${fmtVolume(sellVolume)}`;
-                      if (sell > buy * ratio) {
-                        return {
-                          className: 'strike-flow-buy',
-                          pulse: Boolean(flow.blink) && Number(flow.topBuyRank || 0) > 0,
-                          superscriptNotional: fmtStrikeFlowUsd(sell),
-                          title: `Put selling / support | buy ${fmtStrikeFlowUsd(buy)} | sell ${fmtStrikeFlowUsd(sell)}${volumeText}`
-                        };
-                      }
-                      if (buy > sell * ratio) {
-                        return {
-                          className: 'strike-flow-sell',
-                          pulse: Boolean(flow.blink) && Number(flow.topSellRank || 0) > 0,
-                          superscriptNotional: fmtStrikeFlowUsd(buy),
-                          title: `Put buying / protection | buy ${fmtStrikeFlowUsd(buy)} | sell ${fmtStrikeFlowUsd(sell)}${volumeText}`
-                        };
-                      }
-                      return {
-                        className: 'strike-flow-mixed',
-                        pulse: false,
-                        superscriptNotional: fmtStrikeFlowUsd(Math.max(buy, sell)),
-                        title: `Put mixed | buy ${fmtStrikeFlowUsd(buy)} | sell ${fmtStrikeFlowUsd(sell)}${volumeText}`
-                      };
-                    }
-                    return undefined;
+                    const isCall = side === 'call';
+                    const isPut = side === 'put';
+                    if (!isCall && !isPut) return undefined;
+                    // SIGNED CUMULATIVE NET — the displayed superscript is ONE signed $ per cell that drifts up/down
+                    // through the session (callBuy/callSell/... are already session-cumulative via accumulateNotional).
+                    // Sign follows the bullish/bearish convention so green/red stays consistent with the chain:
+                    //   call net = callBuy - callSell  (+ = net call BUYING = bullish, - = net call selling = bearish)
+                    //   put  net = putSell  - putBuy   (+ = net put SELLING/support = bullish, - = net put buying/protection)
+                    const buy = Number((isCall ? flow.callBuyNotional : flow.putBuyNotional) || 0);
+                    const sell = Number((isCall ? flow.callSellNotional : flow.putSellNotional) || 0);
+                    const buyVolume = Number((isCall ? flow.callBuyVolume : flow.putBuyVolume) || 0);
+                    const sellVolume = Number((isCall ? flow.callSellVolume : flow.putSellVolume) || 0);
+                    const net = isCall ? (buy - sell) : (sell - buy);
+                    const bullish = net > 0;
+                    const bearish = net < 0;
+                    const className = bullish ? 'strike-flow-buy' : (bearish ? 'strike-flow-sell' : 'strike-flow-mixed');
+                    const sign = bullish ? '+' : (bearish ? '-' : '');
+                    // Exactly-zero net (no flow / perfectly balanced) renders NO superscript — no more "$0" clutter on
+                    // the many strikes that have no net flow. Non-zero strikes show e.g. "+$1.2M" (green) / "-$800K" (red).
+                    const superscriptNotional = net === 0 ? '' : `${sign}${fmtStrikeFlowUsd(Math.abs(net))}`;
+                    const pulse = Boolean(flow.blink) && net !== 0
+                      && (Number(flow.topBuyRank || 0) > 0 || Number(flow.topSellRank || 0) > 0);
+                    const label = isCall
+                      ? (bullish ? 'Call net buying' : bearish ? 'Call net selling' : 'Call balanced')
+                      : (bullish ? 'Put net selling / support' : bearish ? 'Put net buying / protection' : 'Put balanced');
+                    const title = `${label} | net ${sign}${fmtStrikeFlowUsd(Math.abs(net))}`
+                      + ` | buy ${fmtStrikeFlowUsd(buy)} | sell ${fmtStrikeFlowUsd(sell)}`
+                      + ` | buy vol ${fmtVolume(buyVolume)} | sell vol ${fmtVolume(sellVolume)}`;
+                    return { className, pulse, superscriptNotional, title };
                   }
 
                   function strikeFlowRowClass(row) {
