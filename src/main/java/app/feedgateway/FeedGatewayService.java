@@ -883,6 +883,12 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         // NOTE: DATABENTO gex + max-pain are Avro-encoded and consumed by runAvroCacheConsumer (above), NOT
         // here. Only genuinely-JSON topics belong on this string consumer.
+        // The DATABENTO gex HISTORY topic, however, IS JSON (emitted by databento-gex-history-service),
+        // so it belongs here. It carries the same symbol|expiry|strike identity as the Avro gex rows, so
+        // gexCacheKey() merges its `history` map onto the existing DATABENTO|... gex-by-strike row (mirrors
+        // the UW gex/gex-history pairing above; the history record is a superset and wins via the
+        // history-preservation gate in cacheRecord()).
+        topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
@@ -910,7 +916,10 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
-        // DATABENTO gex + max-pain are Avro — live-consumed by runAvroLiveConsumer, not here.
+        // DATABENTO gex + max-pain are Avro — live-consumed by runAvroLiveConsumer, not here. The
+        // DATABENTO gex HISTORY topic IS JSON, so it lives here (keep the cache + live JSON consumer
+        // topic sets symmetric, exactly as the UW gex/gex-history pair and the databento-gex Avro pair).
+        topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }

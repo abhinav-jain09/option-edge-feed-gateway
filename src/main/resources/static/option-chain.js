@@ -11,7 +11,21 @@
   const { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
   const h = React.createElement;
   const ROW_RENDER_THROTTLE_MS = 125;
-  const GEX_HISTORY_WINDOWS = ['10m', '30m', '1h', '4h', '8h'];
+  // GEX history popover time-slice windows are SOURCE-DEPENDENT. Unusual Whales publishes a full
+  // trading-day history (10m/30m/1h/4h/8h); the Databento 0DTE history service publishes tighter
+  // intraday slices (5m/15m/30m/1h/2h). Selecting per-source keeps each popover rendering exactly
+  // the windows its producer emits — changing one must never break the other.
+  const GEX_HISTORY_WINDOWS_BY_SOURCE = {
+    databento: ['5m', '15m', '30m', '1h', '2h'],
+    default: ['10m', '30m', '1h', '4h', '8h']
+  };
+  // Legacy alias (Unusual Whales windows) kept for any external reference / default callers.
+  const GEX_HISTORY_WINDOWS = GEX_HISTORY_WINDOWS_BY_SOURCE.default;
+  function gexHistoryWindowsForSource(source) {
+    return String(source || '').toUpperCase() === 'DATABENTO'
+      ? GEX_HISTORY_WINDOWS_BY_SOURCE.databento
+      : GEX_HISTORY_WINDOWS_BY_SOURCE.default;
+  }
   const runtimeEnv = window.__OPTIONS_EDGE_ENV__ || {};
 
   const defaultConfig = {
@@ -2779,14 +2793,14 @@
 	      uwGexTimeframe: String(payload?.timeframe || '1D').toUpperCase(),
 	      uwGexUpdatedAt: payload?.updatedAt,
       uwGexStaleAfterMs: Number(payload?.staleAfterMs || 90_000),
-      uwGexHistory: normalizeGexHistory(payload?.history)
+      uwGexHistory: normalizeGexHistory(payload?.history, payload?.source || payload?.marketDataSource)
     };
   }
 
-  function normalizeGexHistory(history) {
-    const source = history || {};
-    return GEX_HISTORY_WINDOWS.reduce((normalized, windowName) => {
-      const item = source[windowName];
+  function normalizeGexHistory(history, source) {
+    const map = history || {};
+    return gexHistoryWindowsForSource(source).reduce((normalized, windowName) => {
+      const item = map[windowName];
       normalized[windowName] = normalizeGexHistoryItem(item);
       return normalized;
     }, {});
@@ -2940,7 +2954,7 @@
 
 	  function gexHistoryRows(row) {
     const currentNetGex = Number(row?.uwNetGex || 0);
-    return GEX_HISTORY_WINDOWS.map(windowName => {
+    return gexHistoryWindowsForSource(row?.source || row?.marketDataSource).map(windowName => {
       const item = row?.uwGexHistory?.[windowName] || {};
       const historicalNetGex = Number(item.netGex);
       if (!Number.isFinite(historicalNetGex)) {

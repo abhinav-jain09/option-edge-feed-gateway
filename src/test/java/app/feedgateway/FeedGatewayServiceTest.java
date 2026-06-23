@@ -270,6 +270,43 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void databentoGexHistoryDerivesSameCacheKeyAsPlainGex() throws Exception {
+        // The merge of the databento gex-history `history` map onto the databento gex row hinges on
+        // BOTH records deriving the SAME cache key. The history record (a superset emitted by
+        // databento-gex-history-service) carries symbol|expiry|strike identical to the plain gex
+        // record, so gexCacheKey() lands them in the same gex-by-strike cache slot.
+        FeedGatewayService service = service();
+
+        String plainGex = "{\"source\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":6005,\"netGex\":-1.0}";
+        String gexHistory = "{\"source\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":6005,\"netGex\":-1.0,"
+                + "\"history\":{\"5m\":{\"window\":\"5m\",\"available\":true,\"netGex\":-2.0,\"delta\":1.0,\"direction\":\"UP\",\"sampledAt\":\"2026-06-23T19:54:00Z\"}}}";
+
+        String plainKey = gexCacheKey(service, plainGex, "fallbackA");
+        String historyKey = gexCacheKey(service, gexHistory, "fallbackB");
+        assertEquals("SPX|20260612|6005", plainKey);
+        assertEquals(plainKey, historyKey);
+    }
+
+    @Test
+    void databentoGexHistoryBindsOnJsonStateConsumersNotAvro() throws Exception {
+        // The databento gex HISTORY topic is JSON (databento-gex-history-service emits String/JSON),
+        // unlike the Avro databento gex topic. It must bind on the JSON state cache + live consumers
+        // (so its `history` map merges onto the gex rows) and must NOT appear on the Avro consumers.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        String historyBinding =
+                "topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding(\"DATABENTO\", \"gex-by-strike\"));";
+
+        for (String method : List.of("runJsonStateCacheConsumer", "runJsonStateLiveConsumer")) {
+            assertTrue(methodBody(source, method).contains(historyBinding),
+                    method + " must bind the DATABENTO gex-history topic (JSON)");
+        }
+        for (String method : List.of("runAvroCacheConsumer", "runAvroLiveConsumer")) {
+            assertFalse(methodBody(source, method).contains(historyBinding),
+                    method + " must NOT bind the DATABENTO gex-history topic (it is JSON, not Avro)");
+        }
+    }
+
+    @Test
     void paceCacheStoresSameStrikeSeparatelyBySource() throws Exception {
         FeedGatewayService service = service();
         Object ibkrBinding = topicBinding("IBKR", "pace");

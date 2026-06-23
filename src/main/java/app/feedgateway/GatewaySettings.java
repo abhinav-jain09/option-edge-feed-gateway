@@ -222,6 +222,15 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_GEX_TOPIC", "options.databento.gex.strike");
     }
 
+    /**
+     * Databento per-strike GEX history topic. JSON on the wire (the databento-gex-history Kafka
+     * Streams service emits enriched JSON: the gex fields + a {@code history} window map), unlike
+     * the Avro {@link #databentoGexTopic()}. Merged onto the same DATABENTO gex-by-strike rows.
+     */
+    public String databentoGexHistoryTopic() {
+        return value("KAFKA_DATABENTO_GEX_HISTORY_TOPIC", "options.databento.gex.strike.history");
+    }
+
     /** Databento per-(symbol,expiry) max-pain output topic. Independent of GEX; consumed only by the max-pain stream. */
     public String databentoMaxPainTopic() {
         return value("KAFKA_DATABENTO_MAXPAIN_TOPIC", "options.databento.maxpain");
