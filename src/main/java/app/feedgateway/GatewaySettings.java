@@ -190,6 +190,10 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_STRIKE_FLOW_TOPIC", "options.databento.strike-flow");
     }
 
+    public String databentoPaceMissionTopic() {
+        return value("KAFKA_DATABENTO_PACE_MISSION_TOPIC", "options.databento.pace.mission");
+    }
+
     public String ibkrVolumeSandwichTopic() {
         return value("KAFKA_IBKR_VOLUME_SANDWICH_CURRENT_TOPIC",
                 value("KAFKA_VOLUME_SANDWICH_CURRENT_TOPIC", "options.ibkr.volume-sandwich.current"));
