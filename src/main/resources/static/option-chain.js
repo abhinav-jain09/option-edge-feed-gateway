@@ -65,7 +65,6 @@
     const rowRenderPendingRef = useRef(false);
     const hpsfLastSignalKeyRef = useRef('');
     const hpsfPulseTimerRef = useRef(undefined);
-    const expiryAutoRolloverRef = useRef('');
 
     const [config, setConfig] = useState(defaultConfig);
     const [form, setForm] = useState(defaultConfig);
@@ -294,18 +293,10 @@
         });
     }, [applyConfigState]);
 
-    useEffect(() => {
-      if (!configReady || connectPending) return;
-      const rolloverExpiry = nextExpiryWhenMarketClosed(config.expiry);
-      if (!rolloverExpiry || rolloverExpiry === normalizeExpiry(config.expiry)) return;
-      const rolloverKey = `${config.marketDataSource}|${config.symbol}|${config.expiry}|${rolloverExpiry}`;
-      if (expiryAutoRolloverRef.current === rolloverKey) return;
-      expiryAutoRolloverRef.current = rolloverKey;
-      const nextForm = { ...config, expiry: rolloverExpiry };
-      setForm(nextForm);
-      setNotice(`Market is closed for ${formatExpiry(config.expiry)}. Loading next expiry ${formatExpiry(rolloverExpiry)}...`);
-      reconnect(nextForm);
-    }, [configReady, connectPending, config]);
+    // NOTE: no after-close expiry auto-rollover. The configured expiry (from /api/config, resolved by
+    // the deploy to the same chain date the Databento feed publishes) is authoritative. Advancing it
+    // on a local clock rule pointed the chain at a date the feed never publishes, blanking the UI
+    // after the 16:15 close. The expiry now advances only when the deploy re-resolves it.
 
     useEffect(() => {
       if (!configReady) return undefined;
@@ -2155,21 +2146,6 @@
       date.setUTCDate(date.getUTCDate() + 1);
     }
     return utcExpiry(date);
-  }
-
-  function nextExpiryWhenMarketClosed(expiry, now = new Date()) {
-    const normalized = nextWeekdayExpiry(expiry);
-    const marketNow = marketDateTimeParts(now);
-    if (!marketNow || !/^\d{8}$/.test(normalized)) return normalized;
-    const today = `${marketNow.year}${marketNow.month}${marketNow.day}`;
-    const currentExpiry = nextWeekdayExpiry(today);
-    if (normalized < currentExpiry) return currentExpiry;
-    if (normalized !== today) return normalized;
-    const marketMinute = marketNow.hour * 60 + marketNow.minute;
-    const closeMinute = MarketCalendar.isEarlyClose(today) ? 13 * 60 : 16 * 60 + 15;
-    const afterClose = marketMinute >= closeMinute;
-    if (!afterClose && isMarketExpiry(today)) return normalized;
-    return nextWeekdayExpiry(addUtcDays(normalized, 1));
   }
 
   function isMarketDate(date) {

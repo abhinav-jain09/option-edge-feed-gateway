@@ -2,21 +2,16 @@ package app.feedgateway;
 
 import org.springframework.stereotype.Component;
 
-import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 
 @Component
 public final class GatewaySettings {
     private static final String DEFAULT_BOOTSTRAP_SERVERS = "192.168.100.252:9092,192.168.100.252:9094,192.168.100.252:9096";
     private static final String DEFAULT_SCHEMA_REGISTRY_URL = "http://192.168.100.252:8082";
-    private static final DateTimeFormatter IB_EXPIRY_FORMAT = DateTimeFormatter.BASIC_ISO_DATE;
     private static final ZoneId MARKET_TIME_ZONE = ZoneId.of("America/New_York");
-    private static final LocalTime OPTION_EXPIRY_ROLLOVER_TIME = LocalTime.of(16, 15);
 
     public boolean enabled() {
         return boolValue("KAFKA_ENABLED", true);
@@ -150,7 +145,12 @@ public final class GatewaySettings {
     }
 
     public String initialExpiry() {
-        return normalizeMarketExpiry(value("IB_EXPIRY", ""));
+        // Honor the deploy-resolved IB_EXPIRY verbatim. The deploy sets it to the same chain date the
+        // Databento feed publishes (DATABENTO_EXPIRY); advancing it on a local clock rule (the old
+        // 16:15 rollover) pointed the gateway's default selection at a date the feed never publishes,
+        // so the option chain went empty after the close. The expiry now advances only when the
+        // deploy re-resolves it, keeping gateway and feed locked to the same date.
+        return normalizeExpiry(value("IB_EXPIRY", ""));
     }
 
     public String ibkrDisplayTopic() {
@@ -596,35 +596,5 @@ public final class GatewaySettings {
 
     public static String normalizeExpiry(String expiry) {
         return expiry == null ? "" : expiry.trim().replace("-", "");
-    }
-
-    static String normalizeMarketExpiry(String expiry) {
-        return normalizeMarketExpiry(expiry, ZonedDateTime.now(MARKET_TIME_ZONE));
-    }
-
-    static String normalizeMarketExpiry(String expiry, ZonedDateTime marketNow) {
-        String normalized = normalizeExpiry(expiry);
-        if (normalized.length() != 8) {
-            return normalized;
-        }
-        try {
-            LocalDate date = LocalDate.parse(normalized, IB_EXPIRY_FORMAT);
-            LocalDate nextExpiry = nextWeekday(date);
-            if (nextExpiry.equals(marketNow.toLocalDate())
-                    && !marketNow.toLocalTime().isBefore(OPTION_EXPIRY_ROLLOVER_TIME)) {
-                nextExpiry = nextWeekday(nextExpiry.plusDays(1));
-            }
-            return nextExpiry.format(IB_EXPIRY_FORMAT);
-        } catch (DateTimeParseException ignored) {
-            return normalized;
-        }
-    }
-
-    private static LocalDate nextWeekday(LocalDate date) {
-        LocalDate value = date;
-        while (value.getDayOfWeek() == DayOfWeek.SATURDAY || value.getDayOfWeek() == DayOfWeek.SUNDAY) {
-            value = value.plusDays(1);
-        }
-        return value;
     }
 }
