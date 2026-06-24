@@ -63,6 +63,7 @@ class GatewayRecordMapperTest {
     void eventTypeMapping() {
         assertEquals(EventType.SNAPSHOT, GatewayRecordMapper.eventTypeFor("snapshot"));
         assertEquals(EventType.MISSION_PACE, GatewayRecordMapper.eventTypeFor("mission-pace"));
+        assertEquals(EventType.MISSION_CONTROL, GatewayRecordMapper.eventTypeFor("mission-control"));
         assertEquals(EventType.GEX_BY_STRIKE, GatewayRecordMapper.eventTypeFor("gex-by-strike"));
         assertEquals(EventType.MAX_PAIN, GatewayRecordMapper.eventTypeFor("max-pain"));
         assertNull(GatewayRecordMapper.eventTypeFor("hpsf-audit"));
