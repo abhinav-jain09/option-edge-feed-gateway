@@ -387,14 +387,14 @@ class FeedGatewayServiceTest {
     }
 
     @Test
-    void gatewayInitialExpiryRollsAfterOptionMarketClose() {
-        ZonedDateTime beforeClose = ZonedDateTime.of(2026, 6, 15, 15, 30, 0, 0,
-                ZoneId.of("America/New_York"));
-        ZonedDateTime afterClose = ZonedDateTime.of(2026, 6, 15, 16, 15, 0, 0,
-                ZoneId.of("America/New_York"));
-
-        assertEquals("20260615", GatewaySettings.normalizeMarketExpiry("20260615", beforeClose));
-        assertEquals("20260616", GatewaySettings.normalizeMarketExpiry("20260615", afterClose));
+    void gatewayInitialExpiryHonorsConfiguredDateWithoutClockRollover() {
+        // The gateway must mirror the deploy-resolved IB_EXPIRY (= the Databento feed's chain date)
+        // and never advance it on a local clock rule. A configured expiry is returned verbatim no
+        // matter the time of day, so the gateway's default selection and the feed stay on the same
+        // date — otherwise the chain points at a date the feed never publishes and goes empty.
+        withSystemProperty("IB_EXPIRY", "20260615", () ->
+                assertEquals("20260615", new GatewaySettings().initialExpiry()));
+        assertEquals("20260615", GatewaySettings.normalizeExpiry("2026-06-15"));
     }
 
     @Test
