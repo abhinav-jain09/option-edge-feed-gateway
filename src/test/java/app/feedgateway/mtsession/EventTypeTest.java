@@ -12,7 +12,7 @@ class EventTypeTest {
     @Test
     void contractScopedClassification() {
         for (EventType t : new EventType[]{EventType.SNAPSHOT, EventType.PACE, EventType.DIRECTIONAL_PRESSURE,
-                EventType.STRIKE_FLOW, EventType.VOLUME_SANDWICH, EventType.GEX_BY_STRIKE, EventType.MAX_PAIN}) {
+                EventType.STRIKE_FLOW, EventType.MISSION_PACE, EventType.VOLUME_SANDWICH, EventType.GEX_BY_STRIKE, EventType.MAX_PAIN}) {
             assertTrue(t.isContractScoped(), t + " should be contract-scoped");
             assertFalse(t.isUnderlying(), t + " should not be underlying");
         }

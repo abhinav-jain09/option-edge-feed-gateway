@@ -12,6 +12,7 @@ public enum EventType {
     PACE(Scope.CONTRACT),
     DIRECTIONAL_PRESSURE(Scope.CONTRACT),
     STRIKE_FLOW(Scope.CONTRACT),
+    MISSION_PACE(Scope.CONTRACT),
     VOLUME_SANDWICH(Scope.CONTRACT),
     GEX_BY_STRIKE(Scope.CONTRACT),
     // Max pain is a per-(symbol,expiry) aggregate (one value covers the whole chain), so it routes

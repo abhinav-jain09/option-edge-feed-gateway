@@ -79,6 +79,7 @@ public final class GatewayRecordMapper {
             case "pace" -> EventType.PACE;
             case "directional-pressure" -> EventType.DIRECTIONAL_PRESSURE;
             case "strike-flow" -> EventType.STRIKE_FLOW;
+            case "mission-pace" -> EventType.MISSION_PACE;
             case "volume-sandwich" -> EventType.VOLUME_SANDWICH;
             case "gex-by-strike" -> EventType.GEX_BY_STRIKE;
             case "max-pain" -> EventType.MAX_PAIN;
