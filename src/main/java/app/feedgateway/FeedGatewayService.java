@@ -1191,7 +1191,16 @@ public class FeedGatewayService implements ReplayRunner {
                         // Terminal EXPIRED returns a non-null key, so it still forwards once. Other events
                         // keep their existing unconditional per-session routing (this change is scoped to
                         // max-pain per the approved requirement).
-                        if (cacheKey != null || !"max-pain".equals(binding.event())) {
+                        //
+                        // Mission-pace fail-closed (freshness): mission-pace records carry no per-session
+                        // selectionEpoch (epoch 0 bypasses passesBarrier), so add an explicit maxStale
+                        // freshness gate — a STALE mission-pace frame must never reach a socket. A fresh
+                        // frame is routed by source|symbol|expiry, so it only reaches sockets that selected
+                        // this market. Full pre-selection epoch-gating additionally requires the producer
+                        // to stamp selectionEpoch (multi-tenant follow-up; per-session mode is off in dev).
+                        boolean missionPaceStale = "mission-pace".equals(binding.event())
+                                && !recordWithinMaxStale(record);
+                        if ((cacheKey != null || !"max-pain".equals(binding.event())) && !missionPaceStale) {
                             routeOrBroadcast(binding.source(), binding.event(), json);
                             forwardedEvents.incrementAndGet();
                         }
@@ -1541,6 +1550,18 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if ("index-price".equals(binding.event())) {
             return "DATABENTO".equals(selection.source()) && passesSelectionBarrier(record, selection);
+        }
+        if ("mission-pace".equals(binding.event())) {
+            // Mission-pace is a low-frequency, per-MARKET signal (symbol|expiry), not per-strike. The
+            // source-switch OFFSET barrier exists to suppress pre-switch high-frequency snapshot/gex/
+            // display records; applied to mission-pace it perpetually classifies fresh frames as
+            // pre-switch and drops them (inactiveDropped/sourceStale), so the page never receives
+            // data. Forward when the source matches, the frame is fresh (time barrier), and it
+            // matches the active market — matchesActiveSelection still enforces the symbol/expiry/
+            // source identity, so there is no cross-market or cross-source leak.
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
+                    && matchesActiveSelection(json, selection);
         }
         if (!binding.source().equals(selection.source())) {
             return false;
@@ -2063,7 +2084,12 @@ public class FeedGatewayService implements ReplayRunner {
                         .forEach(cachedEvents::add);
                 case "mission-pace" -> missionPaces.entrySet().stream()
                         .filter(entry -> isCacheFresh("mission-pace:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("mission-pace:" + entry.getKey(), selection))
+                        // Per-MARKET signal: keep the TIME/selected-at barrier (enforceMaxStale=true)
+                        // so a stale or pre-selection frame is never replayed, but DROP the per-strike
+                        // source-switch OFFSET barrier (enforceOffset=false) which otherwise blocks the
+                        // low-frequency mission-pace frame so the page never bootstraps on connect.
+                        // matchesCachedSelection below still enforces symbol/expiry/source identity.
+                        .filter(entry -> passesSelectionBarrier("mission-pace:" + entry.getKey(), selection, true, false))
                         .filter(entry -> "DATABENTO".equals(selection.source()))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
@@ -2248,6 +2274,12 @@ public class FeedGatewayService implements ReplayRunner {
             return false;
         }
         return passesOffsetBarrier(new TopicPartition(record.topic(), record.partition()), record.offset());
+    }
+
+    /** Selection-independent freshness: true when the record's event time is within maxStaleMs of now. */
+    private boolean recordWithinMaxStale(ConsumerRecord<?, ?> record) {
+        long maxStaleMs = settings.maxStaleMs();
+        return maxStaleMs <= 0L || cacheTimestamp(record) >= System.currentTimeMillis() - maxStaleMs;
     }
 
     private boolean passesSelectionTimeBarrier(long eventTimeMs, ActiveSelection selection) {
@@ -2577,7 +2609,14 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "pace", paces);
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
-        replayCacheMap(session, "mission-pace", missionPaces);
+        // mission-pace is intentionally NOT cache-replayed in per-session mode: its cached frames carry
+        // no per-session selectionEpoch (epoch 0 ⇒ they bypass passesBarrier), so replaying them could
+        // surface a pre-selection frame on connect. It is a fast per-market signal (~1 frame/sec), so a
+        // newly attached socket bootstraps from the next LIVE frame instead — which is routed by
+        // source|symbol|expiry and maxStale-gated (see the perSessionRouting branch in the JSON live
+        // consumer). Full pre-selection epoch-gating needs the producer to stamp selectionEpoch
+        // (multi-tenant follow-up). The legacy single-tenant cached send keeps mission-pace with the
+        // time/selected-at barrier — see cachedEvents().
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "max-pain", maxPain);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
