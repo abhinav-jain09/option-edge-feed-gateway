@@ -239,4 +239,35 @@ class FeedGatewayPerSessionBroadcastTest {
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("strike-flow"));
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("index-price"));
     }
+
+    @Test
+    void perSessionLiveMissionPaceRoutesOnlyToTheMatchingMarket() throws Exception {
+        // Per-session live mission-pace is contract-scoped (source|symbol|expiry): it reaches only the
+        // session that selected that exact market, with no cross-market leak.
+        routeOrBroadcast("DATABENTO", "mission-pace",
+                "{\"eventType\":\"mission-pace\",\"symbol\":\"SPX\",\"expiry\":\"20260612\","
+                        + "\"spot\":6004.8,\"rankedStrikes\":[]}");
+        assertEquals(1, u1.size(), "mission-pace reaches the SPX|20260612 session");
+        assertTrue(u2.isEmpty(), "mission-pace must not leak to the SPX|20260620 session");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void perSessionCachedMissionPaceIsNotReplayedOnConnect() throws Exception {
+        // mission-pace cached frames carry no per-session selectionEpoch, so they are deliberately NOT
+        // cache-replayed on connect (a newly attached socket bootstraps from the next live frame).
+        java.lang.reflect.Field f = FeedGatewayService.class.getDeclaredField("missionPaces");
+        f.setAccessible(true);
+        ((java.util.Map<String, String>) f.get(svc)).put("DATABENTO|SPX|20260612",
+                "{\"eventType\":\"mission-pace\",\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"rankedStrikes\":[]}");
+
+        engine.registerAppSession("app:u3", "u3",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260612", StrikeWindow.ALL), Set.of());
+        engine.attachSocket("app:u3", "s3");
+        List<String> u3 = new ArrayList<>();
+        svc.addClient(socket("s3", u3)); // triggers per-session cached replay
+
+        assertFalse(u3.stream().anyMatch(m -> m.contains("\"type\":\"mission-pace\"")),
+                "cached mission-pace must NOT be replayed on connect in per-session mode");
+    }
 }

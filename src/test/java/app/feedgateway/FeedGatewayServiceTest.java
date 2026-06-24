@@ -503,6 +503,58 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void missionPaceForwardsForActiveMarketDespiteSourceSwitchOffsetBarrier() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260612");
+        // A source-switch offset barrier sits ABOVE the record offset — this is the production
+        // condition that was silently dropping every fresh mission-pace frame (it is a low-frequency
+        // per-market signal, so its offset stays "below" the barrier captured at the last switch).
+        setOffsetBarrier(service, settings.databentoPaceMissionTopic(), 0, 100L);
+
+        String payload = "{\"eventType\":\"mission-pace\",\"symbol\":\"SPX\",\"expiry\":\"20260612\","
+                + "\"spot\":6004.8,\"timestampMs\":1,\"rankedStrikes\":[{\"strike\":6005,\"missionPaceScore\":91.4}]}";
+        Object binding = topicBinding("DATABENTO", "mission-pace");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.databentoPaceMissionTopic(), 0, 12L, "SPX|20260612", payload); // offset 12 < barrier 100
+
+        // Per-market signal must forward for the active market despite the per-strike offset barrier.
+        assertTrue(shouldForward(service, binding, payload, record),
+                "mission-pace for the active market must forward despite the source-switch offset barrier");
+
+        // Cross-market safety: a frame for a DIFFERENT expiry must NOT leak to the active selection.
+        String otherMarket = payload.replace("20260612", "20260613");
+        ConsumerRecord<String, String> otherRecord = new ConsumerRecord<>(
+                settings.databentoPaceMissionTopic(), 0, 13L, "SPX|20260613", otherMarket);
+        assertFalse(shouldForward(service, binding, otherMarket, otherRecord),
+                "mission-pace for a different market must not leak to the active selection");
+    }
+
+    @Test
+    void cachedMissionPaceReplayBypassesOffsetBarrierButKeepsTimeBarrier() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260612");
+        setOffsetBarrier(service, settings.databentoPaceMissionTopic(), 0, 100L);
+        String payload = "{\"eventType\":\"mission-pace\",\"symbol\":\"SPX\",\"expiry\":\"20260612\","
+                + "\"spot\":6004.8,\"timestampMs\":1,\"rankedStrikes\":[]}";
+        Object binding = topicBinding("DATABENTO", "mission-pace");
+        // No-timestamp record -> cacheTimestamp falls back to now, so the cached entry is FRESH.
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.databentoPaceMissionTopic(), 0, 12L, "SPX|20260612", payload); // offset 12 < barrier 100
+        updateCache(service, binding, record, payload);
+
+        // Fresh + offset barrier above the record offset -> still replayed (offset bypassed).
+        assertEquals(1, cachedEventCount(service, "mission-pace", System.currentTimeMillis()),
+                "fresh cached mission-pace must replay on connect despite the offset barrier");
+
+        // Older than maxStaleMs -> excluded (the time barrier is still enforced).
+        ageCacheEventTimes(service, "mission-pace:", System.currentTimeMillis() - 60_000L);
+        assertEquals(0, cachedEventCount(service, "mission-pace", System.currentTimeMillis()),
+                "stale cached mission-pace must NOT replay (time barrier enforced)");
+    }
+
+    @Test
     void cachedReplayOnConnectIncludesMissionPaceForMatchingDatabentoSelection() throws Exception {
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
@@ -1055,6 +1107,24 @@ class FeedGatewayServiceTest {
         Field field = FeedGatewayService.class.getDeclaredField("activeSelection");
         field.setAccessible(true);
         ((AtomicReference<Object>) field.get(service)).set(newActiveSelection(src, symbol, expiry));
+    }
+
+    private static int cachedEventCount(FeedGatewayService service, String event, long nowMs) throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod("cachedEvents", java.util.List.class, long.class);
+        m.setAccessible(true);
+        return ((java.util.List<?>) m.invoke(service, java.util.List.of(event), nowMs)).size();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void ageCacheEventTimes(FeedGatewayService service, String versionKeySubstr, long timeMs) throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("cacheEventTimes");
+        field.setAccessible(true);
+        java.util.Map<String, Long> map = (java.util.Map<String, Long>) field.get(service);
+        for (String key : map.keySet()) {
+            if (key.contains(versionKeySubstr)) {
+                map.put(key, timeMs);
+            }
+        }
     }
 
     /** Registers a synchronous recording WebSocketSession (untracked -> direct send) and captures payloads. */
