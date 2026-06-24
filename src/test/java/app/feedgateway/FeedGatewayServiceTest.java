@@ -28,7 +28,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "volume-sandwich", "gex-by-strike", "max-pain"),
+                List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -573,6 +573,108 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void missionControlGatewayContractConsumesCachesAndExposesUiBatchHealthAndMetrics() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        String payload = "{\"eventType\":\"mission-control\",\"symbol\":\"SPX\",\"expiry\":\"20260612\","
+                + "\"spot\":6004.8,\"timestampMs\":1,\"rankedStrikes\":[{\"strike\":6005,\"missionControlScore\":91.4}]}";
+        Object binding = topicBinding("DATABENTO", "mission-control");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.missionControlTopic(),
+                0,
+                12L,
+                "SPX|20260612",
+                payload
+        );
+
+        String cacheKey = updateCache(service, binding, record, payload);
+        String eventEnvelope = envelopeJson(service, "mission-control", payload);
+        String batchEnvelope = uiBatchEnvelopeJsonMissionControl(service, List.of(payload));
+
+        // Default topic resolves to the mission-control topic and binds on the JSON/state path.
+        assertEquals("options.spx.mission-control.current", settings.missionControlTopic());
+        assertTrue(source.contains("topicEvents.put(settings.missionControlTopic(), new TopicBinding(\"DATABENTO\", \"mission-control\"));"));
+        // Cache key is symbol|expiry (per-market, no strike — like max-pain). updateCache prepends the
+        // source, so the full slot is source|symbol|expiry.
+        assertEquals("DATABENTO|SPX|20260612", cacheKey);
+        assertTrue(eventEnvelope.contains("\"type\":\"mission-control\""));
+        assertTrue(batchEnvelope.contains("\"missionControls\":[{\"eventType\":\"mission-control\""));
+        assertTrue(service.healthJson().contains("\"missionControls\":1"));
+        assertTrue(service.metrics().contains("options_edge_feed_gateway_mission_controls 1"));
+    }
+
+    @Test
+    void missionControlForwardsForActiveMarketDespiteSourceSwitchOffsetBarrier() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260612");
+        // A source-switch offset barrier sits ABOVE the record offset — this is the production
+        // condition that was silently dropping every fresh mission-control frame (it is a low-frequency
+        // per-market signal, so its offset stays "below" the barrier captured at the last switch).
+        setOffsetBarrier(service, settings.missionControlTopic(), 0, 100L);
+
+        String payload = "{\"eventType\":\"mission-control\",\"symbol\":\"SPX\",\"expiry\":\"20260612\","
+                + "\"spot\":6004.8,\"timestampMs\":1,\"rankedStrikes\":[{\"strike\":6005,\"missionControlScore\":91.4}]}";
+        Object binding = topicBinding("DATABENTO", "mission-control");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.missionControlTopic(), 0, 12L, "SPX|20260612", payload); // offset 12 < barrier 100
+
+        // Per-market signal must forward for the active market despite the per-strike offset barrier.
+        assertTrue(shouldForward(service, binding, payload, record),
+                "mission-control for the active market must forward despite the source-switch offset barrier");
+
+        // Cross-market safety: a frame for a DIFFERENT expiry must NOT leak to the active selection.
+        String otherMarket = payload.replace("20260612", "20260613");
+        ConsumerRecord<String, String> otherRecord = new ConsumerRecord<>(
+                settings.missionControlTopic(), 0, 13L, "SPX|20260613", otherMarket);
+        assertFalse(shouldForward(service, binding, otherMarket, otherRecord),
+                "mission-control for a different market must not leak to the active selection");
+    }
+
+    @Test
+    void cachedMissionControlReplayBypassesOffsetBarrierButKeepsTimeBarrier() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260612");
+        setOffsetBarrier(service, settings.missionControlTopic(), 0, 100L);
+        String payload = "{\"eventType\":\"mission-control\",\"symbol\":\"SPX\",\"expiry\":\"20260612\","
+                + "\"spot\":6004.8,\"timestampMs\":1,\"rankedStrikes\":[]}";
+        Object binding = topicBinding("DATABENTO", "mission-control");
+        // No-timestamp record -> cacheTimestamp falls back to now, so the cached entry is FRESH.
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.missionControlTopic(), 0, 12L, "SPX|20260612", payload); // offset 12 < barrier 100
+        updateCache(service, binding, record, payload);
+
+        // Fresh + offset barrier above the record offset -> still replayed (offset bypassed).
+        assertEquals(1, cachedEventCount(service, "mission-control", System.currentTimeMillis()),
+                "fresh cached mission-control must replay on connect despite the offset barrier");
+
+        // Older than maxStaleMs -> excluded (the time barrier is still enforced).
+        ageCacheEventTimes(service, "mission-control:", System.currentTimeMillis() - 60_000L);
+        assertEquals(0, cachedEventCount(service, "mission-control", System.currentTimeMillis()),
+                "stale cached mission-control must NOT replay (time barrier enforced)");
+    }
+
+    @Test
+    void cachedReplayOnConnectIncludesMissionControlForMatchingDatabentoSelection() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String payload = "{\"eventType\":\"mission-control\",\"symbol\":\"SPX\",\"expiry\":\"20260612\","
+                + "\"spot\":6004.8,\"timestampMs\":1,\"rankedStrikes\":[{\"strike\":6005,\"missionControlScore\":91.4}]}";
+        updateCache(service, topicBinding("DATABENTO", "mission-control"),
+                recordAt(settings.missionControlTopic(), 0, 1L, "SPX|20260612", payload, now), payload);
+
+        setActiveSelection(service, "DATABENTO", "SPX", "20260612");
+        assertEquals(1, cachedEvents(service, List.of("mission-control"), now).size(),
+                "cached mission-control must replay to a freshly-connected DATABENTO client");
+
+        // Cached source-switch replay must include mission-control in its event list.
+        assertTrue(FeedGatewayService.sourceSwitchReplayEvents().contains("mission-control"));
+    }
+
+    @Test
     void databentoGexGatewayContractConsumesCachesAndExposesUiBatchHealthAndMetrics() throws Exception {
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
@@ -672,6 +774,20 @@ class FeedGatewayServiceTest {
             assertFalse(methodBody(source, method).contains(
                     "topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding(\"DATABENTO\", \"mission-pace\"));"),
                     method + " must NOT bind the DATABENTO mission-pace topic (it is JSON, not Avro)");
+        }
+        // Mission-control is genuinely JSON (String/JSON), like strike-flow: it must be in stringTopics, NOT Avro.
+        assertTrue(source.contains("stringTopics.put(settings.missionControlTopic(), \"mission-control\");"));
+        assertFalse(source.contains("avroTopics.put(settings.missionControlTopic(), \"mission-control\");"));
+        // JSON/string CACHE + LIVE consumers must bind the mission-control topic (it is JSON, not Avro).
+        for (String method : List.of("runJsonStateCacheConsumer", "runJsonStateLiveConsumer")) {
+            assertTrue(methodBody(source, method).contains(
+                    "topicEvents.put(settings.missionControlTopic(), new TopicBinding(\"DATABENTO\", \"mission-control\"));"),
+                    method + " must bind the DATABENTO mission-control topic (JSON)");
+        }
+        for (String method : List.of("runAvroCacheConsumer", "runAvroLiveConsumer")) {
+            assertFalse(methodBody(source, method).contains(
+                    "topicEvents.put(settings.missionControlTopic(), new TopicBinding(\"DATABENTO\", \"mission-control\"));"),
+                    method + " must NOT bind the DATABENTO mission-control topic (it is JSON, not Avro)");
         }
         // Legacy caught-up gating: max-pain (DATABENTO-only Avro) under avroCaughtUp; gex-by-strike
         // (multi-source) under BOTH flags.
@@ -1197,13 +1313,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1211,13 +1327,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1225,13 +1341,27 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), missionPaces, List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
+    private static String uiBatchEnvelopeJsonMissionControl(FeedGatewayService service, List<String> missionControls) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "uiBatchEnvelopeJson",
+                List.class, List.class, List.class, List.class, List.class, List.class,
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+        );
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), missionControls,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1245,13 +1375,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 }

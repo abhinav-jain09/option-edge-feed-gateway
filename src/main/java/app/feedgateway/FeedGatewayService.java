@@ -102,7 +102,7 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "directional-pressure", "strike-flow", "mission-pace", "volume-sandwich", "gex-by-strike",
+            "snapshot", "pace", "directional-pressure", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike",
             "max-pain",
             "index-price", "vix-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
@@ -112,6 +112,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
     private final Map<String, String> strikeFlows = new ConcurrentHashMap<>();
     private final Map<String, String> missionPaces = new ConcurrentHashMap<>();
+    private final Map<String, String> missionControls = new ConcurrentHashMap<>();
     private final Map<String, String> indexPrices = new ConcurrentHashMap<>();
     // P1 (VIX/underlying consistency): VIX is cached SEPARATELY from ES/index so each cache entry keeps its
     // ORIGINAL event type (vix-price vs index-price) on replay, instead of being flattened to index-price.
@@ -136,6 +137,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingDirectionalPressures = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeFlows = new LinkedHashMap<>();
     private final Map<String, String> pendingMissionPaces = new LinkedHashMap<>();
+    private final Map<String, String> pendingMissionControls = new LinkedHashMap<>();
     private final Map<String, String> pendingIndexPrices = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
@@ -356,7 +358,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "directional-pressure", "max-pain"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "mission-pace", "volume-sandwich"));
+            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich"));
         }
         // gex-by-strike is the one MULTI-SOURCE cache: IBKR/Unusual-Whales gex arrives via the JSON state
         // consumer while DATABENTO gex arrives via the Avro consumer. Its cached replay is only complete once
@@ -649,6 +651,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"missionPaces\":" + missionPaces.size() + ","
+                + "\"missionControls\":" + missionControls.size() + ","
                 + "\"indexPrices\":" + indexPrices.size() + ","
                 + "\"vixPrices\":" + vixPrices.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
@@ -728,6 +731,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_mission_paces Cached mission-pace count.\n"
                 + "# TYPE options_edge_feed_gateway_mission_paces gauge\n"
                 + "options_edge_feed_gateway_mission_paces " + missionPaces.size() + "\n"
+                + "# HELP options_edge_feed_gateway_mission_controls Cached mission-control count.\n"
+                + "# TYPE options_edge_feed_gateway_mission_controls gauge\n"
+                + "options_edge_feed_gateway_mission_controls " + missionControls.size() + "\n"
                 + "# HELP options_edge_feed_gateway_index_prices Cached index price count.\n"
                 + "# TYPE options_edge_feed_gateway_index_prices gauge\n"
                 + "options_edge_feed_gateway_index_prices " + indexPrices.size() + "\n"
@@ -897,6 +903,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding("DATABENTO", "mission-pace"));
+        topicEvents.put(settings.missionControlTopic(), new TopicBinding("DATABENTO", "mission-control"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -929,6 +936,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding("DATABENTO", "mission-pace"));
+        topicEvents.put(settings.missionControlTopic(), new TopicBinding("DATABENTO", "mission-control"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
@@ -1200,7 +1208,12 @@ public class FeedGatewayService implements ReplayRunner {
                         // to stamp selectionEpoch (multi-tenant follow-up; per-session mode is off in dev).
                         boolean missionPaceStale = "mission-pace".equals(binding.event())
                                 && !recordWithinMaxStale(record);
-                        if ((cacheKey != null || !"max-pain".equals(binding.event())) && !missionPaceStale) {
+                        // Mission-control fail-closed (freshness): mission-control is the analog low-frequency
+                        // per-MARKET signal (symbol|expiry, epoch 0 bypasses passesBarrier), so it gets the
+                        // same explicit maxStale gate — a STALE mission-control frame must never reach a socket.
+                        boolean missionControlStale = "mission-control".equals(binding.event())
+                                && !recordWithinMaxStale(record);
+                        if ((cacheKey != null || !"max-pain".equals(binding.event())) && !missionPaceStale && !missionControlStale) {
                             routeOrBroadcast(binding.source(), binding.event(), json);
                             forwardedEvents.incrementAndGet();
                         }
@@ -1521,6 +1534,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.databentoEsTradesTopic(),
                     settings.databentoStrikeFlowTopic(),
                     settings.databentoPaceMissionTopic(),
+                    settings.missionControlTopic(),
                     settings.databentoGexTopic(),
                     settings.databentoMaxPainTopic(),
                     settings.databentoVolumeSandwichTopic(),
@@ -1531,7 +1545,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     static List<String> sourceSwitchReplayEvents() {
-        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "volume-sandwich", "gex-by-strike", "max-pain");
+        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -1555,6 +1569,18 @@ public class FeedGatewayService implements ReplayRunner {
             // Mission-pace is a low-frequency, per-MARKET signal (symbol|expiry), not per-strike. The
             // source-switch OFFSET barrier exists to suppress pre-switch high-frequency snapshot/gex/
             // display records; applied to mission-pace it perpetually classifies fresh frames as
+            // pre-switch and drops them (inactiveDropped/sourceStale), so the page never receives
+            // data. Forward when the source matches, the frame is fresh (time barrier), and it
+            // matches the active market — matchesActiveSelection still enforces the symbol/expiry/
+            // source identity, so there is no cross-market or cross-source leak.
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
+                    && matchesActiveSelection(json, selection);
+        }
+        if ("mission-control".equals(binding.event())) {
+            // Mission-control is a low-frequency, per-MARKET signal (symbol|expiry), not per-strike. The
+            // source-switch OFFSET barrier exists to suppress pre-switch high-frequency snapshot/gex/
+            // display records; applied to mission-control it perpetually classifies fresh frames as
             // pre-switch and drops them (inactiveDropped/sourceStale), so the page never receives
             // data. Forward when the source matches, the frame is fresh (time barrier), and it
             // matches the active market — matchesActiveSelection still enforces the symbol/expiry/
@@ -1739,6 +1765,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = strikeFlowCacheKey(json, key);
         } else if ("mission-pace".equals(event)) {
             key = missionPaceCacheKey(json, key);
+        } else if ("mission-control".equals(event)) {
+            key = missionControlCacheKey(json, key);
         } else if ("gex-by-strike".equals(event)) {
             key = gexCacheKey(json, key);
         } else if ("max-pain".equals(event)) {
@@ -1815,6 +1843,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 missionPaces.put(key, json);
+                return key;
+            }
+            case "mission-control" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                missionControls.put(key, json);
                 return key;
             }
             case "volume-sandwich" -> {
@@ -2095,6 +2129,19 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("mission-pace", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "mission-control" -> missionControls.entrySet().stream()
+                        .filter(entry -> isCacheFresh("mission-control:" + entry.getKey(), nowMs))
+                        // Per-MARKET signal: keep the TIME/selected-at barrier (enforceMaxStale=true)
+                        // so a stale or pre-selection frame is never replayed, but DROP the per-strike
+                        // source-switch OFFSET barrier (enforceOffset=false) which otherwise blocks the
+                        // low-frequency mission-control frame so the page never bootstraps on connect.
+                        // matchesCachedSelection below still enforces symbol/expiry/source identity.
+                        .filter(entry -> passesSelectionBarrier("mission-control:" + entry.getKey(), selection, true, false))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("mission-control", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "volume-sandwich" -> currentStates.entrySet().stream()
                         .filter(entry -> "volume-sandwich".equals(eventFromCacheKey(entry.getKey())))
                         .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
@@ -2348,6 +2395,8 @@ public class FeedGatewayService implements ReplayRunner {
             strikeFlows.remove(versionKey.substring("strike-flow:".length()));
         } else if (versionKey.startsWith("mission-pace:")) {
             missionPaces.remove(versionKey.substring("mission-pace:".length()));
+        } else if (versionKey.startsWith("mission-control:")) {
+            missionControls.remove(versionKey.substring("mission-control:".length()));
         } else if (versionKey.startsWith("volume-sandwich:")) {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
@@ -2415,6 +2464,20 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private String missionPaceCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            if (!symbol.isBlank() && !expiry.isBlank()) {
+                return symbol + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    private String missionControlCacheKey(String json, String fallback) {
         try {
             JsonNode root = mapper.readTree(json);
             String symbol = text(root, "symbol").toUpperCase();
@@ -2617,6 +2680,14 @@ public class FeedGatewayService implements ReplayRunner {
         // consumer). Full pre-selection epoch-gating needs the producer to stamp selectionEpoch
         // (multi-tenant follow-up). The legacy single-tenant cached send keeps mission-pace with the
         // time/selected-at barrier — see cachedEvents().
+        // mission-control is intentionally NOT cache-replayed in per-session mode (same rationale as
+        // mission-pace above): its cached frames carry no per-session selectionEpoch (epoch 0 ⇒ they
+        // bypass passesBarrier), so replaying them could surface a pre-selection frame on connect. It is
+        // a fast per-market signal, so a newly attached socket bootstraps from the next LIVE frame
+        // instead — routed by source|symbol|expiry and maxStale-gated (see the perSessionRouting branch
+        // in the JSON live consumer). Full pre-selection epoch-gating needs the producer to stamp
+        // selectionEpoch (multi-tenant follow-up). The legacy single-tenant cached send keeps
+        // mission-control with the time/selected-at barrier — see cachedEvents().
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "max-pain", maxPain);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
@@ -2863,6 +2934,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.databentoMaxPainTopic(), "max-pain");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoPaceMissionTopic(), "mission-pace");
+                stringTopics.put(settings.missionControlTopic(), "mission-control");
                 stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
             } else {
                 avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
@@ -3557,6 +3629,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "directional-pressure" -> pendingDirectionalPressures;
             case "strike-flow" -> pendingStrikeFlows;
             case "mission-pace" -> pendingMissionPaces;
+            case "mission-control" -> pendingMissionControls;
             case "vix-price", "index-price" -> pendingIndexPrices;
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
@@ -3596,6 +3669,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingDirectionalPressures.values()),
                         new ArrayList<>(pendingStrikeFlows.values()),
                         new ArrayList<>(pendingMissionPaces.values()),
+                        new ArrayList<>(pendingMissionControls.values()),
                         new ArrayList<>(pendingIndexPrices.values()),
                         new ArrayList<>(pendingVolumeSandwiches.values()),
                         new ArrayList<>(pendingGexByStrike.values()),
@@ -3632,6 +3706,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingDirectionalPressures.size()
                 + pendingStrikeFlows.size()
                 + pendingMissionPaces.size()
+                + pendingMissionControls.size()
                 + pendingIndexPrices.size()
                 + pendingVolumeSandwiches.size()
                 + pendingGexByStrike.size()
@@ -3649,6 +3724,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingDirectionalPressures.clear();
         pendingStrikeFlows.clear();
         pendingMissionPaces.clear();
+        pendingMissionControls.clear();
         pendingIndexPrices.clear();
         pendingVolumeSandwiches.clear();
         pendingGexByStrike.clear();
@@ -3671,6 +3747,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> directionalPressureJsons = new ArrayList<>();
         List<String> strikeFlowJsons = new ArrayList<>();
         List<String> missionPaceJsons = new ArrayList<>();
+        List<String> missionControlJsons = new ArrayList<>();
         List<String> indexPriceJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
@@ -3687,6 +3764,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "directional-pressure" -> directionalPressureJsons.add(cachedEvent.json());
                 case "strike-flow" -> strikeFlowJsons.add(cachedEvent.json());
                 case "mission-pace" -> missionPaceJsons.add(cachedEvent.json());
+                case "mission-control" -> missionControlJsons.add(cachedEvent.json());
                 case "vix-price", "index-price" -> indexPriceJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
@@ -3707,6 +3785,7 @@ public class FeedGatewayService implements ReplayRunner {
                 directionalPressureJsons,
                 strikeFlowJsons,
                 missionPaceJsons,
+                missionControlJsons,
                 indexPriceJsons,
                 volumeSandwichJsons,
                 gexByStrikeJsons,
@@ -3725,6 +3804,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> directionalPressureJsons,
             List<String> strikeFlowJsons,
             List<String> missionPaceJsons,
+            List<String> missionControlJsons,
             List<String> indexPriceJsons,
             List<String> volumeSandwichJsons,
             List<String> gexByStrikeJsons,
@@ -3750,6 +3830,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"directionalPressures\":" + jsonArray(directionalPressureJsons) + ","
                 + "\"strikeFlows\":" + jsonArray(strikeFlowJsons) + ","
                 + "\"missionPaces\":" + jsonArray(missionPaceJsons) + ","
+                + "\"missionControls\":" + jsonArray(missionControlJsons) + ","
                 + "\"indexPrices\":" + jsonArray(indexPriceJsons) + ","
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
@@ -3788,6 +3869,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"missionPaces\":" + missionPaces.size() + ","
+                + "\"missionControls\":" + missionControls.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","

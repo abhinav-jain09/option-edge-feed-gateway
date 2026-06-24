@@ -270,4 +270,35 @@ class FeedGatewayPerSessionBroadcastTest {
         assertFalse(u3.stream().anyMatch(m -> m.contains("\"type\":\"mission-pace\"")),
                 "cached mission-pace must NOT be replayed on connect in per-session mode");
     }
+
+    @Test
+    void perSessionLiveMissionControlRoutesOnlyToTheMatchingMarket() throws Exception {
+        // Per-session live mission-control is contract-scoped (source|symbol|expiry): it reaches only the
+        // session that selected that exact market, with no cross-market leak.
+        routeOrBroadcast("DATABENTO", "mission-control",
+                "{\"eventType\":\"mission-control\",\"symbol\":\"SPX\",\"expiry\":\"20260612\","
+                        + "\"spot\":6004.8,\"rankedStrikes\":[]}");
+        assertEquals(1, u1.size(), "mission-control reaches the SPX|20260612 session");
+        assertTrue(u2.isEmpty(), "mission-control must not leak to the SPX|20260620 session");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void perSessionCachedMissionControlIsNotReplayedOnConnect() throws Exception {
+        // mission-control cached frames carry no per-session selectionEpoch, so they are deliberately NOT
+        // cache-replayed on connect (a newly attached socket bootstraps from the next live frame).
+        java.lang.reflect.Field f = FeedGatewayService.class.getDeclaredField("missionControls");
+        f.setAccessible(true);
+        ((java.util.Map<String, String>) f.get(svc)).put("DATABENTO|SPX|20260612",
+                "{\"eventType\":\"mission-control\",\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"rankedStrikes\":[]}");
+
+        engine.registerAppSession("app:u4", "u4",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260612", StrikeWindow.ALL), Set.of());
+        engine.attachSocket("app:u4", "s4");
+        List<String> u4 = new ArrayList<>();
+        svc.addClient(socket("s4", u4)); // triggers per-session cached replay
+
+        assertFalse(u4.stream().anyMatch(m -> m.contains("\"type\":\"mission-control\"")),
+                "cached mission-control must NOT be replayed on connect in per-session mode");
+    }
 }
