@@ -1,7 +1,7 @@
 @Library('oe') _
 
 pipeline {
-  agent any
+  agent { label 'mac' }
   parameters {
     choice(name: 'ENVIRONMENT', choices: ['dev', 'production'], description: 'Target environment — drives registry + build platform from oeProfile (single source of truth)')
     string(name: 'IMAGE_REGISTRY', defaultValue: '', description: 'Override registry. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers (e.g. bring-up-all).')
