@@ -10,6 +10,8 @@ pipeline {
     string(name: 'BUILD_PLATFORM', defaultValue: '', description: 'Override platform. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers.')
     string(name: 'CONTRACTS_BRANCH', defaultValue: 'main', description: 'options-edge-contracts branch to install before building the gateway')
     booleanParam(name: 'PUSH_IMAGE', defaultValue: true, description: 'Push built image to registry')
+    string(name: 'REMOTE_BUILD_HOST', defaultValue: '192.168.100.252', description: 'Production only: Linux amd64 host that performs native docker build/push. Dev remains local on the Mac.')
+    string(name: 'REMOTE_BUILD_ROOT', defaultValue: '/home/abhinav/ci/remote-builds', description: 'Production only: temporary remote workspace root for native Linux image builds.')
   }
   stages {
     stage('Resolve profile') {
@@ -148,7 +150,24 @@ EOF
           if [ -n "$DEV_TAG" ] && [ "$DEV_TAG" != "$TAG" ]; then
             TAG_ARGS="$TAG_ARGS -t $DEV_IMAGE"
           fi
-          if [ "$PUSH_IMAGE" = "true" ]; then
+          if [ "${ENVIRONMENT:-dev}" = "production" ] && [ "$PUSH_IMAGE" = "true" ]; then
+            remote_host="${REMOTE_BUILD_HOST:-192.168.100.252}"
+            remote_root="${REMOTE_BUILD_ROOT:-/home/abhinav/ci/remote-builds}"
+            remote_job="$(printf '%s' "${JOB_NAME:-options-edge-feed-gateway}" | tr '/ ' '__')"
+            remote_dir="$remote_root/$remote_job-${BUILD_NUMBER:-manual}"
+            remote="abhinav@$remote_host"
+            push_refs="$IMAGE"
+            if [ -n "${DEV_IMAGE_TAG:-}" ] && [ "${DEV_IMAGE_TAG:-}" != "$TAG" ]; then
+              push_refs="$push_refs $DEV_IMAGE"
+            fi
+            echo "Production image build runs natively on $remote_host ($BUILD_PLATFORM): $TAG_ARGS"
+            ssh "$remote" "rm -rf '$remote_dir' && mkdir -p '$remote_dir'"
+            rsync -az --delete \
+              --exclude '.git' \
+              --exclude '.deps/options-edge-contracts/.git' \
+              ./ "$remote:$remote_dir/"
+            ssh "$remote" "cd '$remote_dir' && docker build --no-cache $TAG_ARGS . && for ref in $push_refs; do docker push \"\$ref\"; done && rm -rf '$remote_dir'"
+          elif [ "$PUSH_IMAGE" = "true" ]; then
             docker buildx build --platform "$BUILD_PLATFORM" --no-cache $TAG_ARGS --push .
           else
             docker buildx build --platform "$BUILD_PLATFORM" --no-cache $TAG_ARGS --load .
