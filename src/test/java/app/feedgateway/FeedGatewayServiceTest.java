@@ -28,7 +28,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "max-pain"),
+                List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "strike-sr", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -789,10 +789,22 @@ class FeedGatewayServiceTest {
                     "topicEvents.put(settings.missionControlTopic(), new TopicBinding(\"DATABENTO\", \"mission-control\"));"),
                     method + " must NOT bind the DATABENTO mission-control topic (it is JSON, not Avro)");
         }
+        // Unified S/R (strike-sr) is DATABENTO-only Avro: bound in the Avro consumers + avroTopics,
+        // and NEVER in the JSON consumers.
+        assertTrue(source.contains("avroTopics.put(settings.unifiedSrTopic(), \"strike-sr\");"));
+        for (String method : List.of("runAvroCacheConsumer", "runAvroLiveConsumer")) {
+            assertTrue(methodBody(source, method).contains(
+                    "topicEvents.put(settings.unifiedSrTopic(), new TopicBinding(\"DATABENTO\", \"strike-sr\"));"),
+                    method + " must bind the unified S/R topic (Avro)");
+        }
+        for (String method : List.of("runJsonStateCacheConsumer", "runJsonStateLiveConsumer")) {
+            assertFalse(methodBody(source, method).contains("strike-sr"),
+                    method + " must NOT bind the unified S/R topic (it is Avro, not JSON)");
+        }
         // Legacy caught-up gating: max-pain (DATABENTO-only Avro) under avroCaughtUp; gex-by-strike
         // (multi-source) under BOTH flags.
         assertTrue(source.contains(
-                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"directional-pressure\", \"max-pain\"));"));
+                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"directional-pressure\", \"max-pain\", \"strike-sr\"));"));
         assertTrue(source.contains("if (avroCaughtUp.get() && stateCaughtUp.get()) {"));
         // gex legacy cached replay is source-aware (no hard IBKR-only filter).
         assertFalse(source.contains(".filter(entry -> \"IBKR\".equals(selection.source()))"));

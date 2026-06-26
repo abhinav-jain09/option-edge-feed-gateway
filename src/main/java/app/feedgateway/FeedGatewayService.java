@@ -103,6 +103,7 @@ public class FeedGatewayService implements ReplayRunner {
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
             "snapshot", "pace", "directional-pressure", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike",
+            "strike-sr",
             "max-pain",
             "index-price", "vix-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
@@ -120,6 +121,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> vixPrices = new ConcurrentHashMap<>();
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
+    private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> maxPain = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfLatestSignals = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfMarketFlows = new ConcurrentHashMap<>();
@@ -354,8 +356,8 @@ public class FeedGatewayService implements ReplayRunner {
             return;
         }
         if (avroCaughtUp.get()) {
-            // max-pain is DATABENTO-only and Avro on the wire, so it bootstraps purely via the Avro consumer.
-            sendCachedState(session, List.of("snapshot", "pace", "directional-pressure", "max-pain"));
+            // max-pain + strike-sr are DATABENTO-only Avro, so they bootstrap purely via the Avro consumer.
+            sendCachedState(session, List.of("snapshot", "pace", "directional-pressure", "max-pain", "strike-sr"));
         }
         if (stateCaughtUp.get()) {
             sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich"));
@@ -882,6 +884,7 @@ public class FeedGatewayService implements ReplayRunner {
         // Whales gex + gex-history stay on the JSON consumer below; those topics are genuinely JSON.)
         topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
+        topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -919,6 +922,7 @@ public class FeedGatewayService implements ReplayRunner {
         // (mirrors runAvroCacheConsumer; keep the cache + live consumer topic sets symmetric).
         topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
+        topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -1545,7 +1549,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     static List<String> sourceSwitchReplayEvents() {
-        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "max-pain");
+        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "strike-sr", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -1863,6 +1867,19 @@ public class FeedGatewayService implements ReplayRunner {
                 gexByStrike.put(key, json);
                 return key;
             }
+            case "strike-sr" -> {
+                // Compacted topic: a tombstone (null/blank value) retracts a level that dropped out —
+                // evict the cache entry so it is not replayed to new sessions, and do not forward.
+                if (json == null || json.isBlank()) {
+                    strikeSr.remove(key);
+                    removeCacheEntry(versionKey);
+                    return null;
+                }
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                strikeSr.put(key, json);
+                return key;
+            }
             case "max-pain" -> {
                 // EXPIRED terminal records evict the cache entry instead of caching them — a stale
                 // terminal must NEVER be replayed to a freshly-connected client. The live forward of
@@ -2162,6 +2179,15 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "strike-sr" -> strikeSr.entrySet().stream()
+                        // DATABENTO-only Avro per-bucket S/R map; same identity/selection isolation as gex.
+                        .filter(entry -> isCacheFresh("strike-sr:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("strike-sr:" + entry.getKey(), selection))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("strike-sr", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "max-pain" -> maxPain.entrySet().stream()
                         // DATABENTO-only stream: IBKR-selected sessions never receive max pain.
@@ -2932,6 +2958,7 @@ public class FeedGatewayService implements ReplayRunner {
                 // consistent across cache / live / replay).
                 avroTopics.put(settings.databentoGexTopic(), "gex-by-strike");
                 avroTopics.put(settings.databentoMaxPainTopic(), "max-pain");
+                avroTopics.put(settings.unifiedSrTopic(), "strike-sr");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoPaceMissionTopic(), "mission-pace");
                 stringTopics.put(settings.missionControlTopic(), "mission-control");
