@@ -2748,9 +2748,16 @@ public class FeedGatewayService implements ReplayRunner {
             return;
         }
         String socketId = session.getId();
+        long nowMs = System.currentTimeMillis();
         for (Map.Entry<String, String> entry : cache.entrySet()) {
             String json = entry.getValue();
             if (json == null || json.isBlank()) {
+                continue;
+            }
+            // Freshness gate for strike-sr (Codex): never replay an S/R bucket that crossed its TTL
+            // between purge ticks on per-session bootstrap / return-to-live. Scoped to strike-sr to
+            // preserve the established replay semantics of the other events.
+            if ("strike-sr".equals(event) && !isCacheFresh(event + ":" + entry.getKey(), nowMs)) {
                 continue;
             }
             try {
