@@ -1325,13 +1325,37 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
+    @Test
+    void uiBatchEnvelopeCarriesStrikeSrArrayKey() throws Exception {
+        FeedGatewayService service = service();
+        String json = "{\"messageType\":\"UNIFIED_SR_LEVEL\",\"symbol\":\"SPX\",\"bucketStrike\":6050.0,\"dominantSide\":\"RESISTANCE\"}";
+        String envelope = uiBatchEnvelopeJsonStrikeSr(service, List.of(json));
+        assertTrue(envelope.contains("\"strikeSr\":[" + json + "]"),
+                "batch envelope must carry the strikeSr array; was: " + envelope);
+        assertTrue(envelope.contains("\"gexByStrike\":[]"));
+    }
+
+    private static String uiBatchEnvelopeJsonStrikeSr(FeedGatewayService service, List<String> strikeSr) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "uiBatchEnvelopeJson",
+                List.class, List.class, List.class, List.class, List.class, List.class,
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+        );
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1339,13 +1363,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1353,13 +1377,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), missionPaces, List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1367,13 +1391,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), missionControls,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1387,13 +1411,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 }

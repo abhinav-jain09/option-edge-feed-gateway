@@ -83,6 +83,7 @@ public final class GatewayRecordMapper {
             case "mission-control" -> EventType.MISSION_CONTROL;
             case "volume-sandwich" -> EventType.VOLUME_SANDWICH;
             case "gex-by-strike" -> EventType.GEX_BY_STRIKE;
+            case "strike-sr" -> EventType.STRIKE_SR;
             case "max-pain" -> EventType.MAX_PAIN;
             case "vix-price" -> EventType.VIX_PRICE;
             case "index-price" -> EventType.INDEX_PRICE;

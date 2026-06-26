@@ -143,6 +143,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingIndexPrices = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
+    private final Map<String, String> pendingStrikeSr = new LinkedHashMap<>();
     private final Map<String, String> pendingMaxPain = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfLatestSignals = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfMarketFlows = new LinkedHashMap<>();
@@ -1089,6 +1090,7 @@ public class FeedGatewayService implements ReplayRunner {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
+                        evictStrikeSrTombstone(binding, record);
                         continue;
                     }
                     updateCache(binding, record, json);
@@ -1187,6 +1189,7 @@ public class FeedGatewayService implements ReplayRunner {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
+                        evictStrikeSrTombstone(binding, record);
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
@@ -1540,6 +1543,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.databentoPaceMissionTopic(),
                     settings.missionControlTopic(),
                     settings.databentoGexTopic(),
+                    settings.unifiedSrTopic(),
                     settings.databentoMaxPainTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic()
@@ -1682,6 +1686,25 @@ public class FeedGatewayService implements ReplayRunner {
 
     private boolean matchesActiveSelection(String json, ActiveSelection selection) {
         return matchesSelection(json, selection, true);
+    }
+
+    /**
+     * Evict a unified S/R level on a compacted-topic tombstone (null value). The consumer skips null
+     * json before {@link #updateCache}, so retraction is handled here: drop the cache entry so new
+     * sessions / cached replay no longer see the dropped level. Live sessions converge within the
+     * cache TTL (the level is no longer re-emitted). Only acts for the {@code strike-sr} event.
+     */
+    private void evictStrikeSrTombstone(TopicBinding binding, ConsumerRecord<String, Object> record) {
+        if (binding == null || !"strike-sr".equals(binding.event()) || record.value() != null) {
+            return;
+        }
+        if (record.key() == null || record.key().isBlank()) {
+            return;
+        }
+        String key = binding.source() + "|" + record.key();
+        if (strikeSr.remove(key) != null) {
+            removeCacheEntry("strike-sr:" + key);
+        }
     }
 
     private boolean matchesCachedSelection(String json, ActiveSelection selection) {
@@ -1868,13 +1891,8 @@ public class FeedGatewayService implements ReplayRunner {
                 return key;
             }
             case "strike-sr" -> {
-                // Compacted topic: a tombstone (null/blank value) retracts a level that dropped out —
-                // evict the cache entry so it is not replayed to new sessions, and do not forward.
-                if (json == null || json.isBlank()) {
-                    strikeSr.remove(key);
-                    removeCacheEntry(versionKey);
-                    return null;
-                }
+                // Per-bucket upsert. Compacted-topic tombstones (null value) never reach here (the
+                // consumer skips null json); they are evicted by evictStrikeSrTombstone() instead.
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 strikeSr.put(key, json);
@@ -3660,6 +3678,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "vix-price", "index-price" -> pendingIndexPrices;
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
+            case "strike-sr" -> pendingStrikeSr;
             case "max-pain" -> pendingMaxPain;
             case "hpsf-latest-signal" -> pendingHpsfLatestSignals;
             case "hpsf-market-flow" -> pendingHpsfMarketFlows;
@@ -3700,6 +3719,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingIndexPrices.values()),
                         new ArrayList<>(pendingVolumeSandwiches.values()),
                         new ArrayList<>(pendingGexByStrike.values()),
+                        new ArrayList<>(pendingStrikeSr.values()),
                         new ArrayList<>(pendingMaxPain.values()),
                         new ArrayList<>(pendingHpsfLatestSignals.values()),
                         new ArrayList<>(pendingHpsfMarketFlows.values()),
@@ -3737,6 +3757,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingIndexPrices.size()
                 + pendingVolumeSandwiches.size()
                 + pendingGexByStrike.size()
+                + pendingStrikeSr.size()
                 + pendingMaxPain.size()
                 + pendingHpsfLatestSignals.size()
                 + pendingHpsfMarketFlows.size()
@@ -3755,6 +3776,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingIndexPrices.clear();
         pendingVolumeSandwiches.clear();
         pendingGexByStrike.clear();
+        pendingStrikeSr.clear();
         pendingMaxPain.clear();
         pendingHpsfLatestSignals.clear();
         pendingHpsfMarketFlows.clear();
@@ -3778,6 +3800,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> indexPriceJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
+        List<String> strikeSrJsons = new ArrayList<>();
         List<String> maxPainJsons = new ArrayList<>();
         List<String> hpsfLatestSignalJsons = new ArrayList<>();
         List<String> hpsfMarketFlowJsons = new ArrayList<>();
@@ -3795,6 +3818,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "vix-price", "index-price" -> indexPriceJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
+                case "strike-sr" -> strikeSrJsons.add(cachedEvent.json());
                 case "max-pain" -> maxPainJsons.add(cachedEvent.json());
                 case "hpsf-latest-signal" -> hpsfLatestSignalJsons.add(cachedEvent.json());
                 case "hpsf-market-flow" -> hpsfMarketFlowJsons.add(cachedEvent.json());
@@ -3816,6 +3840,7 @@ public class FeedGatewayService implements ReplayRunner {
                 indexPriceJsons,
                 volumeSandwichJsons,
                 gexByStrikeJsons,
+                strikeSrJsons,
                 maxPainJsons,
                 hpsfLatestSignalJsons,
                 hpsfMarketFlowJsons,
@@ -3835,6 +3860,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> indexPriceJsons,
             List<String> volumeSandwichJsons,
             List<String> gexByStrikeJsons,
+            List<String> strikeSrJsons,
             List<String> maxPainJsons,
             List<String> hpsfLatestSignalJsons,
             List<String> hpsfMarketFlowJsons,
@@ -3861,6 +3887,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"indexPrices\":" + jsonArray(indexPriceJsons) + ","
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
+                + "\"strikeSr\":" + jsonArray(strikeSrJsons) + ","
                 + "\"maxPains\":" + jsonArray(maxPainJsons) + ","
                 + "\"hpsfLatestSignals\":" + jsonArray(hpsfLatestSignalJsons) + ","
                 + "\"hpsfMarketFlows\":" + jsonArray(hpsfMarketFlowJsons) + ","
