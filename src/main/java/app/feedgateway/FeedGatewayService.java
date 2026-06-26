@@ -2445,6 +2445,8 @@ public class FeedGatewayService implements ReplayRunner {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
+        } else if (versionKey.startsWith("strike-sr:")) {
+            strikeSr.remove(versionKey.substring("strike-sr:".length()));
         } else if (versionKey.startsWith("max-pain:")) {
             maxPain.remove(versionKey.substring("max-pain:".length()));
         } else if (versionKey.startsWith("hpsf-latest-signal:")) {
