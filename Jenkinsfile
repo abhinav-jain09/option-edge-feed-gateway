@@ -166,7 +166,9 @@ EOF
               --exclude '.git' \
               --exclude '.deps/options-edge-contracts/.git' \
               ./ "$remote:$remote_dir/"
-            ssh "$remote" "cd '$remote_dir' && docker build --no-cache $TAG_ARGS . && for ref in $push_refs; do docker push \"\$ref\"; done && rm -rf '$remote_dir'"
+            push_cmd=""
+            for ref in $push_refs; do push_cmd="$push_cmd && docker push '$ref'"; done
+            ssh "$remote" "cd '$remote_dir' && docker build --no-cache $TAG_ARGS . $push_cmd && rm -rf '$remote_dir'"
           elif [ "$PUSH_IMAGE" = "true" ]; then
             docker buildx build --platform "$BUILD_PLATFORM" --no-cache $TAG_ARGS --push .
           else
