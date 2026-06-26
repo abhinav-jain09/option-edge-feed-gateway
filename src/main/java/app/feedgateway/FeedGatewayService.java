@@ -2733,6 +2733,7 @@ public class FeedGatewayService implements ReplayRunner {
         // selectionEpoch (multi-tenant follow-up). The legacy single-tenant cached send keeps
         // mission-control with the time/selected-at barrier — see cachedEvents().
         replayCacheMap(session, "gex-by-strike", gexByStrike);
+        replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "max-pain", maxPain);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
         // as index-price — so a VIX record is never delivered mislabelled as index-price.
