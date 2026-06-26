@@ -33,6 +33,20 @@ class GatewayRecordMapperTest {
     }
 
     @Test
+    void mapsUnifiedSrLevelAsContractEventWithStrikeAndExpiry() throws Exception {
+        // The real UNIFIED_SR_LEVEL payload (producer PR #131) carries symbol/marketDataSource/
+        // expiry/strike(=bucketStrike)/bucketStrike — proving strike-sr routes + strike-window filters.
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "strike-sr",
+                node("{\"messageType\":\"UNIFIED_SR_LEVEL\",\"symbol\":\"SPX\",\"marketDataSource\":\"DATABENTO\","
+                        + "\"expiry\":\"20260619\",\"sessionDate\":\"20260619\",\"strike\":6050.0,"
+                        + "\"bucketStrike\":6050.0,\"dominantSide\":\"RESISTANCE\"}")).orElseThrow();
+        assertEquals(EventType.STRIKE_SR, rec.eventType());
+        assertEquals("SPX", rec.symbol());
+        assertEquals("20260619", rec.expiry());
+        assertEquals(6050.0, rec.strike().getAsDouble());
+    }
+
+    @Test
     void mapsUnderlyingEventWithoutSymbolStrike() throws Exception {
         RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "vix-price",
                 node("{\"value\":18.2}")).orElseThrow();
