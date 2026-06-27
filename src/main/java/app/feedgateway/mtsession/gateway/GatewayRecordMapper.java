@@ -77,6 +77,7 @@ public final class GatewayRecordMapper {
         return switch (event) {
             case "snapshot" -> EventType.SNAPSHOT;
             case "pace" -> EventType.PACE;
+            case "pace-rank" -> EventType.PACE_RANK;
             case "directional-pressure" -> EventType.DIRECTIONAL_PRESSURE;
             case "strike-flow" -> EventType.STRIKE_FLOW;
             case "mission-pace" -> EventType.MISSION_PACE;
