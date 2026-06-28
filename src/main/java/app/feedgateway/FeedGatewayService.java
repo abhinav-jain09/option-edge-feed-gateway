@@ -102,13 +102,14 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "directional-pressure", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike",
             "max-pain",
             "index-price", "vix-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
     private final SessionRoutingEngine routingEngine;
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
+    private final Map<String, String> paceRanks = new ConcurrentHashMap<>(); // board-level pace ranking, keyed by boardKey
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
     private final Map<String, String> strikeFlows = new ConcurrentHashMap<>();
     private final Map<String, String> missionPaces = new ConcurrentHashMap<>();
@@ -134,6 +135,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Object batchLock = new Object();
     private final Map<String, String> pendingSnapshots = new LinkedHashMap<>();
     private final Map<String, String> pendingPaces = new LinkedHashMap<>();
+    private final Map<String, String> pendingPaceRanks = new LinkedHashMap<>();
     private final Map<String, String> pendingDirectionalPressures = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeFlows = new LinkedHashMap<>();
     private final Map<String, String> pendingMissionPaces = new LinkedHashMap<>();
@@ -355,7 +357,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (avroCaughtUp.get()) {
             // max-pain is DATABENTO-only and Avro on the wire, so it bootstraps purely via the Avro consumer.
-            sendCachedState(session, List.of("snapshot", "pace", "directional-pressure", "max-pain"));
+            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain"));
         }
         if (stateCaughtUp.get()) {
             sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich"));
@@ -648,6 +650,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"outboundDroppedOnClose\":" + wsDroppedOnClose.get() + ","
                 + "\"snapshots\":" + snapshots.size() + ","
                 + "\"paces\":" + paces.size() + ","
+                + "\"paceRanks\":" + paceRanks.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"missionPaces\":" + missionPaces.size() + ","
@@ -722,6 +725,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_paces Cached pace count.\n"
                 + "# TYPE options_edge_feed_gateway_paces gauge\n"
                 + "options_edge_feed_gateway_paces " + paces.size() + "\n"
+                + "# HELP options_edge_feed_gateway_pace_ranks Cached pace-rank board count.\n"
+                + "# TYPE options_edge_feed_gateway_pace_ranks gauge\n"
+                + "options_edge_feed_gateway_pace_ranks " + paceRanks.size() + "\n"
                 + "# HELP options_edge_feed_gateway_directional_pressures Cached directional-pressure count.\n"
                 + "# TYPE options_edge_feed_gateway_directional_pressures gauge\n"
                 + "options_edge_feed_gateway_directional_pressures " + directionalPressures.size() + "\n"
@@ -872,9 +878,11 @@ public class FeedGatewayService implements ReplayRunner {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.ibkrDisplayTopic(), new TopicBinding("IBKR", "snapshot"));
         topicEvents.put(settings.ibkrPaceTopic(), new TopicBinding("IBKR", "pace"));
+        topicEvents.put(settings.ibkrPaceRankTopic(), new TopicBinding("IBKR", "pace-rank"));
         topicEvents.put(settings.ibkrDirectionalPressureTopic(), new TopicBinding("IBKR", "directional-pressure"));
         topicEvents.put(settings.databentoDisplayTopic(), new TopicBinding("DATABENTO", "snapshot"));
         topicEvents.put(settings.databentoPaceTopic(), new TopicBinding("DATABENTO", "pace"));
+        topicEvents.put(settings.databentoPaceRankTopic(), new TopicBinding("DATABENTO", "pace-rank"));
         topicEvents.put(settings.databentoDirectionalPressureTopic(), new TopicBinding("DATABENTO", "directional-pressure"));
         // DATABENTO gex + max-pain are Avro on the wire (Confluent schema-registry framed, like
         // display/pace), so they MUST be consumed via the Avro deserializer — reading them as JSON yields a
@@ -911,9 +919,11 @@ public class FeedGatewayService implements ReplayRunner {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.ibkrDisplayTopic(), new TopicBinding("IBKR", "snapshot"));
         topicEvents.put(settings.ibkrPaceTopic(), new TopicBinding("IBKR", "pace"));
+        topicEvents.put(settings.ibkrPaceRankTopic(), new TopicBinding("IBKR", "pace-rank"));
         topicEvents.put(settings.ibkrDirectionalPressureTopic(), new TopicBinding("IBKR", "directional-pressure"));
         topicEvents.put(settings.databentoDisplayTopic(), new TopicBinding("DATABENTO", "snapshot"));
         topicEvents.put(settings.databentoPaceTopic(), new TopicBinding("DATABENTO", "pace"));
+        topicEvents.put(settings.databentoPaceRankTopic(), new TopicBinding("DATABENTO", "pace-rank"));
         topicEvents.put(settings.databentoDirectionalPressureTopic(), new TopicBinding("DATABENTO", "directional-pressure"));
         // DATABENTO gex + max-pain are Avro on the wire — live-consume them via the Avro deserializer too
         // (mirrors runAvroCacheConsumer; keep the cache + live consumer topic sets symmetric).
@@ -1517,6 +1527,7 @@ public class FeedGatewayService implements ReplayRunner {
             return List.of(
                     settings.ibkrDisplayTopic(),
                     settings.ibkrPaceTopic(),
+                    settings.ibkrPaceRankTopic(),
                     settings.ibkrDirectionalPressureTopic(),
                     settings.ibkrVixPriceTopic(),
                     settings.ibkrVolumeSandwichTopic(),
@@ -1529,6 +1540,7 @@ public class FeedGatewayService implements ReplayRunner {
             return List.of(
                     settings.databentoDisplayTopic(),
                     settings.databentoPaceTopic(),
+                    settings.databentoPaceRankTopic(),
                     settings.databentoDirectionalPressureTopic(),
                     settings.ibkrVixPriceTopic(),
                     settings.databentoEsTradesTopic(),
@@ -1545,7 +1557,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     static List<String> sourceSwitchReplayEvents() {
-        return List.of("snapshot", "pace", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "max-pain");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -1772,7 +1784,8 @@ public class FeedGatewayService implements ReplayRunner {
         } else if ("max-pain".equals(event)) {
             key = maxPainCacheKey(json, key);
         }
-        if (!"pace".equals(event)) {
+        if (!"pace".equals(event) && !"pace-rank".equals(event)) {
+            // pace-rank's record key is already the epoch-qualified boardKey (includes source) — don't re-prefix.
             key = binding.source() + "|" + key;
         }
         String versionKey = event + ":" + key;
@@ -1813,6 +1826,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 paces.put(key, json);
+                return key;
+            }
+            case "pace-rank" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                paceRanks.put(key, json); // one compact board record per boardKey (latest-wins)
                 return key;
             }
             case "directional-pressure" -> {
@@ -2087,6 +2106,13 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("pace", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "pace-rank" -> paceRanks.entrySet().stream()
+                        .filter(entry -> isCacheFresh("pace-rank:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("pace-rank:" + entry.getKey(), selection))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("pace-rank", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "directional-pressure" -> directionalPressures.entrySet().stream()
                         .filter(entry -> isCacheFresh("directional-pressure:" + entry.getKey(), nowMs))
@@ -2383,6 +2409,8 @@ public class FeedGatewayService implements ReplayRunner {
         cachePositions.remove(versionKey);
         if (versionKey.startsWith("snapshot:")) {
             snapshots.remove(versionKey.substring("snapshot:".length()));
+        } else if (versionKey.startsWith("pace-rank:")) {
+            paceRanks.remove(versionKey.substring("pace-rank:".length()));
         } else if (versionKey.startsWith("pace:")) {
             paces.remove(versionKey.substring("pace:".length()));
         } else if (versionKey.startsWith("directional-pressure:")) {
@@ -2670,6 +2698,7 @@ public class FeedGatewayService implements ReplayRunner {
     private void replayCachedToSocket(WebSocketSession session) {
         replayCacheMap(session, "snapshot", snapshots);
         replayCacheMap(session, "pace", paces);
+        replayCacheMap(session, "pace-rank", paceRanks);
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
         // mission-pace is intentionally NOT cache-replayed in per-session mode: its cached frames carry
@@ -2926,6 +2955,7 @@ public class FeedGatewayService implements ReplayRunner {
             if (source == MarketDataSource.DATABENTO) {
                 avroTopics.put(settings.databentoDisplayTopic(), "snapshot");
                 avroTopics.put(settings.databentoPaceTopic(), "pace");
+                avroTopics.put(settings.databentoPaceRankTopic(), "pace-rank");
                 avroTopics.put(settings.databentoDirectionalPressureTopic(), "directional-pressure");
                 // DATABENTO gex + max-pain are Avro on the wire — replay them via the Avro reader too, so a
                 // historical replay reproduces them exactly like the live Avro path (keep classification
@@ -2939,6 +2969,7 @@ public class FeedGatewayService implements ReplayRunner {
             } else {
                 avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
                 avroTopics.put(settings.ibkrPaceTopic(), "pace");
+                avroTopics.put(settings.ibkrPaceRankTopic(), "pace-rank");
                 avroTopics.put(settings.ibkrDirectionalPressureTopic(), "directional-pressure");
                 stringTopics.put(settings.ibkrUnusualWhalesGexTopic(), "gex-by-strike");
                 stringTopics.put(settings.ibkrVixPriceTopic(), "vix-price");
@@ -3626,6 +3657,7 @@ public class FeedGatewayService implements ReplayRunner {
         return switch (event) {
             case "snapshot" -> pendingSnapshots;
             case "pace" -> pendingPaces;
+            case "pace-rank" -> pendingPaceRanks;
             case "directional-pressure" -> pendingDirectionalPressures;
             case "strike-flow" -> pendingStrikeFlows;
             case "mission-pace" -> pendingMissionPaces;
@@ -3666,6 +3698,7 @@ public class FeedGatewayService implements ReplayRunner {
                 envelope = uiBatchEnvelopeJson(
                         new ArrayList<>(pendingSnapshots.values()),
                         new ArrayList<>(pendingPaces.values()),
+                        new ArrayList<>(pendingPaceRanks.values()),
                         new ArrayList<>(pendingDirectionalPressures.values()),
                         new ArrayList<>(pendingStrikeFlows.values()),
                         new ArrayList<>(pendingMissionPaces.values()),
@@ -3703,6 +3736,7 @@ public class FeedGatewayService implements ReplayRunner {
     private int pendingEventCountLocked() {
         return pendingSnapshots.size()
                 + pendingPaces.size()
+                + pendingPaceRanks.size()
                 + pendingDirectionalPressures.size()
                 + pendingStrikeFlows.size()
                 + pendingMissionPaces.size()
@@ -3721,6 +3755,7 @@ public class FeedGatewayService implements ReplayRunner {
     private void clearPendingLocked() {
         pendingSnapshots.clear();
         pendingPaces.clear();
+        pendingPaceRanks.clear();
         pendingDirectionalPressures.clear();
         pendingStrikeFlows.clear();
         pendingMissionPaces.clear();
@@ -3744,6 +3779,7 @@ public class FeedGatewayService implements ReplayRunner {
     private String uiBatchEnvelopeJson(List<CachedEvent> cachedEvents) {
         List<String> snapshotJsons = new ArrayList<>();
         List<String> paceJsons = new ArrayList<>();
+        List<String> paceRankJsons = new ArrayList<>();
         List<String> directionalPressureJsons = new ArrayList<>();
         List<String> strikeFlowJsons = new ArrayList<>();
         List<String> missionPaceJsons = new ArrayList<>();
@@ -3761,6 +3797,7 @@ public class FeedGatewayService implements ReplayRunner {
             switch (cachedEvent.event()) {
                 case "snapshot" -> snapshotJsons.add(cachedEvent.json());
                 case "pace" -> paceJsons.add(cachedEvent.json());
+                case "pace-rank" -> paceRankJsons.add(cachedEvent.json());
                 case "directional-pressure" -> directionalPressureJsons.add(cachedEvent.json());
                 case "strike-flow" -> strikeFlowJsons.add(cachedEvent.json());
                 case "mission-pace" -> missionPaceJsons.add(cachedEvent.json());
@@ -3782,6 +3819,7 @@ public class FeedGatewayService implements ReplayRunner {
         return uiBatchEnvelopeJson(
                 snapshotJsons,
                 paceJsons,
+                paceRankJsons,
                 directionalPressureJsons,
                 strikeFlowJsons,
                 missionPaceJsons,
@@ -3801,6 +3839,7 @@ public class FeedGatewayService implements ReplayRunner {
     private String uiBatchEnvelopeJson(
             List<String> snapshotJsons,
             List<String> paceJsons,
+            List<String> paceRankJsons,
             List<String> directionalPressureJsons,
             List<String> strikeFlowJsons,
             List<String> missionPaceJsons,
@@ -3827,6 +3866,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"selectionEpoch\":" + selection.selectionEpoch() + ","
                 + "\"snapshots\":" + jsonArray(snapshotJsons) + ","
                 + "\"paces\":" + jsonArray(paceJsons) + ","
+                + "\"paceRanks\":" + jsonArray(paceRankJsons) + ","
                 + "\"directionalPressures\":" + jsonArray(directionalPressureJsons) + ","
                 + "\"strikeFlows\":" + jsonArray(strikeFlowJsons) + ","
                 + "\"missionPaces\":" + jsonArray(missionPaceJsons) + ","
@@ -3866,6 +3906,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"lastSelectedForwardAgeSeconds\":" + lastSelectedForwardAgeSeconds(selection) + ","
                 + "\"snapshots\":" + snapshots.size() + ","
                 + "\"paces\":" + paces.size() + ","
+                + "\"paceRanks\":" + paceRanks.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"missionPaces\":" + missionPaces.size() + ","

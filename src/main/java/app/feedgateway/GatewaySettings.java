@@ -169,6 +169,14 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_PACE_TOPIC", "options.databento.pace");
     }
 
+    public String ibkrPaceRankTopic() {
+        return value("KAFKA_IBKR_PACE_RANK_TOPIC", ibkrPaceTopic() + ".rank");
+    }
+
+    public String databentoPaceRankTopic() {
+        return value("KAFKA_DATABENTO_PACE_RANK_TOPIC", databentoPaceTopic() + ".rank");
+    }
+
     public String ibkrDirectionalPressureTopic() {
         return value("KAFKA_IBKR_DIRECTIONAL_PRESSURE_TOPIC",
                 value("KAFKA_DIRECTIONAL_PRESSURE_TOPIC", "options.ibkr.directional-pressure"));

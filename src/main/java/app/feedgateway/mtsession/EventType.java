@@ -10,6 +10,9 @@ package app.feedgateway.mtsession;
 public enum EventType {
     SNAPSHOT(Scope.CONTRACT),
     PACE(Scope.CONTRACT),
+    // Board-level pace ranking — one compact record per (symbol,expiry) chain, like MAX_PAIN: routes
+    // CONTRACT-scoped by source|symbol|expiry with NO strike filter (every session on the chain gets it).
+    PACE_RANK(Scope.CONTRACT),
     DIRECTIONAL_PRESSURE(Scope.CONTRACT),
     STRIKE_FLOW(Scope.CONTRACT),
     MISSION_PACE(Scope.CONTRACT),
