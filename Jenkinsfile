@@ -3,15 +3,16 @@
 pipeline {
   agent { label 'mac' }
   parameters {
-    choice(name: 'ENVIRONMENT', choices: ['dev', 'production'], description: 'Target environment — drives registry + build platform from oeProfile (single source of truth)')
+    choice(name: 'ENVIRONMENT', choices: ['dev', 'production', 'experiment'], description: 'Target environment — drives registry + build platform from oeProfile (single source of truth)')
     string(name: 'IMAGE_REGISTRY', defaultValue: '', description: 'Override registry. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers (e.g. bring-up-all).')
     string(name: 'IMAGE_TAG', defaultValue: '', description: 'Docker tag. Defaults to current git SHA.')
     string(name: 'DEV_IMAGE_TAG', defaultValue: 'dev', description: 'Also publish this mutable dev tag for the deploy job. Empty disables it.')
     string(name: 'BUILD_PLATFORM', defaultValue: '', description: 'Override platform. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers.')
     string(name: 'CONTRACTS_BRANCH', defaultValue: 'main', description: 'options-edge-contracts branch to install before building the gateway')
     booleanParam(name: 'PUSH_IMAGE', defaultValue: true, description: 'Push built image to registry')
-    string(name: 'REMOTE_BUILD_HOST', defaultValue: '192.168.100.252', description: 'Production only: Linux amd64 host that performs native docker build/push. Dev remains local on the Mac.')
-    string(name: 'REMOTE_BUILD_ROOT', defaultValue: '/home/abhinav/ci/remote-builds', description: 'Production only: temporary remote workspace root for native Linux image builds.')
+    string(name: 'REMOTE_BUILD_HOST', defaultValue: '', description: 'Override remote build host. Empty = per-env default (prod=192.168.100.252 amd64; experiment=192.168.100.2 .2 arm64). Dev builds locally.')
+    string(name: 'REMOTE_BUILD_USER', defaultValue: '', description: 'Override SSH user on the remote build host. Empty = per-env default (prod=abhinav; experiment=AMSKEL).')
+    string(name: 'REMOTE_BUILD_ROOT', defaultValue: '', description: 'Override remote workspace root. Empty = per-env default (prod=/home/abhinav/ci/remote-builds; experiment=/Users/rajuljain/ci/remote-builds).')
   }
   stages {
     stage('Resolve profile') {
@@ -29,7 +30,7 @@ pipeline {
           def normalize = { String r ->
             r?.toString()?.trim()?.toLowerCase()?.replaceFirst(/^https?:\/\//, '')?.replaceFirst(/\/+$/, '')
           }
-          def knownEnvs = ['dev', 'production']
+          def knownEnvs = ['dev', 'production', 'experiment']
           def insecure = knownEnvs.findAll { oeProfile(it).insecureRegistry }
                                   .collect { normalize(oeProfile(it).registry) }
           insecure += ['localhost:5001', '127.0.0.1:5001']   // loopback aliases of the dev registry
@@ -150,12 +151,24 @@ EOF
           if [ -n "$DEV_TAG" ] && [ "$DEV_TAG" != "$TAG" ]; then
             TAG_ARGS="$TAG_ARGS -t $DEV_IMAGE"
           fi
-          if [ "${ENVIRONMENT:-dev}" = "production" ] && [ "$PUSH_IMAGE" = "true" ]; then
-            remote_host="${REMOTE_BUILD_HOST:-192.168.100.252}"
-            remote_root="${REMOTE_BUILD_ROOT:-/home/abhinav/ci/remote-builds}"
+          # production AND experiment build natively on a remote host (command build, no binary
+          # copy): production -> Linux amd64 (.252); experiment -> the .2 box (arm64). The remote
+          # user/host are caller-supplied so the same path serves both (REMOTE_BUILD_USER/HOST).
+          if { [ "${ENVIRONMENT:-dev}" = "production" ] || [ "${ENVIRONMENT:-dev}" = "experiment" ]; } && [ "$PUSH_IMAGE" = "true" ]; then
+            # Per-env defaults (overridable via params). prod -> .252 amd64; experiment -> the .2 box arm64.
+            case "${ENVIRONMENT:-dev}" in
+              experiment) def_host=192.168.100.2;   def_user=AMSKEL;  def_root=/Users/rajuljain/ci/remote-builds ;;
+              *)          def_host=192.168.100.252; def_user=abhinav; def_root=/home/abhinav/ci/remote-builds ;;
+            esac
+            remote_host="${REMOTE_BUILD_HOST:-$def_host}"
+            remote_user="${REMOTE_BUILD_USER:-$def_user}"
+            remote_root="${REMOTE_BUILD_ROOT:-$def_root}"
+            case "$remote_user" in *[!a-zA-Z0-9._-]*|'') echo "invalid REMOTE_BUILD_USER: '$remote_user'" >&2; exit 1 ;; esac
+            case "$remote_host" in *[!a-zA-Z0-9.:_-]*|'') echo "invalid REMOTE_BUILD_HOST: '$remote_host'" >&2; exit 1 ;; esac
+            case "$remote_root" in *[!a-zA-Z0-9._/-]*|'') echo "invalid REMOTE_BUILD_ROOT: '$remote_root'" >&2; exit 1 ;; esac
             remote_job="$(printf '%s' "${JOB_NAME:-options-edge-feed-gateway}" | tr '/ ' '__')"
             remote_dir="$remote_root/$remote_job-${BUILD_NUMBER:-manual}"
-            remote="abhinav@$remote_host"
+            remote="$remote_user@$remote_host"
             push_refs="$IMAGE"
             if [ -n "${DEV_IMAGE_TAG:-}" ] && [ "${DEV_IMAGE_TAG:-}" != "$TAG" ]; then
               push_refs="$push_refs $DEV_IMAGE"
