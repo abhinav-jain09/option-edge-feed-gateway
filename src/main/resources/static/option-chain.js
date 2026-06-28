@@ -498,7 +498,14 @@
       () => [...rowsRef.current.values()].sort((a, b) => Number(a.strike) - Number(b.strike)),
       [rowsVersion]
 	    );
-	    const spot = latestSnapshot?.underlyingPrice ?? cachedData[0]?.underlyingPrice;
+	    // Spot SSOT P2 (design row 16): the displayed spot is the co-stamped canonicalSpot (the single
+	    // source of truth), falling back to the legacy underlyingPrice only when canonical is absent/<=0
+	    // (e.g. pre-P0 data). The gateway forwards canonicalSpot generically (AvroJson), so it is already
+	    // on the snapshot payload.
+	    const canonicalSpot = latestSnapshot?.canonicalSpot ?? cachedData[0]?.canonicalSpot;
+	    const spot = (typeof canonicalSpot === 'number' && canonicalSpot > 0)
+	        ? canonicalSpot
+	        : (latestSnapshot?.underlyingPrice ?? cachedData[0]?.underlyingPrice);
     const visibleMaxStrikes = isDatabentoMarketData(config) ? cachedData.length : form.maxStrikes ?? config.maxStrikes;
 	    const data = useMemo(
 	      () => stableActiveStrikeRows(cachedData, spot, visibleMaxStrikes, visibleStrikesRef),
