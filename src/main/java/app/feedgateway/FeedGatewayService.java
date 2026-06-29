@@ -45,6 +45,7 @@ import org.springframework.web.socket.WebSocketSession;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -78,6 +79,11 @@ public class FeedGatewayService implements ReplayRunner {
     private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
     private final GatewayMarketCalendar marketCalendar;
+    // The ET trading date the AUTO expiry last rolled to. Seeded from the initial selection; advanced by
+    // maybeAutoRollExpiry on each new trading day. A manual (control-topic) selection does NOT change it,
+    // so the manual pick holds for the day and the auto-roll resumes the next trading day. Only meaningful
+    // when settings.autoExpiry().
+    private volatile String autoRolledExpiry;
     private final ObjectMapper mapper;
     private final HpsfGatewayViewMapper hpsfViewMapper;
     private final Set<WebSocketSession> clients = new CopyOnWriteArraySet<>();
@@ -218,6 +224,7 @@ public class FeedGatewayService implements ReplayRunner {
         this.routingEngine = routingEngine;
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
         this.marketCalendar = settings.marketCalendar();
+        this.autoRolledExpiry = this.activeSelection.get().expiry();
     }
 
     /**
@@ -273,6 +280,9 @@ public class FeedGatewayService implements ReplayRunner {
                 Math.max(100L, settings.wsWriteDeadlineMs() / 2),
                 TimeUnit.MILLISECONDS
         );
+        // AUTO-expiry daily roll (no-op unless IB_EXPIRY is empty/AUTO). 60s cadence catches the overnight
+        // ET trading-date change well before the open; the date never changes mid-session.
+        batchExecutor.scheduleAtFixedRate(this::maybeAutoRollExpiry, 60L, 60L, TimeUnit.SECONDS);
     }
 
     private void enforceOutboundWriteDeadlines() {
@@ -1490,6 +1500,39 @@ public class FeedGatewayService implements ReplayRunner {
         System.out.println("Feed gateway selected market data source " + next.source()
                 + " " + next.symbol() + " " + next.expiry()
                 + " epoch=" + next.selectionEpoch());
+    }
+
+    /**
+     * AUTO-expiry daily roll: when the ET trading date advances, switch the active selection to the new
+     * date so the gateway's strict expiry filter stays locked to the date the Databento feed publishes
+     * (the feed self-rolls the same way). Reuses {@link #applySelection} — the SAME path as a control-topic
+     * selection — so the chain reset/replay/readiness behave identically. {@code autoRolledExpiry} guards it
+     * to fire once per new trading day, and a manual selection holds for the day (auto resumes next day).
+     * No-op when pinned to an explicit IB_EXPIRY. Scheduled every 60s; the date only changes overnight, so
+     * this is never a mid-session swap. A fresh ms epoch makes the rolled selection supersede prior ones.
+     */
+    private void maybeAutoRollExpiry() {
+        if (!settings.autoExpiry()) {
+            return;
+        }
+        String target;
+        try {
+            target = marketCalendar.currentTradingDate(Instant.now()).format(DateTimeFormatter.BASIC_ISO_DATE);
+        } catch (RuntimeException e) {
+            return; // a calendar hiccup must never kill the scheduled task
+        }
+        if (target.equals(autoRolledExpiry)) {
+            return; // same trading day, or a manual selection already holds for today
+        }
+        autoRolledExpiry = target;
+        ActiveSelection current = activeSelection.get();
+        if (target.equals(current.expiry())) {
+            return; // already serving the new date
+        }
+        long now = System.currentTimeMillis();
+        System.out.println("Feed gateway auto-rolling expiry " + current.expiry() + " -> " + target
+                + " (new ET trading day)");
+        applySelection(new ActiveSelection(current.source(), current.symbol(), target, now, now));
     }
 
     private Map<TopicPartition, Long> captureOffsetBarriers(ActiveSelection selection) {

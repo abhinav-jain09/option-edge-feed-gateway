@@ -66,6 +66,19 @@ public final class GatewayMarketCalendar {
         return !holidays.contains(date);
     }
 
+    /**
+     * The ET trading date for the given instant: that day if it is a trading day, else the most recent
+     * trading day (walk back over weekends/holidays). Mirrors the Databento feed's current_trading_date()
+     * so the gateway's AUTO expiry stays locked to the date the feed publishes.
+     */
+    public LocalDate currentTradingDate(Instant instant) {
+        LocalDate day = Objects.requireNonNull(instant, "instant").atZone(zone).toLocalDate();
+        while (!isTradingDay(day)) {
+            day = day.minusDays(1);
+        }
+        return day;
+    }
+
     public int holidayCount() {
         return holidays.size();
     }

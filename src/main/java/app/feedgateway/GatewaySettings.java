@@ -2,9 +2,11 @@ package app.feedgateway;
 
 import org.springframework.stereotype.Component;
 
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 
 @Component
@@ -145,12 +147,27 @@ public final class GatewaySettings {
     }
 
     public String initialExpiry() {
-        // Honor the deploy-resolved IB_EXPIRY verbatim. The deploy sets it to the same chain date the
-        // Databento feed publishes (DATABENTO_EXPIRY); advancing it on a local clock rule (the old
-        // 16:15 rollover) pointed the gateway's default selection at a date the feed never publishes,
-        // so the option chain went empty after the close. The expiry now advances only when the
-        // deploy re-resolves it, keeping gateway and feed locked to the same date.
-        return normalizeExpiry(value("IB_EXPIRY", ""));
+        // IB_EXPIRY empty or "AUTO" -> resolve the current ET trading date from the market calendar,
+        // mirroring the Databento feed's AUTO mode. The OLD static 16:15 rollover was removed because the
+        // feed did NOT roll, so advancing the gateway alone emptied the chain. The feed now self-rolls
+        // (options-edge-databento-feed AUTO), so the gateway rolls too — by the SAME calendar, to the SAME
+        // date — via FeedGatewayService.maybeAutoRollExpiry. An explicit yyyyMMdd still pins (verbatim),
+        // for replay or a manual override.
+        String configured = value("IB_EXPIRY", "");
+        if (isAutoExpiry(configured)) {
+            return marketCalendar().currentTradingDate(Instant.now())
+                    .format(DateTimeFormatter.BASIC_ISO_DATE);
+        }
+        return normalizeExpiry(configured);
+    }
+
+    /** True when IB_EXPIRY is empty or AUTO: the gateway resolves AND daily-rolls the expiry from the calendar. */
+    public boolean autoExpiry() {
+        return isAutoExpiry(value("IB_EXPIRY", ""));
+    }
+
+    private static boolean isAutoExpiry(String configured) {
+        return configured == null || configured.isBlank() || configured.trim().equalsIgnoreCase("AUTO");
     }
 
     public String ibkrDisplayTopic() {
