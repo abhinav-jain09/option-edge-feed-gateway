@@ -103,6 +103,7 @@ public class FeedGatewayService implements ReplayRunner {
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
             "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike",
+            "strike-sr",
             "max-pain",
             "index-price", "vix-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
@@ -121,6 +122,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> vixPrices = new ConcurrentHashMap<>();
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
+    private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> maxPain = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfLatestSignals = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfMarketFlows = new ConcurrentHashMap<>();
@@ -143,6 +145,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingIndexPrices = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
+    private final Map<String, String> pendingStrikeSr = new LinkedHashMap<>();
     private final Map<String, String> pendingMaxPain = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfLatestSignals = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfMarketFlows = new LinkedHashMap<>();
@@ -356,8 +359,8 @@ public class FeedGatewayService implements ReplayRunner {
             return;
         }
         if (avroCaughtUp.get()) {
-            // max-pain is DATABENTO-only and Avro on the wire, so it bootstraps purely via the Avro consumer.
-            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain"));
+            // max-pain + strike-sr are DATABENTO-only Avro, so they bootstrap purely via the Avro consumer.
+            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr"));
         }
         if (stateCaughtUp.get()) {
             sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich"));
@@ -890,6 +893,7 @@ public class FeedGatewayService implements ReplayRunner {
         // Whales gex + gex-history stay on the JSON consumer below; those topics are genuinely JSON.)
         topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
+        topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -929,6 +933,7 @@ public class FeedGatewayService implements ReplayRunner {
         // (mirrors runAvroCacheConsumer; keep the cache + live consumer topic sets symmetric).
         topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
+        topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -1095,6 +1100,7 @@ public class FeedGatewayService implements ReplayRunner {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
+                        evictStrikeSrTombstone(binding, record);
                         continue;
                     }
                     updateCache(binding, record, json);
@@ -1193,6 +1199,7 @@ public class FeedGatewayService implements ReplayRunner {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
+                        evictStrikeSrTombstone(binding, record);
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
@@ -1548,6 +1555,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.databentoPaceMissionTopic(),
                     settings.missionControlTopic(),
                     settings.databentoGexTopic(),
+                    settings.unifiedSrTopic(),
                     settings.databentoMaxPainTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic()
@@ -1557,7 +1565,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     static List<String> sourceSwitchReplayEvents() {
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "max-pain");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "strike-sr", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -1690,6 +1698,25 @@ public class FeedGatewayService implements ReplayRunner {
 
     private boolean matchesActiveSelection(String json, ActiveSelection selection) {
         return matchesSelection(json, selection, true);
+    }
+
+    /**
+     * Evict a unified S/R level on a compacted-topic tombstone (null value). The consumer skips null
+     * json before {@link #updateCache}, so retraction is handled here: drop the cache entry so new
+     * sessions / cached replay no longer see the dropped level. Live sessions converge within the
+     * cache TTL (the level is no longer re-emitted). Only acts for the {@code strike-sr} event.
+     */
+    private void evictStrikeSrTombstone(TopicBinding binding, ConsumerRecord<String, Object> record) {
+        if (binding == null || !"strike-sr".equals(binding.event()) || record.value() != null) {
+            return;
+        }
+        if (record.key() == null || record.key().isBlank()) {
+            return;
+        }
+        String key = binding.source() + "|" + record.key();
+        if (strikeSr.remove(key) != null) {
+            removeCacheEntry("strike-sr:" + key);
+        }
     }
 
     private boolean matchesCachedSelection(String json, ActiveSelection selection) {
@@ -1880,6 +1907,14 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gexByStrike.put(key, json);
+                return key;
+            }
+            case "strike-sr" -> {
+                // Per-bucket upsert. Compacted-topic tombstones (null value) never reach here (the
+                // consumer skips null json); they are evicted by evictStrikeSrTombstone() instead.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                strikeSr.put(key, json);
                 return key;
             }
             case "max-pain" -> {
@@ -2189,6 +2224,15 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "strike-sr" -> strikeSr.entrySet().stream()
+                        // DATABENTO-only Avro per-bucket S/R map; same identity/selection isolation as gex.
+                        .filter(entry -> isCacheFresh("strike-sr:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("strike-sr:" + entry.getKey(), selection))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("strike-sr", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "max-pain" -> maxPain.entrySet().stream()
                         // DATABENTO-only stream: IBKR-selected sessions never receive max pain.
                         // isCacheFresh is event-aware (12h max-pain window); the selection barrier relaxes
@@ -2429,6 +2473,8 @@ public class FeedGatewayService implements ReplayRunner {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
+        } else if (versionKey.startsWith("strike-sr:")) {
+            strikeSr.remove(versionKey.substring("strike-sr:".length()));
         } else if (versionKey.startsWith("max-pain:")) {
             maxPain.remove(versionKey.substring("max-pain:".length()));
         } else if (versionKey.startsWith("hpsf-latest-signal:")) {
@@ -2718,6 +2764,7 @@ public class FeedGatewayService implements ReplayRunner {
         // selectionEpoch (multi-tenant follow-up). The legacy single-tenant cached send keeps
         // mission-control with the time/selected-at barrier — see cachedEvents().
         replayCacheMap(session, "gex-by-strike", gexByStrike);
+        replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "max-pain", maxPain);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
         // as index-price — so a VIX record is never delivered mislabelled as index-price.
@@ -2730,9 +2777,16 @@ public class FeedGatewayService implements ReplayRunner {
             return;
         }
         String socketId = session.getId();
+        long nowMs = System.currentTimeMillis();
         for (Map.Entry<String, String> entry : cache.entrySet()) {
             String json = entry.getValue();
             if (json == null || json.isBlank()) {
+                continue;
+            }
+            // Freshness gate for strike-sr (Codex): never replay an S/R bucket that crossed its TTL
+            // between purge ticks on per-session bootstrap / return-to-live. Scoped to strike-sr to
+            // preserve the established replay semantics of the other events.
+            if ("strike-sr".equals(event) && !isCacheFresh(event + ":" + entry.getKey(), nowMs)) {
                 continue;
             }
             try {
@@ -2962,6 +3016,7 @@ public class FeedGatewayService implements ReplayRunner {
                 // consistent across cache / live / replay).
                 avroTopics.put(settings.databentoGexTopic(), "gex-by-strike");
                 avroTopics.put(settings.databentoMaxPainTopic(), "max-pain");
+                avroTopics.put(settings.unifiedSrTopic(), "strike-sr");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoPaceMissionTopic(), "mission-pace");
                 stringTopics.put(settings.missionControlTopic(), "mission-control");
@@ -3665,6 +3720,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "vix-price", "index-price" -> pendingIndexPrices;
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
+            case "strike-sr" -> pendingStrikeSr;
             case "max-pain" -> pendingMaxPain;
             case "hpsf-latest-signal" -> pendingHpsfLatestSignals;
             case "hpsf-market-flow" -> pendingHpsfMarketFlows;
@@ -3706,6 +3762,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingIndexPrices.values()),
                         new ArrayList<>(pendingVolumeSandwiches.values()),
                         new ArrayList<>(pendingGexByStrike.values()),
+                        new ArrayList<>(pendingStrikeSr.values()),
                         new ArrayList<>(pendingMaxPain.values()),
                         new ArrayList<>(pendingHpsfLatestSignals.values()),
                         new ArrayList<>(pendingHpsfMarketFlows.values()),
@@ -3744,6 +3801,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingIndexPrices.size()
                 + pendingVolumeSandwiches.size()
                 + pendingGexByStrike.size()
+                + pendingStrikeSr.size()
                 + pendingMaxPain.size()
                 + pendingHpsfLatestSignals.size()
                 + pendingHpsfMarketFlows.size()
@@ -3763,6 +3821,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingIndexPrices.clear();
         pendingVolumeSandwiches.clear();
         pendingGexByStrike.clear();
+        pendingStrikeSr.clear();
         pendingMaxPain.clear();
         pendingHpsfLatestSignals.clear();
         pendingHpsfMarketFlows.clear();
@@ -3787,6 +3846,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> indexPriceJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
+        List<String> strikeSrJsons = new ArrayList<>();
         List<String> maxPainJsons = new ArrayList<>();
         List<String> hpsfLatestSignalJsons = new ArrayList<>();
         List<String> hpsfMarketFlowJsons = new ArrayList<>();
@@ -3805,6 +3865,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "vix-price", "index-price" -> indexPriceJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
+                case "strike-sr" -> strikeSrJsons.add(cachedEvent.json());
                 case "max-pain" -> maxPainJsons.add(cachedEvent.json());
                 case "hpsf-latest-signal" -> hpsfLatestSignalJsons.add(cachedEvent.json());
                 case "hpsf-market-flow" -> hpsfMarketFlowJsons.add(cachedEvent.json());
@@ -3827,6 +3888,7 @@ public class FeedGatewayService implements ReplayRunner {
                 indexPriceJsons,
                 volumeSandwichJsons,
                 gexByStrikeJsons,
+                strikeSrJsons,
                 maxPainJsons,
                 hpsfLatestSignalJsons,
                 hpsfMarketFlowJsons,
@@ -3847,6 +3909,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> indexPriceJsons,
             List<String> volumeSandwichJsons,
             List<String> gexByStrikeJsons,
+            List<String> strikeSrJsons,
             List<String> maxPainJsons,
             List<String> hpsfLatestSignalJsons,
             List<String> hpsfMarketFlowJsons,
@@ -3874,6 +3937,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"indexPrices\":" + jsonArray(indexPriceJsons) + ","
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
+                + "\"strikeSr\":" + jsonArray(strikeSrJsons) + ","
                 + "\"maxPains\":" + jsonArray(maxPainJsons) + ","
                 + "\"hpsfLatestSignals\":" + jsonArray(hpsfLatestSignalJsons) + ","
                 + "\"hpsfMarketFlows\":" + jsonArray(hpsfMarketFlowJsons) + ","
