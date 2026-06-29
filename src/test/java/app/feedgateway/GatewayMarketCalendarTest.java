@@ -1,5 +1,6 @@
 package app.feedgateway;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -58,5 +59,29 @@ class GatewayMarketCalendarTest {
         assertTrue(c.isRegularTradingHours(et(2026, 11, 27, 12, 59)), "before the early close is RTH");
         assertFalse(c.isRegularTradingHours(et(2026, 11, 27, 13, 0)), "at the early close is off-hours");
         assertFalse(c.isRegularTradingHours(et(2026, 11, 27, 15, 0)), "after early close is off-hours");
+    }
+
+    @Test
+    void currentTradingDateIsTodayOnATradingWeekday() {
+        GatewayMarketCalendar c = calendar(Set.of(), Map.of());
+        // 2026-06-29 is a Monday: today regardless of the time of day.
+        assertEquals(LocalDate.of(2026, 6, 29), c.currentTradingDate(et(2026, 6, 29, 6, 0)));
+        assertEquals(LocalDate.of(2026, 6, 29), c.currentTradingDate(et(2026, 6, 29, 23, 30)));
+    }
+
+    @Test
+    void currentTradingDateWalksBackOverWeekend() {
+        GatewayMarketCalendar c = calendar(Set.of(), Map.of());
+        // 2026-06-27 Sat + 2026-06-28 Sun -> most recent trading day is Fri 2026-06-26.
+        assertEquals(LocalDate.of(2026, 6, 26), c.currentTradingDate(et(2026, 6, 27, 12, 0)));
+        assertEquals(LocalDate.of(2026, 6, 26), c.currentTradingDate(et(2026, 6, 28, 12, 0)));
+    }
+
+    @Test
+    void currentTradingDateWalksBackOverHoliday() {
+        // 2026-07-03 (Fri) holiday, 07-04 Sat, 07-05 Sun -> most recent trading day is Thu 2026-07-02.
+        GatewayMarketCalendar c = calendar(Set.of(LocalDate.of(2026, 7, 3)), Map.of());
+        assertEquals(LocalDate.of(2026, 7, 2), c.currentTradingDate(et(2026, 7, 3, 12, 0)));
+        assertEquals(LocalDate.of(2026, 7, 2), c.currentTradingDate(et(2026, 7, 5, 12, 0)));
     }
 }
