@@ -147,7 +147,7 @@ public final class GatewaySettings {
     }
 
     public String initialExpiry() {
-        // IB_EXPIRY empty or "AUTO" -> resolve the current ET trading date from the market calendar,
+        // IB_EXPIRY == "AUTO" -> resolve the current ET trading date from the market calendar,
         // mirroring the Databento feed's AUTO mode. The OLD static 16:15 rollover was removed because the
         // feed did NOT roll, so advancing the gateway alone emptied the chain. The feed now self-rolls
         // (options-edge-databento-feed AUTO), so the gateway rolls too — by the SAME calendar, to the SAME
@@ -167,7 +167,11 @@ public final class GatewaySettings {
     }
 
     private static boolean isAutoExpiry(String configured) {
-        return configured == null || configured.isBlank() || configured.trim().equalsIgnoreCase("AUTO");
+        // ONLY an explicit "AUTO" enables calendar resolution. A blank IB_EXPIRY deliberately stays blank
+        // so a truly-unconfigured gateway still fails closed on the bearer handshake
+        // (WsJwtHandshakeInterceptor.defaultSelection throws on a blank expiry). The deploy always writes
+        // AUTO or a concrete yyyyMMdd, never blank, so AUTO mode is still active in every deployed env.
+        return configured != null && configured.trim().equalsIgnoreCase("AUTO");
     }
 
     public String ibkrDisplayTopic() {
