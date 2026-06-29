@@ -77,12 +77,14 @@ public final class GatewayRecordMapper {
         return switch (event) {
             case "snapshot" -> EventType.SNAPSHOT;
             case "pace" -> EventType.PACE;
+            case "pace-rank" -> EventType.PACE_RANK;
             case "directional-pressure" -> EventType.DIRECTIONAL_PRESSURE;
             case "strike-flow" -> EventType.STRIKE_FLOW;
             case "mission-pace" -> EventType.MISSION_PACE;
             case "mission-control" -> EventType.MISSION_CONTROL;
             case "volume-sandwich" -> EventType.VOLUME_SANDWICH;
             case "gex-by-strike" -> EventType.GEX_BY_STRIKE;
+            case "strike-sr" -> EventType.STRIKE_SR;
             case "max-pain" -> EventType.MAX_PAIN;
             case "vix-price" -> EventType.VIX_PRICE;
             case "index-price" -> EventType.INDEX_PRICE;
