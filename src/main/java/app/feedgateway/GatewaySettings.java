@@ -346,6 +346,17 @@ public final class GatewaySettings {
         return longValue("GATEWAY_WS_IDLE_TIMEOUT_MS", 300_000L, 1_000L);
     }
 
+    /**
+     * Server-side WebSocket PING interval (P2 — passive-browser idle-sweep fix). Every open socket gets a
+     * PING frame every this-many ms; the browser auto-responds with a PONG at the protocol layer, which
+     * bumps the idle-sweep clock — so a listener-only browser tab (no application frames back) is not
+     * evicted every {@link #wsIdleTimeoutMs()} ms during quiet market periods or after hours. Default 30s
+     * (an order of magnitude tighter than the 5 min idle threshold so a single missed pong is fine).
+     */
+    public long wsPingIntervalMs() {
+        return longValue("GATEWAY_WS_PING_INTERVAL_MS", 30_000L, 1_000L);
+    }
+
     /** Size of the shared pool of outbound writer threads (one active drain per socket at a time). */
     public int wsWriterThreads() {
         return intValue("GATEWAY_WS_WRITER_THREADS", 8, 1);

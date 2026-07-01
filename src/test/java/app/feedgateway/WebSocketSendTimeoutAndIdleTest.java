@@ -18,6 +18,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.stubbing.Answer;
 import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.PingMessage;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
@@ -148,6 +149,67 @@ class WebSocketSendTimeoutAndIdleTest {
         assertTrue(ch.isClosed());
         assertTrue(closedCb.await(2, TimeUnit.SECONDS));
         org.mockito.Mockito.verify(ws).close(CloseStatus.SESSION_NOT_RELIABLE);
+    }
+
+    /**
+     * Passive-browser P2 fix: sendPing emits a WebSocket PING frame on the writer pool, and a subsequent
+     * pong (delivered via {@code notePongReceived}) keeps the idle sweep quiet even when the client never
+     * sends application frames. Verifies both halves in one flow.
+     */
+    @Test
+    void sendPingEmitsPingFrameAndPongResetsIdleClock() throws Exception {
+        CountDownLatch pinged = new CountDownLatch(1);
+        java.util.List<Object> frames = new CopyOnWriteArrayList<>();
+        WebSocketSession ws = mock(WebSocketSession.class);
+        when(ws.getId()).thenReturn("passive");
+        when(ws.isOpen()).thenReturn(true);
+        org.mockito.Mockito.doAnswer(inv -> {
+            Object arg = inv.getArgument(0);
+            frames.add(arg);
+            if (arg instanceof PingMessage) {
+                pinged.countDown();
+            }
+            return null;
+        }).when(ws).sendMessage(any());
+
+        OutboundChannel ch = channel(ws);
+        ch.sendPing();
+
+        assertTrue(pinged.await(2, TimeUnit.SECONDS), "sendPing dispatched a PingMessage to the session");
+        assertTrue(frames.stream().anyMatch(f -> f instanceof PingMessage),
+                "at least one PingMessage was sent via session.sendMessage");
+
+        // Simulate a pong arriving — the handler calls notePongReceived which bumps lastActivityAtMs.
+        Thread.sleep(5);
+        ch.notePongReceived();
+
+        long idleTimeoutMs = 300_000L;
+        long checkAt = System.currentTimeMillis() + (idleTimeoutMs / 2);
+        assertFalse(ch.enforceIdleTimeout(checkAt, idleTimeoutMs),
+                "a pong within the window keeps the idle sweep from evicting the passive client");
+        assertFalse(ch.isClosed());
+        assertEquals(0, writeErrors.get());
+    }
+
+    /**
+     * Belt-and-braces: if the server sends pings but NO pong ever arrives AND no outbound activity flows,
+     * the idle sweep still evicts the socket after the timeout — a zombie TCP is not kept alive by the
+     * ping side alone. (The successful ping-send DOES bump lastActivityAtMs — see comment in
+     * OutboundChannel#sendPingNow — so this test verifies the sweep with a fresh channel that has never
+     * transmitted anything, then advances the clock past the idle threshold.)
+     */
+    @Test
+    void noPongAndNoOutboundStillEvictsAfterTimeout() throws Exception {
+        WebSocketSession ws = mock(WebSocketSession.class);
+        when(ws.getId()).thenReturn("zombie");
+        when(ws.isOpen()).thenReturn(true);
+        OutboundChannel ch = channel(ws);
+
+        long idleTimeoutMs = 300_000L;
+        long future = System.currentTimeMillis() + idleTimeoutMs + 1_000L;
+        assertTrue(ch.enforceIdleTimeout(future, idleTimeoutMs),
+                "with no activity of any kind the sweep still closes after the timeout");
+        assertTrue(ch.isClosed());
     }
 
     /** Recording an inbound frame resets the idle clock — a chatty client is not evicted. */

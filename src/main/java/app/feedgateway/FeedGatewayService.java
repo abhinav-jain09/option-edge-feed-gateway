@@ -294,6 +294,27 @@ public class FeedGatewayService implements ReplayRunner {
         // when no bytes are moving at all (laptop closed, dead NAT, dropped WiFi) — those never trigger a
         // send error, so without this sweep a dead client keeps its writer pinned indefinitely.
         batchExecutor.scheduleAtFixedRate(this::sweepIdleSessions, 60L, 60L, TimeUnit.SECONDS);
+        // P2 (passive-browser idle-sweep fix): send a WebSocket PING frame to every open socket every
+        // GATEWAY_WS_PING_INTERVAL_MS. The browser auto-responds with a PONG at the protocol layer, which
+        // FeedWebSocketHandler.handlePongMessage stamps as inbound activity — so a listener-only tab is
+        // not evicted by sweepIdleSessions during quiet market minutes or after hours.
+        long pingIntervalMs = settings.wsPingIntervalMs();
+        batchExecutor.scheduleAtFixedRate(
+                this::sendHeartbeatPings, pingIntervalMs, pingIntervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Visible for tests: send one round of server-originated PING frames across every tracked outbound
+     * channel. Production wiring schedules this every {@link GatewaySettings#wsPingIntervalMs()} ms.
+     */
+    void sendHeartbeatPings() {
+        for (OutboundChannel channel : outbound.values()) {
+            try {
+                channel.sendPing();
+            } catch (RuntimeException ignored) {
+                // a single channel must not break the sweep
+            }
+        }
     }
 
     private void enforceOutboundWriteDeadlines() {
@@ -340,6 +361,21 @@ public class FeedGatewayService implements ReplayRunner {
         OutboundChannel channel = outbound.get(session.getId());
         if (channel != null) {
             channel.noteInboundActivity();
+        }
+    }
+
+    /**
+     * Called by the WS handler when a PONG frame arrives — the true liveness signal for a listener-only
+     * browser that never sends application frames. Bumps the idle-sweep clock so the passive client is
+     * not evicted while the socket is still healthy.
+     */
+    public void notePongReceived(WebSocketSession session) {
+        if (session == null) {
+            return;
+        }
+        OutboundChannel channel = outbound.get(session.getId());
+        if (channel != null) {
+            channel.notePongReceived();
         }
     }
 

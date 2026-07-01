@@ -1,10 +1,12 @@
 package app.feedgateway;
 
 import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.PingMessage;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -50,6 +52,9 @@ final class OutboundChannel {
 
     /** Throttle interval for the "slow send force-closed" WARN log; one line per socket per 30s. */
     private static final long TIMEOUT_WARN_THROTTLE_MS = 30_000L;
+
+    /** Empty payload used for every server-originated WS PING frame; the browser echoes it in the PONG. */
+    private static final ByteBuffer EMPTY_PING_PAYLOAD = ByteBuffer.allocate(0);
 
     private record Pending(String envelope, int bytes) {
     }
@@ -222,6 +227,59 @@ final class OutboundChannel {
      * sweep even when no outbound events are currently being written for it.
      */
     void noteInboundActivity() {
+        lastActivityAtMs.set(System.currentTimeMillis());
+    }
+
+    /**
+     * Send a server-originated WebSocket PING frame to the client (P2 — passive-browser idle-sweep fix).
+     * Browsers auto-respond with a PONG at the protocol layer without any client code, and the pong lands
+     * in the handler's {@code handlePongMessage} which calls {@link #noteInboundActivity} — so a purely
+     * passive listener (browser opens the socket, only listens) still bumps its {@code lastActivityAtMs}
+     * every {@code GATEWAY_WS_PING_INTERVAL_MS} and is not evicted by the idle sweep during quiet market
+     * minutes or after hours.
+     *
+     * <p>Runs on the shared writer pool so it respects the "one writer per socket at a time" invariant —
+     * a ping is a normal blocking {@code sendMessage} on the same session and cannot race the drain path.
+     * If the send fails (IOException / dead socket), the watchdog + idle sweep still close the channel
+     * on their next tick; the ping itself only logs a throttled WARN and returns.
+     */
+    void sendPing() {
+        if (closed.get()) {
+            return;
+        }
+        // Serialize with the drain path via the writer pool: at most one send in flight per socket.
+        writers.execute(this::sendPingNow);
+    }
+
+    private void sendPingNow() {
+        if (closed.get() || !session.isOpen()) {
+            return;
+        }
+        sendStartedAtMs = System.currentTimeMillis(); // arm the watchdog; a stuck ping is a stuck send
+        try {
+            session.sendMessage(new PingMessage(EMPTY_PING_PAYLOAD.duplicate()));
+            lastActivityAtMs.set(System.currentTimeMillis()); // successful outbound I/O
+        } catch (IOException | RuntimeException e) {
+            // Do not close here — let the write-deadline watchdog + idle sweep handle it deterministically.
+            // Log at most once per socket per throttle window so a mass network flap does not spam the log.
+            long now = System.currentTimeMillis();
+            long lastWarn = lastTimeoutWarnAtMs.get();
+            if (now - lastWarn >= TIMEOUT_WARN_THROTTLE_MS
+                    && lastTimeoutWarnAtMs.compareAndSet(lastWarn, now)) {
+                System.out.println("WARN ws-ping-failed socketId=" + socketId
+                        + " error=" + e.getClass().getSimpleName() + " action=defer-to-watchdog");
+            }
+        } finally {
+            sendStartedAtMs = 0;
+        }
+    }
+
+    /**
+     * Note a WebSocket PONG frame from the client — the true liveness signal for passive browsers that
+     * never send application frames. Same effect as {@link #noteInboundActivity}, but named for clarity
+     * at the handler call site.
+     */
+    void notePongReceived() {
         lastActivityAtMs.set(System.currentTimeMillis());
     }
 

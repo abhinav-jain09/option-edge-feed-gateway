@@ -5,6 +5,7 @@ import app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.PongMessage;
 import org.springframework.web.socket.SubProtocolCapable;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
@@ -75,6 +76,14 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
         // quiet. Actual message handling (selection changes, replay control) still routes via the REST
         // controller; this handler only needs to observe that the client is alive.
         gatewayService.noteInboundActivity(session);
+    }
+
+    @Override
+    protected void handlePongMessage(WebSocketSession session, PongMessage message) {
+        // The true liveness signal for a listener-only browser (P2 — passive-browser idle-sweep fix).
+        // Browsers auto-echo the server PING at the protocol layer without any client code, so a passive
+        // client keeps its idle-sweep clock fresh even when no application frames flow either direction.
+        gatewayService.notePongReceived(session);
     }
 
     @Override
