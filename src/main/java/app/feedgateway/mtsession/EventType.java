@@ -23,6 +23,9 @@ public enum EventType {
     // Max pain is a per-(symbol,expiry) aggregate (one value covers the whole chain), so it routes
     // CONTRACT-scoped by source|symbol|expiry with NO strike filter — every session on that chain receives it.
     MAX_PAIN(Scope.CONTRACT),
+    // Option price behavior dashboard is symbol-level (no expiry in the contract), so it fans out to
+    // every Databento SPX chain session instead of pretending to be a single-expiry contract event.
+    OPTION_PRICE_BEHAVIOR(Scope.UNDERLYING),
     VIX_PRICE(Scope.UNDERLYING),
     INDEX_PRICE(Scope.UNDERLYING),
     SPX_PRICE(Scope.UNDERLYING),
@@ -62,7 +65,7 @@ public enum EventType {
     public String underlyingSymbol() {
         return switch (this) {
             case VIX_PRICE -> "VIX";
-            case INDEX_PRICE, SPX_PRICE, HPSF_MARKET_FLOW -> "SPX";
+            case INDEX_PRICE, SPX_PRICE, OPTION_PRICE_BEHAVIOR, HPSF_MARKET_FLOW -> "SPX";
             default -> throw new IllegalStateException("Not an underlying event: " + this);
         };
     }

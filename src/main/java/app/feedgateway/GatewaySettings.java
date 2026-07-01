@@ -291,6 +291,11 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_MAXPAIN_TOPIC", "options.databento.maxpain");
     }
 
+    /** Databento option price behavior dashboard topic. JSON, one compact symbol-level dashboard record. */
+    public String databentoOptionPriceBehaviorDashboardTopic() {
+        return value("KAFKA_DATABENTO_OPTION_PRICE_BEHAVIOR_DASHBOARD_TOPIC", "option-price-behavior-dashboard");
+    }
+
     public String hpsfLatestSignalTopic() {
         return value("KAFKA_HPSF_LATEST_SIGNAL_TOPIC", "options.hpsf.latest-signal");
     }

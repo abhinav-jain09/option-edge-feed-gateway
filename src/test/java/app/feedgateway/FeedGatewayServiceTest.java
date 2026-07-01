@@ -28,7 +28,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "strike-sr", "max-pain"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "strike-sr", "max-pain", "option-price-behavior"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -138,6 +138,21 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void databentoOptionPriceBehaviorDashboardTopicHasExpectedDefault() {
+        assertEquals("option-price-behavior-dashboard",
+                new GatewaySettings().databentoOptionPriceBehaviorDashboardTopic());
+    }
+
+    @Test
+    void optionPriceBehaviorCacheKeyDerivesFromPayloadSymbolAndTradingDate() throws Exception {
+        FeedGatewayService service = service();
+        String json = "{\"symbol\":\"spx\",\"tradingDate\":\"2026-07-01\",\"sessionBehaviorScore\":64.2}";
+        assertEquals("SPX|20260701", optionPriceBehaviorCacheKey(service, json, "fallback"));
+        assertEquals("fallback", optionPriceBehaviorCacheKey(service, "{\"tradingDate\":\"20260701\"}", "fallback"));
+        assertEquals("fallback", optionPriceBehaviorCacheKey(service, "not-json", "fallback"));
+    }
+
+    @Test
     void maxPainCacheKeyDerivesFromPayloadSymbolAndExpiry() throws Exception {
         FeedGatewayService service = service();
         String json = "{\"symbol\":\"spx\",\"expiry\":\"2026-07-10\",\"status\":\"VALID\"}";
@@ -172,6 +187,37 @@ class FeedGatewayServiceTest {
         // Existing gex array must still be present (no regression).
         assertTrue(envelope.contains("\"gexByStrike\":[]"));
     }
+
+    @Test
+    void optionPriceBehaviorGatewayContractConsumesCachesAndExposesUiBatchHealthAndMetrics() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        String payload = "{\"symbol\":\"SPX\",\"tradingDate\":\"20260701\","
+                + "\"sessionBehaviorScore\":61.5,\"rolling10sBehaviorScore\":58.2,"
+                + "\"expectedMoveModelVersion\":\"DELTA_GAMMA_VEGA_V1\",\"freshness\":\"OK\"}";
+        Object binding = topicBinding("DATABENTO", "option-price-behavior");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.databentoOptionPriceBehaviorDashboardTopic(),
+                0,
+                12L,
+                "SPX|20260701",
+                payload
+        );
+
+        String cacheKey = updateCache(service, binding, record, payload);
+        String eventEnvelope = envelopeJson(service, "option-price-behavior", payload);
+        String batchEnvelope = uiBatchEnvelopeJsonOptionPriceBehavior(service, List.of(payload));
+
+        assertEquals("option-price-behavior-dashboard", settings.databentoOptionPriceBehaviorDashboardTopic());
+        assertTrue(source.contains("topicEvents.put(settings.databentoOptionPriceBehaviorDashboardTopic(), new TopicBinding(\"DATABENTO\", \"option-price-behavior\"));"));
+        assertEquals("DATABENTO|SPX|20260701", cacheKey);
+        assertTrue(eventEnvelope.contains("\"type\":\"option-price-behavior\""));
+        assertTrue(batchEnvelope.contains("\"optionPriceBehaviors\":[{\"symbol\":\"SPX\""));
+        assertTrue(service.healthJson().contains("\"optionPriceBehaviors\":1"));
+        assertTrue(service.metrics().contains("options_edge_feed_gateway_option_price_behaviors 1"));
+    }
+
 
     @Test
     void indexPriceCacheKeyUsesPayloadSymbolInsteadOfKafkaTradeKey() {
@@ -1406,6 +1452,22 @@ class FeedGatewayServiceTest {
         );
     }
 
+    private static String uiBatchEnvelopeJsonOptionPriceBehavior(FeedGatewayService service, List<String> optionPriceBehaviors) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "uiBatchEnvelopeJson",
+                List.class, List.class, List.class, List.class, List.class, List.class,
+                List.class, List.class, List.class, List.class, List.class, List.class,
+                List.class, List.class, List.class, List.class, List.class, List.class
+        );
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors,
+                List.of(), List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
     private static String uiBatchEnvelopeJsonMissionPace(FeedGatewayService service, List<String> missionPaces) throws Exception {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
@@ -1452,5 +1514,11 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
+    }
+
+    private static String optionPriceBehaviorCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("optionPriceBehaviorCacheKey", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, fallback);
     }
 }
