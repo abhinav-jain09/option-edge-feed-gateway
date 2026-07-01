@@ -223,6 +223,56 @@ class FeedGatewayReadinessWatchdogTest {
                 "after the fresh 60s grace, a genuinely stalled forward path must still fail readiness");
     }
 
+    @Test
+    void replayOnlySessionsDoNotArmWatchdog() {
+        // Codex round-4 P2: previously the readiness gate counted ALL attached sockets, including
+        // sessions in replay mode. But route() skips replaying sessions on the live path and
+        // sendToAppSession() does not stamp lastForwardEpochMs — so a legitimate replay lasting >60s
+        // during market hours would flip /readyz to 503 and k8s would restart a working pod mid-replay.
+        // Fix: fall back to routingEngine.liveAttachedSocketCount() which excludes replay-mode sockets.
+        SessionRoutingEngine engine = new SessionRoutingEngine(
+                new ConcurrencyLimits(5, 5, 100), new SubscriptionManager());
+        engine.registerAppSession("app:u1", "u1",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260701", StrikeWindow.ALL), Set.of());
+        engine.attachSocket("app:u1", "sock:u1");
+        engine.setReplayMode("app:u1", true);
+        FeedGatewayService service = serviceWithEngine(engine);
+        service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        service.setInMarketHoursForTest(true);
+        // Stamp is 61s old — would trip the watchdog if replay-mode sockets counted as "active".
+        service.setLastForwardEpochMsForTest(System.currentTimeMillis() - 61_000L);
+        assertEquals(1, engine.attachedSocketCount(),
+                "precondition: one socket attached (in replay mode)");
+        assertEquals(0, engine.liveAttachedSocketCount(),
+                "precondition: zero LIVE-mode sockets — the sole session is replaying");
+        assertEquals(200, service.readinessStatus(),
+                "replay-only sockets must not gate readiness (Codex round-4 P2)");
+    }
+
+    @Test
+    void mixOfLiveAndReplaySessionsStillArmsWatchdog() {
+        // Existing behavior preservation for round-4 P2: as long as at least one LIVE-mode socket is
+        // attached, the watchdog must still trip after a >60s stall in market hours. A replay running
+        // alongside a live session must NOT mask a genuine live-path wedge.
+        SessionRoutingEngine engine = new SessionRoutingEngine(
+                new ConcurrencyLimits(5, 5, 100), new SubscriptionManager());
+        engine.registerAppSession("app:live", "u1",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260701", StrikeWindow.ALL), Set.of());
+        engine.attachSocket("app:live", "sock:live");
+        engine.registerAppSession("app:replay", "u2",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260701", StrikeWindow.ALL), Set.of());
+        engine.attachSocket("app:replay", "sock:replay");
+        engine.setReplayMode("app:replay", true);
+        FeedGatewayService service = serviceWithEngine(engine);
+        service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        service.setInMarketHoursForTest(true);
+        service.setLastForwardEpochMsForTest(System.currentTimeMillis() - 61_000L);
+        assertEquals(1, engine.liveAttachedSocketCount(),
+                "precondition: one LIVE socket + one replay socket");
+        assertEquals(503, service.readinessStatus(),
+                "mixed live+replay with a genuine live-path stall must still fail readiness");
+    }
+
     private static FeedGatewayService service() {
         return new FeedGatewayService(
                 new GatewaySettings(),

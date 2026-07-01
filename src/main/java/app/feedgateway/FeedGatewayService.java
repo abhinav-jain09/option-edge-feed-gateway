@@ -697,14 +697,17 @@ public class FeedGatewayService implements ReplayRunner {
         }
         long lastMs = lastForwardEpochMs.get();
         long secondsSinceLastForward = lastMs <= 0L ? -1L : Math.max(0L, (nowMs - lastMs) / 1_000L);
-        // Session count = sockets currently ATTACHED to a session, NOT the raw AppSession count. AppSessions
-        // that outlive their WebSocket (detach → grace window before eviction) still appear in
-        // activeAppSessions() but have no socket to deliver to, so treating them as "active" for the
-        // readiness gate would restart a pod that has zero real clients (Codex round-3 P2a). Legacy mode
-        // still consults the clients set directly; per-session mode delegates to the routing engine.
+        // Session count = sockets currently ATTACHED to a session in LIVE mode, NOT the raw AppSession
+        // count. AppSessions that outlive their WebSocket (detach → grace window before eviction) still
+        // appear in activeAppSessions() but have no socket to deliver to, so treating them as "active"
+        // for the readiness gate would restart a pod that has zero real clients (Codex round-3 P2a).
+        // Similarly, sessions in REPLAY mode receive only their private replay stream — route() skips
+        // them on the live path and sendToAppSession() does not stamp lastForwardEpochMs — so counting
+        // them here would trip /readyz on any replay >60s during market hours (Codex round-4 P2).
+        // Legacy mode still consults the clients set directly; per-session mode delegates to the engine.
         int activeSessions = clients.size();
         if (activeSessions == 0 && routingEngine != null) {
-            activeSessions = routingEngine.attachedSocketCount();
+            activeSessions = routingEngine.liveAttachedSocketCount();
         }
         // Startup-during-wedge fallback: if we've never forwarded but a session is connected, start counting
         // from the moment we first saw that session. Reset BOTH baseline and lastForwardEpochMs to 0 when no
