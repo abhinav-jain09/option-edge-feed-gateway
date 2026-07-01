@@ -686,12 +686,16 @@ public class FeedGatewayService implements ReplayRunner {
             activeSessions = routingEngine.activeAppSessions().size();
         }
         // Startup-during-wedge fallback: if we've never forwarded but a session is connected, start counting
-        // from the moment we first saw that session. Reset to 0 when no sessions remain so a client-less window
-        // doesn't accumulate stall time.
+        // from the moment we first saw that session. Reset BOTH baseline and lastForwardEpochMs to 0 when no
+        // sessions remain — otherwise a >60s client-less window would keep the (now stale) lastForwardEpochMs
+        // alive, and the next active-session transition would see it as "last forward" and trip /readyz
+        // immediately instead of getting the intended fresh 60s grace (Codex round-2 P2a).
         if (activeSessions > 0) {
             readinessBaselineEpochMs.compareAndSet(0L, nowMs);
         } else {
             readinessBaselineEpochMs.set(0L);
+            lastForwardEpochMs.set(0L);
+            lastMs = 0L;
         }
         long effectiveLastMs = lastMs > 0L ? lastMs : readinessBaselineEpochMs.get();
         boolean marketHours = isRegularTradingHours(nowMs);
@@ -1118,13 +1122,19 @@ public class FeedGatewayService implements ReplayRunner {
                         // P0 (HPSF bypass): in tenant mode route per-session by the record's chain key
                         // so HPSF signals/audit reach only entitled sessions; the all-client batch path
                         // is unreachable. Legacy single-tenant mode keeps the coalesced batch.
+                        int delivered = 0;
                         if (perSessionRouting()) {
-                            routeHpsfPerSession(update);
+                            delivered = routeHpsfPerSession(update);
                         } else {
+                            // Legacy coalesced: enqueue only stages into pending maps; flushPendingBatch
+                            // is the real socket write site and stamps the watchdog itself. Do NOT stamp
+                            // here (Codex round-2 P2b).
                             enqueuePending(update.event(), update.key(), update.json());
                         }
                         forwardedEvents.incrementAndGet();
-                        lastForwardEpochMs.set(System.currentTimeMillis());
+                        if (delivered > 0) {
+                            lastForwardEpochMs.set(System.currentTimeMillis());
+                        }
                     } else if (update != null) {
                         inactiveDroppedEvents.incrementAndGet();
                     }
@@ -1166,9 +1176,13 @@ public class FeedGatewayService implements ReplayRunner {
                     String json = binding == null ? null : enrichJson(record.value(), binding);
                     ActiveSelection decided = activeSelection.get();
                     if (json != null && !json.isBlank() && (perSessionRouting() || shouldForward(binding, json, record, decided))) {
-                        routeOrBroadcast(binding.source(), binding.event(), json);
+                        int delivered = routeOrBroadcast(binding.source(), binding.event(), json);
                         forwardedEvents.incrementAndGet();
-                        lastForwardEpochMs.set(System.currentTimeMillis());
+                        // Stamp only when we actually enqueued to at least one socket: a session-mismatch
+                        // drop or empty routing map must not mask a broadcast wedge (Codex round-2 P2b).
+                        if (delivered > 0) {
+                            lastForwardEpochMs.set(System.currentTimeMillis());
+                        }
                         recordSelectedForward(binding, json, decided);
                     } else {
                         inactiveDroppedEvents.incrementAndGet();
@@ -1336,9 +1350,14 @@ public class FeedGatewayService implements ReplayRunner {
                         boolean missionControlStale = "mission-control".equals(binding.event())
                                 && !recordWithinMaxStale(record);
                         if ((cacheKey != null || !"max-pain".equals(binding.event())) && !missionPaceStale && !missionControlStale) {
-                            routeOrBroadcast(binding.source(), binding.event(), json);
+                            int delivered = routeOrBroadcast(binding.source(), binding.event(), json);
                             forwardedEvents.incrementAndGet();
-                            lastForwardEpochMs.set(System.currentTimeMillis());
+                            // Per-session mode can return 0 when no active session selected this record's
+                            // source/symbol/expiry — do NOT stamp the watchdog on a no-op route or a wedge
+                            // would stay invisible (Codex round-2 P2b).
+                            if (delivered > 0) {
+                                lastForwardEpochMs.set(System.currentTimeMillis());
+                            }
                         }
                     } else if (cacheKey != null && cacheCaughtUpFlag.get()
                             && shouldForward(binding, json, record, (decided = activeSelection.get()))) {
@@ -2869,17 +2888,24 @@ public class FeedGatewayService implements ReplayRunner {
         return value == null ? null : value.toString();
     }
 
-    private void broadcast(String event, String json) {
+    /**
+     * @return number of sockets the envelope was enqueued to; 0 when the event is dropped by the
+     *         per-session-routing guard or when the clients set is empty.
+     */
+    private int broadcast(String event, String json) {
         // Per-session routing: only explicitly allowlisted global events may fan out to every
         // socket. Any other event reaching here (e.g. a market-data event via a fallback path) is
         // dropped so it can never leak to another user. Legacy mode broadcasts everything.
         if (perSessionRouting() && !isGlobalBroadcastEvent(event)) {
             droppedNonRoutableEvents.incrementAndGet();
-            return;
+            return 0;
         }
+        int delivered = 0;
         for (WebSocketSession client : clients) {
             send(client, event, json);
+            delivered++;
         }
+        return delivered;
     }
 
     /** Per-session filtered replay of cached state to a newly-connected socket (FR-11). */
@@ -3683,7 +3709,12 @@ public class FeedGatewayService implements ReplayRunner {
      * dropped — never broadcast — unless it is an explicitly {@linkplain #GLOBAL_BROADCAST_EVENTS
      * allowlisted global event}. In legacy mode the behaviour is unchanged (broadcast).
      */
-    private void routeOrBroadcast(String bindingSource, String event, String json) {
+    /**
+     * @return number of sockets an envelope was actually enqueued to. Callers stamp the readiness
+     *         watchdog only when this is &gt; 0 so a session-mismatch drop or empty routing map does not
+     *         mask a broadcast wedge (Codex round-2 P2b).
+     */
+    private int routeOrBroadcast(String bindingSource, String event, String json) {
         if (perSessionRouting()) {
             SessionRoutingEngine engine = routingEngine;
             try {
@@ -3696,27 +3727,29 @@ public class FeedGatewayService implements ReplayRunner {
                         : (root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "");
                 Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
                 if (rec.isPresent()) {
+                    int delivered = 0;
                     for (String socketId : engine.route(rec.get())) {
                         WebSocketSession s = clientsById.get(socketId);
                         if (s != null) {
                             send(s, event, json);
+                            delivered++;
                         }
                     }
-                    return;
+                    return delivered;
                 }
                 // Unroutable while per-session: drop unless it is an allowlisted global event.
                 if (isGlobalBroadcastEvent(event)) {
-                    broadcast(event, json);
-                } else {
-                    droppedNonRoutableEvents.incrementAndGet();
+                    return broadcast(event, json);
                 }
+                droppedNonRoutableEvents.incrementAndGet();
+                return 0;
             } catch (JsonProcessingException malformed) {
                 // Malformed payload while per-session: drop, never broadcast.
                 droppedNonRoutableEvents.incrementAndGet();
+                return 0;
             }
-            return;
         }
-        broadcast(event, json);
+        return broadcast(event, json);
     }
 
     private void send(WebSocketSession session, String event, String json) {
@@ -3785,16 +3818,20 @@ public class FeedGatewayService implements ReplayRunner {
      * expiry} with no strike filter (whole-chain decisions); market-flow routes by the underlying.
      * Unroutable records (unknown source/event or missing expiry) are dropped — NEVER broadcast.
      */
-    private void routeHpsfPerSession(HpsfCacheUpdate update) {
+    /**
+     * @return number of sockets the HPSF envelope was enqueued to; 0 when routing had no matching
+     *         session, the engine is not wired, or the record could not be built (Codex round-2 P2b).
+     */
+    private int routeHpsfPerSession(HpsfCacheUpdate update) {
         SessionRoutingEngine engine = routingEngine;
         if (engine == null) {
-            return;
+            return 0;
         }
         EventType type = hpsfEventType(update.event());
         Optional<MarketDataSource> source = MarketDataSource.parse(settings.initialMarketDataSource());
         if (type == null || source.isEmpty()) {
             droppedNonRoutableEvents.incrementAndGet();
-            return;
+            return 0;
         }
         RoutableRecord record;
         if (type.isUnderlying()) {
@@ -3802,17 +3839,20 @@ public class FeedGatewayService implements ReplayRunner {
         } else {
             if (update.expiry() == null || update.expiry().isBlank()) {
                 droppedNonRoutableEvents.incrementAndGet();
-                return;
+                return 0;
             }
             record = new RoutableRecord(source.get(), type, settings.initialSymbol(), update.expiry(),
                     OptionalDouble.empty(), 0L, null, null);
         }
+        int delivered = 0;
         for (String socketId : engine.route(record)) {
             WebSocketSession s = clientsById.get(socketId);
             if (s != null) {
                 send(s, update.event(), update.json());
+                delivered++;
             }
         }
+        return delivered;
     }
 
     private static EventType hpsfEventType(String event) {
