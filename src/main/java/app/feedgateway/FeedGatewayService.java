@@ -396,15 +396,16 @@ public class FeedGatewayService implements ReplayRunner {
     public void addClient(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
-        // Wrap in Spring's ConcurrentWebSocketSessionDecorator so its BUILT-IN send-time-limit gives us a
-        // second line of defence: if a single sendMessage hangs longer than the configured send timeout,
-        // Spring itself force-closes the session — protecting even the case where our own watchdog might
-        // not fire (e.g. shutdown races). bufferSizeLimit mirrors the outbound-queue byte cap so the raw
-        // Spring buffer never grows past what our OutboundChannel already bounds. The wrapped session is
-        // the ONLY one handed to OutboundChannel; the raw session stays in {@code clients}/{@code clientsById}
-        // so external callers (routing engine, expiry sweep) can still look it up by its original id.
-        WebSocketSession sendSession = wrapForBoundedSend(session);
-        OutboundChannel channel = new OutboundChannel(sendSession, outboundWriterExecutor(),
+        // OutboundChannel is the sole defence against a stuck single send: its watchdog
+        // ({@link OutboundChannel#enforceWriteDeadline}) runs on a separate scheduler thread and closes
+        // the session with SESSION_NOT_RELIABLE when a single sendMessage exceeds
+        // {@code wsWriteDeadlineMs}. Spring's ConcurrentWebSocketSessionDecorator was tried here as
+        // "belt-and-suspenders" but its sendTimeLimit only fires on RE-ENTRY (a second send arriving
+        // while the first is in flight); the serialized single-drain in OutboundChannel never triggers
+        // that path, so the decorator added no protection and was removed (Codex P2). Queued bytes are
+        // still bounded by OutboundChannel itself (wsMaxQueuedBytes), so no Spring-level buffer cap is
+        // needed either.
+        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(),
                 settings.wsMaxQueuedMessages(), settings.wsMaxQueuedBytes(), outboundMetrics, this::onSlowDisconnect);
         outbound.put(session.getId(), channel);
         clients.add(session);
@@ -592,24 +593,6 @@ public class FeedGatewayService implements ReplayRunner {
             // absent session (unlike setReplayMode); cancelActiveReplay above already stopped the reader.
             routingEngine.setReplayModeIfPresent(appSessionId, false);
         }
-    }
-
-    /**
-     * Wrap a raw {@link WebSocketSession} in Spring's {@link
-     * org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator} so a single blocking
-     * {@code sendMessage} cannot pin a writer thread past {@code GATEWAY_WS_SEND_TIMEOUT_MS} — Spring
-     * force-closes the underlying session when its own send-time-limit is exceeded. Idempotent for a
-     * session already wrapped (returns the input). Buffer size mirrors {@code wsMaxQueuedBytes} so the
-     * raw Spring buffer never grows past what our own OutboundChannel already bounds.
-     */
-    private WebSocketSession wrapForBoundedSend(WebSocketSession session) {
-        if (session instanceof org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator) {
-            return session;
-        }
-        int sendTimeLimit = (int) Math.min(Integer.MAX_VALUE, settings.wsWriteDeadlineMs());
-        int bufferSizeLimit = (int) Math.min(Integer.MAX_VALUE, settings.wsMaxQueuedBytes());
-        return new org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator(
-                session, sendTimeLimit, bufferSizeLimit);
     }
 
     private static void closeQuietly(WebSocketSession session) {
