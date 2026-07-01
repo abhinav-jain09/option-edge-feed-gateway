@@ -717,6 +717,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"vixPrices\":" + vixPrices.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
+                + "\"strikeSr\":" + strikeSr.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
                 + "\"hpsfMarketFlows\":" + hpsfMarketFlows.size() + ","
@@ -810,6 +811,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_gex_by_strike Cached Unusual Whales GEX strike count.\n"
                 + "# TYPE options_edge_feed_gateway_gex_by_strike gauge\n"
                 + "options_edge_feed_gateway_gex_by_strike " + gexByStrike.size() + "\n"
+                + "# HELP options_edge_feed_gateway_strike_sr Cached unified support/resistance level count.\n"
+                + "# TYPE options_edge_feed_gateway_strike_sr gauge\n"
+                + "options_edge_feed_gateway_strike_sr " + strikeSr.size() + "\n"
                 + "# HELP options_edge_feed_gateway_max_pain Cached per-(symbol,expiry) max-pain count.\n"
                 + "# TYPE options_edge_feed_gateway_max_pain gauge\n"
                 + "options_edge_feed_gateway_max_pain " + maxPain.size() + "\n"
@@ -1796,6 +1800,15 @@ public class FeedGatewayService implements ReplayRunner {
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesActiveSelection(json, selection);
         }
+        if ("strike-sr".equals(binding.event())) {
+            // Strike-S/R is a low-frequency derived selected-market signal. It may be (re)started after the
+            // gateway has captured source-switch offset barriers, so applying that offset barrier can suppress
+            // valid fresh levels indefinitely. Keep the same source/symbol/expiry and max-stale gates used by
+            // mission-* while bypassing only the offset barrier.
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
+                    && matchesActiveSelection(json, selection);
+        }
         if (!binding.source().equals(selection.source())) {
             return false;
         }
@@ -2457,9 +2470,12 @@ public class FeedGatewayService implements ReplayRunner {
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "strike-sr" -> strikeSr.entrySet().stream()
-                        // DATABENTO-only Avro per-bucket S/R map; same identity/selection isolation as gex.
+                        // DATABENTO-only Avro per-bucket S/R map. These are compacted current-state levels:
+                        // unchanged active levels are not re-emitted every maxStaleMs, and retractions arrive as
+                        // tombstones. Replay them while the cache entry is alive, but still enforce
+                        // source/symbol/expiry isolation below.
                         .filter(entry -> isCacheFresh("strike-sr:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("strike-sr:" + entry.getKey(), selection))
+                        .filter(entry -> passesSelectionBarrier("strike-sr:" + entry.getKey(), selection, false, false))
                         .filter(entry -> "DATABENTO".equals(selection.source()))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
