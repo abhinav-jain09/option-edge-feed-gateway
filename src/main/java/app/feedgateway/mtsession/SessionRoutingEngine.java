@@ -483,6 +483,37 @@ public final class SessionRoutingEngine {
         return callRead(() -> new ArrayList<>(appSessions.values()));
     }
 
+    /**
+     * Count of WebSockets currently attached to any AppSession — i.e. AppSessions in the grace window
+     * (detached-socket, awaiting eviction) are NOT counted. Used by the readiness watchdog to decide
+     * whether there is a real client to broadcast to; using {@link #activeAppSessions()} instead would
+     * inflate the count with grace-window sessions and cause false 503s (Codex round-3 P2a).
+     */
+    public int attachedSocketCount() {
+        return callRead(socketToApp::size);
+    }
+
+    /**
+     * Count of WebSockets attached to AppSessions that are in LIVE mode (i.e. NOT currently replaying).
+     * Used by the readiness watchdog: replay delivery goes through {@code sendToAppSession()} and does
+     * NOT stamp {@code lastForwardEpochMs}, and {@link #route} intentionally skips replaying sessions
+     * (see the {@code app.isReplaying()} guard around line 339). Counting replay-mode sockets in the
+     * readiness gate would restart a healthy pod mid-replay whenever a legitimate replay lasts >60s
+     * during market hours (Codex round-4 P2).
+     */
+    public int liveAttachedSocketCount() {
+        return callRead(() -> {
+            int live = 0;
+            for (String appSessionId : socketToApp.values()) {
+                AppSession app = appSessions.get(appSessionId);
+                if (app != null && !app.isReplaying()) {
+                    live++;
+                }
+            }
+            return live;
+        });
+    }
+
     public int appSessionCountForUser(String userId) {
         return callRead(() -> {
             Set<String> apps = userToApps.get(userId);

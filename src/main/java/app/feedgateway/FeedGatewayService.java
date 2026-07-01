@@ -168,6 +168,28 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong batchesSent = new AtomicLong();
     private final AtomicLong consumerRestarts = new AtomicLong();
     private final AtomicLong forwardedEvents = new AtomicLong();
+    // Forward-path watchdog (readiness gate): stamped every time an event is actually forwarded to sockets
+    // (all four forward sites). /readyz fails when this stays stale during market hours with active sessions
+    // — so k8s auto-restarts the pod within ~60s if the broadcast path silently wedges (e.g. after the
+    // midnight-ET session rollover leaves activeSelection/cacheCaughtUp/shouldForward stuck false). This is
+    // ONLY read by readiness; liveness (/health) is unaffected.
+    private final AtomicLong lastForwardEpochMs = new AtomicLong(0L);
+    // Startup-during-wedge baseline: when a fresh pod has never forwarded (lastForwardEpochMs == 0), but a
+    // session is connected and waiting, we still want /readyz to trip if the wait exceeds the stall threshold.
+    // Stamped the first time readinessStatus() sees an active session, cleared back to 0 once no sessions
+    // remain (so a client-less window doesn't accumulate stall time). Used only as a fallback "last forward"
+    // when the real timestamp is still 0.
+    private final AtomicLong readinessBaselineEpochMs = new AtomicLong(0L);
+    // Throttle for the readiness-fail WARN log so a wedged pod doesn't spam once per probe (probes fire
+    // every few seconds). At most one WARN per 10s while readiness is down.
+    private final AtomicLong lastReadyWarnMs = new AtomicLong(0L);
+    // Tracks whether the most recent readiness probe saw regular trading hours. Used to detect the
+    // off-hours→on-hours edge inside readinessStatus() so we can clear stale forward/baseline stamps
+    // carried over from the prior trading session (e.g. a WS held open overnight or across a weekend).
+    // Without this, at 09:30 the previous session's lastForwardEpochMs would be 15-60+ hours old and
+    // instantly trip the stall guard, restarting a healthy pod before its first tick of the new day
+    // (Codex round-3 P2b).
+    private final AtomicBoolean inMarketHours = new AtomicBoolean(false);
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -230,6 +252,16 @@ public class FeedGatewayService implements ReplayRunner {
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
         this.marketCalendar = settings.marketCalendar();
         this.autoRolledExpiry = this.activeSelection.get().expiry();
+        // Codex round-6 P2: when GATEWAY_MARKET_HOLIDAYS is empty the calendar reports every holiday
+        // (July 4th, Christmas, Thanksgiving) as a regular session. Arming the forward-stall watchdog
+        // under that condition would 503 a healthy pod all holiday long and k8s would restart-loop it.
+        // Emit a one-time startup WARN so the operator knows the watchdog is disabled until they
+        // populate the calendar; the /readyz path in readinessStatus() will then fail-open on the
+        // watchdog dimension (liveness is unaffected).
+        if (!marketCalendar.hasHolidaysConfigured()) {
+            System.err.println("WARN readiness-watchdog=DISABLED reason=GATEWAY_MARKET_HOLIDAYS_EMPTY "
+                    + "action=populate_env_to_enable");
+        }
     }
 
     /**
@@ -642,6 +674,124 @@ public class FeedGatewayService implements ReplayRunner {
         return closed;
     }
 
+    /**
+     * Forward-path watchdog readiness. Returns 503 when — during US regular trading hours, with at least
+     * one active WebSocket session — the gateway has not forwarded ANY event to sockets in the last
+     * {@link #FORWARD_STALL_THRESHOLD_MS}. Off-hours or with zero sessions readiness stays 200 so we do not
+     * flap a healthy pod (session-less startup / weekends / overnight all yield 200 by design).
+     *
+     * <p>Liveness (/health) is intentionally NOT gated on this — only readiness — so k8s stops routing
+     * traffic to a wedged pod and restarts it via the readiness→restart controller path, without an
+     * abrupt liveness kill.
+     *
+     * <p>Introduced after the 2026-07-01 prod incident: pod stayed 1/1 Ready (HTTP alive) and Kafka
+     * offsets advanced, but the internal broadcast state (activeSelection / cacheCaughtUpFlag /
+     * shouldForward) got stuck false after the midnight-ET session rollover, so NO events reached
+     * clients for 9.5 hours. Separate PR addresses the rollover cause; this is the watchdog.
+     *
+     * @return HTTP status: 200 healthy, 503 forward path stalled during market hours with active sessions.
+     */
+    public int readinessStatus() {
+        long nowMs = System.currentTimeMillis();
+        boolean marketHours = isRegularTradingHours(nowMs);
+        // Off-hours → on-hours edge: a WebSocket held open overnight or across a weekend would keep
+        // lastForwardEpochMs stamped from the PRIOR session, and at 09:30 that timestamp is 15-60+ hours
+        // old — instantly tripping the >60s stall guard and restarting a pod that just hasn't had its
+        // first tick yet. Clear both stamps on the transition so the fresh session gets a clean baseline
+        // re-armed below (Codex round-3 P2b).
+        if (marketHours && !inMarketHours.getAndSet(true)) {
+            lastForwardEpochMs.set(0L);
+            readinessBaselineEpochMs.set(0L);
+        } else if (!marketHours) {
+            inMarketHours.set(false);
+        }
+        long lastMs = lastForwardEpochMs.get();
+        long secondsSinceLastForward = lastMs <= 0L ? -1L : Math.max(0L, (nowMs - lastMs) / 1_000L);
+        // Session count = sockets currently ATTACHED to a session in LIVE mode, NOT the raw AppSession
+        // count. AppSessions that outlive their WebSocket (detach → grace window before eviction) still
+        // appear in activeAppSessions() but have no socket to deliver to, so treating them as "active"
+        // for the readiness gate would restart a pod that has zero real clients (Codex round-3 P2a).
+        // Similarly, sessions in REPLAY mode receive only their private replay stream — route() skips
+        // them on the live path and sendToAppSession() does not stamp lastForwardEpochMs — so counting
+        // them here would trip /readyz on any replay >60s during market hours (Codex round-4 P2).
+        // In per-session mode (routingEngine != null) we ALWAYS delegate to the engine's live-attached count
+        // — clients.size() includes replay-only sockets (FeedWebSocketHandler adds every WS regardless of
+        // mode), so preferring it would defeat the replay-exclusion above and re-trip /readyz on replay-only
+        // sessions. Legacy broadcast mode (routingEngine == null) still counts clients directly
+        // (Codex round-5 P2).
+        int activeSessions = (routingEngine != null)
+            ? routingEngine.liveAttachedSocketCount()
+            : clients.size();
+        // Startup-during-wedge fallback: if we've never forwarded but a session is connected, start counting
+        // from the moment we first saw that session. Reset BOTH baseline and lastForwardEpochMs to 0 when no
+        // sessions remain — otherwise a >60s client-less window would keep the (now stale) lastForwardEpochMs
+        // alive, and the next active-session transition would see it as "last forward" and trip /readyz
+        // immediately instead of getting the intended fresh 60s grace (Codex round-2 P2a).
+        if (activeSessions > 0) {
+            readinessBaselineEpochMs.compareAndSet(0L, nowMs);
+        } else {
+            readinessBaselineEpochMs.set(0L);
+            lastForwardEpochMs.set(0L);
+            lastMs = 0L;
+        }
+        long effectiveLastMs = lastMs > 0L ? lastMs : readinessBaselineEpochMs.get();
+        // Codex round-6 P2: fail-open on the watchdog dimension when the market calendar is incomplete
+        // (GATEWAY_MARKET_HOLIDAYS empty). Without a holiday list, `marketHours` misreports July 4th /
+        // Christmas / Thanksgiving as regular sessions and the stall guard would 503 a healthy pod all
+        // day → k8s restart-loop → self-inflicted outage. Startup WARN in the constructor tells the
+        // operator the watchdog is off until the holiday env is populated. Liveness is unaffected.
+        boolean calendarComplete = holidaysConfigured();
+        boolean forwardStalled = calendarComplete
+                && effectiveLastMs > 0L
+                && (nowMs - effectiveLastMs) > FORWARD_STALL_THRESHOLD_MS;
+        boolean unhealthy = marketHours && forwardStalled && activeSessions > 0;
+        if (unhealthy) {
+            long lastWarn = lastReadyWarnMs.get();
+            if (nowMs - lastWarn >= READY_WARN_THROTTLE_MS
+                    && lastReadyWarnMs.compareAndSet(lastWarn, nowMs)) {
+                System.err.println("WARN feed-gateway readiness=DOWN forward-stalled"
+                        + " nowMs=" + nowMs
+                        + " lastForwardEpochMs=" + lastMs
+                        + " readinessBaselineEpochMs=" + readinessBaselineEpochMs.get()
+                        + " secondsSinceLastForward=" + secondsSinceLastForward
+                        + " activeSessions=" + activeSessions);
+            }
+            return 503;
+        }
+        return 200;
+    }
+
+    /** Forward-stall threshold — pod restarts within ~60s of a wedged broadcast path. */
+    private static final long FORWARD_STALL_THRESHOLD_MS = 60_000L;
+    /** Cap the readiness-fail WARN at one every 10s so a wedged pod doesn't spam probe-rate log lines. */
+    private static final long READY_WARN_THROTTLE_MS = 10_000L;
+
+    // Test seams for the readiness watchdog.
+    void setLastForwardEpochMsForTest(long epochMs) {
+        this.lastForwardEpochMs.set(epochMs);
+    }
+
+    void setReadinessBaselineEpochMsForTest(long epochMs) {
+        this.readinessBaselineEpochMs.set(epochMs);
+    }
+
+    int activeSessionsForTest() {
+        return clients.size();
+    }
+
+    /**
+     * Test seam: pre-arm the market-hours edge tracker so a test that pins RTH=true from the start does
+     * not have its intentional stale {@code lastForwardEpochMs} clobbered by the off-hours→on-hours reset
+     * on the very first probe. Real code paths always drive this via {@link #readinessStatus()}.
+     */
+    void setInMarketHoursForTest(boolean value) {
+        this.inMarketHours.set(value);
+    }
+
+    void addSessionForTest(WebSocketSession session) {
+        clients.add(session);
+    }
+
     public String healthJson() {
         purgeExpiredCache(System.currentTimeMillis());
         ActiveSelection selection = activeSelection.get();
@@ -1025,12 +1175,19 @@ public class FeedGatewayService implements ReplayRunner {
                         // P0 (HPSF bypass): in tenant mode route per-session by the record's chain key
                         // so HPSF signals/audit reach only entitled sessions; the all-client batch path
                         // is unreachable. Legacy single-tenant mode keeps the coalesced batch.
+                        int delivered = 0;
                         if (perSessionRouting()) {
-                            routeHpsfPerSession(update);
+                            delivered = routeHpsfPerSession(update);
                         } else {
+                            // Legacy coalesced: enqueue only stages into pending maps; flushPendingBatch
+                            // is the real socket write site and stamps the watchdog itself. Do NOT stamp
+                            // here (Codex round-2 P2b).
                             enqueuePending(update.event(), update.key(), update.json());
                         }
                         forwardedEvents.incrementAndGet();
+                        if (delivered > 0) {
+                            lastForwardEpochMs.set(System.currentTimeMillis());
+                        }
                     } else if (update != null) {
                         inactiveDroppedEvents.incrementAndGet();
                     }
@@ -1072,8 +1229,13 @@ public class FeedGatewayService implements ReplayRunner {
                     String json = binding == null ? null : enrichJson(record.value(), binding);
                     ActiveSelection decided = activeSelection.get();
                     if (json != null && !json.isBlank() && (perSessionRouting() || shouldForward(binding, json, record, decided))) {
-                        routeOrBroadcast(binding.source(), binding.event(), json);
+                        int delivered = routeOrBroadcast(binding.source(), binding.event(), json);
                         forwardedEvents.incrementAndGet();
+                        // Stamp only when we actually enqueued to at least one socket: a session-mismatch
+                        // drop or empty routing map must not mask a broadcast wedge (Codex round-2 P2b).
+                        if (delivered > 0) {
+                            lastForwardEpochMs.set(System.currentTimeMillis());
+                        }
                         recordSelectedForward(binding, json, decided);
                     } else {
                         inactiveDroppedEvents.incrementAndGet();
@@ -1241,11 +1403,20 @@ public class FeedGatewayService implements ReplayRunner {
                         boolean missionControlStale = "mission-control".equals(binding.event())
                                 && !recordWithinMaxStale(record);
                         if ((cacheKey != null || !"max-pain".equals(binding.event())) && !missionPaceStale && !missionControlStale) {
-                            routeOrBroadcast(binding.source(), binding.event(), json);
+                            int delivered = routeOrBroadcast(binding.source(), binding.event(), json);
                             forwardedEvents.incrementAndGet();
+                            // Per-session mode can return 0 when no active session selected this record's
+                            // source/symbol/expiry — do NOT stamp the watchdog on a no-op route or a wedge
+                            // would stay invisible (Codex round-2 P2b).
+                            if (delivered > 0) {
+                                lastForwardEpochMs.set(System.currentTimeMillis());
+                            }
                         }
                     } else if (cacheKey != null && cacheCaughtUpFlag.get()
                             && shouldForward(binding, json, record, (decided = activeSelection.get()))) {
+                        // Legacy coalesced path: enqueue only stages into pending maps — real socket delivery
+                        // is flushPendingBatch(), which now stamps lastForwardEpochMs after a successful send.
+                        // Do NOT stamp here or the watchdog would be fooled by a wedged flush.
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
                         recordSelectedForward(binding, json, decided);
@@ -2375,9 +2546,20 @@ public class FeedGatewayService implements ReplayRunner {
     // POLICY can be tested deterministically without the wall clock. The calendar date/holiday math itself
     // is covered separately by GatewayMarketCalendarTest. Mirrors the other override*ForTest seams.
     private volatile Boolean regularTradingHoursOverrideForTest = null;
+    private volatile Boolean holidaysConfiguredOverrideForTest = null;
 
     void overrideRegularTradingHoursForTest(Boolean regularTradingHours) {
         this.regularTradingHoursOverrideForTest = regularTradingHours;
+    }
+
+    /** Test seam for Codex round-6 P2: force the calendar-complete signal on/off. */
+    void overrideHolidaysConfiguredForTest(Boolean holidaysConfigured) {
+        this.holidaysConfiguredOverrideForTest = holidaysConfigured;
+    }
+
+    private boolean holidaysConfigured() {
+        Boolean override = holidaysConfiguredOverrideForTest;
+        return override != null ? override : marketCalendar.hasHolidaysConfigured();
     }
 
     private boolean isRegularTradingHours(long nowMs) {
@@ -2770,17 +2952,24 @@ public class FeedGatewayService implements ReplayRunner {
         return value == null ? null : value.toString();
     }
 
-    private void broadcast(String event, String json) {
+    /**
+     * @return number of sockets the envelope was enqueued to; 0 when the event is dropped by the
+     *         per-session-routing guard or when the clients set is empty.
+     */
+    private int broadcast(String event, String json) {
         // Per-session routing: only explicitly allowlisted global events may fan out to every
         // socket. Any other event reaching here (e.g. a market-data event via a fallback path) is
         // dropped so it can never leak to another user. Legacy mode broadcasts everything.
         if (perSessionRouting() && !isGlobalBroadcastEvent(event)) {
             droppedNonRoutableEvents.incrementAndGet();
-            return;
+            return 0;
         }
+        int delivered = 0;
         for (WebSocketSession client : clients) {
             send(client, event, json);
+            delivered++;
         }
+        return delivered;
     }
 
     /** Per-session filtered replay of cached state to a newly-connected socket (FR-11). */
@@ -3584,7 +3773,12 @@ public class FeedGatewayService implements ReplayRunner {
      * dropped — never broadcast — unless it is an explicitly {@linkplain #GLOBAL_BROADCAST_EVENTS
      * allowlisted global event}. In legacy mode the behaviour is unchanged (broadcast).
      */
-    private void routeOrBroadcast(String bindingSource, String event, String json) {
+    /**
+     * @return number of sockets an envelope was actually enqueued to. Callers stamp the readiness
+     *         watchdog only when this is &gt; 0 so a session-mismatch drop or empty routing map does not
+     *         mask a broadcast wedge (Codex round-2 P2b).
+     */
+    private int routeOrBroadcast(String bindingSource, String event, String json) {
         if (perSessionRouting()) {
             SessionRoutingEngine engine = routingEngine;
             try {
@@ -3597,27 +3791,29 @@ public class FeedGatewayService implements ReplayRunner {
                         : (root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "");
                 Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
                 if (rec.isPresent()) {
+                    int delivered = 0;
                     for (String socketId : engine.route(rec.get())) {
                         WebSocketSession s = clientsById.get(socketId);
                         if (s != null) {
                             send(s, event, json);
+                            delivered++;
                         }
                     }
-                    return;
+                    return delivered;
                 }
                 // Unroutable while per-session: drop unless it is an allowlisted global event.
                 if (isGlobalBroadcastEvent(event)) {
-                    broadcast(event, json);
-                } else {
-                    droppedNonRoutableEvents.incrementAndGet();
+                    return broadcast(event, json);
                 }
+                droppedNonRoutableEvents.incrementAndGet();
+                return 0;
             } catch (JsonProcessingException malformed) {
                 // Malformed payload while per-session: drop, never broadcast.
                 droppedNonRoutableEvents.incrementAndGet();
+                return 0;
             }
-            return;
         }
-        broadcast(event, json);
+        return broadcast(event, json);
     }
 
     private void send(WebSocketSession session, String event, String json) {
@@ -3686,16 +3882,20 @@ public class FeedGatewayService implements ReplayRunner {
      * expiry} with no strike filter (whole-chain decisions); market-flow routes by the underlying.
      * Unroutable records (unknown source/event or missing expiry) are dropped — NEVER broadcast.
      */
-    private void routeHpsfPerSession(HpsfCacheUpdate update) {
+    /**
+     * @return number of sockets the HPSF envelope was enqueued to; 0 when routing had no matching
+     *         session, the engine is not wired, or the record could not be built (Codex round-2 P2b).
+     */
+    private int routeHpsfPerSession(HpsfCacheUpdate update) {
         SessionRoutingEngine engine = routingEngine;
         if (engine == null) {
-            return;
+            return 0;
         }
         EventType type = hpsfEventType(update.event());
         Optional<MarketDataSource> source = MarketDataSource.parse(settings.initialMarketDataSource());
         if (type == null || source.isEmpty()) {
             droppedNonRoutableEvents.incrementAndGet();
-            return;
+            return 0;
         }
         RoutableRecord record;
         if (type.isUnderlying()) {
@@ -3703,17 +3903,20 @@ public class FeedGatewayService implements ReplayRunner {
         } else {
             if (update.expiry() == null || update.expiry().isBlank()) {
                 droppedNonRoutableEvents.incrementAndGet();
-                return;
+                return 0;
             }
             record = new RoutableRecord(source.get(), type, settings.initialSymbol(), update.expiry(),
                     OptionalDouble.empty(), 0L, null, null);
         }
+        int delivered = 0;
         for (String socketId : engine.route(record)) {
             WebSocketSession s = clientsById.get(socketId);
             if (s != null) {
                 send(s, update.event(), update.json());
+                delivered++;
             }
         }
+        return delivered;
     }
 
     private static EventType hpsfEventType(String event) {
@@ -3815,10 +4018,19 @@ public class FeedGatewayService implements ReplayRunner {
                 );
                 clearPendingLocked();
             }
+            int delivered = 0;
             for (WebSocketSession client : clients) {
                 sendEnvelope(client, envelope);
+                delivered++;
             }
             batchesSent.incrementAndGet();
+            // Forward-path watchdog: stamp ONLY after a real flush actually delivered to at least one session.
+            // Enqueue-time stamping (removed on the caller side) would let the watchdog stay green while the
+            // batch flusher itself is wedged. sendEnvelope is fire-and-forget onto per-socket outbound queues,
+            // which is the last write-site inside the gateway process.
+            if (delivered > 0) {
+                lastForwardEpochMs.set(System.currentTimeMillis());
+            }
         } catch (RuntimeException e) {
             if (running.get()) {
                 System.err.println("Feed gateway batch flush error: " + e.getMessage());
