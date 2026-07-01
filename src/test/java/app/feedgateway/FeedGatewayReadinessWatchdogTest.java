@@ -301,21 +301,59 @@ class FeedGatewayReadinessWatchdogTest {
                 "mixed live+replay with a genuine live-path stall must still fail readiness");
     }
 
+    @Test
+    void watchdogFailsOpenWhenHolidaysNotConfigured() throws Exception {
+        // Codex round-6 P2: when GATEWAY_MARKET_HOLIDAYS is empty, isRegularTradingHours() reports US
+        // market holidays (July 4th, Christmas, Thanksgiving) as regular sessions, so the forward-stall
+        // guard would 503 a healthy pod all holiday long and k8s would restart-loop it. Fix: /readyz
+        // fails open on the watchdog dimension whenever the calendar is incomplete.
+        FeedGatewayService service = service();
+        service.overrideHolidaysConfiguredForTest(Boolean.FALSE);
+        service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        service.setInMarketHoursForTest(true);
+        service.addSessionForTest(fakeSession("s1"));
+        // Genuinely stale forward stamp — would trip the watchdog if the calendar were complete.
+        service.setLastForwardEpochMsForTest(System.currentTimeMillis() - 61_000L);
+        assertEquals(200, service.readinessStatus(),
+                "watchdog must fail open when holidays list is empty (Codex round-6 P2)");
+    }
+
+    @Test
+    void watchdogArmsNormallyWhenHolidaysConfigured() throws Exception {
+        // Companion to the fail-open test: with the calendar complete, the existing 61s-stall-in-RTH
+        // behavior is preserved unchanged.
+        FeedGatewayService service = service();
+        service.overrideHolidaysConfiguredForTest(Boolean.TRUE);
+        service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        service.setInMarketHoursForTest(true);
+        service.addSessionForTest(fakeSession("s1"));
+        service.setLastForwardEpochMsForTest(System.currentTimeMillis() - 61_000L);
+        assertEquals(503, service.readinessStatus(),
+                "watchdog must arm normally when holidays are configured (Codex round-6 P2)");
+    }
+
     private static FeedGatewayService service() {
-        return new FeedGatewayService(
+        FeedGatewayService svc = new FeedGatewayService(
                 new GatewaySettings(),
                 new ObjectMapper(),
                 new HpsfGatewayViewMapper(),
                 null /* routingEngine: legacy broadcast path */
         );
+        // Default the existing suite to "calendar complete" so the fail-open watchdog added in Codex
+        // round-6 P2 does not silence every prior armed-watchdog assertion. The new fail-open tests
+        // override this back to FALSE.
+        svc.overrideHolidaysConfiguredForTest(Boolean.TRUE);
+        return svc;
     }
 
     private static FeedGatewayService serviceWithEngine(SessionRoutingEngine engine) {
-        return new FeedGatewayService(
+        FeedGatewayService svc = new FeedGatewayService(
                 new GatewaySettings(),
                 new ObjectMapper(),
                 new HpsfGatewayViewMapper(),
                 engine);
+        svc.overrideHolidaysConfiguredForTest(Boolean.TRUE);
+        return svc;
     }
 
     /** A minimal WebSocketSession proxy — clients is only queried for size in these tests. */

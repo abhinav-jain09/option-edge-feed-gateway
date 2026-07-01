@@ -82,4 +82,16 @@ public final class GatewayMarketCalendar {
     public int holidayCount() {
         return holidays.size();
     }
+
+    /**
+     * True iff the operator supplied at least one holiday. Used by the readiness watchdog to fail-open when
+     * the calendar is incomplete: without a holiday list, {@link #isRegularTradingHours(Instant)} would
+     * report a US market holiday (July 4th, Christmas, Thanksgiving, …) as a normal session, and the
+     * forward-stall guard would 503 a healthy pod all day — a self-inflicted outage. When this returns
+     * false the watchdog disables itself entirely (see {@link FeedGatewayService#readinessStatus()}), and
+     * emits a startup WARN so the operator knows to populate {@code GATEWAY_MARKET_HOLIDAYS}.
+     */
+    public boolean hasHolidaysConfigured() {
+        return !holidays.isEmpty();
+    }
 }

@@ -252,6 +252,16 @@ public class FeedGatewayService implements ReplayRunner {
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
         this.marketCalendar = settings.marketCalendar();
         this.autoRolledExpiry = this.activeSelection.get().expiry();
+        // Codex round-6 P2: when GATEWAY_MARKET_HOLIDAYS is empty the calendar reports every holiday
+        // (July 4th, Christmas, Thanksgiving) as a regular session. Arming the forward-stall watchdog
+        // under that condition would 503 a healthy pod all holiday long and k8s would restart-loop it.
+        // Emit a one-time startup WARN so the operator knows the watchdog is disabled until they
+        // populate the calendar; the /readyz path in readinessStatus() will then fail-open on the
+        // watchdog dimension (liveness is unaffected).
+        if (!marketCalendar.hasHolidaysConfigured()) {
+            System.err.println("WARN readiness-watchdog=DISABLED reason=GATEWAY_MARKET_HOLIDAYS_EMPTY "
+                    + "action=populate_env_to_enable");
+        }
     }
 
     /**
@@ -725,7 +735,15 @@ public class FeedGatewayService implements ReplayRunner {
             lastMs = 0L;
         }
         long effectiveLastMs = lastMs > 0L ? lastMs : readinessBaselineEpochMs.get();
-        boolean forwardStalled = effectiveLastMs > 0L && (nowMs - effectiveLastMs) > FORWARD_STALL_THRESHOLD_MS;
+        // Codex round-6 P2: fail-open on the watchdog dimension when the market calendar is incomplete
+        // (GATEWAY_MARKET_HOLIDAYS empty). Without a holiday list, `marketHours` misreports July 4th /
+        // Christmas / Thanksgiving as regular sessions and the stall guard would 503 a healthy pod all
+        // day → k8s restart-loop → self-inflicted outage. Startup WARN in the constructor tells the
+        // operator the watchdog is off until the holiday env is populated. Liveness is unaffected.
+        boolean calendarComplete = holidaysConfigured();
+        boolean forwardStalled = calendarComplete
+                && effectiveLastMs > 0L
+                && (nowMs - effectiveLastMs) > FORWARD_STALL_THRESHOLD_MS;
         boolean unhealthy = marketHours && forwardStalled && activeSessions > 0;
         if (unhealthy) {
             long lastWarn = lastReadyWarnMs.get();
@@ -2528,9 +2546,20 @@ public class FeedGatewayService implements ReplayRunner {
     // POLICY can be tested deterministically without the wall clock. The calendar date/holiday math itself
     // is covered separately by GatewayMarketCalendarTest. Mirrors the other override*ForTest seams.
     private volatile Boolean regularTradingHoursOverrideForTest = null;
+    private volatile Boolean holidaysConfiguredOverrideForTest = null;
 
     void overrideRegularTradingHoursForTest(Boolean regularTradingHours) {
         this.regularTradingHoursOverrideForTest = regularTradingHours;
+    }
+
+    /** Test seam for Codex round-6 P2: force the calendar-complete signal on/off. */
+    void overrideHolidaysConfiguredForTest(Boolean holidaysConfigured) {
+        this.holidaysConfiguredOverrideForTest = holidaysConfigured;
+    }
+
+    private boolean holidaysConfigured() {
+        Boolean override = holidaysConfiguredOverrideForTest;
+        return override != null ? override : marketCalendar.hasHolidaysConfigured();
     }
 
     private boolean isRegularTradingHours(long nowMs) {
