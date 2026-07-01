@@ -704,11 +704,14 @@ public class FeedGatewayService implements ReplayRunner {
         // Similarly, sessions in REPLAY mode receive only their private replay stream — route() skips
         // them on the live path and sendToAppSession() does not stamp lastForwardEpochMs — so counting
         // them here would trip /readyz on any replay >60s during market hours (Codex round-4 P2).
-        // Legacy mode still consults the clients set directly; per-session mode delegates to the engine.
-        int activeSessions = clients.size();
-        if (activeSessions == 0 && routingEngine != null) {
-            activeSessions = routingEngine.liveAttachedSocketCount();
-        }
+        // In per-session mode (routingEngine != null) we ALWAYS delegate to the engine's live-attached count
+        // — clients.size() includes replay-only sockets (FeedWebSocketHandler adds every WS regardless of
+        // mode), so preferring it would defeat the replay-exclusion above and re-trip /readyz on replay-only
+        // sessions. Legacy broadcast mode (routingEngine == null) still counts clients directly
+        // (Codex round-5 P2).
+        int activeSessions = (routingEngine != null)
+            ? routingEngine.liveAttachedSocketCount()
+            : clients.size();
         // Startup-during-wedge fallback: if we've never forwarded but a session is connected, start counting
         // from the moment we first saw that session. Reset BOTH baseline and lastForwardEpochMs to 0 when no
         // sessions remain — otherwise a >60s client-less window would keep the (now stale) lastForwardEpochMs

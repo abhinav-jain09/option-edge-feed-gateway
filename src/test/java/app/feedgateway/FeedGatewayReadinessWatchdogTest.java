@@ -250,6 +250,34 @@ class FeedGatewayReadinessWatchdogTest {
     }
 
     @Test
+    void perSessionReplayOnlyDoesNotArmWatchdogEvenWhenClientsNonempty() {
+        // Codex round-5 P2: FeedWebSocketHandler.afterConnectionEstablished adds every WebSocket to the
+        // shared `clients` set regardless of replay/live mode. Round-4 code preferred clients.size() when
+        // it was non-zero and only fell back to liveAttachedSocketCount() when clients was empty — so a
+        // replay-only socket would still register as "active" and re-trip /readyz on a >60s replay in
+        // market hours. Fix: in per-session mode (routingEngine != null) ALWAYS delegate to
+        // liveAttachedSocketCount(); only legacy broadcast mode counts clients directly.
+        SessionRoutingEngine engine = new SessionRoutingEngine(
+                new ConcurrencyLimits(5, 5, 100), new SubscriptionManager());
+        engine.registerAppSession("app:u1", "u1",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260701", StrikeWindow.ALL), Set.of());
+        engine.attachSocket("app:u1", "sock:u1");
+        engine.setReplayMode("app:u1", true);
+        FeedGatewayService service = serviceWithEngine(engine);
+        // Also add a raw WebSocketSession to clients — this mirrors FeedWebSocketHandler adding every WS
+        // regardless of replay status. Round-4 fallback would have preferred clients.size() = 1 here.
+        service.addSessionForTest(fakeSession("replay-only"));
+        service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        service.setInMarketHoursForTest(true);
+        service.setLastForwardEpochMsForTest(System.currentTimeMillis() - 61_000L);
+        assertEquals(0, engine.liveAttachedSocketCount(),
+                "precondition: zero LIVE-mode sockets — sole session is replaying");
+        assertEquals(200, service.readinessStatus(),
+                "per-session mode with only replay sockets must not arm watchdog even when clients "
+                        + "is non-empty (Codex round-5 P2)");
+    }
+
+    @Test
     void mixOfLiveAndReplaySessionsStillArmsWatchdog() {
         // Existing behavior preservation for round-4 P2: as long as at least one LIVE-mode socket is
         // attached, the watchdog must still trip after a >60s stall in market hours. A replay running
