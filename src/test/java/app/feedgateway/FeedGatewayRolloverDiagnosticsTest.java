@@ -132,6 +132,29 @@ class FeedGatewayRolloverDiagnosticsTest {
                 "streak must reset when forwards resume, so no false alert");
     }
 
+    @Test
+    void forwardStalledDoesNotFireWhenConsumersAreQuiet() {
+        // Regression for Codex P2: the pre-fix code used the CUMULATIVE liveRecordsPolled counter,
+        // so once a consumer had EVER seen a record, `consumersAdvancing` stayed true forever and two
+        // quiet cycles (zero forwardedDelta AND zero new polled records) would fire a false stall
+        // alert. After the fix, `consumersAdvancing` is derived from the per-interval polled delta,
+        // so quiet cycles are NOT treated as a wedge.
+        FeedGatewayService service = service();
+        overrideRth(service, Boolean.TRUE);
+        addFakeClient(service);
+
+        try (CapturedOut ignored = new CapturedOut()) {
+            // One poll cycle produced records — arm the cumulative counter, then let it go quiet.
+            service.bumpLiveRecordsPolledForTest(100L);
+            service.dumpDiagnosticState();  // primes lastDumpLiveRecordsPolledSnapshot to 100
+            // Two quiet dumps: NO new polled records, NO forwards. Consumers are legitimately idle.
+            service.dumpDiagnosticState();  // cycle 1: polledDelta == 0 => streak stays 0
+            service.dumpDiagnosticState();  // cycle 2: polledDelta == 0 => streak stays 0
+        }
+        assertEquals(0L, service.forwardStalledAlertsForTest(),
+                "quiet cycles (no new polled records) must NOT count toward the stall streak");
+    }
+
     // -------------------- test helpers --------------------
 
     private static void overrideRth(FeedGatewayService service, Boolean rth) {

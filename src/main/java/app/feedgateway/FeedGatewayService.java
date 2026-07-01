@@ -192,6 +192,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicReference<String> lastRolloverFrom = new AtomicReference<>("");
     private final AtomicReference<String> lastRolloverTo = new AtomicReference<>("");
     private final AtomicLong lastForwardedSnapshot = new AtomicLong();      // forwardedEvents at the last 60s dump
+    private final AtomicLong lastDumpLiveRecordsPolledSnapshot = new AtomicLong(); // liveRecordsPolled at the last 60s dump
     private volatile int consecutiveZeroForwardCycles = 0;                  // read/written only by the diagnostics thread
     private volatile ScheduledExecutorService diagnosticsExecutor;
     private volatile boolean diagnosticsEnabled = true;
@@ -4241,6 +4242,10 @@ public class FeedGatewayService implements ReplayRunner {
                     : String.format(java.util.Locale.ROOT, "%.2f", (nowMs - lastRoll) / 3_600_000.0);
             int activeSessions = activeSessionsCount();
             long polled = liveRecordsPolled.get();
+            // Per-interval delta — cumulative `polled` would stay > 0 forever after the first record,
+            // making `consumersAdvancing` a false positive during legitimately quiet cycles. Use the
+            // delta since the previous dump instead. (Codex P2 fix.)
+            long polledDelta = Math.max(0L, polled - lastDumpLiveRecordsPolledSnapshot.getAndSet(polled));
 
             System.out.println("RGW_STATE_DUMP event=state_dump"
                     + " activeSelection=" + describeSelection(selection)
@@ -4268,7 +4273,7 @@ public class FeedGatewayService implements ReplayRunner {
                     + " nowMs=" + nowMs);
 
             boolean marketHours = isRegularTradingHours(nowMs);
-            boolean consumersAdvancing = polled > 0L;
+            boolean consumersAdvancing = polledDelta > 0L;
             if (marketHours && delta == 0L && activeSessions > 0 && consumersAdvancing) {
                 consecutiveZeroForwardCycles++;
             } else {
