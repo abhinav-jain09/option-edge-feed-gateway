@@ -62,6 +62,44 @@ class FeedGatewayReadinessWatchdogTest {
                 "zero-session startup window must never fail readiness");
     }
 
+    @Test
+    void readyFailsOnFreshPodStartupWhenSessionWaits61sWithNoForward() throws Exception {
+        // P1 regression: fresh pod, lastForwardEpochMs=0. A client connects, then market-hours ticks pass
+        // without any forward. Previously readinessStatus() stayed 200 because the stall guard required
+        // lastForwardEpochMs > 0 — so a wedge present since startup was invisible. Fix stamps a baseline
+        // the first time we see a session and treats that as the "last forward" fallback.
+        FeedGatewayService service = service();
+        service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        service.addSessionForTest(fakeSession("s1"));
+        // First readiness check: fresh pod, session just appeared → baseline is now, readiness still 200.
+        assertEquals(200, service.readinessStatus(),
+                "fresh pod + session just connected must not immediately fail readiness");
+        // Simulate 61s having passed since the session first appeared with still no forward.
+        service.setReadinessBaselineEpochMsForTest(System.currentTimeMillis() - 61_000L);
+        assertEquals(503, service.readinessStatus(),
+                "fresh pod + active session waiting >60s with no forward must fail readiness");
+    }
+
+    @Test
+    void enqueueWithoutFlushDoesNotStampWatchdog() throws Exception {
+        // P2 regression: legacy coalesced path used to stamp lastForwardEpochMs at enqueue time, so a wedged
+        // flushPendingBatch would leave the watchdog green even though sockets received nothing. Verify the
+        // stamp is not moved forward by simulating a stale prior flush and confirming readiness trips.
+        FeedGatewayService service = service();
+        service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        service.addSessionForTest(fakeSession("s1"));
+        // Pretend a prior flush stamped 61s ago; nothing has flushed since. Enqueue-only calls between then
+        // and now must NOT move this forward.
+        long staleFlushMs = System.currentTimeMillis() - 61_000L;
+        service.setLastForwardEpochMsForTest(staleFlushMs);
+        assertEquals(503, service.readinessStatus(),
+                "stale last-flush timestamp must fail readiness even if enqueue-only work happened since");
+        // Now simulate flushPendingBatch delivering — stamp advances.
+        service.setLastForwardEpochMsForTest(System.currentTimeMillis());
+        assertEquals(200, service.readinessStatus(),
+                "successful flush must clear the stall");
+    }
+
     private static FeedGatewayService service() {
         return new FeedGatewayService(
                 new GatewaySettings(),

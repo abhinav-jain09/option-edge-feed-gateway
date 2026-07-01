@@ -174,6 +174,12 @@ public class FeedGatewayService implements ReplayRunner {
     // midnight-ET session rollover leaves activeSelection/cacheCaughtUp/shouldForward stuck false). This is
     // ONLY read by readiness; liveness (/health) is unaffected.
     private final AtomicLong lastForwardEpochMs = new AtomicLong(0L);
+    // Startup-during-wedge baseline: when a fresh pod has never forwarded (lastForwardEpochMs == 0), but a
+    // session is connected and waiting, we still want /readyz to trip if the wait exceeds the stall threshold.
+    // Stamped the first time readinessStatus() sees an active session, cleared back to 0 once no sessions
+    // remain (so a client-less window doesn't accumulate stall time). Used only as a fallback "last forward"
+    // when the real timestamp is still 0.
+    private final AtomicLong readinessBaselineEpochMs = new AtomicLong(0L);
     // Throttle for the readiness-fail WARN log so a wedged pod doesn't spam once per probe (probes fire
     // every few seconds). At most one WARN per 10s while readiness is down.
     private final AtomicLong lastReadyWarnMs = new AtomicLong(0L);
@@ -672,9 +678,24 @@ public class FeedGatewayService implements ReplayRunner {
         long nowMs = System.currentTimeMillis();
         long lastMs = lastForwardEpochMs.get();
         long secondsSinceLastForward = lastMs <= 0L ? -1L : Math.max(0L, (nowMs - lastMs) / 1_000L);
+        // Session count spans both routing modes: legacy uses the clients set directly; per-session mode also
+        // populates clients on addClient(), but consult the routing engine as belt-and-suspenders so we still
+        // detect waiting users if the engine is the authoritative source in a future refactor.
         int activeSessions = clients.size();
+        if (activeSessions == 0 && routingEngine != null) {
+            activeSessions = routingEngine.activeAppSessions().size();
+        }
+        // Startup-during-wedge fallback: if we've never forwarded but a session is connected, start counting
+        // from the moment we first saw that session. Reset to 0 when no sessions remain so a client-less window
+        // doesn't accumulate stall time.
+        if (activeSessions > 0) {
+            readinessBaselineEpochMs.compareAndSet(0L, nowMs);
+        } else {
+            readinessBaselineEpochMs.set(0L);
+        }
+        long effectiveLastMs = lastMs > 0L ? lastMs : readinessBaselineEpochMs.get();
         boolean marketHours = isRegularTradingHours(nowMs);
-        boolean forwardStalled = lastMs > 0L && (nowMs - lastMs) > FORWARD_STALL_THRESHOLD_MS;
+        boolean forwardStalled = effectiveLastMs > 0L && (nowMs - effectiveLastMs) > FORWARD_STALL_THRESHOLD_MS;
         boolean unhealthy = marketHours && forwardStalled && activeSessions > 0;
         if (unhealthy) {
             long lastWarn = lastReadyWarnMs.get();
@@ -683,6 +704,7 @@ public class FeedGatewayService implements ReplayRunner {
                 System.err.println("WARN feed-gateway readiness=DOWN forward-stalled"
                         + " nowMs=" + nowMs
                         + " lastForwardEpochMs=" + lastMs
+                        + " readinessBaselineEpochMs=" + readinessBaselineEpochMs.get()
                         + " secondsSinceLastForward=" + secondsSinceLastForward
                         + " activeSessions=" + activeSessions);
             }
@@ -699,6 +721,10 @@ public class FeedGatewayService implements ReplayRunner {
     // Test seams for the readiness watchdog.
     void setLastForwardEpochMsForTest(long epochMs) {
         this.lastForwardEpochMs.set(epochMs);
+    }
+
+    void setReadinessBaselineEpochMsForTest(long epochMs) {
+        this.readinessBaselineEpochMs.set(epochMs);
     }
 
     int activeSessionsForTest() {
@@ -1316,9 +1342,11 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                     } else if (cacheKey != null && cacheCaughtUpFlag.get()
                             && shouldForward(binding, json, record, (decided = activeSelection.get()))) {
+                        // Legacy coalesced path: enqueue only stages into pending maps — real socket delivery
+                        // is flushPendingBatch(), which now stamps lastForwardEpochMs after a successful send.
+                        // Do NOT stamp here or the watchdog would be fooled by a wedged flush.
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
-                        lastForwardEpochMs.set(System.currentTimeMillis());
                         recordSelectedForward(binding, json, decided);
                     } else if (cacheKey != null) {
                         inactiveDroppedEvents.incrementAndGet();
@@ -3886,10 +3914,19 @@ public class FeedGatewayService implements ReplayRunner {
                 );
                 clearPendingLocked();
             }
+            int delivered = 0;
             for (WebSocketSession client : clients) {
                 sendEnvelope(client, envelope);
+                delivered++;
             }
             batchesSent.incrementAndGet();
+            // Forward-path watchdog: stamp ONLY after a real flush actually delivered to at least one session.
+            // Enqueue-time stamping (removed on the caller side) would let the watchdog stay green while the
+            // batch flusher itself is wedged. sendEnvelope is fire-and-forget onto per-socket outbound queues,
+            // which is the last write-site inside the gateway process.
+            if (delivered > 0) {
+                lastForwardEpochMs.set(System.currentTimeMillis());
+            }
         } catch (RuntimeException e) {
             if (running.get()) {
                 System.err.println("Feed gateway batch flush error: " + e.getMessage());
