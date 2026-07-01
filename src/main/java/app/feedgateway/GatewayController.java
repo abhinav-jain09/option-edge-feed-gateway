@@ -37,6 +37,19 @@ public class GatewayController {
         return service.healthJson();
     }
 
+    /**
+     * Forward-path watchdog readiness probe. 503 when the broadcast path is silently stalled during
+     * market hours with at least one active WebSocket session — so k8s stops routing to a wedged pod
+     * and restarts it. Liveness (/health) is unaffected. See
+     * {@link FeedGatewayService#readinessStatus()} for the full contract.
+     */
+    @GetMapping(value = "/readyz", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<String> readyz() {
+        int status = service.readinessStatus();
+        String body = status == 200 ? "{\"ready\":true}" : "{\"ready\":false,\"reason\":\"forward-stalled\"}";
+        return ResponseEntity.status(status).body(body);
+    }
+
     @GetMapping(value = "/metrics", produces = MediaType.TEXT_PLAIN_VALUE)
     public String metrics() {
         return service.metrics();

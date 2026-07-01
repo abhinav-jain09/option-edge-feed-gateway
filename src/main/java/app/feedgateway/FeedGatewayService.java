@@ -168,6 +168,15 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong batchesSent = new AtomicLong();
     private final AtomicLong consumerRestarts = new AtomicLong();
     private final AtomicLong forwardedEvents = new AtomicLong();
+    // Forward-path watchdog (readiness gate): stamped every time an event is actually forwarded to sockets
+    // (all four forward sites). /readyz fails when this stays stale during market hours with active sessions
+    // — so k8s auto-restarts the pod within ~60s if the broadcast path silently wedges (e.g. after the
+    // midnight-ET session rollover leaves activeSelection/cacheCaughtUp/shouldForward stuck false). This is
+    // ONLY read by readiness; liveness (/health) is unaffected.
+    private final AtomicLong lastForwardEpochMs = new AtomicLong(0L);
+    // Throttle for the readiness-fail WARN log so a wedged pod doesn't spam once per probe (probes fire
+    // every few seconds). At most one WARN per 10s while readiness is down.
+    private final AtomicLong lastReadyWarnMs = new AtomicLong(0L);
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -642,6 +651,64 @@ public class FeedGatewayService implements ReplayRunner {
         return closed;
     }
 
+    /**
+     * Forward-path watchdog readiness. Returns 503 when — during US regular trading hours, with at least
+     * one active WebSocket session — the gateway has not forwarded ANY event to sockets in the last
+     * {@link #FORWARD_STALL_THRESHOLD_MS}. Off-hours or with zero sessions readiness stays 200 so we do not
+     * flap a healthy pod (session-less startup / weekends / overnight all yield 200 by design).
+     *
+     * <p>Liveness (/health) is intentionally NOT gated on this — only readiness — so k8s stops routing
+     * traffic to a wedged pod and restarts it via the readiness→restart controller path, without an
+     * abrupt liveness kill.
+     *
+     * <p>Introduced after the 2026-07-01 prod incident: pod stayed 1/1 Ready (HTTP alive) and Kafka
+     * offsets advanced, but the internal broadcast state (activeSelection / cacheCaughtUpFlag /
+     * shouldForward) got stuck false after the midnight-ET session rollover, so NO events reached
+     * clients for 9.5 hours. Separate PR addresses the rollover cause; this is the watchdog.
+     *
+     * @return HTTP status: 200 healthy, 503 forward path stalled during market hours with active sessions.
+     */
+    public int readinessStatus() {
+        long nowMs = System.currentTimeMillis();
+        long lastMs = lastForwardEpochMs.get();
+        long secondsSinceLastForward = lastMs <= 0L ? -1L : Math.max(0L, (nowMs - lastMs) / 1_000L);
+        int activeSessions = clients.size();
+        boolean marketHours = isRegularTradingHours(nowMs);
+        boolean forwardStalled = lastMs > 0L && (nowMs - lastMs) > FORWARD_STALL_THRESHOLD_MS;
+        boolean unhealthy = marketHours && forwardStalled && activeSessions > 0;
+        if (unhealthy) {
+            long lastWarn = lastReadyWarnMs.get();
+            if (nowMs - lastWarn >= READY_WARN_THROTTLE_MS
+                    && lastReadyWarnMs.compareAndSet(lastWarn, nowMs)) {
+                System.err.println("WARN feed-gateway readiness=DOWN forward-stalled"
+                        + " nowMs=" + nowMs
+                        + " lastForwardEpochMs=" + lastMs
+                        + " secondsSinceLastForward=" + secondsSinceLastForward
+                        + " activeSessions=" + activeSessions);
+            }
+            return 503;
+        }
+        return 200;
+    }
+
+    /** Forward-stall threshold — pod restarts within ~60s of a wedged broadcast path. */
+    private static final long FORWARD_STALL_THRESHOLD_MS = 60_000L;
+    /** Cap the readiness-fail WARN at one every 10s so a wedged pod doesn't spam probe-rate log lines. */
+    private static final long READY_WARN_THROTTLE_MS = 10_000L;
+
+    // Test seams for the readiness watchdog.
+    void setLastForwardEpochMsForTest(long epochMs) {
+        this.lastForwardEpochMs.set(epochMs);
+    }
+
+    int activeSessionsForTest() {
+        return clients.size();
+    }
+
+    void addSessionForTest(WebSocketSession session) {
+        clients.add(session);
+    }
+
     public String healthJson() {
         purgeExpiredCache(System.currentTimeMillis());
         ActiveSelection selection = activeSelection.get();
@@ -1031,6 +1098,7 @@ public class FeedGatewayService implements ReplayRunner {
                             enqueuePending(update.event(), update.key(), update.json());
                         }
                         forwardedEvents.incrementAndGet();
+                        lastForwardEpochMs.set(System.currentTimeMillis());
                     } else if (update != null) {
                         inactiveDroppedEvents.incrementAndGet();
                     }
@@ -1074,6 +1142,7 @@ public class FeedGatewayService implements ReplayRunner {
                     if (json != null && !json.isBlank() && (perSessionRouting() || shouldForward(binding, json, record, decided))) {
                         routeOrBroadcast(binding.source(), binding.event(), json);
                         forwardedEvents.incrementAndGet();
+                        lastForwardEpochMs.set(System.currentTimeMillis());
                         recordSelectedForward(binding, json, decided);
                     } else {
                         inactiveDroppedEvents.incrementAndGet();
@@ -1243,11 +1312,13 @@ public class FeedGatewayService implements ReplayRunner {
                         if ((cacheKey != null || !"max-pain".equals(binding.event())) && !missionPaceStale && !missionControlStale) {
                             routeOrBroadcast(binding.source(), binding.event(), json);
                             forwardedEvents.incrementAndGet();
+                            lastForwardEpochMs.set(System.currentTimeMillis());
                         }
                     } else if (cacheKey != null && cacheCaughtUpFlag.get()
                             && shouldForward(binding, json, record, (decided = activeSelection.get()))) {
                         enqueuePending(binding.event(), cacheKey, json);
                         forwardedEvents.incrementAndGet();
+                        lastForwardEpochMs.set(System.currentTimeMillis());
                         recordSelectedForward(binding, json, decided);
                     } else if (cacheKey != null) {
                         inactiveDroppedEvents.incrementAndGet();
