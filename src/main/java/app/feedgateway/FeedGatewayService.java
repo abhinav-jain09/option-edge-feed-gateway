@@ -111,6 +111,7 @@ public class FeedGatewayService implements ReplayRunner {
             "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike",
             "strike-sr",
             "max-pain",
+            "option-price-behavior",
             "index-price", "vix-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
     private final SessionRoutingEngine routingEngine;
@@ -130,6 +131,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> maxPain = new ConcurrentHashMap<>();
+    private final Map<String, String> optionPriceBehaviors = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfLatestSignals = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfMarketFlows = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfTopCandidates = new ConcurrentHashMap<>();
@@ -153,6 +155,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeSr = new LinkedHashMap<>();
     private final Map<String, String> pendingMaxPain = new LinkedHashMap<>();
+    private final Map<String, String> pendingOptionPriceBehaviors = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfLatestSignals = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfMarketFlows = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfTopCandidates = new LinkedHashMap<>();
@@ -285,7 +288,8 @@ public class FeedGatewayService implements ReplayRunner {
                 Math.max(100L, settings.wsWriteDeadlineMs() / 2),
                 TimeUnit.MILLISECONDS
         );
-        // AUTO-expiry daily roll (no-op unless IB_EXPIRY is empty/AUTO). 60s cadence catches the overnight
+        // AUTO-expiry daily roll (no-op unless MARKET_DATA_EXPIRY, or its IB_EXPIRY fallback, is the explicit
+        // "AUTO"). 60s cadence catches the overnight
         // ET trading-date change well before the open; the date never changes mid-session.
         batchExecutor.scheduleAtFixedRate(this::maybeAutoRollExpiry, 60L, 60L, TimeUnit.SECONDS);
     }
@@ -673,6 +677,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
+                + "\"optionPriceBehaviors\":" + optionPriceBehaviors.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
                 + "\"hpsfMarketFlows\":" + hpsfMarketFlows.size() + ","
                 + "\"hpsfTopCandidates\":" + hpsfTopCandidates.size() + ","
@@ -768,6 +773,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_max_pain Cached per-(symbol,expiry) max-pain count.\n"
                 + "# TYPE options_edge_feed_gateway_max_pain gauge\n"
                 + "options_edge_feed_gateway_max_pain " + maxPain.size() + "\n"
+                + "# HELP options_edge_feed_gateway_option_price_behaviors Cached symbol-level option price behavior dashboard count.\n"
+                + "# TYPE options_edge_feed_gateway_option_price_behaviors gauge\n"
+                + "options_edge_feed_gateway_option_price_behaviors " + optionPriceBehaviors.size() + "\n"
                 + "# HELP options_edge_feed_gateway_hpsf_latest_signals Cached HPSF latest-signal view count.\n"
                 + "# TYPE options_edge_feed_gateway_hpsf_latest_signals gauge\n"
                 + "options_edge_feed_gateway_hpsf_latest_signals " + hpsfLatestSignals.size() + "\n"
@@ -926,6 +934,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding("DATABENTO", "mission-pace"));
         topicEvents.put(settings.missionControlTopic(), new TopicBinding("DATABENTO", "mission-control"));
+        topicEvents.put(settings.databentoOptionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -962,6 +971,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding("DATABENTO", "mission-pace"));
         topicEvents.put(settings.missionControlTopic(), new TopicBinding("DATABENTO", "mission-control"));
+        topicEvents.put(settings.databentoOptionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
@@ -1240,7 +1250,12 @@ public class FeedGatewayService implements ReplayRunner {
                         // same explicit maxStale gate — a STALE mission-control frame must never reach a socket.
                         boolean missionControlStale = "mission-control".equals(binding.event())
                                 && !recordWithinMaxStale(record);
-                        if ((cacheKey != null || !"max-pain".equals(binding.event())) && !missionPaceStale && !missionControlStale) {
+                        boolean optionPriceBehaviorStale = "option-price-behavior".equals(binding.event())
+                                && !recordWithinMaxStale(record);
+                        if ((cacheKey != null || !"max-pain".equals(binding.event()))
+                                && !missionPaceStale
+                                && !missionControlStale
+                                && !optionPriceBehaviorStale) {
                             routeOrBroadcast(binding.source(), binding.event(), json);
                             forwardedEvents.incrementAndGet();
                         }
@@ -1525,7 +1540,8 @@ public class FeedGatewayService implements ReplayRunner {
      * (the feed self-rolls the same way). Reuses {@link #applySelection} — the SAME path as a control-topic
      * selection — so the chain reset/replay/readiness behave identically. {@code autoRolledExpiry} guards it
      * to fire once per new trading day, and a manual selection holds for the day (auto resumes next day).
-     * No-op when pinned to an explicit IB_EXPIRY. Scheduled every 60s; the date only changes overnight, so
+     * No-op when pinned to an explicit MARKET_DATA_EXPIRY (or its IB_EXPIRY fallback). Scheduled every 60s;
+     * the date only changes overnight, so
      * this is never a mid-session swap. A fresh ms epoch makes the rolled selection supersede prior ones.
      */
     private void maybeAutoRollExpiry() {
@@ -1608,7 +1624,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     static List<String> sourceSwitchReplayEvents() {
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "strike-sr", "max-pain");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "strike-sr", "max-pain", "option-price-behavior");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -1651,6 +1667,13 @@ public class FeedGatewayService implements ReplayRunner {
             return binding.source().equals(selection.source())
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesActiveSelection(json, selection);
+        }
+        if ("option-price-behavior".equals(binding.event())) {
+            // The behavior dashboard is symbol-level: it intentionally has no expiry field, so gate it
+            // by source, freshness, and selected symbol only. Per-session routing fans it to SPX chains.
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
+                    && matchesActiveSymbol(json, selection);
         }
         if (!binding.source().equals(selection.source())) {
             return false;
@@ -1741,6 +1764,22 @@ public class FeedGatewayService implements ReplayRunner {
 
     private boolean matchesActiveSelection(String json, ActiveSelection selection) {
         return matchesSelection(json, selection, true);
+    }
+
+    private boolean matchesActiveSymbol(String json, ActiveSelection selection) {
+        if (json == null || json.isBlank() || selection == null) {
+            return false;
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            String source = GatewaySettings.normalizeSource(text(root, "marketDataSource"));
+            if (!source.isBlank() && !selection.source().equals(source)) {
+                return false;
+            }
+            return selection.symbol().equalsIgnoreCase(text(root, "symbol"));
+        } catch (JsonProcessingException ignored) {
+            return false;
+        }
     }
 
     /**
@@ -1853,6 +1892,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = gexCacheKey(json, key);
         } else if ("max-pain".equals(event)) {
             key = maxPainCacheKey(json, key);
+        } else if ("option-price-behavior".equals(event)) {
+            key = optionPriceBehaviorCacheKey(json, key);
         }
         if (!"pace".equals(event) && !"pace-rank".equals(event)) {
             // pace-rank's record key is already the epoch-qualified boardKey (includes source) — don't re-prefix.
@@ -1973,6 +2014,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 maxPain.put(key, json);
+                return key;
+            }
+            case "option-price-behavior" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                optionPriceBehaviors.put(key, json);
                 return key;
             }
             default -> {
@@ -2293,6 +2340,13 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("max-pain", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "option-price-behavior" -> optionPriceBehaviors.entrySet().stream()
+                        .filter(entry -> isCacheFresh("option-price-behavior:" + entry.getKey(), nowMs))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesActiveSymbol(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("option-price-behavior", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "hpsf-latest-signal" -> hpsfLatestSignals.entrySet().stream()
                         .filter(entry -> isCacheFresh("hpsf-latest-signal:" + entry.getKey(), nowMs))
                         .sorted(Map.Entry.comparingByKey())
@@ -2520,6 +2574,8 @@ public class FeedGatewayService implements ReplayRunner {
             strikeSr.remove(versionKey.substring("strike-sr:".length()));
         } else if (versionKey.startsWith("max-pain:")) {
             maxPain.remove(versionKey.substring("max-pain:".length()));
+        } else if (versionKey.startsWith("option-price-behavior:")) {
+            optionPriceBehaviors.remove(versionKey.substring("option-price-behavior:".length()));
         } else if (versionKey.startsWith("hpsf-latest-signal:")) {
             hpsfLatestSignals.remove(versionKey.substring("hpsf-latest-signal:".length()));
         } else if (versionKey.startsWith("hpsf-market-flow:")) {
@@ -2639,6 +2695,24 @@ public class FeedGatewayService implements ReplayRunner {
             String expiry = normalizeExpiry(text(root, "expiry"));
             if (!symbol.isBlank() && !expiry.isBlank()) {
                 return symbol + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    /**
+     * Cache key for the symbol-level option price behavior dashboard. The producer key is symbol|tradingDate;
+     * re-derive it from payload identity so a bad Kafka key does not cross-wire dashboards.
+     */
+    private String optionPriceBehaviorCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String tradingDate = text(root, "tradingDate").replace("-", "");
+            if (!symbol.isBlank() && !tradingDate.isBlank()) {
+                return symbol + "|" + tradingDate;
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
@@ -2809,6 +2883,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "max-pain", maxPain);
+        replayCacheMap(session, "option-price-behavior", optionPriceBehaviors);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
         // as index-price — so a VIX record is never delivered mislabelled as index-price.
         replayCacheMap(session, "vix-price", vixPrices);
@@ -3064,6 +3139,7 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics.put(settings.databentoPaceMissionTopic(), "mission-pace");
                 stringTopics.put(settings.missionControlTopic(), "mission-control");
                 stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
+                stringTopics.put(settings.databentoOptionPriceBehaviorDashboardTopic(), "option-price-behavior");
             } else {
                 avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
                 avroTopics.put(settings.ibkrPaceTopic(), "pace");
@@ -3765,6 +3841,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "gex-by-strike" -> pendingGexByStrike;
             case "strike-sr" -> pendingStrikeSr;
             case "max-pain" -> pendingMaxPain;
+            case "option-price-behavior" -> pendingOptionPriceBehaviors;
             case "hpsf-latest-signal" -> pendingHpsfLatestSignals;
             case "hpsf-market-flow" -> pendingHpsfMarketFlows;
             case "hpsf-top-candidates" -> pendingHpsfTopCandidates;
@@ -3807,6 +3884,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingGexByStrike.values()),
                         new ArrayList<>(pendingStrikeSr.values()),
                         new ArrayList<>(pendingMaxPain.values()),
+                        new ArrayList<>(pendingOptionPriceBehaviors.values()),
                         new ArrayList<>(pendingHpsfLatestSignals.values()),
                         new ArrayList<>(pendingHpsfMarketFlows.values()),
                         new ArrayList<>(pendingHpsfTopCandidates.values()),
@@ -3846,6 +3924,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingGexByStrike.size()
                 + pendingStrikeSr.size()
                 + pendingMaxPain.size()
+                + pendingOptionPriceBehaviors.size()
                 + pendingHpsfLatestSignals.size()
                 + pendingHpsfMarketFlows.size()
                 + pendingHpsfTopCandidates.size()
@@ -3866,6 +3945,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingGexByStrike.clear();
         pendingStrikeSr.clear();
         pendingMaxPain.clear();
+        pendingOptionPriceBehaviors.clear();
         pendingHpsfLatestSignals.clear();
         pendingHpsfMarketFlows.clear();
         pendingHpsfTopCandidates.clear();
@@ -3891,6 +3971,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> gexByStrikeJsons = new ArrayList<>();
         List<String> strikeSrJsons = new ArrayList<>();
         List<String> maxPainJsons = new ArrayList<>();
+        List<String> optionPriceBehaviorJsons = new ArrayList<>();
         List<String> hpsfLatestSignalJsons = new ArrayList<>();
         List<String> hpsfMarketFlowJsons = new ArrayList<>();
         List<String> hpsfTopCandidatesJsons = new ArrayList<>();
@@ -3910,6 +3991,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
                 case "strike-sr" -> strikeSrJsons.add(cachedEvent.json());
                 case "max-pain" -> maxPainJsons.add(cachedEvent.json());
+                case "option-price-behavior" -> optionPriceBehaviorJsons.add(cachedEvent.json());
                 case "hpsf-latest-signal" -> hpsfLatestSignalJsons.add(cachedEvent.json());
                 case "hpsf-market-flow" -> hpsfMarketFlowJsons.add(cachedEvent.json());
                 case "hpsf-top-candidates" -> hpsfTopCandidatesJsons.add(cachedEvent.json());
@@ -3933,6 +4015,7 @@ public class FeedGatewayService implements ReplayRunner {
                 gexByStrikeJsons,
                 strikeSrJsons,
                 maxPainJsons,
+                optionPriceBehaviorJsons,
                 hpsfLatestSignalJsons,
                 hpsfMarketFlowJsons,
                 hpsfTopCandidatesJsons,
@@ -3954,6 +4037,48 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> gexByStrikeJsons,
             List<String> strikeSrJsons,
             List<String> maxPainJsons,
+            List<String> hpsfLatestSignalJsons,
+            List<String> hpsfMarketFlowJsons,
+            List<String> hpsfTopCandidatesJsons,
+            List<String> hpsfAuditJsons,
+            List<String> hpsfExitIntentJsons
+    ) {
+        return uiBatchEnvelopeJson(
+                snapshotJsons,
+                paceJsons,
+                paceRankJsons,
+                directionalPressureJsons,
+                strikeFlowJsons,
+                missionPaceJsons,
+                missionControlJsons,
+                indexPriceJsons,
+                volumeSandwichJsons,
+                gexByStrikeJsons,
+                strikeSrJsons,
+                maxPainJsons,
+                List.of(),
+                hpsfLatestSignalJsons,
+                hpsfMarketFlowJsons,
+                hpsfTopCandidatesJsons,
+                hpsfAuditJsons,
+                hpsfExitIntentJsons
+        );
+    }
+
+    private String uiBatchEnvelopeJson(
+            List<String> snapshotJsons,
+            List<String> paceJsons,
+            List<String> paceRankJsons,
+            List<String> directionalPressureJsons,
+            List<String> strikeFlowJsons,
+            List<String> missionPaceJsons,
+            List<String> missionControlJsons,
+            List<String> indexPriceJsons,
+            List<String> volumeSandwichJsons,
+            List<String> gexByStrikeJsons,
+            List<String> strikeSrJsons,
+            List<String> maxPainJsons,
+            List<String> optionPriceBehaviorJsons,
             List<String> hpsfLatestSignalJsons,
             List<String> hpsfMarketFlowJsons,
             List<String> hpsfTopCandidatesJsons,
@@ -3982,6 +4107,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
                 + "\"strikeSr\":" + jsonArray(strikeSrJsons) + ","
                 + "\"maxPains\":" + jsonArray(maxPainJsons) + ","
+                + "\"optionPriceBehaviors\":" + jsonArray(optionPriceBehaviorJsons) + ","
                 + "\"hpsfLatestSignals\":" + jsonArray(hpsfLatestSignalJsons) + ","
                 + "\"hpsfMarketFlows\":" + jsonArray(hpsfMarketFlowJsons) + ","
                 + "\"hpsfTopCandidates\":" + jsonArray(hpsfTopCandidatesJsons) + ","
@@ -4020,6 +4146,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"missionControls\":" + missionControls.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
+                + "\"optionPriceBehaviors\":" + optionPriceBehaviors.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
                 + "\"hpsfMarketFlows\":" + hpsfMarketFlows.size() + ","
                 + "\"hpsfTopCandidates\":" + hpsfTopCandidates.size() + ","

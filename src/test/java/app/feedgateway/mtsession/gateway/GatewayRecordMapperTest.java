@@ -55,6 +55,15 @@ class GatewayRecordMapperTest {
     }
 
     @Test
+    void mapsOptionPriceBehaviorAsUnderlyingScopedDashboardEvent() throws Exception {
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "option-price-behavior",
+                node("{\"symbol\":\"SPX\",\"tradingDate\":\"20260701\",\"rolling10sBehaviorScore\":58.2}"))
+                .orElseThrow();
+        assertEquals(EventType.OPTION_PRICE_BEHAVIOR, rec.eventType());
+        assertTrue(rec.strike().isEmpty());
+    }
+
+    @Test
     void contractEventWithoutStrikeHasEmptyStrike() throws Exception {
         RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "strike-flow",
                 node("{\"symbol\":\"SPX\",\"expiry\":\"20260617\"}")).orElseThrow();
@@ -80,6 +89,7 @@ class GatewayRecordMapperTest {
         assertEquals(EventType.MISSION_CONTROL, GatewayRecordMapper.eventTypeFor("mission-control"));
         assertEquals(EventType.GEX_BY_STRIKE, GatewayRecordMapper.eventTypeFor("gex-by-strike"));
         assertEquals(EventType.MAX_PAIN, GatewayRecordMapper.eventTypeFor("max-pain"));
+        assertEquals(EventType.OPTION_PRICE_BEHAVIOR, GatewayRecordMapper.eventTypeFor("option-price-behavior"));
         assertNull(GatewayRecordMapper.eventTypeFor("hpsf-audit"));
         assertNull(GatewayRecordMapper.eventTypeFor(null));
     }

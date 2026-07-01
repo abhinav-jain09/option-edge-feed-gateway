@@ -147,13 +147,14 @@ public final class GatewaySettings {
     }
 
     public String initialExpiry() {
-        // IB_EXPIRY == "AUTO" -> resolve the current ET trading date from the market calendar,
+        // MARKET_DATA_EXPIRY == "AUTO" -> resolve the current ET trading date from the market calendar,
         // mirroring the Databento feed's AUTO mode. The OLD static 16:15 rollover was removed because the
         // feed did NOT roll, so advancing the gateway alone emptied the chain. The feed now self-rolls
         // (options-edge-databento-feed AUTO), so the gateway rolls too — by the SAME calendar, to the SAME
         // date — via FeedGatewayService.maybeAutoRollExpiry. An explicit yyyyMMdd still pins (verbatim),
-        // for replay or a manual override.
-        String configured = value("IB_EXPIRY", "");
+        // for replay or a manual override. IB_EXPIRY is the deprecated fallback (retired IB feed) — read
+        // only when MARKET_DATA_EXPIRY is unset, so old config keeps working during the transition.
+        String configured = marketDataExpiry();
         if (isAutoExpiry(configured)) {
             return marketCalendar().currentTradingDate(Instant.now())
                     .format(DateTimeFormatter.BASIC_ISO_DATE);
@@ -161,16 +162,28 @@ public final class GatewaySettings {
         return normalizeExpiry(configured);
     }
 
-    /** True when IB_EXPIRY is empty or AUTO: the gateway resolves AND daily-rolls the expiry from the calendar. */
+    /** True ONLY when MARKET_DATA_EXPIRY (or its IB_EXPIRY fallback) is the explicit string "AUTO":
+     *  the gateway resolves AND daily-rolls the expiry from the calendar. Blank fails closed. */
     public boolean autoExpiry() {
-        return isAutoExpiry(value("IB_EXPIRY", ""));
+        return isAutoExpiry(marketDataExpiry());
+    }
+
+    /**
+     * The configured chain expiry: source-neutral {@code MARKET_DATA_EXPIRY} is primary, and the legacy
+     * {@code IB_EXPIRY} (a leftover from the retired Interactive-Brokers feed; the system is Databento-only
+     * now) is the deprecated backward-compat fallback. {@link #value} treats blank as unset, so IB_EXPIRY
+     * is consulted only when MARKET_DATA_EXPIRY is absent/blank — old config keeps resolving unchanged.
+     */
+    private static String marketDataExpiry() {
+        return value("MARKET_DATA_EXPIRY", value("IB_EXPIRY", ""));
     }
 
     private static boolean isAutoExpiry(String configured) {
-        // ONLY an explicit "AUTO" enables calendar resolution. A blank IB_EXPIRY deliberately stays blank
-        // so a truly-unconfigured gateway still fails closed on the bearer handshake
-        // (WsJwtHandshakeInterceptor.defaultSelection throws on a blank expiry). The deploy always writes
-        // AUTO or a concrete yyyyMMdd, never blank, so AUTO mode is still active in every deployed env.
+        // ONLY an explicit "AUTO" enables calendar resolution. A blank MARKET_DATA_EXPIRY (and blank
+        // IB_EXPIRY fallback) deliberately stays blank so a truly-unconfigured gateway still fails closed
+        // on the bearer handshake (WsJwtHandshakeInterceptor.defaultSelection throws on a blank expiry).
+        // The deploy always writes AUTO or a concrete yyyyMMdd, never blank, so AUTO mode is still active
+        // in every deployed env.
         return configured != null && configured.trim().equalsIgnoreCase("AUTO");
     }
 
@@ -276,6 +289,11 @@ public final class GatewaySettings {
     /** Databento per-(symbol,expiry) max-pain output topic. Independent of GEX; consumed only by the max-pain stream. */
     public String databentoMaxPainTopic() {
         return value("KAFKA_DATABENTO_MAXPAIN_TOPIC", "options.databento.maxpain");
+    }
+
+    /** Databento option price behavior dashboard topic. JSON, one compact symbol-level dashboard record. */
+    public String databentoOptionPriceBehaviorDashboardTopic() {
+        return value("KAFKA_DATABENTO_OPTION_PRICE_BEHAVIOR_DASHBOARD_TOPIC", "option-price-behavior-dashboard");
     }
 
     public String hpsfLatestSignalTopic() {
