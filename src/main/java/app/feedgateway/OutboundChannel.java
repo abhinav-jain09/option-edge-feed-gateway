@@ -1,5 +1,6 @@
 package app.feedgateway;
 
+import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
@@ -9,6 +10,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
@@ -44,7 +46,10 @@ final class OutboundChannel {
         void droppedOnClose(int messages);
     }
 
-    private enum CloseReason { OVERFLOW, WRITE_ERROR }
+    private enum CloseReason { OVERFLOW, WRITE_ERROR, SEND_TIMEOUT, IDLE }
+
+    /** Throttle interval for the "slow send force-closed" WARN log; one line per socket per 30s. */
+    private static final long TIMEOUT_WARN_THROTTLE_MS = 30_000L;
 
     private record Pending(String envelope, int bytes) {
     }
@@ -64,6 +69,12 @@ final class OutboundChannel {
     private boolean draining;
     private long peakDepth;
     private volatile long sendStartedAtMs; // 0 = no send in flight; else the wall-clock the write began
+    // Wall-clock of the last observed I/O in EITHER direction: successful send OR inbound frame from the
+    // client. Seeded to construction time so a brand-new socket does not fire the idle sweep immediately.
+    private final AtomicLong lastActivityAtMs = new AtomicLong(System.currentTimeMillis());
+    // Wall-clock of the last "send timeout" WARN emitted for this channel; drives per-socket throttling so
+    // a wedged send does not spam the log on every watchdog tick.
+    private final AtomicLong lastTimeoutWarnAtMs = new AtomicLong(0L);
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     OutboundChannel(WebSocketSession session, Executor writers, int maxMessages, long maxBytes,
@@ -123,6 +134,7 @@ final class OutboundChannel {
             }
             queuedBytes += bytes;
             metrics.enqueued(bytes);
+            lastActivityAtMs.set(System.currentTimeMillis()); // outbound activity — keep the idle sweep quiet
             if (queue.size() > peakDepth) {
                 peakDepth = queue.size();
             }
@@ -171,6 +183,7 @@ final class OutboundChannel {
                 // If it exceeds the write deadline the watchdog force-closes the session, unblocking us.
                 session.sendMessage(new TextMessage(next.envelope()));
                 metrics.sent(next.bytes());
+                lastActivityAtMs.set(System.currentTimeMillis()); // successful outbound I/O
             } catch (IOException | RuntimeException e) {
                 close(CloseReason.WRITE_ERROR);
                 return;
@@ -183,14 +196,56 @@ final class OutboundChannel {
     /**
      * Watchdog hook (called periodically off the writer threads): if a send has been in flight longer than
      * {@code deadlineMs}, force-close the socket — this unblocks the stuck writer and frees its pool thread,
-     * so a few stuck clients cannot starve everyone else. Returns true if it disconnected the client.
+     * so a few stuck clients cannot starve everyone else. Returns true if it disconnected the client. The
+     * close uses {@link CloseStatus#SESSION_NOT_RELIABLE} so the browser can distinguish a slow-client evict
+     * from a normal disconnect, and emits ONE structured WARN per socket per 30s (throttled) — enough to
+     * see it in prod without flooding the log if many sockets wedge at once.
      */
     boolean enforceWriteDeadline(long nowMs, long deadlineMs) {
         long started = sendStartedAtMs;
         if (started != 0L && nowMs - started > deadlineMs && !closed.get()) {
-            return close(CloseReason.WRITE_ERROR);
+            long elapsed = nowMs - started;
+            long lastWarn = lastTimeoutWarnAtMs.get();
+            if (nowMs - lastWarn >= TIMEOUT_WARN_THROTTLE_MS
+                    && lastTimeoutWarnAtMs.compareAndSet(lastWarn, nowMs)) {
+                System.out.println("WARN ws-send-timeout socketId=" + socketId + " elapsedMs=" + elapsed
+                        + " deadlineMs=" + deadlineMs + " action=close-session-not-reliable");
+            }
+            return close(CloseReason.SEND_TIMEOUT);
         }
         return false;
+    }
+
+    /**
+     * Note an inbound frame from the client. Called by the WS handler on every message received, so a
+     * chatty control channel (ping/pong, resubscribes, replay control) keeps the socket out of the idle
+     * sweep even when no outbound events are currently being written for it.
+     */
+    void noteInboundActivity() {
+        lastActivityAtMs.set(System.currentTimeMillis());
+    }
+
+    /**
+     * Idle-sweep hook: if the socket has had no I/O in EITHER direction for {@code idleMs}, close it. This
+     * catches TCP half-open connections (laptop lid closed, dead NAT, dropped WiFi) that Spring's raw
+     * WebSocket does NOT detect on its own — the send never fails because no bytes need to leave, so
+     * {@link #enforceWriteDeadline} never fires. Returns true if it disconnected the client.
+     */
+    boolean enforceIdleTimeout(long nowMs, long idleMs) {
+        if (closed.get()) {
+            return false;
+        }
+        long last = lastActivityAtMs.get();
+        if (nowMs - last > idleMs) {
+            System.out.println("WARN ws-idle-timeout socketId=" + socketId
+                    + " idleMs=" + (nowMs - last) + " thresholdMs=" + idleMs + " action=close");
+            return close(CloseReason.IDLE);
+        }
+        return false;
+    }
+
+    long lastActivityAtMs() {
+        return lastActivityAtMs.get();
     }
 
     private boolean close(CloseReason reason) {
@@ -206,14 +261,24 @@ final class OutboundChannel {
         if (reason == CloseReason.OVERFLOW) {
             metrics.disconnectedSlow();
         } else {
+            // SEND_TIMEOUT / IDLE / WRITE_ERROR all bucket into writeError for now — they all indicate the
+            // client is not reliably draining, and the log line above carries the specific reason.
             metrics.writeError();
         }
         if (dropped > 0) {
             metrics.droppedOnClose(dropped);
         }
-        closeSessionQuietly();
+        closeSessionQuietly(closeStatusFor(reason));
         onClose.accept(this);
         return true;
+    }
+
+    private static CloseStatus closeStatusFor(CloseReason reason) {
+        // A slow/idle/timeout eviction is not an application protocol violation; the closest existing
+        // CloseStatus is SESSION_NOT_RELIABLE, which the task requested explicitly.
+        return switch (reason) {
+            case SEND_TIMEOUT, IDLE, OVERFLOW, WRITE_ERROR -> CloseStatus.SESSION_NOT_RELIABLE;
+        };
     }
 
     /** Quiet teardown on a NORMAL disconnect/shutdown — drops the queue, fires no slow-client signal. */
@@ -227,10 +292,14 @@ final class OutboundChannel {
         }
     }
 
-    private void closeSessionQuietly() {
+    private void closeSessionQuietly(CloseStatus status) {
         try {
             if (session.isOpen()) {
-                session.close();
+                if (status != null) {
+                    session.close(status);
+                } else {
+                    session.close();
+                }
             }
         } catch (IOException | RuntimeException ignored) {
             // already marked closed and detached from routing

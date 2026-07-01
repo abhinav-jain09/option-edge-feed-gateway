@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.stubbing.Answer;
+import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
@@ -61,8 +62,9 @@ class OutboundChannelTest {
             return null;
         };
         org.mockito.Mockito.doAnswer(answer).when(ws).sendMessage(any());
-        // unblock any blocked writer when the channel force-closes the session
+        // unblock any blocked writer when the channel force-closes the session (both close() and close(status))
         org.mockito.Mockito.doAnswer(inv -> { release.countDown(); return null; }).when(ws).close();
+        org.mockito.Mockito.doAnswer(inv -> { release.countDown(); return null; }).when(ws).close(any(CloseStatus.class));
         return ws;
     }
 
@@ -140,7 +142,7 @@ class OutboundChannelTest {
         assertTrue(closedCb.await(2, TimeUnit.SECONDS), "the slow client is disconnected");
         assertEquals(1, slowDisconnects.get());
         assertTrue(ch.isClosed());
-        org.mockito.Mockito.verify(ws).close();          // socket actually closed
+        org.mockito.Mockito.verify(ws).close(CloseStatus.SESSION_NOT_RELIABLE); // slow-client evict
         release.countDown();
     }
 
@@ -170,7 +172,7 @@ class OutboundChannelTest {
         assertTrue(disconnected, "a send past the deadline is force-closed");
         assertTrue(ch.isClosed());
         assertEquals(1, writeErrors.get());
-        org.mockito.Mockito.verify(ws).close();
+        org.mockito.Mockito.verify(ws).close(CloseStatus.SESSION_NOT_RELIABLE);
         assertTrue(closedCb.await(2, TimeUnit.SECONDS));
     }
 

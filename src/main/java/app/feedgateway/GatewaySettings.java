@@ -320,9 +320,30 @@ public final class GatewaySettings {
         return longValue("GATEWAY_WS_MAX_QUEUED_BYTES", 16L * 1024 * 1024, 1_024L);
     }
 
-    /** Per-write deadline (container blocking-send timeout): a write that exceeds it drops the client. */
+    /**
+     * Per-write deadline (container blocking-send timeout): a write that exceeds it drops the client.
+     * {@code GATEWAY_WS_SEND_TIMEOUT_MS} is preferred; {@code GATEWAY_WS_WRITE_DEADLINE_MS} is the legacy
+     * alias kept for operators that already set it. If BOTH are set, {@code GATEWAY_WS_SEND_TIMEOUT_MS} wins.
+     */
     public long wsWriteDeadlineMs() {
+        String preferred = value("GATEWAY_WS_SEND_TIMEOUT_MS", "");
+        if (!preferred.isBlank()) {
+            try {
+                return Math.max(100L, Long.parseLong(preferred));
+            } catch (NumberFormatException ignored) {
+                // fall through to the legacy key
+            }
+        }
         return longValue("GATEWAY_WS_WRITE_DEADLINE_MS", 5_000L, 100L);
+    }
+
+    /**
+     * Idle-session sweep threshold: a socket with no inbound frame AND no outbound send for this long is
+     * closed by {@code FeedGatewayService.sweepIdleSessions} so a TCP half-open (browser gone silent, dead
+     * NAT, dropped WiFi) cannot pin a writer thread forever. Default 5 minutes.
+     */
+    public long wsIdleTimeoutMs() {
+        return longValue("GATEWAY_WS_IDLE_TIMEOUT_MS", 300_000L, 1_000L);
     }
 
     /** Size of the shared pool of outbound writer threads (one active drain per socket at a time). */

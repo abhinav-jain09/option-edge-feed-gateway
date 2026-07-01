@@ -6,6 +6,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.SubProtocolCapable;
+import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
@@ -65,6 +66,15 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
         } catch (Exception ignored) {
             // best-effort; the socket is already being torn down
         }
+    }
+
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
+        // Note every inbound frame as activity so the idle-session sweep (P0 — TCP half-open protection)
+        // does not close a chatty control-channel client just because the outbound stream is currently
+        // quiet. Actual message handling (selection changes, replay control) still routes via the REST
+        // controller; this handler only needs to observe that the client is alive.
+        gatewayService.noteInboundActivity(session);
     }
 
     @Override

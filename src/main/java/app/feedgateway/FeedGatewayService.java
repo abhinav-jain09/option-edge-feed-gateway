@@ -288,6 +288,12 @@ public class FeedGatewayService implements ReplayRunner {
         // AUTO-expiry daily roll (no-op unless IB_EXPIRY is empty/AUTO). 60s cadence catches the overnight
         // ET trading-date change well before the open; the date never changes mid-session.
         batchExecutor.scheduleAtFixedRate(this::maybeAutoRollExpiry, 60L, 60L, TimeUnit.SECONDS);
+        // Idle-session sweep (P0 — TCP half-open protection): closes any socket that has had no inbound
+        // frame AND no outbound send for GATEWAY_WS_IDLE_TIMEOUT_MS (default 5 min). Complements the write-
+        // deadline watchdog: the watchdog fires only while a send is stuck in flight; the idle sweep fires
+        // when no bytes are moving at all (laptop closed, dead NAT, dropped WiFi) — those never trigger a
+        // send error, so without this sweep a dead client keeps its writer pinned indefinitely.
+        batchExecutor.scheduleAtFixedRate(this::sweepIdleSessions, 60L, 60L, TimeUnit.SECONDS);
     }
 
     private void enforceOutboundWriteDeadlines() {
@@ -299,6 +305,41 @@ public class FeedGatewayService implements ReplayRunner {
             } catch (RuntimeException ignored) {
                 // a single channel must not break the sweep
             }
+        }
+    }
+
+    /**
+     * Visible for tests: run the idle sweep once with the given "now". Production wiring schedules this
+     * every 60s. Any channel closed here fires its onClose (→ {@link #onSlowDisconnect}) which detaches
+     * the socket from routing and returns the writer thread to the pool.
+     */
+    void sweepIdleSessions(long nowMs) {
+        long idle = settings.wsIdleTimeoutMs();
+        for (OutboundChannel channel : outbound.values()) {
+            try {
+                channel.enforceIdleTimeout(nowMs, idle);
+            } catch (RuntimeException ignored) {
+                // a single channel must not break the sweep
+            }
+        }
+    }
+
+    private void sweepIdleSessions() {
+        sweepIdleSessions(System.currentTimeMillis());
+    }
+
+    /**
+     * Called by the WebSocket handler on every inbound text frame — resets the idle-sweep clock so an
+     * active bidirectional client is not closed by the sweep even when no outbound events happen to be
+     * flowing to it (e.g. no selection change, quiet market period).
+     */
+    public void noteInboundActivity(WebSocketSession session) {
+        if (session == null) {
+            return;
+        }
+        OutboundChannel channel = outbound.get(session.getId());
+        if (channel != null) {
+            channel.noteInboundActivity();
         }
     }
 
@@ -355,7 +396,15 @@ public class FeedGatewayService implements ReplayRunner {
     public void addClient(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
-        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(),
+        // Wrap in Spring's ConcurrentWebSocketSessionDecorator so its BUILT-IN send-time-limit gives us a
+        // second line of defence: if a single sendMessage hangs longer than the configured send timeout,
+        // Spring itself force-closes the session — protecting even the case where our own watchdog might
+        // not fire (e.g. shutdown races). bufferSizeLimit mirrors the outbound-queue byte cap so the raw
+        // Spring buffer never grows past what our OutboundChannel already bounds. The wrapped session is
+        // the ONLY one handed to OutboundChannel; the raw session stays in {@code clients}/{@code clientsById}
+        // so external callers (routing engine, expiry sweep) can still look it up by its original id.
+        WebSocketSession sendSession = wrapForBoundedSend(session);
+        OutboundChannel channel = new OutboundChannel(sendSession, outboundWriterExecutor(),
                 settings.wsMaxQueuedMessages(), settings.wsMaxQueuedBytes(), outboundMetrics, this::onSlowDisconnect);
         outbound.put(session.getId(), channel);
         clients.add(session);
@@ -543,6 +592,24 @@ public class FeedGatewayService implements ReplayRunner {
             // absent session (unlike setReplayMode); cancelActiveReplay above already stopped the reader.
             routingEngine.setReplayModeIfPresent(appSessionId, false);
         }
+    }
+
+    /**
+     * Wrap a raw {@link WebSocketSession} in Spring's {@link
+     * org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator} so a single blocking
+     * {@code sendMessage} cannot pin a writer thread past {@code GATEWAY_WS_SEND_TIMEOUT_MS} — Spring
+     * force-closes the underlying session when its own send-time-limit is exceeded. Idempotent for a
+     * session already wrapped (returns the input). Buffer size mirrors {@code wsMaxQueuedBytes} so the
+     * raw Spring buffer never grows past what our own OutboundChannel already bounds.
+     */
+    private WebSocketSession wrapForBoundedSend(WebSocketSession session) {
+        if (session instanceof org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator) {
+            return session;
+        }
+        int sendTimeLimit = (int) Math.min(Integer.MAX_VALUE, settings.wsWriteDeadlineMs());
+        int bufferSizeLimit = (int) Math.min(Integer.MAX_VALUE, settings.wsMaxQueuedBytes());
+        return new org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator(
+                session, sendTimeLimit, bufferSizeLimit);
     }
 
     private static void closeQuietly(WebSocketSession session) {
