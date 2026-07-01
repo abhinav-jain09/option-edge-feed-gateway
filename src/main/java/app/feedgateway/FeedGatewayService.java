@@ -4307,7 +4307,11 @@ public class FeedGatewayService implements ReplayRunner {
 
             boolean marketHours = isRegularTradingHours(nowMs);
             boolean consumersAdvancing = polledDelta > 0L;
-            if (marketHours && delta == 0L && activeSessions > 0 && consumersAdvancing) {
+            // Gate on ATTACHED sockets, not registered AppSessions: an AppSession in the grace
+            // window has no user waiting for data, so a zero-forward cycle there is not a stall.
+            // (Codex round-3 P2.)
+            long attachedSockets = attachedSocketCount();
+            if (marketHours && delta == 0L && attachedSockets > 0L && consumersAdvancing) {
                 consecutiveZeroForwardCycles++;
             } else {
                 consecutiveZeroForwardCycles = 0;
@@ -4324,6 +4328,7 @@ public class FeedGatewayService implements ReplayRunner {
                         + " autoRolledExpiry=" + quote(autoRolledExpiry)
                         + " hoursSinceLastRollover=" + hoursSinceRoll
                         + " activeSessions=" + activeSessions
+                        + " attachedSockets=" + attachedSockets
                         + " liveRecordsPolled=" + polled
                         + " forwardedEventsTotal=" + forwardedNow
                         + " droppedByStaleness=" + droppedByStaleness.get()
@@ -4381,6 +4386,28 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 if (result instanceof java.util.Map<?, ?> map) {
                     return map.size();
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // Fall through to client-count fallback.
+        }
+        return clients.size();
+    }
+
+    /**
+     * Count of currently-attached WebSockets (per {@code SessionRoutingEngine#attachedSocketCount}),
+     * excluding AppSessions that persist in the grace window after their socket detached. Used to
+     * gate the GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS alert so we don't cry wolf when there's
+     * no real user waiting for data. Falls back to {@code clients.size()} if the routing engine is
+     * absent or the method is not present on the linked class version.
+     */
+    private long attachedSocketCount() {
+        try {
+            if (routingEngine != null) {
+                java.lang.reflect.Method m = routingEngine.getClass().getMethod("attachedSocketCount");
+                Object result = m.invoke(routingEngine);
+                if (result instanceof Number number) {
+                    return number.longValue();
                 }
             }
         } catch (ReflectiveOperationException | RuntimeException ignored) {

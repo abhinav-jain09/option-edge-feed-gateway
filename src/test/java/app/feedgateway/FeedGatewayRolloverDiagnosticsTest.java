@@ -203,7 +203,83 @@ class FeedGatewayRolloverDiagnosticsTest {
                 "quiet cycles (no new polled records) must NOT count toward the stall streak");
     }
 
+    @Test
+    void stallAlertGatedByAttachedSockets() {
+        // Codex round-3 P2: an AppSession in the grace window (socket detached, session persists)
+        // must NOT satisfy the stall-alert gate. Before the fix, activeAppSessions()>0 was enough,
+        // so a lingering grace-window session would fire GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS
+        // even with zero attached clients — false alarm.
+        FeedGatewayService service = service();
+        overrideRth(service, Boolean.TRUE);
+        // Wire a real routingEngine with 1 registered AppSession but NO attached socket
+        // (grace-window shape): activeAppSessions() == 1, attachedSocketCount() == 0.
+        app.feedgateway.mtsession.SessionRoutingEngine engine = new app.feedgateway.mtsession.SessionRoutingEngine(
+                new app.feedgateway.mtsession.ConcurrencyLimits(5, 5, 100),
+                new app.feedgateway.mtsession.SubscriptionManager());
+        engine.registerAppSession(
+                "app:grace",
+                "u1",
+                new app.feedgateway.mtsession.Selection(
+                        app.feedgateway.mtsession.MarketDataSource.DATABENTO, "SPX", "20260701",
+                        app.feedgateway.mtsession.StrikeWindow.ALL),
+                java.util.Set.of());
+        injectRoutingEngine(service, engine);
+        // Consumers advancing, no forwards.
+        service.bumpLiveRecordsPolledForTest(100L);
+
+        long alertsBefore = service.forwardStalledAlertsForTest();
+        try (CapturedOut ignored = new CapturedOut()) {
+            service.dumpDiagnosticState();  // cycle 1
+            service.bumpLiveRecordsPolledForTest(50L);
+            service.dumpDiagnosticState();  // cycle 2 — would alert under the OLD gate
+        }
+        assertEquals(alertsBefore, service.forwardStalledAlertsForTest(),
+                "stall alert must NOT fire when no sockets are attached (only grace-window sessions)");
+    }
+
+    @Test
+    void stallAlertFiresWithAttachedSocket() {
+        // Codex round-3 P2 counter-case: with a real attached socket the existing stall detection
+        // behaviour must be preserved.
+        FeedGatewayService service = service();
+        overrideRth(service, Boolean.TRUE);
+        app.feedgateway.mtsession.SessionRoutingEngine engine = new app.feedgateway.mtsession.SessionRoutingEngine(
+                new app.feedgateway.mtsession.ConcurrencyLimits(5, 5, 100),
+                new app.feedgateway.mtsession.SubscriptionManager());
+        engine.registerAppSession(
+                "app:live",
+                "u1",
+                new app.feedgateway.mtsession.Selection(
+                        app.feedgateway.mtsession.MarketDataSource.DATABENTO, "SPX", "20260701",
+                        app.feedgateway.mtsession.StrikeWindow.ALL),
+                java.util.Set.of());
+        engine.attachSocket("app:live", "sock1");  // attachedSocketCount() == 1
+        injectRoutingEngine(service, engine);
+
+        service.bumpLiveRecordsPolledForTest(100L);
+        long alertsBefore = service.forwardStalledAlertsForTest();
+        try (CapturedOut ignored = new CapturedOut()) {
+            service.dumpDiagnosticState();  // cycle 1
+            service.bumpLiveRecordsPolledForTest(50L);
+            service.dumpDiagnosticState();  // cycle 2 — MUST alert
+        }
+        assertEquals(alertsBefore + 1, service.forwardStalledAlertsForTest(),
+                "stall alert must fire when a socket is attached (existing behaviour preserved)");
+    }
+
     // -------------------- test helpers --------------------
+
+    private static void injectRoutingEngine(FeedGatewayService service,
+                                            app.feedgateway.mtsession.SessionRoutingEngine engine) {
+        try {
+            java.lang.reflect.Field f = FeedGatewayService.class.getDeclaredField("routingEngine");
+            f.setAccessible(true);
+            f.set(service, engine);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("cannot inject routingEngine", e);
+        }
+    }
+
 
     private static void overrideRth(FeedGatewayService service, Boolean rth) {
         try {
