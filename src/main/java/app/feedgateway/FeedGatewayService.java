@@ -183,6 +183,11 @@ public class FeedGatewayService implements ReplayRunner {
     // nothing here alters the forward decision or the rollover logic. Removing this block would restore
     // the pre-instrumentation runtime exactly.
     private final AtomicLong liveRecordsPolled = new AtomicLong();          // total records seen by any live consumer
+    // Codex round-4 P2: only records whose binding.source() matches the CURRENT activeSelection.source()
+    // (plus HPSF, which is not source-gated) are eligible for forward. `consumersAdvancing` in the stall
+    // gate is derived from THIS counter's per-interval delta, not liveRecordsPolled, so noisy traffic
+    // from a non-selected source can never mask a real wedge in the selected source's pipeline.
+    private final AtomicLong liveRecordsEligibleForActiveSelection = new AtomicLong();
     private final AtomicLong droppedByStaleness = new AtomicLong();         // records dropped by selection-barrier / stale gate
     private final AtomicLong droppedByCacheGate = new AtomicLong();         // records dropped because cacheCaughtUpFlag was false
     private final AtomicLong droppedByOtherReasons = new AtomicLong();      // caught-up + non-forwardable (source/symbol/expiry mismatch, etc.)
@@ -193,6 +198,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicReference<String> lastRolloverTo = new AtomicReference<>("");
     private final AtomicLong lastForwardedSnapshot = new AtomicLong();      // forwardedEvents at the last 60s dump
     private final AtomicLong lastDumpLiveRecordsPolledSnapshot = new AtomicLong(); // liveRecordsPolled at the last 60s dump
+    private final AtomicLong lastDumpLiveRecordsEligibleSnapshot = new AtomicLong(); // liveRecordsEligibleForActiveSelection at the last 60s dump
     private volatile int consecutiveZeroForwardCycles = 0;                  // read/written only by the diagnostics thread
     private volatile ScheduledExecutorService diagnosticsExecutor;
     private volatile boolean diagnosticsEnabled = true;
@@ -905,6 +911,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_forward_stalled_live_records_polled_total Total records observed by the live consumers (poll advance signal).\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_live_records_polled_total counter\n"
                 + "options_edge_feed_gateway_forward_stalled_live_records_polled_total " + liveRecordsPolled.get() + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_live_records_eligible_total Records whose source matches the current active selection (or HPSF); the actual `consumers advancing` signal used by the stall alert.\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_live_records_eligible_total counter\n"
+                + "options_edge_feed_gateway_forward_stalled_live_records_eligible_total " + liveRecordsEligibleForActiveSelection.get() + "\n"
                 + "# HELP options_edge_feed_gateway_forward_stalled_rollover_count_total Number of session-boundary rollovers observed (applySelection transitions).\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_rollover_count_total counter\n"
                 + "options_edge_feed_gateway_forward_stalled_rollover_count_total " + rolloverCount.get() + "\n"
@@ -1102,8 +1111,11 @@ public class FeedGatewayService implements ReplayRunner {
                 // signal so an HPSF-only advancing pipeline still lifts polledDelta > 0. Without this, an
                 // HPSF-only feed would leave consumersAdvancing=false and permanently suppress the
                 // GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS alert.
+                // Codex round-4 P2: HPSF is NOT source-gated (it forwards unconditionally when caught up),
+                // so every HPSF-poll record is eligible for the active selection's forward path.
                 if (!records.isEmpty()) {
                     liveRecordsPolled.addAndGet(records.count());
+                    liveRecordsEligibleForActiveSelection.addAndGet(records.count());
                 }
                 for (ConsumerRecord<String, String> record : records) {
                     HpsfCacheUpdate update = updateHpsfCache(record);
@@ -1305,6 +1317,24 @@ public class FeedGatewayService implements ReplayRunner {
                 if (!records.isEmpty()) {
                     liveRecordsPolled.addAndGet(records.count());
                 }
+                // Codex round-4 P2: bucket polled records by "eligible for the active selection" — a
+                // record's binding.source() matching the current active selection is the only shape that
+                // COULD forward if the pipeline were healthy. Symbol/expiry mismatch is a real wedge and
+                // must NOT count as advancing (peer producing the wrong contract is exactly what we want
+                // the stall alert to catch).
+                ActiveSelection selectionForEligibility = activeSelection.get();
+                if (selectionForEligibility != null && !records.isEmpty()) {
+                    long eligible = 0L;
+                    for (ConsumerRecord<String, Object> r : records) {
+                        TopicBinding b = topicEvents.get(r.topic());
+                        if (b != null && b.source().equals(selectionForEligibility.source())) {
+                            eligible++;
+                        }
+                    }
+                    if (eligible > 0L) {
+                        liveRecordsEligibleForActiveSelection.addAndGet(eligible);
+                    }
+                }
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
@@ -1354,16 +1384,9 @@ public class FeedGatewayService implements ReplayRunner {
                         // Rollover-diagnostics fine-grained bucketing (additive; existing counters still
                         // increment). Splits inactiveDroppedEvents into WHY it dropped so a stall shows
                         // up as e.g. "droppedByCacheGate climbing" vs "droppedByOtherReasons climbing".
-                        if (!cacheCaughtUpFlag.get()) {
-                            droppedByCacheGate.incrementAndGet();
-                        } else {
-                            ActiveSelection sel = decided != null ? decided : activeSelection.get();
-                            if (sel != null && !binding.source().equals(sel.source())) {
-                                droppedByOtherReasons.incrementAndGet();
-                            } else {
-                                droppedByStaleness.incrementAndGet();
-                            }
-                        }
+                        recordDropBucket(binding, json,
+                                cacheCaughtUpFlag.get(),
+                                decided != null ? decided : activeSelection.get());
                         // Cache-arrival convergence: a snapshot for the ACTIVE selection was cached but not
                         // live-forwarded (e.g. it arrived already older than maxStaleMs on a closed market
                         // right after the daily roll). Still mark the selection ready so markSelectionReady
@@ -1879,6 +1902,34 @@ public class FeedGatewayService implements ReplayRunner {
 
     private boolean matchesActiveSelection(String json, ActiveSelection selection) {
         return matchesSelection(json, selection, true);
+    }
+
+    /**
+     * Codex round-4 P3: bucket a dropped record into the right diagnostic counter.
+     *
+     * <p>Semantics:
+     * <ul>
+     *   <li>{@code cacheCaughtUp == false} → {@code droppedByCacheGate}</li>
+     *   <li>caught up AND source matches AND symbol/expiry matches → {@code droppedByStaleness}
+     *       (fresh-selection record dropped by the staleness / selection-barrier gate)</li>
+     *   <li>otherwise → {@code droppedByOtherReasons} (wrong source; or source match but wrong
+     *       symbol/expiry — the peer is producing the wrong contract, which is a real wedge shape
+     *       and must NOT be lumped in with normal staleness noise).</li>
+     * </ul>
+     */
+    void recordDropBucket(TopicBinding binding, String json, boolean cacheCaughtUp, ActiveSelection selection) {
+        if (!cacheCaughtUp) {
+            droppedByCacheGate.incrementAndGet();
+            return;
+        }
+        if (selection != null
+                && binding != null
+                && binding.source().equals(selection.source())
+                && matchesActiveSelection(json, selection)) {
+            droppedByStaleness.incrementAndGet();
+        } else {
+            droppedByOtherReasons.incrementAndGet();
+        }
     }
 
     /**
@@ -4279,6 +4330,12 @@ public class FeedGatewayService implements ReplayRunner {
             // making `consumersAdvancing` a false positive during legitimately quiet cycles. Use the
             // delta since the previous dump instead. (Codex P2 fix.)
             long polledDelta = Math.max(0L, polled - lastDumpLiveRecordsPolledSnapshot.getAndSet(polled));
+            // Codex round-4 P2: `consumersAdvancing` must reflect records ELIGIBLE for the active
+            // selection (source matches, or HPSF which is not source-gated). Otherwise noisy traffic
+            // from a non-selected source (e.g. IB traffic while DATABENTO is selected) keeps
+            // polledDelta > 0 and hides a real wedge in the selected pipeline.
+            long eligible = liveRecordsEligibleForActiveSelection.get();
+            long eligibleDelta = Math.max(0L, eligible - lastDumpLiveRecordsEligibleSnapshot.getAndSet(eligible));
 
             System.out.println("RGW_STATE_DUMP event=state_dump"
                     + " activeSelection=" + describeSelection(selection)
@@ -4295,6 +4352,7 @@ public class FeedGatewayService implements ReplayRunner {
                     + " forwardedEventsSinceLastLog=" + delta
                     + " forwardedEventsTotal=" + forwardedNow
                     + " liveRecordsPolled=" + polled
+                    + " liveRecordsEligibleForActiveSelection=" + eligible
                     + " droppedByStaleness=" + droppedByStaleness.get()
                     + " droppedByCacheGate=" + droppedByCacheGate.get()
                     + " droppedByOtherReasons=" + droppedByOtherReasons.get()
@@ -4306,7 +4364,7 @@ public class FeedGatewayService implements ReplayRunner {
                     + " nowMs=" + nowMs);
 
             boolean marketHours = isRegularTradingHours(nowMs);
-            boolean consumersAdvancing = polledDelta > 0L;
+            boolean consumersAdvancing = eligibleDelta > 0L;
             // Gate on ATTACHED sockets, not registered AppSessions: an AppSession in the grace
             // window has no user waiting for data, so a zero-forward cycle there is not a stall.
             // (Codex round-3 P2.)
@@ -4330,6 +4388,7 @@ public class FeedGatewayService implements ReplayRunner {
                         + " activeSessions=" + activeSessions
                         + " attachedSockets=" + attachedSockets
                         + " liveRecordsPolled=" + polled
+                        + " liveRecordsEligibleForActiveSelection=" + eligible
                         + " forwardedEventsTotal=" + forwardedNow
                         + " droppedByStaleness=" + droppedByStaleness.get()
                         + " droppedByCacheGate=" + droppedByCacheGate.get()
@@ -4445,6 +4504,34 @@ public class FeedGatewayService implements ReplayRunner {
 
     void bumpLiveRecordsPolledForTest(long by) {
         liveRecordsPolled.addAndGet(by);
+    }
+
+    // Codex round-4 P2 test seam: bump the eligible counter used by the stall gate.
+    void bumpLiveRecordsEligibleForActiveSelectionForTest(long by) {
+        liveRecordsEligibleForActiveSelection.addAndGet(by);
+    }
+
+    long droppedByStalenessForTest() {
+        return droppedByStaleness.get();
+    }
+
+    long droppedByOtherReasonsForTest() {
+        return droppedByOtherReasons.get();
+    }
+
+    // Codex round-4 P3 test seam: exercise the drop-bucket helper without needing to spin up a live
+    // Kafka consumer. Test provides the ingredients (source/event/json + cache flag + active selection)
+    // and asserts on {droppedByStaleness, droppedByOtherReasons, droppedByCacheGate}.
+    void recordDropBucketForTest(String bindingSource, String bindingEvent, String json,
+                                 boolean cacheCaughtUp,
+                                 String selectionSource, String selectionSymbol, String selectionExpiry,
+                                 long selectionEpoch) {
+        TopicBinding binding = new TopicBinding(bindingSource, bindingEvent);
+        ActiveSelection selection = selectionSource == null
+                ? null
+                : new ActiveSelection(selectionSource, selectionSymbol, selectionExpiry, selectionEpoch,
+                        System.currentTimeMillis());
+        recordDropBucket(binding, json, cacheCaughtUp, selection);
     }
 
     void bumpForwardedEventsForTest(long by) {

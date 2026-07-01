@@ -91,9 +91,11 @@ class FeedGatewayRolloverDiagnosticsTest {
         // routingEngine? Not wired in this ctor. Instead, cheat by opening a fake client channel via
         // reflection: we register a WebSocketSession into `clients` so activeSessionsCount() > 0.
         addFakeClient(service);
-        // Consumers ARE advancing (liveRecordsPolled > 0) but no forwards. This is the exact wedge
-        // shape the 2026-07-01 outage showed.
+        // Consumers ARE advancing (liveRecordsPolled > 0, and ELIGIBLE for the active selection) but
+        // no forwards. This is the exact wedge shape the 2026-07-01 outage showed. Codex round-4 P2:
+        // the stall gate now reads the eligible-delta counter, so bump both.
         service.bumpLiveRecordsPolledForTest(100L);
+        service.bumpLiveRecordsEligibleForActiveSelectionForTest(100L);
         // NOTE: forwardedEvents stays at 0 — no bump.
 
         CapturedOut out = new CapturedOut();
@@ -105,6 +107,7 @@ class FeedGatewayRolloverDiagnosticsTest {
             assertEquals(alertsBefore, alertsAfter1, "must NOT alert on the first zero-forward cycle");
             // Cycle 2: still zero forwards, still advancing, still in RTH -> ALERT
             service.bumpLiveRecordsPolledForTest(50L); // consumers keep advancing
+            service.bumpLiveRecordsEligibleForActiveSelectionForTest(50L);
             service.dumpDiagnosticState();
         }
         assertEquals(alertsBefore + 1, service.forwardStalledAlertsForTest(),
@@ -119,13 +122,16 @@ class FeedGatewayRolloverDiagnosticsTest {
         overrideRth(service, Boolean.TRUE);
         addFakeClient(service);
         service.bumpLiveRecordsPolledForTest(100L);
+        service.bumpLiveRecordsEligibleForActiveSelectionForTest(100L);
 
         try (CapturedOut ignored = new CapturedOut()) {
             service.dumpDiagnosticState();          // cycle1: zero
             service.bumpForwardedEventsForTest(5L); // a real forward happens
             service.bumpLiveRecordsPolledForTest(50L);
+            service.bumpLiveRecordsEligibleForActiveSelectionForTest(50L);
             service.dumpDiagnosticState();          // cycle2: nonzero delta => streak resets
             service.bumpLiveRecordsPolledForTest(50L);
+            service.bumpLiveRecordsEligibleForActiveSelectionForTest(50L);
             service.dumpDiagnosticState();          // cycle3: zero again but streak was reset
         }
         assertEquals(0L, service.forwardStalledAlertsForTest(),
@@ -146,13 +152,16 @@ class FeedGatewayRolloverDiagnosticsTest {
         long alertsBefore = service.forwardStalledAlertsForTest();
         try (CapturedOut ignored = new CapturedOut()) {
             // Cycle 1: HPSF poll delivered 100 records (mimicking runHpsfLiveConsumerOnce's new
-            // liveRecordsPolled.addAndGet(records.count())). No forwards.
+            // liveRecordsPolled.addAndGet(records.count())). No forwards. Codex round-4 P2: HPSF polls
+            // are unconditionally eligible (HPSF is not source-gated), so bump both counters.
             service.bumpLiveRecordsPolledForTest(100L);
+            service.bumpLiveRecordsEligibleForActiveSelectionForTest(100L);
             service.dumpDiagnosticState();
             assertEquals(alertsBefore, service.forwardStalledAlertsForTest(),
                     "cycle-1 must not alert");
             // Cycle 2: HPSF keeps advancing, still no forwards → ALERT
             service.bumpLiveRecordsPolledForTest(75L);
+            service.bumpLiveRecordsEligibleForActiveSelectionForTest(75L);
             service.dumpDiagnosticState();
         }
         assertEquals(alertsBefore + 1, service.forwardStalledAlertsForTest(),
@@ -226,11 +235,13 @@ class FeedGatewayRolloverDiagnosticsTest {
         injectRoutingEngine(service, engine);
         // Consumers advancing, no forwards.
         service.bumpLiveRecordsPolledForTest(100L);
+        service.bumpLiveRecordsEligibleForActiveSelectionForTest(100L);
 
         long alertsBefore = service.forwardStalledAlertsForTest();
         try (CapturedOut ignored = new CapturedOut()) {
             service.dumpDiagnosticState();  // cycle 1
             service.bumpLiveRecordsPolledForTest(50L);
+            service.bumpLiveRecordsEligibleForActiveSelectionForTest(50L);
             service.dumpDiagnosticState();  // cycle 2 — would alert under the OLD gate
         }
         assertEquals(alertsBefore, service.forwardStalledAlertsForTest(),
@@ -257,14 +268,65 @@ class FeedGatewayRolloverDiagnosticsTest {
         injectRoutingEngine(service, engine);
 
         service.bumpLiveRecordsPolledForTest(100L);
+        service.bumpLiveRecordsEligibleForActiveSelectionForTest(100L);
         long alertsBefore = service.forwardStalledAlertsForTest();
         try (CapturedOut ignored = new CapturedOut()) {
             service.dumpDiagnosticState();  // cycle 1
             service.bumpLiveRecordsPolledForTest(50L);
+            service.bumpLiveRecordsEligibleForActiveSelectionForTest(50L);
             service.dumpDiagnosticState();  // cycle 2 — MUST alert
         }
         assertEquals(alertsBefore + 1, service.forwardStalledAlertsForTest(),
                 "stall alert must fire when a socket is attached (existing behaviour preserved)");
+    }
+
+    @Test
+    void stallAlertNotEmittedWhenOnlyOtherSourceTrafficAdvances() {
+        // Codex round-4 P2: `consumersAdvancing` must count only records eligible for the ACTIVE
+        // selection's forward path. If the active selection is DATABENTO and only noisy IB traffic
+        // is being polled, the DATABENTO pipeline is silently wedged — no eligible-delta, so the
+        // alert must NOT fire even across two zero-forward dumps. (Before the fix, the raw
+        // liveRecordsPolled delta would count the IB traffic and the alert would fire falsely.)
+        FeedGatewayService service = service();
+        overrideRth(service, Boolean.TRUE);
+        addFakeClient(service);
+        service.seedReadySelectionForTest("DATABENTO", "SPX", "20260701", 1L);
+
+        long alertsBefore = service.forwardStalledAlertsForTest();
+        try (CapturedOut ignored = new CapturedOut()) {
+            // Cycle 1: noisy IB (non-eligible) traffic advances liveRecordsPolled but NOT the eligible
+            // counter. No forwards. Under the fix, consumersAdvancing = false → streak stays 0.
+            service.bumpLiveRecordsPolledForTest(100L);
+            service.dumpDiagnosticState();
+            // Cycle 2: still only non-eligible traffic → still no alert.
+            service.bumpLiveRecordsPolledForTest(75L);
+            service.dumpDiagnosticState();
+        }
+        assertEquals(alertsBefore, service.forwardStalledAlertsForTest(),
+                "stall alert must NOT fire when only non-eligible (wrong-source) traffic advances");
+    }
+
+    @Test
+    void symbolMismatchDropCountsAsOtherReasons() {
+        // Codex round-4 P3: with the cache caught up and a source match but WRONG symbol, the drop
+        // must land in droppedByOtherReasons — the peer is producing the wrong contract, a real wedge
+        // shape — not in droppedByStaleness (which is reserved for "right selection, dropped by the
+        // staleness / selection-barrier gate").
+        FeedGatewayService service = service();
+        long stalenessBefore = service.droppedByStalenessForTest();
+        long otherBefore = service.droppedByOtherReasonsForTest();
+
+        // Source match (DATABENTO); symbol mismatch (SPY vs SPX-selected). Cache caught up.
+        String json = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPY\",\"expiry\":\"20260701\"}";
+        service.recordDropBucketForTest(
+                "DATABENTO", "snapshot", json,
+                true /* cacheCaughtUp */,
+                "DATABENTO", "SPX", "20260701", 1L);
+
+        assertEquals(stalenessBefore, service.droppedByStalenessForTest(),
+                "symbol mismatch must NOT increment droppedByStaleness");
+        assertEquals(otherBefore + 1, service.droppedByOtherReasonsForTest(),
+                "symbol mismatch (source match but wrong contract) must increment droppedByOtherReasons");
     }
 
     // -------------------- test helpers --------------------
