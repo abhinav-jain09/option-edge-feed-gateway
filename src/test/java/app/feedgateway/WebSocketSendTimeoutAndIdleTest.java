@@ -192,24 +192,97 @@ class WebSocketSendTimeoutAndIdleTest {
     }
 
     /**
-     * Belt-and-braces: if the server sends pings but NO pong ever arrives AND no outbound activity flows,
-     * the idle sweep still evicts the socket after the timeout — a zombie TCP is not kept alive by the
-     * ping side alone. (The successful ping-send DOES bump lastActivityAtMs — see comment in
-     * OutboundChannel#sendPingNow — so this test verifies the sweep with a fresh channel that has never
-     * transmitted anything, then advances the clock past the idle threshold.)
+     * Round-3 P2: even if pings SUCCEED at the write layer, an absence of pong frames must still evict
+     * the socket after the idle timeout. TCP happily buffers to a zombie peer (dead NIC / closed lid),
+     * so a successful ping-write is NOT proof of liveness — only a pong is. This test writes a ping
+     * successfully, then never delivers a pong, then advances the clock past the idle threshold: the
+     * sweep MUST close. On the pre-fix code the ping-write itself stamped lastActivityAtMs and the sweep
+     * would spare the zombie forever.
      */
     @Test
-    void noPongAndNoOutboundStillEvictsAfterTimeout() throws Exception {
+    void pingSentButNoPongStillEvictsAfterTimeout() throws Exception {
+        java.util.List<Object> frames = new CopyOnWriteArrayList<>();
+        CountDownLatch pinged = new CountDownLatch(1);
         WebSocketSession ws = mock(WebSocketSession.class);
         when(ws.getId()).thenReturn("zombie");
         when(ws.isOpen()).thenReturn(true);
+        org.mockito.Mockito.doAnswer(inv -> {
+            Object arg = inv.getArgument(0);
+            frames.add(arg);
+            if (arg instanceof PingMessage) {
+                pinged.countDown();
+            }
+            return null;
+        }).when(ws).sendMessage(any());
+
         OutboundChannel ch = channel(ws);
+        long baseline = ch.lastActivityAtMs();
+
+        ch.sendPing();
+        assertTrue(pinged.await(2, TimeUnit.SECONDS), "the ping was written to the session");
+        // The successful ping-WRITE must NOT bump lastActivityAtMs — only a pong may.
+        assertEquals(baseline, ch.lastActivityAtMs(),
+                "a successful ping-write is not proof of peer liveness and must not refresh lastActivityAtMs");
 
         long idleTimeoutMs = 300_000L;
         long future = System.currentTimeMillis() + idleTimeoutMs + 1_000L;
         assertTrue(ch.enforceIdleTimeout(future, idleTimeoutMs),
-                "with no activity of any kind the sweep still closes after the timeout");
+                "with a ping sent but no pong the sweep still closes after the timeout");
         assertTrue(ch.isClosed());
+    }
+
+    /**
+     * Round-3 P1: a ping firing while a data drain is stuck in {@code sendMessage} must NOT clear the
+     * drain's {@code sendStartedAtMs} watchdog state. Under the pre-fix code the ping ran on a second
+     * writer thread and, on its way out, set {@code sendStartedAtMs = 0} — which defeated the watchdog
+     * exactly when it was needed. Under the fix, pings are serialized through the drain gate, so a ping
+     * cannot run concurrently with an in-flight data send at all.
+     */
+    @Test
+    void pingDoesNotClearWatchdogOfInFlightDataSend() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        // Use a two-thread writer pool so a stuck data send would leave room for a concurrent ping task
+        // on the pre-fix code. The fix must keep them serialized regardless of pool width.
+        ExecutorService twoThread = Executors.newFixedThreadPool(2);
+        try {
+            WebSocketSession ws = mock(WebSocketSession.class);
+            when(ws.getId()).thenReturn("stuck-with-ping");
+            when(ws.isOpen()).thenReturn(true);
+            Answer<Void> answer = inv -> {
+                Object arg = inv.getArgument(0);
+                if (arg instanceof TextMessage) {
+                    sent.add(((TextMessage) arg).getPayload());
+                    entered.countDown();
+                    release.await(5, TimeUnit.SECONDS);
+                }
+                // Any PingMessage returns immediately (fast) — this is the exact regression scenario.
+                return null;
+            };
+            org.mockito.Mockito.doAnswer(answer).when(ws).sendMessage(any());
+            org.mockito.Mockito.doAnswer(inv -> { release.countDown(); return null; })
+                    .when(ws).close(any(CloseStatus.class));
+
+            OutboundChannel ch = new OutboundChannel(
+                    ws, twoThread, 1000, 1L << 20, metrics, c -> closedCb.countDown());
+
+            ch.enqueue("stuck", null);
+            assertTrue(entered.await(2, TimeUnit.SECONDS), "data send is in flight");
+
+            // Fire a ping while the data send is wedged. On the pre-fix code this ran on thread 2 and
+            // reset sendStartedAtMs to 0 in its finally block.
+            ch.sendPing();
+            Thread.sleep(50); // give a hypothetical concurrent ping task time to run its finally
+
+            long timeoutMs = 5_000L;
+            boolean disconnected = ch.enforceWriteDeadline(System.currentTimeMillis() + 10_000L, timeoutMs);
+            assertTrue(disconnected,
+                    "watchdog must still fire on the stuck data send even after a ping was requested");
+            assertTrue(ch.isClosed());
+            assertTrue(closedCb.await(2, TimeUnit.SECONDS));
+        } finally {
+            twoThread.shutdownNow();
+        }
     }
 
     /** Recording an inbound frame resets the idle clock — a chatty client is not evicted. */

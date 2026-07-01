@@ -81,6 +81,12 @@ final class OutboundChannel {
     // a wedged send does not spam the log on every watchdog tick.
     private final AtomicLong lastTimeoutWarnAtMs = new AtomicLong(0L);
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    // P2 (round-3): request a WS PING at the next safe point on the writer thread. sendPing() sets this
+    // flag; the drain loop consumes it — while still holding the {@code draining} gate — so at most one
+    // send is in flight per socket at any time. This preserves the "one writer per socket" invariant that
+    // the {@code sendStartedAtMs} watchdog relies on: a ping can never race a data send and clear its
+    // in-flight timestamp on the way out. See PR #48 round-3 findings.
+    private final AtomicBoolean pingRequested = new AtomicBoolean(false);
 
     OutboundChannel(WebSocketSession session, Executor writers, int maxMessages, long maxBytes,
                     Metrics metrics, Consumer<OutboundChannel> onClose) {
@@ -171,12 +177,19 @@ final class OutboundChannel {
                 }
                 Iterator<Map.Entry<String, Pending>> it = queue.entrySet().iterator();
                 if (!it.hasNext()) {
-                    draining = false; // go idle; the next enqueue re-arms a drain
-                    return;
+                    // Queue is empty. If a ping is pending, service it while still holding {@code draining}
+                    // so it stays serialized with any future data send. Otherwise go idle; the next enqueue
+                    // (or sendPing) re-arms a drain.
+                    if (!pingRequested.compareAndSet(true, false)) {
+                        draining = false;
+                        return;
+                    }
+                    next = null; // fall through: send a ping instead of a data frame
+                } else {
+                    next = it.next().getValue();
+                    it.remove();
+                    queuedBytes -= next.bytes();
                 }
-                next = it.next().getValue();
-                it.remove();
-                queuedBytes -= next.bytes();
             }
             if (!session.isOpen()) {
                 close(CloseReason.WRITE_ERROR);
@@ -184,12 +197,33 @@ final class OutboundChannel {
             }
             sendStartedAtMs = System.currentTimeMillis(); // arm the watchdog deadline
             try {
-                // Blocking write — but NEVER on the Kafka thread, so a slow socket cannot stall polling.
-                // If it exceeds the write deadline the watchdog force-closes the session, unblocking us.
-                session.sendMessage(new TextMessage(next.envelope()));
-                metrics.sent(next.bytes());
-                lastActivityAtMs.set(System.currentTimeMillis()); // successful outbound I/O
+                if (next == null) {
+                    // Server-originated PING — same writer path so it never races a data send. The peer's
+                    // PONG lands in the handler and refreshes {@code lastActivityAtMs} via notePongReceived;
+                    // the ping WRITE itself does NOT refresh it (TCP buffers to dead peers happily).
+                    session.sendMessage(new PingMessage(EMPTY_PING_PAYLOAD.duplicate()));
+                } else {
+                    // Blocking write — but NEVER on the Kafka thread, so a slow socket cannot stall polling.
+                    // If it exceeds the write deadline the watchdog force-closes the session, unblocking us.
+                    session.sendMessage(new TextMessage(next.envelope()));
+                    metrics.sent(next.bytes());
+                    lastActivityAtMs.set(System.currentTimeMillis()); // successful outbound DATA I/O only
+                }
             } catch (IOException | RuntimeException e) {
+                if (next == null) {
+                    // A failed ping does not deterministically close the socket — let the watchdog + idle
+                    // sweep evict it. Log at most once per throttle window so a mass network flap does not
+                    // spam. We stay in the drain loop so any queued data still gets a chance to send/fail.
+                    long now = System.currentTimeMillis();
+                    long lastWarn = lastTimeoutWarnAtMs.get();
+                    if (now - lastWarn >= TIMEOUT_WARN_THROTTLE_MS
+                            && lastTimeoutWarnAtMs.compareAndSet(lastWarn, now)) {
+                        System.out.println("WARN ws-ping-failed socketId=" + socketId
+                                + " error=" + e.getClass().getSimpleName() + " action=defer-to-watchdog");
+                    }
+                    sendStartedAtMs = 0;
+                    continue;
+                }
                 close(CloseReason.WRITE_ERROR);
                 return;
             } finally {
@@ -231,46 +265,36 @@ final class OutboundChannel {
     }
 
     /**
-     * Send a server-originated WebSocket PING frame to the client (P2 — passive-browser idle-sweep fix).
+     * Request a server-originated WebSocket PING frame to the client (P2 — passive-browser idle-sweep fix).
      * Browsers auto-respond with a PONG at the protocol layer without any client code, and the pong lands
-     * in the handler's {@code handlePongMessage} which calls {@link #noteInboundActivity} — so a purely
-     * passive listener (browser opens the socket, only listens) still bumps its {@code lastActivityAtMs}
-     * every {@code GATEWAY_WS_PING_INTERVAL_MS} and is not evicted by the idle sweep during quiet market
+     * in the handler's {@code handlePongMessage} which calls {@link #notePongReceived} — so a purely
+     * passive listener (browser opens the socket, only listens) refreshes its {@code lastActivityAtMs}
+     * on every peer-acknowledged heartbeat and is not evicted by the idle sweep during quiet market
      * minutes or after hours.
      *
-     * <p>Runs on the shared writer pool so it respects the "one writer per socket at a time" invariant —
-     * a ping is a normal blocking {@code sendMessage} on the same session and cannot race the drain path.
-     * If the send fails (IOException / dead socket), the watchdog + idle sweep still close the channel
-     * on their next tick; the ping itself only logs a throttled WARN and returns.
+     * <p>Round-3 P1 fix: pings are NOT submitted as independent writer tasks anymore. They set a flag that
+     * the drain loop consumes while still holding the {@code draining} gate, so a ping can never run on a
+     * second thread and clobber the {@code sendStartedAtMs} timestamp of an in-flight data send — the
+     * watchdog stays effective. If a drain is already running, it will pick the flag up at the tail of its
+     * current batch; if not, we kick one here.
      */
     void sendPing() {
         if (closed.get()) {
             return;
         }
-        // Serialize with the drain path via the writer pool: at most one send in flight per socket.
-        writers.execute(this::sendPingNow);
-    }
-
-    private void sendPingNow() {
-        if (closed.get() || !session.isOpen()) {
-            return;
-        }
-        sendStartedAtMs = System.currentTimeMillis(); // arm the watchdog; a stuck ping is a stuck send
-        try {
-            session.sendMessage(new PingMessage(EMPTY_PING_PAYLOAD.duplicate()));
-            lastActivityAtMs.set(System.currentTimeMillis()); // successful outbound I/O
-        } catch (IOException | RuntimeException e) {
-            // Do not close here — let the write-deadline watchdog + idle sweep handle it deterministically.
-            // Log at most once per socket per throttle window so a mass network flap does not spam the log.
-            long now = System.currentTimeMillis();
-            long lastWarn = lastTimeoutWarnAtMs.get();
-            if (now - lastWarn >= TIMEOUT_WARN_THROTTLE_MS
-                    && lastTimeoutWarnAtMs.compareAndSet(lastWarn, now)) {
-                System.out.println("WARN ws-ping-failed socketId=" + socketId
-                        + " error=" + e.getClass().getSimpleName() + " action=defer-to-watchdog");
+        pingRequested.set(true);
+        boolean startDrain = false;
+        synchronized (lock) {
+            if (closed.get()) {
+                return;
             }
-        } finally {
-            sendStartedAtMs = 0;
+            if (!draining) {
+                draining = true;
+                startDrain = true;
+            }
+        }
+        if (startDrain) {
+            writers.execute(this::drain);
         }
     }
 
