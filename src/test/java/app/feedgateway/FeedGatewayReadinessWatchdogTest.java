@@ -1,5 +1,11 @@
 package app.feedgateway;
 
+import app.feedgateway.mtsession.ConcurrencyLimits;
+import app.feedgateway.mtsession.MarketDataSource;
+import app.feedgateway.mtsession.Selection;
+import app.feedgateway.mtsession.SessionRoutingEngine;
+import app.feedgateway.mtsession.StrikeWindow;
+import app.feedgateway.mtsession.SubscriptionManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.WebSocketSession;
@@ -7,6 +13,7 @@ import org.springframework.web.socket.WebSocketSession;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -33,6 +40,9 @@ class FeedGatewayReadinessWatchdogTest {
     void readyFailsAfter61sStallDuringMarketHoursWithActiveSession() throws Exception {
         FeedGatewayService service = service();
         service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        // Pre-arm the market-hours edge tracker; otherwise the first probe would treat this as an
+        // off-hours→on-hours transition and clear the intentional stale stamp (Codex round-3 P2b).
+        service.setInMarketHoursForTest(true);
         service.addSessionForTest(fakeSession("s1"));
         // Advance simulated clock by 61s past the last forward.
         service.setLastForwardEpochMsForTest(System.currentTimeMillis() - 61_000L);
@@ -87,6 +97,9 @@ class FeedGatewayReadinessWatchdogTest {
         // stamp is not moved forward by simulating a stale prior flush and confirming readiness trips.
         FeedGatewayService service = service();
         service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        // Pre-arm the market-hours edge tracker so the first probe doesn't clear the intentional stale
+        // stamp as if it were an overnight carryover (Codex round-3 P2b).
+        service.setInMarketHoursForTest(true);
         service.addSessionForTest(fakeSession("s1"));
         // Pretend a prior flush stamped 61s ago; nothing has flushed since. Enqueue-only calls between then
         // and now must NOT move this forward.
@@ -161,6 +174,55 @@ class FeedGatewayReadinessWatchdogTest {
                 "session active + only route-drops for 61s must fail readiness (round-1 code stayed 200 forever)");
     }
 
+    @Test
+    void graceWindowAppSessionAloneDoesNotFailReadiness() {
+        // Codex round-3 P2a: an AppSession that outlived its WebSocket (detach → grace-window state) still
+        // shows up in routingEngine.activeAppSessions(), but has no attached socket to deliver to. Prior
+        // code fell back to that raw count when clients was empty and treated it as "active" — so during
+        // market hours with a stale forward stamp, the pod would flip 503 even though there was no real
+        // client waiting for a broadcast, and k8s would pointlessly restart it. Fix: fall back to
+        // routingEngine.attachedSocketCount() instead — zero when the sole session is in its grace window.
+        SessionRoutingEngine engine = new SessionRoutingEngine(
+                new ConcurrencyLimits(5, 5, 100), new SubscriptionManager());
+        engine.registerAppSession("app:u1", "u1",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260701", StrikeWindow.ALL), Set.of());
+        // Note: attachSocket is NOT called → AppSession is in the grace window with no attached socket.
+        FeedGatewayService service = serviceWithEngine(engine);
+        service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        // Stale forward timestamp from before the socket detached.
+        service.setLastForwardEpochMsForTest(System.currentTimeMillis() - 120_000L);
+        assertEquals(0, engine.attachedSocketCount(),
+                "precondition: no sockets attached, only a grace-window AppSession");
+        assertEquals(200, service.readinessStatus(),
+                "grace-window AppSession with no attached socket must not fail readiness (Codex round-3 P2a)");
+    }
+
+    @Test
+    void marketOpenTransitionResetsStallWindow() {
+        // Codex round-3 P2b: a WebSocket held open overnight or across a weekend keeps
+        // lastForwardEpochMs stamped from the PRIOR trading session. Off-hours readiness stays 200
+        // (correct), but at 09:30 the stamp is 15-60+ hours old and instantly trips the >60s stall guard —
+        // restarting a healthy pod before its first forward of the new day. Fix: detect the
+        // off-hours→on-hours edge inside readinessStatus() and clear both stamps so the fresh session gets
+        // a clean 60s grace baseline.
+        FeedGatewayService service = service();
+        // Pod ran overnight: last forward from yesterday, session still attached, current time = off-hours.
+        service.overrideRegularTradingHoursForTest(Boolean.FALSE);
+        service.addSessionForTest(fakeSession("s1"));
+        service.setLastForwardEpochMsForTest(System.currentTimeMillis() - 20L * 3_600_000L);
+        assertEquals(200, service.readinessStatus(), "off-hours must stay healthy");
+        // Clock crosses 09:30. First probe of the new session: prior code would immediately trip 503
+        // (stamp 20h stale > 60s). With the transition reset, the fresh session gets a new baseline.
+        service.overrideRegularTradingHoursForTest(Boolean.TRUE);
+        assertEquals(200, service.readinessStatus(),
+                "first market-hours probe after overnight must clear the stale stamp and get fresh grace");
+        // 61s later, still no forward with the session attached — now the fresh baseline elapses and
+        // the stall guard correctly trips.
+        service.setReadinessBaselineEpochMsForTest(System.currentTimeMillis() - 61_000L);
+        assertEquals(503, service.readinessStatus(),
+                "after the fresh 60s grace, a genuinely stalled forward path must still fail readiness");
+    }
+
     private static FeedGatewayService service() {
         return new FeedGatewayService(
                 new GatewaySettings(),
@@ -168,6 +230,14 @@ class FeedGatewayReadinessWatchdogTest {
                 new HpsfGatewayViewMapper(),
                 null /* routingEngine: legacy broadcast path */
         );
+    }
+
+    private static FeedGatewayService serviceWithEngine(SessionRoutingEngine engine) {
+        return new FeedGatewayService(
+                new GatewaySettings(),
+                new ObjectMapper(),
+                new HpsfGatewayViewMapper(),
+                engine);
     }
 
     /** A minimal WebSocketSession proxy — clients is only queried for size in these tests. */

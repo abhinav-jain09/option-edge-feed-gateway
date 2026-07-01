@@ -183,6 +183,13 @@ public class FeedGatewayService implements ReplayRunner {
     // Throttle for the readiness-fail WARN log so a wedged pod doesn't spam once per probe (probes fire
     // every few seconds). At most one WARN per 10s while readiness is down.
     private final AtomicLong lastReadyWarnMs = new AtomicLong(0L);
+    // Tracks whether the most recent readiness probe saw regular trading hours. Used to detect the
+    // off-hours→on-hours edge inside readinessStatus() so we can clear stale forward/baseline stamps
+    // carried over from the prior trading session (e.g. a WS held open overnight or across a weekend).
+    // Without this, at 09:30 the previous session's lastForwardEpochMs would be 15-60+ hours old and
+    // instantly trip the stall guard, restarting a healthy pod before its first tick of the new day
+    // (Codex round-3 P2b).
+    private final AtomicBoolean inMarketHours = new AtomicBoolean(false);
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -676,14 +683,28 @@ public class FeedGatewayService implements ReplayRunner {
      */
     public int readinessStatus() {
         long nowMs = System.currentTimeMillis();
+        boolean marketHours = isRegularTradingHours(nowMs);
+        // Off-hours → on-hours edge: a WebSocket held open overnight or across a weekend would keep
+        // lastForwardEpochMs stamped from the PRIOR session, and at 09:30 that timestamp is 15-60+ hours
+        // old — instantly tripping the >60s stall guard and restarting a pod that just hasn't had its
+        // first tick yet. Clear both stamps on the transition so the fresh session gets a clean baseline
+        // re-armed below (Codex round-3 P2b).
+        if (marketHours && !inMarketHours.getAndSet(true)) {
+            lastForwardEpochMs.set(0L);
+            readinessBaselineEpochMs.set(0L);
+        } else if (!marketHours) {
+            inMarketHours.set(false);
+        }
         long lastMs = lastForwardEpochMs.get();
         long secondsSinceLastForward = lastMs <= 0L ? -1L : Math.max(0L, (nowMs - lastMs) / 1_000L);
-        // Session count spans both routing modes: legacy uses the clients set directly; per-session mode also
-        // populates clients on addClient(), but consult the routing engine as belt-and-suspenders so we still
-        // detect waiting users if the engine is the authoritative source in a future refactor.
+        // Session count = sockets currently ATTACHED to a session, NOT the raw AppSession count. AppSessions
+        // that outlive their WebSocket (detach → grace window before eviction) still appear in
+        // activeAppSessions() but have no socket to deliver to, so treating them as "active" for the
+        // readiness gate would restart a pod that has zero real clients (Codex round-3 P2a). Legacy mode
+        // still consults the clients set directly; per-session mode delegates to the routing engine.
         int activeSessions = clients.size();
         if (activeSessions == 0 && routingEngine != null) {
-            activeSessions = routingEngine.activeAppSessions().size();
+            activeSessions = routingEngine.attachedSocketCount();
         }
         // Startup-during-wedge fallback: if we've never forwarded but a session is connected, start counting
         // from the moment we first saw that session. Reset BOTH baseline and lastForwardEpochMs to 0 when no
@@ -698,7 +719,6 @@ public class FeedGatewayService implements ReplayRunner {
             lastMs = 0L;
         }
         long effectiveLastMs = lastMs > 0L ? lastMs : readinessBaselineEpochMs.get();
-        boolean marketHours = isRegularTradingHours(nowMs);
         boolean forwardStalled = effectiveLastMs > 0L && (nowMs - effectiveLastMs) > FORWARD_STALL_THRESHOLD_MS;
         boolean unhealthy = marketHours && forwardStalled && activeSessions > 0;
         if (unhealthy) {
@@ -733,6 +753,15 @@ public class FeedGatewayService implements ReplayRunner {
 
     int activeSessionsForTest() {
         return clients.size();
+    }
+
+    /**
+     * Test seam: pre-arm the market-hours edge tracker so a test that pins RTH=true from the start does
+     * not have its intentional stale {@code lastForwardEpochMs} clobbered by the off-hours→on-hours reset
+     * on the very first probe. Real code paths always drive this via {@link #readinessStatus()}.
+     */
+    void setInMarketHoursForTest(boolean value) {
+        this.inMarketHours.set(value);
     }
 
     void addSessionForTest(WebSocketSession session) {

@@ -483,6 +483,16 @@ public final class SessionRoutingEngine {
         return callRead(() -> new ArrayList<>(appSessions.values()));
     }
 
+    /**
+     * Count of WebSockets currently attached to any AppSession — i.e. AppSessions in the grace window
+     * (detached-socket, awaiting eviction) are NOT counted. Used by the readiness watchdog to decide
+     * whether there is a real client to broadcast to; using {@link #activeAppSessions()} instead would
+     * inflate the count with grace-window sessions and cause false 503s (Codex round-3 P2a).
+     */
+    public int attachedSocketCount() {
+        return callRead(socketToApp::size);
+    }
+
     public int appSessionCountForUser(String userId) {
         return callRead(() -> {
             Set<String> apps = userToApps.get(userId);
