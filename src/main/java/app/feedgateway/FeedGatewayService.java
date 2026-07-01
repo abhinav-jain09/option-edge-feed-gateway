@@ -285,7 +285,8 @@ public class FeedGatewayService implements ReplayRunner {
                 Math.max(100L, settings.wsWriteDeadlineMs() / 2),
                 TimeUnit.MILLISECONDS
         );
-        // AUTO-expiry daily roll (no-op unless IB_EXPIRY is empty/AUTO). 60s cadence catches the overnight
+        // AUTO-expiry daily roll (no-op unless MARKET_DATA_EXPIRY, or its IB_EXPIRY fallback, is the explicit
+        // "AUTO"). 60s cadence catches the overnight
         // ET trading-date change well before the open; the date never changes mid-session.
         batchExecutor.scheduleAtFixedRate(this::maybeAutoRollExpiry, 60L, 60L, TimeUnit.SECONDS);
     }
@@ -1525,7 +1526,8 @@ public class FeedGatewayService implements ReplayRunner {
      * (the feed self-rolls the same way). Reuses {@link #applySelection} — the SAME path as a control-topic
      * selection — so the chain reset/replay/readiness behave identically. {@code autoRolledExpiry} guards it
      * to fire once per new trading day, and a manual selection holds for the day (auto resumes next day).
-     * No-op when pinned to an explicit IB_EXPIRY. Scheduled every 60s; the date only changes overnight, so
+     * No-op when pinned to an explicit MARKET_DATA_EXPIRY (or its IB_EXPIRY fallback). Scheduled every 60s;
+     * the date only changes overnight, so
      * this is never a mid-session swap. A fresh ms epoch makes the rolled selection supersede prior ones.
      */
     private void maybeAutoRollExpiry() {

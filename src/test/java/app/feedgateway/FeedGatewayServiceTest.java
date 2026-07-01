@@ -388,13 +388,46 @@ class FeedGatewayServiceTest {
 
     @Test
     void gatewayInitialExpiryHonorsConfiguredDateWithoutClockRollover() {
-        // The gateway must mirror the deploy-resolved IB_EXPIRY (= the Databento feed's chain date)
+        // The gateway must mirror the deploy-resolved MARKET_DATA_EXPIRY (= the Databento feed's chain date)
         // and never advance it on a local clock rule. A configured expiry is returned verbatim no
         // matter the time of day, so the gateway's default selection and the feed stay on the same
         // date — otherwise the chain points at a date the feed never publishes and goes empty.
-        withSystemProperty("IB_EXPIRY", "20260615", () ->
+        withSystemProperty("MARKET_DATA_EXPIRY", "20260615", () ->
                 assertEquals("20260615", new GatewaySettings().initialExpiry()));
         assertEquals("20260615", GatewaySettings.normalizeExpiry("2026-06-15"));
+    }
+
+    @Test
+    void gatewayInitialExpiryHonorsLegacyIbExpiryFallback() {
+        // BACKWARD-COMPAT: IB_EXPIRY is the retired-IB-feed leftover, now a deprecated fallback. With
+        // ONLY IB_EXPIRY set (old config / half-deployed state), the gateway must still resolve the date,
+        // so the date-roll can't break while MARKET_DATA_EXPIRY has not yet been written everywhere.
+        withSystemProperty("IB_EXPIRY", "20260615", () ->
+                assertEquals("20260615", new GatewaySettings().initialExpiry()));
+    }
+
+    @Test
+    void gatewayMarketDataExpiryTakesPrecedenceOverLegacyIbExpiry() {
+        // When BOTH are set, the source-neutral MARKET_DATA_EXPIRY wins; IB_EXPIRY is only a fallback.
+        withSystemProperty("IB_EXPIRY", "20260615", () ->
+                withSystemProperty("MARKET_DATA_EXPIRY", "20260620", () ->
+                        assertEquals("20260620", new GatewaySettings().initialExpiry())));
+    }
+
+    @Test
+    void gatewayAutoExpiryHonorsMarketDataExpiryAndLegacyFallbackButFailsClosedOnBlank() {
+        // Only the explicit "AUTO" enables calendar auto-roll — via the primary key or the legacy fallback.
+        withSystemProperty("MARKET_DATA_EXPIRY", "AUTO", () ->
+                assertTrue(new GatewaySettings().autoExpiry()));
+        withSystemProperty("IB_EXPIRY", "AUTO", () ->
+                assertTrue(new GatewaySettings().autoExpiry()));
+        // A concrete date pins, never auto-rolls.
+        withSystemProperty("MARKET_DATA_EXPIRY", "20260615", () ->
+                assertFalse(new GatewaySettings().autoExpiry()));
+        // MARKET_DATA_EXPIRY precedence: an explicit date pins even when IB_EXPIRY says AUTO.
+        withSystemProperty("IB_EXPIRY", "AUTO", () ->
+                withSystemProperty("MARKET_DATA_EXPIRY", "20260615", () ->
+                        assertFalse(new GatewaySettings().autoExpiry())));
     }
 
     @Test
