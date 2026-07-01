@@ -288,6 +288,33 @@ public class FeedGatewayService implements ReplayRunner {
         // AUTO-expiry daily roll (no-op unless IB_EXPIRY is empty/AUTO). 60s cadence catches the overnight
         // ET trading-date change well before the open; the date never changes mid-session.
         batchExecutor.scheduleAtFixedRate(this::maybeAutoRollExpiry, 60L, 60L, TimeUnit.SECONDS);
+        // Idle-session sweep (P0 — TCP half-open protection): closes any socket that has had no inbound
+        // frame AND no outbound send for GATEWAY_WS_IDLE_TIMEOUT_MS (default 5 min). Complements the write-
+        // deadline watchdog: the watchdog fires only while a send is stuck in flight; the idle sweep fires
+        // when no bytes are moving at all (laptop closed, dead NAT, dropped WiFi) — those never trigger a
+        // send error, so without this sweep a dead client keeps its writer pinned indefinitely.
+        batchExecutor.scheduleAtFixedRate(this::sweepIdleSessions, 60L, 60L, TimeUnit.SECONDS);
+        // P2 (passive-browser idle-sweep fix): send a WebSocket PING frame to every open socket every
+        // GATEWAY_WS_PING_INTERVAL_MS. The browser auto-responds with a PONG at the protocol layer, which
+        // FeedWebSocketHandler.handlePongMessage stamps as inbound activity — so a listener-only tab is
+        // not evicted by sweepIdleSessions during quiet market minutes or after hours.
+        long pingIntervalMs = settings.wsPingIntervalMs();
+        batchExecutor.scheduleAtFixedRate(
+                this::sendHeartbeatPings, pingIntervalMs, pingIntervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Visible for tests: send one round of server-originated PING frames across every tracked outbound
+     * channel. Production wiring schedules this every {@link GatewaySettings#wsPingIntervalMs()} ms.
+     */
+    void sendHeartbeatPings() {
+        for (OutboundChannel channel : outbound.values()) {
+            try {
+                channel.sendPing();
+            } catch (RuntimeException ignored) {
+                // a single channel must not break the sweep
+            }
+        }
     }
 
     private void enforceOutboundWriteDeadlines() {
@@ -299,6 +326,56 @@ public class FeedGatewayService implements ReplayRunner {
             } catch (RuntimeException ignored) {
                 // a single channel must not break the sweep
             }
+        }
+    }
+
+    /**
+     * Visible for tests: run the idle sweep once with the given "now". Production wiring schedules this
+     * every 60s. Any channel closed here fires its onClose (→ {@link #onSlowDisconnect}) which detaches
+     * the socket from routing and returns the writer thread to the pool.
+     */
+    void sweepIdleSessions(long nowMs) {
+        long idle = settings.wsIdleTimeoutMs();
+        for (OutboundChannel channel : outbound.values()) {
+            try {
+                channel.enforceIdleTimeout(nowMs, idle);
+            } catch (RuntimeException ignored) {
+                // a single channel must not break the sweep
+            }
+        }
+    }
+
+    private void sweepIdleSessions() {
+        sweepIdleSessions(System.currentTimeMillis());
+    }
+
+    /**
+     * Called by the WebSocket handler on every inbound text frame — resets the idle-sweep clock so an
+     * active bidirectional client is not closed by the sweep even when no outbound events happen to be
+     * flowing to it (e.g. no selection change, quiet market period).
+     */
+    public void noteInboundActivity(WebSocketSession session) {
+        if (session == null) {
+            return;
+        }
+        OutboundChannel channel = outbound.get(session.getId());
+        if (channel != null) {
+            channel.noteInboundActivity();
+        }
+    }
+
+    /**
+     * Called by the WS handler when a PONG frame arrives — the true liveness signal for a listener-only
+     * browser that never sends application frames. Bumps the idle-sweep clock so the passive client is
+     * not evicted while the socket is still healthy.
+     */
+    public void notePongReceived(WebSocketSession session) {
+        if (session == null) {
+            return;
+        }
+        OutboundChannel channel = outbound.get(session.getId());
+        if (channel != null) {
+            channel.notePongReceived();
         }
     }
 
@@ -355,6 +432,15 @@ public class FeedGatewayService implements ReplayRunner {
     public void addClient(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
+        // OutboundChannel is the sole defence against a stuck single send: its watchdog
+        // ({@link OutboundChannel#enforceWriteDeadline}) runs on a separate scheduler thread and closes
+        // the session with SESSION_NOT_RELIABLE when a single sendMessage exceeds
+        // {@code wsWriteDeadlineMs}. Spring's ConcurrentWebSocketSessionDecorator was tried here as
+        // "belt-and-suspenders" but its sendTimeLimit only fires on RE-ENTRY (a second send arriving
+        // while the first is in flight); the serialized single-drain in OutboundChannel never triggers
+        // that path, so the decorator added no protection and was removed (Codex P2). Queued bytes are
+        // still bounded by OutboundChannel itself (wsMaxQueuedBytes), so no Spring-level buffer cap is
+        // needed either.
         OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(),
                 settings.wsMaxQueuedMessages(), settings.wsMaxQueuedBytes(), outboundMetrics, this::onSlowDisconnect);
         outbound.put(session.getId(), channel);
