@@ -133,6 +133,54 @@ class FeedGatewayRolloverDiagnosticsTest {
     }
 
     @Test
+    void hpsfPollsCountTowardConsumersAdvancing() {
+        // Codex round-2 P2b: HPSF-only pipelines must lift polledDelta > 0 so the stall-alert path
+        // fires when appropriate. Before the fix, only the generic Avro/state loop bumped
+        // liveRecordsPolled — so an HPSF-only wedge could never trip the alert. We simulate the HPSF
+        // loop's new increment by calling bumpLiveRecordsPolledForTest (same code path) and verify the
+        // alert DOES fire after two zero-forward cycles in RTH with sessions present.
+        FeedGatewayService service = service();
+        overrideRth(service, Boolean.TRUE);
+        addFakeClient(service);
+
+        long alertsBefore = service.forwardStalledAlertsForTest();
+        try (CapturedOut ignored = new CapturedOut()) {
+            // Cycle 1: HPSF poll delivered 100 records (mimicking runHpsfLiveConsumerOnce's new
+            // liveRecordsPolled.addAndGet(records.count())). No forwards.
+            service.bumpLiveRecordsPolledForTest(100L);
+            service.dumpDiagnosticState();
+            assertEquals(alertsBefore, service.forwardStalledAlertsForTest(),
+                    "cycle-1 must not alert");
+            // Cycle 2: HPSF keeps advancing, still no forwards → ALERT
+            service.bumpLiveRecordsPolledForTest(75L);
+            service.dumpDiagnosticState();
+        }
+        assertEquals(alertsBefore + 1, service.forwardStalledAlertsForTest(),
+                "HPSF polls alone must count toward consumersAdvancing so the stall alert fires");
+    }
+
+    @Test
+    void readySelectionKeyGaugeFlipsOffOnRollover() {
+        // Codex round-2 P2a: applySelection intentionally does NOT reset readySelectionKey, so the
+        // gauge must compare readySelectionKey to the CURRENT active selection's key (not just check
+        // non-empty). After a rollover to a new selection whose key differs, the gauge must read 0
+        // even though the field is still populated with the previous selection's key.
+        FeedGatewayService service = service();
+
+        // Seed: activeSelection = A, readySelectionKey = key(A) → gauge should read 1.
+        service.seedReadySelectionForTest("DATABENTO", "SPX", "20260701", 1L);
+        assertEquals(1, service.readySelectionKeyGaugeForTest(),
+                "gauge must read 1 when readySelectionKey matches the current activeSelection");
+
+        // Rollover: swap activeSelection to B (new expiry / new epoch). readySelectionKey stays as
+        // key(A) because applySelection does NOT reset it. Gauge must now read 0.
+        service.swapActiveSelectionForTest("DATABENTO", "SPX", "20260702", 2L);
+        assertEquals(0, service.readySelectionKeyGaugeForTest(),
+                "gauge must read 0 after rollover: readySelectionKey still holds the PREVIOUS "
+                        + "selection's key, so the new selection has NOT yet transitioned to ready");
+    }
+
+    @Test
     void forwardStalledDoesNotFireWhenConsumersAreQuiet() {
         // Regression for Codex P2: the pre-fix code used the CUMULATIVE liveRecordsPolled counter,
         // so once a consumer had EVER seen a record, `consumersAdvancing` stayed true forever and two

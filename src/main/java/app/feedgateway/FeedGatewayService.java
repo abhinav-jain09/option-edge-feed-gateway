@@ -890,9 +890,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_forward_stalled_flag_active_selection_present Whether the activeSelection reference is non-null.\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_flag_active_selection_present gauge\n"
                 + "options_edge_feed_gateway_forward_stalled_flag_active_selection_present " + boolMetric(selection != null) + "\n"
-                + "# HELP options_edge_feed_gateway_forward_stalled_flag_ready_selection_key_set Whether readySelectionKey has been transitioned for the active selection.\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_flag_ready_selection_key_set Whether readySelectionKey has been transitioned for the CURRENT active selection (matches by key, so a stale key from the PREVIOUS selection reads 0).\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_flag_ready_selection_key_set gauge\n"
-                + "options_edge_feed_gateway_forward_stalled_flag_ready_selection_key_set " + boolMetric(!readySelectionKey.get().isEmpty()) + "\n"
+                + "options_edge_feed_gateway_forward_stalled_flag_ready_selection_key_set " + boolMetric(readySelectionKeyMatchesActive(selection)) + "\n"
                 + "# HELP options_edge_feed_gateway_forward_stalled_dropped_by_staleness_total Records dropped by the selection/staleness barrier (bucketed slice of inactiveDroppedEvents).\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_dropped_by_staleness_total counter\n"
                 + "options_edge_feed_gateway_forward_stalled_dropped_by_staleness_total " + droppedByStaleness.get() + "\n"
@@ -1098,6 +1098,13 @@ public class FeedGatewayService implements ReplayRunner {
             }
             while (running.get()) {
                 ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                // Rollover-diagnostics (Codex round-2 P2b): count HPSF polls toward the "consumers advancing"
+                // signal so an HPSF-only advancing pipeline still lifts polledDelta > 0. Without this, an
+                // HPSF-only feed would leave consumersAdvancing=false and permanently suppress the
+                // GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS alert.
+                if (!records.isEmpty()) {
+                    liveRecordsPolled.addAndGet(records.count());
+                }
                 for (ConsumerRecord<String, String> record : records) {
                     HpsfCacheUpdate update = updateHpsfCache(record);
                     if (update != null && hpsfCaughtUp.get()) {
@@ -1112,6 +1119,15 @@ public class FeedGatewayService implements ReplayRunner {
                         forwardedEvents.incrementAndGet();
                     } else if (update != null) {
                         inactiveDroppedEvents.incrementAndGet();
+                        // Rollover-diagnostics fine-grained bucketing (Codex round-2 P2b): mirror the
+                        // generic live-loop bucketing so HPSF drops also show up in the per-bucket telemetry.
+                        // The only reason a non-null update drops here is the HPSF cache-gate being FALSE.
+                        droppedByCacheGate.incrementAndGet();
+                    } else {
+                        // update == null: parse failure or non-matching binding — not a staleness/gate drop,
+                        // so bucket as "other reasons". Note: inactiveDroppedEvents intentionally does NOT
+                        // include this branch (legacy behavior); only the diagnostic bucket does.
+                        droppedByOtherReasons.incrementAndGet();
                     }
                 }
                 purgeExpiredCache(System.currentTimeMillis());
@@ -1842,6 +1858,23 @@ public class FeedGatewayService implements ReplayRunner {
 
     private String selectionKey(ActiveSelection selection) {
         return selection.source() + "|" + selection.symbol() + "|" + selection.expiry() + "|" + selection.selectionEpoch();
+    }
+
+    /**
+     * Rollover-diagnostics (Codex round-2 P2a): true only when {@code readySelectionKey} matches the CURRENT
+     * active selection's key. {@link #applySelection} intentionally does NOT reset {@code readySelectionKey}
+     * on rollover, so a bare non-empty check would keep the gauge at 1 using the PREVIOUS selection's key —
+     * hiding the exact "new selection has not yet emitted source-ready" wedge the gauge is meant to expose.
+     */
+    private boolean readySelectionKeyMatchesActive(ActiveSelection selection) {
+        if (selection == null) {
+            return false;
+        }
+        String ready = readySelectionKey.get();
+        if (ready == null || ready.isEmpty()) {
+            return false;
+        }
+        return ready.equals(selectionKey(selection));
     }
 
     private boolean matchesActiveSelection(String json, ActiveSelection selection) {
@@ -4396,5 +4429,27 @@ public class FeedGatewayService implements ReplayRunner {
         emitRolloverWarn(
                 new ActiveSelection(fromSource, "SPX", "20260701", 1L, now - 1000L),
                 new ActiveSelection(toSource, "SPX", "20260702", 2L, now));
+    }
+
+    // Codex round-2 P2a test seam: drive the applySelection-without-reset path so a test can verify
+    // the readySelectionKey gauge flips OFF on rollover even though the field itself is intentionally
+    // NOT cleared. Returns 1 iff readySelectionKey matches the current activeSelection's key.
+    int readySelectionKeyGaugeForTest() {
+        return boolMetric(readySelectionKeyMatchesActive(activeSelection.get()));
+    }
+
+    void seedReadySelectionForTest(String source, String symbol, String expiry, long epoch) {
+        long now = System.currentTimeMillis();
+        ActiveSelection sel = new ActiveSelection(source, symbol, expiry, epoch, now);
+        activeSelection.set(sel);
+        readySelectionKey.set(selectionKey(sel));
+    }
+
+    // Codex round-2 P2a: swap the active selection WITHOUT clearing readySelectionKey (mirrors the
+    // real applySelection contract). Used to verify the readySelectionKey gauge flips to 0 when the
+    // stored key belongs to the PREVIOUS selection.
+    void swapActiveSelectionForTest(String source, String symbol, String expiry, long epoch) {
+        long now = System.currentTimeMillis();
+        activeSelection.set(new ActiveSelection(source, symbol, expiry, epoch, now));
     }
 }
