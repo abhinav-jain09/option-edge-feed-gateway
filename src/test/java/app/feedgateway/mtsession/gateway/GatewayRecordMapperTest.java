@@ -80,8 +80,15 @@ class GatewayRecordMapperTest {
         assertEquals(EventType.MISSION_CONTROL, GatewayRecordMapper.eventTypeFor("mission-control"));
         assertEquals(EventType.GEX_BY_STRIKE, GatewayRecordMapper.eventTypeFor("gex-by-strike"));
         assertEquals(EventType.MAX_PAIN, GatewayRecordMapper.eventTypeFor("max-pain"));
+        assertEquals(EventType.LIQUIDITY_HEATMAP, GatewayRecordMapper.eventTypeFor("liquidity-heatmap"));
         assertNull(GatewayRecordMapper.eventTypeFor("hpsf-audit"));
         assertNull(GatewayRecordMapper.eventTypeFor(null));
+    }
+
+    @Test
+    void liquidityHeatmapRoutesContractScopedLikeMaxPain() {
+        // One column frame covers the whole (symbol, expiry) chain: contract-scoped, no strike filter.
+        assertEquals(true, EventType.LIQUIDITY_HEATMAP.isContractScoped());
     }
 
     // ---- source-mismatch rejection (req. 5) ----

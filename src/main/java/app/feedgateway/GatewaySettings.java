@@ -219,6 +219,25 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_STRIKE_FLOW_TOPIC", "options.databento.strike-flow");
     }
 
+    /**
+     * Strike-liquidity heatmap dashboard frames (JSON {@code StrikeLiquidityHeatmapFrame}, one
+     * per-second column per symbol|expiry) from strike-liquidity-heatmap-service. Broadcast as
+     * event {@code "liquidity-heatmap"}. Optional topic: when the producer is down or absent the
+     * ui-batch simply carries no frames and the option-chain page renders exactly as before.
+     */
+    public String strikeLiquidityTopic() {
+        return value("KAFKA_STRIKE_LIQUIDITY_TOPIC", "strike-liquidity-heatmap-dashboard");
+    }
+
+    /**
+     * Freshness TTL for liquidity-heatmap frames — deliberately SHORT (default 5s ~= 2x bucket
+     * width + grace), NOT the generic 15-min {@link #cacheTtlMs()}: a minutes-old "latest column"
+     * must render as stale/absent, never as live liquidity (the GEX generic-TTL lesson).
+     */
+    public long liquidityHeatmapTtlMs() {
+        return longValue("GATEWAY_LIQUIDITY_HEATMAP_TTL_MS", 5_000L, 0L);
+    }
+
     public String databentoPaceMissionTopic() {
         return value("KAFKA_DATABENTO_PACE_MISSION_TOPIC", "options.databento.pace.mission");
     }
@@ -276,6 +295,12 @@ public final class GatewaySettings {
     /** Databento per-(symbol,expiry) max-pain output topic. Independent of GEX; consumed only by the max-pain stream. */
     public String databentoMaxPainTopic() {
         return value("KAFKA_DATABENTO_MAXPAIN_TOPIC", "options.databento.maxpain");
+    }
+
+    /** Option Price Behavior dashboard output topic (JSON, per symbol/trading-date). */
+    public String optionPriceBehaviorDashboardTopic() {
+        return value("OPTION_PRICE_BEHAVIOR_DASHBOARD_TOPIC",
+                value("KAFKA_OPTION_PRICE_BEHAVIOR_DASHBOARD_TOPIC", "option-price-behavior-dashboard"));
     }
 
     public String hpsfLatestSignalTopic() {
