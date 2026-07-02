@@ -253,13 +253,15 @@ class FeedGatewayPerSessionBroadcastTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void perSessionCachedMissionPaceIsNotReplayedOnConnect() throws Exception {
-        // mission-pace cached frames carry no per-session selectionEpoch, so they are deliberately NOT
-        // cache-replayed on connect (a newly attached socket bootstraps from the next live frame).
+    void perSessionCachedMissionPaceReplaysOnlyToTheMatchingMarketOnConnect() throws Exception {
         java.lang.reflect.Field f = FeedGatewayService.class.getDeclaredField("missionPaces");
         f.setAccessible(true);
         ((java.util.Map<String, String>) f.get(svc)).put("DATABENTO|SPX|20260612",
                 "{\"eventType\":\"mission-pace\",\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"rankedStrikes\":[]}");
+        java.lang.reflect.Field times = FeedGatewayService.class.getDeclaredField("cacheEventTimes");
+        times.setAccessible(true);
+        ((java.util.Map<String, Long>) times.get(svc)).put("mission-pace:DATABENTO|SPX|20260612",
+                System.currentTimeMillis());
 
         engine.registerAppSession("app:u3", "u3",
                 new Selection(MarketDataSource.DATABENTO, "SPX", "20260612", StrikeWindow.ALL), Set.of());
@@ -267,8 +269,10 @@ class FeedGatewayPerSessionBroadcastTest {
         List<String> u3 = new ArrayList<>();
         svc.addClient(socket("s3", u3)); // triggers per-session cached replay
 
-        assertFalse(u3.stream().anyMatch(m -> m.contains("\"type\":\"mission-pace\"")),
-                "cached mission-pace must NOT be replayed on connect in per-session mode");
+        assertTrue(u3.stream().anyMatch(m -> m.contains("\"type\":\"mission-pace\"")),
+                "fresh cached mission-pace must replay to the matching per-session market on connect");
+        assertTrue(u2.stream().noneMatch(m -> m.contains("\"type\":\"mission-pace\"")),
+                "cached mission-pace must not leak to a different selected expiry");
     }
 
     @Test

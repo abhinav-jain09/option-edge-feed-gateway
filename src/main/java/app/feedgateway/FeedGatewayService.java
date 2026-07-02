@@ -184,6 +184,34 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong lastSourceStaleBroadcastMs = new AtomicLong();
     private final AtomicLong lastLagCheckMs = new AtomicLong();
     private final AtomicReference<String> readySelectionKey = new AtomicReference<>("");
+
+    // ---- Rollover-diagnostics instrumentation (additive; no behavior changes) ----
+    // These counters + fields exist ONLY to answer "which flag flipped wrong?" the next time the gateway
+    // silently wedges across a midnight-ET rollover (see 2026-07-01 9.5h outage). They are additive:
+    // nothing here alters the forward decision or the rollover logic. Removing this block would restore
+    // the pre-instrumentation runtime exactly.
+    private final AtomicLong liveRecordsPolled = new AtomicLong();          // total records seen by any live consumer
+    // Codex round-4 P2: only records whose binding.source() matches the CURRENT activeSelection.source()
+    // (plus HPSF, which is not source-gated) are eligible for forward. `consumersAdvancing` in the stall
+    // gate is derived from THIS counter's per-interval delta, not liveRecordsPolled, so noisy traffic
+    // from a non-selected source can never mask a real wedge in the selected source's pipeline.
+    private final AtomicLong liveRecordsEligibleForActiveSelection = new AtomicLong();
+    private final AtomicLong droppedByStaleness = new AtomicLong();         // records dropped by selection-barrier / stale gate
+    private final AtomicLong droppedByCacheGate = new AtomicLong();         // records dropped because cacheCaughtUpFlag was false
+    private final AtomicLong droppedByOtherReasons = new AtomicLong();      // caught-up + non-forwardable (source/symbol/expiry mismatch, etc.)
+    private final AtomicLong rolloverCount = new AtomicLong();              // number of session-boundary rollovers observed
+    private final AtomicLong forwardStalledAlerts = new AtomicLong();       // number of GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS emissions
+    private final AtomicLong lastRolloverAtMs = new AtomicLong();           // wall-clock ms of the most recent rollover
+    private final AtomicReference<String> lastRolloverFrom = new AtomicReference<>("");
+    private final AtomicReference<String> lastRolloverTo = new AtomicReference<>("");
+    private final AtomicLong lastForwardedSnapshot = new AtomicLong();      // forwardedEvents at the last 60s dump
+    private final AtomicLong lastDumpLiveRecordsPolledSnapshot = new AtomicLong(); // liveRecordsPolled at the last 60s dump
+    private final AtomicLong lastDumpLiveRecordsEligibleSnapshot = new AtomicLong(); // liveRecordsEligibleForActiveSelection at the last 60s dump
+    private volatile int consecutiveZeroForwardCycles = 0;                  // read/written only by the diagnostics thread
+    private volatile ScheduledExecutorService diagnosticsExecutor;
+    private volatile boolean diagnosticsEnabled = true;
+    // ---- end rollover-diagnostics instrumentation ----
+
     private ExecutorService executor;
     private ScheduledExecutorService batchExecutor;
 
@@ -296,6 +324,14 @@ public class FeedGatewayService implements ReplayRunner {
         // AUTO-expiry daily roll (no-op unless IB_EXPIRY is empty/AUTO). 60s cadence catches the overnight
         // ET trading-date change well before the open; the date never changes mid-session.
         batchExecutor.scheduleAtFixedRate(this::maybeAutoRollExpiry, 60L, 60L, TimeUnit.SECONDS);
+        // Rollover-diagnostics 60s dump (additive; separate executor so a diag exception can never wedge
+        // the batch/deadline/autoroll cadence). See dumpDiagnosticState() for the semantics.
+        diagnosticsExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "options-edge-feed-gateway-diagnostics");
+            thread.setDaemon(true);
+            return thread;
+        });
+        diagnosticsExecutor.scheduleAtFixedRate(this::dumpDiagnosticState, 60L, 60L, TimeUnit.SECONDS);
     }
 
     private void enforceOutboundWriteDeadlines() {
@@ -327,6 +363,15 @@ public class FeedGatewayService implements ReplayRunner {
             currentBatchExecutor.shutdownNow();
             try {
                 currentBatchExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        ScheduledExecutorService currentDiagExecutor = diagnosticsExecutor;
+        if (currentDiagExecutor != null) {
+            currentDiagExecutor.shutdownNow();
+            try {
+                currentDiagExecutor.awaitTermination(5, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -857,7 +902,50 @@ public class FeedGatewayService implements ReplayRunner {
                 + "options_edge_feed_gateway_cache_ttl_ms " + settings.cacheTtlMs() + "\n"
                 + "# HELP options_edge_feed_gateway_uptime_seconds Seconds since the feed gateway service object was created.\n"
                 + "# TYPE options_edge_feed_gateway_uptime_seconds gauge\n"
-                + "options_edge_feed_gateway_uptime_seconds " + uptimeSeconds + "\n";
+                + "options_edge_feed_gateway_uptime_seconds " + uptimeSeconds + "\n"
+                // ---- Rollover-diagnostics counters/gauges (additive; see dumpDiagnosticState). ----
+                + "# HELP options_edge_feed_gateway_forward_stalled_flag_avro_caught_up Whether the Avro live-consumer cache-caught-up gate is TRUE.\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_flag_avro_caught_up gauge\n"
+                + "options_edge_feed_gateway_forward_stalled_flag_avro_caught_up " + boolMetric(avroCaughtUp.get()) + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_flag_state_caught_up Whether the JSON-state live-consumer cache-caught-up gate is TRUE.\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_flag_state_caught_up gauge\n"
+                + "options_edge_feed_gateway_forward_stalled_flag_state_caught_up " + boolMetric(stateCaughtUp.get()) + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_flag_hpsf_caught_up Whether the HPSF live-consumer cache-caught-up gate is TRUE.\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_flag_hpsf_caught_up gauge\n"
+                + "options_edge_feed_gateway_forward_stalled_flag_hpsf_caught_up " + boolMetric(hpsfCaughtUp.get()) + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_flag_active_selection_present Whether the activeSelection reference is non-null.\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_flag_active_selection_present gauge\n"
+                + "options_edge_feed_gateway_forward_stalled_flag_active_selection_present " + boolMetric(selection != null) + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_flag_ready_selection_key_set Whether readySelectionKey has been transitioned for the CURRENT active selection (matches by key, so a stale key from the PREVIOUS selection reads 0).\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_flag_ready_selection_key_set gauge\n"
+                + "options_edge_feed_gateway_forward_stalled_flag_ready_selection_key_set " + boolMetric(readySelectionKeyMatchesActive(selection)) + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_dropped_by_staleness_total Records dropped by the selection/staleness barrier (bucketed slice of inactiveDroppedEvents).\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_dropped_by_staleness_total counter\n"
+                + "options_edge_feed_gateway_forward_stalled_dropped_by_staleness_total " + droppedByStaleness.get() + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_dropped_by_cache_gate_total Records dropped because cacheCaughtUpFlag was FALSE.\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_dropped_by_cache_gate_total counter\n"
+                + "options_edge_feed_gateway_forward_stalled_dropped_by_cache_gate_total " + droppedByCacheGate.get() + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_dropped_by_other_reasons_total Records dropped by source/symbol/expiry mismatch or other non-staleness reasons.\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_dropped_by_other_reasons_total counter\n"
+                + "options_edge_feed_gateway_forward_stalled_dropped_by_other_reasons_total " + droppedByOtherReasons.get() + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_live_records_polled_total Total records observed by the live consumers (poll advance signal).\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_live_records_polled_total counter\n"
+                + "options_edge_feed_gateway_forward_stalled_live_records_polled_total " + liveRecordsPolled.get() + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_live_records_eligible_total Records whose source matches the current active selection (or HPSF); the actual `consumers advancing` signal used by the stall alert.\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_live_records_eligible_total counter\n"
+                + "options_edge_feed_gateway_forward_stalled_live_records_eligible_total " + liveRecordsEligibleForActiveSelection.get() + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_rollover_count_total Number of session-boundary rollovers observed (applySelection transitions).\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_rollover_count_total counter\n"
+                + "options_edge_feed_gateway_forward_stalled_rollover_count_total " + rolloverCount.get() + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_last_rollover_ms Wall-clock ms of the most recent rollover (0 if none observed).\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_last_rollover_ms gauge\n"
+                + "options_edge_feed_gateway_forward_stalled_last_rollover_ms " + lastRolloverAtMs.get() + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_active_sessions Current active-session count (routing engine when per-session, else connected clients).\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_active_sessions gauge\n"
+                + "options_edge_feed_gateway_forward_stalled_active_sessions " + activeSessionsCount() + "\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_alerts_total Number of GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS alerts emitted.\n"
+                + "# TYPE options_edge_feed_gateway_forward_stalled_alerts_total counter\n"
+                + "options_edge_feed_gateway_forward_stalled_alerts_total " + forwardStalledAlerts.get() + "\n";
     }
 
     private static int boolMetric(boolean value) {
@@ -1046,6 +1134,16 @@ public class FeedGatewayService implements ReplayRunner {
             }
             while (running.get()) {
                 ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                // Rollover-diagnostics (Codex round-2 P2b): count HPSF polls toward the "consumers advancing"
+                // signal so an HPSF-only advancing pipeline still lifts polledDelta > 0. Without this, an
+                // HPSF-only feed would leave consumersAdvancing=false and permanently suppress the
+                // GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS alert.
+                // Codex round-4 P2: HPSF is NOT source-gated (it forwards unconditionally when caught up),
+                // so every HPSF-poll record is eligible for the active selection's forward path.
+                if (!records.isEmpty()) {
+                    liveRecordsPolled.addAndGet(records.count());
+                    liveRecordsEligibleForActiveSelection.addAndGet(records.count());
+                }
                 for (ConsumerRecord<String, String> record : records) {
                     HpsfCacheUpdate update = updateHpsfCache(record);
                     if (update != null && hpsfCaughtUp.get()) {
@@ -1060,6 +1158,15 @@ public class FeedGatewayService implements ReplayRunner {
                         forwardedEvents.incrementAndGet();
                     } else if (update != null) {
                         inactiveDroppedEvents.incrementAndGet();
+                        // Rollover-diagnostics fine-grained bucketing (Codex round-2 P2b): mirror the
+                        // generic live-loop bucketing so HPSF drops also show up in the per-bucket telemetry.
+                        // The only reason a non-null update drops here is the HPSF cache-gate being FALSE.
+                        droppedByCacheGate.incrementAndGet();
+                    } else {
+                        // update == null: parse failure or non-matching binding — not a staleness/gate drop,
+                        // so bucket as "other reasons". Note: inactiveDroppedEvents intentionally does NOT
+                        // include this branch (legacy behavior); only the diagnostic bucket does.
+                        droppedByOtherReasons.incrementAndGet();
                     }
                 }
                 purgeExpiredCache(System.currentTimeMillis());
@@ -1232,6 +1339,29 @@ public class FeedGatewayService implements ReplayRunner {
             }
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
+                // is only read by dumpDiagnosticState() to distinguish "consumers polling" from "forward gate stuck".
+                if (!records.isEmpty()) {
+                    liveRecordsPolled.addAndGet(records.count());
+                }
+                // Codex round-4 P2: bucket polled records by "eligible for the active selection" — a
+                // record's binding.source() matching the current active selection is the only shape that
+                // COULD forward if the pipeline were healthy. Symbol/expiry mismatch is a real wedge and
+                // must NOT count as advancing (peer producing the wrong contract is exactly what we want
+                // the stall alert to catch).
+                ActiveSelection selectionForEligibility = activeSelection.get();
+                if (selectionForEligibility != null && !records.isEmpty()) {
+                    long eligible = 0L;
+                    for (ConsumerRecord<String, Object> r : records) {
+                        TopicBinding b = topicEvents.get(r.topic());
+                        if (b != null && b.source().equals(selectionForEligibility.source())) {
+                            eligible++;
+                        }
+                    }
+                    if (eligible > 0L) {
+                        liveRecordsEligibleForActiveSelection.addAndGet(eligible);
+                    }
+                }
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
@@ -1285,6 +1415,12 @@ public class FeedGatewayService implements ReplayRunner {
                         recordSelectedForward(binding, json, decided);
                     } else if (cacheKey != null) {
                         inactiveDroppedEvents.incrementAndGet();
+                        // Rollover-diagnostics fine-grained bucketing (additive; existing counters still
+                        // increment). Splits inactiveDroppedEvents into WHY it dropped so a stall shows
+                        // up as e.g. "droppedByCacheGate climbing" vs "droppedByOtherReasons climbing".
+                        recordDropBucket(binding, json,
+                                cacheCaughtUpFlag.get(),
+                                decided != null ? decided : activeSelection.get());
                         // Cache-arrival convergence: a snapshot for the ACTIVE selection was cached but not
                         // live-forwarded (e.g. it arrived already older than maxStaleMs on a closed market
                         // right after the daily roll). Still mark the selection ready so markSelectionReady
@@ -1547,6 +1683,14 @@ public class FeedGatewayService implements ReplayRunner {
             if (!next.newerThan(previous)) {
                 return;
             }
+            // Rollover-diagnostics WARN — moment-of-truth log emitted BEFORE the swap so a grep-friendly
+            // before/after record exists in Loki for the 2026-07-01-style silent-wedge incidents. Additive;
+            // does not gate the roll. (Wrapped so a diag failure never breaks the roll.)
+            try {
+                emitRolloverWarn(previous, next);
+            } catch (RuntimeException ignored) {
+                // instrumentation must never fail a real rollover
+            }
             offsetBarriers.set(captureOffsetBarriers(next));
             // NOTE: readySelectionKey is intentionally NOT reset here. markSelectionReady detects a NEW
             // selection by key change, so resetting to "" is unnecessary and previously opened a race:
@@ -1805,8 +1949,53 @@ public class FeedGatewayService implements ReplayRunner {
         return selection.source() + "|" + selection.symbol() + "|" + selection.expiry() + "|" + selection.selectionEpoch();
     }
 
+    /**
+     * Rollover-diagnostics (Codex round-2 P2a): true only when {@code readySelectionKey} matches the CURRENT
+     * active selection's key. {@link #applySelection} intentionally does NOT reset {@code readySelectionKey}
+     * on rollover, so a bare non-empty check would keep the gauge at 1 using the PREVIOUS selection's key —
+     * hiding the exact "new selection has not yet emitted source-ready" wedge the gauge is meant to expose.
+     */
+    private boolean readySelectionKeyMatchesActive(ActiveSelection selection) {
+        if (selection == null) {
+            return false;
+        }
+        String ready = readySelectionKey.get();
+        if (ready == null || ready.isEmpty()) {
+            return false;
+        }
+        return ready.equals(selectionKey(selection));
+    }
+
     private boolean matchesActiveSelection(String json, ActiveSelection selection) {
         return matchesSelection(json, selection, true);
+    }
+
+    /**
+     * Codex round-4 P3: bucket a dropped record into the right diagnostic counter.
+     *
+     * <p>Semantics:
+     * <ul>
+     *   <li>{@code cacheCaughtUp == false} → {@code droppedByCacheGate}</li>
+     *   <li>caught up AND source matches AND symbol/expiry matches → {@code droppedByStaleness}
+     *       (fresh-selection record dropped by the staleness / selection-barrier gate)</li>
+     *   <li>otherwise → {@code droppedByOtherReasons} (wrong source; or source match but wrong
+     *       symbol/expiry — the peer is producing the wrong contract, which is a real wedge shape
+     *       and must NOT be lumped in with normal staleness noise).</li>
+     * </ul>
+     */
+    void recordDropBucket(TopicBinding binding, String json, boolean cacheCaughtUp, ActiveSelection selection) {
+        if (!cacheCaughtUp) {
+            droppedByCacheGate.incrementAndGet();
+            return;
+        }
+        if (selection != null
+                && binding != null
+                && binding.source().equals(selection.source())
+                && matchesActiveSelection(json, selection)) {
+            droppedByStaleness.incrementAndGet();
+        } else {
+            droppedByOtherReasons.incrementAndGet();
+        }
     }
 
     /**
@@ -2953,22 +3142,10 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "pace-rank", paceRanks);
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
-        // mission-pace is intentionally NOT cache-replayed in per-session mode: its cached frames carry
-        // no per-session selectionEpoch (epoch 0 ⇒ they bypass passesBarrier), so replaying them could
-        // surface a pre-selection frame on connect. It is a fast per-market signal (~1 frame/sec), so a
-        // newly attached socket bootstraps from the next LIVE frame instead — which is routed by
-        // source|symbol|expiry and maxStale-gated (see the perSessionRouting branch in the JSON live
-        // consumer). Full pre-selection epoch-gating needs the producer to stamp selectionEpoch
-        // (multi-tenant follow-up). The legacy single-tenant cached send keeps mission-pace with the
-        // time/selected-at barrier — see cachedEvents().
-        // mission-control is intentionally NOT cache-replayed in per-session mode (same rationale as
-        // mission-pace above): its cached frames carry no per-session selectionEpoch (epoch 0 ⇒ they
-        // bypass passesBarrier), so replaying them could surface a pre-selection frame on connect. It is
-        // a fast per-market signal, so a newly attached socket bootstraps from the next LIVE frame
-        // instead — routed by source|symbol|expiry and maxStale-gated (see the perSessionRouting branch
-        // in the JSON live consumer). Full pre-selection epoch-gating needs the producer to stamp
-        // selectionEpoch (multi-tenant follow-up). The legacy single-tenant cached send keeps
-        // mission-control with the time/selected-at barrier — see cachedEvents().
+        // Mission-level state is low-frequency in replay/off-hours dev. Replay the fresh cached value on
+        // connect, still routed by source|symbol|expiry so it cannot leak to another selected market.
+        replayCacheMap(session, "mission-pace", missionPaces);
+        replayCacheMap(session, "mission-control", missionControls);
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "strike-sr", strikeSr);
         // liquidity-heatmap replays WITH the freshness gate below (5s TTL): only a live-fresh
@@ -2994,11 +3171,9 @@ public class FeedGatewayService implements ReplayRunner {
             if (json == null || json.isBlank()) {
                 continue;
             }
-            // Freshness gate for strike-sr (Codex): never replay an S/R bucket that crossed its TTL
-            // between purge ticks on per-session bootstrap / return-to-live. Scoped to strike-sr to
-            // preserve the established replay semantics of the other events.
-            if (("strike-sr".equals(event) || "liquidity-heatmap".equals(event))
-                    && !isCacheFresh(event + ":" + entry.getKey(), nowMs)) {
+            // Freshness gate for short-lived derived state: never replay a bucket/frame that crossed its
+            // TTL between purge ticks on per-session bootstrap / return-to-live.
+            if (requiresFreshPerSessionReplay(event) && !isCacheFresh(event + ":" + entry.getKey(), nowMs)) {
                 continue;
             }
             try {
@@ -3017,6 +3192,13 @@ public class FeedGatewayService implements ReplayRunner {
                 // skip malformed cached entry
             }
         }
+    }
+
+    private boolean requiresFreshPerSessionReplay(String event) {
+        return "strike-sr".equals(event)
+                || "liquidity-heatmap".equals(event)
+                || "mission-pace".equals(event)
+                || "mission-control".equals(event);
     }
 
     // =====================================================================
@@ -4300,5 +4482,277 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
         return escaped.toString();
+    }
+
+    // ============================================================================================
+    // Rollover-diagnostics instrumentation. All methods below are additive and never gate real
+    // behavior. Purpose: after the 2026-07-01 9.5-hour silent-wedge incident where a midnight-ET
+    // rollover left activeSelection/cacheCaughtUp/shouldForward in a state that dropped every
+    // record without an error, we want to know within minutes which flag flipped wrong. Every log
+    // line is structured (key=value) so `grep RGW_` in Loki/Discord surfaces the timeline.
+    // ============================================================================================
+
+    /**
+     * Structured periodic state dump. Emits ONE INFO line every 60s with all rollover-adjacent flags
+     * and the forwarded-events delta since the last dump. Also drives the two-cycle
+     * "GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS" ERROR when the gateway is provably not forwarding
+     * during trading hours even though consumers are advancing.
+     *
+     * <p>Called by {@link #diagnosticsExecutor} every 60s (and directly from tests).
+     */
+    void dumpDiagnosticState() {
+        if (!diagnosticsEnabled) {
+            return;
+        }
+        try {
+            long nowMs = System.currentTimeMillis();
+            ActiveSelection selection = activeSelection.get();
+            long forwardedNow = forwardedEvents.get();
+            long delta = Math.max(0L, forwardedNow - lastForwardedSnapshot.getAndSet(forwardedNow));
+            long lastRoll = lastRolloverAtMs.get();
+            String hoursSinceRoll = lastRoll <= 0L
+                    ? "never"
+                    : String.format(java.util.Locale.ROOT, "%.2f", (nowMs - lastRoll) / 3_600_000.0);
+            int activeSessions = activeSessionsCount();
+            long polled = liveRecordsPolled.get();
+            // Per-interval delta — cumulative `polled` would stay > 0 forever after the first record,
+            // making `consumersAdvancing` a false positive during legitimately quiet cycles. Use the
+            // delta since the previous dump instead. (Codex P2 fix.)
+            long polledDelta = Math.max(0L, polled - lastDumpLiveRecordsPolledSnapshot.getAndSet(polled));
+            // Codex round-4 P2: `consumersAdvancing` must reflect records ELIGIBLE for the active
+            // selection (source matches, or HPSF which is not source-gated). Otherwise noisy traffic
+            // from a non-selected source (e.g. IB traffic while DATABENTO is selected) keeps
+            // polledDelta > 0 and hides a real wedge in the selected pipeline.
+            long eligible = liveRecordsEligibleForActiveSelection.get();
+            long eligibleDelta = Math.max(0L, eligible - lastDumpLiveRecordsEligibleSnapshot.getAndSet(eligible));
+
+            System.out.println("RGW_STATE_DUMP event=state_dump"
+                    + " activeSelection=" + describeSelection(selection)
+                    + " avroCaughtUp=" + avroCaughtUp.get()
+                    + " stateCaughtUp=" + stateCaughtUp.get()
+                    + " hpsfCaughtUp=" + hpsfCaughtUp.get()
+                    + " readySelectionKey=" + quote(readySelectionKey.get())
+                    + " autoRolledExpiry=" + quote(autoRolledExpiry)
+                    + " lastRolloverAtMs=" + lastRoll
+                    + " hoursSinceLastRollover=" + hoursSinceRoll
+                    + " rolloverCount=" + rolloverCount.get()
+                    + " activeSessions=" + activeSessions
+                    + " connectedClients=" + clients.size()
+                    + " forwardedEventsSinceLastLog=" + delta
+                    + " forwardedEventsTotal=" + forwardedNow
+                    + " liveRecordsPolled=" + polled
+                    + " liveRecordsEligibleForActiveSelection=" + eligible
+                    + " droppedByStaleness=" + droppedByStaleness.get()
+                    + " droppedByCacheGate=" + droppedByCacheGate.get()
+                    + " droppedByOtherReasons=" + droppedByOtherReasons.get()
+                    + " inactiveDroppedEvents=" + inactiveDroppedEvents.get()
+                    + " staleDroppedEvents=" + staleDroppedEvents.get()
+                    + " sourceStaleEvents=" + sourceStaleEvents.get()
+                    + " offsetBarriers=" + offsetBarriers.get().size()
+                    + " running=" + running.get()
+                    + " nowMs=" + nowMs);
+
+            boolean marketHours = isRegularTradingHours(nowMs);
+            boolean consumersAdvancing = eligibleDelta > 0L;
+            // Gate on ATTACHED sockets, not registered AppSessions: an AppSession in the grace
+            // window has no user waiting for data, so a zero-forward cycle there is not a stall.
+            // (Codex round-3 P2.)
+            long attachedSockets = attachedSocketCount();
+            if (marketHours && delta == 0L && attachedSockets > 0L && consumersAdvancing) {
+                consecutiveZeroForwardCycles++;
+            } else {
+                consecutiveZeroForwardCycles = 0;
+            }
+            if (consecutiveZeroForwardCycles >= 2) {
+                forwardStalledAlerts.incrementAndGet();
+                System.err.println("RGW_ALERT event=GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS"
+                        + " consecutiveZeroForwardCycles=" + consecutiveZeroForwardCycles
+                        + " activeSelection=" + describeSelection(selection)
+                        + " avroCaughtUp=" + avroCaughtUp.get()
+                        + " stateCaughtUp=" + stateCaughtUp.get()
+                        + " hpsfCaughtUp=" + hpsfCaughtUp.get()
+                        + " readySelectionKey=" + quote(readySelectionKey.get())
+                        + " autoRolledExpiry=" + quote(autoRolledExpiry)
+                        + " hoursSinceLastRollover=" + hoursSinceRoll
+                        + " activeSessions=" + activeSessions
+                        + " attachedSockets=" + attachedSockets
+                        + " liveRecordsPolled=" + polled
+                        + " liveRecordsEligibleForActiveSelection=" + eligible
+                        + " forwardedEventsTotal=" + forwardedNow
+                        + " droppedByStaleness=" + droppedByStaleness.get()
+                        + " droppedByCacheGate=" + droppedByCacheGate.get()
+                        + " droppedByOtherReasons=" + droppedByOtherReasons.get()
+                        + " nowMs=" + nowMs);
+            }
+        } catch (RuntimeException e) {
+            // Instrumentation must never wedge its own thread; log and move on.
+            System.err.println("RGW_DIAG_ERROR event=diagnostics_dump_failed message=" + quote(e.getMessage()));
+        }
+    }
+
+    /**
+     * Rollover WARN. Emits ONE structured WARN line at every session-boundary transition (the daily
+     * AUTO expiry roll or any other {@link #applySelection} that supersedes the previous selection),
+     * capturing before/after flag state. Called from inside the {@link #applySelection} readyLock, so
+     * the flag snapshot is consistent with the swap. Additive: never gates the roll.
+     */
+    private void emitRolloverWarn(ActiveSelection previous, ActiveSelection next) {
+        long nowMs = System.currentTimeMillis();
+        rolloverCount.incrementAndGet();
+        lastRolloverAtMs.set(nowMs);
+        lastRolloverFrom.set(describeSelection(previous));
+        lastRolloverTo.set(describeSelection(next));
+        System.err.println("RGW_ROLLOVER event=rollover_transition"
+                + " fromSelection=" + describeSelection(previous)
+                + " toSelection=" + describeSelection(next)
+                + " avroCaughtUp=" + avroCaughtUp.get()
+                + " stateCaughtUp=" + stateCaughtUp.get()
+                + " hpsfCaughtUp=" + hpsfCaughtUp.get()
+                + " readySelectionKey=" + quote(readySelectionKey.get())
+                + " autoRolledExpiry=" + quote(autoRolledExpiry)
+                + " activeSessions=" + activeSessionsCount()
+                + " connectedClients=" + clients.size()
+                + " forwardedEventsTotal=" + forwardedEvents.get()
+                + " liveRecordsPolled=" + liveRecordsPolled.get()
+                + " rolloverCount=" + rolloverCount.get()
+                + " nowMs=" + nowMs);
+    }
+
+    private int activeSessionsCount() {
+        // In per-session/routing mode use the routing engine's session count; else fall back to the
+        // legacy connected-client count. Either way a positive value means "someone is waiting for
+        // data" and a zero-forward cycle is suspicious.
+        try {
+            if (routingEngine != null) {
+                java.lang.reflect.Method m = routingEngine.getClass().getMethod("activeAppSessions");
+                Object result = m.invoke(routingEngine);
+                if (result instanceof Number number) {
+                    return number.intValue();
+                }
+                if (result instanceof java.util.Collection<?> coll) {
+                    return coll.size();
+                }
+                if (result instanceof java.util.Map<?, ?> map) {
+                    return map.size();
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // Fall through to client-count fallback.
+        }
+        return clients.size();
+    }
+
+    /**
+     * Count of currently-attached WebSockets (per {@code SessionRoutingEngine#attachedSocketCount}),
+     * excluding AppSessions that persist in the grace window after their socket detached. Used to
+     * gate the GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS alert so we don't cry wolf when there's
+     * no real user waiting for data. Falls back to {@code clients.size()} if the routing engine is
+     * absent or the method is not present on the linked class version.
+     */
+    private long attachedSocketCount() {
+        try {
+            if (routingEngine != null) {
+                java.lang.reflect.Method m = routingEngine.getClass().getMethod("attachedSocketCount");
+                Object result = m.invoke(routingEngine);
+                if (result instanceof Number number) {
+                    return number.longValue();
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // Fall through to client-count fallback.
+        }
+        return clients.size();
+    }
+
+    private static String describeSelection(ActiveSelection selection) {
+        if (selection == null) {
+            return "null";
+        }
+        return "\"" + escapeJson(String.valueOf(selection.source()))
+                + "|" + escapeJson(String.valueOf(selection.symbol()))
+                + "|" + escapeJson(String.valueOf(selection.expiry()))
+                + "|epoch=" + selection.selectionEpoch() + "\"";
+    }
+
+    private static String quote(String value) {
+        return "\"" + (value == null ? "null" : escapeJson(value)) + "\"";
+    }
+
+    // Package-private test seams for the diagnostics unit tests.
+    void setDiagnosticsEnabledForTest(boolean enabled) {
+        this.diagnosticsEnabled = enabled;
+    }
+
+    long forwardStalledAlertsForTest() {
+        return forwardStalledAlerts.get();
+    }
+
+    long rolloverCountForTest() {
+        return rolloverCount.get();
+    }
+
+    void bumpLiveRecordsPolledForTest(long by) {
+        liveRecordsPolled.addAndGet(by);
+    }
+
+    // Codex round-4 P2 test seam: bump the eligible counter used by the stall gate.
+    void bumpLiveRecordsEligibleForActiveSelectionForTest(long by) {
+        liveRecordsEligibleForActiveSelection.addAndGet(by);
+    }
+
+    long droppedByStalenessForTest() {
+        return droppedByStaleness.get();
+    }
+
+    long droppedByOtherReasonsForTest() {
+        return droppedByOtherReasons.get();
+    }
+
+    // Codex round-4 P3 test seam: exercise the drop-bucket helper without needing to spin up a live
+    // Kafka consumer. Test provides the ingredients (source/event/json + cache flag + active selection)
+    // and asserts on {droppedByStaleness, droppedByOtherReasons, droppedByCacheGate}.
+    void recordDropBucketForTest(String bindingSource, String bindingEvent, String json,
+                                 boolean cacheCaughtUp,
+                                 String selectionSource, String selectionSymbol, String selectionExpiry,
+                                 long selectionEpoch) {
+        TopicBinding binding = new TopicBinding(bindingSource, bindingEvent);
+        ActiveSelection selection = selectionSource == null
+                ? null
+                : new ActiveSelection(selectionSource, selectionSymbol, selectionExpiry, selectionEpoch,
+                        System.currentTimeMillis());
+        recordDropBucket(binding, json, cacheCaughtUp, selection);
+    }
+
+    void bumpForwardedEventsForTest(long by) {
+        forwardedEvents.addAndGet(by);
+    }
+
+    void invokeRolloverWarnForTest(String fromSource, String toSource) {
+        long now = System.currentTimeMillis();
+        emitRolloverWarn(
+                new ActiveSelection(fromSource, "SPX", "20260701", 1L, now - 1000L),
+                new ActiveSelection(toSource, "SPX", "20260702", 2L, now));
+    }
+
+    // Codex round-2 P2a test seam: drive the applySelection-without-reset path so a test can verify
+    // the readySelectionKey gauge flips OFF on rollover even though the field itself is intentionally
+    // NOT cleared. Returns 1 iff readySelectionKey matches the current activeSelection's key.
+    int readySelectionKeyGaugeForTest() {
+        return boolMetric(readySelectionKeyMatchesActive(activeSelection.get()));
+    }
+
+    void seedReadySelectionForTest(String source, String symbol, String expiry, long epoch) {
+        long now = System.currentTimeMillis();
+        ActiveSelection sel = new ActiveSelection(source, symbol, expiry, epoch, now);
+        activeSelection.set(sel);
+        readySelectionKey.set(selectionKey(sel));
+    }
+
+    // Codex round-2 P2a: swap the active selection WITHOUT clearing readySelectionKey (mirrors the
+    // real applySelection contract). Used to verify the readySelectionKey gauge flips to 0 when the
+    // stored key belongs to the PREVIOUS selection.
+    void swapActiveSelectionForTest(String source, String symbol, String expiry, long epoch) {
+        long now = System.currentTimeMillis();
+        activeSelection.set(new ActiveSelection(source, symbol, expiry, epoch, now));
     }
 }

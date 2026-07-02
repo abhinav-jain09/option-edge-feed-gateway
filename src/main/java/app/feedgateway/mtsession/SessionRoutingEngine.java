@@ -483,6 +483,16 @@ public final class SessionRoutingEngine {
         return callRead(() -> new ArrayList<>(appSessions.values()));
     }
 
+    /**
+     * Count of currently-attached WebSockets (excludes AppSessions in the grace window whose sockets
+     * have detached). Used by diagnostics only — see {@code FeedGatewayService#dumpDiagnosticState}
+     * which gates the GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS alert on real waiting clients.
+     * If a sibling PR adds an identically-named method this becomes a no-op after merge.
+     */
+    public long attachedSocketCount() {
+        return callRead(() -> (long) socketToApp.size());
+    }
+
     public int appSessionCountForUser(String userId) {
         return callRead(() -> {
             Set<String> apps = userToApps.get(userId);
