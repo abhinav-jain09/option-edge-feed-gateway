@@ -26,6 +26,9 @@ public enum EventType {
     // Strike-liquidity heatmap column frame — one per-second record per (symbol,expiry) chain
     // covering every strike, so it routes CONTRACT-scoped with NO strike filter (like MAX_PAIN).
     LIQUIDITY_HEATMAP(Scope.CONTRACT),
+    // Option Price Behavior is a per-(symbol,tradingDate) dashboard aggregate. Route it like a whole-chain
+    // contract-scoped event, using tradingDate as the expiry/date key.
+    OPTION_PRICE_BEHAVIOR(Scope.CONTRACT),
     VIX_PRICE(Scope.UNDERLYING),
     INDEX_PRICE(Scope.UNDERLYING),
     SPX_PRICE(Scope.UNDERLYING),

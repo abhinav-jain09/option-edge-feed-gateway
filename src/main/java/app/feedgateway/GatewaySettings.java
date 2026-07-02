@@ -11,7 +11,7 @@ import java.time.format.DateTimeParseException;
 
 @Component
 public final class GatewaySettings {
-    private static final String DEFAULT_BOOTSTRAP_SERVERS = "192.168.100.252:9092,192.168.100.252:9094,192.168.100.252:9096";
+    private static final String DEFAULT_BOOTSTRAP_SERVERS = "192.168.100.252:9092";
     private static final String DEFAULT_SCHEMA_REGISTRY_URL = "http://192.168.100.252:8082";
     private static final ZoneId MARKET_TIME_ZONE = ZoneId.of("America/New_York");
 
@@ -295,6 +295,12 @@ public final class GatewaySettings {
     /** Databento per-(symbol,expiry) max-pain output topic. Independent of GEX; consumed only by the max-pain stream. */
     public String databentoMaxPainTopic() {
         return value("KAFKA_DATABENTO_MAXPAIN_TOPIC", "options.databento.maxpain");
+    }
+
+    /** Option Price Behavior dashboard output topic (JSON, per symbol/trading-date). */
+    public String optionPriceBehaviorDashboardTopic() {
+        return value("OPTION_PRICE_BEHAVIOR_DASHBOARD_TOPIC",
+                value("KAFKA_OPTION_PRICE_BEHAVIOR_DASHBOARD_TOPIC", "option-price-behavior-dashboard"));
     }
 
     public String hpsfLatestSignalTopic() {

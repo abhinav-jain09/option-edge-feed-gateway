@@ -45,6 +45,9 @@ public final class GatewayRecordMapper {
         }
         String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
         String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
+        if (expiry.isBlank() && type == EventType.OPTION_PRICE_BEHAVIOR) {
+            expiry = root.hasNonNull("tradingDate") ? root.get("tradingDate").asText("") : "";
+        }
         OptionalDouble strike = root.hasNonNull("strike")
                 ? OptionalDouble.of(root.get("strike").asDouble())
                 : OptionalDouble.empty();
@@ -87,6 +90,7 @@ public final class GatewayRecordMapper {
             case "strike-sr" -> EventType.STRIKE_SR;
             case "max-pain" -> EventType.MAX_PAIN;
             case "liquidity-heatmap" -> EventType.LIQUIDITY_HEATMAP;
+            case "option-price-behavior" -> EventType.OPTION_PRICE_BEHAVIOR;
             case "vix-price" -> EventType.VIX_PRICE;
             case "index-price" -> EventType.INDEX_PRICE;
             default -> null; // hpsf-* and others: caller falls back to broadcast
