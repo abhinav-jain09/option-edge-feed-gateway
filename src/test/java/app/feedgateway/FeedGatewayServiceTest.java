@@ -28,7 +28,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "strike-sr", "max-pain"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike", "strike-sr", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -1325,13 +1325,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1345,17 +1345,44 @@ class FeedGatewayServiceTest {
         assertTrue(envelope.contains("\"gexByStrike\":[]"));
     }
 
+    @Test
+    void uiBatchEnvelopeCarriesLiquidityHeatmapsArrayKey() throws Exception {
+        FeedGatewayService service = service();
+        String json = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"expiry\":\"2026-07-02\","
+                + "\"bucketStartMs\":1,\"freshness\":\"LIVE\",\"inputQuality\":\"FULL\",\"cells\":[]}";
+        String envelope = uiBatchEnvelopeJsonLiquidityHeatmap(service, List.of(json));
+        assertTrue(envelope.contains("\"liquidityHeatmaps\":[" + json + "]"),
+                "batch envelope must carry the liquidityHeatmaps array; was: " + envelope);
+        assertTrue(envelope.contains("\"strikeFlows\":[]"));
+        assertTrue(envelope.contains("\"missionPaces\":[]"));
+    }
+
+    private static String uiBatchEnvelopeJsonLiquidityHeatmap(FeedGatewayService service,
+                                                              List<String> liquidityHeatmaps) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "uiBatchEnvelopeJson",
+                List.class, List.class, List.class, List.class, List.class, List.class,
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+        );
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), liquidityHeatmaps, List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
     private static String uiBatchEnvelopeJsonStrikeSr(FeedGatewayService service, List<String> strikeSr) throws Exception {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1363,13 +1390,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1377,13 +1404,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
-                List.of(), List.of(), List.of(), List.of(), List.of(), missionPaces, List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), missionPaces,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1391,12 +1418,12 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), missionControls,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), missionControls,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
@@ -1411,13 +1438,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 }
