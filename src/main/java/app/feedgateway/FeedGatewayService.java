@@ -754,6 +754,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_strike_flows Cached strike-flow count.\n"
                 + "# TYPE options_edge_feed_gateway_strike_flows gauge\n"
                 + "options_edge_feed_gateway_strike_flows " + strikeFlows.size() + "\n"
+                + "# HELP options_edge_feed_gateway_liquidity_heatmaps Cached liquidity-heatmap frame count.\n"
+                + "# TYPE options_edge_feed_gateway_liquidity_heatmaps gauge\n"
+                + "options_edge_feed_gateway_liquidity_heatmaps " + liquidityHeatmaps.size() + "\n"
                 + "# HELP options_edge_feed_gateway_mission_paces Cached mission-pace count.\n"
                 + "# TYPE options_edge_feed_gateway_mission_paces gauge\n"
                 + "options_edge_feed_gateway_mission_paces " + missionPaces.size() + "\n"
@@ -1255,7 +1258,14 @@ public class FeedGatewayService implements ReplayRunner {
                         // same explicit maxStale gate — a STALE mission-control frame must never reach a socket.
                         boolean missionControlStale = "mission-control".equals(binding.event())
                                 && !recordWithinMaxStale(record);
-                        if ((cacheKey != null || !"max-pain".equals(binding.event())) && !missionPaceStale && !missionControlStale) {
+                        // Liquidity-heatmap fail-closed (freshness): frames carry no per-session
+                        // selectionEpoch (epoch 0 bypasses passesBarrier) and their useful life is
+                        // the SHORT liquidity TTL, not the generic maxStale window — a stale column
+                        // must never be live-routed as current liquidity.
+                        boolean liquidityHeatmapStale = "liquidity-heatmap".equals(binding.event())
+                                && cacheTimestamp(record) < System.currentTimeMillis() - settings.liquidityHeatmapTtlMs();
+                        if ((cacheKey != null || !"max-pain".equals(binding.event()))
+                                && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale) {
                             routeOrBroadcast(binding.source(), binding.event(), json);
                             forwardedEvents.incrementAndGet();
                         }
@@ -1390,6 +1400,14 @@ public class FeedGatewayService implements ReplayRunner {
                 + "; sought selected partitions to latest.");
     }
 
+    /**
+     * Topics whose producers may legitimately be absent (graceful-absence contract). Every other
+     * topic in a consumer set is mandatory and keeps the strict metadata requirement.
+     */
+    private boolean isOptionalTopic(String topic) {
+        return topic != null && topic.equals(settings.strikeLiquidityTopic());
+    }
+
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {
         if (caughtUpFlag.getAndSet(false)) {
             broadcast("status", statusJson());
@@ -1405,6 +1423,14 @@ public class FeedGatewayService implements ReplayRunner {
             for (String topic : topics) {
                 List<PartitionInfo> partitions = consumer.partitionsFor(topic, Duration.ofMillis(1_000));
                 if (partitions == null || partitions.isEmpty()) {
+                    if (isOptionalTopic(topic)) {
+                        // OPTIONAL topic (producer not deployed yet / absent): skip it so its
+                        // absence can NEVER block or crash-loop the shared consumer and starve
+                        // the mandatory feeds. It is picked up when the consumer restarts after
+                        // the producer's topic exists (gateway redeploy/restart).
+                        System.err.println("Feed gateway: optional topic absent, consuming without it: " + topic);
+                        continue;
+                    }
                     complete = false;
                     break;
                 }
@@ -1869,6 +1895,10 @@ public class FeedGatewayService implements ReplayRunner {
         } else if ("vix-price".equals(event) || "index-price".equals(event)) {
             key = indexPriceCacheKey(json, key);
         } else if ("strike-flow".equals(event)) {
+            key = strikeFlowCacheKey(json, key);
+        } else if ("liquidity-heatmap".equals(event)) {
+            // Payload-derived symbol|expiry key (mirrors strike-flow): last-value-wins per chain
+            // must not depend on the Kafka record key shape.
             key = strikeFlowCacheKey(json, key);
         } else if ("mission-pace".equals(event)) {
             key = missionPaceCacheKey(json, key);
@@ -2860,6 +2890,10 @@ public class FeedGatewayService implements ReplayRunner {
         // mission-control with the time/selected-at barrier — see cachedEvents().
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "strike-sr", strikeSr);
+        // liquidity-heatmap replays WITH the freshness gate below (5s TTL): only a live-fresh
+        // column frame bootstraps a new socket; anything older is simply absent and the UI
+        // fills forward from the next live frame.
+        replayCacheMap(session, "liquidity-heatmap", liquidityHeatmaps);
         replayCacheMap(session, "max-pain", maxPain);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
         // as index-price — so a VIX record is never delivered mislabelled as index-price.
@@ -2881,7 +2915,8 @@ public class FeedGatewayService implements ReplayRunner {
             // Freshness gate for strike-sr (Codex): never replay an S/R bucket that crossed its TTL
             // between purge ticks on per-session bootstrap / return-to-live. Scoped to strike-sr to
             // preserve the established replay semantics of the other events.
-            if ("strike-sr".equals(event) && !isCacheFresh(event + ":" + entry.getKey(), nowMs)) {
+            if (("strike-sr".equals(event) || "liquidity-heatmap".equals(event))
+                    && !isCacheFresh(event + ":" + entry.getKey(), nowMs)) {
                 continue;
             }
             try {

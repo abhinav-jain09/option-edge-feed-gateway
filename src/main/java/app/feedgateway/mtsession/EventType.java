@@ -23,6 +23,9 @@ public enum EventType {
     // Max pain is a per-(symbol,expiry) aggregate (one value covers the whole chain), so it routes
     // CONTRACT-scoped by source|symbol|expiry with NO strike filter — every session on that chain receives it.
     MAX_PAIN(Scope.CONTRACT),
+    // Strike-liquidity heatmap column frame — one per-second record per (symbol,expiry) chain
+    // covering every strike, so it routes CONTRACT-scoped with NO strike filter (like MAX_PAIN).
+    LIQUIDITY_HEATMAP(Scope.CONTRACT),
     VIX_PRICE(Scope.UNDERLYING),
     INDEX_PRICE(Scope.UNDERLYING),
     SPX_PRICE(Scope.UNDERLYING),

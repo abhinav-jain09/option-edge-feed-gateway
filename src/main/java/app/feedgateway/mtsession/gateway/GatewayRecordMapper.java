@@ -86,6 +86,7 @@ public final class GatewayRecordMapper {
             case "gex-by-strike" -> EventType.GEX_BY_STRIKE;
             case "strike-sr" -> EventType.STRIKE_SR;
             case "max-pain" -> EventType.MAX_PAIN;
+            case "liquidity-heatmap" -> EventType.LIQUIDITY_HEATMAP;
             case "vix-price" -> EventType.VIX_PRICE;
             case "index-price" -> EventType.INDEX_PRICE;
             default -> null; // hpsf-* and others: caller falls back to broadcast

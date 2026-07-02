@@ -1346,6 +1346,28 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void liquidityHeatmapUsesShortTtlNotGenericCacheWindow() throws Exception {
+        FeedGatewayService service = service();
+        long now = 10_000_000L;
+        // 6s-old frame: expired on the 5s liquidity TTL...
+        assertTrue(isExpiredEvent(service, "liquidity-heatmap", now - 6_000, now));
+        // ...while a 4s-old frame is fresh, and strike-flow keeps the generic 15-min window.
+        assertFalse(isExpiredEvent(service, "liquidity-heatmap", now - 4_000, now));
+        assertFalse(isExpiredEvent(service, "strike-flow", now - 6_000, now));
+    }
+
+    @Test
+    void liquidityHeatmapCacheKeyIsPayloadDerivedSymbolExpiry() throws Exception {
+        FeedGatewayService service = service();
+        Method m = FeedGatewayService.class.getDeclaredMethod("strikeFlowCacheKey", String.class, String.class);
+        m.setAccessible(true);
+        String key = (String) m.invoke(service,
+                "{\"symbol\":\"spx\",\"expiry\":\"2026-07-02\",\"cells\":[]}", "kafka-key-fallback");
+        assertEquals("SPX|20260702", key);
+        assertEquals("kafka-key-fallback", m.invoke(service, "not json", "kafka-key-fallback"));
+    }
+
+    @Test
     void uiBatchEnvelopeCarriesLiquidityHeatmapsArrayKey() throws Exception {
         FeedGatewayService service = service();
         String json = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"expiry\":\"2026-07-02\","
