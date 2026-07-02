@@ -2590,6 +2590,8 @@ public class FeedGatewayService implements ReplayRunner {
             indexPrices.remove(versionKey.substring("index-price:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
             strikeFlows.remove(versionKey.substring("strike-flow:".length()));
+        } else if (versionKey.startsWith("liquidity-heatmap:")) {
+            liquidityHeatmaps.remove(versionKey.substring("liquidity-heatmap:".length()));
         } else if (versionKey.startsWith("mission-pace:")) {
             missionPaces.remove(versionKey.substring("mission-pace:".length()));
         } else if (versionKey.startsWith("mission-control:")) {

@@ -1357,6 +1357,26 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void expiredLiquidityHeatmapFramesAreEvictedFromTheCacheMap() throws Exception {
+        FeedGatewayService service = service();
+        java.lang.reflect.Field mapField = FeedGatewayService.class.getDeclaredField("liquidityHeatmaps");
+        mapField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, String> cache = (java.util.Map<String, String>) mapField.get(service);
+        java.lang.reflect.Field timesField = FeedGatewayService.class.getDeclaredField("cacheEventTimes");
+        timesField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, Long> times = (java.util.Map<String, Long>) timesField.get(service);
+        cache.put("SPX|20260702", "{\"cells\":[]}");
+        times.put("liquidity-heatmap:SPX|20260702", System.currentTimeMillis() - 60_000); // way past 5s TTL
+        Method purge = FeedGatewayService.class.getDeclaredMethod("purgeExpiredCache", long.class);
+        purge.setAccessible(true);
+        purge.invoke(service, System.currentTimeMillis());
+        // The backing map must be evicted too — otherwise health/metrics gauges report stale frames.
+        assertTrue(cache.isEmpty(), "expired liquidity-heatmap frame must be evicted from the cache map");
+    }
+
+    @Test
     void liquidityHeatmapCacheKeyIsPayloadDerivedSymbolExpiry() throws Exception {
         FeedGatewayService service = service();
         Method m = FeedGatewayService.class.getDeclaredMethod("strikeFlowCacheKey", String.class, String.class);
