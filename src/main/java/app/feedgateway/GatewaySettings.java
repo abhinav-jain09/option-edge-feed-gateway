@@ -11,7 +11,7 @@ import java.time.format.DateTimeParseException;
 
 @Component
 public final class GatewaySettings {
-    private static final String DEFAULT_BOOTSTRAP_SERVERS = "192.168.100.252:9092,192.168.100.252:9094,192.168.100.252:9096";
+    private static final String DEFAULT_BOOTSTRAP_SERVERS = "192.168.100.252:9092";
     private static final String DEFAULT_SCHEMA_REGISTRY_URL = "http://192.168.100.252:8082";
     private static final ZoneId MARKET_TIME_ZONE = ZoneId.of("America/New_York");
 
