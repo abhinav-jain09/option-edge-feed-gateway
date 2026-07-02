@@ -2995,22 +2995,10 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "pace-rank", paceRanks);
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
-        // mission-pace is intentionally NOT cache-replayed in per-session mode: its cached frames carry
-        // no per-session selectionEpoch (epoch 0 ⇒ they bypass passesBarrier), so replaying them could
-        // surface a pre-selection frame on connect. It is a fast per-market signal (~1 frame/sec), so a
-        // newly attached socket bootstraps from the next LIVE frame instead — which is routed by
-        // source|symbol|expiry and maxStale-gated (see the perSessionRouting branch in the JSON live
-        // consumer). Full pre-selection epoch-gating needs the producer to stamp selectionEpoch
-        // (multi-tenant follow-up). The legacy single-tenant cached send keeps mission-pace with the
-        // time/selected-at barrier — see cachedEvents().
-        // mission-control is intentionally NOT cache-replayed in per-session mode (same rationale as
-        // mission-pace above): its cached frames carry no per-session selectionEpoch (epoch 0 ⇒ they
-        // bypass passesBarrier), so replaying them could surface a pre-selection frame on connect. It is
-        // a fast per-market signal, so a newly attached socket bootstraps from the next LIVE frame
-        // instead — routed by source|symbol|expiry and maxStale-gated (see the perSessionRouting branch
-        // in the JSON live consumer). Full pre-selection epoch-gating needs the producer to stamp
-        // selectionEpoch (multi-tenant follow-up). The legacy single-tenant cached send keeps
-        // mission-control with the time/selected-at barrier — see cachedEvents().
+        // Mission-level state is low-frequency in replay/off-hours dev. Replay the fresh cached value on
+        // connect, still routed by source|symbol|expiry so it cannot leak to another selected market.
+        replayCacheMap(session, "mission-pace", missionPaces);
+        replayCacheMap(session, "mission-control", missionControls);
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "max-pain", maxPain);
@@ -3034,7 +3022,7 @@ public class FeedGatewayService implements ReplayRunner {
             // Freshness gate for strike-sr (Codex): never replay an S/R bucket that crossed its TTL
             // between purge ticks on per-session bootstrap / return-to-live. Scoped to strike-sr to
             // preserve the established replay semantics of the other events.
-            if ("strike-sr".equals(event) && !isCacheFresh(event + ":" + entry.getKey(), nowMs)) {
+            if (requiresFreshPerSessionReplay(event) && !isCacheFresh(event + ":" + entry.getKey(), nowMs)) {
                 continue;
             }
             try {
@@ -3053,6 +3041,10 @@ public class FeedGatewayService implements ReplayRunner {
                 // skip malformed cached entry
             }
         }
+    }
+
+    private boolean requiresFreshPerSessionReplay(String event) {
+        return "strike-sr".equals(event) || "mission-pace".equals(event) || "mission-control".equals(event);
     }
 
     // =====================================================================
