@@ -28,7 +28,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior", "gex-by-strike", "strike-sr", "max-pain"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior", "gex-by-strike", "strike-sr", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -1356,7 +1356,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1370,13 +1370,78 @@ class FeedGatewayServiceTest {
         assertTrue(envelope.contains("\"gexByStrike\":[]"));
     }
 
+    @Test
+    void liquidityHeatmapUsesShortTtlNotGenericCacheWindow() throws Exception {
+        FeedGatewayService service = service();
+        long now = 10_000_000L;
+        // 6s-old frame: expired on the 5s liquidity TTL...
+        assertTrue(isExpiredEvent(service, "liquidity-heatmap", now - 6_000, now));
+        // ...while a 4s-old frame is fresh, and strike-flow keeps the generic 15-min window.
+        assertFalse(isExpiredEvent(service, "liquidity-heatmap", now - 4_000, now));
+        assertFalse(isExpiredEvent(service, "strike-flow", now - 6_000, now));
+    }
+
+    @Test
+    void expiredLiquidityHeatmapFramesAreEvictedFromTheCacheMap() throws Exception {
+        FeedGatewayService service = service();
+        java.lang.reflect.Field mapField = FeedGatewayService.class.getDeclaredField("liquidityHeatmaps");
+        mapField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, String> cache = (java.util.Map<String, String>) mapField.get(service);
+        java.lang.reflect.Field timesField = FeedGatewayService.class.getDeclaredField("cacheEventTimes");
+        timesField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, Long> times = (java.util.Map<String, Long>) timesField.get(service);
+        cache.put("SPX|20260702", "{\"cells\":[]}");
+        times.put("liquidity-heatmap:SPX|20260702", System.currentTimeMillis() - 60_000); // way past 5s TTL
+        Method purge = FeedGatewayService.class.getDeclaredMethod("purgeExpiredCache", long.class);
+        purge.setAccessible(true);
+        purge.invoke(service, System.currentTimeMillis());
+        // The backing map must be evicted too — otherwise health/metrics gauges report stale frames.
+        assertTrue(cache.isEmpty(), "expired liquidity-heatmap frame must be evicted from the cache map");
+    }
+
+    @Test
+    void liquidityHeatmapCacheKeyIsPayloadDerivedSymbolExpiry() throws Exception {
+        FeedGatewayService service = service();
+        Method m = FeedGatewayService.class.getDeclaredMethod("strikeFlowCacheKey", String.class, String.class);
+        m.setAccessible(true);
+        String key = (String) m.invoke(service,
+                "{\"symbol\":\"spx\",\"expiry\":\"2026-07-02\",\"cells\":[]}", "kafka-key-fallback");
+        assertEquals("SPX|20260702", key);
+        assertEquals("kafka-key-fallback", m.invoke(service, "not json", "kafka-key-fallback"));
+    }
+
+    @Test
+    void uiBatchEnvelopeCarriesLiquidityHeatmapsArrayKey() throws Exception {
+        FeedGatewayService service = service();
+        String json = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"expiry\":\"2026-07-02\","
+                + "\"bucketStartMs\":1,\"freshness\":\"LIVE\",\"inputQuality\":\"FULL\",\"cells\":[]}";
+        String envelope = uiBatchEnvelopeJsonLiquidityHeatmap(service, List.of(json));
+        assertTrue(envelope.contains("\"liquidityHeatmaps\":[" + json + "]"),
+                "batch envelope must carry the liquidityHeatmaps array; was: " + envelope);
+        assertTrue(envelope.contains("\"strikeFlows\":[]"));
+        assertTrue(envelope.contains("\"missionPaces\":[]"));
+    }
+
+    private static String uiBatchEnvelopeJsonLiquidityHeatmap(FeedGatewayService service,
+                                                              List<String> liquidityHeatmaps) throws Exception {
+        Method method = uiBatchEnvelopeMethod();
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), liquidityHeatmaps, List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
     private static String uiBatchEnvelopeJsonStrikeSr(FeedGatewayService service, List<String> strikeSr) throws Exception {
         Method method = uiBatchEnvelopeMethod();
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1386,7 +1451,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1399,8 +1464,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors,
-                List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1409,8 +1473,8 @@ class FeedGatewayServiceTest {
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
-                List.of(), List.of(), List.of(), List.of(), List.of(), missionPaces, List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), missionPaces,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1419,8 +1483,8 @@ class FeedGatewayServiceTest {
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), missionControls,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                missionControls, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1436,7 +1500,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1445,7 +1509,7 @@ class FeedGatewayServiceTest {
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
     }
 }
