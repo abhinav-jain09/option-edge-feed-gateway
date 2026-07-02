@@ -24,6 +24,15 @@ class ReplayTopicResolverTest {
     }
 
     @Test
+    void liquidityHeatmapDefaultTopicIsNotRunReplayResolvable() {
+        // Documents WHY FeedGatewayService drops the strike-liquidity topic before
+        // toReplayTopics on run-scoped replay: the dotless default name has no namespace
+        // segment, and per-run heatmap replay is deferred by design.
+        assertThrows(IllegalArgumentException.class,
+                () -> ReplayTopicResolver.toReplayTopic("strike-liquidity-heatmap-dashboard", "r-1"));
+    }
+
+    @Test
     void rejectsBlankOrNamespacelessInput() {
         assertThrows(IllegalArgumentException.class, () -> ReplayTopicResolver.toReplayTopic("", "r-1"));
         assertThrows(IllegalArgumentException.class, () -> ReplayTopicResolver.toReplayTopic("options.databento.display", ""));

@@ -3163,6 +3163,12 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics.put(settings.ibkrVixPriceTopic(), "vix-price");
             }
             if (params.hasRun()) {
+                // Run-scoped replay reads options.replay.<runId>.* topics. The strike-liquidity
+                // dashboard is NOT part of the per-run replay contract (design defers heatmap
+                // replay; the replicator produces no replay.<runId> liquidity topic), and its
+                // dotless name has no namespace segment for ReplayTopicResolver — drop it BEFORE
+                // resolution so an orchestrated Databento run can never die on topic resolution.
+                stringTopics.remove(settings.strikeLiquidityTopic());
                 // Read the orchestrated run's LOCAL replay topics instead of the live topics.
                 avroTopics = toReplayTopics(avroTopics, params.runId());
                 stringTopics = toReplayTopics(stringTopics, params.runId());
