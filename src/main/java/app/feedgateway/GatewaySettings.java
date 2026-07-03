@@ -238,6 +238,47 @@ public final class GatewaySettings {
         return longValue("GATEWAY_LIQUIDITY_HEATMAP_TTL_MS", 5_000L, 0L);
     }
 
+    // ---- Strike-liquidity heatmap SESSION-HISTORY backfill (HEATMAP-SESSION-HISTORY-BACKFILL v8) ----
+
+    /** Master switch for the /api/liquidity-history endpoint + its dedicated group-less Kafka consumer. */
+    public boolean heatmapHistoryEnabled() {
+        return boolValue("HEATMAP_HISTORY_ENABLED", true);
+    }
+
+    /** Max distinct chains (symbol|expiry) held in the session-history store (spec §2 memory bounds). */
+    public int heatmapHistoryMaxChains() {
+        return intValue("HEATMAP_HISTORY_MAX_CHAINS", 4, 1);
+    }
+
+    /** Max approximate bytes across all session aggregates before cap-breach eviction (spec §2). */
+    public long heatmapHistoryMaxBytes() {
+        return longValue("HEATMAP_HISTORY_MAX_BYTES", 200L * 1024 * 1024, 1L);
+    }
+
+    /**
+     * Steady-state lag guard (spec §2): while the history consumer's total record lag exceeds this,
+     * the endpoint answers 503 — a lagging aggregate is never silently served as complete.
+     * Default 300 records ~= 5 minutes of 1s frames.
+     */
+    public long heatmapHistoryMaxLagRecords() {
+        return longValue("HEATMAP_HISTORY_MAX_LAG_RECORDS", 300L, 0L);
+    }
+
+    /** Hard raw (pre-gzip) response budget; breach drops OLDEST buckets + truncated=true, never 500 (spec §3). */
+    public long heatmapHistoryMaxResponseBytes() {
+        return longValue("HEATMAP_HISTORY_MAX_RESPONSE_BYTES", 24L * 1024 * 1024, 1024L);
+    }
+
+    /** Per-principal request rate limit for /api/liquidity-history (spec §3: 6/min → 429). */
+    public int heatmapHistoryRateLimitPerMin() {
+        return intValue("HEATMAP_HISTORY_RATE_LIMIT_PER_MIN", 6, 1);
+    }
+
+    /** Catch-up abort budget: a rebuild epoch not caught up within this is REBUILD_FAILED (spec §2). */
+    public long heatmapHistoryCatchupAbortMs() {
+        return longValue("HEATMAP_HISTORY_CATCHUP_ABORT_MS", 300_000L, 1_000L);
+    }
+
     public String databentoPaceMissionTopic() {
         return value("KAFKA_DATABENTO_PACE_MISSION_TOPIC", "options.databento.pace.mission");
     }

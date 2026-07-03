@@ -193,6 +193,17 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
      * something the gateway should paper over.
      */
     private Selection defaultSelection() {
+        return defaultSelection(settings);
+    }
+
+    /**
+     * Static form of {@link #defaultSelection()} so the REST liquidity-history endpoint
+     * ({@code app.feedgateway.liquidityhistory.LiquidityHistoryAuth}) enforces the EXACT same
+     * fail-closed source/symbol/expiry resolution when it registers/refreshes an AppSession through
+     * the shared {@link WsTicketService#ensureAppSession} helper — a divergence here would let the
+     * REST path accept a configuration the WS handshake rejects (or vice versa).
+     */
+    public static Selection defaultSelection(GatewaySettings settings) {
         String configured = settings.initialMarketDataSource();
         MarketDataSource source;
         if (configured == null || configured.isBlank()) {
@@ -248,6 +259,16 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
     }
 
     private JwtDecoder buildDecoder() {
+        return buildWsDecoder(settings);
+    }
+
+    /**
+     * Builds the legacy single-tenant WS JWT decoder (issuer + audience validation from
+     * {@code WS_AUTH_ISSUER_URI}/{@code WS_AUTH_AUDIENCE}). Public+static so the REST
+     * liquidity-history endpoint validates bearer tokens with the SAME decoder rules as the WS
+     * handshake in legacy mode (one token-validation policy per mode, never two).
+     */
+    public static JwtDecoder buildWsDecoder(GatewaySettings settings) {
         String issuer = settings.wsAuthIssuer();
         if (issuer == null || issuer.isBlank()) {
             throw new IllegalStateException("WS_AUTH_ISSUER_URI is required when WS_AUTH_ENABLED=true");
