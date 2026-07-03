@@ -1402,7 +1402,8 @@ public class FeedGatewayService implements ReplayRunner {
                         // the SHORT liquidity TTL, not the generic maxStale window — a stale column
                         // must never be live-routed as current liquidity.
                         boolean liquidityHeatmapStale = "liquidity-heatmap".equals(binding.event())
-                                && cacheTimestamp(record) < System.currentTimeMillis() - settings.liquidityHeatmapTtlMs();
+                                && eventCacheTimestamp(binding.event(), record, json)
+                                < System.currentTimeMillis() - settings.liquidityHeatmapTtlMs();
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale) {
                             routeOrBroadcast(binding.source(), binding.event(), json);
@@ -2120,7 +2121,7 @@ public class FeedGatewayService implements ReplayRunner {
             key = binding.source() + "|" + key;
         }
         String versionKey = event + ":" + key;
-        long eventTime = cacheTimestamp(record);
+        long eventTime = eventCacheTimestamp(event, record, json);
         Long previousEventTime = cacheEventTimes.get(versionKey);
         // Terminal max-pain MUST always reach the EXPIRED branch (eviction + return key for the
         // one-time live forward) regardless of timestamp ordering. Without this, an EXPIRED record
@@ -2787,6 +2788,33 @@ public class FeedGatewayService implements ReplayRunner {
     private long cacheTimestamp(ConsumerRecord<?, ?> record) {
         long eventTime = record.timestamp();
         return eventTime >= 0 ? eventTime : System.currentTimeMillis();
+    }
+
+    private long eventCacheTimestamp(String event, ConsumerRecord<?, ?> record, String json) {
+        if ("liquidity-heatmap".equals(event)) {
+            long payloadTime = liquidityHeatmapTimestamp(json);
+            if (payloadTime >= 0) {
+                return payloadTime;
+            }
+        }
+        return cacheTimestamp(record);
+    }
+
+    private long liquidityHeatmapTimestamp(String json) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            long asOf = longField(root, "asOfEventTimeMs", -1L);
+            if (asOf >= 0) {
+                return asOf;
+            }
+            long bucketEnd = longField(root, "bucketEndMs", -1L);
+            if (bucketEnd >= 0) {
+                return bucketEnd;
+            }
+            return longField(root, "bucketStartMs", -1L);
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
     }
 
     private RecordPosition recordPosition(ConsumerRecord<?, ?> record) {
