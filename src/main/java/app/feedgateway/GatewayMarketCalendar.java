@@ -57,6 +57,38 @@ public final class GatewayMarketCalendar {
         return !now.isBefore(regularOpen) && now.isBefore(close);
     }
 
+    /** The exchange time zone this calendar resolves session instants in (America/New_York in prod). */
+    public ZoneId zone() {
+        return zone;
+    }
+
+    /**
+     * UTC instant of the regular-session open (09:30 exchange time) on {@code date}, resolved through the
+     * zone's rules so DST transitions are handled by conversion, never by a fixed offset (spec §4).
+     *
+     * <p>Returns {@code null} when {@code date} is not a trading day (weekend/holiday) — chosen over
+     * throwing so callers can use "no session exists" as an ordinary branch (the liquidity-history
+     * endpoint serves explicit zero sentinels for such dates rather than treating them as errors).
+     */
+    public Instant sessionOpen(LocalDate date) {
+        if (!isTradingDay(Objects.requireNonNull(date, "date"))) {
+            return null;
+        }
+        return date.atTime(regularOpen).atZone(zone).toInstant();
+    }
+
+    /**
+     * UTC instant of the session close on {@code date}: the configured early close (half-day) when one
+     * exists, else the regular close — zone-converted like {@link #sessionOpen(LocalDate)}. Returns
+     * {@code null} when {@code date} is not a trading day (same contract as {@code sessionOpen}).
+     */
+    public Instant sessionClose(LocalDate date) {
+        if (!isTradingDay(Objects.requireNonNull(date, "date"))) {
+            return null;
+        }
+        return date.atTime(earlyCloses.getOrDefault(date, regularClose)).atZone(zone).toInstant();
+    }
+
     /** A weekday that is not a configured market holiday. */
     public boolean isTradingDay(LocalDate date) {
         DayOfWeek dow = date.getDayOfWeek();

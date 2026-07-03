@@ -695,6 +695,27 @@ public class FeedGatewayService implements ReplayRunner {
         return closed;
     }
 
+    /**
+     * Chains ({@code symbol|yyyy-MM-dd}, the liquidity chainKey format) that at least one connected
+     * WebSocket client is currently watching — the liquidity-history store's eviction-preference
+     * hook (spec §2: chains with no active WS subscriber evict first). Broadcast mode has exactly
+     * one active selection, so the set is that selection's chain whenever any client is connected.
+     * TODO(per-session routing): derive per-session chains from the routing engine's selections;
+     * until then the eviction preference simply degrades to last-fold ordering for extra chains.
+     */
+    public java.util.Set<String> liquidityHistoryWsChains() {
+        if (clients.isEmpty()) {
+            return java.util.Set.of();
+        }
+        ActiveSelection selection = activeSelection.get();
+        String expiry = selection.expiry(); // normalized yyyyMMdd (GatewaySettings.normalizeExpiry)
+        if (expiry == null || expiry.length() != 8) {
+            return java.util.Set.of();
+        }
+        String iso = expiry.substring(0, 4) + "-" + expiry.substring(4, 6) + "-" + expiry.substring(6, 8);
+        return java.util.Set.of(selection.symbol() + "|" + iso);
+    }
+
     public String healthJson() {
         purgeExpiredCache(System.currentTimeMillis());
         ActiveSelection selection = activeSelection.get();

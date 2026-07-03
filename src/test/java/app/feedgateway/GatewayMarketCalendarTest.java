@@ -2,6 +2,7 @@ package app.feedgateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.LocalDate;
@@ -83,5 +84,46 @@ class GatewayMarketCalendarTest {
         GatewayMarketCalendar c = calendar(Set.of(LocalDate.of(2026, 7, 3)), Map.of());
         assertEquals(LocalDate.of(2026, 7, 2), c.currentTradingDate(et(2026, 7, 3, 12, 0)));
         assertEquals(LocalDate.of(2026, 7, 2), c.currentTradingDate(et(2026, 7, 5, 12, 0)));
+    }
+
+    // ---- session open/close instants (liquidity-history backfill spec §4 / AC5) ----
+
+    @Test
+    void sessionOpenAndCloseAreZoneConvertedInstants() {
+        GatewayMarketCalendar c = calendar(Set.of(), Map.of());
+        // 2026-06-23 (Tue) is EDT: 09:30 ET == 13:30Z, 16:00 ET == 20:00Z.
+        assertEquals(et(2026, 6, 23, 9, 30), c.sessionOpen(LocalDate.of(2026, 6, 23)));
+        assertEquals(et(2026, 6, 23, 16, 0), c.sessionClose(LocalDate.of(2026, 6, 23)));
+        assertEquals("2026-06-23T13:30:00Z", c.sessionOpen(LocalDate.of(2026, 6, 23)).toString());
+        assertEquals("2026-06-23T20:00:00Z", c.sessionClose(LocalDate.of(2026, 6, 23)).toString());
+    }
+
+    @Test
+    void sessionInstantsFollowDstTransitions() {
+        // AC5: DST-transition week — 2026-03-08 is the US spring-forward Sunday. The Friday before
+        // is EST (09:30 ET == 14:30Z); the Monday after is EDT (09:30 ET == 13:30Z). A fixed offset
+        // would get one of these wrong by an hour.
+        GatewayMarketCalendar c = calendar(Set.of(), Map.of());
+        assertEquals("2026-03-06T14:30:00Z", c.sessionOpen(LocalDate.of(2026, 3, 6)).toString());
+        assertEquals("2026-03-09T13:30:00Z", c.sessionOpen(LocalDate.of(2026, 3, 9)).toString());
+        // Fall-back week (2026-11-01): the Friday before is EDT, the Monday after is EST.
+        assertEquals("2026-10-30T13:30:00Z", c.sessionOpen(LocalDate.of(2026, 10, 30)).toString());
+        assertEquals("2026-11-02T14:30:00Z", c.sessionOpen(LocalDate.of(2026, 11, 2)).toString());
+    }
+
+    @Test
+    void sessionCloseHonorsEarlyClose() {
+        // AC5: half-day session resolves the early-close instant (2026-11-27, 13:00 ET).
+        GatewayMarketCalendar c = calendar(Set.of(), Map.of(LocalDate.of(2026, 11, 27), LocalTime.of(13, 0)));
+        assertEquals(et(2026, 11, 27, 13, 0), c.sessionClose(LocalDate.of(2026, 11, 27)));
+        assertEquals(et(2026, 11, 27, 9, 30), c.sessionOpen(LocalDate.of(2026, 11, 27)));
+    }
+
+    @Test
+    void sessionInstantsAreNullOnNonTradingDays() {
+        GatewayMarketCalendar c = calendar(Set.of(LocalDate.of(2026, 7, 3)), Map.of());
+        assertNull(c.sessionOpen(LocalDate.of(2026, 6, 27)), "Saturday has no session");
+        assertNull(c.sessionClose(LocalDate.of(2026, 6, 28)), "Sunday has no session");
+        assertNull(c.sessionOpen(LocalDate.of(2026, 7, 3)), "holiday has no session");
     }
 }

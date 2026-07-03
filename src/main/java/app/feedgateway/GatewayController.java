@@ -11,9 +11,13 @@ import java.net.URI;
 @RestController
 public class GatewayController {
     private final FeedGatewayService service;
+    private final app.feedgateway.liquidityhistory.LiquidityHistoryStore historyStore;
 
-    public GatewayController(FeedGatewayService service) {
+    public GatewayController(FeedGatewayService service,
+                             org.springframework.beans.factory.ObjectProvider<
+                                     app.feedgateway.liquidityhistory.LiquidityHistoryStore> historyStore) {
         this.service = service;
+        this.historyStore = historyStore.getIfAvailable();
     }
 
     @GetMapping(value = "/")
@@ -39,6 +43,8 @@ public class GatewayController {
 
     @GetMapping(value = "/metrics", produces = MediaType.TEXT_PLAIN_VALUE)
     public String metrics() {
-        return service.metrics();
+        // Liquidity-history §7 metrics are appended to the same text endpoint the rest of the
+        // gateway exports on (one scrape target per pod).
+        return service.metrics() + (historyStore == null ? "" : historyStore.metricsText());
     }
 }
