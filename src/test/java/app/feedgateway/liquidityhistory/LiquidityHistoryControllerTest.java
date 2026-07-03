@@ -225,12 +225,26 @@ class LiquidityHistoryControllerTest {
                 "default path never walks back to the prior session");
     }
 
-    // Explicit tradeDate for a retained-but-never-folded previous session: 200 empty + truncated.
+    // Codex Gate-2 finding 4: an explicit previous-day tradeDate this process never folded is a
+    // CACHE MISS on a retained session → 503 + widened rebuild (AC15), not a permanent empty
+    // answer. Only after a rebuild whose seek COVERED that day may an absent chain serve as
+    // honestly-empty + truncated.
     @Test
-    void absentPreviousTradingDayServesEmptyTruncated() {
+    void absentPreviousTradingDayRebuildsThenServesHonestEmpty() {
         Clock clock = midSession();
-        LiquidityHistoryStore store = publishedStore(clock, oneCellFrame(M0, 1L));
-        ResponseEntity<byte[]> response = controller(store, clock)
+        LiquidityHistoryStore store = publishedStore(clock, oneCellFrame(M0, 1L)); // seeked from TODAY
+        LiquidityHistoryController controller = controller(store, clock);
+
+        ResponseEntity<byte[]> miss = controller
+                .liquidityHistory(SYMBOL, EXPIRY, PREVIOUS_TRADING_DAY.toString(), null);
+        assertEquals(503, miss.getStatusCode().value(), "retained prior-day miss triggers a rebuild");
+        assertTrue(Integer.parseInt(miss.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)) >= 5);
+        assertTrue(store.rebuildPending(), "widened rebuild requested (seek from the prior day's open)");
+
+        // Simulate the widened rebuild epoch: seek covered the previous day, found nothing for it.
+        store.beginEpochState(PREVIOUS_TRADING_DAY);
+        store.completeEpochState();
+        ResponseEntity<byte[]> response = controller
                 .liquidityHistory(SYMBOL, EXPIRY, PREVIOUS_TRADING_DAY.toString(), null);
         assertEquals(200, response.getStatusCode().value());
         JsonNode envelope = body(response);

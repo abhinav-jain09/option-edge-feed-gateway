@@ -40,6 +40,13 @@ final class SessionAggregate {
 
     private final TreeMap<Long, BucketFold> buckets = new TreeMap<>();
     private long watermarkBucketStartMs;
+    /**
+     * bucketStartMs of the EARLIEST raw 1s frame folded — 1-second granularity, deliberately NOT
+     * the first 60s bucket key: retention can delete the opening seconds while the first surviving
+     * raw frame still lands inside the 09:30 minute bucket, and the bucket-key test would then
+     * report truncated=false with data missing (Codex Gate-2 finding 2).
+     */
+    private long earliestRawBucketStartMs = Long.MAX_VALUE;
     private long lastFoldAtMs;
     private long approxBytes = BUCKET_BYTES; // base object overhead, same constant reused
 
@@ -67,6 +74,7 @@ final class SessionAggregate {
         }
         approxBytes += bucket.fold(frame);
         watermarkBucketStartMs = Math.max(watermarkBucketStartMs, frame.bucketStartMs());
+        earliestRawBucketStartMs = Math.min(earliestRawBucketStartMs, frame.bucketStartMs());
         lastFoldAtMs = nowMs;
     }
 
@@ -86,16 +94,17 @@ final class SessionAggregate {
 
     /**
      * Immutable projection of the whole session. {@code sessionOpenMs} is only used to decide
-     * {@code truncatedStart}: a retention-suspect seek whose earliest folded bucket starts more than
-     * one bucket after the open means the session's head was already deleted (spec §3 / AC12).
+     * {@code truncatedStart}: on a retention-suspect partition, an earliest RAW frame (1s
+     * granularity) strictly after the session open means the session's head — possibly only its
+     * opening seconds — was already deleted (spec §3 / AC12; Codex Gate-2 finding 2).
      */
     ChainSnapshot snapshot(long sessionOpenMs) {
         List<ChainSnapshot.BucketProjection> projected = new ArrayList<>(buckets.size());
         for (BucketFold bucket : buckets.values()) {
             projected.add(bucket.project());
         }
-        boolean truncatedStart = retentionSuspect && !buckets.isEmpty()
-                && buckets.firstKey() > sessionOpenMs + BUCKET_MS;
+        boolean truncatedStart = retentionSuspect && earliestRawBucketStartMs != Long.MAX_VALUE
+                && earliestRawBucketStartMs > sessionOpenMs;
         return new ChainSnapshot(symbol, expiry, tradeDate, watermarkBucketStartMs, truncatedStart,
                 List.copyOf(projected));
     }

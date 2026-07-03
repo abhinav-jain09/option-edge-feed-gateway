@@ -156,9 +156,11 @@ class LiquidityHistoryStoreEpochTest {
         }
     }
 
-    // AC16: partition-count change at epoch start -> sticky alarm + 503 all chains; reverting clears it.
+    // AC16 (Codex Gate-2 finding 1): partition-count change -> STICKY alarm + 503 all chains. A
+    // reverted count must NOT clear it — records written while the count differed may already sit
+    // on the wrong partition; only operator action (restart) clears the alarm.
     @Test
-    void partitionTopologyChangeRaisesAlarmAndRevertClears() {
+    void partitionTopologyAlarmIsStickyEvenAfterRevert() throws Exception {
         MockConsumer<String, String> boot = mockConsumer(2, Map.of(TP0, 0L, TP1, 0L));
         MockConsumer<String, String> changed = mockConsumer(3,
                 Map.of(TP0, 0L, TP1, 0L, new TopicPartition(TOPIC, 2), 0L));
@@ -172,10 +174,62 @@ class LiquidityHistoryStoreEpochTest {
             await("topology alarm raised", store::topologyAlarm);
             assertEquals(LiquidityHistoryStore.ServeStatus.TOPOLOGY_ALARM,
                     store.query(SYMBOL, EXPIRY, TRADING_DAY).status(), "all chains 503 under the alarm");
-            // The backoff retry gets the reverted 2-partition consumer -> alarm clears.
-            await("alarm clears on topology revert", () -> !store.topologyAlarm());
-            await("serving resumes", () ->
-                    store.query(SYMBOL, EXPIRY, TRADING_DAY).status() != LiquidityHistoryStore.ServeStatus.TOPOLOGY_ALARM);
+            // The backoff retry consumes the REVERTED 2-partition consumer (~1s in). The alarm must
+            // survive it: sleep past that retry, then pin that nothing cleared.
+            Thread.sleep(2_500L);
+            assertTrue(store.topologyAlarm(), "sticky for the process lifetime — revert proves nothing");
+            assertEquals(LiquidityHistoryStore.ServeStatus.TOPOLOGY_ALARM,
+                    store.query(SYMBOL, EXPIRY, TRADING_DAY).status(),
+                    "requests keep answering 503 until operator restart");
+        } finally {
+            store.close();
+        }
+    }
+
+    // Codex Gate-2 finding 4 / AC15: a cache miss for the RETAINED previous trading day widens the
+    // rebuild epoch's seek to THAT day's session open; tradeDateOf routing then rebuilds the
+    // prior-day aggregate transparently and the request succeeds after the swap.
+    @Test
+    void retainedPriorDayCacheMissRebuildsWithWidenedSeek() {
+        long yesterdayLate = et(PREVIOUS_TRADING_DAY, 15, 59).toEpochMilli();
+        long yesterdayOpenMs = sessionOpenMs(PREVIOUS_TRADING_DAY);
+        // Timestamp-sensitive seek seam: yesterday's open (or earlier) -> offset 0; today's -> offset 1.
+        LiquidityHistoryStore.TimeSeek seek = (consumer, timestamps) -> {
+            Map<TopicPartition, OffsetAndTimestamp> result = new HashMap<>();
+            long requested = timestamps.get(TP0);
+            result.put(TP0, new OffsetAndTimestamp(requested <= yesterdayOpenMs ? 0L : 1L, requested));
+            result.put(TP1, null);
+            return result;
+        };
+        String yesterdayFrame = frame(SYMBOL, EXPIRY, yesterdayLate, "LIVE", "FULL", List.of(6000.0),
+                cell(6000.0, "CALL", "buyContracts", 7L));
+        // Boot epoch seeks TODAY's open (offset 1) and never reads yesterday's record.
+        MockConsumer<String, String> bootConsumer = mockConsumer(2, Map.of(TP0, 2L, TP1, 0L));
+        bootConsumer.schedulePollTask(() ->
+                bootConsumer.addRecord(new ConsumerRecord<>(TOPIC, 0, 1L, CHAIN, frameWithBuy(M0, 2L))));
+        // The widened rebuild epoch seeks YESTERDAY's open (offset 0) and reads both sessions.
+        MockConsumer<String, String> widened = mockConsumer(2, Map.of(TP0, 2L, TP1, 0L));
+        widened.schedulePollTask(() -> {
+            widened.addRecord(new ConsumerRecord<>(TOPIC, 0, 0L, CHAIN, yesterdayFrame));
+            widened.addRecord(new ConsumerRecord<>(TOPIC, 0, 1L, CHAIN, frameWithBuy(M0, 2L)));
+        });
+        LiquidityHistoryStore store = threadedStore(
+                new ArrayDeque<>(List.of(bootConsumer, widened)), seek);
+        try {
+            await("boot epoch swaps (today only)", () ->
+                    store.query(SYMBOL, EXPIRY, TRADING_DAY).status() == LiquidityHistoryStore.ServeStatus.OK);
+            // Cache miss for the retained prior session: 503 + widened rebuild trigger, NOT a
+            // permanent empty+truncated answer.
+            assertEquals(LiquidityHistoryStore.ServeStatus.UNAVAILABLE,
+                    store.query(SYMBOL, EXPIRY, PREVIOUS_TRADING_DAY).status());
+            await("widened rebuild serves the prior day", () ->
+                    store.query(SYMBOL, EXPIRY, PREVIOUS_TRADING_DAY).status() == LiquidityHistoryStore.ServeStatus.OK
+                            && !store.query(SYMBOL, EXPIRY, PREVIOUS_TRADING_DAY).snapshot().buckets().isEmpty());
+            assertEquals(7L, store.query(SYMBOL, EXPIRY, PREVIOUS_TRADING_DAY).snapshot()
+                    .buckets().get(0).cells().get(0).buyContracts());
+            assertEquals(2L, store.query(SYMBOL, EXPIRY, TRADING_DAY).snapshot()
+                            .buckets().get(0).cells().get(0).buyContracts(),
+                    "today's aggregate survives the widened rebuild (normal tradeDate routing)");
         } finally {
             store.close();
         }
@@ -296,6 +350,28 @@ class LiquidityHistoryStoreEpochTest {
         assertTrue(store.publishedContains("AAA|" + EXPIRY, TRADING_DAY), "WS-subscribed chain survives");
         assertFalse(store.publishedContains("BBB|" + EXPIRY, TRADING_DAY));
         assertTrue(store.publishedContains("CCC|" + EXPIRY, TRADING_DAY));
+    }
+
+    // Codex Gate-2 finding 3 / AC15: MULTIPLE subscribed chains (per-session routing: one per live
+    // user session) are ALL protected — the unsubscribed chain evicts even when it is the newest.
+    @Test
+    void evictionProtectsEveryChainWithAnActiveSubscriber() {
+        LiquidityHistoryTestSupport.MutableClock clock =
+                new LiquidityHistoryTestSupport.MutableClock(et(TRADING_DAY, 10, 0));
+        LiquidityHistoryStore store = seamStore(clock, config(2, 200L * 1024 * 1024, 300L),
+                () -> Set.of("AAA|" + EXPIRY, "BBB|" + EXPIRY));
+        store.beginEpochState();
+        store.foldForTest(chainFrame("AAA", M0), 0);
+        clock.set(et(TRADING_DAY, 10, 1));
+        store.foldForTest(chainFrame("BBB", M0), 0);
+        clock.set(et(TRADING_DAY, 10, 2));
+        store.foldForTest(chainFrame("CCC", M0), 0); // newest, but the only unsubscribed one
+        store.completeEpochState();
+
+        assertTrue(store.publishedContains("AAA|" + EXPIRY, TRADING_DAY));
+        assertTrue(store.publishedContains("BBB|" + EXPIRY, TRADING_DAY));
+        assertFalse(store.publishedContains("CCC|" + EXPIRY, TRADING_DAY),
+                "the chain no session watches evicts first, regardless of recency");
     }
 
     @Test

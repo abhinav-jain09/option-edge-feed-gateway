@@ -99,6 +99,18 @@ public final class LiquidityHistoryStore implements AutoCloseable {
     private final Set<AggKey> evictedKeys = new HashSet<>();
     private boolean publishedFrozen = true;                   // true whenever no consumer folds published
     private boolean rebuildFailed;
+    /**
+     * Finding-4 rebuild widening (AC15 for RETAINED prior sessions): a cache miss targeting the
+     * previous trading day records that date here; the next epoch seeks from ITS session open
+     * instead of today's, and the normal tradeDateOf routing folds each frame to its own
+     * (chain, tradeDate) aggregate. Never earlier than the previous trading day (24h retention
+     * bound). {@code pendingSeekDate}/{@code publishedSeekDate} track which session-open the
+     * running/published epoch actually seeked from, so a prior-day miss can distinguish
+     * "never read that session" (rebuild) from "read it, truly no data" (honest empty).
+     */
+    private LocalDate rebuildFromDate;
+    private LocalDate pendingSeekDate;
+    private LocalDate publishedSeekDate;
     // ---- end guarded by lock ----
 
     /** Chains with an in-flight request are never evicted (spec §2); marked by the controller. */
@@ -320,7 +332,18 @@ public final class LiquidityHistoryStore implements AutoCloseable {
         consumer.assign(tps);
 
         LocalDate tradingDate = calendar.currentTradingDate(clock.instant());
-        Instant sessionOpen = calendar.sessionOpen(tradingDate); // non-null: currentTradingDate is a trading day
+        // Finding 4: consume any requested seek widening. Guard against pathological re-seeks —
+        // only the previous trading day (re-validated NOW, not at request time) may widen; its
+        // data can still exist under the 24h retention, anything older cannot.
+        LocalDate seekDate = tradingDate;
+        synchronized (lock) {
+            LocalDate requested = rebuildFromDate;
+            rebuildFromDate = null;
+            if (requested != null && requested.equals(previousTradingDay(tradingDate))) {
+                seekDate = requested;
+            }
+        }
+        Instant sessionOpen = calendar.sessionOpen(seekDate); // non-null: both candidates are trading days
         Map<TopicPartition, Long> epochEnd = consumer.endOffsets(tps);
         Map<TopicPartition, Long> beginning = consumer.beginningOffsets(tps);
         Map<TopicPartition, Long> timestamps = new HashMap<>();
@@ -347,7 +370,7 @@ public final class LiquidityHistoryStore implements AutoCloseable {
         }
 
         long catchupStartMs = clock.millis();
-        beginEpochState();
+        beginEpochState(seekDate);
         boolean caughtUp = false;
         long lastLagCheckMs = 0L;
         long lastTopologyCheckMs = clock.millis();
@@ -422,8 +445,18 @@ public final class LiquidityHistoryStore implements AutoCloseable {
         return true;
     }
 
-    /** True while the partition count matches the boot snapshot; a change raises the sticky alarm. */
+    /**
+     * True while the partition count matches the boot snapshot AND the alarm has never fired. The
+     * alarm is STICKY for the process lifetime (spec §2 fail-closed guard): a partition-count
+     * change reshuffles key hashes, so records written while the count differed may already sit on
+     * the WRONG partition — a reverted count proves nothing about them. Only OPERATOR ACTION
+     * (fix the topic, then restart/redeploy the gateway) clears it; the epoch loop keeps probing
+     * only so the condition stays visible in logs, and every request keeps answering 503.
+     */
     private boolean checkTopology(int count) {
+        if (topologyAlarm) {
+            return false; // sticky: cleared only by a process restart
+        }
         if (bootPartitionCount < 0) {
             bootPartitionCount = count;
             if (count != config.expectedPartitions()) {
@@ -433,17 +466,11 @@ public final class LiquidityHistoryStore implements AutoCloseable {
             return true;
         }
         if (count != bootPartitionCount) {
-            // Fail closed and LOUD (spec §2): a partition-count change reshuffles key hashes and
-            // silently breaks the one-chain-one-partition ordering contract. All requests 503 until
-            // the topology matches the boot snapshot again (operator action).
             topologyAlarm = true;
             System.out.println("ERROR liquidity-history PARTITION TOPOLOGY CHANGED: " + bootPartitionCount
-                    + " -> " + count + " — all /api/liquidity-history requests answer 503");
+                    + " -> " + count + " — all /api/liquidity-history requests answer 503 until the "
+                    + "gateway is restarted (STICKY alarm; operator action required)");
             return false;
-        }
-        if (topologyAlarm) {
-            topologyAlarm = false;
-            System.out.println("liquidity-history partition topology restored to " + count);
         }
         return true;
     }
@@ -469,10 +496,16 @@ public final class LiquidityHistoryStore implements AutoCloseable {
 
     // -------------------------------------------------------------- epoch state (also test seams)
 
-    /** New epoch: fresh shadow, published (if any) keeps serving frozen. */
+    /** New epoch seeking from TODAY's session open: fresh shadow, published keeps serving frozen. */
     void beginEpochState() {
+        beginEpochState(calendar.currentTradingDate(clock.instant()));
+    }
+
+    /** New epoch seeking from {@code seekDate}'s session open (today, or a widened prior day). */
+    void beginEpochState(LocalDate seekDate) {
         synchronized (lock) {
             shadow = new HashMap<>();
+            pendingSeekDate = seekDate;
             publishedFrozen = true;
         }
     }
@@ -482,6 +515,8 @@ public final class LiquidityHistoryStore implements AutoCloseable {
         synchronized (lock) {
             published = shadow;
             shadow = null;
+            publishedSeekDate = pendingSeekDate;
+            pendingSeekDate = null;
             // Every pre-swap evicted key was refolded from sessionOpen by this epoch; only keys the
             // SHADOW itself evicted (cap breach during catch-up) remain knowingly incomplete.
             evictedKeys.clear();
@@ -498,6 +533,7 @@ public final class LiquidityHistoryStore implements AutoCloseable {
     void abortEpochState() {
         synchronized (lock) {
             shadow = null;
+            pendingSeekDate = null;
             shadowEvictedMarks.clear();
             rebuildFailed = true;
         }
@@ -510,6 +546,7 @@ public final class LiquidityHistoryStore implements AutoCloseable {
                 shadow = null;
                 shadowEvictedMarks.clear();
             }
+            pendingSeekDate = null;
             publishedFrozen = true;
         }
     }
@@ -738,7 +775,7 @@ public final class LiquidityHistoryStore implements AutoCloseable {
                 return unavailableLocked();
             }
             if (evictedKeys.contains(key)) {
-                requestRebuildUnlessCatchingUpLocked();
+                requestRetainedRebuildLocked(tradeDate, currentTradingDate);
                 return unavailableLocked();
             }
             SessionAggregate aggregate = published.get(key);
@@ -748,7 +785,7 @@ public final class LiquidityHistoryStore implements AutoCloseable {
                     if (frozen || rebuildFailed) {
                         // The frozen store predates this chain's possible first frame; completeness
                         // cannot be claimed, so this is precedence step 2, not an empty 200.
-                        requestRebuildUnlessCatchingUpLocked();
+                        requestRetainedRebuildLocked(tradeDate, currentTradingDate);
                         return unavailableLocked();
                     }
                     if (lagRecords > config.maxLagRecords()) {
@@ -757,8 +794,21 @@ public final class LiquidityHistoryStore implements AutoCloseable {
                     return new ServeDecision(ServeStatus.OK, 0, false,
                             ChainSnapshot.empty(symbol, expiry, tradeDate, false));
                 }
-                // A retained previous trading day this process never folded (epochs seek from TODAY's
-                // open) is unbuildable — served honestly as empty + truncated, never a rebuild loop.
+                if (tradeDate.equals(previousTradingDay(currentTradingDate))) {
+                    if (publishedSeekDate != null && !publishedSeekDate.isAfter(tradeDate)) {
+                        // The published epoch's seek COVERED that session and folded every offset:
+                        // the prior day truly has no surviving data — honest empty + truncated.
+                        return new ServeDecision(ServeStatus.OK, 0, frozen,
+                                ChainSnapshot.empty(symbol, expiry, tradeDate, true));
+                    }
+                    // Cache miss for a RETAINED prior session (evicted earlier, or this process only
+                    // ever seeked from today's open): transparently rebuild with a widened seek
+                    // (AC15) — 503 now, served after the rebuild epoch swaps.
+                    requestRetainedRebuildLocked(tradeDate, currentTradingDate);
+                    return unavailableLocked();
+                }
+                // Older than the previous trading day: unbuildable per the 24h retention — served
+                // honestly as empty + truncated, never a rebuild loop.
                 return new ServeDecision(ServeStatus.OK, 0, frozen,
                         ChainSnapshot.empty(symbol, expiry, tradeDate, true));
             }
@@ -776,12 +826,21 @@ public final class LiquidityHistoryStore implements AutoCloseable {
     }
 
     /**
-     * Single-flight coalescing: while an epoch is ACTIVELY catching up (shadow present) it will
-     * already refold the requested chain, so a further trigger would only queue a redundant
-     * back-to-back epoch. Only an idle/failed loop needs the wake-up.
+     * Single-flighted rebuild trigger for a cache miss, with the Finding-4 seek widening: when the
+     * miss targets the PREVIOUS trading day (the only widening the 24h retention permits), the next
+     * epoch seeks from that day's session open. Coalescing: an epoch already catching up from a
+     * seek date that COVERS the requested date will deliver the answer itself, so no extra trigger
+     * is queued; an epoch whose seek starts later than the requested date cannot help, so a
+     * follow-up rebuild is queued behind it.
      */
-    private void requestRebuildUnlessCatchingUpLocked() {
-        if (shadow == null) {
+    private void requestRetainedRebuildLocked(LocalDate tradeDate, LocalDate currentTradingDate) {
+        if (tradeDate.isBefore(currentTradingDate)
+                && tradeDate.equals(previousTradingDay(currentTradingDate))) {
+            rebuildFromDate = tradeDate;
+        }
+        boolean coveredByRunningEpoch = shadow != null
+                && pendingSeekDate != null && !pendingSeekDate.isAfter(tradeDate);
+        if (!coveredByRunningEpoch) {
             requestRebuild();
         }
     }

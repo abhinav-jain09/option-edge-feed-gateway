@@ -696,24 +696,44 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * Chains ({@code symbol|yyyy-MM-dd}, the liquidity chainKey format) that at least one connected
-     * WebSocket client is currently watching — the liquidity-history store's eviction-preference
-     * hook (spec §2: chains with no active WS subscriber evict first). Broadcast mode has exactly
-     * one active selection, so the set is that selection's chain whenever any client is connected.
-     * TODO(per-session routing): derive per-session chains from the routing engine's selections;
-     * until then the eviction preference simply degrades to last-fold ordering for extra chains.
+     * Chains ({@code symbol|yyyy-MM-dd}, the liquidity chainKey format) with an active WS
+     * subscriber — the liquidity-history store's eviction-preference hook (spec §2: chains with no
+     * active WS subscriber evict first).
+     *
+     * <p>Per-session routing (multi-tenant) mode: the DISTINCT chains across ALL live AppSession
+     * selections in the routing engine — each user may watch a different chain and every one of
+     * them must be preferred over unwatched chains (Codex Gate-2 finding 3 / AC15). AppSessions in
+     * the reconnect grace window (sockets momentarily detached) are deliberately still counted:
+     * evicting the chain a user is about to re-attach to would defeat the preference.
+     *
+     * <p>Legacy broadcast mode: exactly one active selection, so the set is that selection's chain
+     * whenever any client is connected.
      */
     public java.util.Set<String> liquidityHistoryWsChains() {
+        if (routingEngine != null) {
+            java.util.Set<String> chains = new java.util.HashSet<>();
+            for (app.feedgateway.mtsession.AppSession session : routingEngine.activeAppSessions()) {
+                String chain = liquidityChainKey(session.selection().symbol(), session.selection().expiry());
+                if (chain != null) {
+                    chains.add(chain);
+                }
+            }
+            return java.util.Set.copyOf(chains);
+        }
         if (clients.isEmpty()) {
             return java.util.Set.of();
         }
         ActiveSelection selection = activeSelection.get();
-        String expiry = selection.expiry(); // normalized yyyyMMdd (GatewaySettings.normalizeExpiry)
-        if (expiry == null || expiry.length() != 8) {
-            return java.util.Set.of();
+        String chain = liquidityChainKey(selection.symbol(), selection.expiry());
+        return chain == null ? java.util.Set.of() : java.util.Set.of(chain);
+    }
+
+    /** {@code symbol|yyyy-MM-dd} from a normalized yyyyMMdd expiry; null when either part is malformed. */
+    private static String liquidityChainKey(String symbol, String expiry) {
+        if (symbol == null || symbol.isBlank() || expiry == null || expiry.length() != 8) {
+            return null;
         }
-        String iso = expiry.substring(0, 4) + "-" + expiry.substring(4, 6) + "-" + expiry.substring(6, 8);
-        return java.util.Set.of(selection.symbol() + "|" + iso);
+        return symbol + "|" + expiry.substring(0, 4) + "-" + expiry.substring(4, 6) + "-" + expiry.substring(6, 8);
     }
 
     public String healthJson() {

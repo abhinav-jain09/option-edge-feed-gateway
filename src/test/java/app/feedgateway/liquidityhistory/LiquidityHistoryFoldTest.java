@@ -331,7 +331,36 @@ class LiquidityHistoryFoldTest {
         assertFalse(store.publishedContains(CHAIN, TRADING_DAY), "nothing may fold from rejected frames");
     }
 
+    // Codex Gate-2 finding 2 (AC12): retention-hole detection is RAW-frame (1s) granular — the
+    // opening seconds can be deleted while the first surviving frame still lands inside the 09:30
+    // minute bucket, and the response must still say truncated=true.
+    @Test
+    void retentionSuspectTruncationIsRawFrameGranular() {
+        // First surviving raw frame at open+5s, SAME minute bucket as the open -> truncated.
+        SessionAggregate suspectMissingSeconds = new SessionAggregate(SYMBOL, EXPIRY, TRADING_DAY, true);
+        suspectMissingSeconds.fold(parsedFrame(M0 + 5_000L), 0L);
+        assertTrue(suspectMissingSeconds.snapshot(M0).truncatedStart(),
+                "opening seconds deleted inside the first minute bucket must report truncated");
+
+        // First surviving raw frame EXACTLY at the open -> nothing can be missing -> not truncated.
+        SessionAggregate suspectComplete = new SessionAggregate(SYMBOL, EXPIRY, TRADING_DAY, true);
+        suspectComplete.fold(parsedFrame(M0), 0L);
+        assertFalse(suspectComplete.snapshot(M0).truncatedStart());
+
+        // No retention suspicion on the partition -> a late-starting producer is NOT a hole.
+        SessionAggregate notSuspect = new SessionAggregate(SYMBOL, EXPIRY, TRADING_DAY, false);
+        notSuspect.fold(parsedFrame(M0 + 5_000L), 0L);
+        assertFalse(notSuspect.snapshot(M0).truncatedStart());
+    }
+
     // ---- helpers ----
+
+    private static HistoryFrame parsedFrame(long bucketStartMs) {
+        HistoryFrame parsed = HistoryFrame.parse(frame(SYMBOL, EXPIRY, bucketStartMs, "LIVE", "FULL",
+                List.of(6000.0), cell(6000.0, "CALL")), MAPPER);
+        assertNotNull(parsed);
+        return parsed;
+    }
 
     private static HistoryFrame.Cell parsedCell(ObjectNode cellNode) {
         HistoryFrame frame = HistoryFrame.parse(
