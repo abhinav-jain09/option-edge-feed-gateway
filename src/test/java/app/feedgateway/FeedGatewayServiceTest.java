@@ -1413,6 +1413,24 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void liquidityHeatmapFreshnessUsesRewrittenPayloadTimeNotKafkaRecordTime() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"expiry\":\"2026-07-06\","
+                + "\"bucketStartMs\":" + (now - 1_500) + ","
+                + "\"bucketEndMs\":" + (now - 500) + ","
+                + "\"asOfEventTimeMs\":" + (now - 750) + ","
+                + "\"freshness\":\"LIVE\",\"inputQuality\":\"FULL\",\"cells\":[]}";
+
+        String key = updateCache(service, topicBinding("DATABENTO", "liquidity-heatmap"),
+                recordAt(settings.strikeLiquidityTopic(), 0, 1L, "SPX|20260706", json, now - 60_000),
+                json);
+
+        assertEquals("DATABENTO|SPX|20260706", key);
+    }
+
+    @Test
     void uiBatchEnvelopeCarriesLiquidityHeatmapsArrayKey() throws Exception {
         FeedGatewayService service = service();
         String json = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"expiry\":\"2026-07-02\","
