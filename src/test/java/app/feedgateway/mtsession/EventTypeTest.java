@@ -19,6 +19,13 @@ class EventTypeTest {
     }
 
     @Test
+    void dealerLedgerIsContractScoped() {
+        // The gateway joins profile+state into one per-(symbol,expiry) envelope — routes like MAX_PAIN.
+        assertTrue(EventType.DEALER_LEDGER.isContractScoped());
+        assertFalse(EventType.DEALER_LEDGER.isUnderlying());
+    }
+
+    @Test
     void underlyingClassificationAndMapping() {
         assertTrue(EventType.VIX_PRICE.isUnderlying());
         assertEquals("VIX", EventType.VIX_PRICE.underlyingSymbol());

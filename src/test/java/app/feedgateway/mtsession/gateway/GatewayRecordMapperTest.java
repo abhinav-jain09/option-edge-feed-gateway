@@ -135,4 +135,17 @@ class GatewayRecordMapperTest {
                 .orElseThrow();
         assertEquals("WAT", rec.payloadMarketDataSource());
     }
+
+    @Test
+    void dealerLedgerRoutesContractScopedBySymbolExpiry() throws Exception {
+        // The joined dealer-ledger envelope routes like a whole-chain event: contract-scoped, no strike.
+        assertEquals(EventType.DEALER_LEDGER, GatewayRecordMapper.eventTypeFor("dealer-ledger"));
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "dealer-ledger",
+                node("{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"marketDataSource\":\"DATABENTO\"}"))
+                .orElseThrow();
+        assertEquals(EventType.DEALER_LEDGER, rec.eventType());
+        assertEquals("SPXW", rec.symbol());
+        assertEquals("20260704", rec.expiry());
+        assertTrue(rec.strike().isEmpty());
+    }
 }

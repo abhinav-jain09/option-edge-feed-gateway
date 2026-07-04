@@ -91,6 +91,7 @@ public final class GatewayRecordMapper {
             case "max-pain" -> EventType.MAX_PAIN;
             case "liquidity-heatmap" -> EventType.LIQUIDITY_HEATMAP;
             case "option-price-behavior" -> EventType.OPTION_PRICE_BEHAVIOR;
+            case "dealer-ledger" -> EventType.DEALER_LEDGER;
             case "vix-price" -> EventType.VIX_PRICE;
             case "index-price" -> EventType.INDEX_PRICE;
             default -> null; // hpsf-* and others: caller falls back to broadcast

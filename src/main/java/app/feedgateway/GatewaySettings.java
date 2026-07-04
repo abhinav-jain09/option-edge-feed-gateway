@@ -219,6 +219,16 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_STRIKE_FLOW_TOPIC", "options.databento.strike-flow");
     }
 
+    /** dealer-ledger-service chain-level book (U1-U9), one record per (symbol, expiry). */
+    public String dealerLedgerProfileTopic() {
+        return value("KAFKA_DEALER_LEDGER_PROFILE_TOPIC", "dealer-ledger-profile");
+    }
+
+    /** dealer-ledger-service session state, one record per (symbol, expiry). Joined with the profile. */
+    public String dealerLedgerStateTopic() {
+        return value("KAFKA_DEALER_LEDGER_STATE_TOPIC", "dealer-ledger-state");
+    }
+
     /**
      * Strike-liquidity heatmap dashboard frames (JSON {@code StrikeLiquidityHeatmapFrame}, one
      * per-second column per symbol|expiry) from strike-liquidity-heatmap-service. Broadcast as
