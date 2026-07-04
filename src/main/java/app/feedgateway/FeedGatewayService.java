@@ -3152,6 +3152,9 @@ public class FeedGatewayService implements ReplayRunner {
      * dealerLedgers holds only fresh, non-evicted envelopes, so no extra freshness gate is needed here.
      */
     private void replayDealerLedgerCached(WebSocketSession session) {
+        // Purge first so a stale-half envelope (one role crossed TTL since the last poll purge) is evicted
+        // before replay rather than sent to the connecting client.
+        purgeExpiredCache(System.currentTimeMillis());
         ActiveSelection selection = activeSelection.get();
         for (Map.Entry<String, String> entry : dealerLedgers.entrySet()) {
             String json = entry.getValue();
@@ -3346,6 +3349,10 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** Per-session filtered replay of cached state to a newly-connected socket (FR-11). */
     private void replayCachedToSocket(WebSocketSession session) {
+        // Purge FIRST so no replay path (connect OR return-to-live via resumeLive) can serve a cache
+        // entry that crossed its TTL since the last consumer purge. Critical for the joined dealer-ledger
+        // envelope: an expired role evicts the envelope (removeCacheEntry), so a stale pill can't replay.
+        purgeExpiredCache(System.currentTimeMillis());
         replayCacheMap(session, "snapshot", snapshots);
         replayCacheMap(session, "pace", paces);
         replayCacheMap(session, "pace-rank", paceRanks);
