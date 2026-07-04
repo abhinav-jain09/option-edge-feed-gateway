@@ -108,7 +108,9 @@ pipeline {
       steps {
         sh '''
           set -eu
-          TAG="${IMAGE_TAG:-$(git rev-parse --short=12 HEAD)}"
+          # <build-number>-<git-sha>: unique per run (git-sha alone repeats across rebuilds of
+          # one commit); :dev (DEV_TAG) pushed alongside. Deploy pins by digest of :dev.
+          TAG="${IMAGE_TAG:-${BUILD_NUMBER:-manual}-$(git rev-parse --short=12 HEAD)}"
           DEV_TAG="${DEV_IMAGE_TAG:-}"
           BUILD_PLATFORM="${BUILD_PLATFORM:-linux/arm64}"
           IMAGE="$IMAGE_REGISTRY/options-edge-feed-gateway:$TAG"
