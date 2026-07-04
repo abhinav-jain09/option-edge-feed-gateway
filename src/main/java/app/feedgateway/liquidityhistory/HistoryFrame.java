@@ -66,11 +66,16 @@ record HistoryFrame(
             String diagnostics) {
     }
 
+    /** Core measured-size fields a present cell MUST carry; absence is malformed, not zero. */
+    private static final String[] REQUIRED_SIZE_FIELDS =
+            {"lastBidSize", "lastAskSize", "maxBidSize", "maxAskSize"};
+
     /**
      * Parses one topic record value. Returns {@code null} on ANY malformed input — missing/blank
      * required fields ({@code symbol}, {@code expiry}, {@code bucketStartMs}, {@code bucketEndMs},
-     * {@code cells} array), a non-object root, a malformed cell (missing strike or CALL/PUT side),
-     * or invalid JSON. The caller counts the reject and skips; parsing NEVER throws.
+     * {@code cells} array), a non-object root, a malformed cell (missing strike, CALL/PUT side, or
+     * a required size field), or invalid JSON. Absent/unknown {@code freshness}/{@code inputQuality}
+     * fail closed to STALE/DEGRADED. The caller counts the reject and skips; parsing NEVER throws.
      */
     static HistoryFrame parse(String json, ObjectMapper mapper) {
         try {
@@ -104,16 +109,29 @@ record HistoryFrame(
                     }
                 }
             }
-            // freshness/inputQuality are always written by the producer; defaulting the (never-observed)
-            // absent case to the benign LIVE/FULL keeps worst-of folding well-defined without inventing
-            // severity that was not asserted.
-            String freshness = root.path("freshness").asText("LIVE");
-            String inputQuality = root.path("inputQuality").asText("FULL");
+            // FAIL-CLOSED freshness/quality: the producer always writes these, so an ABSENT or
+            // UNKNOWN value is malformed/schema-drift — never assume the benign LIVE/FULL, which
+            // would let stale/degraded history render as active liquidity. Map anything outside the
+            // known set to the WORST severity (STALE / DEGRADED). This is also forward-compatible:
+            // a future freshness value the gateway does not recognize is treated conservatively as
+            // STALE rather than dropped, and worst-of folding stays well-defined.
+            String freshness = failClosedFreshness(root.path("freshness").asText(""));
+            String inputQuality = failClosedQuality(root.path("inputQuality").asText(""));
             return new HistoryFrame(symbol, expiry, bucketStartMs, bucketEndMs,
                     List.copyOf(cells), List.copyOf(visibleStrikes), freshness, inputQuality);
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /** LIVE/GAP/STALE pass through; absent or any unknown value fails closed to STALE. */
+    private static String failClosedFreshness(String v) {
+        return "LIVE".equals(v) || "GAP".equals(v) || "STALE".equals(v) ? v : "STALE";
+    }
+
+    /** FULL/DEGRADED pass through; absent or any unknown value fails closed to DEGRADED. */
+    private static String failClosedQuality(String v) {
+        return "FULL".equals(v) || "DEGRADED".equals(v) ? v : "DEGRADED";
     }
 
     private static Cell parseCell(JsonNode c) {
@@ -124,6 +142,15 @@ record HistoryFrame(
         String side = c.path("optionSide").asText("");
         if (!Double.isFinite(strike) || (!"CALL".equals(side) && !"PUT".equals(side))) {
             return null;
+        }
+        // A PRESENT cell must carry its core measured sizes — a missing size key is malformed
+        // (schema-drift / producer bug), NOT "zero liquidity". Reject the cell (→ whole frame,
+        // same fail-closed-never-partial rule) rather than silently folding a phantom zero wall.
+        for (String required : REQUIRED_SIZE_FIELDS) {
+            JsonNode f = c.get(required);
+            if (f == null || !f.isNumber()) {
+                return null;
+            }
         }
         return new Cell(
                 strike, side,
