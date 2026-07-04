@@ -433,7 +433,10 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior", "dealer-ledger"));
+            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior"));
+            // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
+            // so it replays via its own path rather than sendCachedState's batch envelope.
+            replayDealerLedgerCached(session);
         }
         // gex-by-strike is the one MULTI-SOURCE cache: IBKR/Unusual-Whales gex arrives via the JSON state
         // consumer while DATABENTO gex arrives via the Avro consumer. Its cached replay is only complete once
@@ -1875,7 +1878,9 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     static List<String> sourceSwitchReplayEvents() {
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior", "dealer-ledger", "gex-by-strike", "strike-sr", "max-pain");
+        // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
+        // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior", "gex-by-strike", "strike-sr", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -2337,7 +2342,7 @@ public class FeedGatewayService implements ReplayRunner {
                 } else {
                     dealerLedgerProfiles.put(baseKey, json);
                 }
-                String envelope = joinDealerLedger(baseKey, binding.source(), record);
+                String envelope = joinDealerLedger(baseKey, binding.source());
                 if (envelope == null) {
                     return null;
                 }
@@ -2648,16 +2653,6 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
                         .forEach(cachedEvents::add);
-                case "dealer-ledger" -> dealerLedgers.entrySet().stream()
-                        // The joined envelope, one per source|symbol|expiry. Freshness/barrier gates key
-                        // off the base key (no ROLE suffix); matchesCachedSelection enforces (source,
-                        // symbol,expiry) isolation via the envelope's own symbol/expiry/marketDataSource.
-                        .filter(entry -> isCacheFresh("dealer-ledger:" + entry.getKey() + "|STATE", nowMs)
-                                || isCacheFresh("dealer-ledger:" + entry.getKey() + "|PROFILE", nowMs))
-                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
-                        .sorted(Map.Entry.comparingByKey())
-                        .map(entry -> new CachedEvent("dealer-ledger", entry.getValue()))
-                        .forEach(cachedEvents::add);
                 case "strike-sr" -> strikeSr.entrySet().stream()
                         // DATABENTO-only Avro per-bucket S/R map. These are compacted current-state levels:
                         // unchanged active levels are not re-emitted every maxStaleMs, and retractions arrive as
@@ -2958,6 +2953,18 @@ public class FeedGatewayService implements ReplayRunner {
             maxPain.remove(versionKey.substring("max-pain:".length()));
         } else if (versionKey.startsWith("option-price-behavior:")) {
             optionPriceBehaviors.remove(versionKey.substring("option-price-behavior:".length()));
+        } else if (versionKey.startsWith("dealer-ledger:")) {
+            // versionKey = dealer-ledger:SOURCE|symbol|expiry|ROLE. Evict the expired role's RAW record
+            // and drop the joined envelope so a later fresh half never joins against a stale counterpart
+            // (the next record of either role rebuilds it from whatever is still fresh — see joinDealerLedger).
+            String roleKey = versionKey.substring("dealer-ledger:".length());
+            String baseKey = dealerLedgerBaseKey(roleKey);
+            if (roleKey.endsWith("|STATE")) {
+                dealerLedgerStates.remove(baseKey);
+            } else if (roleKey.endsWith("|PROFILE")) {
+                dealerLedgerProfiles.remove(baseKey);
+            }
+            dealerLedgers.remove(baseKey);
         } else if (versionKey.startsWith("hpsf-latest-signal:")) {
             hpsfLatestSignals.remove(versionKey.substring("hpsf-latest-signal:".length()));
         } else if (versionKey.startsWith("hpsf-market-flow:")) {
@@ -3112,19 +3119,45 @@ public class FeedGatewayService implements ReplayRunner {
 
     /**
      * (Re)join the latest cached dealer-ledger profile + state for one chain into the single envelope
-     * the UI consumes. Returns null if neither has been seen (nothing to publish). Never throws.
+     * the UI consumes. Freshness is computed PER ROLE (not from the one triggering record): a STALE
+     * state half is dropped so the pill is never emitted from stale state, and a stale profile half is
+     * dropped from the book — otherwise a fresh profile arriving next to an old state would publish a
+     * stale action pill as fresh. Returns null when neither half is fresh. Never throws.
      */
-    private String joinDealerLedger(String baseKey, String source, ConsumerRecord<?, ?> record) {
+    private String joinDealerLedger(String baseKey, String source) {
         try {
-            String profileJson = dealerLedgerProfiles.get(baseKey);
-            String stateJson = dealerLedgerStates.get(baseKey);
+            long now = System.currentTimeMillis();
+            boolean stateFresh = isCacheFresh("dealer-ledger:" + baseKey + "|STATE", now);
+            boolean profileFresh = isCacheFresh("dealer-ledger:" + baseKey + "|PROFILE", now);
+            String stateJson = stateFresh ? dealerLedgerStates.get(baseKey) : null;
+            String profileJson = profileFresh ? dealerLedgerProfiles.get(baseKey) : null;
+            if (stateJson == null && profileJson == null) {
+                return null; // both halves stale/absent — nothing fresh to publish
+            }
             JsonNode profile = profileJson == null ? null : mapper.readTree(profileJson);
             JsonNode state = stateJson == null ? null : mapper.readTree(stateJson);
-            boolean stale = !recordWithinMaxStale(record);
+            // The pill is state-driven; mark the envelope stale whenever the state half isn't fresh
+            // (state absent ⇒ book-only, so stale reflects the book/profile half instead).
+            boolean stale = stateJson == null ? !profileFresh : false;
             ObjectNode envelope = DealerLedgerJoiner.join(mapper, profile, state, source, settings.maxStaleMs(), stale);
             return envelope == null ? null : mapper.writeValueAsString(envelope);
         } catch (JsonProcessingException ignored) {
             return null;
+        }
+    }
+
+    /**
+     * Legacy-mode (single active selection) cached replay of the dealer-ledger signal on connect.
+     * Sent STANDALONE (its own message.type), never batched — mirrors the standalone live delivery.
+     * dealerLedgers holds only fresh, non-evicted envelopes, so no extra freshness gate is needed here.
+     */
+    private void replayDealerLedgerCached(WebSocketSession session) {
+        ActiveSelection selection = activeSelection.get();
+        for (Map.Entry<String, String> entry : dealerLedgers.entrySet()) {
+            String json = entry.getValue();
+            if (json != null && !json.isBlank() && matchesCachedSelection(json, selection)) {
+                send(session, "dealer-ledger", json);
+            }
         }
     }
 
@@ -3330,6 +3363,9 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "liquidity-heatmap", liquidityHeatmaps);
         replayCacheMap(session, "max-pain", maxPain);
         replayCacheMap(session, "option-price-behavior", optionPriceBehaviors);
+        // The joined dealer-ledger envelope, standalone per session. dealerLedgers holds only envelopes
+        // built from fresh halves (joinDealerLedger) and evicted on role expiry (removeCacheEntry).
+        replayCacheMap(session, "dealer-ledger", dealerLedgers);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
         // as index-price — so a VIX record is never delivered mislabelled as index-price.
         replayCacheMap(session, "vix-price", vixPrices);
