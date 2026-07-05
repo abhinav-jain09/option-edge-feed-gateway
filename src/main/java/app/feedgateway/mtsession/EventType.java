@@ -32,6 +32,8 @@ public enum EventType {
     // Dealer-ledger signal — the gateway JOINS dealer-ledger-profile + -state into one per-(symbol,expiry)
     // envelope, so it routes CONTRACT-scoped by source|symbol|expiry with NO strike filter (like MAX_PAIN).
     DEALER_LEDGER(Scope.CONTRACT),
+    OPB_V2_BY_OPTION(Scope.CONTRACT),
+    OPB_V2_SESSION(Scope.CONTRACT),
     VIX_PRICE(Scope.UNDERLYING),
     INDEX_PRICE(Scope.UNDERLYING),
     SPX_PRICE(Scope.UNDERLYING),
