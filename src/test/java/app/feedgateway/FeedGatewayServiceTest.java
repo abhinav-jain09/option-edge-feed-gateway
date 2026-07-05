@@ -28,7 +28,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior", "gex-by-strike", "strike-sr", "max-pain"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -171,6 +171,25 @@ class FeedGatewayServiceTest {
                 "batch envelope must carry the maxPains array with the record; was: " + envelope);
         // Existing gex array must still be present (no regression).
         assertTrue(envelope.contains("\"gexByStrike\":[]"));
+    }
+
+    @Test
+    void uiBatchEnvelopeCarriesOpbV2ByOptionArrayKey() throws Exception {
+        FeedGatewayService service = service();
+        String json = "{\"symbol\":\"SPX\",\"expiry\":\"20260710\",\"strike\":5500.0,\"residualZScore\":3.2,\"behaviorLabel\":\"CALL_OVERPERFORMING\"}";
+        String envelope = uiBatchEnvelopeJsonOpbV2ByOption(service, List.of(json));
+        assertTrue(envelope.contains("\"opbV2ByOptions\":[" + json + "]"),
+                "batch envelope must carry the opbV2ByOptions array; was: " + envelope);
+        assertTrue(envelope.contains("\"optionPriceBehaviors\":[]"));
+    }
+
+    @Test
+    void uiBatchEnvelopeCarriesOpbV2SessionArrayKey() throws Exception {
+        FeedGatewayService service = service();
+        String json = "{\"symbol\":\"SPX\",\"tradingDate\":\"2026-07-10\",\"directionalPressureZ\":2.7,\"perContractAnomalyZ\":1.4}";
+        String envelope = uiBatchEnvelopeJsonOpbV2Session(service, List.of(json));
+        assertTrue(envelope.contains("\"opbV2Sessions\":[" + json + "]"),
+                "batch envelope must carry the opbV2Sessions array; was: " + envelope);
     }
 
     @Test
@@ -1356,7 +1375,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1449,7 +1468,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), liquidityHeatmaps, List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1459,7 +1478,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1469,7 +1488,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1482,7 +1501,27 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
+    private static String uiBatchEnvelopeJsonOpbV2ByOption(FeedGatewayService service, List<String> opbV2ByOptions) throws Exception {
+        Method method = uiBatchEnvelopeMethod();
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2ByOptions, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
+    private static String uiBatchEnvelopeJsonOpbV2Session(FeedGatewayService service, List<String> opbV2Sessions) throws Exception {
+        Method method = uiBatchEnvelopeMethod();
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2Sessions, List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1492,7 +1531,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), missionPaces,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1502,7 +1541,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                missionControls, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                missionControls, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1518,7 +1557,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1527,7 +1566,8 @@ class FeedGatewayServiceTest {
                 "uiBatchEnvelopeJson",
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class,
+                List.class, List.class
         );
     }
 }
