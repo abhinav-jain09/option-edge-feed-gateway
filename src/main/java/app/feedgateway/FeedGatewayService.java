@@ -3113,9 +3113,18 @@ public class FeedGatewayService implements ReplayRunner {
             JsonNode root = mapper.readTree(json);
             String symbol = text(root, "symbol").toUpperCase();
             String expiry = normalizeExpiry(text(root, "expiry"));
-            String strike = text(root, "strike");
-            if (!symbol.isBlank() && !expiry.isBlank() && !strike.isBlank()) {
-                return symbol + "|" + expiry + "|" + strike;
+            // Normalize strike the same way as gex/pace (formatStrike) so 5500 and 5500.0 collapse to a
+            // single cache slot instead of splitting into two and leaking a stale residual on replay.
+            double strike = doubleField(root, "strike", Double.NaN);
+            // Per-contract event: call and put share a strike, so the side MUST be part of the key or
+            // the two contracts overwrite each other in the cache. Prefer the fully-qualified optionKey;
+            // fall back to optionType when absent.
+            String side = text(root, "optionType").toUpperCase();
+            if (side.isBlank()) {
+                side = text(root, "optionKey").toUpperCase();
+            }
+            if (!symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike) && !side.isBlank()) {
+                return symbol + "|" + expiry + "|" + formatStrike(strike) + "|" + side;
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.

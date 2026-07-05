@@ -149,6 +149,24 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void opbV2ByOptionCacheKeyIncludesSideSoCallAndPutDoNotCollide() throws Exception {
+        FeedGatewayService service = service();
+        String call = "{\"symbol\":\"spx\",\"expiry\":\"2026-07-10\",\"strike\":5500.0,\"optionType\":\"CALL\"}";
+        String put = "{\"symbol\":\"spx\",\"expiry\":\"2026-07-10\",\"strike\":5500.0,\"optionType\":\"PUT\"}";
+        // Per-contract events: same strike, opposite side must land in distinct cache slots. Strike is
+        // normalized (formatStrike) so 5500.0 and 5500 collapse to a single slot.
+        assertEquals("SPX|20260710|5500|CALL", opbV2ByOptionCacheKey(service, call, "fallback"));
+        assertEquals("SPX|20260710|5500|PUT", opbV2ByOptionCacheKey(service, put, "fallback"));
+        assertEquals("SPX|20260710|5500|CALL",
+                opbV2ByOptionCacheKey(service, call.replace("5500.0", "5500"), "fallback"));
+        // Missing side -> fall back to optionKey, then to the Kafka key.
+        String keyed = "{\"symbol\":\"SPX\",\"expiry\":\"20260710\",\"strike\":5500.0,\"optionKey\":\"SPX-20260710-5500-C\"}";
+        assertEquals("SPX|20260710|5500|SPX-20260710-5500-C", opbV2ByOptionCacheKey(service, keyed, "fallback"));
+        assertEquals("fallback", opbV2ByOptionCacheKey(service, "{\"symbol\":\"SPX\",\"expiry\":\"20260710\"}", "fallback"));
+        assertEquals("fallback", opbV2ByOptionCacheKey(service, "not-json", "fallback"));
+    }
+
+    @Test
     void isMaxPainExpiredReturnsTrueOnlyForTerminalStatus() throws Exception {
         FeedGatewayService service = service();
         assertTrue(isMaxPainExpired(service, "{\"status\":\"EXPIRED\"}"));
@@ -1191,6 +1209,12 @@ class FeedGatewayServiceTest {
 
     private static String maxPainCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
         Method method = FeedGatewayService.class.getDeclaredMethod("maxPainCacheKey", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, fallback);
+    }
+
+    private static String opbV2ByOptionCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("opbV2ByOptionCacheKey", String.class, String.class);
         method.setAccessible(true);
         return (String) method.invoke(service, json, fallback);
     }
