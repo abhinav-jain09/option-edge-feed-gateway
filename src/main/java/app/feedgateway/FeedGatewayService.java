@@ -2910,7 +2910,25 @@ public class FeedGatewayService implements ReplayRunner {
                 return payloadTime;
             }
         }
+        if ("dealer-ledger".equals(event)) {
+            // Freshness MUST track the PAYLOAD event time (asOfEventTimeMs), not the Kafka ARRIVAL time.
+            // A producer catching up on a backlog appends records now (fresh arrival) whose asOfEventTimeMs
+            // is old — using arrival time would let a stale permission pass the 15s TTL and render active.
+            long payloadTime = dealerLedgerEventTimestamp(json);
+            if (payloadTime >= 0) {
+                return payloadTime;
+            }
+        }
         return cacheTimestamp(record);
+    }
+
+    /** Event time (asOfEventTimeMs) of a raw dealer-ledger profile/state record; -1 if absent/unparseable. */
+    private long dealerLedgerEventTimestamp(String json) {
+        try {
+            return longField(mapper.readTree(json), "asOfEventTimeMs", -1L);
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
     }
 
     private long liquidityHeatmapTimestamp(String json) {

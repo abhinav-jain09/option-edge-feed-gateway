@@ -34,6 +34,19 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void dealerLedgerFreshnessUsesPayloadEventTimeNotKafkaArrivalTime() throws Exception {
+        // A producer catching up on a backlog appends records now (fresh arrival) whose asOfEventTimeMs is
+        // old — freshness MUST track the payload event time, else a stale permission passes the 15s TTL.
+        FeedGatewayService service = service();
+        long oldEventTime = 1_700_000_000_000L;
+        // 5-arg ctor sets timestamp = NO_TIMESTAMP (-1); the payload asOfEventTimeMs must still win.
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                "dealer-ledger-state", 0, 0L, "SPXW|20260704",
+                "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"asOfEventTimeMs\":" + oldEventTime + "}");
+        assertEquals(oldEventTime, eventCacheTimestamp(service, "dealer-ledger", record));
+    }
+
+    @Test
     void dealerLedgerFreshnessUsesShortLiveSignalTtlNotGenericCacheTtl() throws Exception {
         // BLOCKING guard: dealer-ledger state is a live permission heartbeat, so its freshness MUST use
         // the short dealer-ledger TTL (default 15s), never the generic 15-min cache TTL — otherwise a
@@ -1199,6 +1212,13 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod("isExpired", String.class, long.class, long.class);
         method.setAccessible(true);
         return (boolean) method.invoke(service, event, eventTime, now);
+    }
+
+    private static long eventCacheTimestamp(FeedGatewayService service, String event, ConsumerRecord<?, ?> record) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "eventCacheTimestamp", String.class, ConsumerRecord.class, String.class);
+        method.setAccessible(true);
+        return (long) method.invoke(service, event, record, record.value());
     }
 
     private static String paceCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
