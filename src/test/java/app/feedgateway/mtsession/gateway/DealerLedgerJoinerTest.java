@@ -146,6 +146,19 @@ class DealerLedgerJoinerTest {
     }
 
     @Test
+    void stateOnlyAfterProfileExpiresKeepsThePillWithAnEmptyBook() throws Exception {
+        // Mirrors removeCacheEntry rebuilding from the surviving fresh half: profile aged out (null),
+        // state still fresh -> the actionable pill MUST survive; the book is simply empty ('—' in UI).
+        String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"DEFENDED\",\"defendedLevel\":5300,"
+                + "\"actions\":[{\"zone\":\"PUT_SELL_ZONE\",\"state\":\"ACTIVE\"}]}";
+        ObjectNode env = join(null, state, false);
+        assertEquals(1, env.get("strikes").size());
+        assertEquals(5300.0, env.get("strikes").get(0).get("strike").asDouble());
+        assertEquals("DEFENDED", env.get("strikes").get(0).get("state").asText());
+        assertFalse(env.get("book").has("netDealerGammaUsd")); // no profile -> book fields absent, not faked
+    }
+
+    @Test
     void staleFlagPropagatesToEnvelopeAndEntry() throws Exception {
         String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"pinCandidateStrike\":5300}";
         String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"DEFENDED\",\"defendedLevel\":5300}";

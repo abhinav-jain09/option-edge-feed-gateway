@@ -2961,9 +2961,11 @@ public class FeedGatewayService implements ReplayRunner {
         } else if (versionKey.startsWith("option-price-behavior:")) {
             optionPriceBehaviors.remove(versionKey.substring("option-price-behavior:".length()));
         } else if (versionKey.startsWith("dealer-ledger:")) {
-            // versionKey = dealer-ledger:SOURCE|symbol|expiry|ROLE. Evict the expired role's RAW record
-            // and drop the joined envelope so a later fresh half never joins against a stale counterpart
-            // (the next record of either role rebuilds it from whatever is still fresh — see joinDealerLedger).
+            // versionKey = dealer-ledger:SOURCE|symbol|expiry|ROLE. Evict the expired role's RAW record,
+            // then REBUILD the envelope from whatever half is still fresh (one fresh half is publishable —
+            // a fresh state keeps the pill even after the profile ages out). Only drop the envelope when
+            // the rebuild yields nothing (both halves stale/absent). cacheEventTimes for this role was
+            // already removed at the top of this method, so joinDealerLedger sees it as not-fresh.
             String roleKey = versionKey.substring("dealer-ledger:".length());
             String baseKey = dealerLedgerBaseKey(roleKey);
             if (roleKey.endsWith("|STATE")) {
@@ -2971,7 +2973,14 @@ public class FeedGatewayService implements ReplayRunner {
             } else if (roleKey.endsWith("|PROFILE")) {
                 dealerLedgerProfiles.remove(baseKey);
             }
-            dealerLedgers.remove(baseKey);
+            int sep = baseKey.indexOf('|');
+            String source = sep < 0 ? "" : baseKey.substring(0, sep);
+            String rebuilt = joinDealerLedger(baseKey, source);
+            if (rebuilt == null) {
+                dealerLedgers.remove(baseKey);
+            } else {
+                dealerLedgers.put(baseKey, rebuilt);
+            }
         } else if (versionKey.startsWith("hpsf-latest-signal:")) {
             hpsfLatestSignals.remove(versionKey.substring("hpsf-latest-signal:".length()));
         } else if (versionKey.startsWith("hpsf-market-flow:")) {
