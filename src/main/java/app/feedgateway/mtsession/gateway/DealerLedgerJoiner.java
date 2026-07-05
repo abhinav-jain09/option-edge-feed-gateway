@@ -125,16 +125,27 @@ public final class DealerLedgerJoiner {
         if (!ACTIONABLE_STATES.contains(state)) {
             return null;
         }
-        double anchor = firstFinite(s.get("defendedLevel"), p.get("pinCandidateStrike"));
+        // Resolve the action SIDE first, then anchor by side. defendedLevel is the DEFENSE/support anchor
+        // (put-side); it must NEVER anchor a CALL-side sell permission. A CALL-side entry anchors ONLY to
+        // pinCandidateStrike (the backend exposes no dedicated call-side/cluster anchor yet); if that is
+        // absent, we render NO pill rather than fabricate the wrong strike. PUT/DEFENDED and the
+        // (defense-oriented) ARMING candidate phase use defendedLevel first, then pinCandidateStrike.
+        String[] sideAndPermission = dominantSell(s.get("actions"));
+        String side = sideAndPermission[0]; // CALL | PUT | null
+        double anchor;
+        if ("CALL".equals(side)) {
+            anchor = numberOrNaN(p.get("pinCandidateStrike"));
+        } else {
+            anchor = firstFinite(s.get("defendedLevel"), p.get("pinCandidateStrike"));
+        }
         if (!Double.isFinite(anchor)) {
-            return null; // no strike to pin the pill to — emit book only
+            return null; // no valid side-correct strike to pin the pill to — emit book only
         }
         ObjectNode entry = mapper.createObjectNode();
         entry.put("strike", anchor);
         entry.put("state", state);
-        String[] sideAndPermission = dominantSell(s.get("actions"));
-        if (sideAndPermission[0] != null) {
-            entry.put("action", sideAndPermission[0]);
+        if (side != null) {
+            entry.put("action", side);
         }
         if (sideAndPermission[1] != null) {
             entry.put("permission", sideAndPermission[1]);

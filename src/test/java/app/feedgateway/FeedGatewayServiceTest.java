@@ -34,6 +34,24 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void dealerLedgerFreshnessUsesShortLiveSignalTtlNotGenericCacheTtl() throws Exception {
+        // BLOCKING guard: dealer-ledger state is a live permission heartbeat, so its freshness MUST use
+        // the short dealer-ledger TTL (default 15s), never the generic 15-min cache TTL — otherwise a
+        // stalled producer's last ARMED/DEFENDED would join as fresh and render as an active permission.
+        FeedGatewayService service = service();
+        long now = 1_000_000_000L;
+        long ttl = new GatewaySettings().dealerLedgerTtlMs();
+        assertTrue(ttl > 0 && ttl <= 60_000L, "dealer-ledger TTL must be a short live-signal window");
+        // Just past the short TTL ⇒ EXPIRED (would still be 'fresh' under the 15-min generic window).
+        assertTrue(isExpired(service, "dealer-ledger", now - ttl - 1, now));
+        // Within the short TTL ⇒ fresh.
+        assertFalse(isExpired(service, "dealer-ledger", now - ttl + 1_000, now));
+        // Contrast: a generic event of the same 30s age is NOT expired — proves dealer-ledger is NOT
+        // sharing the generic TTL.
+        assertFalse(isExpired(service, "strike-flow", now - 30_000, now));
+    }
+
+    @Test
     void dealerLedgerTopicsAreOptionalSoTheirAbsenceCannotStarveTheSharedConsumer() throws Exception {
         // Kafka is wiped + services restart daily, and the dealer-ledger producer may not be deployed,
         // so both DL topics are absent at gateway startup. They MUST be optional or partitionsFor would
@@ -1175,6 +1193,12 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod("isOptionalTopic", String.class);
         method.setAccessible(true);
         return (boolean) method.invoke(service, topic);
+    }
+
+    private static boolean isExpired(FeedGatewayService service, String event, long eventTime, long now) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("isExpired", String.class, long.class, long.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, event, eventTime, now);
     }
 
     private static String paceCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {

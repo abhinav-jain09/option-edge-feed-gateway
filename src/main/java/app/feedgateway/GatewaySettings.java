@@ -562,6 +562,17 @@ public final class GatewaySettings {
         return longValue("MARKETDATA_GATEWAY_MAX_STALE_MS", 15_000L, 0L);
     }
 
+    /**
+     * SHORT live-signal TTL for dealer-ledger role records. The dealer-ledger {@code state} topic is a
+     * heartbeat (the service emits a routine frame on every flow evaluation), so an ARMED/DEFENDED
+     * permission is only valid while the producer keeps refreshing it. Freshness MUST use this window,
+     * never the generic 15-min {@link #cacheTtlMs()} — otherwise a stalled/dead producer's last
+     * permission would render as active for minutes. Defaults to {@link #maxStaleMs()} (15s).
+     */
+    public long dealerLedgerTtlMs() {
+        return longValue("GATEWAY_DEALER_LEDGER_TTL_MS", maxStaleMs(), 0L);
+    }
+
     /** Per-session historical replay (Live↔Replay switching) is enabled only when this flag is on. */
     public boolean replayUiEnabled() {
         return boolValue("DATABENTO_REPLAY_UI_ENABLED", false);

@@ -2798,6 +2798,13 @@ public class FeedGatewayService implements ReplayRunner {
             // a minutes-old frame must read as stale/absent, not live liquidity.
             return CachePolicy.expiring(settings.liquidityHeatmapTtlMs());
         }
+        if ("dealer-ledger".equals(event)) {
+            // Live PERMISSION heartbeat (state emits every flow evaluation): a minutes-old record must
+            // read as STALE, never active. SHORT window (default 15s), never the generic 15-min TTL —
+            // otherwise a stalled/dead producer's last ARMED/DEFENDED would render as an active permission.
+            // Drives join freshness (joinDealerLedger), purge eviction, and cached-replay uniformly.
+            return CachePolicy.expiring(settings.dealerLedgerTtlMs());
+        }
         if (MARKET_AWARE_CHAIN_EVENTS.contains(event)) {
             if (isRegularTradingHours(nowMs)) {
                 return CachePolicy.expiring(settings.optionChainRthCacheTtlMs());

@@ -2,6 +2,7 @@ package app.feedgateway.mtsession.gateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -83,15 +84,51 @@ class DealerLedgerJoinerTest {
     }
 
     @Test
-    void armedCallSideUsesCallActionWhenCallZoneMostPermissive() throws Exception {
+    void callArmedDoesNotUseDefendedLevelAsAnchor() throws Exception {
+        // CALL-side ARMED must anchor to pinCandidateStrike (5350), NEVER the put-side defendedLevel (5340),
+        // even though defendedLevel is present (defense-candidate lifecycle). This is a wrong-strike guard.
         String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"pinCandidateStrike\":5350}";
         String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"ARMED\",\"defendedLevel\":5340,"
                 + "\"actions\":[{\"zone\":\"CALL_SELL_ZONE\",\"state\":\"ACTIVE\"},{\"zone\":\"PUT_SELL_ZONE\",\"state\":\"WAITING\"}]}";
         ObjectNode env = join(profile, state, false);
         JsonNode e = env.get("strikes").get(0);
-        assertEquals(5340.0, e.get("strike").asDouble()); // defendedLevel preferred as anchor
+        assertEquals(5350.0, e.get("strike").asDouble()); // pinCandidateStrike, NOT defendedLevel 5340
         assertEquals("CALL", e.get("action").asText());
         assertEquals("ACTIVE", e.get("permission").asText());
+    }
+
+    @Test
+    void defendedLevelPresentButDominantActionCALLDoesNotAnchorToDefendedLevel() throws Exception {
+        // Explicit: defendedLevel set + CALL dominant ⇒ the entry strike is NOT defendedLevel.
+        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"pinCandidateStrike\":5400}";
+        String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"ARMED\",\"defendedLevel\":5310,"
+                + "\"actions\":[{\"zone\":\"CALL_SELL_ZONE\",\"state\":\"ACTIVE\"}]}";
+        ObjectNode env = join(profile, state, false);
+        assertEquals(5400.0, env.get("strikes").get(0).get("strike").asDouble());
+        assertNotEquals(5310.0, env.get("strikes").get(0).get("strike").asDouble());
+    }
+
+    @Test
+    void callArmedWithNoCallAnchorDoesNotRenderWrongStrikePill() throws Exception {
+        // CALL-side ARMED with NO pinCandidateStrike must NOT fall back to defendedLevel: no pill at all
+        // (refuse to fabricate the wrong strike), book only.
+        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"netDealerGamma\":-1e7}";
+        String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"ARMED\",\"defendedLevel\":5310,"
+                + "\"actions\":[{\"zone\":\"CALL_SELL_ZONE\",\"state\":\"ACTIVE\"}]}";
+        ObjectNode env = join(profile, state, false);
+        assertEquals(0, env.get("strikes").size());
+        assertEquals(5310.0, env.get("book").get("defendedLevel").asDouble()); // still shown in the book, just not as the pill anchor
+    }
+
+    @Test
+    void putDefendedUsesDefendedLevel() throws Exception {
+        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"pinCandidateStrike\":5350}";
+        String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"DEFENDED\",\"defendedLevel\":5300,"
+                + "\"actions\":[{\"zone\":\"PUT_SELL_ZONE\",\"state\":\"ACTIVE\"}]}";
+        ObjectNode env = join(profile, state, false);
+        JsonNode e = env.get("strikes").get(0);
+        assertEquals(5300.0, e.get("strike").asDouble()); // put/defense side anchors to defendedLevel
+        assertEquals("PUT", e.get("action").asText());
     }
 
     @Test
