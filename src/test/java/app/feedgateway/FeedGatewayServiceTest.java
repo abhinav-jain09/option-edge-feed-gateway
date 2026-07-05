@@ -34,6 +34,19 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void dealerLedgerTopicsAreOptionalSoTheirAbsenceCannotStarveTheSharedConsumer() throws Exception {
+        // Kafka is wiped + services restart daily, and the dealer-ledger producer may not be deployed,
+        // so both DL topics are absent at gateway startup. They MUST be optional or partitionsFor would
+        // block the shared JSON consumer waiting for them, starving strike-flow / mission-pace / etc.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertTrue(isOptionalTopic(service, settings.dealerLedgerProfileTopic()));
+        assertTrue(isOptionalTopic(service, settings.dealerLedgerStateTopic()));
+        // A mandatory feed must still be mandatory (guards against over-broadening the optional set).
+        assertFalse(isOptionalTopic(service, settings.databentoStrikeFlowTopic()));
+    }
+
+    @Test
     void markSelectionReadyIsOneShotAndGuardedByActiveSelection() throws Exception {
         FeedGatewayService service = service();
         setActiveSelection(service, "DATABENTO", "SPX", "20260623");
@@ -1156,6 +1169,12 @@ class FeedGatewayServiceTest {
                 new HpsfGatewayViewMapper(),
                 null /* routingEngine: legacy broadcast path */
         );
+    }
+
+    private static boolean isOptionalTopic(FeedGatewayService service, String topic) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("isOptionalTopic", String.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, topic);
     }
 
     private static String paceCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {

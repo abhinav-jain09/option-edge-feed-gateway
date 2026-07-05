@@ -1624,7 +1624,14 @@ public class FeedGatewayService implements ReplayRunner {
      * topic in a consumer set is mandatory and keeps the strict metadata requirement.
      */
     private boolean isOptionalTopic(String topic) {
-        return topic != null && topic.equals(settings.strikeLiquidityTopic());
+        // OPTIONAL: absence must never block/crash-loop the SHARED consumer. The dealer-ledger topics
+        // are produced by a separate service that may not be deployed (and, since Kafka is wiped and
+        // services restart each day, are simply absent until that service first produces) — treat them
+        // as optional so their absence can't starve strike-flow / mission-pace / the other JSON feeds.
+        return topic != null
+                && (topic.equals(settings.strikeLiquidityTopic())
+                    || topic.equals(settings.dealerLedgerProfileTopic())
+                    || topic.equals(settings.dealerLedgerStateTopic()));
     }
 
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {
