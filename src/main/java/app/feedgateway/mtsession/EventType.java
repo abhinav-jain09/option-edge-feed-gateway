@@ -29,6 +29,8 @@ public enum EventType {
     // Option Price Behavior is a per-(symbol,tradingDate) dashboard aggregate. Route it like a whole-chain
     // contract-scoped event, using tradingDate as the expiry/date key.
     OPTION_PRICE_BEHAVIOR(Scope.CONTRACT),
+    OPB_V2_BY_OPTION(Scope.CONTRACT),
+    OPB_V2_SESSION(Scope.CONTRACT),
     VIX_PRICE(Scope.UNDERLYING),
     INDEX_PRICE(Scope.UNDERLYING),
     SPX_PRICE(Scope.UNDERLYING),
