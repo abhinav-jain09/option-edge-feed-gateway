@@ -77,6 +77,94 @@ class FeedGatewayServiceTest {
         assertFalse(isOptionalTopic(service, settings.databentoStrikeFlowTopic()));
     }
 
+    // ----- delta-flow gateway consumer (per-strike DeltaFlowStrikeSnapshot) -----------------------
+
+    @Test
+    void deltaFlowCacheKeyIsSymbolExpiryStrikeFromPayloadIdentity() throws Exception {
+        // The helper derives symbol|expiry|strike from the payload (source is prepended later by
+        // updateCache), mirroring gexCacheKey — delta-flow is per-strike, not chain-level.
+        FeedGatewayService service = service();
+        assertEquals("SPX|20260622|6005", deltaFlowCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"strike\":6005,\"sessionNetDeltaFlow\":42}",
+                "fallback-key"));
+    }
+
+    @Test
+    void deltaFlowUpdateCacheStoresSourcePrefixedKey() throws Exception {
+        // After updateCache the stored/returned cache key is DATABENTO|SPX|expiry|strike (source prepended).
+        FeedGatewayService service = service();
+        String json = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260622\","
+                + "\"strike\":6005,\"sessionNetDeltaFlow\":42,\"asOfEventTimeMs\":" + System.currentTimeMillis() + "}";
+        String key = updateCache(service, topicBinding("DATABENTO", "delta-flow"),
+                new ConsumerRecord<>(new GatewaySettings().databentoDeltaFlowByStrikeTopic(), 0, 1L, "SPX|20260622|6005", json),
+                json);
+        assertEquals("DATABENTO|SPX|20260622|6005", key,
+                "updateCache must prepend the source to the delta-flow cache key");
+        assertTrue(service.healthJson().contains("\"deltaFlows\":1"), "delta-flow must be cached");
+    }
+
+    @Test
+    void cachedReplayIncludesFreshDeltaFlowForMatchingDatabentoSelectionOnly() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260622\","
+                + "\"strike\":6005,\"sessionNetDeltaFlow\":42,\"asOfEventTimeMs\":" + now + "}";
+        updateCache(service, topicBinding("DATABENTO", "delta-flow"),
+                recordAt(settings.databentoDeltaFlowByStrikeTopic(), 0, 1L, "SPX|20260622|6005", json, now), json);
+
+        // Matching DATABENTO/SPX/20260622 selection replays it.
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        assertEquals(1, cachedEvents(service, List.of("delta-flow"), now).size(),
+                "fresh delta-flow must replay to a matching DATABENTO client");
+
+        // Wrong source (IBKR) is filtered (delta-flow is DATABENTO-only).
+        setActiveSelection(service, "IBKR", "SPX", "20260622");
+        assertTrue(cachedEvents(service, List.of("delta-flow"), now).isEmpty(),
+                "IBKR selection must never receive DATABENTO delta-flow");
+
+        // Wrong symbol is filtered by the selection barrier.
+        setActiveSelection(service, "DATABENTO", "SPY", "20260622");
+        assertTrue(cachedEvents(service, List.of("delta-flow"), now).isEmpty(),
+                "a different symbol must not receive this delta-flow");
+    }
+
+    @Test
+    void staleCachedDeltaFlowIsNotReplayed() throws Exception {
+        // FIX 1: a delta-flow whose freshness (event time) is old must NOT be replayed on connect — the
+        // isCacheFresh gate in cachedEvents drops it, so a catching-up/backfilled producer cannot render
+        // a stale delta-flow as a live signal.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        // asOfEventTimeMs is well past the generic 15-min TTL; eventCacheTimestamp uses the payload time.
+        long staleEventTime = now - 60L * 60_000L;
+        String json = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260622\","
+                + "\"strike\":6005,\"sessionNetDeltaFlow\":42,\"asOfEventTimeMs\":" + staleEventTime + "}";
+        // Fresh Kafka ARRIVAL time (record timestamp = now) — only the payload event time makes it stale.
+        updateCache(service, topicBinding("DATABENTO", "delta-flow"),
+                recordAt(settings.databentoDeltaFlowByStrikeTopic(), 0, 1L, "SPX|20260622|6005", json, now), json);
+
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        assertTrue(cachedEvents(service, List.of("delta-flow"), now).isEmpty(),
+                "a stale (old payload event time) delta-flow must not be replayed");
+    }
+
+    @Test
+    void deltaFlowFreshnessUsesPayloadEventTimeNotKafkaArrivalTime() throws Exception {
+        // FIX 1: eventCacheTimestamp for delta-flow returns the payload asOfEventTimeMs, not the record
+        // arrival timestamp (mirrors dealer-ledger). The 5-arg ctor sets record timestamp = -1, so the
+        // payload event time must be what is returned.
+        FeedGatewayService service = service();
+        long oldEventTime = 1_700_000_000_000L;
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                "delta-flow-by-strike", 0, 0L, "SPX|20260622|6005",
+                "{\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"strike\":6005,\"sessionNetDeltaFlow\":42,"
+                        + "\"asOfEventTimeMs\":" + oldEventTime + "}");
+        assertEquals(oldEventTime, eventCacheTimestamp(service, "delta-flow", record));
+    }
+
     @Test
     void markSelectionReadyIsOneShotAndGuardedByActiveSelection() throws Exception {
         FeedGatewayService service = service();
@@ -1266,6 +1354,12 @@ class FeedGatewayServiceTest {
 
     private static String gexCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
         Method method = FeedGatewayService.class.getDeclaredMethod("gexCacheKey", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, fallback);
+    }
+
+    private static String deltaFlowCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("deltaFlowCacheKey", String.class, String.class);
         method.setAccessible(true);
         return (String) method.invoke(service, json, fallback);
     }
