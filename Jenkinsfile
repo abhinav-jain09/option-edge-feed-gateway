@@ -110,11 +110,17 @@ pipeline {
           set -eu
           # <build-number>-<git-sha>: unique per run (git-sha alone repeats across rebuilds of
           # one commit); :dev (DEV_TAG) pushed alongside. Deploy pins by digest of :dev.
-          TAG="${IMAGE_TAG:-${BUILD_NUMBER:-manual}-$(git rev-parse --short=12 HEAD)}"
+          # dev = <build>-<sha>; PROD = prod-<build>-<sha> (self-documents env+build+commit).
+          if [ "${ENVIRONMENT:-dev}" = "production" ]; then
+            TAG="${IMAGE_TAG:-prod-${BUILD_NUMBER:-manual}-$(git rev-parse --short=12 HEAD)}"
+          else
+            TAG="${IMAGE_TAG:-${BUILD_NUMBER:-manual}-$(git rev-parse --short=12 HEAD)}"
+          fi
           DEV_TAG="${DEV_IMAGE_TAG:-}"
           BUILD_PLATFORM="${BUILD_PLATFORM:-linux/arm64}"
           IMAGE="$IMAGE_REGISTRY/options-edge-feed-gateway:$TAG"
           DEV_IMAGE="$IMAGE_REGISTRY/options-edge-feed-gateway:$DEV_TAG"
+          PROD_IMAGE="$IMAGE_REGISTRY/options-edge-feed-gateway:prod"  # self-documenting prod moving tag
           BUILDER_NAME="options-edge-feed-gateway-${BUILD_NUMBER:-local}"
           BUILDKITD_CONFIG="$(mktemp)"
           # Write a buildkit insecure-registry entry for the EFFECTIVE registry iff it
@@ -152,6 +158,9 @@ EOF
           if [ -n "$DEV_TAG" ] && [ "$DEV_TAG" != "$TAG" ]; then
             TAG_ARGS="$TAG_ARGS -t $DEV_IMAGE"
           fi
+          if [ "${ENVIRONMENT:-dev}" = "production" ]; then
+            TAG_ARGS="$TAG_ARGS -t $PROD_IMAGE"   # prod also gets the self-documenting :prod moving tag
+          fi
           if [ "${ENVIRONMENT:-dev}" = "production" ] && [ "$PUSH_IMAGE" = "true" ]; then
             remote_host="${REMOTE_BUILD_HOST:-192.168.100.252}"
             remote_root="${REMOTE_BUILD_ROOT:-/home/abhinav/ci/remote-builds}"
@@ -162,6 +171,7 @@ EOF
             if [ -n "${DEV_IMAGE_TAG:-}" ] && [ "${DEV_IMAGE_TAG:-}" != "$TAG" ]; then
               push_refs="$push_refs $DEV_IMAGE"
             fi
+            push_refs="$push_refs $PROD_IMAGE"   # push the :prod moving tag for prod
             echo "Production image build runs natively on $remote_host ($BUILD_PLATFORM): $TAG_ARGS"
             ssh "$remote" "rm -rf '$remote_dir' && mkdir -p '$remote_dir'"
             rsync -az --delete \
