@@ -110,6 +110,9 @@ pipeline {
           set -eu
           # <build-number>-<git-sha>: unique per run (git-sha alone repeats across rebuilds of
           # one commit); :dev (DEV_TAG) pushed alongside. Deploy pins by digest of :dev.
+          # Clean replace: prod publishes ONLY :prod, NOT :dev — the deploy resolves :prod, so
+          # suppress the :dev moving tag for prod (empties the DEV_IMAGE_TAG guard below).
+          if [ "${ENVIRONMENT:-dev}" = "production" ]; then DEV_IMAGE_TAG=""; fi
           # dev = <build>-<sha>; PROD = prod-<build>-<sha> (self-documents env+build+commit).
           if [ "${ENVIRONMENT:-dev}" = "production" ]; then
             TAG="${IMAGE_TAG:-prod-${BUILD_NUMBER:-manual}-$(git rev-parse --short=12 HEAD)}"
