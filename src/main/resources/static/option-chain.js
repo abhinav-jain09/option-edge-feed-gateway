@@ -54,6 +54,7 @@
 	    const pacesRef = useRef(new Map());
 	    const gexByStrikeRef = useRef(new Map());
 	    const strikeFlowRef = useRef(new Map());
+	    const deltaFlowRef = useRef(new Map());
 	    const opbV2ByOptionsRef = useRef(new Map());
 	    const opbV2SessionsRef = useRef(new Map());
     const visibleStrikesRef = useRef([]);
@@ -121,6 +122,7 @@
 	                      pacesRef.current.clear();
                       gexByStrikeRef.current.clear();
                       strikeFlowRef.current.clear();
+                      deltaFlowRef.current.clear();
                       opbV2ByOptionsRef.current.clear();
                       opbV2SessionsRef.current.clear();
 		                      setLatestSnapshot(undefined);
@@ -144,7 +146,8 @@
       const pace = pacesRef.current.get(key);
       const gex = gexByStrikeRef.current.get(key);
       const strikeFlow = strikeFlowRef.current.get(key);
-      rowsRef.current.set(key, { ...payload, ...(pace || {}), ...(gex || {}), ...(strikeFlow || {}) });
+      const deltaFlow = deltaFlowRef.current.get(key);
+      rowsRef.current.set(key, { ...payload, ...(pace || {}), ...(gex || {}), ...(strikeFlow || {}), ...(deltaFlow || {}) });
       return true;
     }, []);
 
@@ -193,6 +196,20 @@
         changed = true;
       });
       return changed;
+    }, []);
+
+    // Per-strike delta-flow (DeltaFlowStrikeSnapshot): one JSON record per strike, merged onto the row
+    // keyed by source|symbol|expiry|strike (mirrors the gex per-strike merge). Carries a compact
+    // `deltaFlow` object; the visible number is sessionNetDeltaFlow (signed, colored by sign).
+    const mergeDeltaFlowPayload = useCallback(payload => {
+      const deltaFlow = normalizeDeltaFlowPayload(payload);
+      if (!deltaFlow || !Number.isFinite(deltaFlow.strike)) return false;
+      const key = contractKey(payload);
+      deltaFlowRef.current.set(key, deltaFlow);
+      const row = rowsRef.current.get(key);
+      if (!row) return false;
+      rowsRef.current.set(key, { ...row, ...deltaFlow });
+      return true;
     }, []);
 
     // SURFACE_RESIDUAL_V2 (design §7): per-contract mispricing events keyed symbol|expiry|strike|side,
@@ -279,6 +296,10 @@
         if (!shouldAcceptStrikeFlowPayload(strikeFlow, activeConfig)) return;
         rowsChanged = mergeStrikeFlowPayload(strikeFlow) || rowsChanged;
       });
+      batchItems(payload, 'deltaFlows').forEach(deltaFlow => {
+        if (!shouldAcceptStrikeFlowPayload(deltaFlow, activeConfig)) return;
+        rowsChanged = mergeDeltaFlowPayload(deltaFlow) || rowsChanged;
+      });
       batchItems(payload, 'opbV2ByOptions').forEach(item => {
         rowsChanged = mergeOpbV2ByOption(item) || rowsChanged;
       });
@@ -307,7 +328,7 @@
         validation: lastPayload(batchItems(payload, 'hpsfValidations'))
       });
       if (rowsChanged) bumpRows();
-    }, [applyHpsfViews, applyVolumeSandwichAlertPayload, applyVolumeSandwichPayload, bumpRows, mergeGexPayload, mergeOpbV2ByOption, mergeOpbV2Session, mergePacePayload, mergeSnapshotPayload, mergeStrikeFlowPayload]);
+    }, [applyHpsfViews, applyVolumeSandwichAlertPayload, applyVolumeSandwichPayload, bumpRows, mergeDeltaFlowPayload, mergeGexPayload, mergeOpbV2ByOption, mergeOpbV2Session, mergePacePayload, mergeSnapshotPayload, mergeStrikeFlowPayload]);
 
     useEffect(() => {
       fetch(apiUrl('/api/config'), { cache: 'no-store' })
@@ -407,13 +428,14 @@
 		            const strike = Number(payload.strike);
 		            const removeAllSources = String(payload.source || payload.marketDataSource || '').toUpperCase() === 'ALL';
 		            const keys = removeAllSources
-		              ? matchingStrikeKeys([rowsRef.current, pacesRef.current, gexByStrikeRef.current, strikeFlowRef.current], payload)
+		              ? matchingStrikeKeys([rowsRef.current, pacesRef.current, gexByStrikeRef.current, strikeFlowRef.current, deltaFlowRef.current], payload)
 		              : [activeContractKey(payload, config)];
 		            keys.forEach(key => {
 		              rowsRef.current.delete(key);
 		              pacesRef.current.delete(key);
 		              gexByStrikeRef.current.delete(key);
 		              strikeFlowRef.current.delete(key);
+		              deltaFlowRef.current.delete(key);
 		            });
 	            setLatestSnapshot(current => Number(current?.strike) === strike ? undefined : current);
 	            setSelectedSpread(current => Number(current?.strike) === strike ? undefined : current);
@@ -431,6 +453,11 @@
                       } else if (message.type === 'strike-flow') {
                         if (!shouldAcceptStrikeFlowPayload(payload, config)) return;
                         if (mergeStrikeFlowPayload(payload)) {
+                          bumpRows();
+                        }
+                      } else if (message.type === 'delta-flow') {
+                        if (!shouldAcceptStrikeFlowPayload(payload, config)) return;
+                        if (mergeDeltaFlowPayload(payload)) {
                           bumpRows();
                         }
                       } else if (message.type === 'opb-v2-by-option') {
@@ -502,7 +529,7 @@
           wsRef.current.close();
         }
       };
-	    }, [applyConfigState, applyHpsfViews, applyUiBatch, applyVolumeSandwichAlertPayload, applyVolumeSandwichPayload, bumpRows, clearData, config, configReady, mergeGexPayload, mergeOpbV2ByOption, mergeOpbV2Session, mergePacePayload, mergeSnapshotPayload, mergeStrikeFlowPayload]);
+	    }, [applyConfigState, applyHpsfViews, applyUiBatch, applyVolumeSandwichAlertPayload, applyVolumeSandwichPayload, bumpRows, clearData, config, configReady, mergeDeltaFlowPayload, mergeGexPayload, mergeOpbV2ByOption, mergeOpbV2Session, mergePacePayload, mergeSnapshotPayload, mergeStrikeFlowPayload]);
 
     useEffect(() => () => {
       centerTimersRef.current.forEach(window.clearTimeout);
@@ -1469,6 +1496,7 @@
 
 				                  function StrikeCell({ row, maxAbsGex }) {
 				                    const gex = gexStrikeState(row, maxAbsGex);
+				                    const deltaFlow = deltaFlowCellState(row);
 				                    const gexExpiry = normalizeExpiry(row.uwGexExpiry || row.expiry);
 				                    const historyJson = JSON.stringify(row.uwGexHistory || {});
 				                    const timeframe = String(row.uwGexTimeframe || '1D').toUpperCase();
@@ -1498,7 +1526,10 @@
 				                        h('span', { className: 'strike-gex-line' },
 				                          h('span', { className: 'strike-price-value' }, row.strike),
 				                          gex.visible ? h('span', { className: 'uw-gex-value' }, gex.text) : null
-				                        )
+				                        ),
+				                        deltaFlow.visible
+				                          ? h('span', { className: `delta-flow-value ${deltaFlow.className}`, title: deltaFlow.title, 'aria-label': deltaFlow.title }, `Δ ${deltaFlow.text}`)
+				                          : null
 				                      ),
 				                      gex.visible ? h(GexHistoryPopover, { row, gex }) : null,
 				                      gex.stale ? h('sup', { className: 'gamma-stale-marker', title: `${gexSourceMeta(row).display} exposure is stale` }, '?') : null
@@ -2913,6 +2944,25 @@
 	    return number > 0 ? `+${text}` : text;
 	  }
 
+  // Compact per-strike Δ-Flow render state. Blank (visible=false) when no delta-flow has merged onto
+  // the row. sessionNetDeltaFlow is signed and colored by sign (positive green / negative red).
+  function deltaFlowCellState(row) {
+    const flow = row?.deltaFlow;
+    if (!flow || !Number.isFinite(Number(flow.sessionNetDeltaFlow))) {
+      return { visible: false };
+    }
+    const value = Number(flow.sessionNetDeltaFlow);
+    const className = value > 0 ? 'delta-flow-positive' : (value < 0 ? 'delta-flow-negative' : 'delta-flow-zero');
+    const quality = flow.confidenceWeightQuality ? ` (${flow.confidenceWeightQuality})` : '';
+    return {
+      visible: true,
+      value,
+      text: fmtSignedGex(value),
+      className,
+      title: `Session net Δ-flow ${fmtSignedGex(value)}${quality}`
+    };
+  }
+
   function fmtSignedUsdGex(value) {
     const number = Number(value || 0);
     const text = fmtGex(Math.abs(number));
@@ -2935,6 +2985,25 @@
 	  function strikeRowTitle(row) {
 	    return `Strike ${row.strike}`;
 	  }
+
+  // Per-strike delta-flow row-merge object. The visible number is sessionNetDeltaFlow; the other
+  // confidence/side fields ride along for the tooltip. NB: confidenceWeightedNetDeltaFlow is
+  // deliberately NOT surfaced — it is structurally always 0 on OPRA (R11 never calibrates).
+  function normalizeDeltaFlowPayload(payload) {
+    const strike = Number(payload?.strike);
+    if (!Number.isFinite(strike)) return undefined;
+    return {
+      strike,
+      deltaFlow: {
+        strike,
+        sessionNetDeltaFlow: Number(payload?.sessionNetDeltaFlow || 0),
+        highConfidenceNetDeltaFlow: Number(payload?.highConfidenceNetDeltaFlow || 0),
+        strikeNetCallDeltaFlow: Number(payload?.strikeNetCallDeltaFlow || 0),
+        strikeNetPutDeltaFlow: Number(payload?.strikeNetPutDeltaFlow || 0),
+        confidenceWeightQuality: String(payload?.confidenceWeightQuality || '').toUpperCase()
+      }
+    };
+  }
 
   function normalizeGexPayload(payload) {
     return {

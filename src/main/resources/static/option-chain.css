@@ -1215,6 +1215,33 @@ td.sandwich-role-outer {
     justify-self: end;
 }
 
+/* Compact per-strike Δ-Flow (sessionNetDeltaFlow), signed + colored by sign. */
+.delta-flow-value {
+    display: block;
+    margin-top: 1px;
+    max-width: 100%;
+    overflow: hidden;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.05;
+    font-variant-numeric: tabular-nums;
+    text-overflow: ellipsis;
+    text-align: right;
+    justify-self: end;
+}
+
+.delta-flow-value.delta-flow-positive {
+    color: #2ecc71;
+}
+
+.delta-flow-value.delta-flow-negative {
+    color: #e74c3c;
+}
+
+.delta-flow-value.delta-flow-zero {
+    color: rgba(255, 255, 255, 0.7);
+}
+
 .gex-strength-fill {
     position: absolute;
     top: 0;

@@ -62,6 +62,26 @@ class GatewayRecordMapperTest {
     }
 
     @Test
+    void mapsDeltaFlowAsContractEventWithStrike() throws Exception {
+        // delta-flow is per-strike JSON (DeltaFlowStrikeSnapshot), keyed symbol|date|expiry|strike —
+        // it routes CONTRACT-scoped by source|symbol|expiry AND carries a strike for the per-user filter.
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "delta-flow",
+                node("{\"symbol\":\"SPX\",\"tradingDate\":\"2026-06-17\",\"expiry\":\"20260617\","
+                        + "\"strike\":6000.0,\"sessionNetDeltaFlow\":12345.6,"
+                        + "\"confidenceWeightQuality\":\"DEGRADED\"}")).orElseThrow();
+        assertEquals(EventType.DELTA_FLOW, rec.eventType());
+        assertTrue(EventType.DELTA_FLOW.isContractScoped());
+        assertEquals("SPX", rec.symbol());
+        assertEquals("20260617", rec.expiry());
+        assertEquals(6000.0, rec.strike().getAsDouble());
+    }
+
+    @Test
+    void deltaFlowEventTypeMapping() {
+        assertEquals(EventType.DELTA_FLOW, GatewayRecordMapper.eventTypeFor("delta-flow"));
+    }
+
+    @Test
     void unknownEventReturnsEmpty() throws Exception {
         assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "hpsf-latest-signal",
                 node("{\"symbol\":\"SPX\"}")).isEmpty());

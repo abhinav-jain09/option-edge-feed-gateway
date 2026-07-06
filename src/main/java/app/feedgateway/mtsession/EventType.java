@@ -15,6 +15,9 @@ public enum EventType {
     PACE_RANK(Scope.CONTRACT),
     DIRECTIONAL_PRESSURE(Scope.CONTRACT),
     STRIKE_FLOW(Scope.CONTRACT),
+    // Per-strike delta-flow signal — one record per (symbol, expiry, strike), so it routes
+    // CONTRACT-scoped by source|symbol|expiry and is strike-filtered per user (like GEX_BY_STRIKE).
+    DELTA_FLOW(Scope.CONTRACT),
     MISSION_PACE(Scope.CONTRACT),
     MISSION_CONTROL(Scope.CONTRACT),
     VOLUME_SANDWICH(Scope.CONTRACT),

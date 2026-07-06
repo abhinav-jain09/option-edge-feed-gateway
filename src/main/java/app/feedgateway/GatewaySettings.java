@@ -219,6 +219,16 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_STRIKE_FLOW_TOPIC", "options.databento.strike-flow");
     }
 
+    /**
+     * Per-strike delta-flow topic (JSON {@code DeltaFlowStrikeSnapshot}, one record per
+     * {@code symbol|date|expiry|strike}) from delta-flow-service. Broadcast as event
+     * {@code "delta-flow"}. NB: unlike the {@code options.databento.*} topics, the delta-flow
+     * topics are UNPREFIXED — the default is the bare name {@code delta-flow-by-strike}.
+     */
+    public String databentoDeltaFlowByStrikeTopic() {
+        return value("KAFKA_DATABENTO_DELTA_FLOW_BY_STRIKE_TOPIC", "delta-flow-by-strike");
+    }
+
     /** dealer-ledger-service chain-level book (U1-U9), one record per (symbol, expiry). */
     public String dealerLedgerProfileTopic() {
         return value("KAFKA_DEALER_LEDGER_PROFILE_TOPIC", "dealer-ledger-profile");
