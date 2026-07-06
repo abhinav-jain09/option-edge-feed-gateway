@@ -146,7 +146,10 @@
       const pace = pacesRef.current.get(key);
       const gex = gexByStrikeRef.current.get(key);
       const strikeFlow = strikeFlowRef.current.get(key);
-      const deltaFlow = deltaFlowRef.current.get(key);
+      const cachedDeltaFlow = deltaFlowRef.current.get(key);
+      // FIX 3: do NOT re-merge a STALE cached delta-flow onto a fresh snapshot row — otherwise an old
+      // value reappears forever on every later snapshot as a false live signal once publishing stops.
+      const deltaFlow = deltaFlowIsFresh(cachedDeltaFlow?.deltaFlow, Date.now()) ? cachedDeltaFlow : null;
       rowsRef.current.set(key, { ...payload, ...(pace || {}), ...(gex || {}), ...(strikeFlow || {}), ...(deltaFlow || {}) });
       return true;
     }, []);
@@ -2944,6 +2947,27 @@
 	    return number > 0 ? `+${text}` : text;
 	  }
 
+  // FIX 3: client-side staleness TTL for per-strike delta-flow, measured against the CLIENT receive
+  // time (receivedAtMs) so it is robust to browser clock skew. If delta-flow stops publishing, the
+  // last value must stop counting as live rather than re-merging forever as a false signal.
+  const DELTA_FLOW_STALE_MS = 90_000;
+
+  // A merged delta-flow object is FRESH when it was received within DELTA_FLOW_STALE_MS. Uses the
+  // receive-time delta (never event-time-vs-wall-clock). A missing receivedAtMs is treated as stale.
+  function deltaFlowIsFresh(flow, nowMs) {
+    const receivedAtMs = Number(flow?.receivedAtMs);
+    if (!Number.isFinite(receivedAtMs)) return false;
+    return (Number(nowMs) - receivedAtMs) <= DELTA_FLOW_STALE_MS;
+  }
+
+  // FIX 4: dedicated signed formatter for delta-flow. Unit is SHARE_DELTA (net buyer-aggressor
+  // share-delta at the strike), NOT dollar gamma — delegates to the compact K/M/B formatter.
+  function fmtSignedDeltaFlow(value) {
+    const number = Number(value || 0);
+    const text = fmtGex(number); // fmtGex is a plain compact K/M/B number formatter (unit-agnostic)
+    return number > 0 ? `+${text}` : text;
+  }
+
   // Compact per-strike Δ-Flow render state. Blank (visible=false) when no delta-flow has merged onto
   // the row. sessionNetDeltaFlow is signed and colored by sign (positive green / negative red).
   function deltaFlowCellState(row) {
@@ -2951,15 +2975,29 @@
     if (!flow || !Number.isFinite(Number(flow.sessionNetDeltaFlow))) {
       return { visible: false };
     }
+    // FIX 3: a stale delta-flow (no update within the TTL) is HIDDEN rather than rendered as a normal
+    // live number — a stale trading signal shown as current is worse than a blank cell.
+    if (!deltaFlowIsFresh(flow, Date.now())) {
+      return { visible: false, stale: true };
+    }
     const value = Number(flow.sessionNetDeltaFlow);
     const className = value > 0 ? 'delta-flow-positive' : (value < 0 ? 'delta-flow-negative' : 'delta-flow-zero');
-    const quality = flow.confidenceWeightQuality ? ` (${flow.confidenceWeightQuality})` : '';
+    // FIX 4: richer tooltip so an operator can see whether the net is call/put/high-confidence driven.
+    const quality = flow.confidenceWeightQuality || 'UNKNOWN';
+    const eventTime = Number.isFinite(Number(flow.asOfEventTimeMs)) ? formatTime(Number(flow.asOfEventTimeMs)) : 'unknown';
+    const title = [
+      `Session net Δ-flow ${fmtSignedDeltaFlow(value)}`,
+      `High-confidence net ${fmtSignedDeltaFlow(flow.highConfidenceNetDeltaFlow)}`,
+      `Call net ${fmtSignedDeltaFlow(flow.strikeNetCallDeltaFlow)} | Put net ${fmtSignedDeltaFlow(flow.strikeNetPutDeltaFlow)}`,
+      `Quality ${quality} | event ${eventTime}`,
+      `Positive = net buyer-aggressor share-delta at the strike`
+    ].join('\n');
     return {
       visible: true,
       value,
-      text: fmtSignedGex(value),
+      text: fmtSignedDeltaFlow(value),
       className,
-      title: `Session net Δ-flow ${fmtSignedGex(value)}${quality}`
+      title
     };
   }
 
@@ -2992,15 +3030,26 @@
   function normalizeDeltaFlowPayload(payload) {
     const strike = Number(payload?.strike);
     if (!Number.isFinite(strike)) return undefined;
+    // FIX 2: reject a missing/null/non-finite sessionNetDeltaFlow rather than masking it as a real 0.
+    // The visible cell renders sessionNetDeltaFlow, so a schema-drifted/absent field would otherwise
+    // show a fake neutral "Δ 0.00". Blank (reject the whole payload) beats a fabricated live signal.
+    const sessionNetDeltaFlow = Number(payload?.sessionNetDeltaFlow);
+    if (!Number.isFinite(sessionNetDeltaFlow)) return undefined;
+    // FIX 3: carry the producer event time and stamp a CLIENT receive time. The receive time (same
+    // Date.now() clock the UI uses elsewhere) drives client-side staleness via receive-time deltas,
+    // which is robust to browser clock skew (never compares event time against wall clock).
+    const asOfEventTimeMs = Number(payload?.asOfEventTimeMs);
     return {
       strike,
       deltaFlow: {
         strike,
-        sessionNetDeltaFlow: Number(payload?.sessionNetDeltaFlow || 0),
+        sessionNetDeltaFlow,
         highConfidenceNetDeltaFlow: Number(payload?.highConfidenceNetDeltaFlow || 0),
         strikeNetCallDeltaFlow: Number(payload?.strikeNetCallDeltaFlow || 0),
         strikeNetPutDeltaFlow: Number(payload?.strikeNetPutDeltaFlow || 0),
-        confidenceWeightQuality: String(payload?.confidenceWeightQuality || '').toUpperCase()
+        confidenceWeightQuality: String(payload?.confidenceWeightQuality || '').toUpperCase(),
+        asOfEventTimeMs: Number.isFinite(asOfEventTimeMs) ? asOfEventTimeMs : undefined,
+        receivedAtMs: Date.now()
       }
     };
   }

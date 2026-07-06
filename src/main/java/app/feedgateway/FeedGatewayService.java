@@ -3008,11 +3008,30 @@ public class FeedGatewayService implements ReplayRunner {
                 return payloadTime;
             }
         }
+        if ("delta-flow".equals(event)) {
+            // Freshness MUST track the PAYLOAD event time (asOfEventTimeMs), not the Kafka ARRIVAL time
+            // (mirrors dealer-ledger above). A producer catching up / backfilling appends records now
+            // (fresh arrival) whose asOfEventTimeMs is old — using arrival time would let a stale
+            // delta-flow signal pass the cache-fresh TTL + replay barriers and render as live.
+            long payloadTime = deltaFlowTimestamp(json);
+            if (payloadTime >= 0) {
+                return payloadTime;
+            }
+        }
         return cacheTimestamp(record);
     }
 
     /** Event time (asOfEventTimeMs) of a raw dealer-ledger profile/state record; -1 if absent/unparseable. */
     private long dealerLedgerEventTimestamp(String json) {
+        try {
+            return longField(mapper.readTree(json), "asOfEventTimeMs", -1L);
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
+    }
+
+    /** Event time (asOfEventTimeMs) of a raw per-strike delta-flow record; -1 if absent/unparseable. */
+    private long deltaFlowTimestamp(String json) {
         try {
             return longField(mapper.readTree(json), "asOfEventTimeMs", -1L);
         } catch (JsonProcessingException ignored) {
