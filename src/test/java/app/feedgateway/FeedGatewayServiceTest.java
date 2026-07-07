@@ -525,6 +525,26 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void slowGexByStrikeIsExemptFromCachedReplayBarriersLikeMaxPain() {
+        // GEX is a once-daily-OI signal whose latest per-strike record is routinely older than the 15s
+        // selection barrier — it must replay on connect like snapshot/max-pain, not be re-dropped as stale.
+        assertFalse(FeedGatewayService.enforceCachedReplayMaxStale("gex-by-strike", "DATABENTO"));
+        assertFalse(FeedGatewayService.enforceCachedReplayMaxStale("gex-by-strike", "IBKR"));
+        assertFalse(FeedGatewayService.enforceCachedReplayOffsetBarrier("gex-by-strike", "DATABENTO"));
+        assertFalse(FeedGatewayService.enforceCachedReplayOffsetBarrier("gex-by-strike", "IBKR"));
+        // Regression guard: max-pain stays exempt, fast flow signals stay gated.
+        assertFalse(FeedGatewayService.enforceCachedReplayMaxStale("max-pain", "DATABENTO"));
+        assertTrue(FeedGatewayService.enforceCachedReplayMaxStale("strike-flow", "DATABENTO"));
+    }
+
+    @Test
+    void gexByStrikeUsesLongLastValueWinsTtlLikeMaxPain() {
+        // Default: GEX shares max-pain's 12h window so a slow strike is not evicted after 15 min.
+        GatewaySettings s = new GatewaySettings();
+        assertEquals(s.maxPainTtlMs(), s.gexByStrikeTtlMs());
+    }
+
+    @Test
     void cachedOptionSnapshotsCanReplayBeforeNewSelectionTime() {
         FeedGatewayService service = new FeedGatewayService(
                 new GatewaySettings(),

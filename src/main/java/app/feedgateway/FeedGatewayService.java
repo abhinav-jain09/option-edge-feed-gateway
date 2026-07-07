@@ -2722,7 +2722,15 @@ public class FeedGatewayService implements ReplayRunner {
                         .forEach(cachedEvents::add);
                 case "gex-by-strike" -> gexByStrike.entrySet().stream()
                         .filter(entry -> isCacheFresh("gex-by-strike:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("gex-by-strike:" + entry.getKey(), selection))
+                        // Slow daily-OI signal like max-pain: relax the time-freshness + offset barriers on
+                        // cached replay (enforceCachedReplay* return false for gex-by-strike) so a valid-but-slow
+                        // GEX still replays on connect instead of being re-dropped by the 15s selection barrier.
+                        .filter(entry -> passesSelectionBarrier(
+                                "gex-by-strike:" + entry.getKey(),
+                                selection,
+                                enforceCachedReplayMaxStale("gex-by-strike", selection == null ? "" : selection.source()),
+                                enforceCachedReplayOffsetBarrier("gex-by-strike", selection == null ? "" : selection.source())
+                        ))
                         // Source-aware (not hard IBKR-only): the gexByStrike cache now holds BOTH IBKR
                         // (Unusual-Whales, JSON) AND DATABENTO (Avro) entries, source-prefixed in the key.
                         // matchesCachedSelection enforces (source,symbol,expiry) isolation, so an IBKR
@@ -2882,6 +2890,12 @@ public class FeedGatewayService implements ReplayRunner {
         if ("max-pain".equals(event)) {
             return CachePolicy.expiring(settings.maxPainTtlMs());
         }
+        if ("gex-by-strike".equals(event)) {
+            // GEX is a slow once-daily-OI signal like max-pain: a strike re-emits only when it trades, so its
+            // latest record is routinely older than the generic 15-min TTL. Use a long last-value-wins window
+            // (default 12h) so a valid-but-slow GEX is not evicted and still replays on connect.
+            return CachePolicy.expiring(settings.gexByStrikeTtlMs());
+        }
         if ("liquidity-heatmap".equals(event)) {
             // Per-second column frames: SHORT window (default 5s), never the generic 15-min TTL —
             // a minutes-old frame must read as stale/absent, not live liquidity.
@@ -2967,19 +2981,19 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     static boolean enforceCachedReplayMaxStale(String event, String source) {
-        // snapshot AND max-pain are "current-state" caches replayed in full on connect. Max-pain is a slow
-        // daily-OI signal whose latest record is routinely older than maxStaleMs (15s) and older than the
-        // client's selectedAtMs — enforcing the max-stale/selected-time barrier here would re-drop it even
-        // after the TTL seam admits it. Selection isolation is still enforced by matchesCachedSelection +
-        // the DATABENTO source filter; this only relaxes the time-freshness barrier.
-        return !"snapshot".equals(event) && !"max-pain".equals(event);
+        // snapshot, max-pain AND gex-by-strike are "current-state" caches replayed in full on connect. Max-pain
+        // and GEX are slow daily-OI signals whose latest record is routinely older than maxStaleMs (15s) and
+        // older than the client's selectedAtMs — enforcing the max-stale/selected-time barrier here would
+        // re-drop them even after the TTL seam admits them. Selection isolation is still enforced by
+        // matchesCachedSelection + the DATABENTO source filter; this only relaxes the time-freshness barrier.
+        return !"snapshot".equals(event) && !"max-pain".equals(event) && !"gex-by-strike".equals(event);
     }
 
     static boolean enforceCachedReplayOffsetBarrier(String event, String source) {
-        // Same rationale as enforceCachedReplayMaxStale: a slow max-pain's latest record can sit below the
+        // Same rationale as enforceCachedReplayMaxStale: a slow max-pain/GEX latest record can sit below the
         // session's per-partition offset barrier (set when other fast topics advanced past selection), so
-        // the offset barrier would wrongly filter the current max-pain on replay. Exempt like snapshot.
-        return !"snapshot".equals(event) && !"max-pain".equals(event);
+        // the offset barrier would wrongly filter the current max-pain/GEX on replay. Exempt like snapshot.
+        return !"snapshot".equals(event) && !"max-pain".equals(event) && !"gex-by-strike".equals(event);
     }
 
     private boolean passesOffsetBarrier(TopicPartition partition, long offset) {
