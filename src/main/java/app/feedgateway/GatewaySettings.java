@@ -500,6 +500,19 @@ public final class GatewaySettings {
     }
 
     /**
+     * Freshness TTL for the DATABENTO per-strike GEX cache ({@code gex-by-strike}). GEX is derived from
+     * once-daily Open Interest (published ~06:30 ET), so a given strike re-emits only when it trades — its
+     * latest record is routinely older than the generic 15s selection barrier and older than the client's
+     * selectedAtMs. Treated exactly like {@link #maxPainTtlMs() max-pain}: a long last-value-wins window so a
+     * valid-but-slow GEX still replays on connect (default 12h). Selection isolation is still enforced by
+     * matchesCachedSelection + the source filter; this only relaxes the time-freshness barrier.
+     * {@code <= 0} preserves the generic "do not cache stale state" semantics (NOT infinite).
+     */
+    public long gexByStrikeTtlMs() {
+        return longValue("GATEWAY_GEX_BY_STRIKE_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
+    /**
      * Freshness TTL for the structural option-chain cache (the {@code snapshot} strike ladder — see
      * {@code FeedGatewayService.MARKET_AWARE_CHAIN_EVENTS}) DURING regular trading hours — default 10 min.
      * Off-hours the chain is never evicted (see {@link FeedGatewayService} cache policy + {@link #marketCalendar()}),
