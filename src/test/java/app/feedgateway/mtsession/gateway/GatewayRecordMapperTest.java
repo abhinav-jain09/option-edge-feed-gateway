@@ -82,6 +82,25 @@ class GatewayRecordMapperTest {
     }
 
     @Test
+    void mapsStrikeIntelAsContractEventWithStrike() throws Exception {
+        // strike-intel is per-strike JSON (StrikeIntelligenceSignal), keyed symbol|expiry|strike —
+        // it routes CONTRACT-scoped by source|symbol|expiry AND carries a strike for the per-user filter.
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "strike-intel",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20260617\","
+                        + "\"strike\":6000.0,\"strikeRole\":\"MAGNET\"}")).orElseThrow();
+        assertEquals(EventType.STRIKE_INTEL, rec.eventType());
+        assertTrue(EventType.STRIKE_INTEL.isContractScoped());
+        assertEquals("SPX", rec.symbol());
+        assertEquals("20260617", rec.expiry());
+        assertEquals(6000.0, rec.strike().getAsDouble());
+    }
+
+    @Test
+    void strikeIntelEventTypeMapping() {
+        assertEquals(EventType.STRIKE_INTEL, GatewayRecordMapper.eventTypeFor("strike-intel"));
+    }
+
+    @Test
     void unknownEventReturnsEmpty() throws Exception {
         assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "hpsf-latest-signal",
                 node("{\"symbol\":\"SPX\"}")).isEmpty());
