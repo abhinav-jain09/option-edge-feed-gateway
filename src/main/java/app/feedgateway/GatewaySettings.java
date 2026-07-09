@@ -369,11 +369,6 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_MAXPAIN_TOPIC", "options.databento.maxpain");
     }
 
-    /** Agent A short-premium recommendation output topic (JSON, key = trade_id). */
-    public String shortPremiumRecommendationTopic() {
-        return value("KAFKA_SHORT_PREMIUM_RECOMMENDATION_TOPIC", "options.short-premium.recommendation");
-    }
-
     /** Option Price Behavior dashboard output topic (JSON, per symbol/trading-date). */
     public String optionPriceBehaviorDashboardTopic() {
         return value("OPTION_PRICE_BEHAVIOR_DASHBOARD_TOPIC",
