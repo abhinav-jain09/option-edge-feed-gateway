@@ -2004,6 +2004,19 @@ public class FeedGatewayService implements ReplayRunner {
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesActiveSelection(json, selection);
         }
+        if ("mission-sandwich".equals(binding.event())) {
+            // Mission-sandwich is a low-frequency, per-MARKET signal (symbol|expiry), not per-strike —
+            // the same class as mission-pace/mission-control. The source-switch OFFSET barrier exists to
+            // suppress pre-switch high-frequency snapshot/gex/display records; applied to mission-sandwich
+            // it perpetually classifies its fresh frames as pre-switch and drops them (inactiveDropped/
+            // sourceStale), so the page never receives the sandwich. Forward when the source matches, the
+            // frame is fresh (time barrier), and it matches the active market — the binding.source() ==
+            // selection.source() check isolates the source, and matchesActiveSelection enforces the
+            // symbol/expiry identity, so there is no cross-market or cross-source leak.
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
+                    && matchesActiveSelection(json, selection);
+        }
         if ("option-price-behavior".equals(binding.event())) {
             return binding.source().equals(selection.source())
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
