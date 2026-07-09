@@ -1,5 +1,6 @@
 package app.feedgateway;
 
+import com.optionsedge.contracts.strikeintelligence.StrikeIntelligenceTopics;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
@@ -229,6 +230,16 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_DELTA_FLOW_BY_STRIKE_TOPIC", "delta-flow-by-strike");
     }
 
+    /**
+     * Per-strike strike-intelligence topic (JSON {@code StrikeIntelligenceSignal}, one record per
+     * {@code symbol|expiry|strike}) from strike-intelligence-service. Broadcast as event
+     * {@code "strike-intel"}. Like the delta-flow topic, this is UNPREFIXED — the default is the
+     * bare name {@code strike-intelligence-by-strike}.
+     */
+    public String strikeIntelByStrikeTopic() {
+        return value("STRIKE_INTEL_BY_STRIKE_TOPIC", StrikeIntelligenceTopics.STRIKE_INTELLIGENCE_BY_STRIKE);
+    }
+
     /** dealer-ledger-service chain-level book (U1-U9), one record per (symbol, expiry). */
     public String dealerLedgerProfileTopic() {
         return value("KAFKA_DEALER_LEDGER_PROFILE_TOPIC", "dealer-ledger-profile");
@@ -356,6 +367,11 @@ public final class GatewaySettings {
     /** Databento per-(symbol,expiry) max-pain output topic. Independent of GEX; consumed only by the max-pain stream. */
     public String databentoMaxPainTopic() {
         return value("KAFKA_DATABENTO_MAXPAIN_TOPIC", "options.databento.maxpain");
+    }
+
+    /** Agent A short-premium recommendation output topic (JSON, key = trade_id). */
+    public String shortPremiumRecommendationTopic() {
+        return value("KAFKA_SHORT_PREMIUM_RECOMMENDATION_TOPIC", "options.short-premium.recommendation");
     }
 
     /** Option Price Behavior dashboard output topic (JSON, per symbol/trading-date). */
