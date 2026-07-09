@@ -28,7 +28,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
