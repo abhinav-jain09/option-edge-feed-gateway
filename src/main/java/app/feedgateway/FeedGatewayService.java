@@ -109,7 +109,7 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "strike-sr",
             "max-pain",
             "liquidity-heatmap",
@@ -2386,6 +2386,12 @@ public class FeedGatewayService implements ReplayRunner {
                 currentStates.put(versionKey, json);
                 return versionKey;
             }
+            case "mission-sandwich" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                currentStates.put(versionKey, json);
+                return versionKey;
+            }
             case "gex-by-strike" -> {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
@@ -2765,6 +2771,14 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("volume-sandwich", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "mission-sandwich" -> currentStates.entrySet().stream()
+                        .filter(entry -> "mission-sandwich".equals(eventFromCacheKey(entry.getKey())))
+                        .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier(entry.getKey(), selection))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("mission-sandwich", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "gex-by-strike" -> gexByStrike.entrySet().stream()
                         .filter(entry -> isCacheFresh("gex-by-strike:" + entry.getKey(), nowMs))
@@ -3174,6 +3188,8 @@ public class FeedGatewayService implements ReplayRunner {
         } else if (versionKey.startsWith("mission-control:")) {
             missionControls.remove(versionKey.substring("mission-control:".length()));
         } else if (versionKey.startsWith("volume-sandwich:")) {
+            currentStates.remove(versionKey);
+        } else if (versionKey.startsWith("mission-sandwich:")) {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
