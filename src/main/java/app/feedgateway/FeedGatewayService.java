@@ -144,8 +144,6 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> maxPain = new ConcurrentHashMap<>();
-    // Agent A short-premium recommendations, cached per trade_id (last-value-wins), replayed on connect.
-    private final Map<String, String> shortPremiumRecommendations = new ConcurrentHashMap<>();
     private final Map<String, String> optionPriceBehaviors = new ConcurrentHashMap<>();
     // Dealer-ledger: the two source topics are cached RAW per (source|symbol|expiry), and the JOINED
     // envelope the UI consumes is cached in dealerLedgers (last-value-wins). See DealerLedgerJoiner.
@@ -1124,8 +1122,6 @@ public class FeedGatewayService implements ReplayRunner {
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
         topicEvents.put(settings.dealerLedgerStateTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
-        // Agent A short-premium recommendations (JSON, standalone/optional like dealer-ledger).
-        topicEvents.put(settings.shortPremiumRecommendationTopic(), new TopicBinding("DATABENTO", "short-premium-recommendation"));
         // Liquidity-heatmap frames are JSON (StrikeLiquidityHeatmapFrame) — this string consumer,
         // never the Avro one (the Avro-read-as-JSON bug class).
         topicEvents.put(settings.strikeLiquidityTopic(), new TopicBinding("DATABENTO", "liquidity-heatmap"));
@@ -1178,8 +1174,6 @@ public class FeedGatewayService implements ReplayRunner {
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
         topicEvents.put(settings.dealerLedgerStateTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
-        // Symmetric with the cache consumer: Agent A short-premium recommendations (JSON, standalone/optional).
-        topicEvents.put(settings.shortPremiumRecommendationTopic(), new TopicBinding("DATABENTO", "short-premium-recommendation"));
         // Keep the cache + live JSON consumer topic sets symmetric (same rule as gex-history).
         topicEvents.put(settings.strikeLiquidityTopic(), new TopicBinding("DATABENTO", "liquidity-heatmap"));
         topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding("DATABENTO", "mission-pace"));
@@ -2254,8 +2248,6 @@ public class FeedGatewayService implements ReplayRunner {
             key = directionalPressureCacheKey(json, key);
         } else if ("vix-price".equals(event) || "index-price".equals(event)) {
             key = indexPriceCacheKey(json, key);
-        } else if ("short-premium-recommendation".equals(event)) {
-            key = shortPremiumRecommendationCacheKey(json, key);
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
         } else if ("delta-flow".equals(event)) {
@@ -2352,12 +2344,6 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 indexPrices.put(key, json);
-                return key;
-            }
-            case "short-premium-recommendation" -> {
-                cacheEventTimes.put(versionKey, eventTime);
-                cachePositions.put(versionKey, recordPosition(record));
-                shortPremiumRecommendations.put(key, json);
                 return key;
             }
             case "strike-flow" -> {
