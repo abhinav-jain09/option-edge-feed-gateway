@@ -452,6 +452,10 @@ public class FeedGatewayService implements ReplayRunner {
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
             replayDealerLedgerCached(session);
+            // short-premium recommendations are likewise STANDALONE; replay the day's cached recommendations
+            // so a page reload mid-session (or a client that connects after Agent A acted) still shows the
+            // active overlay rather than waiting for the next live broadcast.
+            replayShortPremiumCached(session);
         }
         // gex-by-strike is the one MULTI-SOURCE cache: IBKR/Unusual-Whales gex arrives via the JSON state
         // consumer while DATABENTO gex arrives via the Avro consumer. Its cached replay is only complete once
@@ -1535,6 +1539,17 @@ public class FeedGatewayService implements ReplayRunner {
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
                                 && !strikeIntelStale) {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
+                            forwardedEvents.incrementAndGet();
+                        }
+                    } else if ("short-premium-recommendation".equals(binding.event())) {
+                        // Advisory chain-level overlay: broadcast STANDALONE (its own message.type) to every
+                        // connected dashboard as soon as a fresh recommendation is cached. Unlike market-data it
+                        // is deliberately NOT gated by the per-market active selection — that selection is null
+                        // pre-open and until a client selects a market, which would suppress the overlay exactly
+                        // when Agent A acts late in the session. The UI filters by symbol client-side, and a
+                        // recommendation is low-frequency + keyed to today's expiry, so a global broadcast is safe.
+                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                            broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
                     } else if (cacheKey != null && cacheCaughtUpFlag.get()
@@ -3463,6 +3478,26 @@ public class FeedGatewayService implements ReplayRunner {
             if (json != null && !json.isBlank() && matchesCachedSelection(json, selection)) {
                 send(session, "dealer-ledger", json);
             }
+        }
+    }
+
+    private void replayShortPremiumCached(WebSocketSession session) {
+        // Purge first so a recommendation that crossed its (12h) TTL since the last poll purge is evicted
+        // before replay rather than sent to the connecting client. Unlike dealer-ledger this is intentionally
+        // NOT filtered by the active market selection: a recommendation is an advisory overlay filtered by
+        // symbol client-side, and replaying all fresh recommendations lets a reload restore the overlay even
+        // before the client has (re)selected a market.
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        for (Map.Entry<String, String> entry : shortPremiumRecommendations.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("short-premium-recommendation:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, "short-premium-recommendation", json);
         }
     }
 
