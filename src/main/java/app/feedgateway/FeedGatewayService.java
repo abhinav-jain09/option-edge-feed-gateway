@@ -144,6 +144,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> maxPain = new ConcurrentHashMap<>();
+    // Agent A short-premium recommendations, cached per trade_id (last-value-wins), replayed on connect.
+    private final Map<String, String> shortPremiumRecommendations = new ConcurrentHashMap<>();
     private final Map<String, String> optionPriceBehaviors = new ConcurrentHashMap<>();
     // Dealer-ledger: the two source topics are cached RAW per (source|symbol|expiry), and the JOINED
     // envelope the UI consumes is cached in dealerLedgers (last-value-wins). See DealerLedgerJoiner.
@@ -1122,6 +1124,8 @@ public class FeedGatewayService implements ReplayRunner {
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
         topicEvents.put(settings.dealerLedgerStateTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
+        // Agent A short-premium recommendations (JSON, standalone/optional like dealer-ledger).
+        topicEvents.put(settings.shortPremiumRecommendationTopic(), new TopicBinding("DATABENTO", "short-premium-recommendation"));
         // Liquidity-heatmap frames are JSON (StrikeLiquidityHeatmapFrame) — this string consumer,
         // never the Avro one (the Avro-read-as-JSON bug class).
         topicEvents.put(settings.strikeLiquidityTopic(), new TopicBinding("DATABENTO", "liquidity-heatmap"));
@@ -1174,6 +1178,8 @@ public class FeedGatewayService implements ReplayRunner {
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
         topicEvents.put(settings.dealerLedgerStateTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
+        // Symmetric with the cache consumer: Agent A short-premium recommendations (JSON, standalone/optional).
+        topicEvents.put(settings.shortPremiumRecommendationTopic(), new TopicBinding("DATABENTO", "short-premium-recommendation"));
         // Keep the cache + live JSON consumer topic sets symmetric (same rule as gex-history).
         topicEvents.put(settings.strikeLiquidityTopic(), new TopicBinding("DATABENTO", "liquidity-heatmap"));
         topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding("DATABENTO", "mission-pace"));
@@ -1687,7 +1693,8 @@ public class FeedGatewayService implements ReplayRunner {
                 && (topic.equals(settings.strikeLiquidityTopic())
                     || topic.equals(settings.dealerLedgerProfileTopic())
                     || topic.equals(settings.dealerLedgerStateTopic())
-                    || topic.equals(settings.strikeIntelByStrikeTopic()));
+                    || topic.equals(settings.strikeIntelByStrikeTopic())
+                    || topic.equals(settings.shortPremiumRecommendationTopic()));
     }
 
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {
@@ -2248,6 +2255,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = directionalPressureCacheKey(json, key);
         } else if ("vix-price".equals(event) || "index-price".equals(event)) {
             key = indexPriceCacheKey(json, key);
+        } else if ("short-premium-recommendation".equals(event)) {
+            key = shortPremiumRecommendationCacheKey(json, key);
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
         } else if ("delta-flow".equals(event)) {
@@ -2344,6 +2353,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 indexPrices.put(key, json);
+                return key;
+            }
+            case "short-premium-recommendation" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                shortPremiumRecommendations.put(key, json);
                 return key;
             }
             case "strike-flow" -> {
@@ -2932,6 +2947,12 @@ public class FeedGatewayService implements ReplayRunner {
         if ("max-pain".equals(event)) {
             return CachePolicy.expiring(settings.maxPainTtlMs());
         }
+        if ("short-premium-recommendation".equals(event)) {
+            // A recommendation is emitted once at entry and stays valid for the whole 0DTE session:
+            // use a long last-value-wins window (default 12h, like max-pain), NOT the generic 15-min TTL,
+            // so the overlay persists and replays on reconnect instead of vanishing minutes after entry.
+            return CachePolicy.expiring(settings.shortPremiumRecommendationTtlMs());
+        }
         if ("gex-by-strike".equals(event)) {
             // GEX is a slow once-daily-OI signal like max-pain: a strike re-emits only when it trades, so its
             // latest record is routinely older than the generic 15-min TTL. Use a long last-value-wins window
@@ -3157,6 +3178,8 @@ public class FeedGatewayService implements ReplayRunner {
             vixPrices.remove(versionKey.substring("vix-price:".length()));
         } else if (versionKey.startsWith("index-price:")) {
             indexPrices.remove(versionKey.substring("index-price:".length()));
+        } else if (versionKey.startsWith("short-premium-recommendation:")) {
+            shortPremiumRecommendations.remove(versionKey.substring("short-premium-recommendation:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
             strikeFlows.remove(versionKey.substring("strike-flow:".length()));
         } else if (versionKey.startsWith("delta-flow:")) {
@@ -3535,6 +3558,19 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** Cache key for a short-premium recommendation: the trade_id (one cache entry per trade). */
+    private String shortPremiumRecommendationCacheKey(String json, String fallback) {
+        try {
+            String tradeId = text(mapper.readTree(json), "trade_id");
+            if (!tradeId.isBlank()) {
+                return tradeId;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to the Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
     String indexPriceCacheKey(String json, String fallback) {
         try {
             JsonNode root = mapper.readTree(json);
@@ -3688,6 +3724,8 @@ public class FeedGatewayService implements ReplayRunner {
         // as index-price — so a VIX record is never delivered mislabelled as index-price.
         replayCacheMap(session, "vix-price", vixPrices);
         replayCacheMap(session, "index-price", indexPrices);
+        // Agent A recommendations: standalone per session, one envelope per cached trade_id.
+        replayCacheMap(session, "short-premium-recommendation", shortPremiumRecommendations);
     }
 
     private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {

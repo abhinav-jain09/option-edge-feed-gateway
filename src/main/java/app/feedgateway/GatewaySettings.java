@@ -369,6 +369,11 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_MAXPAIN_TOPIC", "options.databento.maxpain");
     }
 
+    /** Agent A short-premium recommendation output topic (JSON, key = trade_id). */
+    public String shortPremiumRecommendationTopic() {
+        return value("KAFKA_SHORT_PREMIUM_RECOMMENDATION_TOPIC", "options.short-premium.recommendation");
+    }
+
     /** Option Price Behavior dashboard output topic (JSON, per symbol/trading-date). */
     public String optionPriceBehaviorDashboardTopic() {
         return value("OPTION_PRICE_BEHAVIOR_DASHBOARD_TOPIC",
@@ -521,6 +526,17 @@ public final class GatewaySettings {
      */
     public long gexByStrikeTtlMs() {
         return longValue("GATEWAY_GEX_BY_STRIKE_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
+    /**
+     * Freshness TTL for the Agent A short-premium recommendation cache. A recommendation is emitted
+     * ONCE when the paper trade is taken and stays valid for the life of that (0DTE) position — the
+     * whole trading day. Like {@link #maxPainTtlMs() max-pain}, use a long last-value-wins window
+     * (default 12h) so the overlay persists and replays on reconnect, rather than being evicted by the
+     * generic 15-min TTL a few minutes after entry. {@code <= 0} preserves the generic semantics.
+     */
+    public long shortPremiumRecommendationTtlMs() {
+        return longValue("GATEWAY_SHORT_PREMIUM_RECOMMENDATION_TTL_MS", maxPainTtlMs(), 0L);
     }
 
     /**
