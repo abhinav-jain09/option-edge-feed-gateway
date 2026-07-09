@@ -826,6 +826,37 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void missionSandwichForwardsForActiveMarketDespiteSourceSwitchOffsetBarrier() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260612");
+        // Same production condition that silently dropped every fresh mission-sandwich frame: it is a
+        // low-frequency per-market signal (symbol|expiry), so its offset stays "below" the source-switch
+        // barrier captured at the last switch. Without the shouldForward special-case it is dropped as
+        // inactiveDropped/sourceStale and the option-chain never renders the sandwich.
+        setOffsetBarrier(service, settings.databentoMissionSandwichTopic(), 0, 100L);
+
+        String payload = "{\"eventType\":\"mission-sandwich\",\"source\":\"DATABENTO\",\"symbol\":\"SPX\","
+                + "\"expiry\":\"20260612\",\"spot\":6004.8,\"timestampMs\":1,"
+                + "\"callSandwich\":{\"side\":\"CALL\",\"tilt\":\"UPPER_HEAVY\",\"lowerStrike\":6000.0,"
+                + "\"midStrike\":6005.0,\"upperStrike\":6010.0,\"lowerVolume\":100,\"upperVolume\":200,\"wallVolume\":300}}";
+        Object binding = topicBinding("DATABENTO", "mission-sandwich");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.databentoMissionSandwichTopic(), 0, 12L, "SPX|20260612", payload); // offset 12 < barrier 100
+
+        // Per-market signal must forward for the active market despite the per-strike offset barrier.
+        assertTrue(shouldForward(service, binding, payload, record),
+                "mission-sandwich for the active market must forward despite the source-switch offset barrier");
+
+        // Cross-market safety: a frame for a DIFFERENT expiry must NOT leak to the active selection.
+        String otherMarket = payload.replace("20260612", "20260613");
+        ConsumerRecord<String, String> otherRecord = new ConsumerRecord<>(
+                settings.databentoMissionSandwichTopic(), 0, 13L, "SPX|20260613", otherMarket);
+        assertFalse(shouldForward(service, binding, otherMarket, otherRecord),
+                "mission-sandwich for a different market must not leak to the active selection");
+    }
+
+    @Test
     void cachedMissionPaceReplayBypassesOffsetBarrierButKeepsTimeBarrier() throws Exception {
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
