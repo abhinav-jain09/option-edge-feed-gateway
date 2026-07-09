@@ -109,7 +109,7 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "mission-pace", "mission-control", "volume-sandwich", "gex-by-strike",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "strike-sr",
             "max-pain",
             "liquidity-heatmap",
@@ -175,6 +175,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingMissionControls = new LinkedHashMap<>();
     private final Map<String, String> pendingIndexPrices = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
+    private final Map<String, String> pendingMissionSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeSr = new LinkedHashMap<>();
     private final Map<String, String> pendingMaxPain = new LinkedHashMap<>();
@@ -446,7 +447,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session"));
+            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session"));
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
             replayDealerLedgerCached(session);
@@ -1101,6 +1102,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
         topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
+        topicEvents.put(settings.databentoMissionSandwichTopic(), new TopicBinding("DATABENTO", "mission-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         // NOTE: DATABENTO gex + max-pain are Avro-encoded and consumed by runAvroCacheConsumer (above), NOT
@@ -1157,6 +1159,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
         topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
+        topicEvents.put(settings.databentoMissionSandwichTopic(), new TopicBinding("DATABENTO", "mission-sandwich"));
         topicEvents.put(settings.ibkrUnusualWhalesGexTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         topicEvents.put(settings.ibkrUnusualWhalesGexHistoryTopic(), new TopicBinding("IBKR", "gex-by-strike"));
         // DATABENTO gex + max-pain are Avro — live-consumed by runAvroLiveConsumer, not here. The
@@ -1938,7 +1941,8 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.unifiedSrTopic(),
                     settings.databentoMaxPainTopic(),
                     settings.databentoVolumeSandwichTopic(),
-                    settings.databentoVolumeSandwichAlertsTopic()
+                    settings.databentoVolumeSandwichAlertsTopic(),
+                    settings.databentoMissionSandwichTopic()
             );
         }
         return List.of();
@@ -1947,7 +1951,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -2382,6 +2386,12 @@ public class FeedGatewayService implements ReplayRunner {
                 currentStates.put(versionKey, json);
                 return versionKey;
             }
+            case "mission-sandwich" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                currentStates.put(versionKey, json);
+                return versionKey;
+            }
             case "gex-by-strike" -> {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
@@ -2761,6 +2771,14 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("volume-sandwich", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "mission-sandwich" -> currentStates.entrySet().stream()
+                        .filter(entry -> "mission-sandwich".equals(eventFromCacheKey(entry.getKey())))
+                        .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier(entry.getKey(), selection))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("mission-sandwich", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "gex-by-strike" -> gexByStrike.entrySet().stream()
                         .filter(entry -> isCacheFresh("gex-by-strike:" + entry.getKey(), nowMs))
@@ -3170,6 +3188,8 @@ public class FeedGatewayService implements ReplayRunner {
         } else if (versionKey.startsWith("mission-control:")) {
             missionControls.remove(versionKey.substring("mission-control:".length()));
         } else if (versionKey.startsWith("volume-sandwich:")) {
+            currentStates.remove(versionKey);
+        } else if (versionKey.startsWith("mission-sandwich:")) {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
@@ -4661,6 +4681,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "mission-control" -> pendingMissionControls;
             case "vix-price", "index-price" -> pendingIndexPrices;
             case "volume-sandwich" -> pendingVolumeSandwiches;
+            case "mission-sandwich" -> pendingMissionSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
             case "strike-sr" -> pendingStrikeSr;
             case "max-pain" -> pendingMaxPain;
@@ -4709,6 +4730,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingMissionControls.values()),
                         new ArrayList<>(pendingIndexPrices.values()),
                         new ArrayList<>(pendingVolumeSandwiches.values()),
+                        new ArrayList<>(pendingMissionSandwiches.values()),
                         new ArrayList<>(pendingGexByStrike.values()),
                         new ArrayList<>(pendingStrikeSr.values()),
                         new ArrayList<>(pendingMaxPain.values()),
@@ -4754,6 +4776,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingMissionControls.size()
                 + pendingIndexPrices.size()
                 + pendingVolumeSandwiches.size()
+                + pendingMissionSandwiches.size()
                 + pendingGexByStrike.size()
                 + pendingStrikeSr.size()
                 + pendingMaxPain.size()
@@ -4780,6 +4803,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingMissionControls.clear();
         pendingIndexPrices.clear();
         pendingVolumeSandwiches.clear();
+        pendingMissionSandwiches.clear();
         pendingGexByStrike.clear();
         pendingStrikeSr.clear();
         pendingMaxPain.clear();
@@ -4811,6 +4835,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> missionControlJsons = new ArrayList<>();
         List<String> indexPriceJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
+        List<String> missionSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
         List<String> strikeSrJsons = new ArrayList<>();
         List<String> maxPainJsons = new ArrayList<>();
@@ -4836,6 +4861,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "mission-control" -> missionControlJsons.add(cachedEvent.json());
                 case "vix-price", "index-price" -> indexPriceJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
+                case "mission-sandwich" -> missionSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
                 case "strike-sr" -> strikeSrJsons.add(cachedEvent.json());
                 case "max-pain" -> maxPainJsons.add(cachedEvent.json());
@@ -4865,6 +4891,7 @@ public class FeedGatewayService implements ReplayRunner {
                 missionControlJsons,
                 indexPriceJsons,
                 volumeSandwichJsons,
+                missionSandwichJsons,
                 gexByStrikeJsons,
                 strikeSrJsons,
                 maxPainJsons,
@@ -4892,6 +4919,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> missionControlJsons,
             List<String> indexPriceJsons,
             List<String> volumeSandwichJsons,
+            List<String> missionSandwichJsons,
             List<String> gexByStrikeJsons,
             List<String> strikeSrJsons,
             List<String> maxPainJsons,
@@ -4926,6 +4954,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"missionControls\":" + jsonArray(missionControlJsons) + ","
                 + "\"indexPrices\":" + jsonArray(indexPriceJsons) + ","
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
+                + "\"missionSandwiches\":" + jsonArray(missionSandwichJsons) + ","
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
                 + "\"strikeSr\":" + jsonArray(strikeSrJsons) + ","
                 + "\"maxPains\":" + jsonArray(maxPainJsons) + ","

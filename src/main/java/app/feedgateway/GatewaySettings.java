@@ -327,6 +327,10 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_VOLUME_SANDWICH_CURRENT_TOPIC", "options.databento.volume-sandwich.current");
     }
 
+    public String databentoMissionSandwichTopic() {
+        return value("KAFKA_DATABENTO_MISSION_SANDWICH_TOPIC", "options.databento.sandwich.mission");
+    }
+
     public String ibkrVolumeSandwichAlertsTopic() {
         return value("KAFKA_IBKR_VOLUME_SANDWICH_ALERTS_TOPIC",
                 value("KAFKA_VOLUME_SANDWICH_ALERTS_TOPIC", "options.ibkr.volume-sandwich.alerts"));

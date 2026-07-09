@@ -24,6 +24,7 @@ public enum EventType {
     MISSION_PACE(Scope.CONTRACT),
     MISSION_CONTROL(Scope.CONTRACT),
     VOLUME_SANDWICH(Scope.CONTRACT),
+    MISSION_SANDWICH(Scope.CONTRACT),
     GEX_BY_STRIKE(Scope.CONTRACT),
     STRIKE_SR(Scope.CONTRACT),
     // Max pain is a per-(symbol,expiry) aggregate (one value covers the whole chain), so it routes
