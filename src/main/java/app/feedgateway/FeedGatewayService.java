@@ -144,6 +144,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> maxPain = new ConcurrentHashMap<>();
+    // Agent A short-premium recommendations, cached per trade_id (last-value-wins), replayed on connect.
+    private final Map<String, String> shortPremiumRecommendations = new ConcurrentHashMap<>();
     private final Map<String, String> optionPriceBehaviors = new ConcurrentHashMap<>();
     // Dealer-ledger: the two source topics are cached RAW per (source|symbol|expiry), and the JOINED
     // envelope the UI consumes is cached in dealerLedgers (last-value-wins). See DealerLedgerJoiner.

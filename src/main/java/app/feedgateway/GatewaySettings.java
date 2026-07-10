@@ -527,6 +527,11 @@ public final class GatewaySettings {
         return longValue("GATEWAY_GEX_BY_STRIKE_TTL_MS", maxPainTtlMs(), 0L);
     }
 
+    /** Agent A short-premium recommendation output topic (JSON, key = trade_id). */
+    public String shortPremiumRecommendationTopic() {
+        return value("KAFKA_SHORT_PREMIUM_RECOMMENDATION_TOPIC", "options.short-premium.recommendation");
+    }
+
     /**
      * Freshness TTL for the Agent A short-premium recommendation cache. A recommendation is emitted
      * ONCE when the paper trade is taken and stays valid for the life of that (0DTE) position — the
