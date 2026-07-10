@@ -528,6 +528,17 @@ public final class GatewaySettings {
     }
 
     /**
+     * Freshness TTL for the Agent A short-premium recommendation cache. A recommendation is emitted
+     * ONCE when the paper trade is taken and stays valid for the life of that (0DTE) position — the
+     * whole trading day. Like {@link #maxPainTtlMs() max-pain}, use a long last-value-wins window
+     * (default 12h) so the overlay persists and replays on reconnect, rather than being evicted by the
+     * generic 15-min TTL a few minutes after entry. {@code <= 0} preserves the generic semantics.
+     */
+    public long shortPremiumRecommendationTtlMs() {
+        return longValue("GATEWAY_SHORT_PREMIUM_RECOMMENDATION_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
+    /**
      * Freshness TTL for the structural option-chain cache (the {@code snapshot} strike ladder — see
      * {@code FeedGatewayService.MARKET_AWARE_CHAIN_EVENTS}) DURING regular trading hours — default 10 min.
      * Off-hours the chain is never evicted (see {@link FeedGatewayService} cache policy + {@link #marketCalendar()}),

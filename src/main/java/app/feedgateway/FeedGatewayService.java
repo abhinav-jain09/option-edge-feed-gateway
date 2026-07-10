@@ -440,6 +440,10 @@ public class FeedGatewayService implements ReplayRunner {
         // contract leak), then live routed data (FR-11).
         if (perSessionRouting()) {
             replayCachedToSocket(session);
+            // short-premium is a GLOBAL advisory (symbol-filtered client-side), not per-session
+            // routed — replayCacheMap can't deliver it (no GatewayRecordMapper case), so replay it
+            // the same standalone way legacy mode does, so an auth-mode reload restores the overlay.
+            replayShortPremiumCached(session);
             return;
         }
         if (avroCaughtUp.get()) {
@@ -451,6 +455,10 @@ public class FeedGatewayService implements ReplayRunner {
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
             replayDealerLedgerCached(session);
+            // short-premium recommendations are likewise STANDALONE; replay the day's cached recommendations
+            // so a page reload mid-session (or a client that connects after Agent A acted) still shows the
+            // active overlay rather than waiting for the next live broadcast.
+            replayShortPremiumCached(session);
         }
         // gex-by-strike is the one MULTI-SOURCE cache: IBKR/Unusual-Whales gex arrives via the JSON state
         // consumer while DATABENTO gex arrives via the Avro consumer. Its cached replay is only complete once
@@ -1534,6 +1542,17 @@ public class FeedGatewayService implements ReplayRunner {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
+                    } else if ("short-premium-recommendation".equals(binding.event())) {
+                        // Advisory chain-level overlay: broadcast STANDALONE (its own message.type) to every
+                        // connected dashboard as soon as a fresh recommendation is cached. Unlike market-data it
+                        // is deliberately NOT gated by the per-market active selection — that selection is null
+                        // pre-open and until a client selects a market, which would suppress the overlay exactly
+                        // when Agent A acts late in the session. The UI filters by symbol client-side, and a
+                        // recommendation is low-frequency + keyed to today's expiry, so a global broadcast is safe.
+                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                            broadcast(binding.event(), forwardJson);
+                            forwardedEvents.incrementAndGet();
+                        }
                     } else if (cacheKey != null && cacheCaughtUpFlag.get()
                             && shouldForward(binding, forwardJson, record, (decided = activeSelection.get()))) {
                         if ("dealer-ledger".equals(binding.event())) {
@@ -1690,7 +1709,8 @@ public class FeedGatewayService implements ReplayRunner {
                 && (topic.equals(settings.strikeLiquidityTopic())
                     || topic.equals(settings.dealerLedgerProfileTopic())
                     || topic.equals(settings.dealerLedgerStateTopic())
-                    || topic.equals(settings.strikeIntelByStrikeTopic()));
+                    || topic.equals(settings.strikeIntelByStrikeTopic())
+                    || topic.equals(settings.shortPremiumRecommendationTopic()));
     }
 
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {
@@ -2963,6 +2983,12 @@ public class FeedGatewayService implements ReplayRunner {
         if ("max-pain".equals(event)) {
             return CachePolicy.expiring(settings.maxPainTtlMs());
         }
+        if ("short-premium-recommendation".equals(event)) {
+            // A recommendation is emitted once at entry and stays valid for the whole 0DTE session:
+            // use a long last-value-wins window (default 12h, like max-pain), NOT the generic 15-min TTL,
+            // so the overlay persists and replays on reconnect instead of vanishing minutes after entry.
+            return CachePolicy.expiring(settings.shortPremiumRecommendationTtlMs());
+        }
         if ("gex-by-strike".equals(event)) {
             // GEX is a slow once-daily-OI signal like max-pain: a strike re-emits only when it trades, so its
             // latest record is routinely older than the generic 15-min TTL. Use a long last-value-wins window
@@ -3188,6 +3214,8 @@ public class FeedGatewayService implements ReplayRunner {
             vixPrices.remove(versionKey.substring("vix-price:".length()));
         } else if (versionKey.startsWith("index-price:")) {
             indexPrices.remove(versionKey.substring("index-price:".length()));
+        } else if (versionKey.startsWith("short-premium-recommendation:")) {
+            shortPremiumRecommendations.remove(versionKey.substring("short-premium-recommendation:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
             strikeFlows.remove(versionKey.substring("strike-flow:".length()));
         } else if (versionKey.startsWith("delta-flow:")) {
@@ -3476,6 +3504,26 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    private void replayShortPremiumCached(WebSocketSession session) {
+        // Purge first so a recommendation that crossed its (12h) TTL since the last poll purge is evicted
+        // before replay rather than sent to the connecting client. Unlike dealer-ledger this is intentionally
+        // NOT filtered by the active market selection: a recommendation is an advisory overlay filtered by
+        // symbol client-side, and replaying all fresh recommendations lets a reload restore the overlay even
+        // before the client has (re)selected a market.
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        for (Map.Entry<String, String> entry : shortPremiumRecommendations.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("short-premium-recommendation:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, "short-premium-recommendation", json);
+        }
+    }
+
     /**
      * Cache key for the per-(symbol,tradingDate) Option Price Behavior dashboard stream. The payload uses
      * tradingDate instead of option expiry because it describes the whole intraday behavior surface.
@@ -3566,6 +3614,19 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (JsonProcessingException ignored) {
             return false;
         }
+    }
+
+    /** Cache key for a short-premium recommendation: the trade_id (one cache entry per trade). */
+    private String shortPremiumRecommendationCacheKey(String json, String fallback) {
+        try {
+            String tradeId = text(mapper.readTree(json), "trade_id");
+            if (!tradeId.isBlank()) {
+                return tradeId;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to the Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
     }
 
     String indexPriceCacheKey(String json, String fallback) {
@@ -3721,6 +3782,8 @@ public class FeedGatewayService implements ReplayRunner {
         // as index-price — so a VIX record is never delivered mislabelled as index-price.
         replayCacheMap(session, "vix-price", vixPrices);
         replayCacheMap(session, "index-price", indexPrices);
+        // Agent A recommendations: standalone per session, one envelope per cached trade_id.
+        replayCacheMap(session, "short-premium-recommendation", shortPremiumRecommendations);
     }
 
     private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {
@@ -4498,7 +4561,12 @@ public class FeedGatewayService implements ReplayRunner {
      * per-user market-data event can never reach another user's socket.
      */
     static final Set<String> GLOBAL_BROADCAST_EVENTS = Set.of(
-            "status", "reset", "source-switching", "source-ready", "source-stale");
+            "status", "reset", "source-switching", "source-ready", "source-stale",
+            // Agent A short-premium recommendation is a GLOBAL advisory overlay (the UI filters by
+            // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
+            // in per-session (auth) mode too, not only legacy mode — otherwise it is silently
+            // dropped once GATEWAY_AUTH_ENABLED=true (GatewayRecordMapper has no route for it).
+            "short-premium-recommendation");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);
