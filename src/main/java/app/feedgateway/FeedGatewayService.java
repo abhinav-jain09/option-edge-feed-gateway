@@ -441,6 +441,10 @@ public class FeedGatewayService implements ReplayRunner {
         // contract leak), then live routed data (FR-11).
         if (perSessionRouting()) {
             replayCachedToSocket(session);
+            // short-premium is a GLOBAL advisory (symbol-filtered client-side), not per-session
+            // routed — replayCacheMap can't deliver it (no GatewayRecordMapper case), so replay it
+            // the same standalone way legacy mode does, so an auth-mode reload restores the overlay.
+            replayShortPremiumCached(session);
             return;
         }
         if (avroCaughtUp.get()) {
@@ -4538,7 +4542,12 @@ public class FeedGatewayService implements ReplayRunner {
      * per-user market-data event can never reach another user's socket.
      */
     static final Set<String> GLOBAL_BROADCAST_EVENTS = Set.of(
-            "status", "reset", "source-switching", "source-ready", "source-stale");
+            "status", "reset", "source-switching", "source-ready", "source-stale",
+            // Agent A short-premium recommendation is a GLOBAL advisory overlay (the UI filters by
+            // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
+            // in per-session (auth) mode too, not only legacy mode — otherwise it is silently
+            // dropped once GATEWAY_AUTH_ENABLED=true (GatewayRecordMapper has no route for it).
+            "short-premium-recommendation");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);
