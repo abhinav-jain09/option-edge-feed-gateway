@@ -378,7 +378,8 @@ class FeedGatewayServiceTest {
     @Test
     void isMaxPainExpiredReturnsTrueOnlyForTerminalStatus() throws Exception {
         FeedGatewayService service = service();
-        assertTrue(isMaxPainExpired(service, "{\"status\":\"EXPIRED\"}"));
+        assertTrue(isMaxPainExpired(service, "{\"status\":\"TERMINAL\"}"));   // v2 terminal status
+        assertTrue(isMaxPainExpired(service, "{\"status\":\"EXPIRED\"}"));    // v1 terminal status (back-compat)
         assertFalse(isMaxPainExpired(service, "{\"status\":\"VALID\"}"));
         assertFalse(isMaxPainExpired(service, "{\"status\":\"EMPTY\"}"));
         assertFalse(isMaxPainExpired(service, "{}"));

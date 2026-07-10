@@ -3610,7 +3610,11 @@ public class FeedGatewayService implements ReplayRunner {
         }
         try {
             JsonNode root = mapper.readTree(json);
-            return "EXPIRED".equals(text(root, "status"));
+            String status = text(root, "status");
+            // The databento-maxpain service emits a terminal (settled) record as status "TERMINAL"
+            // (the v2 schema's successor to the v1 "EXPIRED"). Accept BOTH so a settled max-pain is
+            // evicted from cache + forwarded once, and never replayed stale to a fresh client.
+            return "TERMINAL".equals(status) || "EXPIRED".equals(status);
         } catch (JsonProcessingException ignored) {
             return false;
         }
