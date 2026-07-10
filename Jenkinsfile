@@ -2,6 +2,12 @@
 
 pipeline {
   agent { label 'mac' }
+  options {
+    // Serialize builds so each build's push -> Deploy+verify is atomic: two concurrent
+    // builds must not both move the mutable :dev tag while the other's Deploy+verify
+    // stage resolves it (Codex: a moving-tag race would let the wrong build verify green).
+    disableConcurrentBuilds()
+  }
   parameters {
     choice(name: 'ENVIRONMENT', choices: ['dev', 'production'], description: 'Target environment — drives registry + build platform from oeProfile (single source of truth)')
     string(name: 'IMAGE_REGISTRY', defaultValue: '', description: 'Override registry. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers (e.g. bring-up-all).')
@@ -10,6 +16,7 @@ pipeline {
     string(name: 'BUILD_PLATFORM', defaultValue: '', description: 'Override platform. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers.')
     string(name: 'CONTRACTS_BRANCH', defaultValue: 'main', description: 'options-edge-contracts branch to install before building the gateway')
     booleanParam(name: 'PUSH_IMAGE', defaultValue: true, description: 'Push built image to registry')
+    booleanParam(name: 'DEPLOY_AND_VERIFY', defaultValue: true, description: 'Dev only: after a successful build+push, trigger service-deploy to roll the dev pod and VERIFY it picked up the new image (fails the build if the running pod does not report the pinned digest). Closes the silent-stale-build gap. No effect on production (manual promote gate).')
     string(name: 'REMOTE_BUILD_HOST', defaultValue: '192.168.100.252', description: 'Production only: Linux amd64 host that performs native docker build/push. Dev remains local on the Mac.')
     string(name: 'REMOTE_BUILD_ROOT', defaultValue: '/home/abhinav/ci/remote-builds', description: 'Production only: temporary remote workspace root for native Linux image builds.')
   }
@@ -190,6 +197,34 @@ EOF
             docker buildx build --platform "$BUILD_PLATFORM" --no-cache $TAG_ARGS --load .
           fi
         '''
+      }
+    }
+
+    // --- CLOSE THE SILENT-STALE-BUILD GAP -------------------------------------------
+    // A build that pushes a new image does NOT update the running pod (build != deploy),
+    // so a dev pod can silently keep an old image. Here every DEV build ends by calling
+    // service-deploy, which pins the freshly-pushed :dev digest, rolls the pod, and runs
+    // its §13.3 gate: rollout Ready + the running pod's imageID MUST contain the pinned
+    // digest + restartCount==0. propagate:true => if the pod fails to pick up the new
+    // image, THIS build turns red. Dev only: production keeps the manual promote gate.
+    // Guarded to the canonical main job (JOB_NAME) so PR/branch jobs never auto-deploy.
+    stage('Deploy + verify (dev)') {
+      when {
+        expression {
+          params.ENVIRONMENT == 'dev' && params.PUSH_IMAGE && params.DEPLOY_AND_VERIFY &&
+            params.DEV_IMAGE_TAG == 'dev' &&
+            (env.JOB_NAME?.endsWith('option-edge-feed-gateway'))
+        }
+      }
+      steps {
+        build job: 'service-deploy',
+          parameters: [
+            string(name: 'SERVICE', value: 'feed-gateway'),
+            string(name: 'ENVIRONMENT', value: 'dev'),
+            booleanParam(name: 'BUILD_IMAGES', value: false),
+            booleanParam(name: 'DEPLOY_DRY_RUN', value: false)
+          ],
+          wait: true, propagate: true
       }
     }
   }
