@@ -130,9 +130,12 @@ public class FeedGatewayService implements ReplayRunner {
     // Per-strike strike-intelligence signals, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (StrikeIntelligenceSignal) — lives on the JSON-state consumer.
     private final Map<String, String> strikeIntels = new ConcurrentHashMap<>();
-    // Per-strike strike-invasion signals, keyed by source|symbol|strike (SPX-only — NO expiry;
-    // last-value-wins per strike). JSON on the wire (StrikeInvasionSnapshot) — lives on the JSON-state
-    // consumer (mirrors strike-intel, minus the expiry segment).
+    // Per-strike, per-direction strike-invasion signals, keyed by source|symbol|strike|direction
+    // (SPX-only — NO expiry; last-value-wins per strike+direction). One strike can legitimately carry
+    // BOTH a live UP record (SHORT_CALL_CANDIDATE domain) and a DOWN record (SHORT_PUT_CANDIDATE
+    // domain) at once, so the key must separate them or one verdict silently overwrites the other.
+    // JSON on the wire (StrikeInvasionSnapshot) — lives on the JSON-state consumer (mirrors
+    // strike-intel, minus the expiry segment).
     private final Map<String, String> strikeInvasions = new ConcurrentHashMap<>();
     // Latest liquidity-heatmap column frame per symbol|expiry (last-value-wins; short TTL —
     // see GatewaySettings.liquidityHeatmapTtlMs()). History accumulates client-side.
@@ -1137,8 +1140,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
         // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
         topicEvents.put(settings.strikeIntelTurnAlertTopic(), new TopicBinding("DATABENTO", "turn-alert"));
-        // strike-invasion is plain JSON (StrikeInvasionSnapshot), per-strike keyed (symbol|strike, SPX-only
-        // — NO expiry) — this JSON-state consumer, never the Avro one (mirrors strike-intel).
+        // strike-invasion is plain JSON (StrikeInvasionSnapshot), per-strike+direction keyed
+        // (symbol|strike|direction, SPX-only — NO expiry) — this JSON-state consumer, never the Avro one
+        // (mirrors strike-intel).
         topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
         // Both dealer-ledger topics bind to ONE event; updateCache tells profile from state by topic name
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
@@ -1195,8 +1199,8 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
         // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
         topicEvents.put(settings.strikeIntelTurnAlertTopic(), new TopicBinding("DATABENTO", "turn-alert"));
-        // strike-invasion is plain JSON, per-strike keyed (symbol|strike, no expiry) — keep the cache +
-        // live JSON consumer topic sets symmetric (same rule as strike-intel above).
+        // strike-invasion is plain JSON, per-strike+direction keyed (symbol|strike|direction, no expiry)
+        // — keep the cache + live JSON consumer topic sets symmetric (same rule as strike-intel above).
         topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
         // Both dealer-ledger topics bind to ONE event; updateCache tells profile from state by topic name
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
@@ -2328,8 +2332,9 @@ public class FeedGatewayService implements ReplayRunner {
             // 0DTE chain the strike-invasion producer emits for and the date the Databento feed self-rolls
             // to — NOT the per-session/global activeSelection or a pinned IB_EXPIRY. A session viewing
             // today's 0DTE receives it; a session that manually selected a non-0DTE chain correctly does
-            // not (a 0DTE-only signal must not attach to a later expiry). The cache key stays symbol|strike
-            // (updateCache's strikeInvasionCacheKey ignores expiry), so last-value-wins per strike holds.
+            // not (a 0DTE-only signal must not attach to a later expiry). The cache key stays
+            // symbol|strike|direction (updateCache's strikeInvasionCacheKey ignores expiry), so
+            // last-value-wins per strike+direction holds.
             // NOTE: the replay path re-stamps this with the replay window's expiry (see emitReplayRecord),
             // since a historical record belongs to that session's chain, not today's.
             if ("strike-invasion".equals(binding.event()) && text(object, "expiry").isBlank()) {
@@ -3484,10 +3489,17 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * Per-strike strike-invasion cache key: {@code symbol|strike} (mirrors {@link #strikeIntelCacheKey}
-     * but WITHOUT the expiry segment — strike-invasion is SPX-only and carries no expiry). Derived from
-     * payload identity so the cache key matches the UI contract (source is prepended by updateCache →
-     * source|symbol|strike). Falls back to the Kafka record key if symbol/strike are absent.
+     * Per-strike, per-direction strike-invasion cache key: {@code symbol|strike|direction} (mirrors
+     * {@link #strikeIntelCacheKey} but WITHOUT the expiry segment — strike-invasion is SPX-only and
+     * carries no expiry — and WITH the contract-v2 {@code direction} segment). One strike can
+     * legitimately carry BOTH a live UP record (SHORT_CALL_CANDIDATE domain) and a DOWN record
+     * (SHORT_PUT_CANDIDATE domain) at the same time; keying by symbol|strike alone would let the second
+     * record OVERWRITE the first and silence an actionable verdict in the UI. Direction is read from the
+     * payload (the Kafka record key shape must not be trusted) via {@link #strikeInvasionDirection} and
+     * defaults to {@code UP} when absent/blank, so a pre-v2 (upside-only) record REPLACES the strike's
+     * UP entry rather than duplicating it. Derived from payload identity so the cache key matches the
+     * UI contract (source is prepended by updateCache → source|symbol|strike|direction). Falls back to
+     * the Kafka record key if symbol/strike are absent.
      */
     private String strikeInvasionCacheKey(String json, String fallback) {
         try {
@@ -3495,12 +3507,24 @@ public class FeedGatewayService implements ReplayRunner {
             String symbol = text(root, "symbol").toUpperCase();
             double strike = doubleField(root, "strike", Double.NaN);
             if (!symbol.isBlank() && Double.isFinite(strike)) {
-                return symbol + "|" + formatStrike(strike);
+                return symbol + "|" + formatStrike(strike) + "|" + strikeInvasionDirection(root);
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
         }
         return fallback;
+    }
+
+    /**
+     * Direction segment of the strike-invasion cache key: the payload's contract-v2 {@code direction}
+     * field ({@code "UP"}/{@code "DOWN"}), normalized to uppercase for key stability; defaults to
+     * {@code UP} when absent/blank because pre-v2 records were upside-only. The gateway never interprets
+     * direction beyond the key — the record passes through as raw JSON, so direction reaches the browser
+     * untouched.
+     */
+    private static String strikeInvasionDirection(JsonNode root) {
+        String direction = text(root, "direction").toUpperCase();
+        return direction.isBlank() ? "UP" : direction;
     }
 
     private String missionPaceCacheKey(String json, String fallback) {

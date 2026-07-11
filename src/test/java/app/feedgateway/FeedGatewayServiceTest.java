@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FeedGatewayServiceTest {
@@ -202,30 +203,55 @@ class FeedGatewayServiceTest {
                 "statusJson must report the strike-intel cache count (delta-flow counterpart)");
     }
 
-    // ----- strike-invasion gateway consumer (per-strike StrikeInvasionSnapshot, SPX-only, NO expiry) --
+    // ----- strike-invasion gateway consumer (per-strike, per-direction StrikeInvasionSnapshot, SPX-only, NO expiry) --
 
     @Test
-    void strikeInvasionCacheKeyIsSymbolStrikeFromPayloadIdentity() throws Exception {
-        // strike-invasion is SPX-only and carries NO expiry, so the key is symbol|strike (mirrors
-        // strikeIntelCacheKey minus the expiry segment; source is prepended later by updateCache).
+    void strikeInvasionCacheKeyIsSymbolStrikeDirectionFromPayloadIdentity() throws Exception {
+        // strike-invasion is SPX-only and carries NO expiry, so the key is symbol|strike|direction
+        // (mirrors strikeIntelCacheKey minus the expiry segment, plus the contract-v2 direction;
+        // source is prepended later by updateCache). Direction comes from the PAYLOAD, never the
+        // Kafka record key shape.
         FeedGatewayService service = service();
-        assertEquals("SPX|6005", strikeInvasionCacheKey(
+        assertEquals("SPX|6005|UP", strikeInvasionCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"direction\":\"UP\",\"invasionState\":\"INVADED\"}",
+                "fallback-key"));
+        assertEquals("SPX|6005|DOWN", strikeInvasionCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"direction\":\"DOWN\",\"invasionState\":\"INVADED\"}",
+                "fallback-key"));
+        // Pre-v2 records carry no direction and were upside-only: they must key as UP (replacing an
+        // older UP entry, never duplicating the strike). Blank direction gets the same default.
+        assertEquals("SPX|6005|UP", strikeInvasionCacheKey(
                 service,
                 "{\"symbol\":\"SPX\",\"strike\":6005,\"invasionState\":\"INVADED\"}",
+                "fallback-key"));
+        assertEquals("SPX|6005|UP", strikeInvasionCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"direction\":\"\",\"invasionState\":\"INVADED\"}",
                 "fallback-key"));
     }
 
     @Test
     void strikeInvasionUpdateCacheStoresSourcePrefixedKey() throws Exception {
-        // After updateCache the stored/returned cache key is DATABENTO|SPX|strike (source prepended, NO expiry).
+        // After updateCache the stored/returned cache key is DATABENTO|SPX|strike|direction (source
+        // prepended, NO expiry; direction defaults to UP for a pre-v2 direction-less record).
         FeedGatewayService service = service();
         String json = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\","
                 + "\"strike\":6005,\"invasionState\":\"INVADED\",\"eventTimeMs\":" + System.currentTimeMillis() + "}";
         String key = updateCache(service, topicBinding("DATABENTO", "strike-invasion"),
                 new ConsumerRecord<>(new GatewaySettings().strikeInvasionTopic(), 0, 1L, "SPX|6005", json),
                 json);
-        assertEquals("DATABENTO|SPX|6005", key,
+        assertEquals("DATABENTO|SPX|6005|UP", key,
                 "updateCache must prepend the source to the strike-invasion cache key");
+
+        String down = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"strike\":6005,"
+                + "\"direction\":\"DOWN\",\"invasionState\":\"INVADED\",\"eventTimeMs\":" + System.currentTimeMillis() + "}";
+        String downKey = updateCache(service, topicBinding("DATABENTO", "strike-invasion"),
+                new ConsumerRecord<>(new GatewaySettings().strikeInvasionTopic(), 0, 2L, "6005:DOWN", down),
+                down);
+        assertEquals("DATABENTO|SPX|6005|DOWN", downKey,
+                "a DOWN record must key separately from the same strike's UP record");
     }
 
     @Test
@@ -301,6 +327,85 @@ class FeedGatewayServiceTest {
 
         assertTrue(cachedEvents(service, List.of("strike-invasion"), now).isEmpty(),
                 "a stale (old payload event time) strike-invasion must not be replayed");
+    }
+
+    @Test
+    void strikeInvasionUpAndDownRecordsForTheSameStrikeCoexistInTheEnvelope() throws Exception {
+        // Contract v2: one strike can legitimately carry BOTH a live UP record (SHORT_CALL_CANDIDATE
+        // domain) and a DOWN record (SHORT_PUT_CANDIDATE domain) at the same time. With the old
+        // symbol|strike cache key the second record OVERWROTE the first, silencing an actionable trade
+        // verdict in the UI — the direction-qualified key must keep both alive through cache, cached
+        // connect replay, and the strikeInvasions envelope array.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        setActiveSelection(service, "DATABENTO", "SPX", currentTradingDateExpiry());
+        String up = enrichJson(service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"direction\":\"UP\",\"state\":\"ACCEPTED_ABOVE\","
+                        + "\"asOfEventTimeMs\":" + now + "}",
+                topicBinding("DATABENTO", "strike-invasion"));
+        String down = enrichJson(service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"direction\":\"DOWN\",\"state\":\"ACCEPTED_BELOW\","
+                        + "\"asOfEventTimeMs\":" + now + "}",
+                topicBinding("DATABENTO", "strike-invasion"));
+        updateCache(service, topicBinding("DATABENTO", "strike-invasion"),
+                recordAt(settings.strikeInvasionTopic(), 0, 1L, "6005:UP", up, now), up);
+        updateCache(service, topicBinding("DATABENTO", "strike-invasion"),
+                recordAt(settings.strikeInvasionTopic(), 0, 2L, "6005:DOWN", down, now), down);
+
+        List<?> events = cachedEvents(service, List.of("strike-invasion"), now);
+        assertEquals(2, events.size(),
+                "UP and DOWN invasion records for the same strike must coexist (neither may overwrite the other)");
+        List<String> jsons = new ArrayList<>();
+        for (Object event : events) {
+            jsons.add(cachedEventJson(event));
+        }
+        assertTrue(jsons.contains(up), "the UP record must survive the DOWN record's arrival");
+        assertTrue(jsons.contains(down), "the DOWN record must be cached alongside the UP record");
+
+        // Both raw records (direction passes through untouched) reach the strikeInvasions envelope array.
+        String envelope = uiBatchEnvelopeJsonStrikeInvasion(service, jsons);
+        assertTrue(envelope.contains(up) && envelope.contains(down),
+                "the strikeInvasions envelope array must carry BOTH directions; was: " + envelope);
+    }
+
+    @Test
+    void directionlessStrikeInvasionKeysAsUpAndReplacesTheOlderUpRecord() throws Exception {
+        // Pre-v2 records carry no direction and were upside-only: a direction-less record must key as UP —
+        // REPLACING the strike's older UP record (same cache slot, same monotonic freshness gate), never
+        // duplicating the strike in the envelope.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        setActiveSelection(service, "DATABENTO", "SPX", currentTradingDateExpiry());
+        String olderUp = enrichJson(service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"direction\":\"UP\",\"state\":\"ACCEPTED_ABOVE\","
+                        + "\"asOfEventTimeMs\":" + (now - 2_000L) + "}",
+                topicBinding("DATABENTO", "strike-invasion"));
+        String legacy = enrichJson(service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"state\":\"INVADED\","
+                        + "\"asOfEventTimeMs\":" + now + "}",
+                topicBinding("DATABENTO", "strike-invasion"));
+        updateCache(service, topicBinding("DATABENTO", "strike-invasion"),
+                recordAt(settings.strikeInvasionTopic(), 0, 1L, "6005:UP", olderUp, now - 2_000L), olderUp);
+        updateCache(service, topicBinding("DATABENTO", "strike-invasion"),
+                recordAt(settings.strikeInvasionTopic(), 0, 2L, "SPX|6005", legacy, now), legacy);
+
+        List<?> events = cachedEvents(service, List.of("strike-invasion"), now);
+        assertEquals(1, events.size(),
+                "a direction-less record must REPLACE the strike's UP record, not duplicate the strike");
+        assertEquals(legacy, cachedEventJson(events.get(0)),
+                "the newer direction-less record must win the shared UP cache slot");
+
+        // The shared slot also shares the per-record monotonic event-time gate: an OLDER direction-less
+        // record must be dropped by the UP slot's freshness gate (updateCache returns null).
+        String staleLegacy = enrichJson(service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"state\":\"RETREATED\","
+                        + "\"asOfEventTimeMs\":" + (now - 1_000L) + "}",
+                topicBinding("DATABENTO", "strike-invasion"));
+        assertNull(updateCache(service, topicBinding("DATABENTO", "strike-invasion"),
+                        recordAt(settings.strikeInvasionTopic(), 0, 3L, "SPX|6005", staleLegacy, now), staleLegacy),
+                "an older direction-less record must be rejected by the UP slot's monotonic event-time gate");
     }
 
     @Test
@@ -1753,6 +1858,13 @@ class FeedGatewayServiceTest {
         Method m = FeedGatewayService.class.getDeclaredMethod("cachedEvents", List.class, long.class);
         m.setAccessible(true);
         return (List<?>) m.invoke(service, events, nowMs);
+    }
+
+    /** The raw json of one CachedEvent (private record) returned by {@link #cachedEvents}. */
+    private static String cachedEventJson(Object cachedEvent) throws Exception {
+        Method m = cachedEvent.getClass().getDeclaredMethod("json");
+        m.setAccessible(true);
+        return (String) m.invoke(cachedEvent);
     }
 
     @SuppressWarnings("unchecked")
