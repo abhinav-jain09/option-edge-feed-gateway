@@ -65,6 +65,28 @@ class RoutingKeyDeriverTest {
     }
 
     @Test
+    void spreadSkewWithBlankExpiryRoutesBySourceAndUnderlying() {
+        // A nullable-expiry spread-skew snapshot (EXPIRY_MISSING / degraded heartbeat) must not be
+        // rejected as a blank contract key: it targets every session viewing the underlying.
+        RoutableRecord r = new RoutableRecord(MarketDataSource.DATABENTO, EventType.SPREAD_SKEW,
+                "SPX", "", OptionalDouble.empty(), 0, null, null);
+        RoutingTarget t = RoutingKeyDeriver.derive(r).orElseThrow();
+        RoutingTarget.Underlying u = assertInstanceOf(RoutingTarget.Underlying.class, t);
+        assertEquals(new UnderlyingKey(MarketDataSource.DATABENTO, "SPX"), u.key());
+    }
+
+    @Test
+    void spreadSkewWithPresentExpiryStaysContractScoped() {
+        // A frame pinned to a chain keeps the normal contract scope, so it never leaks to sessions
+        // on a different expiry.
+        RoutableRecord r = new RoutableRecord(MarketDataSource.DATABENTO, EventType.SPREAD_SKEW,
+                "SPX", "2026-07-11", OptionalDouble.empty(), 0, null, null);
+        RoutingTarget t = RoutingKeyDeriver.derive(r).orElseThrow();
+        RoutingTarget.Contract c = assertInstanceOf(RoutingTarget.Contract.class, t);
+        assertEquals(new SubscriptionKey(MarketDataSource.DATABENTO, "SPX", "20260711"), c.key());
+    }
+
+    @Test
     void payloadSourceMatchingBindingIsAccepted() {
         RoutableRecord r = new RoutableRecord(MarketDataSource.DATABENTO, EventType.SNAPSHOT,
                 "SPX", "20260612", OptionalDouble.of(7500), 0, "DATABENTO", null);

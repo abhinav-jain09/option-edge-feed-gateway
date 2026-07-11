@@ -3327,11 +3327,11 @@ public class FeedGatewayService implements ReplayRunner {
             // strike-invasion above). A producer catching up / backfilling appends records now (fresh
             // arrival) whose ts is old — using arrival time would let a stale skew state pass the
             // cache-fresh TTL + replay barriers and render as live. This is what the spreadSkewStale
-            // live gate and the shouldForward/isCacheFresh spread-skew paths all rely on.
-            long payloadTime = spreadSkewTimestamp(json);
-            if (payloadTime >= 0) {
-                return payloadTime;
-            }
+            // live gate and the shouldForward/isCacheFresh spread-skew paths all rely on. Unlike the
+            // siblings above there is deliberately NO Kafka-arrival fallback: a missing/unparseable ts
+            // returns -1 (fail closed), so a malformed snapshot arriving fresh can never be cached or
+            // forwarded as current.
+            return spreadSkewTimestamp(json);
         }
         return cacheTimestamp(record);
     }
@@ -4901,7 +4901,12 @@ public class FeedGatewayService implements ReplayRunner {
             // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
             // in per-session (auth) mode too, not only legacy mode — otherwise it is silently
             // dropped once GATEWAY_AUTH_ENABLED=true (GatewayRecordMapper has no route for it).
-            "short-premium-recommendation");
+            "short-premium-recommendation",
+            // Discrete spread-skew transitions (FIRE/EXIT/REVERSAL/RESTART) are likewise a GLOBAL
+            // one-shot alert overlay, symbol-filtered client-side (the turn-alert sibling). Allowlist
+            // them so the standalone broadcast still reaches sockets in per-session (auth) mode —
+            // GatewayRecordMapper deliberately has no route for spread-skew-event.
+            "spread-skew-event");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);

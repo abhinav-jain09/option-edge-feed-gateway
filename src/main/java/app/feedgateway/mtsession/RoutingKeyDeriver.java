@@ -52,6 +52,14 @@ public final class RoutingKeyDeriver {
 
         String symbol = Normalization.symbol(record.symbol());
         String expiry = Normalization.expiry(record.expiry());
+        // Spread-skew snapshots carry a NULLABLE expiry (EXPIRY_MISSING / degraded heartbeats): a
+        // blank-expiry frame still belongs to every session viewing this underlying on this source,
+        // so route it by source+underlying instead of rejecting the blank contract key below. A
+        // PRESENT expiry keeps the normal contract scope, so a frame pinned to a different chain
+        // never leaks to another expiry's sessions.
+        if (record.eventType() == EventType.SPREAD_SKEW && !symbol.isEmpty() && expiry.isEmpty()) {
+            return Optional.of(new RoutingTarget.Underlying(new UnderlyingKey(source, symbol)));
+        }
         if (symbol.isEmpty() || expiry.isEmpty()) {
             return Optional.empty();
         }

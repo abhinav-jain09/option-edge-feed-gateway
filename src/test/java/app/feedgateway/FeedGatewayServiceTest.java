@@ -1244,6 +1244,36 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void spreadSkewMissingOrInvalidTsFailsClosedAndIsNotRescuedByFreshKafkaArrival() throws Exception {
+        // eventCacheTimestamp for spread-skew has deliberately NO Kafka-arrival fallback: a snapshot
+        // whose ts is missing, non-numeric or negative must fail closed (never cached, never
+        // forwarded) even when the record's Kafka timestamp is brand new.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260711");
+        long now = System.currentTimeMillis();
+        Object binding = topicBinding("DATABENTO", "spread-skew");
+        String fresh = spreadSkewPayload(now);
+        List<String> malformed = List.of(
+                fresh.replace("\"ts\":" + now + ",", ""),                  // ts missing entirely
+                fresh.replace("\"ts\":" + now, "\"ts\":\"not-a-number\""), // non-numeric ts
+                fresh.replace("\"ts\":" + now, "\"ts\":-5"));              // negative ts
+        long offset = 12L;
+        for (String payload : malformed) {
+            ConsumerRecord<String, String> record =
+                    recordAt(settings.spreadSkewTopic(), 0, offset++, "SPX", payload, now); // arrival FRESH
+            assertTrue(eventCacheTimestamp(service, "spread-skew", record) < 0,
+                    "missing/invalid ts must fail closed, not fall back to the Kafka arrival time");
+            assertNull(updateCache(service, binding, record, payload),
+                    "a snapshot without a valid ts must never be cached");
+            assertFalse(shouldForward(service, binding, payload, record),
+                    "a snapshot without a valid ts must never forward");
+        }
+        assertEquals(0, cachedEventCount(service, "spread-skew", now),
+                "no malformed snapshot may end up replayable");
+    }
+
+    @Test
     void cachedSpreadSkewReplayBypassesOffsetBarrierButKeepsTimeBarrier() throws Exception {
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
