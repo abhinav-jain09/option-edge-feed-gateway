@@ -327,6 +327,122 @@ class FeedGatewayServiceTest {
                 "re-stamping the replay window expiry makes the replayed strike-invasion match");
     }
 
+    // ----- ES 09:15 open-direction gateway consumer (once-a-day forecast + H1/H2/H3 outcomes) ------
+
+    @Test
+    void esOpenDirectionTopicsAreOptionalSoTheirAbsenceCannotStarveTheSharedConsumer() throws Exception {
+        // The forecast producer is a brand-new service that may not be deployed (and after the daily
+        // Kafka wipe the topics are absent until it first produces) — both topics MUST be optional so
+        // their absence can never block/crash-loop the shared JSON consumer.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertTrue(isOptionalTopic(service, settings.esOpenDirectionForecastTopic()));
+        assertTrue(isOptionalTopic(service, settings.esOpenDirectionOutcomeTopic()));
+    }
+
+    @Test
+    void esOpenDirectionCacheKeysAreTradeDateAndTradeDateHorizon() throws Exception {
+        // Forecast: ONE cache entry per tradeDate (last-value-wins). Outcome: tradeDate|horizon, so the
+        // day's H1/H2/H3 all survive side-by-side and a late-joining client replays every outcome
+        // resolved so far (source is prepended later by updateCache).
+        FeedGatewayService service = service();
+        assertEquals("2026-07-11", esOpenDirectionForecastCacheKey(
+                service,
+                "{\"tradeDate\":\"2026-07-11\",\"status\":\"FORECASTED\",\"direction\":\"UP\"}",
+                "fallback-key"));
+        assertEquals("2026-07-11|H1", esOpenDirectionOutcomeCacheKey(
+                service,
+                "{\"tradeDate\":\"2026-07-11\",\"horizon\":\"H1\",\"correct\":true}",
+                "fallback-key"));
+        // Malformed payloads fall back to the Kafka key rather than throwing.
+        assertEquals("fallback-key", esOpenDirectionForecastCacheKey(service, "not json", "fallback-key"));
+        assertEquals("fallback-key", esOpenDirectionOutcomeCacheKey(service, "not json", "fallback-key"));
+    }
+
+    @Test
+    void esOpenDirectionUpdateCacheStoresSourcePrefixedKeys() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String forecast = "{\"tradeDate\":\"2026-07-11\",\"status\":\"FORECASTED\",\"direction\":\"UP\"}";
+        assertEquals("DATABENTO|2026-07-11",
+                updateCache(service, topicBinding("DATABENTO", "es-open-direction-forecast"),
+                        recordAt(settings.esOpenDirectionForecastTopic(), 0, 1L, "2026-07-11", forecast, now),
+                        forecast),
+                "updateCache must prepend the source to the forecast cache key");
+        String outcome = "{\"tradeDate\":\"2026-07-11\",\"horizon\":\"H1\",\"correct\":true}";
+        assertEquals("DATABENTO|2026-07-11|H1",
+                updateCache(service, topicBinding("DATABENTO", "es-open-direction-outcome"),
+                        recordAt(settings.esOpenDirectionOutcomeTopic(), 0, 1L, "2026-07-11", outcome, now),
+                        outcome),
+                "updateCache must prepend the source to the outcome cache key");
+    }
+
+    @Test
+    void esOpenDirectionUsesLongSessionTtlNotGenericCacheWindow() throws Exception {
+        // The whole point of the panel: a forecast published at 09:15 must still be served to a client
+        // that connects at 11:00 (and at 15:59). A 2h-old (even 7h-old) forecast/outcome must be FRESH
+        // under the long 12h window, while a generic event of the same age is long expired.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long ttl = new GatewaySettings().esOpenDirectionTtlMs();
+        assertTrue(ttl >= 12L * 3_600_000L, "es-open-direction TTL must cover the whole trading session");
+        assertFalse(isExpired(service, "es-open-direction-forecast", now - 2L * 3_600_000L, now),
+                "a 2h-old forecast (09:15 -> 11:15) must still be fresh");
+        assertFalse(isExpired(service, "es-open-direction-outcome", now - 7L * 3_600_000L, now),
+                "a 7h-old outcome (09:30 window vs late-day connect) must still be fresh");
+        assertTrue(isExpired(service, "es-open-direction-forecast", now - ttl - 1, now),
+                "a forecast past the 12h window must expire (yesterday never replays as today)");
+        // Contrast: a generic event of 2h age IS expired — proves the events are not on the generic TTL.
+        assertTrue(isExpired(service, "strike-flow", now - 2L * 3_600_000L, now));
+    }
+
+    @Test
+    void lateJoiningClientReplaysForecastAndAllResolvedOutcomes() throws Exception {
+        // End-to-end late-join contract: forecast cached at 09:15 (2h-old Kafka record) + H1/H2 outcomes,
+        // then a client connects at ~11:31 — the standalone replay must deliver all three envelopes
+        // (never dropped by the 15s market-data staleness gates, never selection-gated).
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String forecast = "{\"tradeDate\":\"2026-07-11\",\"status\":\"FORECASTED\",\"direction\":\"UP\","
+                + "\"evidenceStrength\":68}";
+        updateCache(service, topicBinding("DATABENTO", "es-open-direction-forecast"),
+                recordAt(settings.esOpenDirectionForecastTopic(), 0, 1L, "2026-07-11", forecast, now - 2L * 3_600_000L),
+                forecast);
+        String h1 = "{\"tradeDate\":\"2026-07-11\",\"horizon\":\"H1\",\"correct\":true,\"realizedDirection\":\"UP_WIN\"}";
+        updateCache(service, topicBinding("DATABENTO", "es-open-direction-outcome"),
+                recordAt(settings.esOpenDirectionOutcomeTopic(), 0, 1L, "2026-07-11", h1, now - 3_600_000L),
+                h1);
+        String h2 = "{\"tradeDate\":\"2026-07-11\",\"horizon\":\"H2\",\"correct\":false,\"realizedDirection\":\"DOWN_WIN\"}";
+        updateCache(service, topicBinding("DATABENTO", "es-open-direction-outcome"),
+                recordAt(settings.esOpenDirectionOutcomeTopic(), 0, 2L, "2026-07-11", h2, now - 60_000L),
+                h2);
+
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replayEsOpenDirectionCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+
+        assertEquals(3, sink.size(), "late join must replay the forecast + BOTH resolved outcomes; got: " + sink);
+        assertTrue(sink.get(0).contains("\"type\":\"es-open-direction-forecast\"")
+                        && sink.get(0).contains("\"evidenceStrength\":68"),
+                "forecast envelope first; was: " + sink.get(0));
+        assertTrue(sink.stream().filter(s -> s.contains("\"type\":\"es-open-direction-outcome\"")).count() == 2,
+                "both H1 and H2 outcomes must replay; was: " + sink);
+        assertTrue(sink.stream().anyMatch(s -> s.contains("\"horizon\":\"H1\"")), "H1 must replay");
+        assertTrue(sink.stream().anyMatch(s -> s.contains("\"horizon\":\"H2\"")), "H2 must replay");
+    }
+
+    @Test
+    void esOpenDirectionEventsAreGlobalBroadcastInPerSessionMode() {
+        // Per-session (auth) mode drops any event GatewayRecordMapper cannot route unless it is an
+        // allowlisted GLOBAL advisory — without this, the panel silently goes dark once
+        // GATEWAY_AUTH_ENABLED=true (the exact short-premium HIGH-1 review finding).
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("es-open-direction-forecast"));
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("es-open-direction-outcome"));
+    }
+
     @Test
     void cachedReplayIncludesFreshStrikeIntelForMatchingDatabentoSelectionOnly() throws Exception {
         FeedGatewayService service = service();
@@ -1655,6 +1771,18 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(service, json, fallback);
     }
 
+    private static String esOpenDirectionForecastCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("esOpenDirectionForecastCacheKey", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, fallback);
+    }
+
+    private static String esOpenDirectionOutcomeCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("esOpenDirectionOutcomeCacheKey", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, fallback);
+    }
+
     private static String maxPainCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
         Method method = FeedGatewayService.class.getDeclaredMethod("maxPainCacheKey", String.class, String.class);
         method.setAccessible(true);
@@ -1800,6 +1928,33 @@ class FeedGatewayServiceTest {
                 map.put(key, timeMs);
             }
         }
+    }
+
+    /** A synchronous recording WebSocketSession (untracked -> direct send) capturing sent payloads. */
+    private static WebSocketSession recordingSession(List<String> sink) {
+        return (WebSocketSession) Proxy.newProxyInstance(
+                WebSocketSession.class.getClassLoader(),
+                new Class<?>[]{WebSocketSession.class},
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "isOpen": return Boolean.TRUE;
+                        case "getId": return "rec-session";
+                        case "sendMessage":
+                            if (args[0] instanceof TextMessage tm) {
+                                sink.add(tm.getPayload());
+                            }
+                            return null;
+                        case "toString": return "RecordingSession";
+                        case "hashCode": return System.identityHashCode(proxy);
+                        case "equals": return proxy == args[0];
+                        default:
+                            Class<?> rt = method.getReturnType();
+                            if (rt == boolean.class) return Boolean.FALSE;
+                            if (rt == int.class) return 0;
+                            if (rt == long.class) return 0L;
+                            return null;
+                    }
+                });
     }
 
     /** Registers a synchronous recording WebSocketSession (untracked -> direct send) and captures payloads. */
