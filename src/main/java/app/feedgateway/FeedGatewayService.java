@@ -1130,6 +1130,8 @@ public class FeedGatewayService implements ReplayRunner {
         // strike-intelligence-by-strike is plain JSON (StrikeIntelligenceSignal), per-strike keyed
         // (symbol|expiry|strike) — this JSON-state consumer, never the Avro one (mirrors delta-flow).
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
+        // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
+        topicEvents.put(settings.strikeIntelTurnAlertTopic(), new TopicBinding("DATABENTO", "turn-alert"));
         // Both dealer-ledger topics bind to ONE event; updateCache tells profile from state by topic name
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
@@ -1183,6 +1185,8 @@ public class FeedGatewayService implements ReplayRunner {
         // strike-intelligence-by-strike is plain JSON, per-strike keyed — keep the cache + live JSON
         // consumer topic sets symmetric (same rule as delta-flow above).
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
+        // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
+        topicEvents.put(settings.strikeIntelTurnAlertTopic(), new TopicBinding("DATABENTO", "turn-alert"));
         // Both dealer-ledger topics bind to ONE event; updateCache tells profile from state by topic name
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
@@ -1484,6 +1488,15 @@ public class FeedGatewayService implements ReplayRunner {
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
+                        continue;
+                    }
+                    if ("turn-alert".equals(binding.event())) {
+                        // Discrete StrikeTurnAlert START/STOP (own message.type), symbol-filtered client-side
+                        // and keyed to today. Broadcast STANDALONE to every client — never selection-gated (a
+                        // turn must reach the client regardless of active market) and never cached (the producer
+                        // re-asserts START, so a late-joining client catches an active alert within its TTL).
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
