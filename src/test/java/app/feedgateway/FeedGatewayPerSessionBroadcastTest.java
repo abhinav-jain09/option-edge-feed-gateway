@@ -234,6 +234,10 @@ class FeedGatewayPerSessionBroadcastTest {
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("status"));
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("reset"));
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("source-switching"));
+        // Discrete spread-skew transitions are a global one-shot alert (turn-alert sibling) — allowlisted
+        // so they are not silently dropped in per-session mode; the SNAPSHOT stays routed market data.
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("spread-skew-event"));
+        assertFalse(FeedGatewayService.isGlobalBroadcastEvent("spread-skew"));
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("snapshot"));
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("pace"));
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("strike-flow"));
@@ -304,5 +308,97 @@ class FeedGatewayPerSessionBroadcastTest {
 
         assertFalse(u4.stream().anyMatch(m -> m.contains("\"type\":\"mission-control\"")),
                 "cached mission-control must NOT be replayed on connect in per-session mode");
+    }
+
+    // ---- spread-skew in per-session (auth) mode: global event broadcast + nullable-expiry routing ----
+
+    @Test
+    void spreadSkewEventBroadcastsToEverySocketInPerSessionMode() throws Exception {
+        // The discrete transition is a GLOBAL one-shot alert (turn-alert sibling, symbol-filtered
+        // client-side): with per-session routing ENABLED it must fan out via the
+        // GLOBAL_BROADCAST_EVENTS allowlist rather than being dropped as non-routable market data.
+        broadcast("spread-skew-event",
+                "{\"underlying\":\"SPX\",\"expiry\":\"2026-06-12\",\"ts\":1,"
+                        + "\"eventId\":\"e-1\",\"transitionType\":\"FIRE\",\"newState\":\"CALL_SKEW\"}");
+        assertEquals(1, u1.size(), "spread-skew-event must reach user 1 in per-session mode");
+        assertEquals(1, u2.size(), "spread-skew-event must reach user 2 in per-session mode");
+        assertTrue(u1.get(0).contains("\"type\":\"spread-skew-event\""),
+                "delivered standalone under its own message.type");
+    }
+
+    @Test
+    void perSessionLiveSpreadSkewRoutesByExpiryAndNullExpiryReachesEveryUnderlyingSession() throws Exception {
+        // Present matching expiry: contract-scoped — only the SPX|20260612 session receives it.
+        routeOrBroadcast("DATABENTO", "spread-skew",
+                "{\"underlying\":\"SPX\",\"expiry\":\"2026-06-12\",\"ts\":1,\"headline\":{\"state\":\"CALL_SKEW\"}}");
+        assertEquals(1, u1.size(), "spread-skew reaches the SPX|20260612 session");
+        assertTrue(u2.isEmpty(), "spread-skew must not leak to the SPX|20260620 session");
+
+        // NULL expiry (EXPIRY_MISSING / degraded heartbeat): routes by source+underlying — BOTH SPX
+        // sessions receive it instead of the frame being silently dropped as a blank contract key.
+        u1.clear();
+        u2.clear();
+        routeOrBroadcast("DATABENTO", "spread-skew",
+                "{\"underlying\":\"SPX\",\"expiry\":null,\"ts\":2,\"degraded\":true,"
+                        + "\"headline\":{\"state\":\"EXPIRY_MISSING\"}}");
+        assertEquals(1, u1.size(), "null-expiry spread-skew must reach the SPX|20260612 session");
+        assertEquals(1, u2.size(), "null-expiry spread-skew must reach the SPX|20260620 session");
+
+        // Present MISMATCHING expiry: still contract-scoped — reaches neither session (no leak).
+        u1.clear();
+        u2.clear();
+        routeOrBroadcast("DATABENTO", "spread-skew",
+                "{\"underlying\":\"SPX\",\"expiry\":\"2026-06-13\",\"ts\":3,\"headline\":{\"state\":\"CALL_SKEW\"}}");
+        assertTrue(u1.isEmpty(), "a different-expiry spread-skew must not reach the 20260612 session");
+        assertTrue(u2.isEmpty(), "a different-expiry spread-skew must not reach the 20260620 session");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void perSessionCachedSpreadSkewWithNullExpiryReplaysOnConnect() throws Exception {
+        // A fresh cached null-expiry snapshot (single-value slot DATABENTO|SPX) must replay to a
+        // newly-connected session of that underlying — the reconnect/return-to-live bootstrap path.
+        java.lang.reflect.Field f = FeedGatewayService.class.getDeclaredField("spreadSkews");
+        f.setAccessible(true);
+        ((java.util.Map<String, String>) f.get(svc)).put("DATABENTO|SPX",
+                "{\"underlying\":\"SPX\",\"expiry\":null,\"ts\":1,\"degraded\":true,"
+                        + "\"headline\":{\"state\":\"EXPIRY_MISSING\"}}");
+        java.lang.reflect.Field times = FeedGatewayService.class.getDeclaredField("cacheEventTimes");
+        times.setAccessible(true);
+        ((java.util.Map<String, Long>) times.get(svc)).put("spread-skew:DATABENTO|SPX",
+                System.currentTimeMillis());
+
+        engine.registerAppSession("app:u5", "u5",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260612", StrikeWindow.ALL), Set.of());
+        engine.attachSocket("app:u5", "s5");
+        List<String> u5 = new ArrayList<>();
+        svc.addClient(socket("s5", u5)); // triggers per-session cached replay
+
+        assertTrue(u5.stream().anyMatch(m -> m.contains("\"type\":\"spread-skew\"")),
+                "fresh cached null-expiry spread-skew must replay on connect in per-session mode");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void perSessionCachedSpreadSkewWithMismatchingExpiryIsNotReplayedOnConnect() throws Exception {
+        // A cached snapshot pinned to a DIFFERENT chain stays contract-scoped: it must NOT replay to a
+        // session viewing another expiry.
+        java.lang.reflect.Field f = FeedGatewayService.class.getDeclaredField("spreadSkews");
+        f.setAccessible(true);
+        ((java.util.Map<String, String>) f.get(svc)).put("DATABENTO|SPX",
+                "{\"underlying\":\"SPX\",\"expiry\":\"2026-06-13\",\"ts\":1,\"headline\":{\"state\":\"CALL_SKEW\"}}");
+        java.lang.reflect.Field times = FeedGatewayService.class.getDeclaredField("cacheEventTimes");
+        times.setAccessible(true);
+        ((java.util.Map<String, Long>) times.get(svc)).put("spread-skew:DATABENTO|SPX",
+                System.currentTimeMillis());
+
+        engine.registerAppSession("app:u6", "u6",
+                new Selection(MarketDataSource.DATABENTO, "SPX", "20260612", StrikeWindow.ALL), Set.of());
+        engine.attachSocket("app:u6", "s6");
+        List<String> u6 = new ArrayList<>();
+        svc.addClient(socket("s6", u6)); // triggers per-session cached replay
+
+        assertFalse(u6.stream().anyMatch(m -> m.contains("\"type\":\"spread-skew\"")),
+                "a cached spread-skew for a different expiry must NOT replay to this session");
     }
 }
