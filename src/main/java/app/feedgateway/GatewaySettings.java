@@ -582,6 +582,28 @@ public final class GatewaySettings {
         return longValue("GATEWAY_SHORT_PREMIUM_RECOMMENDATION_TTL_MS", maxPainTtlMs(), 0L);
     }
 
+    /** ES 09:15 open-direction forecast topic (JSON, key = tradeDate; ONE forecast per day at 09:15 ET). */
+    public String esOpenDirectionForecastTopic() {
+        return value("KAFKA_ES_OPEN_DIRECTION_TOPIC", "es.open-direction.forecast");
+    }
+
+    /** ES open-direction per-horizon outcome topic (JSON, key = tradeDate; H1 10:30, H2 12:30, H3 16:00). */
+    public String esOpenDirectionOutcomeTopic() {
+        return value("KAFKA_ES_OPEN_DIRECTION_OUTCOME_TOPIC", "es.open-direction.outcome");
+    }
+
+    /**
+     * Freshness TTL for the ES open-direction forecast + outcome caches. The forecast is emitted ONCE
+     * at 09:15 ET and stays decision-relevant for the whole session (outcomes resolve at 10:30/12:30/
+     * 16:00) — like {@link #maxPainTtlMs() max-pain}, use a long last-value-wins window (default 12h)
+     * so a client that connects at 11:00 still receives the 09:15 forecast on replay, and the 12h
+     * cache seek-back re-bootstraps it after a gateway restart. It must NEVER sit behind the generic
+     * 15-min TTL or any market-data staleness gate. {@code <= 0} preserves the generic semantics.
+     */
+    public long esOpenDirectionTtlMs() {
+        return longValue("GATEWAY_ES_OPEN_DIRECTION_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
     /**
      * Freshness TTL for the structural option-chain cache (the {@code snapshot} strike ladder — see
      * {@code FeedGatewayService.MARKET_AWARE_CHAIN_EVENTS}) DURING regular trading hours — default 10 min.
