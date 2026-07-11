@@ -240,6 +240,15 @@ public final class GatewaySettings {
         return value("STRIKE_INTEL_BY_STRIKE_TOPIC", StrikeIntelligenceTopics.STRIKE_INTELLIGENCE_BY_STRIKE);
     }
 
+    /**
+     * Discrete {@code StrikeTurnAlert} START/STOP turn events from strike-intelligence-service, keyed by
+     * {@code symbol|tradingDate}. Broadcast as event {@code "turn-alert"} (own message.type), symbol-filtered
+     * client-side. Unprefixed; default is the bare {@code strike-intelligence-turn-alert}.
+     */
+    public String strikeIntelTurnAlertTopic() {
+        return value("STRIKE_INTEL_TURN_ALERT_TOPIC", StrikeIntelligenceTopics.STRIKE_INTELLIGENCE_TURN_ALERT);
+    }
+
     /** dealer-ledger-service chain-level book (U1-U9), one record per (symbol, expiry). */
     public String dealerLedgerProfileTopic() {
         return value("KAFKA_DEALER_LEDGER_PROFILE_TOPIC", "dealer-ledger-profile");
