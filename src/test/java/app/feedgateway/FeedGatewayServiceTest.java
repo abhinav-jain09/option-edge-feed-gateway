@@ -1,5 +1,6 @@
 package app.feedgateway;
 
+import app.feedgateway.mtsession.gateway.ReplayParams;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
@@ -22,13 +23,14 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -73,6 +75,10 @@ class FeedGatewayServiceTest {
         GatewaySettings settings = new GatewaySettings();
         assertTrue(isOptionalTopic(service, settings.dealerLedgerProfileTopic()));
         assertTrue(isOptionalTopic(service, settings.dealerLedgerStateTopic()));
+        // strike-invasion is a brand-new topic whose producer may not be deployed during a staged
+        // rollout — it MUST be optional (like strike-intel) so its absence cannot starve the shared
+        // JSON consumer (strike-flow / mission-pace / etc.).
+        assertTrue(isOptionalTopic(service, settings.strikeInvasionTopic()));
         // A mandatory feed must still be mandatory (guards against over-broadening the optional set).
         assertFalse(isOptionalTopic(service, settings.databentoStrikeFlowTopic()));
     }
@@ -194,6 +200,131 @@ class FeedGatewayServiceTest {
         statusJson.setAccessible(true);
         assertTrue(((String) statusJson.invoke(service)).contains("\"strikeIntels\":1"),
                 "statusJson must report the strike-intel cache count (delta-flow counterpart)");
+    }
+
+    // ----- strike-invasion gateway consumer (per-strike StrikeInvasionSnapshot, SPX-only, NO expiry) --
+
+    @Test
+    void strikeInvasionCacheKeyIsSymbolStrikeFromPayloadIdentity() throws Exception {
+        // strike-invasion is SPX-only and carries NO expiry, so the key is symbol|strike (mirrors
+        // strikeIntelCacheKey minus the expiry segment; source is prepended later by updateCache).
+        FeedGatewayService service = service();
+        assertEquals("SPX|6005", strikeInvasionCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"invasionState\":\"INVADED\"}",
+                "fallback-key"));
+    }
+
+    @Test
+    void strikeInvasionUpdateCacheStoresSourcePrefixedKey() throws Exception {
+        // After updateCache the stored/returned cache key is DATABENTO|SPX|strike (source prepended, NO expiry).
+        FeedGatewayService service = service();
+        String json = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\","
+                + "\"strike\":6005,\"invasionState\":\"INVADED\",\"eventTimeMs\":" + System.currentTimeMillis() + "}";
+        String key = updateCache(service, topicBinding("DATABENTO", "strike-invasion"),
+                new ConsumerRecord<>(new GatewaySettings().strikeInvasionTopic(), 0, 1L, "SPX|6005", json),
+                json);
+        assertEquals("DATABENTO|SPX|6005", key,
+                "updateCache must prepend the source to the strike-invasion cache key");
+    }
+
+    @Test
+    void enrichJsonStampsActiveSelectionExpiryOnStrikeInvasion() throws Exception {
+        // StrikeInvasionSnapshot carries NO expiry, but contract routing (RoutingKeyDeriver /
+        // matchesSelectionNode / cached-replay barrier) matches on symbol|expiry and REJECTS a blank
+        // expiry. enrichJson must stamp the active SPX selection's expiry so the record routes like
+        // strike-intel instead of being dropped as a blank-expiry contract record.
+        FeedGatewayService service = service();
+        // The stamp comes from the market-calendar trading date, NOT the per-session selection.
+        String today = currentTradingDateExpiry();
+        setActiveSelection(service, "DATABENTO", "SPX", "20991231"); // deliberately NOT the calendar date
+        String enriched = enrichJson(service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"state\":\"ACCEPTED_ABOVE\"}",
+                topicBinding("DATABENTO", "strike-invasion"));
+        assertEquals(today, new ObjectMapper().readTree(enriched).get("expiry").asText(),
+                "strike-invasion must inherit the calendar 0DTE expiry (not the manual selection) so it is routable");
+    }
+
+    @Test
+    void cachedReplayIncludesFreshStrikeInvasionForMatchingSpxSelectionOnly() throws Exception {
+        // End-to-end: a strike-invasion record (no expiry in payload) enriched under an SPX selection
+        // must replay to a matching DATABENTO SPX client — and only to it. Before the enrichJson expiry
+        // stamp this dropped entirely (blank-expiry contract records never match a selection).
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String today = currentTradingDateExpiry();
+        setActiveSelection(service, "DATABENTO", "SPX", today);
+        String enriched = enrichJson(service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"state\":\"ACCEPTED_ABOVE\",\"asOfEventTimeMs\":" + now + "}",
+                topicBinding("DATABENTO", "strike-invasion"));
+        updateCache(service, topicBinding("DATABENTO", "strike-invasion"),
+                recordAt(settings.strikeInvasionTopic(), 0, 1L, "SPX|6005", enriched, now), enriched);
+
+        assertEquals(1, cachedEvents(service, List.of("strike-invasion"), now).size(),
+                "fresh strike-invasion must replay to a matching DATABENTO SPX 0DTE client");
+
+        // Wrong source (IBKR) is filtered (strike-invasion is DATABENTO-only).
+        setActiveSelection(service, "IBKR", "SPX", today);
+        assertTrue(cachedEvents(service, List.of("strike-invasion"), now).isEmpty(),
+                "IBKR selection must never receive DATABENTO strike-invasion");
+
+        // Wrong symbol is filtered by the selection barrier.
+        setActiveSelection(service, "DATABENTO", "SPY", today);
+        assertTrue(cachedEvents(service, List.of("strike-invasion"), now).isEmpty(),
+                "a different symbol must not receive this strike-invasion");
+
+        // Wrong EXPIRY: a session that manually selected a non-0DTE SPX chain must NOT receive the 0DTE
+        // invasion signal — the record is stamped with the calendar 0DTE date, independent of the
+        // session's selection, so the selection barrier correctly filters a later expiry.
+        setActiveSelection(service, "DATABENTO", "SPX", "20991231");
+        assertTrue(cachedEvents(service, List.of("strike-invasion"), now).isEmpty(),
+                "a non-0DTE SPX chain must not receive the 0DTE strike-invasion");
+    }
+
+    @Test
+    void staleCachedStrikeInvasionIsNotReplayed() throws Exception {
+        // A strike-invasion whose PAYLOAD event time (asOfEventTimeMs) is old must NOT replay on connect,
+        // even though its Kafka ARRIVAL time is fresh — a catching-up/backfilling producer must not render
+        // a stale invasion action as live (mirrors strike-intel; relies on the eventCacheTimestamp branch).
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        long staleEventTime = now - 60L * 60_000L;
+        setActiveSelection(service, "DATABENTO", "SPX", currentTradingDateExpiry());
+        String enriched = enrichJson(service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"state\":\"ACCEPTED_ABOVE\",\"asOfEventTimeMs\":" + staleEventTime + "}",
+                topicBinding("DATABENTO", "strike-invasion"));
+        // Fresh Kafka ARRIVAL time (record timestamp = now) — only the payload event time makes it stale.
+        updateCache(service, topicBinding("DATABENTO", "strike-invasion"),
+                recordAt(settings.strikeInvasionTopic(), 0, 1L, "SPX|6005", enriched, now), enriched);
+
+        assertTrue(cachedEvents(service, List.of("strike-invasion"), now).isEmpty(),
+                "a stale (old payload event time) strike-invasion must not be replayed");
+    }
+
+    @Test
+    void replayReStampsStrikeInvasionExpiryToTheReplayWindow() throws Exception {
+        // strike-invasion carries no expiry; enrichJson stamps the LIVE calendar date. In replay the record
+        // belongs to the replay window's chain, so emitReplayRecord re-stamps params.expiry() — without it
+        // the historical (live-dated) record would fail the expiry-matched replayMatches filter and be
+        // silently dropped from the private replay stream.
+        FeedGatewayService service = service();
+        String enriched = enrichJson(service,
+                "{\"symbol\":\"SPX\",\"strike\":6005,\"state\":\"ACCEPTED_ABOVE\"}",
+                topicBinding("DATABENTO", "strike-invasion"));
+        // A historical replay window (a date that is NOT the current calendar trading date).
+        ReplayParams params = new ReplayParams("app:u1", "SPX", "20260612", 1_000L, 2_000L, 1000, null);
+        assertNotEquals("20260612", currentTradingDateExpiry(),
+                "test precondition: the replay window must differ from the live calendar date");
+
+        // The live-dated record does NOT match a historical replay window...
+        assertFalse(replayMatches(service, params, "strike-invasion", enriched),
+                "an unstamped (live-dated) strike-invasion must not match a historical replay window");
+        // ...but after the replay re-stamp (params.expiry) it does.
+        String restamped = stampExpiry(service, enriched, params.expiry());
+        assertTrue(replayMatches(service, params, "strike-invasion", restamped),
+                "re-stamping the replay window expiry makes the replayed strike-invasion match");
     }
 
     @Test
@@ -1128,6 +1259,25 @@ class FeedGatewayServiceTest {
             assertFalse(methodBody(source, method).contains("strike-sr"),
                     method + " must NOT bind the unified S/R topic (it is Avro, not JSON)");
         }
+        // strike-invasion is genuinely JSON (StrikeInvasionSnapshot), like strike-intel: it must be a
+        // stringTopic in windowed replay (NOT Avro), and bound on the JSON consumers only.
+        assertTrue(source.contains("stringTopics.put(settings.strikeInvasionTopic(), \"strike-invasion\");"),
+                "windowed replay must consume strike-invasion as a JSON stringTopic");
+        assertFalse(source.contains("avroTopics.put(settings.strikeInvasionTopic(), \"strike-invasion\");"),
+                "strike-invasion must never be read via the Avro path");
+        // Run-scoped (orchestrated) replay must DROP it (not in the per-run replicator contract), mirroring
+        // strike-intel / delta-flow / liquidity-heatmap.
+        assertTrue(source.contains("stringTopics.remove(settings.strikeInvasionTopic());"),
+                "run-scoped replay must exclude strike-invasion (no replay.<runId> topic for it)");
+        for (String method : List.of("runJsonStateCacheConsumer", "runJsonStateLiveConsumer")) {
+            assertTrue(methodBody(source, method).contains(
+                    "topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding(\"DATABENTO\", \"strike-invasion\"));"),
+                    method + " must bind the DATABENTO strike-invasion topic (JSON)");
+        }
+        for (String method : List.of("runAvroCacheConsumer", "runAvroLiveConsumer")) {
+            assertFalse(methodBody(source, method).contains("strike-invasion"),
+                    method + " must NOT bind strike-invasion (it is JSON, not Avro)");
+        }
         // Legacy caught-up gating: max-pain (DATABENTO-only Avro) under avroCaughtUp; gex-by-strike
         // (multi-source) under BOTH flags.
         assertTrue(source.contains(
@@ -1499,6 +1649,12 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(service, json, fallback);
     }
 
+    private static String strikeInvasionCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("strikeInvasionCacheKey", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, fallback);
+    }
+
     private static String maxPainCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
         Method method = FeedGatewayService.class.getDeclaredMethod("maxPainCacheKey", String.class, String.class);
         method.setAccessible(true);
@@ -1527,6 +1683,33 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod("updateCache", bindingType, ConsumerRecord.class, String.class);
         method.setAccessible(true);
         return (String) method.invoke(service, binding, record, json);
+    }
+
+    private static String enrichJson(FeedGatewayService service, String json, Object binding) throws Exception {
+        Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Method method = FeedGatewayService.class.getDeclaredMethod("enrichJson", String.class, bindingType);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, binding);
+    }
+
+    private static String stampExpiry(FeedGatewayService service, String json, String expiry) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("stampExpiry", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, expiry);
+    }
+
+    private static boolean replayMatches(FeedGatewayService service, ReplayParams params, String event, String json)
+            throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "replayMatches", ReplayParams.class, String.class, String.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, params, event, json);
+    }
+
+    /** The market-calendar trading date the gateway stamps onto expiry-less strike-invasion records. */
+    private static String currentTradingDateExpiry() {
+        return new GatewaySettings().marketCalendar().currentTradingDate(java.time.Instant.now())
+                .format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
     }
 
     /** A ConsumerRecord with an explicit event timestamp (CREATE_TIME), for testing age-based eviction. */
@@ -1691,7 +1874,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1703,6 +1886,16 @@ class FeedGatewayServiceTest {
         assertTrue(envelope.contains("\"strikeSr\":[" + json + "]"),
                 "batch envelope must carry the strikeSr array; was: " + envelope);
         assertTrue(envelope.contains("\"gexByStrike\":[]"));
+    }
+
+    @Test
+    void uiBatchEnvelopeCarriesStrikeInvasionsArrayKey() throws Exception {
+        FeedGatewayService service = service();
+        String json = "{\"symbol\":\"SPX\",\"strike\":6005,\"invasionState\":\"INVADED\"}";
+        String envelope = uiBatchEnvelopeJsonStrikeInvasion(service, List.of(json));
+        assertTrue(envelope.contains("\"strikeInvasions\":[" + json + "]"),
+                "batch envelope must carry the strikeInvasions array; was: " + envelope);
+        assertTrue(envelope.contains("\"strikeIntels\":[]"));
     }
 
     @Test
@@ -1783,8 +1976,8 @@ class FeedGatewayServiceTest {
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), liquidityHeatmaps,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                liquidityHeatmaps, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1794,7 +1987,17 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
+    private static String uiBatchEnvelopeJsonStrikeInvasion(FeedGatewayService service, List<String> strikeInvasions) throws Exception {
+        Method method = uiBatchEnvelopeMethod();
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeInvasions,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1804,7 +2007,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1817,7 +2020,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1827,7 +2030,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2ByOptions, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2ByOptions, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1837,7 +2040,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2Sessions, List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2Sessions, List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1846,8 +2049,8 @@ class FeedGatewayServiceTest {
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), missionPaces,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), missionPaces, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1856,8 +2059,8 @@ class FeedGatewayServiceTest {
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                missionControls, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), missionControls, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1874,8 +2077,8 @@ class FeedGatewayServiceTest {
                 service,
                 // positional args: snapshots, paces, paceRanks, directionalPressures, strikeFlows,
                 // deltaFlows, then the remaining latest-state lists — pass empty except strikeFlows.
-                List.of(), List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -1885,7 +2088,7 @@ class FeedGatewayServiceTest {
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class
         );
     }
 }

@@ -101,6 +101,24 @@ class GatewayRecordMapperTest {
     }
 
     @Test
+    void strikeInvasionEventTypeMapping() {
+        assertEquals(EventType.STRIKE_INVASION, GatewayRecordMapper.eventTypeFor("strike-invasion"));
+    }
+
+    @Test
+    void mapsStrikeInvasionAsContractEventWithNoExpiry() throws Exception {
+        // strike-invasion is per-strike JSON (StrikeInvasionSnapshot), SPX-only with NO expiry — it routes
+        // CONTRACT-scoped and carries a strike for the per-user filter; the mapper tolerates a missing expiry.
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "strike-invasion",
+                node("{\"symbol\":\"SPX\",\"strike\":6000.0,\"invasionState\":\"INVADED\"}")).orElseThrow();
+        assertEquals(EventType.STRIKE_INVASION, rec.eventType());
+        assertTrue(EventType.STRIKE_INVASION.isContractScoped());
+        assertEquals("SPX", rec.symbol());
+        assertEquals("", rec.expiry());
+        assertEquals(6000.0, rec.strike().getAsDouble());
+    }
+
+    @Test
     void unknownEventReturnsEmpty() throws Exception {
         assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "hpsf-latest-signal",
                 node("{\"symbol\":\"SPX\"}")).isEmpty());

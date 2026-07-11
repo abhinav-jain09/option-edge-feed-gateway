@@ -109,7 +109,7 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "strike-sr",
             "max-pain",
             "liquidity-heatmap",
@@ -130,6 +130,10 @@ public class FeedGatewayService implements ReplayRunner {
     // Per-strike strike-intelligence signals, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (StrikeIntelligenceSignal) — lives on the JSON-state consumer.
     private final Map<String, String> strikeIntels = new ConcurrentHashMap<>();
+    // Per-strike strike-invasion signals, keyed by source|symbol|strike (SPX-only — NO expiry;
+    // last-value-wins per strike). JSON on the wire (StrikeInvasionSnapshot) — lives on the JSON-state
+    // consumer (mirrors strike-intel, minus the expiry segment).
+    private final Map<String, String> strikeInvasions = new ConcurrentHashMap<>();
     // Latest liquidity-heatmap column frame per symbol|expiry (last-value-wins; short TTL —
     // see GatewaySettings.liquidityHeatmapTtlMs()). History accumulates client-side.
     private final Map<String, String> liquidityHeatmaps = new ConcurrentHashMap<>();
@@ -172,6 +176,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingStrikeFlows = new LinkedHashMap<>();
     private final Map<String, String> pendingDeltaFlows = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeIntels = new LinkedHashMap<>();
+    private final Map<String, String> pendingStrikeInvasions = new LinkedHashMap<>();
     private final Map<String, String> pendingLiquidityHeatmaps = new LinkedHashMap<>();
     private final Map<String, String> pendingMissionPaces = new LinkedHashMap<>();
     private final Map<String, String> pendingMissionControls = new LinkedHashMap<>();
@@ -453,7 +458,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session"));
+            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session"));
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
             replayDealerLedgerCached(session);
@@ -1132,6 +1137,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
         // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
         topicEvents.put(settings.strikeIntelTurnAlertTopic(), new TopicBinding("DATABENTO", "turn-alert"));
+        // strike-invasion is plain JSON (StrikeInvasionSnapshot), per-strike keyed (symbol|strike, SPX-only
+        // — NO expiry) — this JSON-state consumer, never the Avro one (mirrors strike-intel).
+        topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
         // Both dealer-ledger topics bind to ONE event; updateCache tells profile from state by topic name
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
@@ -1187,6 +1195,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
         // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
         topicEvents.put(settings.strikeIntelTurnAlertTopic(), new TopicBinding("DATABENTO", "turn-alert"));
+        // strike-invasion is plain JSON, per-strike keyed (symbol|strike, no expiry) — keep the cache +
+        // live JSON consumer topic sets symmetric (same rule as strike-intel above).
+        topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
         // Both dealer-ledger topics bind to ONE event; updateCache tells profile from state by topic name
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
@@ -1551,9 +1562,15 @@ public class FeedGatewayService implements ReplayRunner {
                         boolean strikeIntelStale = "strike-intel".equals(binding.event())
                                 && eventCacheTimestamp(binding.event(), record, json)
                                 < System.currentTimeMillis() - settings.cacheTtlMs();
+                        // Strike-invasion fail-closed (freshness): same rationale as strike-intel — a
+                        // per-strike signal carries no per-session selectionEpoch, so gate on the generic
+                        // cache window so a backfilled/catching-up producer never live-routes a stale action.
+                        boolean strikeInvasionStale = "strike-invasion".equals(binding.event())
+                                && eventCacheTimestamp(binding.event(), record, json)
+                                < System.currentTimeMillis() - settings.cacheTtlMs();
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
-                                && !strikeIntelStale) {
+                                && !strikeIntelStale && !strikeInvasionStale) {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -1725,6 +1742,7 @@ public class FeedGatewayService implements ReplayRunner {
                     || topic.equals(settings.dealerLedgerProfileTopic())
                     || topic.equals(settings.dealerLedgerStateTopic())
                     || topic.equals(settings.strikeIntelByStrikeTopic())
+                    || topic.equals(settings.strikeInvasionTopic())
                     || topic.equals(settings.shortPremiumRecommendationTopic()));
     }
 
@@ -1921,6 +1939,22 @@ public class FeedGatewayService implements ReplayRunner {
         applySelection(new ActiveSelection(current.source(), current.symbol(), target, now, now));
     }
 
+    /**
+     * The canonical current-session expiry for the SPX-only 0DTE strike-invasion signal, which carries
+     * no expiry of its own (its {@code StrikeInvasionSnapshot} contract is keyed symbol|strike). Derived
+     * from the SAME market-calendar trading date the Databento feed self-rolls to (see
+     * {@link #maybeAutoRollExpiry}) — the exact chain the strike-invasion producer emits for — so it is
+     * INDEPENDENT of any pinned {@code IB_EXPIRY} or per-session manual selection. Falls back to
+     * {@code autoRolledExpiry} only if the calendar is momentarily unavailable.
+     */
+    private String currentInvasionExpiry() {
+        try {
+            return marketCalendar.currentTradingDate(Instant.now()).format(DateTimeFormatter.BASIC_ISO_DATE);
+        } catch (RuntimeException e) {
+            return autoRolledExpiry; // calendar hiccup — the daily-rolled date is the best available proxy
+        }
+    }
+
     private Map<TopicPartition, Long> captureOffsetBarriers(ActiveSelection selection) {
         List<String> topics = outputTopicsForSource(selection.source());
         if (topics.isEmpty()) {
@@ -1966,6 +2000,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.databentoStrikeFlowTopic(),
                     settings.databentoDeltaFlowByStrikeTopic(),
                     settings.strikeIntelByStrikeTopic(),
+                    settings.strikeInvasionTopic(),
                     settings.strikeLiquidityTopic(),
                     settings.databentoPaceMissionTopic(),
                     settings.missionControlTopic(),
@@ -1986,7 +2021,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -2283,6 +2318,29 @@ public class FeedGatewayService implements ReplayRunner {
             if (!object.hasNonNull("sessionDate")) {
                 object.put("sessionDate", selection.expiry());
             }
+            // strike-invasion is SPX-only 0DTE and its StrikeInvasionSnapshot contract carries NO expiry
+            // (record identity is symbol|strike). But contract routing — RoutingKeyDeriver.derive,
+            // matchesSelectionNode, and the cached-replay selection barrier — all match on symbol|expiry
+            // and REJECT a blank-expiry contract record. Stamp the canonical current 0DTE expiry so
+            // strike-invasion routes and replays like its strike-intel sibling instead of being dropped.
+            //
+            // Source the expiry from the market-calendar trading date (currentInvasionExpiry) — exactly the
+            // 0DTE chain the strike-invasion producer emits for and the date the Databento feed self-rolls
+            // to — NOT the per-session/global activeSelection or a pinned IB_EXPIRY. A session viewing
+            // today's 0DTE receives it; a session that manually selected a non-0DTE chain correctly does
+            // not (a 0DTE-only signal must not attach to a later expiry). The cache key stays symbol|strike
+            // (updateCache's strikeInvasionCacheKey ignores expiry), so last-value-wins per strike holds.
+            // NOTE: the replay path re-stamps this with the replay window's expiry (see emitReplayRecord),
+            // since a historical record belongs to that session's chain, not today's.
+            if ("strike-invasion".equals(binding.event()) && text(object, "expiry").isBlank()) {
+                String expiry = currentInvasionExpiry();
+                if (expiry == null || expiry.isBlank()) {
+                    expiry = selection.expiry(); // last-resort fallback so a routable record is never dropped
+                }
+                if (!expiry.isBlank()) {
+                    object.put("expiry", expiry);
+                }
+            }
             return mapper.writeValueAsString(object);
         } catch (JsonProcessingException ignored) {
             return json;
@@ -2306,6 +2364,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = deltaFlowCacheKey(json, key);
         } else if ("strike-intel".equals(event)) {
             key = strikeIntelCacheKey(json, key);
+        } else if ("strike-invasion".equals(event)) {
+            key = strikeInvasionCacheKey(json, key);
         } else if ("liquidity-heatmap".equals(event)) {
             // Payload-derived symbol|expiry key (mirrors strike-flow): last-value-wins per chain
             // must not depend on the Kafka record key shape.
@@ -2414,6 +2474,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 strikeIntels.put(key, json);
+                return key;
+            }
+            case "strike-invasion" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                strikeInvasions.put(key, json);
                 return key;
             }
             case "mission-pace" -> {
@@ -2774,6 +2840,14 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("strike-intel", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "strike-invasion" -> strikeInvasions.entrySet().stream()
+                        .filter(entry -> isCacheFresh("strike-invasion:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("strike-invasion:" + entry.getKey(), selection))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("strike-invasion", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "liquidity-heatmap" -> liquidityHeatmaps.entrySet().stream()
                         // DATABENTO-only per-second column frames; isCacheFresh is event-aware with the
@@ -3156,6 +3230,17 @@ public class FeedGatewayService implements ReplayRunner {
                 return payloadTime;
             }
         }
+        if ("strike-invasion".equals(event)) {
+            // Freshness MUST track the PAYLOAD event time (asOfEventTimeMs), not the Kafka ARRIVAL time
+            // (mirrors strike-intel above). A producer catching up / backfilling appends records now
+            // (fresh arrival) whose asOfEventTimeMs is old — using arrival time would let a stale
+            // strike-invasion action pass the cache-fresh TTL + replay barriers and render as live. This
+            // is what the strikeInvasionStale live gate and isCacheFresh replay gate both rely on.
+            long payloadTime = strikeInvasionTimestamp(json);
+            if (payloadTime >= 0) {
+                return payloadTime;
+            }
+        }
         return cacheTimestamp(record);
     }
 
@@ -3188,6 +3273,22 @@ public class FeedGatewayService implements ReplayRunner {
             JsonNode node = mapper.readTree(json);
             long eventTime = longField(node, "eventTimeMs", -1L);
             return eventTime >= 0 ? eventTime : longField(node, "asOfEventTimeMs", -1L);
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
+    }
+
+    /**
+     * Event time of a raw per-strike strike-invasion record; -1 if absent/unparseable. The
+     * {@code StrikeInvasionSnapshot} contract names this field {@code asOfEventTimeMs} (decision-relevant
+     * event time). An {@code eventTimeMs} fallback is kept for defensive parity with the strike-intel
+     * sibling.
+     */
+    private long strikeInvasionTimestamp(String json) {
+        try {
+            JsonNode node = mapper.readTree(json);
+            long eventTime = longField(node, "asOfEventTimeMs", -1L);
+            return eventTime >= 0 ? eventTime : longField(node, "eventTimeMs", -1L);
         } catch (JsonProcessingException ignored) {
             return -1L;
         }
@@ -3235,6 +3336,8 @@ public class FeedGatewayService implements ReplayRunner {
             strikeFlows.remove(versionKey.substring("strike-flow:".length()));
         } else if (versionKey.startsWith("delta-flow:")) {
             deltaFlows.remove(versionKey.substring("delta-flow:".length()));
+        } else if (versionKey.startsWith("strike-invasion:")) {
+            strikeInvasions.remove(versionKey.substring("strike-invasion:".length()));
         } else if (versionKey.startsWith("strike-intel:")) {
             strikeIntels.remove(versionKey.substring("strike-intel:".length()));
         } else if (versionKey.startsWith("liquidity-heatmap:")) {
@@ -3373,6 +3476,26 @@ public class FeedGatewayService implements ReplayRunner {
             double strike = doubleField(root, "strike", Double.NaN);
             if (!symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike)) {
                 return symbol + "|" + expiry + "|" + formatStrike(strike);
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    /**
+     * Per-strike strike-invasion cache key: {@code symbol|strike} (mirrors {@link #strikeIntelCacheKey}
+     * but WITHOUT the expiry segment — strike-invasion is SPX-only and carries no expiry). Derived from
+     * payload identity so the cache key matches the UI contract (source is prepended by updateCache →
+     * source|symbol|strike). Falls back to the Kafka record key if symbol/strike are absent.
+     */
+    private String strikeInvasionCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            double strike = doubleField(root, "strike", Double.NaN);
+            if (!symbol.isBlank() && Double.isFinite(strike)) {
+                return symbol + "|" + formatStrike(strike);
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
@@ -3780,6 +3903,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "strike-flow", strikeFlows);
         replayCacheMap(session, "delta-flow", deltaFlows);
         replayCacheMap(session, "strike-intel", strikeIntels);
+        replayCacheMap(session, "strike-invasion", strikeInvasions);
         // Mission-level state is low-frequency in replay/off-hours dev. Replay the fresh cached value on
         // connect, still routed by source|symbol|expiry so it cannot leak to another selected market.
         replayCacheMap(session, "mission-pace", missionPaces);
@@ -4059,6 +4183,7 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.strikeIntelByStrikeTopic(), "strike-intel");
+                stringTopics.put(settings.strikeInvasionTopic(), "strike-invasion");
                 stringTopics.put(settings.strikeLiquidityTopic(), "liquidity-heatmap");
                 stringTopics.put(settings.databentoPaceMissionTopic(), "mission-pace");
                 stringTopics.put(settings.missionControlTopic(), "mission-control");
@@ -4084,6 +4209,11 @@ public class FeedGatewayService implements ReplayRunner {
                 // strike-intelligence-by-strike is likewise NOT in the per-run replay contract and its
                 // dotless name has no namespace segment for ReplayTopicResolver — drop it too.
                 stringTopics.remove(settings.strikeIntelByStrikeTopic());
+                // strike-invasion is likewise NOT part of the per-run replay contract (the replicator
+                // produces no replay.<runId> strike-invasion topic) — drop it too, so an orchestrated
+                // Databento run never dies waiting on a topic the run does not provide. Windowed
+                // (non-run) historical replay still consumes the live topic above.
+                stringTopics.remove(settings.strikeInvasionTopic());
                 // Read the orchestrated run's LOCAL replay topics instead of the live topics.
                 avroTopics = toReplayTopics(avroTopics, params.runId());
                 stringTopics = toReplayTopics(stringTopics, params.runId());
@@ -4474,6 +4604,13 @@ public class FeedGatewayService implements ReplayRunner {
             if (json == null || json.isBlank()) {
                 return false;
             }
+            // strike-invasion carries no expiry; enrichJson stamped the LIVE 0DTE date, but a REPLAYED
+            // record belongs to the replay window's chain (params.expiry()), not today's. Re-stamp it so
+            // the expiry-matched replayMatches filter accepts it — otherwise the historical, live-dated
+            // record would never match the replay selection and would be silently dropped.
+            if ("strike-invasion".equals(r.event())) {
+                json = stampExpiry(json, params.expiry());
+            }
             json = withReplayProvenance(json, r.cursor());
             if (replayMatches(params, r.event(), json)) {
                 // P0 (generation barrier): re-verify ownership IMMEDIATELY before the send. A record already
@@ -4489,6 +4626,26 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (RuntimeException poison) {
             return false; // skip the poison record; the merge continues with the next
         }
+    }
+
+    /**
+     * Overwrite the {@code expiry} of a JSON payload (used to re-stamp the expiry-less strike-invasion
+     * record with the replay window's chain). No-op on blank expiry or non-object/unparseable JSON.
+     */
+    private String stampExpiry(String json, String expiry) {
+        if (expiry == null || expiry.isBlank()) {
+            return json;
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            if (root instanceof ObjectNode object) {
+                object.put("expiry", expiry);
+                return mapper.writeValueAsString(object);
+            }
+        } catch (JsonProcessingException ignored) {
+            // fall through with the original json
+        }
+        return json;
     }
 
     /** Retain the record's canonical event time, topic, partition and offset on the outbound event. */
@@ -4776,6 +4933,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "strike-flow" -> pendingStrikeFlows;
             case "delta-flow" -> pendingDeltaFlows;
             case "strike-intel" -> pendingStrikeIntels;
+            case "strike-invasion" -> pendingStrikeInvasions;
             case "liquidity-heatmap" -> pendingLiquidityHeatmaps;
             case "mission-pace" -> pendingMissionPaces;
             case "mission-control" -> pendingMissionControls;
@@ -4825,6 +4983,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingStrikeFlows.values()),
                         new ArrayList<>(pendingDeltaFlows.values()),
                         new ArrayList<>(pendingStrikeIntels.values()),
+                        new ArrayList<>(pendingStrikeInvasions.values()),
                         new ArrayList<>(pendingLiquidityHeatmaps.values()),
                         new ArrayList<>(pendingMissionPaces.values()),
                         new ArrayList<>(pendingMissionControls.values()),
@@ -4871,6 +5030,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingStrikeFlows.size()
                 + pendingDeltaFlows.size()
                 + pendingStrikeIntels.size()
+                + pendingStrikeInvasions.size()
                 + pendingLiquidityHeatmaps.size()
                 + pendingMissionPaces.size()
                 + pendingMissionControls.size()
@@ -4898,6 +5058,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingStrikeFlows.clear();
         pendingDeltaFlows.clear();
         pendingStrikeIntels.clear();
+        pendingStrikeInvasions.clear();
         pendingLiquidityHeatmaps.clear();
         pendingMissionPaces.clear();
         pendingMissionControls.clear();
@@ -4930,6 +5091,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> strikeFlowJsons = new ArrayList<>();
         List<String> deltaFlowJsons = new ArrayList<>();
         List<String> strikeIntelJsons = new ArrayList<>();
+        List<String> strikeInvasionJsons = new ArrayList<>();
         List<String> liquidityHeatmapJsons = new ArrayList<>();
         List<String> missionPaceJsons = new ArrayList<>();
         List<String> missionControlJsons = new ArrayList<>();
@@ -4956,6 +5118,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "strike-flow" -> strikeFlowJsons.add(cachedEvent.json());
                 case "delta-flow" -> deltaFlowJsons.add(cachedEvent.json());
                 case "strike-intel" -> strikeIntelJsons.add(cachedEvent.json());
+                case "strike-invasion" -> strikeInvasionJsons.add(cachedEvent.json());
                 case "liquidity-heatmap" -> liquidityHeatmapJsons.add(cachedEvent.json());
                 case "mission-pace" -> missionPaceJsons.add(cachedEvent.json());
                 case "mission-control" -> missionControlJsons.add(cachedEvent.json());
@@ -4986,6 +5149,7 @@ public class FeedGatewayService implements ReplayRunner {
                 strikeFlowJsons,
                 deltaFlowJsons,
                 strikeIntelJsons,
+                strikeInvasionJsons,
                 liquidityHeatmapJsons,
                 missionPaceJsons,
                 missionControlJsons,
@@ -5014,6 +5178,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> strikeFlowJsons,
             List<String> deltaFlowJsons,
             List<String> strikeIntelJsons,
+            List<String> strikeInvasionJsons,
             List<String> liquidityHeatmapJsons,
             List<String> missionPaceJsons,
             List<String> missionControlJsons,
@@ -5049,6 +5214,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"strikeFlows\":" + jsonArray(strikeFlowJsons) + ","
                 + "\"deltaFlows\":" + jsonArray(deltaFlowJsons) + ","
                 + "\"strikeIntels\":" + jsonArray(strikeIntelJsons) + ","
+                + "\"strikeInvasions\":" + jsonArray(strikeInvasionJsons) + ","
                 + "\"liquidityHeatmaps\":" + jsonArray(liquidityHeatmapJsons) + ","
                 + "\"missionPaces\":" + jsonArray(missionPaceJsons) + ","
                 + "\"missionControls\":" + jsonArray(missionControlJsons) + ","

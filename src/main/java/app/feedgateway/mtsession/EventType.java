@@ -21,6 +21,10 @@ public enum EventType {
     // Per-strike strike-intelligence signal — one record per (symbol, expiry, strike), so it routes
     // CONTRACT-scoped by source|symbol|expiry and is strike-filtered per user (like DELTA_FLOW).
     STRIKE_INTEL(Scope.CONTRACT),
+    // Per-strike strike-invasion signal — one record per (symbol, strike). SPX-only, so it carries NO
+    // expiry; routes CONTRACT-scoped by source|symbol|expiry (with a blank expiry) and is strike-filtered
+    // per user (like STRIKE_INTEL).
+    STRIKE_INVASION(Scope.CONTRACT),
     MISSION_PACE(Scope.CONTRACT),
     MISSION_CONTROL(Scope.CONTRACT),
     VOLUME_SANDWICH(Scope.CONTRACT),

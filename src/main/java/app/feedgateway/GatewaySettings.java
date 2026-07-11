@@ -249,6 +249,15 @@ public final class GatewaySettings {
         return value("STRIKE_INTEL_TURN_ALERT_TOPIC", StrikeIntelligenceTopics.STRIKE_INTELLIGENCE_TURN_ALERT);
     }
 
+    /**
+     * Per-strike strike-invasion topic (JSON {@code StrikeInvasionSnapshot}, one record per
+     * {@code symbol|strike} — SPX-only, so there is NO expiry). Broadcast as event
+     * {@code "strike-invasion"}. Mirrors the strike-intel topic getter.
+     */
+    public String strikeInvasionTopic() {
+        return value("KAFKA_STRIKE_INVASION_TOPIC", "options.spx.strike-invasion.current");
+    }
+
     /** dealer-ledger-service chain-level book (U1-U9), one record per (symbol, expiry). */
     public String dealerLedgerProfileTopic() {
         return value("KAFKA_DEALER_LEDGER_PROFILE_TOPIC", "dealer-ledger-profile");
