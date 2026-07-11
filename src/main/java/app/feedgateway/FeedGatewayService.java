@@ -109,7 +109,7 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "strike-sr",
             "max-pain",
             "liquidity-heatmap",
@@ -142,6 +142,10 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> liquidityHeatmaps = new ConcurrentHashMap<>();
     private final Map<String, String> missionPaces = new ConcurrentHashMap<>();
     private final Map<String, String> missionControls = new ConcurrentHashMap<>();
+    // Whole-underlying spread-skew snapshot, keyed by source|underlying (SINGLE value, last snapshot
+    // wins). JSON on the wire (SpreadSkewSnapshot) — lives on the JSON-state consumer (the
+    // mission-control sibling; its discrete spread-skew-event siblings are never cached).
+    private final Map<String, String> spreadSkews = new ConcurrentHashMap<>();
     private final Map<String, String> indexPrices = new ConcurrentHashMap<>();
     // P1 (VIX/underlying consistency): VIX is cached SEPARATELY from ES/index so each cache entry keeps its
     // ORIGINAL event type (vix-price vs index-price) on replay, instead of being flattened to index-price.
@@ -183,6 +187,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingLiquidityHeatmaps = new LinkedHashMap<>();
     private final Map<String, String> pendingMissionPaces = new LinkedHashMap<>();
     private final Map<String, String> pendingMissionControls = new LinkedHashMap<>();
+    private final Map<String, String> pendingSpreadSkews = new LinkedHashMap<>();
     private final Map<String, String> pendingIndexPrices = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingMissionSandwiches = new LinkedHashMap<>();
@@ -461,7 +466,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session"));
+            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session"));
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
             replayDealerLedgerCached(session);
@@ -807,6 +812,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"liquidityHeatmaps\":" + liquidityHeatmaps.size() + ","
                 + "\"missionPaces\":" + missionPaces.size() + ","
                 + "\"missionControls\":" + missionControls.size() + ","
+                + "\"spreadSkews\":" + spreadSkews.size() + ","
                 + "\"indexPrices\":" + indexPrices.size() + ","
                 + "\"vixPrices\":" + vixPrices.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
@@ -905,6 +911,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_mission_controls Cached mission-control count.\n"
                 + "# TYPE options_edge_feed_gateway_mission_controls gauge\n"
                 + "options_edge_feed_gateway_mission_controls " + missionControls.size() + "\n"
+                + "# HELP options_edge_feed_gateway_spread_skews Cached spread-skew snapshot count.\n"
+                + "# TYPE options_edge_feed_gateway_spread_skews gauge\n"
+                + "options_edge_feed_gateway_spread_skews " + spreadSkews.size() + "\n"
                 + "# HELP options_edge_feed_gateway_index_prices Cached index price count.\n"
                 + "# TYPE options_edge_feed_gateway_index_prices gauge\n"
                 + "options_edge_feed_gateway_index_prices " + indexPrices.size() + "\n"
@@ -1153,6 +1162,11 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.strikeLiquidityTopic(), new TopicBinding("DATABENTO", "liquidity-heatmap"));
         topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding("DATABENTO", "mission-pace"));
         topicEvents.put(settings.missionControlTopic(), new TopicBinding("DATABENTO", "mission-control"));
+        // spread-skew.current is plain JSON (SpreadSkewSnapshot, a SINGLE record keyed "SPX") — this
+        // JSON-state consumer, never the Avro one (mirrors mission-control: single-value latest-state).
+        topicEvents.put(settings.spreadSkewTopic(), new TopicBinding("DATABENTO", "spread-skew"));
+        // spread-skew.events: discrete FIRE/EXIT/REVERSAL/RESTART transitions, broadcast STANDALONE (never cached).
+        topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding("DATABENTO", "spread-skew-event"));
         topicEvents.put(settings.optionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
         topicEvents.put(settings.optionPriceBehaviorV2ByOptionTopic(), new TopicBinding("DATABENTO", "opb-v2-by-option"));
         topicEvents.put(settings.optionPriceBehaviorV2SessionTopic(), new TopicBinding("DATABENTO", "opb-v2-session"));
@@ -1210,6 +1224,11 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.strikeLiquidityTopic(), new TopicBinding("DATABENTO", "liquidity-heatmap"));
         topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding("DATABENTO", "mission-pace"));
         topicEvents.put(settings.missionControlTopic(), new TopicBinding("DATABENTO", "mission-control"));
+        // spread-skew.current is plain JSON (single record keyed "SPX") — keep the cache + live JSON
+        // consumer topic sets symmetric (same rule as mission-control above).
+        topicEvents.put(settings.spreadSkewTopic(), new TopicBinding("DATABENTO", "spread-skew"));
+        // spread-skew.events: discrete FIRE/EXIT/REVERSAL/RESTART transitions, broadcast STANDALONE (never cached).
+        topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding("DATABENTO", "spread-skew-event"));
         topicEvents.put(settings.optionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
         topicEvents.put(settings.optionPriceBehaviorV2ByOptionTopic(), new TopicBinding("DATABENTO", "opb-v2-by-option"));
         topicEvents.put(settings.optionPriceBehaviorV2SessionTopic(), new TopicBinding("DATABENTO", "opb-v2-session"));
@@ -1514,6 +1533,16 @@ public class FeedGatewayService implements ReplayRunner {
                         forwardedEvents.incrementAndGet();
                         continue;
                     }
+                    if ("spread-skew-event".equals(binding.event())) {
+                        // Discrete spread-skew transition (FIRE/EXIT/REVERSAL/RESTART; own message.type),
+                        // symbol-filtered client-side. Broadcast STANDALONE to every client — never
+                        // selection-gated and never cached (a transition is a one-shot alert; the 5s
+                        // spread-skew snapshot carries the current state for late joiners) — the
+                        // turn-alert sibling.
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                        continue;
+                    }
                     String cacheKey = updateCache(binding, record, json);
                     // Dealer-ledger forwards the JOINED envelope (not the raw profile/state record); for
                     // every other event forwardJson is just `json`, so the block below is unchanged.
@@ -1572,9 +1601,16 @@ public class FeedGatewayService implements ReplayRunner {
                         boolean strikeInvasionStale = "strike-invasion".equals(binding.event())
                                 && eventCacheTimestamp(binding.event(), record, json)
                                 < System.currentTimeMillis() - settings.cacheTtlMs();
+                        // Spread-skew fail-closed (freshness): the whole-underlying skew snapshot is the
+                        // same low-frequency per-MARKET class as mission-control (epoch 0 bypasses
+                        // passesBarrier), so it gets the same explicit maxStale gate — but on the PAYLOAD
+                        // ts (spreadSkewTimestamp): a producer catching up on a backlog must never
+                        // live-route a stale skew state onto a socket.
+                        boolean spreadSkewStale = "spread-skew".equals(binding.event())
+                                && !eventTimeWithinMaxStale(eventCacheTimestamp(binding.event(), record, json));
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
-                                && !strikeIntelStale && !strikeInvasionStale) {
+                                && !strikeIntelStale && !strikeInvasionStale && !spreadSkewStale) {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -1747,6 +1783,11 @@ public class FeedGatewayService implements ReplayRunner {
                     || topic.equals(settings.dealerLedgerStateTopic())
                     || topic.equals(settings.strikeIntelByStrikeTopic())
                     || topic.equals(settings.strikeInvasionTopic())
+                    // Both spread-skew topics come from the same brand-new spread-skew-service, which may
+                    // not be deployed during a staged rollout — BOTH must be optional (like strike-invasion)
+                    // so their absence cannot starve the shared JSON consumer.
+                    || topic.equals(settings.spreadSkewTopic())
+                    || topic.equals(settings.spreadSkewEventsTopic())
                     || topic.equals(settings.shortPremiumRecommendationTopic()));
     }
 
@@ -2008,6 +2049,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.strikeLiquidityTopic(),
                     settings.databentoPaceMissionTopic(),
                     settings.missionControlTopic(),
+                    settings.spreadSkewTopic(),
                     settings.optionPriceBehaviorDashboardTopic(),
                     settings.optionPriceBehaviorV2ByOptionTopic(),
                     settings.optionPriceBehaviorV2SessionTopic(),
@@ -2025,7 +2067,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -2068,6 +2110,18 @@ public class FeedGatewayService implements ReplayRunner {
             return binding.source().equals(selection.source())
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesActiveSelection(json, selection);
+        }
+        if ("spread-skew".equals(binding.event())) {
+            // Spread-skew is a low-frequency, whole-UNDERLYING signal (a single snapshot per underlying),
+            // the same class as mission-control: the source-switch OFFSET barrier would perpetually
+            // classify its fresh frames as pre-switch and drop them, so bypass only the offset barrier.
+            // The time barrier runs on the PAYLOAD ts (spreadSkewTimestamp via eventCacheTimestamp) — a
+            // producer catching up on a backlog must never forward a stale skew state — and
+            // matchesSpreadSkewSelection enforces the underlying/expiry/source identity (the payload
+            // names its market `underlying`, not `symbol`, and its expiry is nullable).
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(eventCacheTimestamp(binding.event(), record, json), selection)
+                    && matchesSpreadSkewSelection(json, selection);
         }
         if ("strike-sr".equals(binding.event())) {
             // Strike-S/R is a low-frequency derived selected-market signal. It may be (re)started after the
@@ -2379,6 +2433,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = missionPaceCacheKey(json, key);
         } else if ("mission-control".equals(event)) {
             key = missionControlCacheKey(json, key);
+        } else if ("spread-skew".equals(event)) {
+            key = spreadSkewCacheKey(json, key);
         } else if ("gex-by-strike".equals(event)) {
             key = gexCacheKey(json, key);
         } else if ("max-pain".equals(event)) {
@@ -2497,6 +2553,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 missionControls.put(key, json);
+                return key;
+            }
+            case "spread-skew" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                spreadSkews.put(key, json); // SINGLE value per source|underlying — last snapshot wins
                 return key;
             }
             case "volume-sandwich" -> {
@@ -2891,6 +2953,19 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("mission-control", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "spread-skew" -> spreadSkews.entrySet().stream()
+                        .filter(entry -> isCacheFresh("spread-skew:" + entry.getKey(), nowMs))
+                        // Per-MARKET signal: keep the TIME/selected-at barrier (enforceMaxStale=true)
+                        // so a stale or pre-selection frame is never replayed, but DROP the per-strike
+                        // source-switch OFFSET barrier (enforceOffset=false) which otherwise blocks the
+                        // low-frequency spread-skew frame so the page never bootstraps on connect.
+                        // matchesSpreadSkewSelection below still enforces underlying/expiry/source identity.
+                        .filter(entry -> passesSelectionBarrier("spread-skew:" + entry.getKey(), selection, true, false))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesSpreadSkewSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("spread-skew", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "volume-sandwich" -> currentStates.entrySet().stream()
                         .filter(entry -> "volume-sandwich".equals(eventFromCacheKey(entry.getKey())))
                         .filter(entry -> isCacheFresh(entry.getKey(), nowMs))
@@ -3154,6 +3229,12 @@ public class FeedGatewayService implements ReplayRunner {
         return maxStaleMs <= 0L || cacheTimestamp(record) >= System.currentTimeMillis() - maxStaleMs;
     }
 
+    /** As {@link #recordWithinMaxStale}, but on a PAYLOAD event time (e.g. spread-skew's {@code ts}). */
+    private boolean eventTimeWithinMaxStale(long eventTimeMs) {
+        long maxStaleMs = settings.maxStaleMs();
+        return maxStaleMs <= 0L || eventTimeMs >= System.currentTimeMillis() - maxStaleMs;
+    }
+
     private boolean passesSelectionTimeBarrier(long eventTimeMs, ActiveSelection selection) {
         return passesSelectionTimeBarrier(eventTimeMs, selection, true);
     }
@@ -3246,6 +3327,17 @@ public class FeedGatewayService implements ReplayRunner {
                 return payloadTime;
             }
         }
+        if ("spread-skew".equals(event)) {
+            // Freshness MUST track the PAYLOAD event time (ts), not the Kafka ARRIVAL time (mirrors
+            // strike-invasion above). A producer catching up / backfilling appends records now (fresh
+            // arrival) whose ts is old — using arrival time would let a stale skew state pass the
+            // cache-fresh TTL + replay barriers and render as live. This is what the spreadSkewStale
+            // live gate and the shouldForward/isCacheFresh spread-skew paths all rely on. Unlike the
+            // siblings above there is deliberately NO Kafka-arrival fallback: a missing/unparseable ts
+            // returns -1 (fail closed), so a malformed snapshot arriving fresh can never be cached or
+            // forwarded as current.
+            return spreadSkewTimestamp(json);
+        }
         return cacheTimestamp(record);
     }
 
@@ -3294,6 +3386,19 @@ public class FeedGatewayService implements ReplayRunner {
             JsonNode node = mapper.readTree(json);
             long eventTime = longField(node, "asOfEventTimeMs", -1L);
             return eventTime >= 0 ? eventTime : longField(node, "eventTimeMs", -1L);
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
+    }
+
+    /**
+     * Event time of a spread-skew snapshot record; -1 if absent/unparseable. The spread-skew contract
+     * names this field {@code ts} (epoch ms of the evaluated bar — the decision-relevant event time;
+     * there is no asOfEventTimeMs sibling).
+     */
+    private long spreadSkewTimestamp(String json) {
+        try {
+            return longField(mapper.readTree(json), "ts", -1L);
         } catch (JsonProcessingException ignored) {
             return -1L;
         }
@@ -3351,6 +3456,8 @@ public class FeedGatewayService implements ReplayRunner {
             missionPaces.remove(versionKey.substring("mission-pace:".length()));
         } else if (versionKey.startsWith("mission-control:")) {
             missionControls.remove(versionKey.substring("mission-control:".length()));
+        } else if (versionKey.startsWith("spread-skew:")) {
+            spreadSkews.remove(versionKey.substring("spread-skew:".length()));
         } else if (versionKey.startsWith("volume-sandwich:")) {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("mission-sandwich:")) {
@@ -3548,6 +3655,25 @@ public class FeedGatewayService implements ReplayRunner {
             String expiry = normalizeExpiry(text(root, "expiry"));
             if (!symbol.isBlank() && !expiry.isBlank()) {
                 return symbol + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    /**
+     * Single-value spread-skew cache key: the {@code underlying} alone (the snapshot is a whole-
+     * underlying signal — SPX-only, ONE record, last snapshot wins across expiries). Derived from
+     * payload identity so the slot never splits on producer key drift; source is prepended by
+     * updateCache (source|underlying). Falls back to the Kafka record key ({@code "SPX"}) if absent.
+     */
+    private String spreadSkewCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String underlying = text(root, "underlying").toUpperCase();
+            if (!underlying.isBlank()) {
+                return underlying;
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
@@ -3761,6 +3887,36 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
+     * Selection match for the whole-underlying spread-skew snapshot: the payload names its market
+     * {@code underlying} (there is NO {@code symbol} field) with a NULLABLE {@code expiry}
+     * ("YYYY-MM-DD"; null while the producer cannot resolve the 0DTE chain). Match the selection
+     * symbol against the underlying, and treat an ABSENT expiry as covering the active session
+     * (mirrors matchesOptionPriceBehaviorSelection's blank-date leniency) — a PRESENT expiry must
+     * still match, so a frame for a different chain never leaks to the active selection.
+     */
+    private boolean matchesSpreadSkewSelection(String json, ActiveSelection selection) {
+        if (selection == null || json == null || json.isBlank()) {
+            return false;
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            String source = GatewaySettings.normalizeSource(text(root, "marketDataSource"));
+            if (source.isBlank()) {
+                source = GatewaySettings.normalizeSource(text(root, "source"));
+            }
+            if (!source.isBlank() && !selection.source().equals(source)) {
+                return false;
+            }
+            String underlying = text(root, "underlying");
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            return selection.symbol().equalsIgnoreCase(underlying)
+                    && (selection.expiry().isBlank() || expiry.isBlank() || selection.expiry().equals(expiry));
+        } catch (JsonProcessingException ignored) {
+            return false;
+        }
+    }
+
+    /**
      * Whether a max-pain payload carries the terminal EXPIRED status. Terminal records evict the cache
      * so a freshly-connected client never receives a stale terminal; the gateway still forwards a
      * single EXPIRED to currently-connected matching clients so the UI can transition cleanly.
@@ -3932,6 +4088,7 @@ public class FeedGatewayService implements ReplayRunner {
         // connect, still routed by source|symbol|expiry so it cannot leak to another selected market.
         replayCacheMap(session, "mission-pace", missionPaces);
         replayCacheMap(session, "mission-control", missionControls);
+        replayCacheMap(session, "spread-skew", spreadSkews);
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "strike-sr", strikeSr);
         // liquidity-heatmap replays WITH the freshness gate below (5s TTL): only a live-fresh
@@ -3991,7 +4148,8 @@ public class FeedGatewayService implements ReplayRunner {
         return "strike-sr".equals(event)
                 || "liquidity-heatmap".equals(event)
                 || "mission-pace".equals(event)
-                || "mission-control".equals(event);
+                || "mission-control".equals(event)
+                || "spread-skew".equals(event);
     }
 
     // =====================================================================
@@ -4211,6 +4369,7 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics.put(settings.strikeLiquidityTopic(), "liquidity-heatmap");
                 stringTopics.put(settings.databentoPaceMissionTopic(), "mission-pace");
                 stringTopics.put(settings.missionControlTopic(), "mission-control");
+                stringTopics.put(settings.spreadSkewTopic(), "spread-skew");
                 stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
             } else {
                 avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
@@ -4766,7 +4925,12 @@ public class FeedGatewayService implements ReplayRunner {
             // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
             // in per-session (auth) mode too, not only legacy mode — otherwise it is silently
             // dropped once GATEWAY_AUTH_ENABLED=true (GatewayRecordMapper has no route for it).
-            "short-premium-recommendation");
+            "short-premium-recommendation",
+            // Discrete spread-skew transitions (FIRE/EXIT/REVERSAL/RESTART) are likewise a GLOBAL
+            // one-shot alert overlay, symbol-filtered client-side (the turn-alert sibling). Allowlist
+            // them so the standalone broadcast still reaches sockets in per-session (auth) mode —
+            // GatewayRecordMapper deliberately has no route for spread-skew-event.
+            "spread-skew-event");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);
@@ -4961,6 +5125,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "liquidity-heatmap" -> pendingLiquidityHeatmaps;
             case "mission-pace" -> pendingMissionPaces;
             case "mission-control" -> pendingMissionControls;
+            case "spread-skew" -> pendingSpreadSkews;
             case "vix-price", "index-price" -> pendingIndexPrices;
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "mission-sandwich" -> pendingMissionSandwiches;
@@ -5011,6 +5176,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingLiquidityHeatmaps.values()),
                         new ArrayList<>(pendingMissionPaces.values()),
                         new ArrayList<>(pendingMissionControls.values()),
+                        new ArrayList<>(pendingSpreadSkews.values()),
                         new ArrayList<>(pendingIndexPrices.values()),
                         new ArrayList<>(pendingVolumeSandwiches.values()),
                         new ArrayList<>(pendingMissionSandwiches.values()),
@@ -5058,6 +5224,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingLiquidityHeatmaps.size()
                 + pendingMissionPaces.size()
                 + pendingMissionControls.size()
+                + pendingSpreadSkews.size()
                 + pendingIndexPrices.size()
                 + pendingVolumeSandwiches.size()
                 + pendingMissionSandwiches.size()
@@ -5086,6 +5253,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingLiquidityHeatmaps.clear();
         pendingMissionPaces.clear();
         pendingMissionControls.clear();
+        pendingSpreadSkews.clear();
         pendingIndexPrices.clear();
         pendingVolumeSandwiches.clear();
         pendingMissionSandwiches.clear();
@@ -5119,6 +5287,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> liquidityHeatmapJsons = new ArrayList<>();
         List<String> missionPaceJsons = new ArrayList<>();
         List<String> missionControlJsons = new ArrayList<>();
+        List<String> spreadSkewJsons = new ArrayList<>();
         List<String> indexPriceJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
         List<String> missionSandwichJsons = new ArrayList<>();
@@ -5146,6 +5315,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "liquidity-heatmap" -> liquidityHeatmapJsons.add(cachedEvent.json());
                 case "mission-pace" -> missionPaceJsons.add(cachedEvent.json());
                 case "mission-control" -> missionControlJsons.add(cachedEvent.json());
+                case "spread-skew" -> spreadSkewJsons.add(cachedEvent.json());
                 case "vix-price", "index-price" -> indexPriceJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "mission-sandwich" -> missionSandwichJsons.add(cachedEvent.json());
@@ -5177,6 +5347,7 @@ public class FeedGatewayService implements ReplayRunner {
                 liquidityHeatmapJsons,
                 missionPaceJsons,
                 missionControlJsons,
+                spreadSkewJsons,
                 indexPriceJsons,
                 volumeSandwichJsons,
                 missionSandwichJsons,
@@ -5206,6 +5377,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> liquidityHeatmapJsons,
             List<String> missionPaceJsons,
             List<String> missionControlJsons,
+            List<String> spreadSkewJsons,
             List<String> indexPriceJsons,
             List<String> volumeSandwichJsons,
             List<String> missionSandwichJsons,
@@ -5242,6 +5414,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"liquidityHeatmaps\":" + jsonArray(liquidityHeatmapJsons) + ","
                 + "\"missionPaces\":" + jsonArray(missionPaceJsons) + ","
                 + "\"missionControls\":" + jsonArray(missionControlJsons) + ","
+                + "\"spreadSkews\":" + jsonArray(spreadSkewJsons) + ","
                 + "\"indexPrices\":" + jsonArray(indexPriceJsons) + ","
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
                 + "\"missionSandwiches\":" + jsonArray(missionSandwichJsons) + ","
@@ -5290,6 +5463,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"liquidityHeatmaps\":" + liquidityHeatmaps.size() + ","
                 + "\"missionPaces\":" + missionPaces.size() + ","
                 + "\"missionControls\":" + missionControls.size() + ","
+                + "\"spreadSkews\":" + spreadSkews.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
                 + "\"optionPriceBehaviors\":" + optionPriceBehaviors.size() + ","

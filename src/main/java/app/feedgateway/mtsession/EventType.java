@@ -28,6 +28,11 @@ public enum EventType {
     STRIKE_INVASION(Scope.CONTRACT),
     MISSION_PACE(Scope.CONTRACT),
     MISSION_CONTROL(Scope.CONTRACT),
+    // Whole-underlying spread-skew snapshot — ONE record per underlying (SPX-only, single-value
+    // last-snapshot-wins cache). The payload names its market `underlying` (mapped to symbol in
+    // GatewayRecordMapper; there is NO symbol field) with a NULLABLE expiry; routes CONTRACT-scoped
+    // by source|symbol|expiry with NO strike filter (like MISSION_CONTROL).
+    SPREAD_SKEW(Scope.CONTRACT),
     VOLUME_SANDWICH(Scope.CONTRACT),
     MISSION_SANDWICH(Scope.CONTRACT),
     GEX_BY_STRIKE(Scope.CONTRACT),

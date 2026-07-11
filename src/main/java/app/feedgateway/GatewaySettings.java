@@ -336,6 +336,27 @@ public final class GatewaySettings {
         return value("KAFKA_SPX_MISSION_CONTROL_TOPIC", "options.spx.mission-control.current");
     }
 
+    /**
+     * Whole-underlying spread-skew snapshot (JSON {@code SpreadSkewSnapshot}, a SINGLE record keyed
+     * {@code "SPX"}, re-emitted every ~5s) from spread-skew-service. Broadcast as event
+     * {@code "spread-skew"} — a single-value latest-state cache, the mission-control sibling. NB:
+     * the payload names its market {@code underlying} (no {@code symbol} field) with a NULLABLE
+     * {@code expiry}, and carries its event time in {@code ts} (epoch ms).
+     */
+    public String spreadSkewTopic() {
+        return value("KAFKA_SPREAD_SKEW_TOPIC", "options.spx.spread-skew.current");
+    }
+
+    /**
+     * Discrete spread-skew transition events (FIRE/EXIT/REVERSAL/RESTART) from spread-skew-service —
+     * the snapshot shape plus eventId/transitionType. Broadcast as event {@code "spread-skew-event"}
+     * (own message.type), symbol-filtered client-side — STANDALONE and never cached, the
+     * strike-intelligence turn-alert sibling.
+     */
+    public String spreadSkewEventsTopic() {
+        return value("KAFKA_SPREAD_SKEW_EVENTS_TOPIC", "options.spx.spread-skew.events");
+    }
+
     public String ibkrVolumeSandwichTopic() {
         return value("KAFKA_IBKR_VOLUME_SANDWICH_CURRENT_TOPIC",
                 value("KAFKA_VOLUME_SANDWICH_CURRENT_TOPIC", "options.ibkr.volume-sandwich.current"));

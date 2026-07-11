@@ -31,7 +31,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -80,6 +80,11 @@ class FeedGatewayServiceTest {
         // rollout — it MUST be optional (like strike-intel) so its absence cannot starve the shared
         // JSON consumer (strike-flow / mission-pace / etc.).
         assertTrue(isOptionalTopic(service, settings.strikeInvasionTopic()));
+        // Both spread-skew topics come from the same brand-new spread-skew-service, which may not be
+        // deployed during a staged rollout — BOTH must be optional (like strike-invasion) so their
+        // absence cannot starve the shared JSON consumer.
+        assertTrue(isOptionalTopic(service, settings.spreadSkewTopic()));
+        assertTrue(isOptionalTopic(service, settings.spreadSkewEventsTopic()));
         // A mandatory feed must still be mandatory (guards against over-broadening the optional set).
         assertFalse(isOptionalTopic(service, settings.databentoStrikeFlowTopic()));
     }
@@ -1237,6 +1242,226 @@ class FeedGatewayServiceTest {
         assertTrue(FeedGatewayService.sourceSwitchReplayEvents().contains("mission-control"));
     }
 
+    // ----- spread-skew gateway consumer (whole-underlying SpreadSkewSnapshot, mission-control mirror) -----
+
+    /** The spread-skew snapshot payload per the producer contract: underlying + nullable expiry, ts = event time. */
+    private static String spreadSkewPayload(long ts) {
+        return "{\"schemaVersion\":1,\"ts\":" + ts + ",\"runId\":\"r-1\",\"sessionDate\":\"2026-07-11\","
+                + "\"underlying\":\"SPX\",\"expiry\":\"2026-07-11\",\"spot\":6004.8,\"anchor\":6005.0,"
+                + "\"degraded\":false,\"lateSession\":false,\"eventDay\":false,"
+                + "\"headline\":{\"state\":\"CALL_SKEW\",\"z\":2.4,\"conflict\":false,"
+                + "\"baselineSessionsMin\":5,\"baselineRequired\":10},"
+                + "\"participatingOffsets\":[10,15,20],\"levels\":[]}";
+    }
+
+    @Test
+    void spreadSkewGatewayContractConsumesCachesAndExposesUiBatchHealthAndMetrics() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        String payload = spreadSkewPayload(System.currentTimeMillis());
+        Object binding = topicBinding("DATABENTO", "spread-skew");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.spreadSkewTopic(),
+                0,
+                12L,
+                "SPX",
+                payload
+        );
+
+        String cacheKey = updateCache(service, binding, record, payload);
+        String eventEnvelope = envelopeJson(service, "spread-skew", payload);
+        String batchEnvelope = uiBatchEnvelopeJsonSpreadSkew(service, List.of(payload));
+
+        // Default topic resolves to the spread-skew topic and binds on the JSON/state path.
+        assertEquals("options.spx.spread-skew.current", settings.spreadSkewTopic());
+        assertTrue(source.contains("topicEvents.put(settings.spreadSkewTopic(), new TopicBinding(\"DATABENTO\", \"spread-skew\"));"));
+        // SINGLE-VALUE cache keyed by the underlying alone (no expiry segment — one snapshot covers the
+        // whole underlying). updateCache prepends the source, so the full slot is source|underlying.
+        assertEquals("DATABENTO|SPX", cacheKey);
+        assertTrue(eventEnvelope.contains("\"type\":\"spread-skew\""));
+        assertTrue(batchEnvelope.contains("\"spreadSkews\":[{\"schemaVersion\""));
+        assertTrue(service.healthJson().contains("\"spreadSkews\":1"));
+        assertTrue(service.metrics().contains("options_edge_feed_gateway_spread_skews 1"));
+    }
+
+    @Test
+    void spreadSkewCacheIsSingleValueLastSnapshotWins() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        Object binding = topicBinding("DATABENTO", "spread-skew");
+        updateCache(service, binding,
+                recordAt(settings.spreadSkewTopic(), 0, 1L, "SPX", spreadSkewPayload(now - 5_000), now - 5_000),
+                spreadSkewPayload(now - 5_000));
+        updateCache(service, binding,
+                recordAt(settings.spreadSkewTopic(), 0, 2L, "SPX", spreadSkewPayload(now), now),
+                spreadSkewPayload(now));
+        // Both records collapse into ONE source|underlying slot — the second (newer ts) wins.
+        assertTrue(service.healthJson().contains("\"spreadSkews\":1"),
+                "spread-skew must be a single-value cache (last snapshot wins)");
+        // An out-of-order OLDER ts must be rejected by the monotonic event-time gate.
+        assertNull(updateCache(service, binding,
+                recordAt(settings.spreadSkewTopic(), 0, 3L, "SPX", spreadSkewPayload(now - 10_000), now),
+                spreadSkewPayload(now - 10_000)));
+    }
+
+    @Test
+    void spreadSkewForwardsForActiveMarketDespiteSourceSwitchOffsetBarrier() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260711");
+        // A source-switch offset barrier sits ABOVE the record offset — like mission-control, the
+        // low-frequency spread-skew frame's offset stays "below" the barrier captured at the last switch.
+        setOffsetBarrier(service, settings.spreadSkewTopic(), 0, 100L);
+
+        long now = System.currentTimeMillis();
+        String payload = spreadSkewPayload(now);
+        Object binding = topicBinding("DATABENTO", "spread-skew");
+        ConsumerRecord<String, String> record =
+                recordAt(settings.spreadSkewTopic(), 0, 12L, "SPX", payload, now); // offset 12 < barrier 100
+
+        // Per-market signal must forward for the active market despite the per-strike offset barrier.
+        assertTrue(shouldForward(service, binding, payload, record),
+                "spread-skew for the active market must forward despite the source-switch offset barrier");
+
+        // Payload-time freshness: a STALE ts must NOT forward even on a fresh Kafka arrival time.
+        String stale = spreadSkewPayload(now - 60_000);
+        ConsumerRecord<String, String> staleRecord =
+                recordAt(settings.spreadSkewTopic(), 0, 13L, "SPX", stale, now); // arrival fresh, ts stale
+        assertFalse(shouldForward(service, binding, stale, staleRecord),
+                "spread-skew freshness must track the payload ts, not the Kafka arrival time");
+
+        // Cross-market safety: a frame for a DIFFERENT expiry must NOT leak to the active selection.
+        String otherMarket = payload.replace("\"expiry\":\"2026-07-11\"", "\"expiry\":\"2026-07-12\"");
+        ConsumerRecord<String, String> otherRecord =
+                recordAt(settings.spreadSkewTopic(), 0, 14L, "SPX", otherMarket, now);
+        assertFalse(shouldForward(service, binding, otherMarket, otherRecord),
+                "spread-skew for a different market must not leak to the active selection");
+
+        // A NULL expiry (producer cannot resolve the 0DTE chain) still covers the active session.
+        String nullExpiry = payload.replace("\"expiry\":\"2026-07-11\"", "\"expiry\":null");
+        ConsumerRecord<String, String> nullExpiryRecord =
+                recordAt(settings.spreadSkewTopic(), 0, 15L, "SPX", nullExpiry, now);
+        assertTrue(shouldForward(service, binding, nullExpiry, nullExpiryRecord),
+                "a null-expiry spread-skew frame must still reach the active selection");
+    }
+
+    @Test
+    void spreadSkewMissingOrInvalidTsFailsClosedAndIsNotRescuedByFreshKafkaArrival() throws Exception {
+        // eventCacheTimestamp for spread-skew has deliberately NO Kafka-arrival fallback: a snapshot
+        // whose ts is missing, non-numeric or negative must fail closed (never cached, never
+        // forwarded) even when the record's Kafka timestamp is brand new.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260711");
+        long now = System.currentTimeMillis();
+        Object binding = topicBinding("DATABENTO", "spread-skew");
+        String fresh = spreadSkewPayload(now);
+        List<String> malformed = List.of(
+                fresh.replace("\"ts\":" + now + ",", ""),                  // ts missing entirely
+                fresh.replace("\"ts\":" + now, "\"ts\":\"not-a-number\""), // non-numeric ts
+                fresh.replace("\"ts\":" + now, "\"ts\":-5"));              // negative ts
+        long offset = 12L;
+        for (String payload : malformed) {
+            ConsumerRecord<String, String> record =
+                    recordAt(settings.spreadSkewTopic(), 0, offset++, "SPX", payload, now); // arrival FRESH
+            assertTrue(eventCacheTimestamp(service, "spread-skew", record) < 0,
+                    "missing/invalid ts must fail closed, not fall back to the Kafka arrival time");
+            assertNull(updateCache(service, binding, record, payload),
+                    "a snapshot without a valid ts must never be cached");
+            assertFalse(shouldForward(service, binding, payload, record),
+                    "a snapshot without a valid ts must never forward");
+        }
+        assertEquals(0, cachedEventCount(service, "spread-skew", now),
+                "no malformed snapshot may end up replayable");
+    }
+
+    @Test
+    void cachedSpreadSkewReplayBypassesOffsetBarrierButKeepsTimeBarrier() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260711");
+        setOffsetBarrier(service, settings.spreadSkewTopic(), 0, 100L);
+        String payload = spreadSkewPayload(System.currentTimeMillis());
+        Object binding = topicBinding("DATABENTO", "spread-skew");
+        // No-timestamp record -> the payload ts (fresh) is the cache event time.
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.spreadSkewTopic(), 0, 12L, "SPX", payload); // offset 12 < barrier 100
+        updateCache(service, binding, record, payload);
+
+        // Fresh + offset barrier above the record offset -> still replayed (offset bypassed).
+        assertEquals(1, cachedEventCount(service, "spread-skew", System.currentTimeMillis()),
+                "fresh cached spread-skew must replay on connect despite the offset barrier");
+
+        // Older than maxStaleMs -> excluded (the time barrier is still enforced).
+        ageCacheEventTimes(service, "spread-skew:", System.currentTimeMillis() - 60_000L);
+        assertEquals(0, cachedEventCount(service, "spread-skew", System.currentTimeMillis()),
+                "stale cached spread-skew must NOT replay (time barrier enforced)");
+    }
+
+    @Test
+    void cachedReplayOnConnectIncludesSpreadSkewForMatchingDatabentoSelection() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String payload = spreadSkewPayload(now);
+        updateCache(service, topicBinding("DATABENTO", "spread-skew"),
+                recordAt(settings.spreadSkewTopic(), 0, 1L, "SPX", payload, now), payload);
+
+        setActiveSelection(service, "DATABENTO", "SPX", "20260711");
+        assertEquals(1, cachedEvents(service, List.of("spread-skew"), now).size(),
+                "cached spread-skew must replay to a freshly-connected DATABENTO client");
+
+        // Wrong source (IBKR) is filtered (spread-skew is DATABENTO-only).
+        setActiveSelection(service, "IBKR", "SPX", "20260711");
+        assertTrue(cachedEvents(service, List.of("spread-skew"), now).isEmpty(),
+                "IBKR selection must never receive DATABENTO spread-skew");
+
+        // Wrong symbol is filtered by the underlying match.
+        setActiveSelection(service, "DATABENTO", "SPY", "20260711");
+        assertTrue(cachedEvents(service, List.of("spread-skew"), now).isEmpty(),
+                "a different symbol must not receive this spread-skew");
+
+        // Cached source-switch replay must include spread-skew in its event list.
+        assertTrue(FeedGatewayService.sourceSwitchReplayEvents().contains("spread-skew"));
+    }
+
+    @Test
+    void spreadSkewEventIsBroadcastStandaloneAndNeverCachedLikeTurnAlert() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+
+        // Default topic resolves to the spread-skew events topic and binds on BOTH JSON consumers
+        // (cache + live kept symmetric), as its own standalone event type.
+        assertEquals("options.spx.spread-skew.events", settings.spreadSkewEventsTopic());
+        for (String method : List.of("runJsonStateCacheConsumer", "runJsonStateLiveConsumer")) {
+            assertTrue(methodBody(source, method).contains(
+                    "topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding(\"DATABENTO\", \"spread-skew-event\"));"),
+                    method + " must bind the spread-skew events topic (JSON)");
+        }
+        // The live consumer broadcasts it STANDALONE via the early dedicated branch (before the
+        // cache/selection machinery), exactly like turn-alert.
+        assertTrue(source.contains("if (\"spread-skew-event\".equals(binding.event())) {"),
+                "spread-skew-event needs the early standalone-broadcast branch (turn-alert mirror)");
+
+        // Behavioral: the broadcast reaches a connected client as its own message.type...
+        List<String> sent = new ArrayList<>();
+        addRecordingClient(service, sent);
+        String payload = spreadSkewPayload(System.currentTimeMillis())
+                .replace("\"participatingOffsets\"",
+                        "\"eventId\":\"e-1\",\"transitionType\":\"FIRE\",\"previousState\":\"NEUTRAL\","
+                                + "\"newState\":\"CALL_SKEW\",\"alertEligible\":true,\"alertSuppressedReason\":null,"
+                                + "\"participatingOffsets\"");
+        broadcast(service, "spread-skew-event", payload);
+        assertTrue(sent.stream().anyMatch(m -> m.contains("\"type\":\"spread-skew-event\"")),
+                "spread-skew-event must reach connected clients standalone");
+        // ...and is never cached or replayed: no cache slot, and not in the source-switch replay list.
+        assertEquals(0, cachedEventCount(service, "spread-skew-event", System.currentTimeMillis()));
+        assertFalse(FeedGatewayService.sourceSwitchReplayEvents().contains("spread-skew-event"));
+    }
+
     @Test
     void databentoGexGatewayContractConsumesCachesAndExposesUiBatchHealthAndMetrics() throws Exception {
         FeedGatewayService service = service();
@@ -1351,6 +1576,19 @@ class FeedGatewayServiceTest {
             assertFalse(methodBody(source, method).contains(
                     "topicEvents.put(settings.missionControlTopic(), new TopicBinding(\"DATABENTO\", \"mission-control\"));"),
                     method + " must NOT bind the DATABENTO mission-control topic (it is JSON, not Avro)");
+        }
+        // Spread-skew is genuinely JSON (String/JSON), like mission-control: it must be in stringTopics, NOT Avro.
+        assertTrue(source.contains("stringTopics.put(settings.spreadSkewTopic(), \"spread-skew\");"));
+        assertFalse(source.contains("avroTopics.put(settings.spreadSkewTopic(), \"spread-skew\");"));
+        // JSON/string CACHE + LIVE consumers must bind the spread-skew topic (it is JSON, not Avro).
+        for (String method : List.of("runJsonStateCacheConsumer", "runJsonStateLiveConsumer")) {
+            assertTrue(methodBody(source, method).contains(
+                    "topicEvents.put(settings.spreadSkewTopic(), new TopicBinding(\"DATABENTO\", \"spread-skew\"));"),
+                    method + " must bind the DATABENTO spread-skew topic (JSON)");
+        }
+        for (String method : List.of("runAvroCacheConsumer", "runAvroLiveConsumer")) {
+            assertFalse(methodBody(source, method).contains("spread-skew"),
+                    method + " must NOT bind spread-skew (it is JSON, not Avro)");
         }
         // Unified S/R (strike-sr) is DATABENTO-only Avro: bound in the Avro consumers + avroTopics,
         // and NEVER in the JSON consumers.
@@ -1914,6 +2152,12 @@ class FeedGatewayServiceTest {
         }
     }
 
+    private static void broadcast(FeedGatewayService service, String event, String json) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("broadcast", String.class, String.class);
+        method.setAccessible(true);
+        method.invoke(service, event, json);
+    }
+
     /** Registers a synchronous recording WebSocketSession (untracked -> direct send) and captures payloads. */
     @SuppressWarnings("unchecked")
     private static void addRecordingClient(FeedGatewayService service, List<String> sink) throws Exception {
@@ -1986,7 +2230,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2089,7 +2333,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                liquidityHeatmaps, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                liquidityHeatmaps, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2099,7 +2343,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2109,7 +2353,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeInvasions,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2119,7 +2363,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2132,7 +2376,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2142,7 +2386,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2ByOptions, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2ByOptions, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2152,7 +2396,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2Sessions, List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2Sessions, List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2162,7 +2406,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), missionPaces, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), missionPaces, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2172,7 +2416,17 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), missionControls, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), missionControls, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
+    private static String uiBatchEnvelopeJsonSpreadSkew(FeedGatewayService service, List<String> spreadSkews) throws Exception {
+        Method method = uiBatchEnvelopeMethod();
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), spreadSkews, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2190,7 +2444,7 @@ class FeedGatewayServiceTest {
                 // positional args: snapshots, paces, paceRanks, directionalPressures, strikeFlows,
                 // deltaFlows, then the remaining latest-state lists — pass empty except strikeFlows.
                 List.of(), List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2200,7 +2454,7 @@ class FeedGatewayServiceTest {
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class, List.class
         );
     }
 }

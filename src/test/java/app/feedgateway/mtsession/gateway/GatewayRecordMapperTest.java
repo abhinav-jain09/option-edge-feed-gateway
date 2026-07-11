@@ -119,6 +119,28 @@ class GatewayRecordMapperTest {
     }
 
     @Test
+    void spreadSkewEventTypeMapping() {
+        assertEquals(EventType.SPREAD_SKEW, GatewayRecordMapper.eventTypeFor("spread-skew"));
+        // The discrete spread-skew-event siblings are broadcast standalone (turn-alert style), never routed.
+        assertNull(GatewayRecordMapper.eventTypeFor("spread-skew-event"));
+    }
+
+    @Test
+    void mapsSpreadSkewAsContractEventUsingUnderlyingAsSymbol() throws Exception {
+        // spread-skew is a whole-underlying JSON snapshot (SpreadSkewSnapshot) that names its market
+        // `underlying` (no symbol field) with a nullable expiry — the mapper reads underlying as the
+        // symbol so it routes CONTRACT-scoped with NO strike filter (like MISSION_CONTROL).
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "spread-skew",
+                node("{\"underlying\":\"SPX\",\"expiry\":\"2026-07-11\",\"ts\":1752192000000,"
+                        + "\"headline\":{\"state\":\"CALL_SKEW\",\"z\":2.4}}")).orElseThrow();
+        assertEquals(EventType.SPREAD_SKEW, rec.eventType());
+        assertTrue(EventType.SPREAD_SKEW.isContractScoped());
+        assertEquals("SPX", rec.symbol());
+        assertEquals("2026-07-11", rec.expiry());
+        assertTrue(rec.strike().isEmpty());
+    }
+
+    @Test
     void unknownEventReturnsEmpty() throws Exception {
         assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "hpsf-latest-signal",
                 node("{\"symbol\":\"SPX\"}")).isEmpty());

@@ -44,6 +44,10 @@ public final class GatewayRecordMapper {
                     OptionalDouble.empty(), epoch, payloadMarketDataSource, payloadSource));
         }
         String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
+        if (symbol.isBlank() && type == EventType.SPREAD_SKEW) {
+            // The spread-skew snapshot names its market `underlying` (no symbol field) — see EventType.
+            symbol = root.hasNonNull("underlying") ? root.get("underlying").asText("") : "";
+        }
         String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
         if (expiry.isBlank() && (type == EventType.OPTION_PRICE_BEHAVIOR || type == EventType.OPB_V2_SESSION)) {
             expiry = root.hasNonNull("tradingDate") ? root.get("tradingDate").asText("") : "";
@@ -88,6 +92,7 @@ public final class GatewayRecordMapper {
             case "strike-invasion" -> EventType.STRIKE_INVASION;
             case "mission-pace" -> EventType.MISSION_PACE;
             case "mission-control" -> EventType.MISSION_CONTROL;
+            case "spread-skew" -> EventType.SPREAD_SKEW;
             case "volume-sandwich" -> EventType.VOLUME_SANDWICH;
             case "mission-sandwich" -> EventType.MISSION_SANDWICH;
             case "gex-by-strike" -> EventType.GEX_BY_STRIKE;
