@@ -614,6 +614,23 @@ public final class GatewaySettings {
         return longValue("GATEWAY_ES_OPEN_DIRECTION_TTL_MS", maxPainTtlMs(), 0L);
     }
 
+    /** ES open-direction LIVE STATUS topic (JSON, key = tradeDate; one snapshot every 60s while a session is active). */
+    public String esOpenDirectionStatusTopic() {
+        return value("KAFKA_ES_OPEN_DIRECTION_STATUS_TOPIC", "es.open-direction.status");
+    }
+
+    /**
+     * Freshness TTL for the ES open-direction live STATUS cache. Unlike its forecast/outcome siblings
+     * (a once-a-day advisory on the long 12h window), the status is a 60s heartbeat whose only value is
+     * being CURRENT — a status older than a few minutes (dead producer, overnight leftover) is misleading
+     * and must read as absent (the UI strip simply vanishes), never replay as live. SHORT window, default
+     * 5 min — the liquidity-heatmap/dealer-ledger freshness class, NEVER the 12h es-open-direction window.
+     * {@code <= 0} preserves the generic "do not cache stale state" semantics (NOT infinite).
+     */
+    public long esOpenDirectionStatusTtlMs() {
+        return longValue("GATEWAY_ES_OPEN_DIRECTION_STATUS_TTL_MS", 300_000L, 0L);
+    }
+
     /**
      * Freshness TTL for the structural option-chain cache (the {@code snapshot} strike ladder — see
      * {@code FeedGatewayService.MARKET_AWARE_CHAIN_EVENTS}) DURING regular trading hours — default 10 min.

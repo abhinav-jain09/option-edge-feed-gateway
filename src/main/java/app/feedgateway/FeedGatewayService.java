@@ -164,6 +164,12 @@ public class FeedGatewayService implements ReplayRunner {
     // gated, never subject to the market-data staleness gates) — lives on the JSON-state consumer.
     private final Map<String, String> esOpenDirectionForecasts = new ConcurrentHashMap<>();
     private final Map<String, String> esOpenDirectionOutcomes = new ConcurrentHashMap<>();
+    // ES open-direction LIVE STATUS (60s heartbeat while a session is active): ONE current value per
+    // source|tradeDate (last heartbeat wins), so a late-joining client gets the CURRENT status on
+    // connect. Unlike the forecast/outcome siblings it lives on the SHORT esOpenDirectionStatusTtlMs
+    // window (default 5 min) — a stale status is evicted/suppressed rather than replayed (the UI strip
+    // simply vanishes). Same standalone/global/JSON pass-through delivery class as the siblings.
+    private final Map<String, String> esOpenDirectionStatuses = new ConcurrentHashMap<>();
     private final Map<String, String> optionPriceBehaviors = new ConcurrentHashMap<>();
     // Dealer-ledger: the two source topics are cached RAW per (source|symbol|expiry), and the JOINED
     // envelope the UI consumes is cached in dealerLedgers (last-value-wins). See DealerLedgerJoiner.
@@ -1190,6 +1196,10 @@ public class FeedGatewayService implements ReplayRunner {
         // 12h seek-back here so a restart mid-session re-bootstraps the morning forecast.
         topicEvents.put(settings.esOpenDirectionForecastTopic(), new TopicBinding("DATABENTO", "es-open-direction-forecast"));
         topicEvents.put(settings.esOpenDirectionOutcomeTopic(), new TopicBinding("DATABENTO", "es-open-direction-outcome"));
+        // ES open-direction live STATUS (60s heartbeat, JSON, key = tradeDate): standalone global
+        // advisory like its siblings, OPTIONAL topic — but on the SHORT esOpenDirectionStatusTtlMs
+        // window (default 5 min), which also bounds its seek-back here to the last few minutes.
+        topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -1259,6 +1269,9 @@ public class FeedGatewayService implements ReplayRunner {
         // outcomes (JSON, standalone/optional — same rule as the cache consumer above).
         topicEvents.put(settings.esOpenDirectionForecastTopic(), new TopicBinding("DATABENTO", "es-open-direction-forecast"));
         topicEvents.put(settings.esOpenDirectionOutcomeTopic(), new TopicBinding("DATABENTO", "es-open-direction-outcome"));
+        // Keep the cache + live JSON consumer topic sets symmetric: the ES open-direction live STATUS
+        // heartbeat (JSON, standalone/optional — same rule as the forecast/outcome siblings above).
+        topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
@@ -1665,6 +1678,9 @@ public class FeedGatewayService implements ReplayRunner {
                         // and would suppress the once-a-day 09:15 forecast) and NOT subject to the 15s
                         // market-data staleness gates (a forecast published at 09:15 must still be served
                         // at 11:00 — freshness is the long esOpenDirectionTtlMs window via updateCache).
+                        // The live STATUS heartbeat shares this branch with its OWN short window: a status
+                        // older than esOpenDirectionStatusTtlMs (5 min) makes updateCache return null
+                        // (cacheKey == null), so a stale heartbeat is never live-broadcast here either.
                         if (cacheKey != null && cacheCaughtUpFlag.get()) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
@@ -1801,7 +1817,9 @@ public class FeedGatewayService implements ReplayRunner {
                     // Never lag-skip the once-a-day ES open-direction forecast/outcomes either: the same
                     // slow last-value-wins class as max-pain — seeking their partitions to END on a
                     // backlog would drop the day's still-unread forecast entirely; their own 12h window
-                    // (esOpenDirectionTtlMs) already bounds how far back they bootstrap.
+                    // (esOpenDirectionTtlMs) already bounds how far back they bootstrap. The 60s status
+                    // heartbeat rides along (trivial volume; each record it reads through is dropped by
+                    // its own SHORT 5-min window when stale, so no stale status ever routes).
                     return !"max-pain".equals(binding.event()) && !isEsOpenDirectionEvent(binding.event());
                 })
                 .toList();
@@ -1852,7 +1870,10 @@ public class FeedGatewayService implements ReplayRunner {
                     // deployed (and the topics are absent after the daily Kafka wipe until it first
                     // produces) — optional, so their absence can never starve the shared JSON consumer.
                     || topic.equals(settings.esOpenDirectionForecastTopic())
-                    || topic.equals(settings.esOpenDirectionOutcomeTopic()));
+                    || topic.equals(settings.esOpenDirectionOutcomeTopic())
+                    // The live STATUS heartbeat comes from the same may-not-be-deployed producer, and is
+                    // additionally absent whenever no overnight session is active — optional like its siblings.
+                    || topic.equals(settings.esOpenDirectionStatusTopic()));
     }
 
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {
@@ -1947,7 +1968,10 @@ public class FeedGatewayService implements ReplayRunner {
             // broadcastCachedState assembles), so re-push them explicitly to the already-connected
             // clients once this consumer's cache is caught up — a dashboard left open across a
             // gateway restart must get the morning forecast back without a page reload.
-            if (events.contains("es-open-direction-forecast") || events.contains("es-open-direction-outcome")) {
+            // (The status heartbeat rides along: replayEsOpenDirectionCached only re-pushes it when
+            // still inside its own SHORT 5-min isCacheFresh window — never a stale overnight status.)
+            if (events.contains("es-open-direction-forecast") || events.contains("es-open-direction-outcome")
+                    || events.contains("es-open-direction-status")) {
                 for (WebSocketSession client : clients) {
                     replayEsOpenDirectionCached(client);
                 }
@@ -2502,6 +2526,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = esOpenDirectionForecastCacheKey(json, key);
         } else if ("es-open-direction-outcome".equals(event)) {
             key = esOpenDirectionOutcomeCacheKey(json, key);
+        } else if ("es-open-direction-status".equals(event)) {
+            key = esOpenDirectionStatusCacheKey(json, key);
         } else if ("liquidity-heatmap".equals(event)) {
             // Payload-derived symbol|expiry key (mirrors strike-flow): last-value-wins per chain
             // must not depend on the Kafka record key shape.
@@ -2630,6 +2656,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 esOpenDirectionOutcomes.put(key, json);
+                return key;
+            }
+            case "es-open-direction-status" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                esOpenDirectionStatuses.put(key, json); // ONE current status per source|tradeDate — last heartbeat wins
                 return key;
             }
             case "mission-pace" -> {
@@ -3247,6 +3279,15 @@ public class FeedGatewayService implements ReplayRunner {
             // so the overlay persists and replays on reconnect instead of vanishing minutes after entry.
             return CachePolicy.expiring(settings.shortPremiumRecommendationTtlMs());
         }
+        if ("es-open-direction-status".equals(event)) {
+            // 60s live heartbeat: SHORT window (default 5 min, the liquidity-heatmap/dealer-ledger
+            // freshness class) — NEVER the siblings' 12h window below (this check MUST stay before the
+            // isEsOpenDirectionEvent fall-through). A stale status (dead producer, overnight leftover)
+            // must read as absent, not replay as current. The ONE seam: drives ingest eviction
+            // (updateCache -> isExpired), periodic purge, the isCacheFresh replay gate, and the bounded
+            // ~5-min seek-back (windowTtlMsFor -> seekBackMs) after a gateway restart.
+            return CachePolicy.expiring(settings.esOpenDirectionStatusTtlMs());
+        }
         if (isEsOpenDirectionEvent(event)) {
             // The 09:15 forecast (and each horizon outcome) stays valid for the whole session: a long
             // last-value-wins window (default 12h, like max-pain) — NEVER the generic 15-min TTL — so a
@@ -3542,6 +3583,8 @@ public class FeedGatewayService implements ReplayRunner {
             esOpenDirectionForecasts.remove(versionKey.substring("es-open-direction-forecast:".length()));
         } else if (versionKey.startsWith("es-open-direction-outcome:")) {
             esOpenDirectionOutcomes.remove(versionKey.substring("es-open-direction-outcome:".length()));
+        } else if (versionKey.startsWith("es-open-direction-status:")) {
+            esOpenDirectionStatuses.remove(versionKey.substring("es-open-direction-status:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
             strikeFlows.remove(versionKey.substring("strike-flow:".length()));
         } else if (versionKey.startsWith("delta-flow:")) {
@@ -3912,9 +3955,16 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
-    /** True for the two ES 09:15 open-direction advisory events (forecast + per-horizon outcome). */
+    /**
+     * True for the three ES open-direction advisory events (once-a-day forecast + per-horizon outcome +
+     * the 60s live status heartbeat). They share the standalone/global/never-selection-gated delivery
+     * class; freshness deliberately does NOT: cachePolicyFor gives the status its own SHORT window
+     * (esOpenDirectionStatusTtlMs, 5 min) BEFORE falling through to the siblings' 12h window.
+     */
     private static boolean isEsOpenDirectionEvent(String event) {
-        return "es-open-direction-forecast".equals(event) || "es-open-direction-outcome".equals(event);
+        return "es-open-direction-forecast".equals(event)
+                || "es-open-direction-outcome".equals(event)
+                || "es-open-direction-status".equals(event);
     }
 
     private void replayEsOpenDirectionCached(WebSocketSession session) {
@@ -3945,6 +3995,19 @@ public class FeedGatewayService implements ReplayRunner {
                 continue;
             }
             send(session, "es-open-direction-outcome", json);
+        }
+        // Live status: same standalone replay, but its isCacheFresh gate runs on the SHORT
+        // esOpenDirectionStatusTtlMs window (5 min via cachePolicyFor) — a late joiner gets the
+        // CURRENT heartbeat only; anything older is simply absent and the UI strip stays hidden.
+        for (Map.Entry<String, String> entry : esOpenDirectionStatuses.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("es-open-direction-status:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, "es-open-direction-status", json);
         }
     }
 
@@ -4102,6 +4165,22 @@ public class FeedGatewayService implements ReplayRunner {
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to the Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    /**
+     * Cache key for the ES open-direction live status: the tradeDate (ONE current status per trading
+     * day, last 60s heartbeat wins — the forecast sibling's key shape).
+     */
+    private String esOpenDirectionStatusCacheKey(String json, String fallback) {
+        try {
+            String tradeDate = text(mapper.readTree(json), "tradeDate");
+            if (!tradeDate.isBlank()) {
+                return tradeDate;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to the Kafka key (also the tradeDate) if the payload is unexpectedly not JSON.
         }
         return fallback;
     }
@@ -5106,8 +5185,10 @@ public class FeedGatewayService implements ReplayRunner {
             "spread-skew-event",
             // ES 09:15 open-direction forecast + outcomes are the same class of GLOBAL advisory
             // overlay (one per day, symbol-independent) — allowlist them so routeOrBroadcast/broadcast
-            // fan them out in per-session (auth) mode too, not only legacy mode.
-            "es-open-direction-forecast", "es-open-direction-outcome");
+            // fan them out in per-session (auth) mode too, not only legacy mode. The 60s live STATUS
+            // heartbeat shares the delivery class (staleness is enforced upstream: updateCache's SHORT
+            // 5-min window returns null for a stale record, which suppresses the broadcast entirely).
+            "es-open-direction-forecast", "es-open-direction-outcome", "es-open-direction-status");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);

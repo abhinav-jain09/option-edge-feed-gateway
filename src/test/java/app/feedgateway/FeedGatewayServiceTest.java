@@ -554,6 +554,85 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void esOpenDirectionStatusIsOptionalGlobalAndOnTheShortFiveMinuteWindow() throws Exception {
+        // The 60s live-status heartbeat shares the siblings' delivery class (optional topic, global
+        // broadcast in per-session mode) but NOT their freshness: a status is only meaningful while
+        // CURRENT, so it lives on the SHORT esOpenDirectionStatusTtlMs window (default 5 min) — never
+        // the 12h forecast/outcome window that would replay a stale overnight status as live.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertTrue(isOptionalTopic(service, settings.esOpenDirectionStatusTopic()),
+                "status producer may be absent (not deployed / no active session) — must be optional");
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("es-open-direction-status"),
+                "status must fan out in per-session (auth) mode like its siblings");
+        assertEquals(300_000L, settings.esOpenDirectionStatusTtlMs(), "default TTL must be 5 minutes");
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, "es-open-direction-status", now - 2L * 60_000L, now),
+                "a 2-min-old status (heartbeat is 60s) must still be fresh");
+        assertTrue(isExpired(service, "es-open-direction-status", now - 6L * 60_000L, now),
+                "a 6-min-old status must be STALE — never routed or replayed as current");
+        // Contrast: the forecast sibling of the same age is comfortably fresh on its 12h window.
+        assertFalse(isExpired(service, "es-open-direction-forecast", now - 6L * 60_000L, now));
+    }
+
+    @Test
+    void freshEsOpenDirectionStatusIsCachedByTradeDateAndReplayedToLateJoiner() throws Exception {
+        // Late-join contract: the current (fresh) heartbeat is cached last-value-wins under
+        // DATABENTO|tradeDate and replayed standalone on connect, so a client that opens the dashboard
+        // mid-overnight-session immediately shows the live strip instead of waiting up to 60s.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String older = "{\"tradeDate\":\"2026-07-13\",\"state\":\"CATCHING_UP\",\"tradesBuffered\":10,"
+                + "\"observabilityOnly\":true}";
+        assertEquals("DATABENTO|2026-07-13",
+                updateCache(service, topicBinding("DATABENTO", "es-open-direction-status"),
+                        recordAt(settings.esOpenDirectionStatusTopic(), 0, 1L, "2026-07-13", older, now - 2L * 60_000L),
+                        older),
+                "updateCache must key the status by source|tradeDate");
+        String current = "{\"tradeDate\":\"2026-07-13\",\"state\":\"MONITORING\",\"tradesBuffered\":1842,"
+                + "\"lastPrice\":6321.25,\"observabilityOnly\":true}";
+        assertEquals("DATABENTO|2026-07-13",
+                updateCache(service, topicBinding("DATABENTO", "es-open-direction-status"),
+                        recordAt(settings.esOpenDirectionStatusTopic(), 0, 2L, "2026-07-13", current, now - 60_000L),
+                        current));
+
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replayEsOpenDirectionCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+
+        assertEquals(1, sink.size(), "exactly the CURRENT status must replay (last heartbeat wins); got: " + sink);
+        assertTrue(sink.get(0).contains("\"type\":\"es-open-direction-status\"")
+                        && sink.get(0).contains("\"state\":\"MONITORING\"")
+                        && sink.get(0).contains("\"tradesBuffered\":1842"),
+                "the latest heartbeat must replay verbatim (JSON pass-through); was: " + sink.get(0));
+    }
+
+    @Test
+    void staleEsOpenDirectionStatusIsNeitherCachedNorReplayed() throws Exception {
+        // Staleness fail-closed: a status record older than the 5-min window (dead producer, gateway
+        // catching up on an overnight backlog) makes updateCache return null — which suppresses the
+        // live broadcast (the cacheKey == null gate) — and nothing replays to a late joiner, so the
+        // UI strip simply stays hidden instead of showing a misleading overnight state.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String stale = "{\"tradeDate\":\"2026-07-13\",\"state\":\"MONITORING\",\"tradesBuffered\":42,"
+                + "\"observabilityOnly\":true}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "es-open-direction-status"),
+                        recordAt(settings.esOpenDirectionStatusTopic(), 0, 1L, "2026-07-13", stale, now - 6L * 60_000L),
+                        stale),
+                "a 6-min-old status must be dropped at ingest (null cacheKey = never live-routed)");
+
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replayEsOpenDirectionCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertTrue(sink.isEmpty(), "a stale status must never replay to a late joiner; got: " + sink);
+    }
+
+    @Test
     void cachedReplayIncludesFreshStrikeIntelForMatchingDatabentoSelectionOnly() throws Exception {
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
