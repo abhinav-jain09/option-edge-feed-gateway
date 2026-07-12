@@ -1160,6 +1160,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
         // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
         topicEvents.put(settings.strikeIntelTurnAlertTopic(), new TopicBinding("DATABENTO", "turn-alert"));
+        // strike-intelligence-dashboard: per-symbol JSON carrying level-based cluster walls, broadcast as
+        // "strike-cluster" STANDALONE (never cached; re-emitted each dashboard interval).
+        topicEvents.put(settings.strikeIntelDashboardTopic(), new TopicBinding("DATABENTO", "strike-cluster"));
         // strike-invasion is plain JSON (StrikeInvasionSnapshot), per-strike+direction keyed
         // (symbol|strike|direction, SPX-only — NO expiry) — this JSON-state consumer, never the Avro one
         // (mirrors strike-intel).
@@ -1230,6 +1233,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
         // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
         topicEvents.put(settings.strikeIntelTurnAlertTopic(), new TopicBinding("DATABENTO", "turn-alert"));
+        // strike-intelligence-dashboard: per-symbol JSON carrying level-based cluster walls, broadcast as
+        // "strike-cluster" STANDALONE (never cached; re-emitted each dashboard interval).
+        topicEvents.put(settings.strikeIntelDashboardTopic(), new TopicBinding("DATABENTO", "strike-cluster"));
         // strike-invasion is plain JSON, per-strike+direction keyed (symbol|strike|direction, no expiry)
         // — keep the cache + live JSON consumer topic sets symmetric (same rule as strike-intel above).
         topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
@@ -1550,6 +1556,15 @@ public class FeedGatewayService implements ReplayRunner {
                         // and keyed to today. Broadcast STANDALONE to every client — never selection-gated (a
                         // turn must reach the client regardless of active market) and never cached (the producer
                         // re-asserts START, so a late-joining client catches an active alert within its TTL).
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("strike-cluster".equals(binding.event())) {
+                        // Per-symbol StrikeIntelligenceDashboard carrying level-based cluster walls (own
+                        // message.type), symbol-filtered client-side. Broadcast STANDALONE to every client —
+                        // never selection-gated and never cached (the producer re-emits the full cluster set
+                        // every dashboard interval, so a late-joining client repopulates on the next tick).
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
                         continue;
