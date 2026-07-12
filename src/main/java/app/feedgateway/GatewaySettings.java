@@ -250,6 +250,16 @@ public final class GatewaySettings {
     }
 
     /**
+     * Per-symbol {@code StrikeIntelligenceDashboard} from strike-intelligence-service (JSON), which carries
+     * the level-based {@code clusters} (adjacent-strike walls). Broadcast as event {@code "strike-cluster"}
+     * (own message.type), symbol-filtered client-side. Unprefixed; default is the bare
+     * {@code strike-intelligence-dashboard}.
+     */
+    public String strikeIntelDashboardTopic() {
+        return value("STRIKE_INTEL_DASHBOARD_TOPIC", StrikeIntelligenceTopics.STRIKE_INTELLIGENCE_DASHBOARD);
+    }
+
+    /**
      * Per-strike strike-invasion topic (JSON {@code StrikeInvasionSnapshot}, one record per
      * {@code symbol|strike} — SPX-only, so there is NO expiry). Broadcast as event
      * {@code "strike-invasion"}. Mirrors the strike-intel topic getter.
