@@ -156,7 +156,7 @@ public final class GatewaySettings {
         // for replay or a manual override.
         String configured = value("IB_EXPIRY", "");
         if (isAutoExpiry(configured)) {
-            return marketCalendar().currentTradingDate(Instant.now())
+            return marketCalendar().currentTradingDate(Instant.now(), expiryRollAfter())
                     .format(DateTimeFormatter.BASIC_ISO_DATE);
         }
         return normalizeExpiry(configured);
@@ -165,6 +165,26 @@ public final class GatewaySettings {
     /** True when IB_EXPIRY is empty or AUTO: the gateway resolves AND daily-rolls the expiry from the calendar. */
     public boolean autoExpiry() {
         return isAutoExpiry(value("IB_EXPIRY", ""));
+    }
+
+    /**
+     * ET wall-clock time ("HH:MM") after which the AUTO expiry rolls to the NEXT trading day. Empty ->
+     * legacy midnight-ET roll (SPX/OPRA, whose 09:30-16:00 session never crosses midnight). Set to the
+     * ES 0DTE expiry time ("16:00") so the gateway follows the feed's session-aware roll — otherwise the
+     * gateway keeps activeSelection on the just-expired date and drops the feed's next-expiry records
+     * until midnight ET. Invalid/blank -> null.
+     */
+    public LocalTime expiryRollAfter() {
+        String raw = value("IB_EXPIRY_ROLL_AFTER", "");
+        if (raw == null || raw.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            String[] parts = raw.trim().split(":", 2);
+            return LocalTime.of(Integer.parseInt(parts[0]), parts.length > 1 ? Integer.parseInt(parts[1]) : 0);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     private static boolean isAutoExpiry(String configured) {

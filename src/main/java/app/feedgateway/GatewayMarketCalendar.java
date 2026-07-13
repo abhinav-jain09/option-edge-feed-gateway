@@ -104,7 +104,30 @@ public final class GatewayMarketCalendar {
      * so the gateway's AUTO expiry stays locked to the date the feed publishes.
      */
     public LocalDate currentTradingDate(Instant instant) {
-        LocalDate day = Objects.requireNonNull(instant, "instant").atZone(zone).toLocalDate();
+        return currentTradingDate(instant, null);
+    }
+
+    /**
+     * ET trading date. With {@code rollAfter == null} this is today if a trading day, else the most
+     * recent trading day (legacy midnight-ET roll — correct for SPX/OPRA, whose 09:30-16:00 session
+     * never crosses midnight). With {@code rollAfter} set (e.g. the ES 0DTE expiry time 16:00 ET), the
+     * trade date advances to the NEXT trading day once the ET wall-clock passes that time, and
+     * non-trading candidates skip FORWARD — so a GLBX/ES 0DTE rolls to the next expiry the instant
+     * today's expires rather than freezing until midnight ET, and the resolved date is stable across a
+     * weekend/holiday (no Fri->Mon->Fri flip-flop). Mirrors the feed's MarketCalendar.
+     */
+    public LocalDate currentTradingDate(Instant instant, LocalTime rollAfter) {
+        ZonedDateTime et = Objects.requireNonNull(instant, "instant").atZone(zone);
+        LocalDate day = et.toLocalDate();
+        if (rollAfter != null) {
+            if (!et.toLocalTime().isBefore(rollAfter)) {
+                day = day.plusDays(1);
+            }
+            while (!isTradingDay(day)) {
+                day = day.plusDays(1);
+            }
+            return day;
+        }
         while (!isTradingDay(day)) {
             day = day.minusDays(1);
         }

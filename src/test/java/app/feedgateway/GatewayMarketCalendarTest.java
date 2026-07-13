@@ -86,6 +86,39 @@ class GatewayMarketCalendarTest {
         assertEquals(LocalDate.of(2026, 7, 2), c.currentTradingDate(et(2026, 7, 5, 12, 0)));
     }
 
+    private static final LocalTime EXPIRY = LocalTime.of(16, 0); // ES 0DTE expiry / roll boundary, ET
+
+    @Test
+    void rollAfterBeforeBoundaryStaysToday() {
+        GatewayMarketCalendar c = calendar(Set.of(), Map.of());
+        // Mon 2026-07-13 15:59 ET, before the 16:00 expiry -> still Monday's 0DTE.
+        assertEquals(LocalDate.of(2026, 7, 13), c.currentTradingDate(et(2026, 7, 13, 15, 59), EXPIRY));
+    }
+
+    @Test
+    void rollAfterAtOrPastBoundaryAdvancesToNextDay() {
+        GatewayMarketCalendar c = calendar(Set.of(), Map.of());
+        // Mon 16:00 (at expiry) and 20:00 (evening) -> Tuesday's 0DTE.
+        assertEquals(LocalDate.of(2026, 7, 14), c.currentTradingDate(et(2026, 7, 13, 16, 0), EXPIRY));
+        assertEquals(LocalDate.of(2026, 7, 14), c.currentTradingDate(et(2026, 7, 13, 20, 0), EXPIRY));
+    }
+
+    @Test
+    void rollAfterSkipsForwardOverWeekendStably() {
+        GatewayMarketCalendar c = calendar(Set.of(), Map.of());
+        // Fri 2026-07-17 evening past boundary, and Sat/Sun before it, ALL resolve forward to Mon 2026-07-20.
+        assertEquals(LocalDate.of(2026, 7, 20), c.currentTradingDate(et(2026, 7, 17, 19, 0), EXPIRY));
+        assertEquals(LocalDate.of(2026, 7, 20), c.currentTradingDate(et(2026, 7, 18, 3, 0), EXPIRY));
+        assertEquals(LocalDate.of(2026, 7, 20), c.currentTradingDate(et(2026, 7, 19, 10, 0), EXPIRY));
+    }
+
+    @Test
+    void rollAfterNullKeepsLegacyBehavior() {
+        GatewayMarketCalendar c = calendar(Set.of(), Map.of());
+        // Null roll-after: same Monday-evening instant stays on Monday (legacy midnight-ET roll).
+        assertEquals(LocalDate.of(2026, 7, 13), c.currentTradingDate(et(2026, 7, 13, 20, 0), null));
+    }
+
     // ---- session open/close instants (liquidity-history backfill spec §4 / AC5) ----
 
     @Test
