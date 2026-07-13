@@ -179,9 +179,14 @@ public final class GatewaySettings {
         if (raw == null || raw.trim().isEmpty()) {
             return null;
         }
+        // Strict HH:MM (mirrors the feed's parse): exactly two numeric, colon-separated parts. LocalTime.of
+        // validates the 0-23 / 0-59 ranges (throws -> null). Rejects "16", "16:00:00", signed/garbage.
+        String[] parts = raw.trim().split(":");
+        if (parts.length != 2) {
+            return null;
+        }
         try {
-            String[] parts = raw.trim().split(":", 2);
-            return LocalTime.of(Integer.parseInt(parts[0]), parts.length > 1 ? Integer.parseInt(parts[1]) : 0);
+            return LocalTime.of(Integer.parseInt(parts[0]), Integer.parseInt(parts[1]));
         } catch (RuntimeException e) {
             return null;
         }
