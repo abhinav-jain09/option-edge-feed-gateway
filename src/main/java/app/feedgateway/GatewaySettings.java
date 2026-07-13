@@ -827,15 +827,37 @@ public final class GatewaySettings {
     }
 
     public static String value(String key, String fallback) {
+        String resolved = fallback;
         String env = System.getenv(key);
         if (env != null && !env.isBlank()) {
-            return env.trim();
+            resolved = env.trim();
+        } else {
+            String property = System.getProperty(key);
+            if (property != null && !property.isBlank()) {
+                resolved = property.trim();
+            }
         }
-        String property = System.getProperty(key);
-        if (property != null && !property.isBlank()) {
-            return property.trim();
+        // Anti-divergence: topic env keys (…_TOPIC) get TOPIC_PREFIX applied so ONE binary serves
+        // SPX (no prefix) and es4 (TOPIC_PREFIX=es.) with env-only difference — matching the
+        // processing-common convention. The guard makes SPX a strict no-op (empty prefix) and never
+        // double-prefixes an already-prefixed default (e.g. the es.open-direction.* topics).
+        if (key.endsWith("_TOPIC")) {
+            return applyTopicPrefix(resolved);
         }
-        return fallback;
+        return resolved;
+    }
+
+    /** Prepend TOPIC_PREFIX to a topic name; no-op when the prefix is empty or already applied. */
+    static String applyTopicPrefix(String topic) {
+        String prefix = System.getenv("TOPIC_PREFIX");
+        if (prefix == null || prefix.isBlank()) {
+            prefix = System.getProperty("TOPIC_PREFIX", "");
+        }
+        prefix = prefix == null ? "" : prefix.trim();
+        if (prefix.isEmpty() || topic == null || topic.isBlank() || topic.startsWith(prefix)) {
+            return topic;
+        }
+        return prefix + topic;
     }
 
     public static boolean boolValue(String key, boolean fallback) {
