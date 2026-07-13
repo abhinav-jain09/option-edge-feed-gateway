@@ -2063,7 +2063,8 @@ public class FeedGatewayService implements ReplayRunner {
         }
         String target;
         try {
-            target = marketCalendar.currentTradingDate(Instant.now()).format(DateTimeFormatter.BASIC_ISO_DATE);
+            target = marketCalendar.currentTradingDate(Instant.now(), settings.expiryRollAfter())
+                    .format(DateTimeFormatter.BASIC_ISO_DATE);
         } catch (RuntimeException e) {
             return; // a calendar hiccup must never kill the scheduled task
         }
