@@ -2335,10 +2335,65 @@ class FeedGatewayServiceTest {
     }
 
     @SuppressWarnings("unchecked")
+    @Test
+    void autoRollOverridesStaleExpiredSelection() throws Exception {
+        // A stale control selection pinned an EXPIRED expiry AFTER today's auto-roll already fired
+        // (autoRolledExpiry == target). The auto-roll must override it, not defer for the day.
+        System.setProperty("IB_EXPIRY", "AUTO");
+        try {
+            FeedGatewayService service = service();
+            String target = currentTradingDateExpiry();
+            setAutoRolledExpiry(service, target);                 // already rolled today
+            setActiveSelection(service, "DATABENTO", "ES", "20000101"); // clearly-expired selection
+            invokeMaybeAutoRollExpiry(service);
+            assertEquals(target, activeExpiry(service),
+                    "a stale/expired control selection must be auto-rolled to the session target");
+        } finally {
+            System.clearProperty("IB_EXPIRY");
+        }
+    }
+
+    @Test
+    void autoRollHoldsFutureSelection() throws Exception {
+        // A control selection for a FUTURE expiry (>= target) is a deliberate pick and must hold.
+        System.setProperty("IB_EXPIRY", "AUTO");
+        try {
+            FeedGatewayService service = service();
+            setAutoRolledExpiry(service, currentTradingDateExpiry());
+            setActiveSelection(service, "DATABENTO", "ES", "29991231"); // clearly-future selection
+            invokeMaybeAutoRollExpiry(service);
+            assertEquals("29991231", activeExpiry(service),
+                    "a future control selection must not be auto-rolled away");
+        } finally {
+            System.clearProperty("IB_EXPIRY");
+        }
+    }
+
     private static void setActiveSelection(FeedGatewayService service, String src, String symbol, String expiry) throws Exception {
         Field field = FeedGatewayService.class.getDeclaredField("activeSelection");
         field.setAccessible(true);
         ((AtomicReference<Object>) field.get(service)).set(newActiveSelection(src, symbol, expiry));
+    }
+
+    private static void setAutoRolledExpiry(FeedGatewayService service, String v) throws Exception {
+        Field f = FeedGatewayService.class.getDeclaredField("autoRolledExpiry");
+        f.setAccessible(true);
+        f.set(service, v);
+    }
+
+    private static String activeExpiry(FeedGatewayService service) throws Exception {
+        Field f = FeedGatewayService.class.getDeclaredField("activeSelection");
+        f.setAccessible(true);
+        Object sel = ((AtomicReference<?>) f.get(service)).get();
+        Method m = sel.getClass().getDeclaredMethod("expiry");
+        m.setAccessible(true);
+        return (String) m.invoke(sel);
+    }
+
+    private static void invokeMaybeAutoRollExpiry(FeedGatewayService service) throws Exception {
+        Method m = FeedGatewayService.class.getDeclaredMethod("maybeAutoRollExpiry");
+        m.setAccessible(true);
+        m.invoke(service);
     }
 
     private static int cachedEventCount(FeedGatewayService service, String event, long nowMs) throws Exception {
