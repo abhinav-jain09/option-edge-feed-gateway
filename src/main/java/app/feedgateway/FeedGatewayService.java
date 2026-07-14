@@ -2068,17 +2068,25 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (RuntimeException e) {
             return; // a calendar hiccup must never kill the scheduled task
         }
-        if (target.equals(autoRolledExpiry)) {
-            return; // same trading day, or a manual selection already holds for today
+        ActiveSelection current = activeSelection.get();
+        // A control-topic selection for the current/future session holds for the day. But a stale
+        // selection pinning an EXPIRED expiry (before the session target — e.g. a retained UI
+        // selection adopted on boot, or one republished after the roll) must NOT strand the chain on
+        // the dead contract, so override it. yyyyMMdd compares chronologically as a string.
+        String currentExpiry = current.expiry();
+        boolean stale = currentExpiry != null && currentExpiry.length() == 8
+                && currentExpiry.chars().allMatch(Character::isDigit)
+                && currentExpiry.compareTo(target) < 0;
+        if (target.equals(autoRolledExpiry) && !stale) {
+            return; // same trading day, or a current/future selection holds for today
         }
         autoRolledExpiry = target;
-        ActiveSelection current = activeSelection.get();
-        if (target.equals(current.expiry())) {
+        if (target.equals(currentExpiry)) {
             return; // already serving the new date
         }
         long now = System.currentTimeMillis();
-        System.out.println("Feed gateway auto-rolling expiry " + current.expiry() + " -> " + target
-                + " (new ET trading day)");
+        System.out.println("Feed gateway auto-rolling expiry " + currentExpiry + " -> " + target
+                + (stale ? " (overriding stale/expired selection)" : " (new ET trading day)"));
         applySelection(new ActiveSelection(current.source(), current.symbol(), target, now, now));
     }
 
