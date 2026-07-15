@@ -77,6 +77,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 public class FeedGatewayService implements ReplayRunner {
+    private static final long EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS = 5L;
     private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
     private final GatewayMarketCalendar marketCalendar;
@@ -398,59 +399,39 @@ public class FeedGatewayService implements ReplayRunner {
     @PreDestroy
     public void stop() {
         running.set(false);
-        ExecutorService currentExecutor = executor;
-        if (currentExecutor != null) {
-            currentExecutor.shutdownNow();
-            try {
-                currentExecutor.awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        ScheduledExecutorService currentBatchExecutor = batchExecutor;
-        if (currentBatchExecutor != null) {
-            currentBatchExecutor.shutdownNow();
-            try {
-                currentBatchExecutor.awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        ScheduledExecutorService currentDiagExecutor = diagnosticsExecutor;
-        if (currentDiagExecutor != null) {
-            currentDiagExecutor.shutdownNow();
-            try {
-                currentDiagExecutor.awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
+        // Let Kafka polling loops observe running=false and leave their try-with-resources blocks.
+        // Interrupting first makes KafkaConsumer.close() inherit the interrupted flag and emit one
+        // "Failed to close fetcher" ERROR per consumer during every normal Kubernetes rollout.
+        shutdownExecutorGracefully(executor);
+        shutdownExecutorGracefully(batchExecutor);
+        shutdownExecutorGracefully(diagnosticsExecutor);
         // Wake and stop any in-flight replay readers so shutdown is not held up by a blocking poll.
         for (ReplayHandle handle : replayHandles.values()) {
             handle.active.set(false);
             handle.wakeConsumers();
         }
-        ExecutorService currentReplayExecutor = replayExecutor;
-        if (currentReplayExecutor != null) {
-            currentReplayExecutor.shutdownNow();
-            try {
-                currentReplayExecutor.awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
+        shutdownExecutorGracefully(replayExecutor);
         for (OutboundChannel channel : outbound.values()) {
             channel.shutdown();
         }
         outbound.clear();
-        ExecutorService currentOutboundWriters = outboundWriters;
-        if (currentOutboundWriters != null) {
-            currentOutboundWriters.shutdownNow();
-            try {
-                currentOutboundWriters.awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        shutdownExecutorGracefully(outboundWriters);
+    }
+
+    static void shutdownExecutorGracefully(ExecutorService executor) {
+        if (executor == null) {
+            return;
+        }
+        executor.shutdown();
+        try {
+            if (executor.awaitTermination(EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                return;
             }
+            executor.shutdownNow();
+            executor.awaitTermination(EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 
