@@ -2018,6 +2018,18 @@ public class FeedGatewayService implements ReplayRunner {
             if (!next.newerThan(previous)) {
                 return;
             }
+            // A new epoch for the same source/symbol/expiry is a control-plane reassertion, not a market
+            // switch. Web-pod restarts used to generate exactly this record and the global reset below
+            // blanked every authenticated dashboard even though all data services were still healthy.
+            // Keep the established selection (including its readiness/barriers) and accept future records:
+            // the forward gate rejects only epochs OLDER than the active epoch, so a newer producer epoch
+            // continues through without forcing clients to throw away cumulative volume and pace.
+            if (sameMarketSelection(previous, next)) {
+                System.out.println("RGW_SELECTION_REASSERT event=selection_reassert_ignored"
+                        + " activeSelection=" + describeSelection(previous)
+                        + " ignoredSelection=" + describeSelection(next));
+                return;
+            }
             // Rollover-diagnostics WARN — moment-of-truth log emitted BEFORE the swap so a grep-friendly
             // before/after record exists in Loki for the 2026-07-01-style silent-wedge incidents. Additive;
             // does not gate the roll. (Wrapped so a diag failure never breaks the roll.)
@@ -2046,6 +2058,13 @@ public class FeedGatewayService implements ReplayRunner {
         System.out.println("Feed gateway selected market data source " + next.source()
                 + " " + next.symbol() + " " + next.expiry()
                 + " epoch=" + next.selectionEpoch());
+    }
+
+    private static boolean sameMarketSelection(ActiveSelection left, ActiveSelection right) {
+        return left != null && right != null
+                && left.source().equalsIgnoreCase(right.source())
+                && left.symbol().equalsIgnoreCase(right.symbol())
+                && left.expiry().equals(right.expiry());
     }
 
     /**
@@ -6027,6 +6046,16 @@ public class FeedGatewayService implements ReplayRunner {
 
     long rolloverCountForTest() {
         return rolloverCount.get();
+    }
+
+    void applySelectionForTest(String source, String symbol, String expiry, long epoch) {
+        long now = System.currentTimeMillis();
+        applySelection(new ActiveSelection(source, symbol, expiry, epoch, now));
+    }
+
+    long activeSelectionEpochForTest() {
+        ActiveSelection selection = activeSelection.get();
+        return selection == null ? -1L : selection.selectionEpoch();
     }
 
     void bumpLiveRecordsPolledForTest(long by) {

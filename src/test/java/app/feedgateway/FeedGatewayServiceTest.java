@@ -29,6 +29,34 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FeedGatewayServiceTest {
     @Test
+    void epochOnlySelectionReassertDoesNotRollOrReplaceTheActiveBoard() {
+        FeedGatewayService service = service();
+        service.seedReadySelectionForTest("DATABENTO", "ES", "20260715", 100L);
+
+        service.applySelectionForTest("DATABENTO", "ES", "20260715", 200L);
+
+        assertEquals(0L, service.rolloverCountForTest(),
+                "same-contract reassertion must not run the reset/rollover lifecycle");
+        assertEquals(100L, service.activeSelectionEpochForTest(),
+                "the established ready selection must remain authoritative");
+        assertEquals(1, service.readySelectionKeyGaugeForTest(),
+                "same-contract reassertion must preserve readiness");
+    }
+
+    @Test
+    void realContractChangeStillRunsTheRolloverLifecycle() {
+        FeedGatewayService service = service();
+        service.seedReadySelectionForTest("DATABENTO", "ES", "20260715", 100L);
+
+        service.applySelectionForTest("DATABENTO", "ES", "20260716", 200L);
+
+        assertEquals(1L, service.rolloverCountForTest());
+        assertEquals(200L, service.activeSelectionEpochForTest());
+        assertEquals(0, service.readySelectionKeyGaugeForTest(),
+                "a real chain change must wait for the new selection to become ready");
+    }
+
+    @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
                 List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain"),
