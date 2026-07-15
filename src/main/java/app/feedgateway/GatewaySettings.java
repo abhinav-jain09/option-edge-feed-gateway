@@ -433,6 +433,11 @@ public final class GatewaySettings {
         return value("KAFKA_UNIFIED_SR_TOPIC", "options.spx.strike-sr.current");
     }
 
+    /** GEX magnet strike (Avro, per-chain last-value-wins). Broadcast as event "gex-magnet". */
+    public String databentoGexMagnetTopic() {
+        return value("KAFKA_DATABENTO_GEX_MAGNET_TOPIC", "options.databento.gex.magnet");
+    }
+
     /**
      * Databento per-strike GEX history topic. JSON on the wire (the databento-gex-history Kafka
      * Streams service emits enriched JSON: the gex fields + a {@code history} window map), unlike

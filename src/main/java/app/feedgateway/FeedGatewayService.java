@@ -112,6 +112,7 @@ public class FeedGatewayService implements ReplayRunner {
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
             "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "strike-sr",
+            "gex-magnet",
             "max-pain",
             "liquidity-heatmap",
             "option-price-behavior",
@@ -155,6 +156,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
+    private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     private final Map<String, String> maxPain = new ConcurrentHashMap<>();
     // Agent A short-premium recommendations, cached per trade_id (last-value-wins), replayed on connect.
     private final Map<String, String> shortPremiumRecommendations = new ConcurrentHashMap<>();
@@ -207,6 +209,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingMissionSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeSr = new LinkedHashMap<>();
+    private final Map<String, String> pendingGexMagnet = new LinkedHashMap<>();
     private final Map<String, String> pendingMaxPain = new LinkedHashMap<>();
     private final Map<String, String> pendingOptionPriceBehaviors = new LinkedHashMap<>();
     private final Map<String, String> pendingOpbV2ByOptions = new LinkedHashMap<>();
@@ -457,7 +460,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (avroCaughtUp.get()) {
             // max-pain + strike-sr are DATABENTO-only Avro, so they bootstrap purely via the Avro consumer.
-            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr"));
+            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet"));
         }
         if (stateCaughtUp.get()) {
             sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session"));
@@ -816,6 +819,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"strikeSr\":" + strikeSr.size() + ","
+                + "\"gexMagnet\":" + gexMagnet.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
                 + "\"optionPriceBehaviors\":" + optionPriceBehaviors.size() + ","
                 + "\"opbV2ByOptions\":" + opbV2ByOptions.size() + ","
@@ -927,6 +931,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_strike_sr Cached unified support/resistance level count.\n"
                 + "# TYPE options_edge_feed_gateway_strike_sr gauge\n"
                 + "options_edge_feed_gateway_strike_sr " + strikeSr.size() + "\n"
+                + "# HELP options_edge_feed_gateway_gex_magnet Cached per-(symbol,expiry) gex-magnet count.\n"
+                + "# TYPE options_edge_feed_gateway_gex_magnet gauge\n"
+                + "options_edge_feed_gateway_gex_magnet " + gexMagnet.size() + "\n"
                 + "# HELP options_edge_feed_gateway_max_pain Cached per-(symbol,expiry) max-pain count.\n"
                 + "# TYPE options_edge_feed_gateway_max_pain gauge\n"
                 + "options_edge_feed_gateway_max_pain " + maxPain.size() + "\n"
@@ -1118,6 +1125,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
+        topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -1199,6 +1207,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
+        topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -2161,6 +2170,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.optionPriceBehaviorV2SessionTopic(),
                     settings.databentoGexTopic(),
                     settings.unifiedSrTopic(),
+                    settings.databentoGexMagnetTopic(),
                     settings.databentoMaxPainTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic(),
@@ -2173,7 +2183,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "max-pain");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -2234,6 +2244,15 @@ public class FeedGatewayService implements ReplayRunner {
             // gateway has captured source-switch offset barriers, so applying that offset barrier can suppress
             // valid fresh levels indefinitely. Keep the same source/symbol/expiry and max-stale gates used by
             // mission-* while bypassing only the offset barrier.
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
+                    && matchesActiveSelection(json, selection);
+        }
+        if ("gex-magnet".equals(binding.event())) {
+            // GEX-magnet is a low-frequency derived selected-market signal (per chain), same class as
+            // strike-sr. It may be (re)started after source-switch offset barriers are captured, so applying
+            // that offset barrier can suppress valid fresh values indefinitely. Keep the same
+            // source/symbol/expiry and max-stale gates while bypassing only the offset barrier.
             return binding.source().equals(selection.source())
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesActiveSelection(json, selection);
@@ -2725,6 +2744,13 @@ public class FeedGatewayService implements ReplayRunner {
                 strikeSr.put(key, json);
                 return key;
             }
+            case "gex-magnet" -> {
+                // Per-chain (symbol|expiry) last-value-wins upsert. No tombstones.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gexMagnet.put(key, json);
+                return key;
+            }
             case "max-pain" -> {
                 // EXPIRED terminal records evict the cache entry instead of caching them — a stale
                 // terminal must NEVER be replayed to a freshly-connected client. The live forward of
@@ -3144,6 +3170,16 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("strike-sr", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "gex-magnet" -> gexMagnet.entrySet().stream()
+                        // DATABENTO-only Avro per-chain magnet value (last-value-wins). Replay while the
+                        // cache entry is alive, enforcing source/symbol/expiry isolation below.
+                        .filter(entry -> isCacheFresh("gex-magnet:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("gex-magnet:" + entry.getKey(), selection, false, false))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("gex-magnet", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "max-pain" -> maxPain.entrySet().stream()
                         // DATABENTO-only stream: IBKR-selected sessions never receive max pain.
@@ -3618,6 +3654,8 @@ public class FeedGatewayService implements ReplayRunner {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
         } else if (versionKey.startsWith("strike-sr:")) {
             strikeSr.remove(versionKey.substring("strike-sr:".length()));
+        } else if (versionKey.startsWith("gex-magnet:")) {
+            gexMagnet.remove(versionKey.substring("gex-magnet:".length()));
         } else if (versionKey.startsWith("max-pain:")) {
             maxPain.remove(versionKey.substring("max-pain:".length()));
         } else if (versionKey.startsWith("option-price-behavior:")) {
@@ -4347,6 +4385,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "spread-skew", spreadSkews);
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "strike-sr", strikeSr);
+        replayCacheMap(session, "gex-magnet", gexMagnet);
         // liquidity-heatmap replays WITH the freshness gate below (5s TTL): only a live-fresh
         // column frame bootstraps a new socket; anything older is simply absent and the UI
         // fills forward from the next live frame.
@@ -4407,6 +4446,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     private boolean requiresFreshPerSessionReplay(String event) {
         return "strike-sr".equals(event)
+                || "gex-magnet".equals(event)
                 || "liquidity-heatmap".equals(event)
                 || "mission-pace".equals(event)
                 || "mission-control".equals(event)
@@ -4623,6 +4663,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.databentoGexTopic(), "gex-by-strike");
                 avroTopics.put(settings.databentoMaxPainTopic(), "max-pain");
                 avroTopics.put(settings.unifiedSrTopic(), "strike-sr");
+                avroTopics.put(settings.databentoGexMagnetTopic(), "gex-magnet");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.strikeIntelByStrikeTopic(), "strike-intel");
@@ -5398,6 +5439,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "mission-sandwich" -> pendingMissionSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
             case "strike-sr" -> pendingStrikeSr;
+            case "gex-magnet" -> pendingGexMagnet;
             case "max-pain" -> pendingMaxPain;
             case "option-price-behavior" -> pendingOptionPriceBehaviors;
             case "opb-v2-by-option" -> pendingOpbV2ByOptions;
@@ -5449,6 +5491,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingMissionSandwiches.values()),
                         new ArrayList<>(pendingGexByStrike.values()),
                         new ArrayList<>(pendingStrikeSr.values()),
+                        new ArrayList<>(pendingGexMagnet.values()),
                         new ArrayList<>(pendingMaxPain.values()),
                         new ArrayList<>(pendingOptionPriceBehaviors.values()),
                         new ArrayList<>(pendingOpbV2ByOptions.values()),
@@ -5497,6 +5540,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingMissionSandwiches.size()
                 + pendingGexByStrike.size()
                 + pendingStrikeSr.size()
+                + pendingGexMagnet.size()
                 + pendingMaxPain.size()
                 + pendingOptionPriceBehaviors.size()
                 + pendingOpbV2ByOptions.size()
@@ -5526,6 +5570,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingMissionSandwiches.clear();
         pendingGexByStrike.clear();
         pendingStrikeSr.clear();
+        pendingGexMagnet.clear();
         pendingMaxPain.clear();
         pendingOptionPriceBehaviors.clear();
         pendingOpbV2ByOptions.clear();
@@ -5560,6 +5605,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> missionSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
         List<String> strikeSrJsons = new ArrayList<>();
+        List<String> gexMagnetJsons = new ArrayList<>();
         List<String> maxPainJsons = new ArrayList<>();
         List<String> optionPriceBehaviorJsons = new ArrayList<>();
         List<String> opbV2ByOptionJsons = new ArrayList<>();
@@ -5588,6 +5634,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "mission-sandwich" -> missionSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
                 case "strike-sr" -> strikeSrJsons.add(cachedEvent.json());
+                case "gex-magnet" -> gexMagnetJsons.add(cachedEvent.json());
                 case "max-pain" -> maxPainJsons.add(cachedEvent.json());
                 case "option-price-behavior" -> optionPriceBehaviorJsons.add(cachedEvent.json());
                 case "opb-v2-by-option" -> opbV2ByOptionJsons.add(cachedEvent.json());
@@ -5620,6 +5667,7 @@ public class FeedGatewayService implements ReplayRunner {
                 missionSandwichJsons,
                 gexByStrikeJsons,
                 strikeSrJsons,
+                gexMagnetJsons,
                 maxPainJsons,
                 optionPriceBehaviorJsons,
                 opbV2ByOptionJsons,
@@ -5650,6 +5698,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> missionSandwichJsons,
             List<String> gexByStrikeJsons,
             List<String> strikeSrJsons,
+            List<String> gexMagnetJsons,
             List<String> maxPainJsons,
             List<String> optionPriceBehaviorJsons,
             List<String> opbV2ByOptionJsons,
@@ -5687,6 +5736,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"missionSandwiches\":" + jsonArray(missionSandwichJsons) + ","
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
                 + "\"strikeSr\":" + jsonArray(strikeSrJsons) + ","
+                + "\"gexMagnets\":" + jsonArray(gexMagnetJsons) + ","
                 + "\"maxPains\":" + jsonArray(maxPainJsons) + ","
                 + "\"optionPriceBehaviors\":" + jsonArray(optionPriceBehaviorJsons) + ","
                 + "\"opbV2ByOptions\":" + jsonArray(opbV2ByOptionJsons) + ","
