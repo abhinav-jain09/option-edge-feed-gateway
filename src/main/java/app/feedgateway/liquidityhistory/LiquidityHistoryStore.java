@@ -56,9 +56,7 @@ public final class LiquidityHistoryStore implements AutoCloseable {
                   long maxLagRecords, long catchupAbortMs, int pollMs) {
 
         static Config fromSettings(GatewaySettings settings) {
-            // 4 partitions is the platform-wide Kafka partition policy the one-chain-one-partition
-            // ordering contract is calibrated against (spec §2 topology guard).
-            return new Config(settings.strikeLiquidityTopic(), 4,
+            return new Config(settings.strikeLiquidityTopic(), settings.heatmapHistoryExpectedPartitions(),
                     settings.heatmapHistoryMaxChains(), settings.heatmapHistoryMaxBytes(),
                     settings.heatmapHistoryMaxLagRecords(), settings.heatmapHistoryCatchupAbortMs(),
                     settings.pollMs());

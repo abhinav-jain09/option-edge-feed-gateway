@@ -329,6 +329,11 @@ public final class GatewaySettings {
         return boolValue("HEATMAP_HISTORY_ENABLED", true);
     }
 
+    /** Expected partition count for the heatmap dashboard topic topology guard. */
+    public int heatmapHistoryExpectedPartitions() {
+        return intValue("HEATMAP_HISTORY_EXPECTED_PARTITIONS", 4, 1);
+    }
+
     /** Max distinct chains (symbol|expiry) held in the session-history store (spec §2 memory bounds). */
     public int heatmapHistoryMaxChains() {
         return intValue("HEATMAP_HISTORY_MAX_CHAINS", 4, 1);

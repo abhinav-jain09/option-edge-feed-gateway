@@ -1,5 +1,6 @@
 package app.feedgateway.liquidityhistory;
 
+import app.feedgateway.GatewaySettings;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.MockConsumer;
@@ -40,6 +41,23 @@ class LiquidityHistoryStoreEpochTest {
     private static final String EXPIRY = "2026-06-23";
     private static final String CHAIN = SYMBOL + "|" + EXPIRY;
     private static final long M0 = sessionOpenMs(TRADING_DAY);
+
+    @Test
+    void expectedPartitionCountComesFromSettings() {
+        String key = "HEATMAP_HISTORY_EXPECTED_PARTITIONS";
+        String previous = System.getProperty(key);
+        try {
+            System.setProperty(key, "32");
+            assertEquals(32, LiquidityHistoryStore.Config.fromSettings(new GatewaySettings())
+                    .expectedPartitions());
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
+    }
 
     private static String frameWithBuy(long bucketStartMs, long buyContracts) {
         return frame(SYMBOL, EXPIRY, bucketStartMs, "LIVE", "FULL", List.of(6000.0),
