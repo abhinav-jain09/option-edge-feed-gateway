@@ -78,6 +78,23 @@ import java.util.concurrent.atomic.AtomicReference;
 @Service
 public class FeedGatewayService implements ReplayRunner {
     private static final long EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS = 5L;
+
+    /**
+     * Every RECORD-surfacing consumer reads {@code read_committed} so a record from an ABORTED pre-open GEX
+     * transaction is never surfaced (PREOPEN-GEX-GATE1-REQUIREMENT.md §6). HARD-CODED, not env-tunable: a single
+     * wrong {@code read_uncommitted} value would silently defeat the safety property on the live/cache/replay
+     * consumers. On the non-transactional topics this is identical to read_uncommitted.
+     */
+    static final String RECORD_CONSUMER_ISOLATION = "read_committed";
+
+    /**
+     * The source-switch barrier ({@link #captureOffsetBarriers}) reads {@code endOffsets()} as a PHYSICAL high
+     * watermark. Under {@code read_committed} that call returns the last-STABLE offset instead, so an open
+     * transaction on an output topic (the databento gex topic IS one) would capture a too-low barrier and
+     * mis-classify records across a source switch. This consumer NEVER polls records, so {@code read_uncommitted}
+     * is safe here and is REQUIRED for a correct physical-offset barrier.
+     */
+    static final String BARRIER_CONSUMER_ISOLATION = "read_uncommitted";
     private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
     private final GatewayMarketCalendar marketCalendar;
@@ -2120,7 +2137,11 @@ public class FeedGatewayService implements ReplayRunner {
         if (topics.isEmpty()) {
             return Map.of();
         }
-        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("barrier"))) {
+        Properties barrierProps = stringConsumerProperties("barrier");
+        // endOffsets() must return the PHYSICAL high watermark here, so force read_uncommitted (read_committed
+        // would return the last-stable offset and capture a too-low barrier while a pre-open txn is open).
+        barrierProps.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, BARRIER_CONSUMER_ISOLATION);
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(barrierProps)) {
             List<TopicPartition> partitions = partitionsFor(consumer, Set.copyOf(topics));
             Map<TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
             System.out.println("Feed gateway captured " + endOffsets.size()
@@ -5846,6 +5867,10 @@ public class FeedGatewayService implements ReplayRunner {
         properties.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         properties.put(ConsumerConfig.GROUP_ID_CONFIG, settings.groupIdBase() + "-" + name);
         properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
+        // read_committed so an ABORTED pre-open GEX transaction is never surfaced (safe/identical on the
+        // non-transactional topics too). The endOffsets-only barrier consumer overrides this — see
+        // captureOffsetBarriers + BARRIER_CONSUMER_ISOLATION.
+        properties.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, RECORD_CONSUMER_ISOLATION);
         properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
         properties.put(ConsumerConfig.CLIENT_ID_CONFIG, settings.groupIdBase() + "-" + name);
         properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, Integer.toString(settings.maxPollRecords()));
