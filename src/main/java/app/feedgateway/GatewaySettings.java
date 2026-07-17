@@ -651,6 +651,18 @@ public final class GatewaySettings {
         return intValue("GATEWAY_KAFKA_MAX_POLL_RECORDS", 100, 1);
     }
 
+    /**
+     * Consumer isolation level. Defaults to {@code read_committed} so the gateway never surfaces records from an
+     * ABORTED Kafka transaction — required for the pre-open GEX snapshot, which is published as one atomic
+     * transaction and aborts on a mid-publish crash or the 09:25 hard-stop (PREOPEN-GEX-GATE1-REQUIREMENT.md §6).
+     * On the non-transactional topics this gateway also consumes, read_committed is identical to read_uncommitted
+     * (every record is "committed"), so this is a safe global default.
+     */
+    public String consumerIsolationLevel() {
+        String v = value("GATEWAY_KAFKA_ISOLATION_LEVEL", "read_committed");
+        return "read_uncommitted".equals(v) ? "read_uncommitted" : "read_committed";
+    }
+
     public int fetchMaxBytes() {
         return intValue("GATEWAY_KAFKA_FETCH_MAX_BYTES", 4 * 1024 * 1024, 1024);
     }

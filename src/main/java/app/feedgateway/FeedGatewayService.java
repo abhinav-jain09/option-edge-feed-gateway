@@ -5846,6 +5846,9 @@ public class FeedGatewayService implements ReplayRunner {
         properties.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         properties.put(ConsumerConfig.GROUP_ID_CONFIG, settings.groupIdBase() + "-" + name);
         properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
+        // read_committed so an ABORTED pre-open GEX transaction is never surfaced (safe/identical on the
+        // non-transactional topics too). See GatewaySettings#consumerIsolationLevel.
+        properties.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, settings.consumerIsolationLevel());
         properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
         properties.put(ConsumerConfig.CLIENT_ID_CONFIG, settings.groupIdBase() + "-" + name);
         properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, Integer.toString(settings.maxPollRecords()));
