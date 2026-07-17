@@ -58,6 +58,17 @@ public final class LiquidityHistoryAuth {
         this.decoder = decoder;
     }
 
+    /**
+     * True when this bean actually verifies a real token before returning {@link Result#ok} — i.e. either
+     * multi-tenant mode ({@link WsTicketService} present) or legacy WS auth is enabled. False only in the
+     * both-off local-dev fallback, where {@link #authenticate} returns an unauthenticated "anonymous"
+     * principal. Callers that must fail closed regardless of the global switch (e.g. {@code /api/pin-flow},
+     * which the spec mandates be authenticated) check this and reject when it is false.
+     */
+    public boolean enforcing() {
+        return ticketService != null || settings.wsAuthEnabled();
+    }
+
     public Result authenticate(String authorizationHeader) {
         boolean multiTenant = ticketService != null;
         if (!multiTenant && !settings.wsAuthEnabled()) {
