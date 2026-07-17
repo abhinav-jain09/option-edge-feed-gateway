@@ -368,6 +368,89 @@ public final class GatewaySettings {
         return longValue("HEATMAP_HISTORY_CATCHUP_ABORT_MS", 300_000L, 1_000L);
     }
 
+    // ---- Flow Explorer / GET /api/pin-flow (FLOW-EXPLORER-OPTION-CHAIN §5/§6) ----
+    // Read-only Postgres. Reuses the SHARED POSTGRES_* env the other Postgres services already carry
+    // (so deploy wiring is trivial), with pinflow.postgres.* overrides that win when present.
+
+    /** JDBC URL for the read-only pin_* datasource; blank/absent → endpoint 503, DB never built (§6.3). */
+    public String pinFlowJdbcUrl() {
+        return firstNonBlank(value("pinflow.postgres.jdbc-url", ""), value("POSTGRES_JDBC_URL", ""));
+    }
+
+    public String pinFlowDbUser() {
+        return firstNonBlank(value("pinflow.postgres.user", ""), value("POSTGRES_USER", ""));
+    }
+
+    public String pinFlowDbPassword() {
+        return firstNonBlank(value("pinflow.postgres.password", ""), value("POSTGRES_PASSWORD", ""));
+    }
+
+    /** Session/label timezone (§5.1 rule 1). */
+    public ZoneId pinFlowZone() {
+        try {
+            return ZoneId.of(value("PIN_FLOW_TZ", "America/New_York"));
+        } catch (RuntimeException bad) {
+            return MARKET_TIME_ZONE;
+        }
+    }
+
+    /** Default strike band lower bound when the request omits lo (§5). */
+    public int pinFlowStrikeLo() {
+        return intValue("PIN_FLOW_STRIKE_LO", 7490, 1);
+    }
+
+    /** Default strike band upper bound when the request omits hi (§5). */
+    public int pinFlowStrikeHi() {
+        return intValue("PIN_FLOW_STRIKE_HI", 7590, 1);
+    }
+
+    /** Bulkhead pool size (§6.1: 2–4 threads). */
+    public int pinFlowExecutorThreads() {
+        return intValue("PIN_FLOW_EXECUTOR_THREADS", 3, 1);
+    }
+
+    /** Bulkhead bounded queue depth (§6.1: tiny queue, CallerRejects → fast 503). */
+    public int pinFlowExecutorQueue() {
+        return intValue("PIN_FLOW_EXECUTOR_QUEUE", 8, 1);
+    }
+
+    /** Per-request deadline for the whole DB round-trip on the bulkhead (§6.1). */
+    public long pinFlowRequestDeadlineMs() {
+        return longValue("PIN_FLOW_REQUEST_DEADLINE_MS", 10_000L, 500L);
+    }
+
+    /** HikariCP connection-acquisition timeout → 503 on pool exhaustion (§6.2). */
+    public long pinFlowConnectionTimeoutMs() {
+        return longValue("PIN_FLOW_CONNECTION_TIMEOUT_MS", 2_000L, 250L);
+    }
+
+    /** JDBC statement/query timeout in seconds (§6.2). */
+    public int pinFlowQueryTimeoutSeconds() {
+        return intValue("PIN_FLOW_QUERY_TIMEOUT_SECONDS", 10, 1);
+    }
+
+    /** Hikari max pool size (§6.2: small, ~4). */
+    public int pinFlowPoolMax() {
+        return intValue("PIN_FLOW_POOL_MAX", 4, 1);
+    }
+
+    /** Short result-cache TTL for (date,lo,hi) coalescing (§6.5: 5–10s). */
+    public long pinFlowCacheTtlMs() {
+        return longValue("PIN_FLOW_CACHE_TTL_MS", 8_000L, 0L);
+    }
+
+    /** Per-principal request rate limit for /api/pin-flow (§6.5 → 503 when exceeded). */
+    public int pinFlowRateLimitPerMin() {
+        return intValue("PIN_FLOW_RATE_LIMIT_PER_MIN", 30, 1);
+    }
+
+    private static String firstNonBlank(String a, String b) {
+        if (a != null && !a.isBlank()) {
+            return a;
+        }
+        return b == null ? "" : b;
+    }
+
     public String databentoPaceMissionTopic() {
         return value("KAFKA_DATABENTO_PACE_MISSION_TOPIC", "options.databento.pace.mission");
     }

@@ -20,6 +20,7 @@
         <kafka.version>4.1.0</kafka.version>
         <confluent.version>8.2.1</confluent.version>
         <options-edge-contracts.version>0.1.0-SNAPSHOT</options-edge-contracts.version>
+        <postgresql.version>42.7.8</postgresql.version>
     </properties>
 
     <repositories>
@@ -74,6 +75,23 @@
             <!-- Redis-backed single-use WS ticket store (OE-DDD-001 §5.3/§6.5); version via Spring Boot BOM -->
             <groupId>io.lettuce</groupId>
             <artifactId>lettuce-core</artifactId>
+        </dependency>
+        <!--
+          FLOW-EXPLORER-OPTION-CHAIN §6: read-only Postgres access for GET /api/pin-flow. We add
+          ONLY the JDBC driver + HikariCP pool (both constructed manually behind @ConditionalOnProperty
+          in PinFlowDataSourceConfig) and deliberately do NOT add spring-boot-starter-jdbc: that starter
+          activates DataSourceAutoConfiguration, which would try to build (and, with a health/actuator
+          probe, validate) a DataSource at boot — the gateway MUST start fine with NO database (§6.3).
+          HikariCP's version is managed by the Spring Boot BOM; postgresql pinned via the property above.
+        -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgresql.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
