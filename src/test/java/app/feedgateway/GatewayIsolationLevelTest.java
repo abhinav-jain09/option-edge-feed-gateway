@@ -1,45 +1,31 @@
 package app.feedgateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 import org.junit.jupiter.api.Test;
 
+/**
+ * Locks the Kafka isolation-level invariant for the pre-open GEX safety property: record-surfacing consumers
+ * MUST be read_committed (so an aborted pre-open transaction is never shown) and the endOffsets-only source
+ * -switch barrier MUST be read_uncommitted (so it captures the physical high watermark, not the last-stable
+ * offset). Both are hard-coded — there is deliberately no env escape hatch that could weaken read_committed.
+ */
 class GatewayIsolationLevelTest {
 
-    private static final String KEY = "GATEWAY_KAFKA_ISOLATION_LEVEL";
-
     @Test
-    void defaultsToReadCommittedSoAbortedPreOpenTxnsAreNeverSurfaced() {
-        assertEquals("read_committed", new GatewaySettings().consumerIsolationLevel());
+    void recordConsumersAreReadCommitted() {
+        assertEquals("read_committed", FeedGatewayService.RECORD_CONSUMER_ISOLATION);
     }
 
     @Test
-    void honoursAnExplicitReadUncommittedOverride() {
-        String prev = System.getProperty(KEY);
-        try {
-            System.setProperty(KEY, "read_uncommitted");
-            assertEquals("read_uncommitted", new GatewaySettings().consumerIsolationLevel());
-        } finally {
-            restore(prev);
-        }
+    void barrierConsumerIsReadUncommittedForAPhysicalHighWatermark() {
+        assertEquals("read_uncommitted", FeedGatewayService.BARRIER_CONSUMER_ISOLATION);
     }
 
     @Test
-    void anUnrecognisedValueFailsSafeToReadCommitted() {
-        String prev = System.getProperty(KEY);
-        try {
-            System.setProperty(KEY, "garbage");
-            assertEquals("read_committed", new GatewaySettings().consumerIsolationLevel());
-        } finally {
-            restore(prev);
-        }
-    }
-
-    private static void restore(String prev) {
-        if (prev == null) {
-            System.clearProperty(KEY);
-        } else {
-            System.setProperty(KEY, prev);
-        }
+    void theTwoIsolationLevelsDiffer() {
+        assertNotEquals(FeedGatewayService.RECORD_CONSUMER_ISOLATION,
+                FeedGatewayService.BARRIER_CONSUMER_ISOLATION);
     }
 }
