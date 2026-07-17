@@ -146,6 +146,10 @@ public class FeedGatewayService implements ReplayRunner {
     // Per-strike delta-flow snapshots, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (DeltaFlowStrikeSnapshot) — lives on the JSON-state consumer.
     private final Map<String, String> deltaFlows = new ConcurrentHashMap<>();
+    // Last StrikeIntelligenceDashboard per symbol ("strike-cluster" event): replayed on connect so a
+    // refreshed page repaints the recent-signals trail instantly instead of waiting for the next
+    // dashboard interval (§9b, user 2026-07-17).
+    private final Map<String, String> strikeClusters = new ConcurrentHashMap<>();
     // Per-strike strike-intelligence signals, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (StrikeIntelligenceSignal) — lives on the JSON-state consumer.
     private final Map<String, String> strikeIntels = new ConcurrentHashMap<>();
@@ -1581,10 +1585,13 @@ public class FeedGatewayService implements ReplayRunner {
                         continue;
                     }
                     if ("strike-cluster".equals(binding.event())) {
-                        // Per-symbol StrikeIntelligenceDashboard carrying level-based cluster walls (own
-                        // message.type), symbol-filtered client-side. Broadcast STANDALONE to every client —
-                        // never selection-gated and never cached (the producer re-emits the full cluster set
-                        // every dashboard interval, so a late-joining client repopulates on the next tick).
+                        // Per-symbol StrikeIntelligenceDashboard carrying cluster walls + the recent-signals
+                        // trail (own message.type), symbol-filtered client-side. Broadcast STANDALONE to every
+                        // client — never selection-gated — and the LAST payload per symbol is cached so a
+                        // freshly-connected page repaints the trail immediately instead of waiting for the
+                        // next dashboard interval (§9b).
+                        String clusterSymbol = record.key() == null ? "" : String.valueOf(record.key());
+                        strikeClusters.put(clusterSymbol, json);
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
                         continue;
@@ -4407,6 +4414,14 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "gex-magnet", gexMagnet);
+        // strike-cluster (dashboard + recent-signals trail): broadcast is unconditional live, so the
+        // replay is unconditional too — the client symbol-filters (fail-closed). Without this a
+        // refreshed page shows an EMPTY trail until the next dashboard interval (§9b).
+        for (String clusterJson : strikeClusters.values()) {
+            if (clusterJson != null && !clusterJson.isBlank()) {
+                send(session, "strike-cluster", clusterJson);
+            }
+        }
         // liquidity-heatmap replays WITH the freshness gate below (5s TTL): only a live-fresh
         // column frame bootstraps a new socket; anything older is simply absent and the UI
         // fills forward from the next live frame.
