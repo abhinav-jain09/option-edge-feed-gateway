@@ -1691,10 +1691,17 @@ public class FeedGatewayService implements ReplayRunner {
                         // uniformly by cachePolicyFor at ingest/purge/replay.
                         boolean esOpenDirectionDropped = isEsOpenDirectionEvent(binding.event())
                                 && cacheKey == null;
+                        // Gamma-lifecycle fail-closed (like max-pain / es-open-direction): a null cacheKey means
+                        // updateCache classified the record as expired (PAYLOAD eventTimeMs older than the 12h
+                        // window) or SUPERSEDED (out-of-order/older payload than the cached value). Live-routing
+                        // it would paint a stale/old badge onto a strike — so drop it. A fresh in-order record
+                        // returns a non-null key and still routes by source|symbol|expiry.
+                        boolean strikeLifecycleDropped = "gex-strike-lifecycle".equals(binding.event())
+                                && cacheKey == null;
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
                                 && !strikeIntelStale && !strikeInvasionStale && !spreadSkewStale
-                                && !esOpenDirectionDropped) {
+                                && !esOpenDirectionDropped && !strikeLifecycleDropped) {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -2320,6 +2327,24 @@ public class FeedGatewayService implements ReplayRunner {
             return binding.source().equals(selection.source())
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesOptionPriceBehaviorSelection(json, selection);
+        }
+        if ("gex-strike-lifecycle".equals(binding.event())) {
+            // Per-strike HIGH-frequency signal (like gex-by-strike), so KEEP the source-switch OFFSET barrier
+            // (pre-switch records must still be suppressed) — but run the freshness/selection TIME barrier on
+            // the PAYLOAD eventTimeMs (via eventCacheTimestamp), not Kafka arrival: a backfilling producer whose
+            // records ARRIVE fresh but carry an OLD eventTimeMs must never live-forward a stale badge, matching
+            // the cache/replay path. A missing/unparseable eventTimeMs yields a negative ts → time barrier fails
+            // closed. matchesActiveSelection enforces the symbol/expiry/source identity (no cross-market leak).
+            if (!binding.source().equals(selection.source())) {
+                return false;
+            }
+            long lifecycleTs = eventCacheTimestamp(binding.event(), record, json);
+            if (!passesSelectionTimeBarrier(lifecycleTs, selection)
+                    || !passesOffsetBarrier(new TopicPartition(record.topic(), record.partition()), record.offset())) {
+                reportSourceStale(selection, "switch-barrier");
+                return false;
+            }
+            return matchesActiveSelection(json, selection);
         }
         // opb-v2-by-option is a normal per-contract signal (symbol|expiry|strike) — fall through to the
         // default contract routing (passesSelectionBarrier + matchesActiveSelection) below.
@@ -3591,10 +3616,10 @@ public class FeedGatewayService implements ReplayRunner {
         if ("gex-strike-lifecycle".equals(event)) {
             // Track the PAYLOAD event time (eventTimeMs), not Kafka arrival — a backfilling producer appends
             // fresh-arrival records whose eventTimeMs is old; arrival time would let a stale badge render live.
-            long payloadTime = strikeLifecycleTimestamp(json);
-            if (payloadTime >= 0) {
-                return payloadTime;
-            }
+            // Return it UNCONDITIONALLY (no Kafka fallback): a missing/unparseable eventTimeMs yields -1, which
+            // reads as ancient so updateCache rejects the record (cacheKey==null) and every live-forward gate
+            // fails closed — a malformed lifecycle record is never cached, replayed, or rendered.
+            return strikeLifecycleTimestamp(json);
         }
         return cacheTimestamp(record);
     }
