@@ -526,6 +526,10 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_GEX_MAGNET_TOPIC", "options.databento.gex.magnet");
     }
 
+    public String databentoGexStrikeLifecycleTopic() {
+        return value("KAFKA_DATABENTO_GEX_STRIKE_LIFECYCLE_TOPIC", "options.databento.gex.strike-lifecycle");
+    }
+
     /**
      * Databento per-strike GEX history topic. JSON on the wire (the databento-gex-history Kafka
      * Streams service emits enriched JSON: the gex fields + a {@code history} window map), unlike
@@ -693,6 +697,11 @@ public final class GatewaySettings {
      */
     public long gexByStrikeTtlMs() {
         return longValue("GATEWAY_GEX_BY_STRIKE_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
+    /** Per-strike gamma-lifecycle TTL — like gex-by-strike, a long last-value-wins window (default 12h). */
+    public long gexStrikeLifecycleTtlMs() {
+        return longValue("GATEWAY_GEX_STRIKE_LIFECYCLE_TTL_MS", maxPainTtlMs(), 0L);
     }
 
     /** Agent A short-premium recommendation output topic (JSON, key = trade_id). */
