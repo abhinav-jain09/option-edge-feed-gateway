@@ -180,7 +180,9 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     // Per-strike gamma lifecycle (emerging/sticky/fading), keyed symbol|expiry|strike (last-value-wins,
-    // like gex-by-strike). Each record carries frameId; the UI groups a frame and swaps the ladder atomically.
+    // like gex-by-strike). rev-17: the producer emits ONLY active strikes plus a one-shot NEUTRAL "clear"
+    // when a strike goes inactive; that NEUTRAL overwrites the cache entry, so a reconnect replays NEUTRAL
+    // (no badge) for a departed strike. Cache is model-agnostic — no gateway-side frame bookkeeping.
     private final Map<String, String> gexStrikeLifecycle = new ConcurrentHashMap<>();
     private final Map<String, String> maxPain = new ConcurrentHashMap<>();
     // Agent A short-premium recommendations, cached per trade_id (last-value-wins), replayed on connect.
@@ -2793,9 +2795,10 @@ public class FeedGatewayService implements ReplayRunner {
                 return key;
             }
             case "gex-strike-lifecycle" -> {
-                // Per-strike (symbol|expiry|strike) last-value-wins upsert (mirrors gex-by-strike). Each
-                // record carries frameId + frameStrikeCount; the UI groups by frameId and swaps the ladder
-                // atomically, evicting strikes absent from the newest frame — so no gateway-side tombstones.
+                // Per-strike (symbol|expiry|strike) last-value-wins upsert (mirrors gex-by-strike). rev-17:
+                // the producer emits only ACTIVE strikes + a one-shot NEUTRAL clear per departure; the UI
+                // applies each per-strike record directly (NEUTRAL removes the badge), so the gateway needs no
+                // frameId bookkeeping or tombstones — the last value per strike is the whole truth.
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gexStrikeLifecycle.put(key, json);
@@ -3406,8 +3409,9 @@ public class FeedGatewayService implements ReplayRunner {
             return CachePolicy.expiring(settings.gexByStrikeTtlMs());
         }
         if ("gex-strike-lifecycle".equals(event)) {
-            // Per-strike lifecycle re-emits the whole ladder each frame; a long last-value-wins window (default
-            // 12h, like gex-by-strike) so a mid-session reconnect gets the latest badge even if a strike paused.
+            // rev-17: an active strike re-emits its label every frame, so a long last-value-wins window (default
+            // 12h, like gex-by-strike) lets a mid-session reconnect replay the latest badge for still-active
+            // strikes; a departed strike's one-shot NEUTRAL is the last cached value and replays as "no badge".
             return CachePolicy.expiring(settings.gexStrikeLifecycleTtlMs());
         }
         if ("liquidity-heatmap".equals(event)) {
