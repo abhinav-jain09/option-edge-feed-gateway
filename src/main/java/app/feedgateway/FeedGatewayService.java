@@ -492,6 +492,9 @@ public class FeedGatewayService implements ReplayRunner {
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
             replayDealerLedgerCached(session);
+            // hot-strike is likewise STANDALONE and GLOBAL: replay the fresh cached
+            // envelope(s) so a legacy-mode reload restores the gold mark (§4.4).
+            replayHotStrikeCached(session);
             // short-premium recommendations are likewise STANDALONE; replay the day's cached recommendations
             // so a page reload mid-session (or a client that connects after Agent A acted) still shows the
             // active overlay rather than waiting for the next live broadcast.
@@ -4046,6 +4049,21 @@ public class FeedGatewayService implements ReplayRunner {
      * Sent STANDALONE (its own message.type), never batched — mirrors the standalone live delivery.
      * dealerLedgers holds only fresh, non-evicted envelopes, so no extra freshness gate is needed here.
      */
+    /**
+     * §4.4: replay the fresh cached hot-strike envelope(s) — client symbol-filters —
+     * gated by the 12h session window so a long-running gateway never resends
+     * yesterday's row. Used by BOTH legacy and per-session connect paths.
+     */
+    private void replayHotStrikeCached(WebSocketSession session) {
+        long hotNowMs = System.currentTimeMillis();
+        for (Map.Entry<String, String> hotEntry : hotStrikes.entrySet()) {
+            if (hotEntry.getValue() != null && !hotEntry.getValue().isBlank()
+                    && isCacheFresh("hot-strike:" + hotEntry.getKey(), hotNowMs)) {
+                send(session, "hot-strike", hotEntry.getValue());
+            }
+        }
+    }
+
     private void replayDealerLedgerCached(WebSocketSession session) {
         // Purge first so a stale-half envelope (one role crossed TTL since the last poll purge) is evicted
         // before replay rather than sent to the connecting client.
@@ -4471,16 +4489,8 @@ public class FeedGatewayService implements ReplayRunner {
                 send(session, "strike-cluster", clusterJson);
             }
         }
-        // hot-strike: replay like strike-cluster (client symbol-filters) but gated by the
-        // 12h session freshness window — a long-running gateway must never resend
-        // yesterday's row (§4.4 display-staleness contract).
-        long hotNowMs = System.currentTimeMillis();
-        for (Map.Entry<String, String> hotEntry : hotStrikes.entrySet()) {
-            if (hotEntry.getValue() != null && !hotEntry.getValue().isBlank()
-                    && isCacheFresh("hot-strike:" + hotEntry.getKey(), hotNowMs)) {
-                send(session, "hot-strike", hotEntry.getValue());
-            }
-        }
+        // hot-strike: same standalone replay as legacy mode (§4.4).
+        replayHotStrikeCached(session);
         // liquidity-heatmap replays WITH the freshness gate below (5s TTL): only a live-fresh
         // column frame bootstraps a new socket; anything older is simply absent and the UI
         // fills forward from the next live frame.
@@ -5328,6 +5338,11 @@ public class FeedGatewayService implements ReplayRunner {
             // them so the standalone broadcast still reaches sockets in per-session (auth) mode —
             // GatewayRecordMapper deliberately has no route for spread-skew-event.
             "spread-skew-event",
+            // Hot Strike of the Day is a GLOBAL advisory overlay (symbol-filtered
+            // client-side, §4.4). Allowlist it so the standalone broadcast reaches
+            // sockets in per-session (auth) mode too — GatewayRecordMapper
+            // deliberately has no route for hot-strike.
+            "hot-strike",
             // ES 09:15 open-direction forecast + outcomes are the same class of GLOBAL advisory
             // overlay (one per day, symbol-independent) — allowlist them so routeOrBroadcast/broadcast
             // fan them out in per-session (auth) mode too, not only legacy mode. The 60s live STATUS

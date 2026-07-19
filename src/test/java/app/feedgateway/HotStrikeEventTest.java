@@ -93,6 +93,13 @@ class HotStrikeEventTest {
         // freshness-gated replay-on-connect (12h session window)
         assertTrue(source.contains("isCacheFresh(\"hot-strike:\" + hotEntry.getKey(), hotNowMs)"),
                 "hot-strike replay must be gated by the session freshness window");
+        // auth-mode delivery: broadcast() drops events outside the global allowlist
+        assertTrue(source.split("GLOBAL_BROADCAST_EVENTS = Set.of\\(")[1]
+                        .substring(0, 2000).contains("\"hot-strike\","),
+                "hot-strike must be allowlisted for per-session (auth) broadcast");
+        // delivered in BOTH connect modes: per-session AND legacy
+        assertEquals(2, source.split("replayHotStrikeCached\\(session\\);", -1).length - 1,
+                "hot-strike must replay on BOTH the legacy and per-session connect paths");
         // session-length cache window + seek-back
         assertTrue(source.contains(
                 "return CachePolicy.expiring(settings.hotStrikeTtlMs());"),
