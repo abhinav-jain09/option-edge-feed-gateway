@@ -134,6 +134,7 @@ public class FeedGatewayService implements ReplayRunner {
             "liquidity-heatmap",
             "option-price-behavior",
             "dealer-ledger",
+            "zero-dte-intelligence",
             "opb-v2-by-option", "opb-v2-session",
             "index-price", "vix-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
@@ -194,6 +195,10 @@ public class FeedGatewayService implements ReplayRunner {
     // window (default 5 min) — a stale status is evicted/suppressed rather than replayed (the UI strip
     // simply vanishes). Same standalone/global/JSON pass-through delivery class as the siblings.
     private final Map<String, String> esOpenDirectionStatuses = new ConcurrentHashMap<>();
+    // Current SPX 0DTE binary direction, keyed by source|symbol|sessionDate. This is a short-lived
+    // standalone UI control signal: stale/malformed data must disappear instead of leaving a chain
+    // tinted green/red after the underlying evidence is no longer current.
+    private final Map<String, String> zeroDteIntelligence = new ConcurrentHashMap<>();
     private final Map<String, String> optionPriceBehaviors = new ConcurrentHashMap<>();
     // Dealer-ledger: the two source topics are cached RAW per (source|symbol|expiry), and the JOINED
     // envelope the UI consumes is cached in dealerLedgers (last-value-wins). See DealerLedgerJoiner.
@@ -477,6 +482,7 @@ public class FeedGatewayService implements ReplayRunner {
             // routed — replayCacheMap can't deliver it (no GatewayRecordMapper case), so replay it
             // the same standalone way legacy mode does, so an auth-mode reload restores the overlay.
             replayShortPremiumCached(session);
+            replayZeroDteIntelligenceCached(session);
             return;
         }
         if (avroCaughtUp.get()) {
@@ -496,6 +502,7 @@ public class FeedGatewayService implements ReplayRunner {
             // cached 09:15 forecast and all horizon outcomes resolved so far, so a client that connects at
             // 11:00 (or reloads) still gets the once-a-day forecast instead of waiting until tomorrow.
             replayEsOpenDirectionCached(session);
+            replayZeroDteIntelligenceCached(session);
         }
         // gex-by-strike is the one MULTI-SOURCE cache: IBKR/Unusual-Whales gex arrives via the JSON state
         // consumer while DATABENTO gex arrives via the Avro consumer. Its cached replay is only complete once
@@ -1210,6 +1217,8 @@ public class FeedGatewayService implements ReplayRunner {
         // advisory like its siblings, OPTIONAL topic — but on the SHORT esOpenDirectionStatusTtlMs
         // window (default 5 min), which also bounds its seek-back here to the last few minutes.
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
+        // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
+        topicEvents.put(settings.zeroDteIntelligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -1283,6 +1292,7 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the ES open-direction live STATUS
         // heartbeat (JSON, standalone/optional — same rule as the forecast/outcome siblings above).
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
+        topicEvents.put(settings.zeroDteIntelligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
@@ -1615,6 +1625,16 @@ public class FeedGatewayService implements ReplayRunner {
                     if ("dealer-ledger".equals(binding.event()) && (forwardJson == null || forwardJson.isBlank())) {
                         continue; // join not ready / stale-dropped — nothing to forward for this record
                     }
+                    if ("zero-dte-intelligence".equals(binding.event())) {
+                        // Chain-level control signal: always its own websocket event, never a ui-batch row
+                        // and never selection-routed. Every client receives it and filters symbol/session;
+                        // updateCache's payload-time TTL ensures replay/backfill cannot look live.
+                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                            broadcast(binding.event(), forwardJson);
+                            forwardedEvents.incrementAndGet();
+                        }
+                        continue;
+                    }
                     // Selection captured ONCE for this record's forward+readiness decision (legacy mode).
                     ActiveSelection decided = null;
                     // Per-session mode: route directly via the engine using the authoritative
@@ -1887,7 +1907,8 @@ public class FeedGatewayService implements ReplayRunner {
                     || topic.equals(settings.esOpenDirectionOutcomeTopic())
                     // The live STATUS heartbeat comes from the same may-not-be-deployed producer, and is
                     // additionally absent whenever no overnight session is active — optional like its siblings.
-                    || topic.equals(settings.esOpenDirectionStatusTopic()));
+                    || topic.equals(settings.esOpenDirectionStatusTopic())
+                    || topic.equals(settings.zeroDteIntelligenceTopic()));
     }
 
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {
@@ -2584,6 +2605,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = esOpenDirectionOutcomeCacheKey(json, key);
         } else if ("es-open-direction-status".equals(event)) {
             key = esOpenDirectionStatusCacheKey(json, key);
+        } else if ("zero-dte-intelligence".equals(event)) {
+            key = zeroDteIntelligenceCacheKey(json, key);
         } else if ("liquidity-heatmap".equals(event)) {
             // Payload-derived symbol|expiry key (mirrors strike-flow): last-value-wins per chain
             // must not depend on the Kafka record key shape.
@@ -2718,6 +2741,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 esOpenDirectionStatuses.put(key, json); // ONE current status per source|tradeDate — last heartbeat wins
+                return key;
+            }
+            case "zero-dte-intelligence" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                zeroDteIntelligence.put(key, json);
                 return key;
             }
             case "mission-pace" -> {
@@ -3343,6 +3372,11 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private CachePolicy cachePolicyFor(String event, long nowMs) {
+        if ("zero-dte-intelligence".equals(event)) {
+            // This state controls a whole-chain red/green background. Keep its lifetime deliberately
+            // short and shared across ingest, purge, reconnect replay, and restart seek-back.
+            return CachePolicy.expiring(settings.zeroDteIntelligenceTtlMs());
+        }
         if ("max-pain".equals(event)) {
             return CachePolicy.expiring(settings.maxPainTtlMs());
         }
@@ -3491,6 +3525,12 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private long eventCacheTimestamp(String event, ConsumerRecord<?, ?> record, String json) {
+        if ("zero-dte-intelligence".equals(event)) {
+            // Never use fresh Kafka arrival time for a replayed direction decision. A historical record
+            // arriving now must expire from its decision time, otherwise an old unusual burst can tint
+            // the live chain dark red/green.
+            return zeroDteIntelligenceTimestamp(json);
+        }
         if ("liquidity-heatmap".equals(event)) {
             long payloadTime = liquidityHeatmapTimestamp(json);
             if (payloadTime >= 0) {
@@ -3558,6 +3598,29 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (JsonProcessingException ignored) {
             return -1L;
         }
+    }
+
+    /** Decision time for the chain-level 0DTE direction state; -1 means malformed and fails closed. */
+    private long zeroDteIntelligenceTimestamp(String json) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            long epochMs = longField(root, "asOfEventTimeMs", -1L);
+            if (epochMs >= 0) {
+                return epochMs;
+            }
+            for (String field : List.of("asOfEventTime", "asOf", "producedAt")) {
+                String value = text(root, field);
+                if (!value.isBlank()) {
+                    long parsed = parseInstantMs(value, -1L);
+                    if (parsed >= 0) {
+                        return parsed;
+                    }
+                }
+            }
+        } catch (JsonProcessingException ignored) {
+            // Invalid JSON is not a current decision.
+        }
+        return -1L;
     }
 
     /** Event time (asOfEventTimeMs) of a raw per-strike delta-flow record; -1 if absent/unparseable. */
@@ -3658,6 +3721,8 @@ public class FeedGatewayService implements ReplayRunner {
             esOpenDirectionOutcomes.remove(versionKey.substring("es-open-direction-outcome:".length()));
         } else if (versionKey.startsWith("es-open-direction-status:")) {
             esOpenDirectionStatuses.remove(versionKey.substring("es-open-direction-status:".length()));
+        } else if (versionKey.startsWith("zero-dte-intelligence:")) {
+            zeroDteIntelligence.remove(versionKey.substring("zero-dte-intelligence:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
             strikeFlows.remove(versionKey.substring("strike-flow:".length()));
         } else if (versionKey.startsWith("delta-flow:")) {
@@ -4030,6 +4095,24 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    private void replayZeroDteIntelligenceCached(WebSocketSession session) {
+        // Global standalone state, filtered by symbol/session in the browser. Purge + per-entry
+        // freshness checks are intentional defence in depth: reconnect must never restore an expired
+        // unusual-movement tint while the periodic purge is between cycles.
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        for (Map.Entry<String, String> entry : zeroDteIntelligence.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("zero-dte-intelligence:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, "zero-dte-intelligence", json);
+        }
+    }
+
     /**
      * True for the three ES open-direction advisory events (once-a-day forecast + per-horizon outcome +
      * the 60s live status heartbeat). They share the standalone/global/never-selection-gated delivery
@@ -4256,6 +4339,22 @@ public class FeedGatewayService implements ReplayRunner {
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to the Kafka key (also the tradeDate) if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    /** One current decision per symbol/session; horizon variants are carried inside the payload. */
+    private String zeroDteIntelligenceCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String sessionDate = normalizeExpiry(text(root, "sessionDate"));
+            if (!symbol.isBlank() && !sessionDate.isBlank()) {
+                return symbol + "|" + sessionDate;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Malformed payloads expire immediately via zeroDteIntelligenceTimestamp; fallback is only
+            // used to give updateCache a stable eviction key.
         }
         return fallback;
     }
