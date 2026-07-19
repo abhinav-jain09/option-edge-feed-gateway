@@ -565,6 +565,23 @@ public final class GatewaySettings {
     }
 
     /**
+     * ES-on-SPX aligned GEX (JSON whole-book per symbol|expiry, compacted, roll-forward). Broadcast as event
+     * "es-gex". Default OFF — the whole ES-GEX-on-SPX feature ships dark until {@code GATEWAY_ES_GEX_ENABLED}.
+     */
+    public String esGexSpxAlignedTopic() {
+        return value("KAFKA_ES_GEX_SPX_ALIGNED_TOPIC", "options.es-gex-spx-aligned");
+    }
+
+    public boolean esGexEnabled() {
+        return "true".equalsIgnoreCase(value("GATEWAY_ES_GEX_ENABLED", "false"));
+    }
+
+    /** Long last-value-wins window for the aligned book (like gex-by-strike); the align service re-emits ~5s. */
+    public long esGexTtlMs() {
+        return longValue("GATEWAY_ES_GEX_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
+    /**
      * Databento per-strike GEX history topic. JSON on the wire (the databento-gex-history Kafka
      * Streams service emits enriched JSON: the gex fields + a {@code history} window map), unlike
      * the Avro {@link #databentoGexTopic()}. Merged onto the same DATABENTO gex-by-strike rows.

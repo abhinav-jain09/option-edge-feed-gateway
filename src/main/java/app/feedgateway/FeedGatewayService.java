@@ -130,6 +130,7 @@ public class FeedGatewayService implements ReplayRunner {
             "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "strike-sr",
             "gex-magnet",
+            "es-gex",
             "max-pain",
             "liquidity-heatmap",
             "option-price-behavior",
@@ -183,6 +184,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
+    // ES-on-SPX aligned whole-book per symbol|expiry (JSON, roll-forward: latest emitEventTimeMs wins).
+    private final Map<String, String> esGex = new ConcurrentHashMap<>();
     private final Map<String, String> maxPain = new ConcurrentHashMap<>();
     // Agent A short-premium recommendations, cached per trade_id (last-value-wins), replayed on connect.
     private final Map<String, String> shortPremiumRecommendations = new ConcurrentHashMap<>();
@@ -240,6 +243,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeSr = new LinkedHashMap<>();
     private final Map<String, String> pendingGexMagnet = new LinkedHashMap<>();
+    private final Map<String, String> pendingEsGex = new LinkedHashMap<>();
     private final Map<String, String> pendingMaxPain = new LinkedHashMap<>();
     private final Map<String, String> pendingOptionPriceBehaviors = new LinkedHashMap<>();
     private final Map<String, String> pendingOpbV2ByOptions = new LinkedHashMap<>();
@@ -494,7 +498,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session"));
+            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "es-gex"));
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
             replayDealerLedgerCached(session);
@@ -855,6 +859,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"strikeSr\":" + strikeSr.size() + ","
                 + "\"gexMagnet\":" + gexMagnet.size() + ","
+                + "\"esGex\":" + esGex.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
                 + "\"optionPriceBehaviors\":" + optionPriceBehaviors.size() + ","
                 + "\"opbV2ByOptions\":" + opbV2ByOptions.size() + ","
@@ -969,6 +974,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_gex_magnet Cached per-(symbol,expiry) gex-magnet count.\n"
                 + "# TYPE options_edge_feed_gateway_gex_magnet gauge\n"
                 + "options_edge_feed_gateway_gex_magnet " + gexMagnet.size() + "\n"
+                + "# HELP options_edge_feed_gateway_es_gex Cached per-(symbol,expiry) ES-on-SPX aligned book count.\n"
+                + "# TYPE options_edge_feed_gateway_es_gex gauge\n"
+                + "options_edge_feed_gateway_es_gex " + esGex.size() + "\n"
                 + "# HELP options_edge_feed_gateway_max_pain Cached per-(symbol,expiry) max-pain count.\n"
                 + "# TYPE options_edge_feed_gateway_max_pain gauge\n"
                 + "options_edge_feed_gateway_max_pain " + maxPain.size() + "\n"
@@ -2263,7 +2271,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "max-pain");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "max-pain");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -2662,6 +2670,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = spreadSkewCacheKey(json, key);
         } else if ("gex-by-strike".equals(event)) {
             key = gexCacheKey(json, key);
+        } else if ("es-gex".equals(event)) {
+            key = esGexCacheKey(json, key);
         } else if ("max-pain".equals(event)) {
             key = maxPainCacheKey(json, key);
         } else if ("option-price-behavior".equals(event)) {
@@ -2849,6 +2859,14 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gexMagnet.put(key, json);
+                return key;
+            }
+            case "es-gex" -> {
+                // ES-on-SPX aligned WHOLE-BOOK per symbol|expiry (roll-forward: latest emitEventTimeMs wins;
+                // the align service is the single writer and stamps a monotonically-advancing emitEventTimeMs).
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                esGex.put(key, json);
                 return key;
             }
             case "max-pain" -> {
@@ -3281,6 +3299,15 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-magnet", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "es-gex" -> esGex.entrySet().stream()
+                        // DATABENTO-only JSON whole-book (roll-forward). Replay while the cache entry is alive.
+                        .filter(entry -> isCacheFresh("es-gex:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("es-gex:" + entry.getKey(), selection, false, false))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("es-gex", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "max-pain" -> maxPain.entrySet().stream()
                         // DATABENTO-only stream: IBKR-selected sessions never receive max pain.
                         // isCacheFresh is event-aware (12h max-pain window); the selection barrier relaxes
@@ -3456,6 +3483,12 @@ public class FeedGatewayService implements ReplayRunner {
             // latest record is routinely older than the generic 15-min TTL. Use a long last-value-wins window
             // (default 12h) so a valid-but-slow GEX is not evicted and still replays on connect.
             return CachePolicy.expiring(settings.gexByStrikeTtlMs());
+        }
+        if ("es-gex".equals(event)) {
+            // ES-on-SPX aligned book: the align service re-emits ~5s, but a quiet chain may pause; a long
+            // last-value-wins window (default 12h, like gex-by-strike) so a mid-session reconnect gets the
+            // latest book. Freshness/roll-forward is governed by the payload emitEventTimeMs (below).
+            return CachePolicy.expiring(settings.esGexTtlMs());
         }
         if ("liquidity-heatmap".equals(event)) {
             // Per-second column frames: SHORT window (default 5s), never the generic 15-min TTL —
@@ -3637,6 +3670,11 @@ public class FeedGatewayService implements ReplayRunner {
             // forwarded as current.
             return spreadSkewTimestamp(json);
         }
+        if ("es-gex".equals(event)) {
+            // Roll-forward + freshness track the align service's monotonic emitEventTimeMs, NOT Kafka arrival
+            // (a re-emitted/replayed book must order by emit time). Missing ⇒ -1 (fail closed).
+            return esGexTimestamp(json);
+        }
         return cacheTimestamp(record);
     }
 
@@ -3800,6 +3838,8 @@ public class FeedGatewayService implements ReplayRunner {
             gexMagnet.remove(versionKey.substring("gex-magnet:".length()));
         } else if (versionKey.startsWith("hot-strike:")) {
             hotStrikes.remove(versionKey.substring("hot-strike:".length()));
+        } else if (versionKey.startsWith("es-gex:")) {
+            esGex.remove(versionKey.substring("es-gex:".length()));
         } else if (versionKey.startsWith("max-pain:")) {
             maxPain.remove(versionKey.substring("max-pain:".length()));
         } else if (versionKey.startsWith("option-price-behavior:")) {
@@ -4039,6 +4079,30 @@ public class FeedGatewayService implements ReplayRunner {
      * producer-side key drift. Source is prepended by updateCache so the resulting cache key matches
      * the UI contract (DATABENTO|symbol|expiry).
      */
+    /** ES-on-SPX aligned book cache key: {@code symbol|expiry} (the TARGET SPX chain the align service stamps). */
+    private String esGexCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            if (!symbol.isBlank() && !expiry.isBlank()) {
+                return symbol + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to the Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    /** Aligned book payload event time (emitEventTimeMs); -1 when absent/unparseable (fail-closed). */
+    private long esGexTimestamp(String json) {
+        try {
+            return longField(mapper.readTree(json), "emitEventTimeMs", -1L);
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
+    }
+
     private String maxPainCacheKey(String json, String fallback) {
         try {
             JsonNode root = mapper.readTree(json);
@@ -4605,6 +4669,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "gex-magnet", gexMagnet);
+        replayCacheMap(session, "es-gex", esGex);
         // strike-cluster (dashboard + recent-signals trail): broadcast is unconditional live, so the
         // replay is unconditional too — the client symbol-filters (fail-closed). Without this a
         // refreshed page shows an EMPTY trail until the next dashboard interval (§9b).
@@ -4676,6 +4741,7 @@ public class FeedGatewayService implements ReplayRunner {
     private boolean requiresFreshPerSessionReplay(String event) {
         return "strike-sr".equals(event)
                 || "gex-magnet".equals(event)
+                || "es-gex".equals(event)
                 || "liquidity-heatmap".equals(event)
                 || "mission-pace".equals(event)
                 || "mission-control".equals(event)
@@ -4902,6 +4968,9 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics.put(settings.missionControlTopic(), "mission-control");
                 stringTopics.put(settings.spreadSkewTopic(), "spread-skew");
                 stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
+                if (settings.esGexEnabled()) {
+                    stringTopics.put(settings.esGexSpxAlignedTopic(), "es-gex");
+                }
             } else {
                 avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
                 avroTopics.put(settings.ibkrPaceTopic(), "pace");
@@ -5674,6 +5743,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "gex-by-strike" -> pendingGexByStrike;
             case "strike-sr" -> pendingStrikeSr;
             case "gex-magnet" -> pendingGexMagnet;
+            case "es-gex" -> pendingEsGex;
             case "max-pain" -> pendingMaxPain;
             case "option-price-behavior" -> pendingOptionPriceBehaviors;
             case "opb-v2-by-option" -> pendingOpbV2ByOptions;
@@ -5734,7 +5804,8 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingHpsfMarketFlows.values()),
                         new ArrayList<>(pendingHpsfTopCandidates.values()),
                         new ArrayList<>(pendingHpsfAudits.values()),
-                        new ArrayList<>(pendingHpsfExitIntents.values())
+                        new ArrayList<>(pendingHpsfExitIntents.values()),
+                        new ArrayList<>(pendingEsGex.values())
                 );
                 clearPendingLocked();
             }
@@ -5775,6 +5846,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingGexByStrike.size()
                 + pendingStrikeSr.size()
                 + pendingGexMagnet.size()
+                + pendingEsGex.size()
                 + pendingMaxPain.size()
                 + pendingOptionPriceBehaviors.size()
                 + pendingOpbV2ByOptions.size()
@@ -5805,6 +5877,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingGexByStrike.clear();
         pendingStrikeSr.clear();
         pendingGexMagnet.clear();
+        pendingEsGex.clear();
         pendingMaxPain.clear();
         pendingOptionPriceBehaviors.clear();
         pendingOpbV2ByOptions.clear();
@@ -5840,6 +5913,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> gexByStrikeJsons = new ArrayList<>();
         List<String> strikeSrJsons = new ArrayList<>();
         List<String> gexMagnetJsons = new ArrayList<>();
+        List<String> esGexJsons = new ArrayList<>();
         List<String> maxPainJsons = new ArrayList<>();
         List<String> optionPriceBehaviorJsons = new ArrayList<>();
         List<String> opbV2ByOptionJsons = new ArrayList<>();
@@ -5869,6 +5943,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
                 case "strike-sr" -> strikeSrJsons.add(cachedEvent.json());
                 case "gex-magnet" -> gexMagnetJsons.add(cachedEvent.json());
+                case "es-gex" -> esGexJsons.add(cachedEvent.json());
                 case "max-pain" -> maxPainJsons.add(cachedEvent.json());
                 case "option-price-behavior" -> optionPriceBehaviorJsons.add(cachedEvent.json());
                 case "opb-v2-by-option" -> opbV2ByOptionJsons.add(cachedEvent.json());
@@ -5910,7 +5985,8 @@ public class FeedGatewayService implements ReplayRunner {
                 hpsfMarketFlowJsons,
                 hpsfTopCandidatesJsons,
                 hpsfAuditJsons,
-                hpsfExitIntentJsons
+                hpsfExitIntentJsons,
+                esGexJsons
         );
     }
 
@@ -5941,7 +6017,8 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> hpsfMarketFlowJsons,
             List<String> hpsfTopCandidatesJsons,
             List<String> hpsfAuditJsons,
-            List<String> hpsfExitIntentJsons
+            List<String> hpsfExitIntentJsons,
+            List<String> esGexJsons
     ) {
         ActiveSelection selection = activeSelection.get();
         return "{"
@@ -5971,6 +6048,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
                 + "\"strikeSr\":" + jsonArray(strikeSrJsons) + ","
                 + "\"gexMagnets\":" + jsonArray(gexMagnetJsons) + ","
+                + "\"esGex\":" + jsonArray(esGexJsons) + ","
                 + "\"maxPains\":" + jsonArray(maxPainJsons) + ","
                 + "\"optionPriceBehaviors\":" + jsonArray(optionPriceBehaviorJsons) + ","
                 + "\"opbV2ByOptions\":" + jsonArray(opbV2ByOptionJsons) + ","
