@@ -1619,12 +1619,12 @@ public class FeedGatewayService implements ReplayRunner {
                             continue;
                         }
                         String hotSymbol = record.key() == null ? "" : String.valueOf(record.key());
-                        hotStrikes.put(hotSymbol, hotRaw);
-                        cacheEventTimes.put("hot-strike:" + hotSymbol,
+                        if (cacheHotStrike(hotSymbol, hotRaw,
                                 record.timestamp() > 0 ? record.timestamp()
-                                        : System.currentTimeMillis());
-                        broadcast(binding.event(), hotRaw);
-                        forwardedEvents.incrementAndGet();
+                                        : System.currentTimeMillis())) {
+                            broadcast(binding.event(), hotRaw);
+                            forwardedEvents.incrementAndGet();
+                        }
                         continue;
                     }
                     if ("spread-skew-event".equals(binding.event())) {
@@ -2601,8 +2601,7 @@ public class FeedGatewayService implements ReplayRunner {
             Object rawValue = record.value();
             String hotRaw = rawValue == null ? null : String.valueOf(rawValue);
             if (hotRaw != null && !hotRaw.isBlank()) {
-                hotStrikes.put(key, hotRaw);
-                cacheEventTimes.put("hot-strike:" + key,
+                cacheHotStrike(key, hotRaw,
                         record.timestamp() > 0 ? record.timestamp()
                                 : System.currentTimeMillis());
             }
@@ -4049,6 +4048,23 @@ public class FeedGatewayService implements ReplayRunner {
      * Sent STANDALONE (its own message.type), never batched — mirrors the standalone live delivery.
      * dealerLedgers holds only fresh, non-evicted envelopes, so no extra freshness gate is needed here.
      */
+    /**
+     * §4.4 cache write, MONOTONIC and ATOMIC: the live and bootstrap consumers run
+     * concurrently, so the value map and its timestamp are updated together under
+     * one lock and an OLDER record can never displace a newer one — replay after a
+     * consumer race stays current.
+     * @return true when the incoming record won (caller broadcasts only then).
+     */
+    private synchronized boolean cacheHotStrike(String symbol, String raw, long timestampMs) {
+        Long existing = cacheEventTimes.get("hot-strike:" + symbol);
+        if (existing != null && existing > timestampMs) {
+            return false;   // stale: a newer record is already cached
+        }
+        hotStrikes.put(symbol, raw);
+        cacheEventTimes.put("hot-strike:" + symbol, timestampMs);
+        return true;
+    }
+
     /**
      * §4.4: replay the fresh cached hot-strike envelope(s) — client symbol-filters —
      * gated by the 12h session window so a long-running gateway never resends

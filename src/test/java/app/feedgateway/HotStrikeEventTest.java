@@ -61,6 +61,21 @@ class HotStrikeEventTest {
     }
 
     @Test
+    void cacheWriteIsMonotonicAcrossConsumers() throws Exception {
+        FeedGatewayService service = service();
+        Method cacheHotStrike = FeedGatewayService.class.getDeclaredMethod("cacheHotStrike",
+                String.class, String.class, long.class);
+        cacheHotStrike.setAccessible(true);
+        assertEquals(Boolean.TRUE,
+                cacheHotStrike.invoke(service, "SPX", "{\"row\":\"newer\"}", 2_000L));
+        assertEquals(Boolean.FALSE,
+                cacheHotStrike.invoke(service, "SPX", "{\"row\":\"older\"}", 1_000L));
+        assertEquals("{\"row\":\"newer\"}", hotStrikes(service).get("SPX"));
+        assertEquals(Boolean.TRUE,
+                cacheHotStrike.invoke(service, "SPX", "{\"row\":\"same\"}", 2_000L));
+    }
+
+    @Test
     void expiredHotStrikeIsPurgedByTheSessionWindow() throws Exception {
         FeedGatewayService service = service();
         Field cacheTimes = FeedGatewayService.class.getDeclaredField("cacheEventTimes");
