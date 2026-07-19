@@ -880,7 +880,11 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"strikeSr\":" + strikeSr.size() + ","
                 + "\"gexMagnet\":" + gexMagnet.size() + ","
-                + "\"esGex\":" + esGex.size() + ","
+                // ES-on-SPX aligned cache. On environments where the feature is OFF (e.g. the ES
+                // env: GATEWAY_ES_GEX_ENABLED unset -> no consumer), a bare 0 here reads like a
+                // data fault. Report "disabled" + an explicit flag instead of a misleading count.
+                + "\"esGexEnabled\":" + settings.esGexEnabled() + ","
+                + "\"esGex\":" + (settings.esGexEnabled() ? String.valueOf(esGex.size()) : "\"disabled\"") + ","
                 + "\"maxPain\":" + maxPain.size() + ","
                 + "\"optionPriceBehaviors\":" + optionPriceBehaviors.size() + ","
                 + "\"opbV2ByOptions\":" + opbV2ByOptions.size() + ","
@@ -995,9 +999,11 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_gex_magnet Cached per-(symbol,expiry) gex-magnet count.\n"
                 + "# TYPE options_edge_feed_gateway_gex_magnet gauge\n"
                 + "options_edge_feed_gateway_gex_magnet " + gexMagnet.size() + "\n"
-                + "# HELP options_edge_feed_gateway_es_gex Cached per-(symbol,expiry) ES-on-SPX aligned book count.\n"
-                + "# TYPE options_edge_feed_gateway_es_gex gauge\n"
-                + "options_edge_feed_gateway_es_gex " + esGex.size() + "\n"
+                + (settings.esGexEnabled()
+                        ? "# HELP options_edge_feed_gateway_es_gex Cached per-(symbol,expiry) ES-on-SPX aligned book count.\n"
+                          + "# TYPE options_edge_feed_gateway_es_gex gauge\n"
+                          + "options_edge_feed_gateway_es_gex " + esGex.size() + "\n"
+                        : "")
                 + "# HELP options_edge_feed_gateway_max_pain Cached per-(symbol,expiry) max-pain count.\n"
                 + "# TYPE options_edge_feed_gateway_max_pain gauge\n"
                 + "options_edge_feed_gateway_max_pain " + maxPain.size() + "\n"
