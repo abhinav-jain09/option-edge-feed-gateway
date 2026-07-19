@@ -1617,6 +1617,9 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                         String hotSymbol = record.key() == null ? "" : String.valueOf(record.key());
                         hotStrikes.put(hotSymbol, hotRaw);
+                        cacheEventTimes.put("hot-strike:" + hotSymbol,
+                                record.timestamp() > 0 ? record.timestamp()
+                                        : System.currentTimeMillis());
                         broadcast(binding.event(), hotRaw);
                         forwardedEvents.incrementAndGet();
                         continue;
@@ -2596,6 +2599,9 @@ public class FeedGatewayService implements ReplayRunner {
             String hotRaw = rawValue == null ? null : String.valueOf(rawValue);
             if (hotRaw != null && !hotRaw.isBlank()) {
                 hotStrikes.put(key, hotRaw);
+                cacheEventTimes.put("hot-strike:" + key,
+                        record.timestamp() > 0 ? record.timestamp()
+                                : System.currentTimeMillis());
             }
             return key;
         }
@@ -3725,6 +3731,8 @@ public class FeedGatewayService implements ReplayRunner {
             strikeSr.remove(versionKey.substring("strike-sr:".length()));
         } else if (versionKey.startsWith("gex-magnet:")) {
             gexMagnet.remove(versionKey.substring("gex-magnet:".length()));
+        } else if (versionKey.startsWith("hot-strike:")) {
+            hotStrikes.remove(versionKey.substring("hot-strike:".length()));
         } else if (versionKey.startsWith("max-pain:")) {
             maxPain.remove(versionKey.substring("max-pain:".length()));
         } else if (versionKey.startsWith("option-price-behavior:")) {
@@ -4463,11 +4471,14 @@ public class FeedGatewayService implements ReplayRunner {
                 send(session, "strike-cluster", clusterJson);
             }
         }
-        // hot-strike: same unconditional idiom — the client symbol-filters; without this a
-        // refreshed page loses the gold mark until the next (hourly) recompute (§4.4).
-        for (String hotJson : hotStrikes.values()) {
-            if (hotJson != null && !hotJson.isBlank()) {
-                send(session, "hot-strike", hotJson);
+        // hot-strike: replay like strike-cluster (client symbol-filters) but gated by the
+        // 12h session freshness window — a long-running gateway must never resend
+        // yesterday's row (§4.4 display-staleness contract).
+        long hotNowMs = System.currentTimeMillis();
+        for (Map.Entry<String, String> hotEntry : hotStrikes.entrySet()) {
+            if (hotEntry.getValue() != null && !hotEntry.getValue().isBlank()
+                    && isCacheFresh("hot-strike:" + hotEntry.getKey(), hotNowMs)) {
+                send(session, "hot-strike", hotEntry.getValue());
             }
         }
         // liquidity-heatmap replays WITH the freshness gate below (5s TTL): only a live-fresh

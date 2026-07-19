@@ -61,6 +61,24 @@ class HotStrikeEventTest {
     }
 
     @Test
+    void expiredHotStrikeIsPurgedByTheSessionWindow() throws Exception {
+        FeedGatewayService service = service();
+        Field cacheTimes = FeedGatewayService.class.getDeclaredField("cacheEventTimes");
+        cacheTimes.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, Long> times = (Map<String, Long>) cacheTimes.get(service);
+        hotStrikes(service).put("SPX", "{\"schemaVersion\":1,\"row\":{}}");
+        // yesterday's row: older than the 12h session window
+        times.put("hot-strike:SPX", System.currentTimeMillis() - 24L * 3600_000);
+        Method purge = FeedGatewayService.class.getDeclaredMethod("purgeExpiredCache",
+                long.class);
+        purge.setAccessible(true);
+        purge.invoke(service, System.currentTimeMillis());
+        assertTrue(hotStrikes(service).isEmpty(),
+                "a stale hot-strike must be evicted, never replayed indefinitely");
+    }
+
+    @Test
     void sourceContractsArePinned() throws Exception {
         String source = Files.readString(Path.of(
                 "src/main/java/app/feedgateway/FeedGatewayService.java"));
@@ -72,9 +90,9 @@ class HotStrikeEventTest {
         assertTrue(source.contains(
                 "String hotRaw = avro ? avroJson(record.value()) : stringJson(record.value());"),
                 "live branch must broadcast the raw record value (verbatim, §4.4)");
-        // unconditional replay-on-connect (strike-cluster idiom)
-        assertTrue(source.contains("for (String hotJson : hotStrikes.values())"),
-                "hot-strike must replay unconditionally on connect");
+        // freshness-gated replay-on-connect (12h session window)
+        assertTrue(source.contains("isCacheFresh(\"hot-strike:\" + hotEntry.getKey(), hotNowMs)"),
+                "hot-strike replay must be gated by the session freshness window");
         // session-length cache window + seek-back
         assertTrue(source.contains(
                 "return CachePolicy.expiring(settings.hotStrikeTtlMs());"),
