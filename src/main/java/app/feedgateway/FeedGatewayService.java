@@ -1606,13 +1606,18 @@ public class FeedGatewayService implements ReplayRunner {
                         continue;
                     }
                     if ("hot-strike".equals(binding.event())) {
-                        // Hot Strike of the Day envelope, symbol-keyed. Broadcast STANDALONE to
-                        // every client (never selection-gated) and cached per symbol so a fresh
-                        // page repaints the gold mark instantly; the client keeps the newest row
-                        // (SPX_NATIVE preferred over ES_MAPPED at equal trading date, §4.4).
+                        // Hot Strike of the Day envelope, symbol-keyed. §4.4 demands the payload
+                        // VERBATIM — cache and broadcast the RAW record value, never the
+                        // enrichJson reserialization. Broadcast STANDALONE to every client
+                        // (never selection-gated); the client keeps the newest row (SPX_NATIVE
+                        // preferred over ES_MAPPED at equal trading date).
+                        String hotRaw = avro ? avroJson(record.value()) : stringJson(record.value());
+                        if (hotRaw == null || hotRaw.isBlank()) {
+                            continue;
+                        }
                         String hotSymbol = record.key() == null ? "" : String.valueOf(record.key());
-                        hotStrikes.put(hotSymbol, json);
-                        broadcast(binding.event(), json);
+                        hotStrikes.put(hotSymbol, hotRaw);
+                        broadcast(binding.event(), hotRaw);
                         forwardedEvents.incrementAndGet();
                         continue;
                     }
@@ -2584,6 +2589,16 @@ public class FeedGatewayService implements ReplayRunner {
         String key = record.key() == null || record.key().isBlank()
                 ? record.topic() + ":" + record.partition()
                 : record.key();
+        if ("hot-strike".equals(event)) {
+            // Restart bootstrap path (cache consumer): same §4.4 VERBATIM contract as the
+            // live branch — store the RAW record value, keyed by symbol, last-value-wins.
+            Object rawValue = record.value();
+            String hotRaw = rawValue == null ? null : String.valueOf(rawValue);
+            if (hotRaw != null && !hotRaw.isBlank()) {
+                hotStrikes.put(key, hotRaw);
+            }
+            return key;
+        }
         if ("pace".equals(event)) {
             key = paceCacheKey(json, key);
         } else if ("directional-pressure".equals(event)) {
@@ -3365,6 +3380,12 @@ public class FeedGatewayService implements ReplayRunner {
     private CachePolicy cachePolicyFor(String event, long nowMs) {
         if ("max-pain".equals(event)) {
             return CachePolicy.expiring(settings.maxPainTtlMs());
+        }
+        if ("hot-strike".equals(event)) {
+            // The day's hot-strike row stays valid for the whole session (recompute is
+            // hourly): 12h window + matching seek-back so a restarted gateway
+            // re-bootstraps the CURRENT row instead of waiting for the next compute.
+            return CachePolicy.expiring(settings.hotStrikeTtlMs());
         }
         if ("short-premium-recommendation".equals(event)) {
             // A recommendation is emitted once at entry and stays valid for the whole 0DTE session:

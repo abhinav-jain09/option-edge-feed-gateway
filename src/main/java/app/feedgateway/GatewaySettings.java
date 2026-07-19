@@ -297,6 +297,16 @@ public final class GatewaySettings {
     }
 
     /**
+     * Hot-strike cache/seek window (default 12h — the max-pain/es-open-direction
+     * session class): the day's row stays valid all session and the matching
+     * seek-back re-bootstraps it after a gateway restart. Never the generic 15-min
+     * TTL — an hourly recompute cadence would leave restarts empty-handed.
+     */
+    public long hotStrikeTtlMs() {
+        return longValue("GATEWAY_HOT_STRIKE_TTL_MS", 43_200_000L, 60_000L);
+    }
+
+    /**
      * Per-strike strike-invasion topic (JSON {@code StrikeInvasionSnapshot}, one record per
      * {@code symbol|strike} — SPX-only, so there is NO expiry). Broadcast as event
      * {@code "strike-invasion"}. Mirrors the strike-intel topic getter.
