@@ -119,7 +119,7 @@ public class PinFlowController {
         LocalDate date;
         try {
             date = dateRaw == null || dateRaw.isBlank()
-                    ? clock.instant().atZone(store.zone()).toLocalDate()
+                    ? currentSessionDate()
                     : LocalDate.parse(dateRaw, STRICT_ISO); // strict → impossible dates throw
         } catch (DateTimeParseException bad) {
             deferred.setResult(badRequest("date must be a real yyyy-MM-dd"));
@@ -220,6 +220,21 @@ public class PinFlowController {
         for (Integer v : values) {
             node.add(v.intValue());
         }
+    }
+
+    /**
+     * The date whose SESSION is currently in progress. For a same-day session (SPX 09:30 → 16:01) that
+     * is simply today. For a MIDNIGHT-SPANNING session (ES 18:00 → 17:00 next day) the live session
+     * started YESTERDAY whenever the clock is still before the start time — without this the default
+     * date would point at a session that has not begun yet and the endpoint returned an empty payload.
+     */
+    private LocalDate currentSessionDate() {
+        java.time.ZonedDateTime now = clock.instant().atZone(store.zone());
+        LocalDate today = now.toLocalDate();
+        if (store.sessionSpansMidnight() && now.toLocalTime().isBefore(store.sessionStart())) {
+            return today.minusDays(1);
+        }
+        return today;
     }
 
     private static Integer parseIntOrNull(String raw) {
