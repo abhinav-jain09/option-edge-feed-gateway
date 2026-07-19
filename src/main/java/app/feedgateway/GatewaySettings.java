@@ -424,6 +424,33 @@ public final class GatewaySettings {
         return firstNonBlank(value("pinflow.postgres.password", ""), value("POSTGRES_PASSWORD", ""));
     }
 
+    /**
+     * Pin-flow session window start/end (local time in {@link #pinFlowZone()}). Defaults preserve the
+     * SPX cash session (09:30 → 16:01 ET). When END <= START the session SPANS MIDNIGHT — e.g. ES on
+     * es4 trades 18:00 ET → 17:00 ET the next day; the store then reads [date START, date+1 END).
+     * Without this the window was hardcoded to the SPX cash session and the Flow Explorer could never
+     * see ES's evening/overnight session (its main trading hours) — it returned an empty payload.
+     */
+    public java.time.LocalTime pinFlowSessionStart() {
+        return parseSessionTime("PIN_FLOW_SESSION_START", java.time.LocalTime.of(9, 30));
+    }
+
+    public java.time.LocalTime pinFlowSessionEnd() {
+        return parseSessionTime("PIN_FLOW_SESSION_END", java.time.LocalTime.of(16, 1));
+    }
+
+    private java.time.LocalTime parseSessionTime(String key, java.time.LocalTime fallback) {
+        String raw = value(key, "");
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        try {
+            return java.time.LocalTime.parse(raw.trim());
+        } catch (RuntimeException bad) {
+            return fallback; // malformed config must never break the endpoint
+        }
+    }
+
     /** Session/label timezone (§5.1 rule 1). */
     public ZoneId pinFlowZone() {
         try {

@@ -57,6 +57,8 @@ public final class PinFlowStore {
 
     private final DataSource dataSource; // null → DB not configured
     private final ZoneId zone;
+    private final java.time.LocalTime sessionStart;
+    private final java.time.LocalTime sessionEnd;
     private final int queryTimeoutSeconds;
     private final long cacheTtlMs;
     // Atomic per-key coalescing: the first caller for a (date,lo,hi) installs a future and runs the DB
@@ -66,14 +68,25 @@ public final class PinFlowStore {
     public PinFlowStore(GatewaySettings settings, DataSource dataSource) {
         this.dataSource = dataSource;
         this.zone = settings.pinFlowZone();
+        this.sessionStart = settings.pinFlowSessionStart();
+        this.sessionEnd = settings.pinFlowSessionEnd();
         this.queryTimeoutSeconds = settings.pinFlowQueryTimeoutSeconds();
         this.cacheTtlMs = settings.pinFlowCacheTtlMs();
     }
 
     /** Test seam: explicit datasource + params, no Spring settings. */
     PinFlowStore(DataSource dataSource, ZoneId zone, int queryTimeoutSeconds, long cacheTtlMs) {
+        this(dataSource, zone, java.time.LocalTime.of(9, 30), java.time.LocalTime.of(16, 1),
+                queryTimeoutSeconds, cacheTtlMs);
+    }
+
+    /** Test seam with an explicit session window (covers midnight-spanning sessions like ES). */
+    PinFlowStore(DataSource dataSource, ZoneId zone, java.time.LocalTime sessionStart,
+                 java.time.LocalTime sessionEnd, int queryTimeoutSeconds, long cacheTtlMs) {
         this.dataSource = dataSource;
         this.zone = zone;
+        this.sessionStart = sessionStart;
+        this.sessionEnd = sessionEnd;
         this.queryTimeoutSeconds = queryTimeoutSeconds;
         this.cacheTtlMs = cacheTtlMs;
     }
@@ -84,6 +97,16 @@ public final class PinFlowStore {
 
     public ZoneId zone() {
         return zone;
+    }
+
+    /** Session window start (local time in {@link #zone()}). */
+    public java.time.LocalTime sessionStart() {
+        return sessionStart;
+    }
+
+    /** True when the session crosses midnight (end <= start), e.g. ES 18:00 → 17:00. */
+    public boolean sessionSpansMidnight() {
+        return !sessionEnd.isAfter(sessionStart);
     }
 
     private record CacheEntry(long builtAtMs, java.util.concurrent.CompletableFuture<PinFlowResponse> future) {
@@ -186,9 +209,14 @@ public final class PinFlowStore {
     }
 
     private PinFlowResponse readAndAggregate(LocalDate date, int lo, int hi) {
-        // §5.1 rule 2: session window [date 09:30 ET, date 16:01 ET) as an instant range.
-        ZonedDateTime start = date.atTime(9, 30).atZone(zone);
-        ZonedDateTime end = date.atTime(16, 1).atZone(zone);
+        // §5.1 rule 2: session window as an instant range. The window is CONFIGURABLE (defaults to the
+        // SPX cash session 09:30 → 16:01 ET). When end <= start the session SPANS MIDNIGHT (e.g. ES:
+        // 18:00 ET → 17:00 ET next day), so the end rolls to date+1 — otherwise the range would be
+        // empty/inverted and the Explorer would show nothing for ES's overnight session.
+        ZonedDateTime start = date.atTime(sessionStart).atZone(zone);
+        ZonedDateTime end = sessionEnd.isAfter(sessionStart)
+                ? date.atTime(sessionEnd).atZone(zone)
+                : date.plusDays(1).atTime(sessionEnd).atZone(zone);
         Timestamp startTs = Timestamp.from(start.toInstant());
         Timestamp endTs = Timestamp.from(end.toInstant());
         // §5.2: widened gamma band for lead, bounded.
