@@ -117,6 +117,67 @@ class FeedGatewayServiceTest {
         assertFalse(isOptionalTopic(service, settings.databentoStrikeFlowTopic()));
     }
 
+    // ----- 0DTE binary direction / unusual-movement option-chain tint -----------------------------
+
+    @Test
+    void zeroDteIntelligenceTopicIsOptionalAndUsesShortControlSignalTtl() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("options.spx.0dte.intelligence.current", settings.zeroDteIntelligenceTopic());
+        assertTrue(isOptionalTopic(service, settings.zeroDteIntelligenceTopic()),
+                "a staged producer rollout must not starve the shared JSON consumer");
+        assertEquals(15_000L, settings.zeroDteIntelligenceTtlMs());
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, "zero-dte-intelligence", now - 14_999L, now));
+        assertTrue(isExpired(service, "zero-dte-intelligence", now - 15_001L, now),
+                "an old decision must return the full chain to neutral");
+    }
+
+    @Test
+    void zeroDteIntelligenceUsesPayloadDecisionTimeAndSourceSymbolSessionKey() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long decisionTime = System.currentTimeMillis() - 1_000L;
+        String payload = "{\"symbol\":\"SPX\",\"sessionDate\":\"2026-07-19\","
+                + "\"asOfEventTimeMs\":" + decisionTime + ",\"marketDirection\":\"DOWN\","
+                + "\"intensity\":\"UNUSUAL\",\"qualityStatus\":\"GOOD\",\"actionable\":true}";
+        ConsumerRecord<String, String> record = recordAt(
+                settings.zeroDteIntelligenceTopic(), 0, 1L, "ignored", payload, System.currentTimeMillis());
+
+        assertEquals(decisionTime, eventCacheTimestamp(service, "zero-dte-intelligence", record),
+                "fresh Kafka arrival must not disguise a historical decision");
+        assertEquals("DATABENTO|SPX|20260719",
+                updateCache(service, topicBinding("DATABENTO", "zero-dte-intelligence"), record, payload));
+    }
+
+    @Test
+    void zeroDteIntelligenceReplaySendsOnlyFreshStandaloneState() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String fresh = "{\"symbol\":\"SPX\",\"sessionDate\":\"2026-07-19\","
+                + "\"asOfEventTimeMs\":" + (now - 1_000L) + ",\"marketDirection\":\"UP\","
+                + "\"intensity\":\"UNUSUAL\",\"unusualTriggers\":[\"CALL_BUY_BURST\"]}";
+        updateCache(service, topicBinding("DATABENTO", "zero-dte-intelligence"),
+                recordAt(settings.zeroDteIntelligenceTopic(), 0, 1L, "SPX|2026-07-19", fresh, now), fresh);
+
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod(
+                "replayZeroDteIntelligenceCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+
+        assertEquals(1, sink.size());
+        assertTrue(sink.get(0).contains("\"type\":\"zero-dte-intelligence\""));
+        assertTrue(sink.get(0).contains("\"marketDirection\":\"UP\""));
+
+        String stale = "{\"symbol\":\"SPX\",\"sessionDate\":\"2026-07-20\","
+                + "\"asOfEventTimeMs\":" + (now - 60_000L) + ",\"marketDirection\":\"DOWN\"}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "zero-dte-intelligence"),
+                recordAt(settings.zeroDteIntelligenceTopic(), 0, 2L, "SPX|2026-07-20", stale, now), stale),
+                "historical snapshot/replay records must fail closed at ingest");
+    }
+
     // ----- delta-flow gateway consumer (per-strike DeltaFlowStrikeSnapshot) -----------------------
 
     @Test

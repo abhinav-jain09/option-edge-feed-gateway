@@ -241,6 +241,20 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_DIRECTIONAL_PRESSURE_TOPIC", "options.databento.directional-pressure");
     }
 
+    /**
+     * Current binary SPX direction from zero-dte-intelligence-engine (JSON, key = symbol|sessionDate).
+     * Forwarded as standalone websocket event {@code zero-dte-intelligence}; optional until the new
+     * producer is deployed.
+     */
+    public String zeroDteIntelligenceTopic() {
+        return value("KAFKA_ZERO_DTE_INTELLIGENCE_TOPIC", "options.spx.0dte.intelligence.current");
+    }
+
+    /** Short freshness window for the live chain tint; a dead producer must return the UI to neutral. */
+    public long zeroDteIntelligenceTtlMs() {
+        return longValue("GATEWAY_ZERO_DTE_INTELLIGENCE_TTL_MS", 15_000L, 0L);
+    }
+
     public String databentoStrikeFlowTopic() {
         return value("KAFKA_DATABENTO_STRIKE_FLOW_TOPIC", "options.databento.strike-flow");
     }
