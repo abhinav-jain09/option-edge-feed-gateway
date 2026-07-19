@@ -59,7 +59,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "max-pain"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -205,6 +205,49 @@ class FeedGatewayServiceTest {
         assertEquals("DATABENTO|SPX|20260622|6005", key,
                 "updateCache must prepend the source to the delta-flow cache key");
         assertTrue(service.healthJson().contains("\"deltaFlows\":1"), "delta-flow must be cached");
+    }
+
+    // ----- es-gex (ES-on-SPX aligned whole-book, JSON, roll-forward) ------------------------------------
+
+    private static String esGexBook(long emitEventTimeMs) {
+        return "{\"recordType\":\"book\",\"source\":\"ES_ON_SPX\",\"symbol\":\"SPX\",\"expiry\":\"20260622\","
+                + "\"settlementType\":\"PM\",\"basisState\":\"MEASURED\",\"basis\":40,\"basisMeasuredAtMs\":" + emitEventTimeMs
+                + ",\"emitEventTimeMs\":" + emitEventTimeMs + ",\"dataEventTimeMs\":" + emitEventTimeMs
+                + ",\"upstreamHeartbeatEventMs\":" + emitEventTimeMs + ",\"upstreamHealth\":\"OK\","
+                + "\"buckets\":[{\"spxStrike\":5580,\"esNetGexSum\":-123456,\"contributorCount\":1,\"truncated\":false,"
+                + "\"contributors\":[{\"esStrike\":5620,\"netGex\":-123456}]}]}";
+    }
+
+    @Test
+    void cachedReplayIncludesFreshEsGexForMatchingSpxSelectionOnly() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = esGexBook(now);
+        updateCache(service, topicBinding("DATABENTO", "es-gex"),
+                recordAt(settings.esGexSpxAlignedTopic(), 0, 1L, "SPX|20260622", json, now), json);
+
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        assertEquals(1, cachedEvents(service, List.of("es-gex"), now).size(),
+                "a fresh ES-on-SPX book replays to a matching SPX DATABENTO client");
+
+        setActiveSelection(service, "DATABENTO", "SPY", "20260622");
+        assertTrue(cachedEvents(service, List.of("es-gex"), now).isEmpty(),
+                "a different symbol must not receive this book");
+    }
+
+    @Test
+    void staleEsGexBookUsesPayloadEmitTimeNotArrival() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        long staleEmit = now - 13L * 3600_000L; // older than the 12h book window
+        String json = esGexBook(staleEmit);
+        updateCache(service, topicBinding("DATABENTO", "es-gex"),
+                recordAt(settings.esGexSpxAlignedTopic(), 0, 1L, "SPX|20260622", json, now), json);
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        assertTrue(cachedEvents(service, List.of("es-gex"), now).isEmpty(),
+                "a stale (old emitEventTimeMs) book must not replay — roll-forward freshness uses payload time");
     }
 
     @Test
@@ -2610,7 +2653,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2739,7 +2782,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                liquidityHeatmaps, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                liquidityHeatmaps, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2749,7 +2792,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2759,7 +2802,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), gexMagnet, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), gexMagnet, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2769,7 +2812,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeInvasions, List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2779,7 +2822,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2792,7 +2835,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2802,7 +2845,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2ByOptions, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2ByOptions, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2812,7 +2855,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2Sessions, List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2Sessions, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2822,7 +2865,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), missionPaces, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), missionPaces, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2832,7 +2875,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), missionControls, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), missionControls, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2842,7 +2885,7 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), spreadSkews, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), spreadSkews, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2860,7 +2903,7 @@ class FeedGatewayServiceTest {
                 // positional args: snapshots, paces, paceRanks, directionalPressures, strikeFlows,
                 // deltaFlows, then the remaining latest-state lists — pass empty except strikeFlows.
                 List.of(), List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2871,7 +2914,7 @@ class FeedGatewayServiceTest {
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class
+                List.class, List.class
         );
     }
 }
