@@ -55,6 +55,10 @@ public final class PinFlowStore {
                     + "WHERE as_of_minute >= ? AND as_of_minute < ? "
                     + "AND strike >= ? AND strike <= ?";
 
+    private static final String SPOT_RANGE_SQL =
+            "SELECT min(spot), max(spot) FROM pin_strike_minute "
+                    + "WHERE as_of_minute >= ? AND as_of_minute < ? AND spot IS NOT NULL";
+
     private final DataSource dataSource; // null → DB not configured
     private final ZoneId zone;
     private final java.time.LocalTime sessionStart;
@@ -64,6 +68,9 @@ public final class PinFlowStore {
     // Atomic per-key coalescing: the first caller for a (date,lo,hi) installs a future and runs the DB
     // work; concurrent callers for the SAME key await that same future → exactly one DB fetch per key.
     private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
+    // Derived-band cache: the band only needs re-deriving as often as the response itself, so reuse the
+    // same TTL. Without it every request (INCLUDING response-cache hits) paid an extra DB round-trip.
+    private final Map<LocalDate, BandEntry> bandCache = new ConcurrentHashMap<>();
 
     public PinFlowStore(GatewaySettings settings, DataSource dataSource) {
         this.dataSource = dataSource;
@@ -110,6 +117,9 @@ public final class PinFlowStore {
     }
 
     private record CacheEntry(long builtAtMs, java.util.concurrent.CompletableFuture<PinFlowResponse> future) {
+    }
+
+    private record BandEntry(long builtAtMs, int lo, int hi) {
     }
 
     /**
@@ -208,17 +218,91 @@ public final class PinFlowStore {
         }
     }
 
+    /** [start,end) instants for the session on {@code date}, honouring a midnight-spanning window. */
+    private ZonedDateTime[] sessionRange(LocalDate date) {
+        ZonedDateTime start = date.atTime(sessionStart).atZone(zone);
+        ZonedDateTime end = sessionEnd.isAfter(sessionStart)
+                ? date.atTime(sessionEnd).atZone(zone)
+                : date.plusDays(1).atTime(sessionEnd).atZone(zone);
+        return new ZonedDateTime[]{start, end};
+    }
+
+    /**
+     * Strike band derived from the session's ACTUAL spot travel: {@code [min(spot)-margin,
+     * max(spot)+margin]} snapped to the 5-point grid. Returns {@code null} when the DB is absent or the
+     * session has no spot yet, so the caller falls back to the configured defaults.
+     *
+     * <p>Why: the configured default band is a FIXED range (historically 7490..7590). It does not follow
+     * the market, so once spot drifts out of it the Flow Explorer silently shows a sliver of the chain —
+     * on 2026-07-17 prod SPX ran 7435..7497 against a 7490..7590 band, hiding nearly the whole session,
+     * and on ES it hid every put below spot. Deriving the band from spot removes that whole class of bug.
+     */
+    public int[] resolveBandFromSpot(LocalDate date, int marginPts, long nowMs) {
+        if (dataSource == null) {
+            return null;
+        }
+        // Serve from the band cache when fresh — this is what keeps response-cache HITS from paying an
+        // extra DB round-trip just to re-derive a band that has not meaningfully moved.
+        BandEntry cached = bandCache.get(date);
+        if (cached != null && (nowMs - cached.builtAtMs()) < cacheTtlMs) {
+            return new int[]{cached.lo(), cached.hi()};
+        }
+        ZonedDateTime[] range = sessionRange(date);
+        Connection conn;
+        try {
+            conn = dataSource.getConnection();
+        } catch (SQLException e) {
+            return null;
+        }
+        // Same §6.1 cancellation contract as the main read: if the worker is interrupted (deadline /
+        // client disconnect) the watcher cancels this statement and closes the connection promptly
+        // instead of holding a pooled connection for the full statement timeout.
+        java.util.concurrent.atomic.AtomicReference<PreparedStatement> active =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        InterruptWatcher watcher = new InterruptWatcher(Thread.currentThread(), active, conn);
+        watcher.start();
+        try (PreparedStatement ps = conn.prepareStatement(SPOT_RANGE_SQL)) {
+            active.set(ps);
+            ps.setQueryTimeout(queryTimeoutSeconds);
+            ps.setTimestamp(1, Timestamp.from(range[0].toInstant()));
+            ps.setTimestamp(2, Timestamp.from(range[1].toInstant()));
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                java.math.BigDecimal min = rs.getBigDecimal(1);
+                java.math.BigDecimal max = rs.getBigDecimal(2);
+                if (min == null || max == null) {
+                    return null;
+                }
+                int lo = (int) (Math.floor((min.doubleValue() - marginPts) / 5.0) * 5);
+                int hi = (int) (Math.ceil((max.doubleValue() + marginPts) / 5.0) * 5);
+                lo = Math.max(1, lo);
+                hi = Math.max(lo, hi);
+                bandCache.put(date, new BandEntry(nowMs, lo, hi));
+                return new int[]{lo, hi};
+            }
+        } catch (SQLException | RuntimeException ignored) {
+            return null; // never fail the request on band derivation — fall back to the defaults
+        } finally {
+            active.set(null);
+            watcher.stop();
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+                // best-effort; the watcher may have closed it already on cancel.
+            }
+        }
+    }
+
     private PinFlowResponse readAndAggregate(LocalDate date, int lo, int hi) {
         // §5.1 rule 2: session window as an instant range. The window is CONFIGURABLE (defaults to the
         // SPX cash session 09:30 → 16:01 ET). When end <= start the session SPANS MIDNIGHT (e.g. ES:
         // 18:00 ET → 17:00 ET next day), so the end rolls to date+1 — otherwise the range would be
         // empty/inverted and the Explorer would show nothing for ES's overnight session.
-        ZonedDateTime start = date.atTime(sessionStart).atZone(zone);
-        ZonedDateTime end = sessionEnd.isAfter(sessionStart)
-                ? date.atTime(sessionEnd).atZone(zone)
-                : date.plusDays(1).atTime(sessionEnd).atZone(zone);
-        Timestamp startTs = Timestamp.from(start.toInstant());
-        Timestamp endTs = Timestamp.from(end.toInstant());
+        ZonedDateTime[] range = sessionRange(date);
+        Timestamp startTs = Timestamp.from(range[0].toInstant());
+        Timestamp endTs = Timestamp.from(range[1].toInstant());
         // §5.2: widened gamma band for lead, bounded.
         int gexLo = Math.max(100, lo - 100);
         int gexHi = Math.min(100_000, hi + 100);

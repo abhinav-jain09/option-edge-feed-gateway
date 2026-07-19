@@ -59,6 +59,7 @@ public class PinFlowController {
     private final int defaultLo;
     private final int defaultHi;
     private final long deadlineMs;
+    private final int bandMargin;
     private final PinFlowController.RateLimiter rateLimiter;
 
     @org.springframework.beans.factory.annotation.Autowired
@@ -66,13 +67,22 @@ public class PinFlowController {
                              LiquidityHistoryAuth auth, ObjectMapper mapper) {
         this(store, bulkhead, auth, mapper, Clock.systemUTC(),
                 settings.pinFlowStrikeLo(), settings.pinFlowStrikeHi(),
-                settings.pinFlowRequestDeadlineMs(), settings.pinFlowRateLimitPerMin());
+                settings.pinFlowRequestDeadlineMs(), settings.pinFlowRateLimitPerMin(),
+                settings.pinFlowBandMargin());
     }
 
     /** Test seam: injectable clock, band defaults, deadline, rate limit. */
     PinFlowController(PinFlowStore store, PinFlowExecutor bulkhead, LiquidityHistoryAuth auth,
                       ObjectMapper mapper, Clock clock, int defaultLo, int defaultHi,
                       long deadlineMs, int ratePerMinute) {
+        this(store, bulkhead, auth, mapper, clock, defaultLo, defaultHi, deadlineMs, ratePerMinute, 0);
+    }
+
+    /** Test seam with spot-derived band margin (0 = keep the fixed default band). */
+    PinFlowController(PinFlowStore store, PinFlowExecutor bulkhead, LiquidityHistoryAuth auth,
+                      ObjectMapper mapper, Clock clock, int defaultLo, int defaultHi,
+                      long deadlineMs, int ratePerMinute, int bandMargin) {
+        this.bandMargin = bandMargin;
         this.store = store;
         this.bulkhead = bulkhead;
         this.auth = auth;
@@ -133,6 +143,13 @@ public class PinFlowController {
             deferred.setResult(badRequest("lo/hi must be integers"));
             return deferred;
         }
+        // Band: an explicit lo/hi always wins. When BOTH are omitted we DERIVE the band from the session's
+        // actual spot travel (the fixed default does not follow the market: prod SPX ran 7435..7497 against
+        // a 7490..7590 default, hiding nearly the whole session; ES hid every put below spot). The
+        // derivation is a DB read, so it happens on the bulkhead thread below — never here on the MVC
+        // thread — and its result is CLAMPED rather than 400'd, since a server-side default must never be
+        // reported as a caller error.
+        final boolean deriveBand = lo == null && hi == null && bandMargin > 0;
         int loVal = lo == null ? defaultLo : lo;
         int hiVal = hi == null ? defaultHi : hi;
         if (loVal > hiVal) { // §5.1 rule 8: swap if reversed
@@ -154,6 +171,7 @@ public class PinFlowController {
         // ---- §6.1 dispatch onto the dedicated bulkhead; saturation → fast 503. ----
         final int fLo = loVal;
         final int fHi = hiVal;
+        final boolean fDerive = deriveBand;
         final LocalDate fDate = date;
         try {
             // §6.1 retain the Future so the deadline / client-disconnect can CANCEL the in-flight JDBC
@@ -164,7 +182,30 @@ public class PinFlowController {
                     return; // client already gone / deadline elapsed
                 }
                 try {
-                    PinFlowResponse response = store.query(fDate, fLo, fHi, clock.millis());
+                    int qLo = fLo;
+                    int qHi = fHi;
+                    if (fDerive) {
+                        int[] derived = store.resolveBandFromSpot(fDate, bandMargin, clock.millis());
+                        if (derived != null) {
+                            // CLAMP (never 400): these bounds are ours, not the caller's.
+                            int dLo = Math.max(MIN_LO, Math.min(derived[0], MAX_HI));
+                            int dHi = Math.max(MIN_LO, Math.min(derived[1], MAX_HI));
+                            if (dLo > dHi) {
+                                int t = dLo;
+                                dLo = dHi;
+                                dHi = t;
+                            }
+                            if (dHi - dLo > MAX_BAND_WIDTH) {
+                                // Keep it centred on the session's midpoint so we lose the edges, not the money.
+                                int mid = dLo + (dHi - dLo) / 2;
+                                dLo = Math.max(MIN_LO, mid - MAX_BAND_WIDTH / 2);
+                                dHi = Math.min(MAX_HI, dLo + MAX_BAND_WIDTH);
+                            }
+                            qLo = dLo;
+                            qHi = dHi;
+                        }
+                    }
+                    PinFlowResponse response = store.query(fDate, qLo, qHi, clock.millis());
                     // §5.2 defensive cell cap (unreachable given the band cap, but enforced).
                     long cells = (long) response.t().size() * (long) response.k().size();
                     if (cells > MAX_CELLS) {
