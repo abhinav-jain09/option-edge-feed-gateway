@@ -105,6 +105,9 @@ class HotStrikeEventTest {
         assertTrue(source.contains(
                 "String hotRaw = avro ? avroJson(record.value()) : stringJson(record.value());"),
                 "live branch must broadcast the raw record value (verbatim, §4.4)");
+        // reader snapshots under the writer's lock (atomic value/timestamp view)
+        assertTrue(source.contains("// SNAPSHOT under the same lock as cacheHotStrike"),
+                "the replay reader must snapshot atomically vs the synchronized writer");
         // freshness-gated replay-on-connect (12h session window)
         assertTrue(source.contains("isCacheFresh(\"hot-strike:\" + hotEntry.getKey(), hotNowMs)"),
                 "hot-strike replay must be gated by the session freshness window");

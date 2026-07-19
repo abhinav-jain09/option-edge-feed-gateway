@@ -4071,12 +4071,21 @@ public class FeedGatewayService implements ReplayRunner {
      * yesterday's row. Used by BOTH legacy and per-session connect paths.
      */
     private void replayHotStrikeCached(WebSocketSession session) {
+        // SNAPSHOT under the same lock as cacheHotStrike so the value/timestamp pair
+        // is read atomically (a racing writer can never yield a fresh timestamp with
+        // a stale value, or vice versa); sends happen OUTSIDE the lock.
+        List<String> freshEnvelopes = new ArrayList<>();
         long hotNowMs = System.currentTimeMillis();
-        for (Map.Entry<String, String> hotEntry : hotStrikes.entrySet()) {
-            if (hotEntry.getValue() != null && !hotEntry.getValue().isBlank()
-                    && isCacheFresh("hot-strike:" + hotEntry.getKey(), hotNowMs)) {
-                send(session, "hot-strike", hotEntry.getValue());
+        synchronized (this) {
+            for (Map.Entry<String, String> hotEntry : hotStrikes.entrySet()) {
+                if (hotEntry.getValue() != null && !hotEntry.getValue().isBlank()
+                        && isCacheFresh("hot-strike:" + hotEntry.getKey(), hotNowMs)) {
+                    freshEnvelopes.add(hotEntry.getValue());
+                }
             }
+        }
+        for (String envelope : freshEnvelopes) {
+            send(session, "hot-strike", envelope);
         }
     }
 
