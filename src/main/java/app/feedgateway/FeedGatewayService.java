@@ -153,6 +153,10 @@ public class FeedGatewayService implements ReplayRunner {
     // Per-strike strike-intelligence signals, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (StrikeIntelligenceSignal) — lives on the JSON-state consumer.
     private final Map<String, String> strikeIntels = new ConcurrentHashMap<>();
+    // Hot Strike of the Day envelope per symbol ("hot-strike" event): last-value-wins,
+    // replayed on connect so a fresh page gets the day's gold mark immediately (§4.4).
+    // The newest-record / SPX_NATIVE-preference logic is CLIENT-side by design.
+    private final Map<String, String> hotStrikes = new ConcurrentHashMap<>();
     // Per-strike, per-direction strike-invasion signals, keyed by source|symbol|strike|direction
     // (SPX-only — NO expiry; last-value-wins per strike+direction). One strike can legitimately carry
     // BOTH a live UP record (SHORT_CALL_CANDIDATE domain) and a DOWN record (SHORT_PUT_CANDIDATE
@@ -1179,6 +1183,10 @@ public class FeedGatewayService implements ReplayRunner {
         // strike-intelligence-dashboard: per-symbol JSON carrying level-based cluster walls, broadcast as
         // "strike-cluster" STANDALONE (never cached; re-emitted each dashboard interval).
         topicEvents.put(settings.strikeIntelDashboardTopic(), new TopicBinding("DATABENTO", "strike-cluster"));
+        // signal-follower.hot-strike: per-symbol JSON envelope (as-of hot_strike_day
+        // snapshots), broadcast as "hot-strike", cached per symbol + replayed on connect
+        // (the strike-cluster idiom; §4.4 gold mark).
+        topicEvents.put(settings.hotStrikeTopic(), new TopicBinding("DATABENTO", "hot-strike"));
         // strike-invasion is plain JSON (StrikeInvasionSnapshot), per-strike+direction keyed
         // (symbol|strike|direction, SPX-only — NO expiry) — this JSON-state consumer, never the Avro one
         // (mirrors strike-intel).
@@ -1257,6 +1265,7 @@ public class FeedGatewayService implements ReplayRunner {
         // strike-intelligence-dashboard: per-symbol JSON carrying level-based cluster walls, broadcast as
         // "strike-cluster" STANDALONE (never cached; re-emitted each dashboard interval).
         topicEvents.put(settings.strikeIntelDashboardTopic(), new TopicBinding("DATABENTO", "strike-cluster"));
+        topicEvents.put(settings.hotStrikeTopic(), new TopicBinding("DATABENTO", "hot-strike"));
         // strike-invasion is plain JSON, per-strike+direction keyed (symbol|strike|direction, no expiry)
         // — keep the cache + live JSON consumer topic sets symmetric (same rule as strike-intel above).
         topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
@@ -1592,6 +1601,17 @@ public class FeedGatewayService implements ReplayRunner {
                         // next dashboard interval (§9b).
                         String clusterSymbol = record.key() == null ? "" : String.valueOf(record.key());
                         strikeClusters.put(clusterSymbol, json);
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("hot-strike".equals(binding.event())) {
+                        // Hot Strike of the Day envelope, symbol-keyed. Broadcast STANDALONE to
+                        // every client (never selection-gated) and cached per symbol so a fresh
+                        // page repaints the gold mark instantly; the client keeps the newest row
+                        // (SPX_NATIVE preferred over ES_MAPPED at equal trading date, §4.4).
+                        String hotSymbol = record.key() == null ? "" : String.valueOf(record.key());
+                        hotStrikes.put(hotSymbol, json);
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
                         continue;
@@ -4420,6 +4440,13 @@ public class FeedGatewayService implements ReplayRunner {
         for (String clusterJson : strikeClusters.values()) {
             if (clusterJson != null && !clusterJson.isBlank()) {
                 send(session, "strike-cluster", clusterJson);
+            }
+        }
+        // hot-strike: same unconditional idiom — the client symbol-filters; without this a
+        // refreshed page loses the gold mark until the next (hourly) recompute (§4.4).
+        for (String hotJson : hotStrikes.values()) {
+            if (hotJson != null && !hotJson.isBlank()) {
+                send(session, "hot-strike", hotJson);
             }
         }
         // liquidity-heatmap replays WITH the freshness gate below (5s TTL): only a live-fresh
