@@ -219,6 +219,32 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void healthReportsEsGexDisabledNotZeroWhenFeatureOff() throws Exception {
+        // ES environment shape: GATEWAY_ES_GEX_ENABLED unset -> no aligned-topic consumer. A bare
+        // esGex:0 there reads like a data fault (it misled a live prod triage on 2026-07-19);
+        // health must say "disabled" and carry the explicit flag instead.
+        System.clearProperty("GATEWAY_ES_GEX_ENABLED");
+        FeedGatewayService service = service();
+        String health = service.healthJson();
+        assertTrue(health.contains("\"esGexEnabled\":false"), "health must carry the explicit enable flag");
+        assertTrue(health.contains("\"esGex\":\"disabled\""), "disabled env must not report a misleading 0 count");
+        assertFalse(health.contains("\"esGex\":0"), "no bare zero for a feature that is off");
+    }
+
+    @Test
+    void healthReportsEsGexCountWhenFeatureOn() throws Exception {
+        System.setProperty("GATEWAY_ES_GEX_ENABLED", "true");
+        try {
+            FeedGatewayService service = service();
+            String health = service.healthJson();
+            assertTrue(health.contains("\"esGexEnabled\":true"), "flag must reflect the enabled state");
+            assertTrue(health.contains("\"esGex\":0"), "enabled env reports the real (initially 0) cache count");
+        } finally {
+            System.clearProperty("GATEWAY_ES_GEX_ENABLED");
+        }
+    }
+
+    @Test
     void cachedReplayIncludesFreshEsGexForMatchingSpxSelectionOnly() throws Exception {
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
