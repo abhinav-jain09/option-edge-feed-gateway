@@ -285,6 +285,28 @@ public final class GatewaySettings {
     }
 
     /**
+     * Hot Strike of the Day topic from signal-follower-service (JSON envelope
+     * {@code {schemaVersion, row}}, keyed by symbol; as-of snapshots of
+     * {@code hot_strike_day} rows — the table is the source of truth). Broadcast as
+     * event {@code hot-strike}, cached per symbol and replayed on connect so a fresh
+     * page gets the day's gold mark immediately (design §4.4). Unprefixed; default is
+     * the bare {@code signal-follower.hot-strike}.
+     */
+    public String hotStrikeTopic() {
+        return value("GATEWAY_HOT_STRIKE_TOPIC", "signal-follower.hot-strike");
+    }
+
+    /**
+     * Hot-strike cache/seek window (default 12h — the max-pain/es-open-direction
+     * session class): the day's row stays valid all session and the matching
+     * seek-back re-bootstraps it after a gateway restart. Never the generic 15-min
+     * TTL — an hourly recompute cadence would leave restarts empty-handed.
+     */
+    public long hotStrikeTtlMs() {
+        return longValue("GATEWAY_HOT_STRIKE_TTL_MS", 43_200_000L, 60_000L);
+    }
+
+    /**
      * Per-strike strike-invasion topic (JSON {@code StrikeInvasionSnapshot}, one record per
      * {@code symbol|strike} — SPX-only, so there is NO expiry). Broadcast as event
      * {@code "strike-invasion"}. Mirrors the strike-intel topic getter.

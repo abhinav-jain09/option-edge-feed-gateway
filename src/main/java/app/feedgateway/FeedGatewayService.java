@@ -153,6 +153,10 @@ public class FeedGatewayService implements ReplayRunner {
     // Per-strike strike-intelligence signals, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (StrikeIntelligenceSignal) — lives on the JSON-state consumer.
     private final Map<String, String> strikeIntels = new ConcurrentHashMap<>();
+    // Hot Strike of the Day envelope per symbol ("hot-strike" event): last-value-wins,
+    // replayed on connect so a fresh page gets the day's gold mark immediately (§4.4).
+    // The newest-record / SPX_NATIVE-preference logic is CLIENT-side by design.
+    private final Map<String, String> hotStrikes = new ConcurrentHashMap<>();
     // Per-strike, per-direction strike-invasion signals, keyed by source|symbol|strike|direction
     // (SPX-only — NO expiry; last-value-wins per strike+direction). One strike can legitimately carry
     // BOTH a live UP record (SHORT_CALL_CANDIDATE domain) and a DOWN record (SHORT_PUT_CANDIDATE
@@ -488,6 +492,9 @@ public class FeedGatewayService implements ReplayRunner {
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
             replayDealerLedgerCached(session);
+            // hot-strike is likewise STANDALONE and GLOBAL: replay the fresh cached
+            // envelope(s) so a legacy-mode reload restores the gold mark (§4.4).
+            replayHotStrikeCached(session);
             // short-premium recommendations are likewise STANDALONE; replay the day's cached recommendations
             // so a page reload mid-session (or a client that connects after Agent A acted) still shows the
             // active overlay rather than waiting for the next live broadcast.
@@ -1179,6 +1186,10 @@ public class FeedGatewayService implements ReplayRunner {
         // strike-intelligence-dashboard: per-symbol JSON carrying level-based cluster walls, broadcast as
         // "strike-cluster" STANDALONE (never cached; re-emitted each dashboard interval).
         topicEvents.put(settings.strikeIntelDashboardTopic(), new TopicBinding("DATABENTO", "strike-cluster"));
+        // signal-follower.hot-strike: per-symbol JSON envelope (as-of hot_strike_day
+        // snapshots), broadcast as "hot-strike", cached per symbol + replayed on connect
+        // (the strike-cluster idiom; §4.4 gold mark).
+        topicEvents.put(settings.hotStrikeTopic(), new TopicBinding("DATABENTO", "hot-strike"));
         // strike-invasion is plain JSON (StrikeInvasionSnapshot), per-strike+direction keyed
         // (symbol|strike|direction, SPX-only — NO expiry) — this JSON-state consumer, never the Avro one
         // (mirrors strike-intel).
@@ -1257,6 +1268,7 @@ public class FeedGatewayService implements ReplayRunner {
         // strike-intelligence-dashboard: per-symbol JSON carrying level-based cluster walls, broadcast as
         // "strike-cluster" STANDALONE (never cached; re-emitted each dashboard interval).
         topicEvents.put(settings.strikeIntelDashboardTopic(), new TopicBinding("DATABENTO", "strike-cluster"));
+        topicEvents.put(settings.hotStrikeTopic(), new TopicBinding("DATABENTO", "hot-strike"));
         // strike-invasion is plain JSON, per-strike+direction keyed (symbol|strike|direction, no expiry)
         // — keep the cache + live JSON consumer topic sets symmetric (same rule as strike-intel above).
         topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
@@ -1594,6 +1606,25 @@ public class FeedGatewayService implements ReplayRunner {
                         strikeClusters.put(clusterSymbol, json);
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("hot-strike".equals(binding.event())) {
+                        // Hot Strike of the Day envelope, symbol-keyed. §4.4 demands the payload
+                        // VERBATIM — cache and broadcast the RAW record value, never the
+                        // enrichJson reserialization. Broadcast STANDALONE to every client
+                        // (never selection-gated); the client keeps the newest row (SPX_NATIVE
+                        // preferred over ES_MAPPED at equal trading date).
+                        String hotRaw = avro ? avroJson(record.value()) : stringJson(record.value());
+                        if (hotRaw == null || hotRaw.isBlank()) {
+                            continue;
+                        }
+                        String hotSymbol = record.key() == null ? "" : String.valueOf(record.key());
+                        if (cacheHotStrike(hotSymbol, hotRaw,
+                                record.timestamp() > 0 ? record.timestamp()
+                                        : System.currentTimeMillis())) {
+                            broadcast(binding.event(), hotRaw);
+                            forwardedEvents.incrementAndGet();
+                        }
                         continue;
                     }
                     if ("spread-skew-event".equals(binding.event())) {
@@ -2564,6 +2595,18 @@ public class FeedGatewayService implements ReplayRunner {
         String key = record.key() == null || record.key().isBlank()
                 ? record.topic() + ":" + record.partition()
                 : record.key();
+        if ("hot-strike".equals(event)) {
+            // Restart bootstrap path (cache consumer): same §4.4 VERBATIM contract as the
+            // live branch — store the RAW record value, keyed by symbol, last-value-wins.
+            Object rawValue = record.value();
+            String hotRaw = rawValue == null ? null : String.valueOf(rawValue);
+            if (hotRaw != null && !hotRaw.isBlank()) {
+                cacheHotStrike(key, hotRaw,
+                        record.timestamp() > 0 ? record.timestamp()
+                                : System.currentTimeMillis());
+            }
+            return key;
+        }
         if ("pace".equals(event)) {
             key = paceCacheKey(json, key);
         } else if ("directional-pressure".equals(event)) {
@@ -3346,6 +3389,12 @@ public class FeedGatewayService implements ReplayRunner {
         if ("max-pain".equals(event)) {
             return CachePolicy.expiring(settings.maxPainTtlMs());
         }
+        if ("hot-strike".equals(event)) {
+            // The day's hot-strike row stays valid for the whole session (recompute is
+            // hourly): 12h window + matching seek-back so a restarted gateway
+            // re-bootstraps the CURRENT row instead of waiting for the next compute.
+            return CachePolicy.expiring(settings.hotStrikeTtlMs());
+        }
         if ("short-premium-recommendation".equals(event)) {
             // A recommendation is emitted once at entry and stays valid for the whole 0DTE session:
             // use a long last-value-wins window (default 12h, like max-pain), NOT the generic 15-min TTL,
@@ -3684,6 +3733,8 @@ public class FeedGatewayService implements ReplayRunner {
             strikeSr.remove(versionKey.substring("strike-sr:".length()));
         } else if (versionKey.startsWith("gex-magnet:")) {
             gexMagnet.remove(versionKey.substring("gex-magnet:".length()));
+        } else if (versionKey.startsWith("hot-strike:")) {
+            hotStrikes.remove(versionKey.substring("hot-strike:".length()));
         } else if (versionKey.startsWith("max-pain:")) {
             maxPain.remove(versionKey.substring("max-pain:".length()));
         } else if (versionKey.startsWith("option-price-behavior:")) {
@@ -3997,6 +4048,47 @@ public class FeedGatewayService implements ReplayRunner {
      * Sent STANDALONE (its own message.type), never batched — mirrors the standalone live delivery.
      * dealerLedgers holds only fresh, non-evicted envelopes, so no extra freshness gate is needed here.
      */
+    /**
+     * §4.4 cache write, MONOTONIC and ATOMIC: the live and bootstrap consumers run
+     * concurrently, so the value map and its timestamp are updated together under
+     * one lock and an OLDER record can never displace a newer one — replay after a
+     * consumer race stays current.
+     * @return true when the incoming record won (caller broadcasts only then).
+     */
+    private synchronized boolean cacheHotStrike(String symbol, String raw, long timestampMs) {
+        Long existing = cacheEventTimes.get("hot-strike:" + symbol);
+        if (existing != null && existing > timestampMs) {
+            return false;   // stale: a newer record is already cached
+        }
+        hotStrikes.put(symbol, raw);
+        cacheEventTimes.put("hot-strike:" + symbol, timestampMs);
+        return true;
+    }
+
+    /**
+     * §4.4: replay the fresh cached hot-strike envelope(s) — client symbol-filters —
+     * gated by the 12h session window so a long-running gateway never resends
+     * yesterday's row. Used by BOTH legacy and per-session connect paths.
+     */
+    private void replayHotStrikeCached(WebSocketSession session) {
+        // SNAPSHOT under the same lock as cacheHotStrike so the value/timestamp pair
+        // is read atomically (a racing writer can never yield a fresh timestamp with
+        // a stale value, or vice versa); sends happen OUTSIDE the lock.
+        List<String> freshEnvelopes = new ArrayList<>();
+        long hotNowMs = System.currentTimeMillis();
+        synchronized (this) {
+            for (Map.Entry<String, String> hotEntry : hotStrikes.entrySet()) {
+                if (hotEntry.getValue() != null && !hotEntry.getValue().isBlank()
+                        && isCacheFresh("hot-strike:" + hotEntry.getKey(), hotNowMs)) {
+                    freshEnvelopes.add(hotEntry.getValue());
+                }
+            }
+        }
+        for (String envelope : freshEnvelopes) {
+            send(session, "hot-strike", envelope);
+        }
+    }
+
     private void replayDealerLedgerCached(WebSocketSession session) {
         // Purge first so a stale-half envelope (one role crossed TTL since the last poll purge) is evicted
         // before replay rather than sent to the connecting client.
@@ -4422,6 +4514,8 @@ public class FeedGatewayService implements ReplayRunner {
                 send(session, "strike-cluster", clusterJson);
             }
         }
+        // hot-strike: same standalone replay as legacy mode (§4.4).
+        replayHotStrikeCached(session);
         // liquidity-heatmap replays WITH the freshness gate below (5s TTL): only a live-fresh
         // column frame bootstraps a new socket; anything older is simply absent and the UI
         // fills forward from the next live frame.
@@ -5269,6 +5363,11 @@ public class FeedGatewayService implements ReplayRunner {
             // them so the standalone broadcast still reaches sockets in per-session (auth) mode —
             // GatewayRecordMapper deliberately has no route for spread-skew-event.
             "spread-skew-event",
+            // Hot Strike of the Day is a GLOBAL advisory overlay (symbol-filtered
+            // client-side, §4.4). Allowlist it so the standalone broadcast reaches
+            // sockets in per-session (auth) mode too — GatewayRecordMapper
+            // deliberately has no route for hot-strike.
+            "hot-strike",
             // ES 09:15 open-direction forecast + outcomes are the same class of GLOBAL advisory
             // overlay (one per day, symbol-independent) — allowlist them so routeOrBroadcast/broadcast
             // fan them out in per-session (auth) mode too, not only legacy mode. The 60s live STATUS
