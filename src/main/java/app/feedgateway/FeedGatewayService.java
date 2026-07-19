@@ -1229,7 +1229,7 @@ public class FeedGatewayService implements ReplayRunner {
         // window (default 5 min), which also bounds its seek-back here to the last few minutes.
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
-        topicEvents.put(settings.zeroDteIntelligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
+        topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -1304,7 +1304,7 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the ES open-direction live STATUS
         // heartbeat (JSON, standalone/optional — same rule as the forecast/outcome siblings above).
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
-        topicEvents.put(settings.zeroDteIntelligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
+        topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
@@ -1939,7 +1939,7 @@ public class FeedGatewayService implements ReplayRunner {
                     // The live STATUS heartbeat comes from the same may-not-be-deployed producer, and is
                     // additionally absent whenever no overnight session is active — optional like its siblings.
                     || topic.equals(settings.esOpenDirectionStatusTopic())
-                    || topic.equals(settings.zeroDteIntelligenceTopic()));
+                    || topic.equals(settings.vixOptionInteligenceTopic()));
     }
 
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {

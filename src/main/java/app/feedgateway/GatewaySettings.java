@@ -242,12 +242,14 @@ public final class GatewaySettings {
     }
 
     /**
-     * Current binary SPX direction from zero-dte-intelligence-engine (JSON, key = symbol|sessionDate).
+     * Current binary SPX direction from vix-option-inteligence-service (JSON, key = symbol|sessionDate).
      * Forwarded as standalone websocket event {@code zero-dte-intelligence}; optional until the new
      * producer is deployed.
      */
-    public String zeroDteIntelligenceTopic() {
-        return value("KAFKA_ZERO_DTE_INTELLIGENCE_TOPIC", "options.spx.0dte.intelligence.current");
+    public String vixOptionInteligenceTopic() {
+        return value(
+                "KAFKA_VIX_OPTION_INTELIGENCE_TOPIC",
+                "options.spx.vix-option-inteligence-service.current");
     }
 
     /** Short freshness window for the live chain tint; a dead producer must return the UI to neutral. */
