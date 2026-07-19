@@ -22,10 +22,12 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * §5.3 status codes + §4 auth for {@code GET /api/pin-flow}: 400 bad band / impossible date, 401/403
@@ -159,6 +161,102 @@ class PinFlowControllerTest {
         // Even WITH a bearer token → still 401 (the endpoint is never open in dev).
         assertEquals(401, status(controller.pinFlow(null, null, null, "Bearer anything")),
                 "auth disabled → 401 even with a bearer token");
+    }
+
+    // ---- Derived band is OURS, not the caller's: an extreme derivation must be CLAMPED, never 400. ----
+
+    /**
+     * DataSource whose spot-range query reports an absurd spread (100..99000) so the derived band is far
+     * wider than MAX_BAND_WIDTH; every other query returns no rows. Captures the lo/hi the store is
+     * finally asked for, which is the clamped band.
+     */
+    private static final class ExtremeSpotDataSource implements javax.sql.DataSource {
+        final java.util.List<Integer> ints = new java.util.ArrayList<>();
+
+        @Override public java.sql.Connection getConnection() {
+            return (java.sql.Connection) java.lang.reflect.Proxy.newProxyInstance(
+                    java.sql.Connection.class.getClassLoader(),
+                    new Class<?>[]{java.sql.Connection.class},
+                    (proxy, method, args) -> {
+                        if ("prepareStatement".equals(method.getName())) {
+                            return statement(String.valueOf(args[0]).contains("min(spot)"));
+                        }
+                        if ("isClosed".equals(method.getName())) {
+                            return false;
+                        }
+                        return null;
+                    });
+        }
+
+        private java.sql.PreparedStatement statement(boolean spotRange) {
+            return (java.sql.PreparedStatement) java.lang.reflect.Proxy.newProxyInstance(
+                    java.sql.PreparedStatement.class.getClassLoader(),
+                    new Class<?>[]{java.sql.PreparedStatement.class},
+                    (proxy, method, args) -> {
+                        if ("setInt".equals(method.getName())) {
+                            ints.add((Integer) args[1]); // captures the band the store queries with
+                            return null;
+                        }
+                        if ("executeQuery".equals(method.getName())) {
+                            return rows(spotRange);
+                        }
+                        return null;
+                    });
+        }
+
+        private java.sql.ResultSet rows(boolean spotRange) {
+            java.util.concurrent.atomic.AtomicBoolean served = new java.util.concurrent.atomic.AtomicBoolean();
+            return (java.sql.ResultSet) java.lang.reflect.Proxy.newProxyInstance(
+                    java.sql.ResultSet.class.getClassLoader(), new Class<?>[]{java.sql.ResultSet.class},
+                    (proxy, method, args) -> switch (method.getName()) {
+                        // the spot-range query yields exactly one row; the data queries yield none
+                        case "next" -> spotRange && served.compareAndSet(false, true);
+                        case "getBigDecimal" -> ((Integer) args[0]) == 1
+                                ? java.math.BigDecimal.valueOf(100)
+                                : java.math.BigDecimal.valueOf(99_000);
+                        default -> null;
+                    });
+        }
+
+        @Override public java.sql.Connection getConnection(String u, String p) { return getConnection(); }
+        @Override public java.io.PrintWriter getLogWriter() { return null; }
+        @Override public void setLogWriter(java.io.PrintWriter out) { }
+        @Override public void setLoginTimeout(int seconds) { }
+        @Override public int getLoginTimeout() { return 0; }
+        @Override public java.util.logging.Logger getParentLogger() { return java.util.logging.Logger.getGlobal(); }
+        @Override public <T> T unwrap(Class<T> iface) { return null; }
+        @Override public boolean isWrapperFor(Class<?> iface) { return false; }
+    }
+
+    @Test
+    void extremeDerivedBandIsClampedNotRejected() throws InterruptedException {
+        ExtremeSpotDataSource ds = new ExtremeSpotDataSource();
+        PinFlowStore store = new PinFlowStore(ds, ET, 10, 8_000L);
+        VerifiedPrincipal principal = new VerifiedPrincipal("uv", "val", Set.of("user"),
+                "options-edge-web", java.time.Instant.parse("2030-01-01T00:00:00Z"));
+        WsTicketService svc = multiTenantService("good.token", principal,
+                q -> ApprovalAuthority.ApprovalDecision.approved(0L));
+        bulkhead = new PinFlowExecutor(2, 4);
+        // bandMargin = 150 → derivation ON (10-arg ctor).
+        PinFlowController controller = new PinFlowController(store, bulkhead,
+                new LiquidityHistoryAuth(new GatewaySettings(), svc), MAPPER, CLOCK,
+                7490, 7590, 5_000L, 1_000, 150);
+
+        // No lo/hi → band derived (absurdly wide), then clamped — and still served, not 400'd.
+        withSymbolAndExpiry(() -> {
+            try {
+                assertEquals(200, status(controller.pinFlow(null, null, null, GOOD_TOKEN)),
+                        "a SERVER-derived band must never surface as a 400 'band out of range'");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+        });
+        assertTrue(ds.ints.size() >= 2, "expected the store to bind a lo/hi band");
+        int lo = ds.ints.get(0);
+        int hi = ds.ints.get(1);
+        assertTrue(hi - lo <= 1_000, "derived band must be clamped to MAX_BAND_WIDTH, was " + lo + ".." + hi);
+        assertTrue(lo >= 100, "clamped lo must respect MIN_LO, was " + lo);
     }
 
     // ---- §4 auth (401/403): same shared verifier as /api/liquidity-history ----

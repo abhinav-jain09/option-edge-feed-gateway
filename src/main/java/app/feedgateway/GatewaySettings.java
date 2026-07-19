@@ -451,6 +451,14 @@ public final class GatewaySettings {
         }
     }
 
+    /**
+     * Points of head-room added either side of the session's spot travel when the strike band is derived
+     * from spot (i.e. the caller sent no lo/hi). 0 disables derivation and keeps the fixed default band.
+     */
+    public int pinFlowBandMargin() {
+        return intValue("PIN_FLOW_BAND_MARGIN", 150, 0);
+    }
+
     /** Session/label timezone (§5.1 rule 1). */
     public ZoneId pinFlowZone() {
         try {

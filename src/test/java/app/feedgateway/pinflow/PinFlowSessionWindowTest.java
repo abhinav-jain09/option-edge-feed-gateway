@@ -35,7 +35,7 @@ class PinFlowSessionWindowTest {
     private static final LocalDate DATE = LocalDate.of(2026, 7, 19); // a Sunday — ES reopens 18:00 ET
 
     /** Captures the [start,end) timestamps the store binds into the query. */
-    private static final class CapturingDataSource implements DataSource {
+    private static class CapturingDataSource implements DataSource {
         final List<Timestamp> bound = new ArrayList<>();
 
         @Override public Connection getConnection() {
@@ -87,6 +87,78 @@ class PinFlowSessionWindowTest {
         @Override public Logger getParentLogger() { return Logger.getGlobal(); }
         @Override public <T> T unwrap(Class<T> iface) { return null; }
         @Override public boolean isWrapperFor(Class<?> iface) { return false; }
+    }
+
+    /** DataSource whose spot-range query returns a fixed [min,max] and counts how often it is asked. */
+    private static final class SpotRangeDataSource extends CapturingDataSource {
+        final java.math.BigDecimal min;
+        final java.math.BigDecimal max;
+        int spotQueries = 0;
+
+        SpotRangeDataSource(double min, double max) {
+            this.min = java.math.BigDecimal.valueOf(min);
+            this.max = java.math.BigDecimal.valueOf(max);
+        }
+
+        @Override public Connection getConnection() {
+            return (Connection) java.lang.reflect.Proxy.newProxyInstance(
+                    Connection.class.getClassLoader(), new Class<?>[]{Connection.class},
+                    (proxy, method, args) -> switch (method.getName()) {
+                        case "prepareStatement" -> {
+                            spotQueries++;
+                            yield spotStatement();
+                        }
+                        case "close", "setAutoCommit", "setReadOnly" -> null;
+                        case "isClosed" -> false;
+                        default -> null;
+                    });
+        }
+
+        private PreparedStatement spotStatement() {
+            return (PreparedStatement) java.lang.reflect.Proxy.newProxyInstance(
+                    PreparedStatement.class.getClassLoader(), new Class<?>[]{PreparedStatement.class},
+                    (proxy, method, args) -> switch (method.getName()) {
+                        case "executeQuery" -> spotResultSet();
+                        default -> null;
+                    });
+        }
+
+        private ResultSet spotResultSet() {
+            return (ResultSet) java.lang.reflect.Proxy.newProxyInstance(
+                    ResultSet.class.getClassLoader(), new Class<?>[]{ResultSet.class},
+                    (proxy, method, args) -> switch (method.getName()) {
+                        case "next" -> true;
+                        case "getBigDecimal" -> ((Integer) args[0]) == 1 ? min : max;
+                        default -> null;
+                    });
+        }
+    }
+
+    @Test
+    void bandIsDerivedFromTheSessionSpotTravelAndSnappedToTheGrid() {
+        // Prod SPX 2026-07-17 ran 7435.10..7496.90 against a fixed 7490..7590 band — nearly the whole
+        // session was invisible. Derived with a 150pt margin the band must cover it comfortably.
+        SpotRangeDataSource ds = new SpotRangeDataSource(7435.10, 7496.90);
+        PinFlowStore store = new PinFlowStore(ds, ET, LocalTime.of(9, 30), LocalTime.of(16, 1), 10, 8_000L);
+
+        int[] band = store.resolveBandFromSpot(DATE, 150, 1_000L);
+
+        assertEquals(7285, band[0], "floor((7435.10-150)/5)*5");
+        assertEquals(7650, band[1], "ceil((7496.90+150)/5)*5");
+        assertTrue(band[0] < 7435 && band[1] > 7497, "band must contain the whole session's spot travel");
+    }
+
+    @Test
+    void derivedBandIsCachedSoCacheHitsDoNotRequeryTheDb() {
+        SpotRangeDataSource ds = new SpotRangeDataSource(7400.0, 7450.0);
+        PinFlowStore store = new PinFlowStore(ds, ET, LocalTime.of(9, 30), LocalTime.of(16, 1), 10, 8_000L);
+
+        store.resolveBandFromSpot(DATE, 150, 1_000L);
+        store.resolveBandFromSpot(DATE, 150, 2_000L); // within the 8s TTL → must be served from cache
+        assertEquals(1, ds.spotQueries, "band must be cached; re-deriving on every call re-hits the DB");
+
+        store.resolveBandFromSpot(DATE, 150, 1_000L + 8_001L); // TTL expired → one more query
+        assertEquals(2, ds.spotQueries, "band must be re-derived once the TTL lapses");
     }
 
     @Test
