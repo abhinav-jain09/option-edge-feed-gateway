@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -59,7 +60,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "max-pain"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "gex-strike-lifecycle", "max-pain"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -203,6 +204,92 @@ class FeedGatewayServiceTest {
         assertEquals("DATABENTO|SPX|20260622|6005", key,
                 "updateCache must prepend the source to the delta-flow cache key");
         assertTrue(service.healthJson().contains("\"deltaFlows\":1"), "delta-flow must be cached");
+    }
+
+    // ----- gex-strike-lifecycle gateway consumer (per-strike GexStrikeLifecycle) ------------------
+
+    @Test
+    void strikeLifecycleCacheKeyIsSymbolExpiryStrikeFromPayloadIdentity() throws Exception {
+        // Per-strike like gex-by-strike / delta-flow: symbol|expiry|strike derived from the payload.
+        FeedGatewayService service = service();
+        assertEquals("SPX|20260622|6005", strikeLifecycleCacheKey(
+                service,
+                "{\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"strike\":6005,\"label\":\"EMERGING\"}",
+                "fallback-key"));
+    }
+
+    @Test
+    void strikeLifecycleUpdateCacheStoresSourcePrefixedKeyAndCaches() throws Exception {
+        FeedGatewayService service = service();
+        String json = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260622\","
+                + "\"strike\":6005,\"label\":\"EMERGING\",\"netSign\":1,\"frameId\":3,\"frameStrikeCount\":17,"
+                + "\"eventTimeMs\":" + System.currentTimeMillis() + "}";
+        String key = updateCache(service, topicBinding("DATABENTO", "gex-strike-lifecycle"),
+                new ConsumerRecord<>(new GatewaySettings().databentoGexStrikeLifecycleTopic(), 0, 1L, "SPX|20260622|6005", json),
+                json);
+        assertEquals("DATABENTO|SPX|20260622|6005", key,
+                "updateCache must prepend the source to the lifecycle cache key");
+        assertTrue(service.healthJson().contains("\"gexStrikeLifecycle\":1"), "lifecycle record must be cached");
+    }
+
+    @Test
+    void cachedReplayIncludesFreshLifecycleForMatchingDatabentoSelectionOnly() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260622\","
+                + "\"strike\":6005,\"label\":\"EMERGING\",\"frameId\":3,\"eventTimeMs\":" + now + "}";
+        updateCache(service, topicBinding("DATABENTO", "gex-strike-lifecycle"),
+                recordAt(settings.databentoGexStrikeLifecycleTopic(), 0, 1L, "SPX|20260622|6005", json, now), json);
+
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        assertEquals(1, cachedEvents(service, List.of("gex-strike-lifecycle"), now).size(),
+                "fresh lifecycle must replay to a matching DATABENTO client");
+
+        setActiveSelection(service, "IBKR", "SPX", "20260622");
+        assertTrue(cachedEvents(service, List.of("gex-strike-lifecycle"), now).isEmpty(),
+                "IBKR selection must never receive DATABENTO lifecycle");
+
+        setActiveSelection(service, "DATABENTO", "SPY", "20260622");
+        assertTrue(cachedEvents(service, List.of("gex-strike-lifecycle"), now).isEmpty(),
+                "wrong symbol is filtered by the selection barrier");
+    }
+
+    @Test
+    void strikeLifecycleUpdateCacheFailsClosedOnExpiredOutOfOrderOrMissingPayloadTime() throws Exception {
+        // Codex round-1 (gateway) fixes #2/#3: freshness comes from the PAYLOAD eventTimeMs, and a record that
+        // is expired (payload older than the 12h window), superseded (out-of-order), or missing eventTimeMs must
+        // make updateCache return null — so the live-forward paths (legacy AND per-session) fail closed.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String topic = settings.databentoGexStrikeLifecycleTopic();
+
+        // Expired: payload eventTimeMs older than the 12h lifecycle window ⇒ rejected (null).
+        String expired = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260622\","
+                + "\"strike\":6005,\"label\":\"EMERGING\",\"eventTimeMs\":" + (now - 13L * 3600_000L) + "}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "gex-strike-lifecycle"),
+                recordAt(topic, 0, 1L, "SPX|20260622|6005", expired, now), expired),
+                "an expired lifecycle payload must be rejected (fail-closed)");
+
+        // Missing eventTimeMs ⇒ treated as ancient ⇒ rejected (null), never cached with a fresh Kafka arrival.
+        String noTs = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260622\","
+                + "\"strike\":6010,\"label\":\"EMERGING\"}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "gex-strike-lifecycle"),
+                recordAt(topic, 0, 2L, "SPX|20260622|6010", noTs, now), noTs),
+                "a lifecycle payload with no eventTimeMs must fail closed, not fall back to Kafka arrival");
+
+        // In-order fresh record caches; a later OUT-OF-ORDER (older payload) record for the same strike is rejected.
+        String fresh = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260622\","
+                + "\"strike\":6015,\"label\":\"STICKY\",\"eventTimeMs\":" + now + "}";
+        assertNotNull(updateCache(service, topicBinding("DATABENTO", "gex-strike-lifecycle"),
+                recordAt(topic, 0, 3L, "SPX|20260622|6015", fresh, now), fresh),
+                "a fresh in-order lifecycle record must cache");
+        String older = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"expiry\":\"20260622\","
+                + "\"strike\":6015,\"label\":\"FADING\",\"eventTimeMs\":" + (now - 1000L) + "}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "gex-strike-lifecycle"),
+                recordAt(topic, 0, 4L, "SPX|20260622|6015", older, now), older),
+                "an out-of-order (older payload) lifecycle record must be superseded (null)");
     }
 
     @Test
@@ -1908,7 +1995,7 @@ class FeedGatewayServiceTest {
         // Legacy caught-up gating: max-pain (DATABENTO-only Avro) under avroCaughtUp; gex-by-strike
         // (multi-source) under BOTH flags.
         assertTrue(source.contains(
-                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"pace-rank\", \"directional-pressure\", \"max-pain\", \"strike-sr\", \"gex-magnet\"));"));
+                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"pace-rank\", \"directional-pressure\", \"max-pain\", \"strike-sr\", \"gex-magnet\", \"gex-strike-lifecycle\"));"));
         assertTrue(source.contains("if (avroCaughtUp.get() && stateCaughtUp.get()) {"));
         // gex legacy cached replay is source-aware (no hard IBKR-only filter).
         assertFalse(source.contains(".filter(entry -> \"IBKR\".equals(selection.source()))"));
@@ -2270,6 +2357,12 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(service, json, fallback);
     }
 
+    private static String strikeLifecycleCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("strikeLifecycleCacheKey", String.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, json, fallback);
+    }
+
     private static String strikeIntelCacheKey(FeedGatewayService service, String json, String fallback) throws Exception {
         Method method = FeedGatewayService.class.getDeclaredMethod("strikeIntelCacheKey", String.class, String.class);
         method.setAccessible(true);
@@ -2608,7 +2701,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), gexByStrike, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), gexByStrike,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2737,7 +2832,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                liquidityHeatmaps, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                liquidityHeatmaps, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2747,7 +2844,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                strikeSr, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2757,7 +2856,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), gexMagnet, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), gexMagnet, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2766,8 +2867,10 @@ class FeedGatewayServiceTest {
         method.setAccessible(true);
         return (String) method.invoke(
                 service,
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeInvasions, List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), strikeInvasions,
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2777,7 +2880,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), maxPains, List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2790,7 +2895,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), optionPriceBehaviors, List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2800,7 +2907,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2ByOptions, List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), opbV2ByOptions, List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2810,7 +2919,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2Sessions, List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), opbV2Sessions, List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2820,7 +2931,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), missionPaces, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), missionPaces, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2830,7 +2943,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), missionControls, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), missionControls, List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2840,7 +2955,9 @@ class FeedGatewayServiceTest {
         return (String) method.invoke(
                 service,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), spreadSkews, List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), spreadSkews, List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2858,7 +2975,7 @@ class FeedGatewayServiceTest {
                 // positional args: snapshots, paces, paceRanks, directionalPressures, strikeFlows,
                 // deltaFlows, then the remaining latest-state lists — pass empty except strikeFlows.
                 List.of(), List.of(), List.of(), List.of(), strikeFlows, List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -2869,7 +2986,7 @@ class FeedGatewayServiceTest {
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class
+                List.class, List.class
         );
     }
 }
