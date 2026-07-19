@@ -1,5 +1,6 @@
 package app.feedgateway;
 
+import com.optionsedge.contracts.greekmoveauth.GreekMoveAuthTopics;
 import com.optionsedge.contracts.strikeintelligence.StrikeIntelligenceTopics;
 import org.springframework.stereotype.Component;
 
@@ -786,6 +787,29 @@ public final class GatewaySettings {
      */
     public long esOpenDirectionStatusTtlMs() {
         return longValue("GATEWAY_ES_OPEN_DIRECTION_STATUS_TTL_MS", 300_000L, 0L);
+    }
+
+    /**
+     * Greek-move-authenticity CURRENT verdict topic (JSON, key = symbol; the compacted last-value-wins
+     * {@code MoveAuthenticityVerdict} — see {@link GreekMoveAuthTopics#GREEK_MOVE_AUTH_CURRENT}). One
+     * record per symbol ("SPX"/"ES"); the standalone service re-publishes as the greeks move. Resolved
+     * through the platform topic-prefix helper at deploy time, so on es4 ({@code TOPIC_PREFIX=es.}) this
+     * default becomes {@code es.options.spx.greek-move-auth.current} without string-editing the constant.
+     */
+    public String greekMoveAuthCurrentTopic() {
+        return value("KAFKA_GREEK_MOVE_AUTH_CURRENT_TOPIC", GreekMoveAuthTopics.GREEK_MOVE_AUTH_CURRENT);
+    }
+
+    /**
+     * Freshness TTL for the greek-move-authenticity CURRENT verdict cache. Like the es-open-direction live
+     * STATUS heartbeat (never its 12h forecast/outcome window), a verdict is only meaningful while CURRENT:
+     * an authenticity read older than a few minutes (dead producer, overnight leftover, gateway catching up
+     * on a backlog) is misleading and must read as absent (the UI move-authenticity track simply vanishes),
+     * never replay as live. SHORT window, default 5 min — the liquidity-heatmap/dealer-ledger/status
+     * freshness class. {@code <= 0} preserves the generic "do not cache stale state" semantics (NOT infinite).
+     */
+    public long greekMoveAuthTtlMs() {
+        return longValue("GATEWAY_GREEK_MOVE_AUTH_TTL_MS", 300_000L, 0L);
     }
 
     /**
