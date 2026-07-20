@@ -89,6 +89,7 @@ public final class GatewayRecordMapper {
             case "strike-flow" -> EventType.STRIKE_FLOW;
             case "delta-flow" -> EventType.DELTA_FLOW;
             case "strike-intel" -> EventType.STRIKE_INTEL;
+            case "option-truth" -> EventType.OPTION_TRUTH;
             case "strike-invasion" -> EventType.STRIKE_INVASION;
             case "mission-pace" -> EventType.MISSION_PACE;
             case "mission-control" -> EventType.MISSION_CONTROL;

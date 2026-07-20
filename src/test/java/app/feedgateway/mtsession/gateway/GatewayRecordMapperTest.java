@@ -101,6 +101,24 @@ class GatewayRecordMapperTest {
     }
 
     @Test
+    void mapsOptionTruthAsStrikeFilteredContractEvent() throws Exception {
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "option-truth",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"2026-07-20\",\"strike\":7500.0,"
+                        + "\"horizon\":\"STEP\",\"eventTimeMs\":1784520000000}"))
+                .orElseThrow();
+        assertEquals(EventType.OPTION_TRUTH, rec.eventType());
+        assertTrue(EventType.OPTION_TRUTH.isContractScoped());
+        assertEquals("SPX", rec.symbol());
+        assertEquals("2026-07-20", rec.expiry());
+        assertEquals(7500.0, rec.strike().getAsDouble());
+    }
+
+    @Test
+    void optionTruthEventTypeMapping() {
+        assertEquals(EventType.OPTION_TRUTH, GatewayRecordMapper.eventTypeFor("option-truth"));
+    }
+
+    @Test
     void strikeInvasionEventTypeMapping() {
         assertEquals(EventType.STRIKE_INVASION, GatewayRecordMapper.eventTypeFor("strike-invasion"));
     }

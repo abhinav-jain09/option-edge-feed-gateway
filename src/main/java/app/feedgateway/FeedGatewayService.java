@@ -127,7 +127,7 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "strike-sr",
             "gex-magnet",
             "es-gex",
@@ -163,6 +163,9 @@ public class FeedGatewayService implements ReplayRunner {
     // Per-strike strike-intelligence signals, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (StrikeIntelligenceSignal) — lives on the JSON-state consumer.
     private final Map<String, String> strikeIntels = new ConcurrentHashMap<>();
+    // Option Truth pair readings, keyed source|symbol|expiry|strike|horizon so STEP and
+    // SESSION_ANCHOR never overwrite each other. JSON on the state consumer.
+    private final Map<String, String> optionTruths = new ConcurrentHashMap<>();
     // Hot Strike of the Day envelope per symbol ("hot-strike" event): last-value-wins,
     // replayed on connect so a fresh page gets the day's gold mark immediately (§4.4).
     // The newest-record / SPX_NATIVE-preference logic is CLIENT-side by design.
@@ -516,6 +519,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (stateCaughtUp.get()) {
             sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "es-gex"));
+            replayOptionTruthCachedLegacy(session);
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
             replayDealerLedgerCached(session);
@@ -870,6 +874,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"deltaFlows\":" + deltaFlows.size() + ","
                 + "\"strikeIntels\":" + strikeIntels.size() + ","
+                + "\"optionTruths\":" + optionTruths.size() + ","
                 + "\"liquidityHeatmaps\":" + liquidityHeatmaps.size() + ","
                 + "\"missionPaces\":" + missionPaces.size() + ","
                 + "\"missionControls\":" + missionControls.size() + ","
@@ -969,6 +974,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_strike_intels Cached strike-intel count.\n"
                 + "# TYPE options_edge_feed_gateway_strike_intels gauge\n"
                 + "options_edge_feed_gateway_strike_intels " + strikeIntels.size() + "\n"
+                + "# HELP options_edge_feed_gateway_option_truths Cached per-strike Option Truth readings.\n"
+                + "# TYPE options_edge_feed_gateway_option_truths gauge\n"
+                + "options_edge_feed_gateway_option_truths " + optionTruths.size() + "\n"
                 + "# HELP options_edge_feed_gateway_liquidity_heatmaps Cached liquidity-heatmap frame count.\n"
                 + "# TYPE options_edge_feed_gateway_liquidity_heatmaps gauge\n"
                 + "options_edge_feed_gateway_liquidity_heatmaps " + liquidityHeatmaps.size() + "\n"
@@ -1226,6 +1234,7 @@ public class FeedGatewayService implements ReplayRunner {
         // strike-intelligence-by-strike is plain JSON (StrikeIntelligenceSignal), per-strike keyed
         // (symbol|expiry|strike) — this JSON-state consumer, never the Avro one (mirrors delta-flow).
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
+        topicEvents.put(settings.optionTruthByStrikeTopic(), new TopicBinding("DATABENTO", "option-truth"));
         // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
         topicEvents.put(settings.strikeIntelTurnAlertTopic(), new TopicBinding("DATABENTO", "turn-alert"));
         // strike-intelligence-dashboard: per-symbol JSON carrying level-based cluster walls, broadcast as
@@ -1317,6 +1326,7 @@ public class FeedGatewayService implements ReplayRunner {
         // strike-intelligence-by-strike is plain JSON, per-strike keyed — keep the cache + live JSON
         // consumer topic sets symmetric (same rule as delta-flow above).
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
+        topicEvents.put(settings.optionTruthByStrikeTopic(), new TopicBinding("DATABENTO", "option-truth"));
         // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
         topicEvents.put(settings.strikeIntelTurnAlertTopic(), new TopicBinding("DATABENTO", "turn-alert"));
         // strike-intelligence-dashboard: per-symbol JSON carrying level-based cluster walls, broadcast as
@@ -1769,6 +1779,9 @@ public class FeedGatewayService implements ReplayRunner {
                         boolean strikeIntelStale = "strike-intel".equals(binding.event())
                                 && eventCacheTimestamp(binding.event(), record, json)
                                 < System.currentTimeMillis() - settings.cacheTtlMs();
+                        boolean optionTruthStale = "option-truth".equals(binding.event())
+                                && eventCacheTimestamp(binding.event(), record, json)
+                                < System.currentTimeMillis() - settings.optionTruthTtlMs();
                         // Strike-invasion fail-closed (freshness): same rationale as strike-intel — a
                         // per-strike signal carries no per-session selectionEpoch, so gate on the generic
                         // cache window so a backfilled/catching-up producer never live-routes a stale action.
@@ -1791,7 +1804,7 @@ public class FeedGatewayService implements ReplayRunner {
                                 && cacheKey == null;
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
-                                && !strikeIntelStale && !strikeInvasionStale && !spreadSkewStale
+                                && !strikeIntelStale && !optionTruthStale && !strikeInvasionStale && !spreadSkewStale
                                 && !esOpenDirectionDropped) {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
@@ -1826,6 +1839,11 @@ public class FeedGatewayService implements ReplayRunner {
                         if ("dealer-ledger".equals(binding.event())) {
                             // Delivered STANDALONE (its own message.type), never inside a ui-batch — the UI
                             // has a dedicated dealer-ledger handler and reads no dealerLedgers batch array.
+                            broadcast(binding.event(), forwardJson);
+                        } else if ("option-truth".equals(binding.event())) {
+                            // Compact per-strike signal has its own event in legacy mode. Keeping it out of
+                            // ui-batch avoids changing the established batch schema and lets the outbound
+                            // channel coalesce latest-by-strike updates directly.
                             broadcast(binding.event(), forwardJson);
                         } else {
                             enqueuePending(binding.event(), cacheKey, forwardJson);
@@ -1984,6 +2002,7 @@ public class FeedGatewayService implements ReplayRunner {
                     || topic.equals(settings.dealerLedgerProfileTopic())
                     || topic.equals(settings.dealerLedgerStateTopic())
                     || topic.equals(settings.strikeIntelByStrikeTopic())
+                    || topic.equals(settings.optionTruthByStrikeTopic())
                     || topic.equals(settings.strikeInvasionTopic())
                     // Both spread-skew topics come from the same brand-new spread-skew-service, which may
                     // not be deployed during a staged rollout — BOTH must be optional (like strike-invasion)
@@ -2314,6 +2333,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.databentoStrikeFlowTopic(),
                     settings.databentoDeltaFlowByStrikeTopic(),
                     settings.strikeIntelByStrikeTopic(),
+                    settings.optionTruthByStrikeTopic(),
                     settings.strikeInvasionTopic(),
                     settings.strikeLiquidityTopic(),
                     settings.databentoPaceMissionTopic(),
@@ -2714,6 +2734,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = deltaFlowCacheKey(json, key);
         } else if ("strike-intel".equals(event)) {
             key = strikeIntelCacheKey(json, key);
+        } else if ("option-truth".equals(event)) {
+            key = optionTruthCacheKey(json, key);
         } else if ("strike-invasion".equals(event)) {
             key = strikeInvasionCacheKey(json, key);
         } else if ("es-open-direction-forecast".equals(event)) {
@@ -2838,6 +2860,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 strikeIntels.put(key, json);
+                return key;
+            }
+            case "option-truth" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                optionTruths.put(key, json);
                 return key;
             }
             case "strike-invasion" -> {
@@ -3516,6 +3544,9 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private CachePolicy cachePolicyFor(String event, long nowMs) {
+        if ("option-truth".equals(event)) {
+            return CachePolicy.expiring(settings.optionTruthTtlMs());
+        }
         if ("zero-dte-intelligence".equals(event)) {
             // This state controls a whole-chain red/green background. Keep its lifetime deliberately
             // short and shared across ingest, purge, reconnect replay, and restart seek-back.
@@ -3738,6 +3769,12 @@ public class FeedGatewayService implements ReplayRunner {
                 return payloadTime;
             }
         }
+        if ("option-truth".equals(event)) {
+            long payloadTime = optionTruthTimestamp(json);
+            if (payloadTime >= 0) {
+                return payloadTime;
+            }
+        }
         if ("strike-invasion".equals(event)) {
             // Freshness MUST track the PAYLOAD event time (asOfEventTimeMs), not the Kafka ARRIVAL time
             // (mirrors strike-intel above). A producer catching up / backfilling appends records now
@@ -3849,6 +3886,15 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** Event time of an Option Truth pair reading; missing time fails closed. */
+    private long optionTruthTimestamp(String json) {
+        try {
+            return longField(mapper.readTree(json), "eventTimeMs", -1L);
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
+    }
+
     /**
      * Event time of a raw per-strike strike-invasion record; -1 if absent/unparseable. The
      * {@code StrikeInvasionSnapshot} contract names this field {@code asOfEventTimeMs} (decision-relevant
@@ -3934,6 +3980,8 @@ public class FeedGatewayService implements ReplayRunner {
             strikeInvasions.remove(versionKey.substring("strike-invasion:".length()));
         } else if (versionKey.startsWith("strike-intel:")) {
             strikeIntels.remove(versionKey.substring("strike-intel:".length()));
+        } else if (versionKey.startsWith("option-truth:")) {
+            optionTruths.remove(versionKey.substring("option-truth:".length()));
         } else if (versionKey.startsWith("liquidity-heatmap:")) {
             liquidityHeatmaps.remove(versionKey.substring("liquidity-heatmap:".length()));
         } else if (versionKey.startsWith("mission-pace:")) {
@@ -4078,6 +4126,23 @@ public class FeedGatewayService implements ReplayRunner {
             double strike = doubleField(root, "strike", Double.NaN);
             if (!symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike)) {
                 return symbol + "|" + expiry + "|" + formatStrike(strike);
+            }
+        } catch (JsonProcessingException ignored) {
+            // Fall back to Kafka key if the payload is unexpectedly not JSON.
+        }
+        return fallback;
+    }
+
+    /** Per-strike, per-horizon Option Truth key: symbol|expiry|strike|horizon. */
+    private String optionTruthCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            double strike = doubleField(root, "strike", Double.NaN);
+            String horizon = text(root, "horizon").toUpperCase();
+            if (!symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike) && !horizon.isBlank()) {
+                return symbol + "|" + expiry + "|" + formatStrike(strike) + "|" + horizon;
             }
         } catch (JsonProcessingException ignored) {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
@@ -4818,6 +4883,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "strike-flow", strikeFlows);
         replayCacheMap(session, "delta-flow", deltaFlows);
         replayCacheMap(session, "strike-intel", strikeIntels);
+        replayCacheMap(session, "option-truth", optionTruths);
         replayCacheMap(session, "strike-invasion", strikeInvasions);
         // Mission-level state is low-frequency in replay/off-hours dev. Replay the fresh cached value on
         // connect, still routed by source|symbol|expiry so it cannot leak to another selected market.
@@ -4902,13 +4968,26 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private boolean requiresFreshPerSessionReplay(String event) {
-        return "strike-sr".equals(event)
+        return "option-truth".equals(event)
+                || "strike-sr".equals(event)
                 || "gex-magnet".equals(event)
                 || "es-gex".equals(event)
                 || "liquidity-heatmap".equals(event)
                 || "mission-pace".equals(event)
                 || "mission-control".equals(event)
                 || "spread-skew".equals(event);
+    }
+
+    /** Legacy single-selection bootstrap for the standalone Option Truth event. */
+    private void replayOptionTruthCachedLegacy(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        ActiveSelection selection = activeSelection.get();
+        optionTruths.entrySet().stream()
+                .filter(entry -> isCacheFresh("option-truth:" + entry.getKey(), nowMs))
+                .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> send(session, "option-truth", entry.getValue()));
     }
 
     // =====================================================================
@@ -5814,7 +5893,9 @@ public class FeedGatewayService implements ReplayRunner {
             String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
             String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
             String strike = root.hasNonNull("strike") ? root.get("strike").asText("") : "";
-            return event + "|" + symbol + "|" + expiry + "|" + strike;
+            String horizon = "option-truth".equals(event) && root.hasNonNull("horizon")
+                    ? root.get("horizon").asText("") : "";
+            return event + "|" + symbol + "|" + expiry + "|" + strike + "|" + horizon;
         } catch (JsonProcessingException unparseable) {
             return null; // when in doubt, deliver it
         }
@@ -6258,6 +6339,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"strikeFlows\":" + strikeFlows.size() + ","
                 + "\"deltaFlows\":" + deltaFlows.size() + ","
                 + "\"strikeIntels\":" + strikeIntels.size() + ","
+                + "\"optionTruths\":" + optionTruths.size() + ","
                 + "\"liquidityHeatmaps\":" + liquidityHeatmaps.size() + ","
                 + "\"missionPaces\":" + missionPaces.size() + ","
                 + "\"missionControls\":" + missionControls.size() + ","

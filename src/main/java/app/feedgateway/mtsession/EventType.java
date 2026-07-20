@@ -21,6 +21,9 @@ public enum EventType {
     // Per-strike strike-intelligence signal — one record per (symbol, expiry, strike), so it routes
     // CONTRACT-scoped by source|symbol|expiry and is strike-filtered per user (like DELTA_FLOW).
     STRIKE_INTEL(Scope.CONTRACT),
+    // Per-strike call+put price-reconciliation reading. Both legs travel in one record and are
+    // evaluated together by the UI; strike-filtered exactly like STRIKE_INTEL.
+    OPTION_TRUTH(Scope.CONTRACT),
     // Per-strike strike-invasion signal — one record per (symbol, strike, direction); contract v2 emits
     // a live UP and DOWN record per strike concurrently. SPX-only, so it carries NO expiry; routes
     // CONTRACT-scoped by source|symbol|expiry (with a blank expiry) and is strike-filtered per user

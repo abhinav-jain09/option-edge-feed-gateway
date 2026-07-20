@@ -283,6 +283,20 @@ public final class GatewaySettings {
     }
 
     /**
+     * Per-strike Option Truth pair readings (JSON, one STEP and one SESSION_ANCHOR record per strike).
+     * The UI currently renders only STEP, but the gateway preserves both horizons by key.
+     */
+    public String optionTruthByStrikeTopic() {
+        return value("KAFKA_OPTION_TRUTH_BY_STRIKE_TOPIC",
+                "options.spx.option-truth-engine-service.by-strike");
+    }
+
+    /** A truth reading is live evidence, not a session-long level. */
+    public long optionTruthTtlMs() {
+        return longValue("GATEWAY_OPTION_TRUTH_TTL_MS", 180_000L, 1_000L);
+    }
+
+    /**
      * Discrete {@code StrikeTurnAlert} START/STOP turn events from strike-intelligence-service, keyed by
      * {@code symbol|tradingDate}. Broadcast as event {@code "turn-alert"} (own message.type), symbol-filtered
      * client-side. Unprefixed; default is the bare {@code strike-intelligence-turn-alert}.
