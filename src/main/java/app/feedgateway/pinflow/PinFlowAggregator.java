@@ -20,7 +20,9 @@ import java.util.TreeSet;
  * <ol>
  *   <li>Frame grid = sorted distinct minutes present across BOTH tables (gaps preserved, no synthetic grid).</li>
  *   <li>Duplicate {@code (minute,strike)} → take the MAX cumulative value (defensive).</li>
- *   <li>{@code cc}/{@code cp} = per-minute delta of the cumulative notional, clamped {@code >= 0}, ÷1000 → {@code $K}
+ *   <li>{@code cc}/{@code cp} = per-minute SIGNED NET flow (sold MINUS bought) ÷1000 → {@code $K}; each
+ *       cumulative's own delta is clamped {@code >= 0} first, then bought is subtracted, so the RESULT
+ *       may be NEGATIVE meaning net BOUGHT at that strike
  *       (round half-up), with a PER-STRIKE baseline: a strike's FIRST observation seeds the baseline and emits
  *       {@code 0}; a previously-seen strike absent this minute carries its baseline forward (delta 0); a never-seen
  *       absent strike stays 0.</li>
@@ -40,7 +42,8 @@ public final class PinFlowAggregator {
 
     /** A row of {@code pin_strike_minute} (already band-filtered, already floored to the minute). */
     public record StrikeMinuteRow(long minuteEpoch, int strike, BigDecimal callSellNotional,
-                                  BigDecimal putSellNotional, BigDecimal spot, String tradeDate) {
+                                  BigDecimal putSellNotional, BigDecimal callBuyNotional,
+                                  BigDecimal putBuyNotional, BigDecimal spot, String tradeDate) {
     }
 
     /**
@@ -90,6 +93,8 @@ public final class PinFlowAggregator {
         // callCum[minute][strike] and putCum[minute][strike] = max cumulative for that cell.
         Map<Long, Map<TdStrike, BigDecimal>> callCum = new HashMap<>();
         Map<Long, Map<TdStrike, BigDecimal>> putCum = new HashMap<>();
+        Map<Long, Map<TdStrike, BigDecimal>> callBuyCum = new HashMap<>();
+        Map<Long, Map<TdStrike, BigDecimal>> putBuyCum = new HashMap<>();
         Map<Long, List<BigDecimal>> spotByMinute = new HashMap<>();
         for (StrikeMinuteRow r : strikeRows) {
             TdStrike key = new TdStrike(r.tradeDate() == null ? "" : r.tradeDate(), r.strike());
@@ -97,6 +102,10 @@ public final class PinFlowAggregator {
                     .merge(key, nz(r.callSellNotional()), PinFlowAggregator::max);
             putCum.computeIfAbsent(r.minuteEpoch(), m -> new HashMap<>())
                     .merge(key, nz(r.putSellNotional()), PinFlowAggregator::max);
+            callBuyCum.computeIfAbsent(r.minuteEpoch(), m -> new HashMap<>())
+                    .merge(key, nz(r.callBuyNotional()), PinFlowAggregator::max);
+            putBuyCum.computeIfAbsent(r.minuteEpoch(), m -> new HashMap<>())
+                    .merge(key, nz(r.putBuyNotional()), PinFlowAggregator::max);
             if (r.spot() != null) {
                 spotByMinute.computeIfAbsent(r.minuteEpoch(), m -> new ArrayList<>()).add(r.spot());
             }
@@ -115,6 +124,8 @@ public final class PinFlowAggregator {
         // ---- Per-strike cumulative baseline (rule 5): seen[strike] = last cumulative we emitted a delta against. ----
         Map<TdStrike, BigDecimal> callBaseline = new HashMap<>();
         Map<TdStrike, BigDecimal> putBaseline = new HashMap<>();
+        Map<TdStrike, BigDecimal> callBuyBaseline = new HashMap<>();
+        Map<TdStrike, BigDecimal> putBuyBaseline = new HashMap<>();
 
         List<String> t = new ArrayList<>(frames.size());
         List<Integer> sp = new ArrayList<>(frames.size());
@@ -144,6 +155,8 @@ public final class PinFlowAggregator {
             // ---- Rule 5: per-strike CALL/PUT sold delta with per-strike baseline. ----
             Map<TdStrike, BigDecimal> callThis = callCum.getOrDefault(minute, Map.of());
             Map<TdStrike, BigDecimal> putThis = putCum.getOrDefault(minute, Map.of());
+            Map<TdStrike, BigDecimal> callBuyThis = callBuyCum.getOrDefault(minute, Map.of());
+            Map<TdStrike, BigDecimal> putBuyThis = putBuyCum.getOrDefault(minute, Map.of());
             // Sum per strike ACROSS trade_dates: each session's counter advances on its own baseline, so a
             // rollover inside the window contributes only its own real increment, never a re-count.
             // Sum the RAW deltas first and round ONCE per strike: rounding each trade_date's delta to $K
@@ -155,6 +168,16 @@ public final class PinFlowAggregator {
             }
             for (Map.Entry<TdStrike, BigDecimal> e : putThis.entrySet()) {
                 cpRaw.merge(e.getKey().strike(), deltaRaw(e.getKey(), e.getValue(), putBaseline), BigDecimal::add);
+            }
+            // NET (rule: report net, not gross). Each cumulative is monotonic so its own delta is clamped
+            // >= 0, then bought is SUBTRACTED — so the emitted value can be negative, meaning net BOUGHT.
+            // Gross alone is misleading: ES 7600 showed $1.63M sold against $1.34M bought — a bar 5.6x the
+            // real $0.29M net position.
+            for (Map.Entry<TdStrike, BigDecimal> e : callBuyThis.entrySet()) {
+                ccRaw.merge(e.getKey().strike(), deltaRaw(e.getKey(), e.getValue(), callBuyBaseline).negate(), BigDecimal::add);
+            }
+            for (Map.Entry<TdStrike, BigDecimal> e : putBuyThis.entrySet()) {
+                cpRaw.merge(e.getKey().strike(), deltaRaw(e.getKey(), e.getValue(), putBuyBaseline).negate(), BigDecimal::add);
             }
             List<Integer> ccRow = new ArrayList<>(strikes.size());
             List<Integer> cpRow = new ArrayList<>(strikes.size());
@@ -214,9 +237,12 @@ public final class PinFlowAggregator {
         return current.subtract(prev);
     }
 
-    /** Raw notional → $K, round half-up. Applied ONCE, after cross-trade_date summation. */
+    /**
+     * Raw NET notional → $K, round half-up, applied ONCE after cross-trade_date summation. SIGN IS
+     * PRESERVED: a negative result means net BOUGHT at that strike (buying exceeded selling).
+     */
     private static int toK(BigDecimal raw) {
-        if (raw == null || raw.signum() <= 0) {
+        if (raw == null || raw.signum() == 0) {
             return 0;
         }
         return raw.divide(THOUSAND, 0, RoundingMode.HALF_UP).intValue();
