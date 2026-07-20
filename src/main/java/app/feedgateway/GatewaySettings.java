@@ -1,6 +1,5 @@
 package app.feedgateway;
 
-import com.optionsedge.contracts.greekmoveauth.GreekMoveAuthTopics;
 import com.optionsedge.contracts.strikeintelligence.StrikeIntelligenceTopics;
 import org.springframework.stereotype.Component;
 
@@ -843,25 +842,25 @@ public final class GatewaySettings {
 
     /**
      * Greek-move-authenticity CURRENT verdict topic (JSON, key = symbol; the compacted last-value-wins
-     * {@code MoveAuthenticityVerdict} — see {@link GreekMoveAuthTopics#GREEK_MOVE_AUTH_CURRENT}). One
+     * {@code PairTruthReading} — one reading per STRIKE, not per symbol). One
      * record per symbol ("SPX"/"ES"); the standalone service re-publishes as the greeks move. Resolved
      * through the platform topic-prefix helper at deploy time, so on es4 ({@code TOPIC_PREFIX=es.}) this
-     * default becomes {@code es.options.spx.greek-move-auth.current} without string-editing the constant.
+     * default becomes {@code es.options.spx.option-truth-engine-service.by-strike} without string-editing the constant.
      */
-    public String greekMoveAuthCurrentTopic() {
-        return value("KAFKA_GREEK_MOVE_AUTH_CURRENT_TOPIC", GreekMoveAuthTopics.GREEK_MOVE_AUTH_CURRENT);
+    public String optionTruthTopic() {
+        return value("KAFKA_OPTION_TRUTH_TOPIC", "options.spx.option-truth-engine-service.by-strike");
     }
 
     /**
-     * Freshness TTL for the greek-move-authenticity CURRENT verdict cache. Like the es-open-direction live
+     * Freshness TTL for the option-truth-engine CURRENT verdict cache. Like the es-open-direction live
      * STATUS heartbeat (never its 12h forecast/outcome window), a verdict is only meaningful while CURRENT:
      * an authenticity read older than a few minutes (dead producer, overnight leftover, gateway catching up
      * on a backlog) is misleading and must read as absent (the UI move-authenticity track simply vanishes),
      * never replay as live. SHORT window, default 5 min — the liquidity-heatmap/dealer-ledger/status
      * freshness class. {@code <= 0} preserves the generic "do not cache stale state" semantics (NOT infinite).
      */
-    public long greekMoveAuthTtlMs() {
-        return longValue("GATEWAY_GREEK_MOVE_AUTH_TTL_MS", 300_000L, 0L);
+    public long optionTruthTtlMs() {
+        return longValue("GATEWAY_OPTION_TRUTH_TTL_MS", 300_000L, 0L);
     }
 
     /**

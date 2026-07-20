@@ -792,53 +792,67 @@ class FeedGatewayServiceTest {
         assertTrue(sink.isEmpty(), "a stale status must never replay to a late joiner; got: " + sink);
     }
 
-    // ----- greek-move-authenticity CURRENT verdict relay ------------------------------------------
+    // ----- option-truth-engine CURRENT verdict relay ------------------------------------------
 
     @Test
-    void greekMoveAuthCurrentTopicIsOptionalGlobalAndOnTheShortFiveMinuteWindow() throws Exception {
+    void optionTruthTopicIsOptionalGlobalAndOnTheShortFiveMinuteWindow() throws Exception {
         // The move-authenticity CURRENT verdict is a standalone global advisory (optional topic, global
         // broadcast in per-session mode) whose only value is being CURRENT — so it lives on the SHORT
-        // greekMoveAuthTtlMs window (default 5 min, the es-open-direction STATUS freshness class), never a
+        // optionTruthTtlMs window (default 5 min, the es-open-direction STATUS freshness class), never a
         // long window that would replay a stale overnight verdict as live.
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
-        assertEquals("options.spx.greek-move-auth.current", settings.greekMoveAuthCurrentTopic(),
-                "default topic must be the contract constant GreekMoveAuthTopics.GREEK_MOVE_AUTH_CURRENT");
-        assertTrue(isOptionalTopic(service, settings.greekMoveAuthCurrentTopic()),
+        assertEquals("options.spx.option-truth-engine-service.by-strike", settings.optionTruthTopic(),
+                "default topic must be the option-truth engine output");
+        assertTrue(isOptionalTopic(service, settings.optionTruthTopic()),
                 "a brand-new standalone producer may be absent — the topic must be optional");
-        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("greek-move-auth"),
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("option-truth"),
                 "the verdict must fan out in per-session (auth) mode like the open-direction siblings");
-        assertEquals(300_000L, settings.greekMoveAuthTtlMs(), "default TTL must be 5 minutes");
+        assertEquals(300_000L, settings.optionTruthTtlMs(), "default TTL must be 5 minutes");
         long now = System.currentTimeMillis();
-        assertFalse(isExpired(service, "greek-move-auth", now - 2L * 60_000L, now),
+        assertFalse(isExpired(service, "option-truth", now - 2L * 60_000L, now),
                 "a 2-min-old verdict must still be fresh");
-        assertTrue(isExpired(service, "greek-move-auth", now - 6L * 60_000L, now),
+        assertTrue(isExpired(service, "option-truth", now - 6L * 60_000L, now),
                 "a 6-min-old verdict must be STALE — never routed or replayed as current");
     }
 
     @Test
-    void greekMoveAuthUsesPayloadDecisionTimeAndSymbolKey() throws Exception {
-        // Freshness tracks the PAYLOAD asOfEventTimeMs, not the Kafka arrival time; the cache key is the
-        // symbol source-prefixed to source|symbol (last-value-wins per SPX/ES, the same convention as
-        // es-open-direction-status' source|tradeDate) — a fresh-arriving backfilled verdict must expire
-        // from its own decision time.
+    void optionTruthUsesPayloadEventTimeAndPerStrikeKey() throws Exception {
+        // Freshness tracks the PAYLOAD eventTimeMs, not Kafka arrival. The cache key must carry
+        // symbol|expiry|strike|horizon: the option-truth engine emits ONE reading per STRIKE, so a
+        // symbol-only key (what this relay used when it carried a per-symbol verdict) would make
+        // every strike overwrite the previous one and the chain would show a single arbitrary row.
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
-        long decisionTime = System.currentTimeMillis() - 1_000L;
-        String payload = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + decisionTime + ","
-                + "\"verdict\":\"REAL_UP\",\"isReal\":true,\"moveDirection\":\"UP\",\"actionable\":true}";
-        ConsumerRecord<String, String> record = recordAt(
-                settings.greekMoveAuthCurrentTopic(), 0, 1L, "SPX", payload, System.currentTimeMillis());
+        long eventTime = System.currentTimeMillis() - 1_000L;
+        String a = optionTruthPayload(7500.0, eventTime);
+        ConsumerRecord<String, String> recA = recordAt(
+                settings.optionTruthTopic(), 0, 1L, "SPX", a, System.currentTimeMillis());
 
-        assertEquals(decisionTime, eventCacheTimestamp(service, "greek-move-auth", record),
-                "fresh Kafka arrival must not disguise a historical verdict");
-        assertEquals("DATABENTO|SPX",
-                updateCache(service, topicBinding("DATABENTO", "greek-move-auth"), record, payload),
-                "updateCache must key the verdict by source|symbol (symbol is the distinguishing component)");
+        assertEquals(eventTime, eventCacheTimestamp(service, "option-truth", recA),
+                "fresh Kafka arrival must not disguise a historical reading");
+
+        String keyA = updateCache(service, topicBinding("DATABENTO", "option-truth"), recA, a);
+        assertEquals("DATABENTO|SPX|20260720|7500|STEP", keyA,
+                "key must be source|symbol|expiry|strike|horizon — STEP and ANCHOR are independent readings");
+
+        String b = optionTruthPayload(7510.0, eventTime);
+        ConsumerRecord<String, String> recB = recordAt(
+                settings.optionTruthTopic(), 0, 2L, "SPX", b, System.currentTimeMillis());
+        String keyB = updateCache(service, topicBinding("DATABENTO", "option-truth"), recB, b);
+        assertNotEquals(keyA, keyB,
+                "two strikes in the same chain must NOT collide onto one cache entry");
+    }
+
+    private static String optionTruthPayload(double strike, long eventTimeMs) {
+        return "{\"schemaVersion\":1,\"messageType\":\"OPTION_TRUTH_BY_STRIKE\",\"symbol\":\"SPX\","
+                + "\"expiry\":\"20260720\",\"strike\":" + strike + ",\"horizon\":\"STEP\","
+                + "\"eventTimeMs\":" + eventTimeMs + ",\"relativeCallPutRichness\":0.42,"
+                + "\"actionable\":false,\"interpretation\":\"OBSERVATIONAL_ONLY\"}";
     }
 
     @Test
-    void futureGreekMoveAuthVerdictFailsClosedAndCannotPoisonLaterValidUpdates() throws Exception {
+    void futureOptionTruthVerdictFailsClosedAndCannotPoisonLaterValidUpdates() throws Exception {
         // Clock-skew freeze-safety: a verdict stamped implausibly in the FUTURE (bad clock / corrupt
         // producer) must fail closed at ingest — otherwise its future event time would evade expiry AND
         // poison the monotonic last-value-wins supersede gate, rejecting every subsequent CORRECT verdict
@@ -848,8 +862,8 @@ class FeedGatewayServiceTest {
         long now = System.currentTimeMillis();
         String future = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now + 60L * 60_000L)
                 + ",\"verdict\":\"REAL_UP\",\"isReal\":true,\"moveDirection\":\"UP\",\"actionable\":true}";
-        assertNull(updateCache(service, topicBinding("DATABENTO", "greek-move-auth"),
-                        recordAt(settings.greekMoveAuthCurrentTopic(), 0, 1L, "SPX", future, now),
+        assertNull(updateCache(service, topicBinding("DATABENTO", "option-truth"),
+                        recordAt(settings.optionTruthTopic(), 0, 1L, "SPX", future, now),
                         future),
                 "an hour-ahead verdict must be dropped at ingest (fail closed), never cached");
 
@@ -857,14 +871,14 @@ class FeedGatewayServiceTest {
         String current = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now - 5_000L)
                 + ",\"verdict\":\"REAL_UP\",\"isReal\":true,\"moveDirection\":\"UP\",\"actionable\":true}";
         assertEquals("DATABENTO|SPX",
-                updateCache(service, topicBinding("DATABENTO", "greek-move-auth"),
-                        recordAt(settings.greekMoveAuthCurrentTopic(), 0, 2L, "SPX", current, now),
+                updateCache(service, topicBinding("DATABENTO", "option-truth"),
+                        recordAt(settings.optionTruthTopic(), 0, 2L, "SPX", current, now),
                         current),
                 "a valid verdict after a future one must be accepted — the future record must not freeze the symbol");
     }
 
     @Test
-    void freshGreekMoveAuthVerdictIsCachedBySymbolAndReplayedToLateJoiner() throws Exception {
+    void freshOptionTruthVerdictIsCachedBySymbolAndReplayedToLateJoiner() throws Exception {
         // Late-join contract: the current (fresh) verdict is cached last-value-wins under the symbol and
         // replayed standalone on connect, so a client that opens the dashboard mid-session immediately
         // shows the current move-authenticity track instead of waiting for the next live verdict.
@@ -874,30 +888,30 @@ class FeedGatewayServiceTest {
         String older = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now - 2L * 60_000L)
                 + ",\"verdict\":\"FAKE\",\"isReal\":false,\"moveDirection\":\"UP\",\"actionable\":false}";
         assertEquals("DATABENTO|SPX",
-                updateCache(service, topicBinding("DATABENTO", "greek-move-auth"),
-                        recordAt(settings.greekMoveAuthCurrentTopic(), 0, 1L, "SPX", older, now - 2L * 60_000L),
+                updateCache(service, topicBinding("DATABENTO", "option-truth"),
+                        recordAt(settings.optionTruthTopic(), 0, 1L, "SPX", older, now - 2L * 60_000L),
                         older),
                 "updateCache must key the verdict by source|symbol");
         String current = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now - 30_000L)
                 + ",\"verdict\":\"REAL_UP\",\"isReal\":true,\"moveDirection\":\"UP\",\"actionable\":true}";
         assertEquals("DATABENTO|SPX",
-                updateCache(service, topicBinding("DATABENTO", "greek-move-auth"),
-                        recordAt(settings.greekMoveAuthCurrentTopic(), 0, 2L, "SPX", current, now - 30_000L),
+                updateCache(service, topicBinding("DATABENTO", "option-truth"),
+                        recordAt(settings.optionTruthTopic(), 0, 2L, "SPX", current, now - 30_000L),
                         current));
 
         List<String> sink = new ArrayList<>();
-        Method replay = FeedGatewayService.class.getDeclaredMethod("replayGreekMoveAuthCached", WebSocketSession.class);
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replayOptionTruthCached", WebSocketSession.class);
         replay.setAccessible(true);
         replay.invoke(service, recordingSession(sink));
 
         assertEquals(1, sink.size(), "exactly the CURRENT verdict must replay (last-value-wins); got: " + sink);
-        assertTrue(sink.get(0).contains("\"type\":\"greek-move-auth\"")
+        assertTrue(sink.get(0).contains("\"type\":\"option-truth\"")
                         && sink.get(0).contains("\"verdict\":\"REAL_UP\""),
                 "the latest verdict must replay verbatim (JSON pass-through); was: " + sink.get(0));
     }
 
     @Test
-    void staleGreekMoveAuthVerdictIsNeitherCachedNorReplayed() throws Exception {
+    void staleOptionTruthVerdictIsNeitherCachedNorReplayed() throws Exception {
         // Staleness fail-closed: a verdict older than the 5-min window (dead producer, gateway catching up
         // on a backlog) makes updateCache return null — which suppresses the live broadcast (the cacheKey
         // == null gate) — and nothing replays to a late joiner, so the UI track simply stays hidden.
@@ -906,13 +920,13 @@ class FeedGatewayServiceTest {
         long now = System.currentTimeMillis();
         String stale = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now - 6L * 60_000L)
                 + ",\"verdict\":\"REAL_UP\",\"isReal\":true,\"moveDirection\":\"UP\",\"actionable\":true}";
-        assertNull(updateCache(service, topicBinding("DATABENTO", "greek-move-auth"),
-                        recordAt(settings.greekMoveAuthCurrentTopic(), 0, 1L, "SPX", stale, now - 6L * 60_000L),
+        assertNull(updateCache(service, topicBinding("DATABENTO", "option-truth"),
+                        recordAt(settings.optionTruthTopic(), 0, 1L, "SPX", stale, now - 6L * 60_000L),
                         stale),
                 "a 6-min-old verdict must be dropped at ingest (null cacheKey = never live-routed)");
 
         List<String> sink = new ArrayList<>();
-        Method replay = FeedGatewayService.class.getDeclaredMethod("replayGreekMoveAuthCached", WebSocketSession.class);
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replayOptionTruthCached", WebSocketSession.class);
         replay.setAccessible(true);
         replay.invoke(service, recordingSession(sink));
         assertTrue(sink.isEmpty(), "a stale verdict must never replay to a late joiner; got: " + sink);

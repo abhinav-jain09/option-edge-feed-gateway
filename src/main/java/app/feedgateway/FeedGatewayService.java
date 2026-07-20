@@ -136,17 +136,17 @@ public class FeedGatewayService implements ReplayRunner {
             "option-price-behavior",
             "dealer-ledger",
             "zero-dte-intelligence",
-            "greek-move-auth",
+            "option-truth",
             "opb-v2-by-option", "opb-v2-session",
             "index-price", "vix-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
-    // Clock-skew allowance for the greek-move-authenticity verdict's PAYLOAD decision time
+    // Clock-skew allowance for the option-truth-engine verdict's PAYLOAD decision time
     // (asOfEventTimeMs, a past market observation): a verdict stamped more than this far ahead of the
     // gateway wall clock is treated as malformed and fails closed, so a bad future timestamp can neither
     // evade the freshness window nor poison the monotonic last-value-wins supersede gate. Generous enough
     // to absorb realistic inter-service NTP skew; tight enough that a poisoned record can never freeze a
     // symbol's track for more than this bound.
-    private static final long GREEK_MOVE_AUTH_MAX_FUTURE_SKEW_MS = 60_000L;
+    private static final long OPTION_TRUTH_MAX_FUTURE_SKEW_MS = 60_000L;
     private final SessionRoutingEngine routingEngine;
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
@@ -212,13 +212,13 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> esOpenDirectionStatuses = new ConcurrentHashMap<>();
     // Greek-move-authenticity CURRENT verdict (the standalone service's MoveAuthenticityVerdict): ONE
     // current value per symbol (last-value-wins), so a late-joining client gets the CURRENT verdict on
-    // connect. Like the es-open-direction live STATUS it lives on the SHORT greekMoveAuthTtlMs window
+    // connect. Like the es-open-direction live STATUS it lives on the SHORT optionTruthTtlMs window
     // (default 5 min) — a stale verdict (dead producer, overnight leftover) is evicted/suppressed rather
     // than replayed (the UI move-authenticity track simply vanishes), never rendered as live. Same
     // standalone/global/JSON pass-through delivery class as the open-direction siblings; NOT in the
     // ui-batch. JSON pass-through; keyed by symbol (updateCache source-prefixes it to source|symbol,
     // exactly like es-open-direction-status keys by source|tradeDate and zero-dte by source|symbol|session).
-    private final Map<String, String> greekMoveAuthCurrent = new ConcurrentHashMap<>();
+    private final Map<String, String> optionTruthByStrike = new ConcurrentHashMap<>();
     // Current SPX 0DTE binary direction, keyed by source|symbol|sessionDate. This is a short-lived
     // standalone UI control signal: stale/malformed data must disappear instead of leaving a chain
     // tinted green/red after the underlying evidence is no longer current.
@@ -533,7 +533,7 @@ public class FeedGatewayService implements ReplayRunner {
             // Greek-move-authenticity CURRENT verdict is likewise a STANDALONE global advisory; replay the
             // fresh cached verdict per symbol so a page reload mid-session restores the move-authenticity
             // track rather than waiting for the next live verdict.
-            replayGreekMoveAuthCached(session);
+            replayOptionTruthCached(session);
             replayZeroDteIntelligenceCached(session);
         }
         // gex-by-strike is the one MULTI-SOURCE cache: IBKR/Unusual-Whales gex arrives via the JSON state
@@ -1267,9 +1267,9 @@ public class FeedGatewayService implements ReplayRunner {
         // window (default 5 min), which also bounds its seek-back here to the last few minutes.
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
         // Greek-move-authenticity CURRENT verdict (JSON, key = symbol): standalone global advisory like the
-        // open-direction siblings, OPTIONAL topic — on the SHORT greekMoveAuthTtlMs window (default 5 min),
+        // open-direction siblings, OPTIONAL topic — on the SHORT optionTruthTtlMs window (default 5 min),
         // which also bounds its seek-back here to the last few minutes.
-        topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
+        topicEvents.put(settings.optionTruthTopic(), new TopicBinding("DATABENTO", "option-truth"));
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
@@ -1349,9 +1349,9 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the ES open-direction live STATUS
         // heartbeat (JSON, standalone/optional — same rule as the forecast/outcome siblings above).
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
-        // Keep the cache + live JSON consumer topic sets symmetric: the greek-move-authenticity CURRENT
+        // Keep the cache + live JSON consumer topic sets symmetric: the option-truth-engine CURRENT
         // verdict (JSON, key = symbol, standalone/optional — same rule as the open-direction siblings above).
-        topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
+        topicEvents.put(settings.optionTruthTopic(), new TopicBinding("DATABENTO", "option-truth"));
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
@@ -1714,10 +1714,10 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                         continue;
                     }
-                    if ("greek-move-auth".equals(binding.event())) {
+                    if ("option-truth".equals(binding.event())) {
                         // Move-authenticity CURRENT verdict: a GLOBAL advisory track, its own websocket event,
                         // never a ui-batch row and never selection-routed. Every client receives it and filters
-                        // by symbol client-side. Freshness fail-closed: updateCache's SHORT greekMoveAuthTtlMs
+                        // by symbol client-side. Freshness fail-closed: updateCache's SHORT optionTruthTtlMs
                         // window returns null (cacheKey == null) for a stale/backfilled verdict, so a stale
                         // authenticity read is never live-broadcast — the UI track just stays hidden.
                         if (cacheKey != null && cacheCaughtUpFlag.get()) {
@@ -2002,7 +2002,7 @@ public class FeedGatewayService implements ReplayRunner {
                     // Greek-move-authenticity is a brand-new standalone service that may not be deployed (and
                     // the topic is absent after the daily Kafka wipe until it first produces) — optional, so
                     // its absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.greekMoveAuthCurrentTopic())
+                    || topic.equals(settings.optionTruthTopic())
                     || topic.equals(settings.vixOptionInteligenceTopic()));
     }
 
@@ -2109,11 +2109,11 @@ public class FeedGatewayService implements ReplayRunner {
             // Greek-move-authenticity CURRENT verdict is STANDALONE (never in the ui-batch) too: re-push it
             // explicitly to already-connected clients once this consumer's cache is caught up, so a
             // dashboard left open across a gateway restart gets the current verdict back without a reload.
-            // (replayGreekMoveAuthCached only re-pushes verdicts still inside their SHORT 5-min isCacheFresh
+            // (replayOptionTruthCached only re-pushes verdicts still inside their SHORT 5-min isCacheFresh
             // window — never a stale overnight verdict.)
-            if (events.contains("greek-move-auth")) {
+            if (events.contains("option-truth")) {
                 for (WebSocketSession client : clients) {
-                    replayGreekMoveAuthCached(client);
+                    replayOptionTruthCached(client);
                 }
             }
             System.out.println("Feed gateway " + name + " cache caught up; replayed cached state to clients.");
@@ -2722,8 +2722,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = esOpenDirectionOutcomeCacheKey(json, key);
         } else if ("es-open-direction-status".equals(event)) {
             key = esOpenDirectionStatusCacheKey(json, key);
-        } else if ("greek-move-auth".equals(event)) {
-            key = greekMoveAuthCacheKey(json, key);
+        } else if ("option-truth".equals(event)) {
+            key = optionTruthCacheKey(json, key);
         } else if ("zero-dte-intelligence".equals(event)) {
             key = zeroDteIntelligenceCacheKey(json, key);
         } else if ("liquidity-heatmap".equals(event)) {
@@ -2864,10 +2864,10 @@ public class FeedGatewayService implements ReplayRunner {
                 esOpenDirectionStatuses.put(key, json); // ONE current status per source|tradeDate — last heartbeat wins
                 return key;
             }
-            case "greek-move-auth" -> {
+            case "option-truth" -> {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
-                greekMoveAuthCurrent.put(key, json); // ONE current verdict per symbol — last-value-wins
+                optionTruthByStrike.put(key, json); // ONE current verdict per symbol — last-value-wins
                 return key;
             }
             case "zero-dte-intelligence" -> {
@@ -3545,14 +3545,14 @@ public class FeedGatewayService implements ReplayRunner {
             // ~5-min seek-back (windowTtlMsFor -> seekBackMs) after a gateway restart.
             return CachePolicy.expiring(settings.esOpenDirectionStatusTtlMs());
         }
-        if ("greek-move-auth".equals(event)) {
+        if ("option-truth".equals(event)) {
             // Move-authenticity CURRENT verdict: SHORT window (default 5 min, the es-open-direction
             // STATUS / liquidity-heatmap / dealer-ledger freshness class) — a verdict is only meaningful
             // while CURRENT. A stale verdict (dead producer, overnight leftover) must read as absent, not
             // replay as live. The ONE seam: drives ingest eviction (updateCache -> isExpired), periodic
             // purge, the isCacheFresh replay gate, and the bounded ~5-min seek-back (windowTtlMsFor ->
             // seekBackMs) after a gateway restart.
-            return CachePolicy.expiring(settings.greekMoveAuthTtlMs());
+            return CachePolicy.expiring(settings.optionTruthTtlMs());
         }
         if (isEsOpenDirectionEvent(event)) {
             // The 09:15 forecast (and each horizon outcome) stays valid for the whole session: a long
@@ -3696,12 +3696,12 @@ public class FeedGatewayService implements ReplayRunner {
             // the live chain dark red/green.
             return zeroDteIntelligenceTimestamp(json);
         }
-        if ("greek-move-auth".equals(event)) {
+        if ("option-truth".equals(event)) {
             // Freshness MUST track the PAYLOAD event time (asOfEventTimeMs), not the Kafka ARRIVAL time
             // (mirrors dealer-ledger/zero-dte). A producer catching up / backfilling appends records now
-            // (fresh arrival) whose asOfEventTimeMs is old — using arrival time would let a stale verdict
-            // pass the SHORT greekMoveAuthTtlMs window and render the authenticity track as live.
-            return greekMoveAuthTimestamp(json);
+            // (fresh arrival) whose eventTimeMs is old — using arrival time would let a stale reading
+            // pass the SHORT optionTruthTtlMs window and render the strength gauge as live.
+            return optionTruthTimestamp(json);
         }
         if ("liquidity-heatmap".equals(event)) {
             long payloadTime = liquidityHeatmapTimestamp(json);
@@ -3801,7 +3801,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * Decision time (asOfEventTimeMs) of a greek-move-authenticity verdict; -1 means malformed/absent/
+     * Decision time (asOfEventTimeMs) of a option-truth-engine verdict; -1 means malformed/absent/
      * implausibly-future and fails closed (such a verdict can never be cached or replayed as current).
      *
      * <p><b>Clock-skew freeze-safety.</b> asOfEventTimeMs is a PAST observation (the market event the
@@ -3809,13 +3809,17 @@ public class FeedGatewayService implements ReplayRunner {
      * future-dated verdict would (a) evade the SHORT-window expiry gate and (b) POISON the monotonic
      * last-value-wins supersede check in {@code updateCache} — its future event time would reject every
      * subsequently-arriving CORRECT verdict as "older" until wall time catches up, freezing the symbol's
-     * track. Records beyond {@link #GREEK_MOVE_AUTH_MAX_FUTURE_SKEW_MS} ahead of now are rejected here
+     * track. Records beyond {@link #OPTION_TRUTH_MAX_FUTURE_SKEW_MS} ahead of now are rejected here
      * (returned as -1) so they are dropped at ingest and can never enter {@code cacheEventTimes}.
      */
-    private long greekMoveAuthTimestamp(String json) {
+    private long optionTruthTimestamp(String json) {
         try {
-            long eventTimeMs = longField(mapper.readTree(json), "asOfEventTimeMs", -1L);
-            if (eventTimeMs > System.currentTimeMillis() + GREEK_MOVE_AUTH_MAX_FUTURE_SKEW_MS) {
+            // The option-truth engine emits "eventTimeMs" (PairTruthReading). "asOfEventTimeMs" is
+            // accepted as a fallback so a mixed-version producer during a roll is not silently
+            // treated as timestamp-less (-1), which would disable freshness for every reading.
+            com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(json);
+            long eventTimeMs = longField(root, "eventTimeMs", longField(root, "asOfEventTimeMs", -1L));
+            if (eventTimeMs > System.currentTimeMillis() + OPTION_TRUTH_MAX_FUTURE_SKEW_MS) {
                 return -1L; // implausibly future — fail closed, never cache/replay/poison the supersede gate
             }
             return eventTimeMs;
@@ -3922,8 +3926,8 @@ public class FeedGatewayService implements ReplayRunner {
             esOpenDirectionOutcomes.remove(versionKey.substring("es-open-direction-outcome:".length()));
         } else if (versionKey.startsWith("es-open-direction-status:")) {
             esOpenDirectionStatuses.remove(versionKey.substring("es-open-direction-status:".length()));
-        } else if (versionKey.startsWith("greek-move-auth:")) {
-            greekMoveAuthCurrent.remove(versionKey.substring("greek-move-auth:".length()));
+        } else if (versionKey.startsWith("option-truth:")) {
+            optionTruthByStrike.remove(versionKey.substring("option-truth:".length()));
         } else if (versionKey.startsWith("zero-dte-intelligence:")) {
             zeroDteIntelligence.remove(versionKey.substring("zero-dte-intelligence:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
@@ -4385,25 +4389,25 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
-    private void replayGreekMoveAuthCached(WebSocketSession session) {
-        // Late-join delivery for the greek-move-authenticity CURRENT verdict: replay the cached verdict
+    private void replayOptionTruthCached(WebSocketSession session) {
+        // Late-join delivery for the option-truth-engine CURRENT verdict: replay the cached verdict
         // per symbol (SPX/ES live under distinct symbol keys, so both current verdicts survive
         // side-by-side). Like the open-direction siblings this is intentionally NOT filtered by the active
         // market selection — it is a GLOBAL advisory the UI renders in its own move-authenticity track,
         // symbol-filtered client-side. The purge-first + isCacheFresh gates run on the SHORT
-        // greekMoveAuthTtlMs window (5 min via cachePolicyFor): a late joiner gets the CURRENT verdict
+        // optionTruthTtlMs window (5 min via cachePolicyFor): a late joiner gets the CURRENT verdict
         // only; anything older is simply absent and the UI track stays hidden.
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
-        for (Map.Entry<String, String> entry : greekMoveAuthCurrent.entrySet()) {
+        for (Map.Entry<String, String> entry : optionTruthByStrike.entrySet()) {
             String json = entry.getValue();
             if (json == null || json.isBlank()) {
                 continue;
             }
-            if (!isCacheFresh("greek-move-auth:" + entry.getKey(), nowMs)) {
+            if (!isCacheFresh("option-truth:" + entry.getKey(), nowMs)) {
                 continue;
             }
-            send(session, "greek-move-auth", json);
+            send(session, "option-truth", json);
         }
     }
 
@@ -4644,15 +4648,27 @@ public class FeedGatewayService implements ReplayRunner {
      * by source|symbol|session), so the stored key, version key, eviction key, and replay key are one and
      * the same {@code DATABENTO|SPX} form everywhere.
      */
-    private String greekMoveAuthCacheKey(String json, String fallback) {
+    /**
+     * Cache key for an option-truth reading: {@code symbol|expiry|strike|horizon}. Unlike the
+     * per-SYMBOL verdict this relay used to carry, the option-truth engine emits ONE reading per
+     * STRIKE (and per horizon), so a symbol-only key would make every strike overwrite the last and
+     * the chain would render a single arbitrary row. Horizon is included because STEP and ANCHOR are
+     * independent readings of the same strike.
+     */
+    private String optionTruthCacheKey(String json, String fallback) {
         try {
-            String symbol = text(mapper.readTree(json), "symbol").toUpperCase();
-            if (!symbol.isBlank()) {
-                return symbol;
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            JsonNode strike = root.get("strike");
+            String horizon = text(root, "horizon").toUpperCase();
+            if (!symbol.isBlank() && !expiry.isBlank() && strike != null && strike.isNumber()) {
+                String base = symbol + "|" + expiry + "|" + strike.decimalValue().stripTrailingZeros().toPlainString();
+                return horizon.isBlank() ? base : base + "|" + horizon;
             }
         } catch (JsonProcessingException ignored) {
-            // Malformed payloads expire immediately via greekMoveAuthTimestamp; fallback is only used to
-            // give updateCache a stable eviction key (the Kafka record key is also the symbol).
+            // Malformed payloads expire immediately via optionTruthTimestamp; fallback is only used to
+            // give updateCache a stable eviction key.
         }
         return fallback;
     }
@@ -4864,7 +4880,7 @@ public class FeedGatewayService implements ReplayRunner {
         // replayCacheMap cannot deliver it (GatewayRecordMapper has no route), so replay it directly here
         // too, which restores the move-authenticity track in per-session (auth) mode and after
         // return-to-live from a historical replay (replayLiveCacheToAppSession -> replayCachedToSocket).
-        replayGreekMoveAuthCached(session);
+        replayOptionTruthCached(session);
     }
 
     private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {
@@ -5708,9 +5724,9 @@ public class FeedGatewayService implements ReplayRunner {
             // Greek-move-authenticity CURRENT verdict is the same class of GLOBAL advisory overlay
             // (per-symbol, symbol-filtered client-side) — allowlist it so routeOrBroadcast/broadcast fan it
             // out in per-session (auth) mode too, not only legacy mode. Staleness is enforced upstream:
-            // updateCache's SHORT 5-min greekMoveAuthTtlMs window returns null for a stale verdict, which
+            // updateCache's SHORT 5-min optionTruthTtlMs window returns null for a stale verdict, which
             // suppresses the broadcast entirely.
-            "greek-move-auth");
+            "option-truth");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);
