@@ -68,6 +68,21 @@ public final class PinFlowAggregator {
      */
     public static PinFlowResponse aggregate(List<StrikeMinuteRow> strikeRows, List<GexMinuteRow> gexRows,
                                             ZoneId zone) {
+        return aggregate(strikeRows, gexRows, zone, java.util.Map.of());
+    }
+
+    /**
+     * As above, plus an authoritative per-minute spot series from {@code pin_spot_minute}.
+     *
+     * <p>{@code spotHistory} WINS over the spot carried on the strike rows. That column is a
+     * leakage-guarded TRAINING field and is frequently NULL — on dev it was 100% NULL while the spot feed
+     * was healthy, which left the price line flat. The history table records the plain market fact — a spot
+     * observed during minute M (the FIRST tick of that minute; the writer throttles to one sample/minute) —
+     * with no such guard. An empty map reproduces the previous behaviour exactly, so environments whose
+     * writer has not been upgraded are unaffected.
+     */
+    public static PinFlowResponse aggregate(List<StrikeMinuteRow> strikeRows, List<GexMinuteRow> gexRows,
+                                            ZoneId zone, java.util.Map<Long, BigDecimal> spotHistory) {
         // ---- Rule 1: frame grid = sorted distinct minutes present across BOTH tables. ----
         TreeSet<Long> minuteSet = new TreeSet<>();
         for (StrikeMinuteRow r : strikeRows) {
@@ -141,7 +156,10 @@ public final class PinFlowAggregator {
             t.add(local.format(HHMM));
 
             // ---- Rule 6: spot avg / carry-forward. ----
-            List<BigDecimal> spots = spotByMinute.get(minute);
+            BigDecimal authoritative = spotHistory == null ? null : spotHistory.get(minute);
+            List<BigDecimal> spots = authoritative != null
+                    ? List.of(authoritative)          // history wins over the leakage-guarded strike column
+                    : spotByMinute.get(minute);
             if (spots != null && !spots.isEmpty()) {
                 BigDecimal sum = BigDecimal.ZERO;
                 for (BigDecimal s : spots) {

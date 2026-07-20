@@ -14,6 +14,7 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -55,6 +56,16 @@ public final class PinFlowStore {
                     + "WHERE as_of_minute >= ? AND as_of_minute < ? "
                     + "AND strike >= ? AND strike <= ?";
 
+    // Per-minute spot history (pin_spot_minute). This is the series the CHART draws. It is separate from
+    // pin_strike_minute.spot, which is a leakage-guarded per-strike TRAINING column and is frequently NULL
+    // (measured: 100% NULL on dev while the spot feed was healthy) — leaving the price line flat/absent.
+    // MUST filter by symbol: pin_spot_minute is multi-symbol and the spot consumer writes every
+    // underlying it sees (SPX ~7478 AND VIX ~17.9 on the same dev feed). Without this filter their rows
+    // collide in one minute->spot map and the chart can plot the wrong instrument's price.
+    private static final String SPOT_HISTORY_SQL =
+            "SELECT date_trunc('minute', as_of_minute) AS m, spot FROM pin_spot_minute "
+                    + "WHERE symbol = ? AND as_of_minute >= ? AND as_of_minute < ? ORDER BY as_of_minute";
+
     private static final String SPOT_RANGE_SQL =
             "SELECT min(spot), max(spot) FROM pin_strike_minute "
                     + "WHERE as_of_minute >= ? AND as_of_minute < ? AND spot IS NOT NULL";
@@ -65,6 +76,7 @@ public final class PinFlowStore {
     private final java.time.LocalTime sessionEnd;
     private final int queryTimeoutSeconds;
     private final long cacheTtlMs;
+    private final String spotSymbol;
     // Atomic per-key coalescing: the first caller for a (date,lo,hi) installs a future and runs the DB
     // work; concurrent callers for the SAME key await that same future → exactly one DB fetch per key.
     private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
@@ -79,6 +91,7 @@ public final class PinFlowStore {
         this.sessionEnd = settings.pinFlowSessionEnd();
         this.queryTimeoutSeconds = settings.pinFlowQueryTimeoutSeconds();
         this.cacheTtlMs = settings.pinFlowCacheTtlMs();
+        this.spotSymbol = settings.initialSymbol();
     }
 
     /** Test seam: explicit datasource + params, no Spring settings. */
@@ -96,6 +109,7 @@ public final class PinFlowStore {
         this.sessionEnd = sessionEnd;
         this.queryTimeoutSeconds = queryTimeoutSeconds;
         this.cacheTtlMs = cacheTtlMs;
+        this.spotSymbol = "SPX";   // test seam default; production uses settings.initialSymbol()
     }
 
     public boolean dbConfigured() {
@@ -336,7 +350,8 @@ public final class PinFlowStore {
                     readStrikeRows(conn, startTs, endTs, lo, hi, active);
             List<PinFlowAggregator.GexMinuteRow> gexRows =
                     readGexRows(conn, startTs, endTs, gexLo, gexHi, active);
-            return PinFlowAggregator.aggregate(strikeRows, gexRows, zone);
+            Map<Long, BigDecimal> spotHistory = readSpotHistory(conn, startTs, endTs, active);
+            return PinFlowAggregator.aggregate(strikeRows, gexRows, zone, spotHistory);
         } catch (SQLException e) {
             // A cancelled statement surfaces here as a SQLException — map it to the cancel signal.
             if (Thread.currentThread().isInterrupted() || watcher.fired()) {
@@ -417,6 +432,44 @@ public final class PinFlowStore {
             running = false;
             thread.interrupt();
         }
+    }
+
+    /**
+     * Per-minute spot series from pin_spot_minute. Empty map when the table has nothing for the window —
+     * the aggregator then falls back to the spot carried on the strike rows, so behaviour is unchanged
+     * wherever that column is populated.
+     */
+    private Map<Long, BigDecimal> readSpotHistory(Connection conn, Timestamp start, Timestamp end,
+                                                  java.util.concurrent.atomic.AtomicReference<PreparedStatement> active)
+            throws SQLException {
+        Map<Long, BigDecimal> byMinute = new HashMap<>();
+        try (PreparedStatement ps = conn.prepareStatement(SPOT_HISTORY_SQL)) {
+            active.set(ps);
+            ps.setQueryTimeout(queryTimeoutSeconds);
+            ps.setString(1, spotSymbol);
+            ps.setTimestamp(2, start);
+            ps.setTimestamp(3, end);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    BigDecimal spot = rs.getBigDecimal("spot");
+                    if (spot != null) {
+                        byMinute.put(rs.getTimestamp("m").getTime(), spot);
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            // Degrade ONLY when the table genuinely does not exist yet (writer not upgraded on this env).
+            // Everything else — timeouts, CANCELLATION (the deadline path cancels this statement), grants,
+            // type/schema bugs, dead connections — must propagate, or a cancelled request would silently
+            // return a stale legacy response and real faults would masquerade as "no history".
+            if ("42P01".equals(e.getSQLState())) {
+                return Map.of();
+            }
+            throw e;
+        } finally {
+            active.set(null);
+        }
+        return byMinute;
     }
 
     private List<PinFlowAggregator.StrikeMinuteRow> readStrikeRows(Connection conn, Timestamp start,
