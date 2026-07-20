@@ -43,7 +43,7 @@ public final class PinFlowStore {
     // Session-to-date cumulative sell notionals + spot, band-filtered, floored to the minute.
     private static final String STRIKE_SQL =
             "SELECT date_trunc('minute', as_of_minute) AS m, strike, "
-                    + "call_sell_notional, put_sell_notional, spot, trade_date "
+                    + "call_sell_notional, put_sell_notional, call_buy_notional, put_buy_notional, spot, trade_date "
                     + "FROM pin_strike_minute "
                     + "WHERE as_of_minute >= ? AND as_of_minute < ? "
                     + "AND strike >= ? AND strike <= ?";
@@ -444,6 +444,8 @@ public final class PinFlowStore {
                             strike,
                             rs.getBigDecimal("call_sell_notional"),
                             rs.getBigDecimal("put_sell_notional"),
+                            rs.getBigDecimal("call_buy_notional"),
+                            rs.getBigDecimal("put_buy_notional"),
                             rs.getBigDecimal("spot"),
                             rs.getString("trade_date")));
                 }

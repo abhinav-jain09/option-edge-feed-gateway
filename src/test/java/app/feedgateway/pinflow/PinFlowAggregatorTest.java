@@ -35,6 +35,7 @@ class PinFlowAggregatorTest {
                                                         long putCum, Integer spot, String tradeDate) {
         return new PinFlowAggregator.StrikeMinuteRow(minute(hh, mm), strike,
                 BigDecimal.valueOf(callCum), BigDecimal.valueOf(putCum),
+                BigDecimal.ZERO, BigDecimal.ZERO,
                 spot == null ? null : BigDecimal.valueOf(spot), tradeDate);
     }
 
@@ -95,6 +96,45 @@ class PinFlowAggregatorTest {
 
         assertEquals(1, out.cp().stream().mapToInt(row -> row.get(0)).sum(),
                 "500 + 500 must round once to 1K, not twice to 2K");
+    }
+
+    @Test
+    void reportsNetFlowNotGross() {
+        // The bar must show NET (sold - bought). Live ES 7600 sold $1.63M against $1.34M bought: a gross
+        // bar 5.6x the real ~$0.29M net position, which reads as a huge one-way trade when it is not.
+        // put: sold 0 -> 1_628_000, bought 0 -> 1_336_000  => net 292_000 -> 292 $K
+        List<PinFlowAggregator.StrikeMinuteRow> rows = List.of(
+                new PinFlowAggregator.StrikeMinuteRow(minute(9, 30), 7600,
+                        BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO,
+                        BigDecimal.valueOf(7500), "2026-07-19"),
+                new PinFlowAggregator.StrikeMinuteRow(minute(9, 31), 7600,
+                        BigDecimal.ZERO, BigDecimal.valueOf(1_628_000),
+                        BigDecimal.ZERO, BigDecimal.valueOf(1_336_000),
+                        BigDecimal.valueOf(7500), "2026-07-19"));
+
+        PinFlowResponse out = PinFlowAggregator.aggregate(rows, List.of(), ET);
+
+        assertEquals(292, out.cp().stream().mapToInt(r -> r.get(0)).sum(),
+                "must report NET sold (1_628_000 - 1_336_000), not the 1_628_000 gross");
+    }
+
+    @Test
+    void netIsNegativeWhenBuyingExceedsSelling() {
+        // Sign is meaningful: negative = net BOUGHT at that strike. Clamping it away would hide the
+        // distinction between "nobody traded" and "the strike was accumulated".
+        List<PinFlowAggregator.StrikeMinuteRow> rows = List.of(
+                new PinFlowAggregator.StrikeMinuteRow(minute(9, 30), 7600,
+                        BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO,
+                        BigDecimal.valueOf(7500), "2026-07-19"),
+                new PinFlowAggregator.StrikeMinuteRow(minute(9, 31), 7600,
+                        BigDecimal.ZERO, BigDecimal.valueOf(100_000),
+                        BigDecimal.ZERO, BigDecimal.valueOf(400_000),
+                        BigDecimal.valueOf(7500), "2026-07-19"));
+
+        PinFlowResponse out = PinFlowAggregator.aggregate(rows, List.of(), ET);
+
+        assertEquals(-300, out.cp().stream().mapToInt(r -> r.get(0)).sum(),
+                "net must go negative when buying exceeds selling");
     }
 
     private static PinFlowAggregator.GexMinuteRow gr(int hh, int mm, int strike, long gex) {
