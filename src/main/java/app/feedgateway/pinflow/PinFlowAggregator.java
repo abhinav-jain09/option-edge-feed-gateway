@@ -40,7 +40,18 @@ public final class PinFlowAggregator {
 
     /** A row of {@code pin_strike_minute} (already band-filtered, already floored to the minute). */
     public record StrikeMinuteRow(long minuteEpoch, int strike, BigDecimal callSellNotional,
-                                  BigDecimal putSellNotional, BigDecimal spot) {
+                                  BigDecimal putSellNotional, BigDecimal spot, String tradeDate) {
+    }
+
+    /**
+     * Cumulative-counter identity. The counters RESET per trade_date, and one session window legitimately
+     * spans two trade_dates (ES runs 18:00→17:00 ET while trade_date rolls at midnight). Keying the
+     * baseline by strike alone let the two sessions' counters collide: de-duplicating (minute,strike) via
+     * MAX picked the OLD session's high cumulative over the NEW session's fresh low one, so the old
+     * session's entire total was re-emitted as a single positive delta — measured $3.25M against a true
+     * $1.65M at ES 7600. Track each (tradeDate,strike) counter independently and sum their deltas.
+     */
+    private record TdStrike(String tradeDate, int strike) {
     }
 
     /** A row of {@code pin_self_gex_minute} (already widened-band-filtered, floored to the minute). */
@@ -77,14 +88,15 @@ public final class PinFlowAggregator {
 
         // ---- Index rows by minute for O(1) lookup, de-duplicating (minute,strike) via MAX (rule 2). ----
         // callCum[minute][strike] and putCum[minute][strike] = max cumulative for that cell.
-        Map<Long, Map<Integer, BigDecimal>> callCum = new HashMap<>();
-        Map<Long, Map<Integer, BigDecimal>> putCum = new HashMap<>();
+        Map<Long, Map<TdStrike, BigDecimal>> callCum = new HashMap<>();
+        Map<Long, Map<TdStrike, BigDecimal>> putCum = new HashMap<>();
         Map<Long, List<BigDecimal>> spotByMinute = new HashMap<>();
         for (StrikeMinuteRow r : strikeRows) {
+            TdStrike key = new TdStrike(r.tradeDate() == null ? "" : r.tradeDate(), r.strike());
             callCum.computeIfAbsent(r.minuteEpoch(), m -> new HashMap<>())
-                    .merge(r.strike(), nz(r.callSellNotional()), PinFlowAggregator::max);
+                    .merge(key, nz(r.callSellNotional()), PinFlowAggregator::max);
             putCum.computeIfAbsent(r.minuteEpoch(), m -> new HashMap<>())
-                    .merge(r.strike(), nz(r.putSellNotional()), PinFlowAggregator::max);
+                    .merge(key, nz(r.putSellNotional()), PinFlowAggregator::max);
             if (r.spot() != null) {
                 spotByMinute.computeIfAbsent(r.minuteEpoch(), m -> new ArrayList<>()).add(r.spot());
             }
@@ -101,8 +113,8 @@ public final class PinFlowAggregator {
         }
 
         // ---- Per-strike cumulative baseline (rule 5): seen[strike] = last cumulative we emitted a delta against. ----
-        Map<Integer, BigDecimal> callBaseline = new HashMap<>();
-        Map<Integer, BigDecimal> putBaseline = new HashMap<>();
+        Map<TdStrike, BigDecimal> callBaseline = new HashMap<>();
+        Map<TdStrike, BigDecimal> putBaseline = new HashMap<>();
 
         List<String> t = new ArrayList<>(frames.size());
         List<Integer> sp = new ArrayList<>(frames.size());
@@ -130,13 +142,25 @@ public final class PinFlowAggregator {
             sp.add(prevSpot);
 
             // ---- Rule 5: per-strike CALL/PUT sold delta with per-strike baseline. ----
-            Map<Integer, BigDecimal> callThis = callCum.getOrDefault(minute, Map.of());
-            Map<Integer, BigDecimal> putThis = putCum.getOrDefault(minute, Map.of());
+            Map<TdStrike, BigDecimal> callThis = callCum.getOrDefault(minute, Map.of());
+            Map<TdStrike, BigDecimal> putThis = putCum.getOrDefault(minute, Map.of());
+            // Sum per strike ACROSS trade_dates: each session's counter advances on its own baseline, so a
+            // rollover inside the window contributes only its own real increment, never a re-count.
+            // Sum the RAW deltas first and round ONCE per strike: rounding each trade_date's delta to $K
+            // before summing inflates split flow (two $500 deltas would round to 1K + 1K = 2K, not 1K).
+            Map<Integer, BigDecimal> ccRaw = new HashMap<>();
+            Map<Integer, BigDecimal> cpRaw = new HashMap<>();
+            for (Map.Entry<TdStrike, BigDecimal> e : callThis.entrySet()) {
+                ccRaw.merge(e.getKey().strike(), deltaRaw(e.getKey(), e.getValue(), callBaseline), BigDecimal::add);
+            }
+            for (Map.Entry<TdStrike, BigDecimal> e : putThis.entrySet()) {
+                cpRaw.merge(e.getKey().strike(), deltaRaw(e.getKey(), e.getValue(), putBaseline), BigDecimal::add);
+            }
             List<Integer> ccRow = new ArrayList<>(strikes.size());
             List<Integer> cpRow = new ArrayList<>(strikes.size());
             for (Integer strike : strikes) {
-                ccRow.add(deltaK(strike, callThis, callBaseline));
-                cpRow.add(deltaK(strike, putThis, putBaseline));
+                ccRow.add(toK(ccRaw.get(strike)));
+                cpRow.add(toK(cpRaw.get(strike)));
             }
             cc.add(ccRow);
             cp.add(cpRow);
@@ -170,22 +194,32 @@ public final class PinFlowAggregator {
      * First observation seeds the baseline and emits 0; a strike absent this minute keeps its baseline
      * (delta 0); a never-seen absent strike stays 0.
      */
-    private static int deltaK(int strike, Map<Integer, BigDecimal> thisMinute, Map<Integer, BigDecimal> baseline) {
-        BigDecimal current = thisMinute.get(strike);
+    private static BigDecimal deltaRaw(TdStrike key, BigDecimal current, Map<TdStrike, BigDecimal> baseline) {
         if (current == null) {
-            return 0; // absent this minute: carry-forward baseline unchanged, delta 0
+            return BigDecimal.ZERO; // absent this minute: carry-forward baseline unchanged, delta 0
         }
-        BigDecimal prev = baseline.get(strike);
+        BigDecimal prev = baseline.get(key);
         if (prev == null) {
-            baseline.put(strike, current); // FIRST observation: seed, emit 0 (never the whole cumulative)
+            baseline.put(key, current); // FIRST observation: seed, emit 0 (never the whole cumulative)
+            return BigDecimal.ZERO;
+        }
+        if (current.compareTo(prev) < 0) {
+            // A DECREASE within one (tradeDate,strike) counter is impossible in-order — it means a stale
+            // or replayed row. Emit 0 and KEEP the high-water baseline: lowering it would let the
+            // subsequent in-order row re-emit flow already counted (1_628_000 -> stale 1_000_000 ->
+            // replay 1_628_000 would otherwise emit a second +628_000).
+            return BigDecimal.ZERO;
+        }
+        baseline.put(key, current);
+        return current.subtract(prev);
+    }
+
+    /** Raw notional → $K, round half-up. Applied ONCE, after cross-trade_date summation. */
+    private static int toK(BigDecimal raw) {
+        if (raw == null || raw.signum() <= 0) {
             return 0;
         }
-        baseline.put(strike, current);
-        BigDecimal delta = current.subtract(prev);
-        if (delta.signum() < 0) {
-            return 0; // clamp negatives (cumulative should never decrease; defensive)
-        }
-        return delta.divide(THOUSAND, 0, RoundingMode.HALF_UP).intValue();
+        return raw.divide(THOUSAND, 0, RoundingMode.HALF_UP).intValue();
     }
 
     private static BigDecimal nz(BigDecimal v) {

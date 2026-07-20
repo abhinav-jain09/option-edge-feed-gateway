@@ -27,9 +27,74 @@ class PinFlowAggregatorTest {
 
     private static PinFlowAggregator.StrikeMinuteRow sr(int hh, int mm, int strike, long callCum,
                                                         long putCum, Integer spot) {
+        return sr(hh, mm, strike, callCum, putCum, spot, "2026-07-19");
+    }
+
+    /** Same, but on an explicit trade_date — the cumulative counters reset per trade_date. */
+    private static PinFlowAggregator.StrikeMinuteRow sr(int hh, int mm, int strike, long callCum,
+                                                        long putCum, Integer spot, String tradeDate) {
         return new PinFlowAggregator.StrikeMinuteRow(minute(hh, mm), strike,
                 BigDecimal.valueOf(callCum), BigDecimal.valueOf(putCum),
-                spot == null ? null : BigDecimal.valueOf(spot));
+                spot == null ? null : BigDecimal.valueOf(spot), tradeDate);
+    }
+
+    @Test
+    void sessionRolloverDoesNotRecountThePreviousTradeDate() {
+        // REGRESSION (live ES 7600): the ES window (18:00->17:00 ET) spans TWO trade_dates whose
+        // cumulative counters reset independently. Keying the baseline by strike alone, the
+        // (minute,strike) de-dup took MAX across trade_dates — picking the OLD session's high cumulative
+        // over the NEW session's fresh low one — and re-emitted the old session's whole total as one
+        // positive delta. Measured live: $3.25M reported against $1.65M of real flow.
+        //
+        // Old session climbs 1_000_000 -> 1_628_000 (real new flow 628_000), then the trade_date rolls
+        // and the new session starts at 9_400 -> 28_800 (real new flow 19_400). Both appear in one window,
+        // and at 09:32 BOTH trade_dates report the same minute (as happens on a writer restart).
+        PinFlowResponse out = PinFlowAggregator.aggregate(
+                List.of(
+                        sr(9, 30, 7600, 0, 1_000_000, 7500, "2026-07-19"),
+                        sr(9, 31, 7600, 0, 1_628_000, 7500, "2026-07-19"),
+                        sr(9, 32, 7600, 0, 9_400, 7500, "2026-07-20"),
+                        sr(9, 32, 7600, 0, 1_628_000, 7500, "2026-07-19"), // old td repeats this minute
+                        sr(9, 33, 7600, 0, 28_800, 7500, "2026-07-20")),
+                List.of(), ET);
+
+        int totalPutSoldK = out.cp().stream().mapToInt(row -> row.get(0)).sum();
+        // 628k (old session) + 19.4k (new session) = 647.4k -> 647 in $K. NOT 2_275 (the re-count).
+        assertEquals(647, totalPutSoldK,
+                "a trade_date rollover inside the window must not re-count the previous session");
+    }
+
+    @Test
+    void staleReplayOfAnAlreadyCountedRowIsNotRecounted() {
+        // Codex: deltaK used to lower the baseline before the negative check, so a stale/replayed row
+        // (1_628_000 -> 1_000_000 -> 1_628_000) emitted 0 then a SECOND +628_000. The baseline is now a
+        // high-water mark, so the replay emits nothing.
+        PinFlowResponse out = PinFlowAggregator.aggregate(
+                List.of(
+                        sr(9, 30, 7600, 0, 1_000_000, 7500, "2026-07-19"),
+                        sr(9, 31, 7600, 0, 1_628_000, 7500, "2026-07-19"),
+                        sr(9, 32, 7600, 0, 1_000_000, 7500, "2026-07-19"),  // stale
+                        sr(9, 33, 7600, 0, 1_628_000, 7500, "2026-07-19")), // replay
+                List.of(), ET);
+
+        assertEquals(628, out.cp().stream().mapToInt(row -> row.get(0)).sum(),
+                "a stale replay must not re-emit flow already counted");
+    }
+
+    @Test
+    void splitFlowRoundsOnceAfterSummation() {
+        // Codex: rounding each trade_date's delta to $K BEFORE summing inflated split flow — two 500
+        // deltas became 1K + 1K = 2K. Sum raw, then round once => 1K.
+        PinFlowResponse out = PinFlowAggregator.aggregate(
+                List.of(
+                        sr(9, 30, 7600, 0, 0, 7500, "2026-07-19"),
+                        sr(9, 30, 7600, 0, 0, 7500, "2026-07-20"),
+                        sr(9, 31, 7600, 0, 500, 7500, "2026-07-19"),
+                        sr(9, 31, 7600, 0, 500, 7500, "2026-07-20")),
+                List.of(), ET);
+
+        assertEquals(1, out.cp().stream().mapToInt(row -> row.get(0)).sum(),
+                "500 + 500 must round once to 1K, not twice to 2K");
     }
 
     private static PinFlowAggregator.GexMinuteRow gr(int hh, int mm, int strike, long gex) {
