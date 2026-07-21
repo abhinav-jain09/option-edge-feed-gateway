@@ -131,6 +131,7 @@ public class FeedGatewayService implements ReplayRunner {
             "strike-sr",
             "gex-magnet",
             "es-gex",
+            "gex-strike-lifecycle",
             "max-pain",
             "liquidity-heatmap",
             "option-price-behavior",
@@ -197,6 +198,11 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     // ES-on-SPX aligned whole-book per symbol|expiry (JSON, roll-forward: latest emitEventTimeMs wins).
     private final Map<String, String> esGex = new ConcurrentHashMap<>();
+    // Per-strike gamma lifecycle (emerging/sticky/fading), keyed symbol|expiry|strike (last-value-wins,
+    // like gex-by-strike). rev-17: the producer emits ONLY active strikes plus a one-shot NEUTRAL "clear"
+    // when a strike goes inactive; that NEUTRAL overwrites the cache entry, so a reconnect replays NEUTRAL
+    // (no badge) for a departed strike. Cache is model-agnostic — no gateway-side frame bookkeeping.
+    private final Map<String, String> gexStrikeLifecycle = new ConcurrentHashMap<>();
     private final Map<String, String> maxPain = new ConcurrentHashMap<>();
     // Agent A short-premium recommendations, cached per trade_id (last-value-wins), replayed on connect.
     private final Map<String, String> shortPremiumRecommendations = new ConcurrentHashMap<>();
@@ -264,6 +270,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingStrikeSr = new LinkedHashMap<>();
     private final Map<String, String> pendingGexMagnet = new LinkedHashMap<>();
     private final Map<String, String> pendingEsGex = new LinkedHashMap<>();
+    private final Map<String, String> pendingGexStrikeLifecycle = new LinkedHashMap<>();
     private final Map<String, String> pendingMaxPain = new LinkedHashMap<>();
     private final Map<String, String> pendingOptionPriceBehaviors = new LinkedHashMap<>();
     private final Map<String, String> pendingOpbV2ByOptions = new LinkedHashMap<>();
@@ -515,7 +522,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (avroCaughtUp.get()) {
             // max-pain + strike-sr are DATABENTO-only Avro, so they bootstrap purely via the Avro consumer.
-            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet"));
+            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gex-strike-lifecycle"));
         }
         if (stateCaughtUp.get()) {
             sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "es-gex"));
@@ -890,6 +897,7 @@ public class FeedGatewayService implements ReplayRunner {
                 // data fault. Report "disabled" + an explicit flag instead of a misleading count.
                 + "\"esGexEnabled\":" + settings.esGexEnabled() + ","
                 + "\"esGex\":" + (settings.esGexEnabled() ? String.valueOf(esGex.size()) : "\"disabled\"") + ","
+                + "\"gexStrikeLifecycle\":" + gexStrikeLifecycle.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
                 + "\"optionPriceBehaviors\":" + optionPriceBehaviors.size() + ","
                 + "\"opbV2ByOptions\":" + opbV2ByOptions.size() + ","
@@ -1012,6 +1020,9 @@ public class FeedGatewayService implements ReplayRunner {
                           + "# TYPE options_edge_feed_gateway_es_gex gauge\n"
                           + "options_edge_feed_gateway_es_gex " + esGex.size() + "\n"
                         : "")
+                + "# HELP options_edge_feed_gateway_gex_strike_lifecycle Cached per-strike gamma-lifecycle count.\n"
+                + "# TYPE options_edge_feed_gateway_gex_strike_lifecycle gauge\n"
+                + "options_edge_feed_gateway_gex_strike_lifecycle " + gexStrikeLifecycle.size() + "\n"
                 + "# HELP options_edge_feed_gateway_max_pain Cached per-(symbol,expiry) max-pain count.\n"
                 + "# TYPE options_edge_feed_gateway_max_pain gauge\n"
                 + "options_edge_feed_gateway_max_pain " + maxPain.size() + "\n"
@@ -1204,6 +1215,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
+        topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -1300,6 +1312,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
+        topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -1802,10 +1815,17 @@ public class FeedGatewayService implements ReplayRunner {
                         // uniformly by cachePolicyFor at ingest/purge/replay.
                         boolean esOpenDirectionDropped = isEsOpenDirectionEvent(binding.event())
                                 && cacheKey == null;
+                        // Gamma-lifecycle fail-closed (like max-pain / es-open-direction): a null cacheKey means
+                        // updateCache classified the record as expired (PAYLOAD eventTimeMs older than the 12h
+                        // window) or SUPERSEDED (out-of-order/older payload than the cached value). Live-routing
+                        // it would paint a stale/old badge onto a strike — so drop it. A fresh in-order record
+                        // returns a non-null key and still routes by source|symbol|expiry.
+                        boolean strikeLifecycleDropped = "gex-strike-lifecycle".equals(binding.event())
+                                && cacheKey == null;
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
                                 && !strikeIntelStale && !optionTruthStale && !strikeInvasionStale && !spreadSkewStale
-                                && !esOpenDirectionDropped) {
+                                && !esOpenDirectionDropped && !strikeLifecycleDropped) {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -2357,7 +2377,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "max-pain");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "max-pain", "gex-strike-lifecycle");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -2453,6 +2473,24 @@ public class FeedGatewayService implements ReplayRunner {
             return binding.source().equals(selection.source())
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesOptionPriceBehaviorSelection(json, selection);
+        }
+        if ("gex-strike-lifecycle".equals(binding.event())) {
+            // Per-strike HIGH-frequency signal (like gex-by-strike), so KEEP the source-switch OFFSET barrier
+            // (pre-switch records must still be suppressed) — but run the freshness/selection TIME barrier on
+            // the PAYLOAD eventTimeMs (via eventCacheTimestamp), not Kafka arrival: a backfilling producer whose
+            // records ARRIVE fresh but carry an OLD eventTimeMs must never live-forward a stale badge, matching
+            // the cache/replay path. A missing/unparseable eventTimeMs yields a negative ts → time barrier fails
+            // closed. matchesActiveSelection enforces the symbol/expiry/source identity (no cross-market leak).
+            if (!binding.source().equals(selection.source())) {
+                return false;
+            }
+            long lifecycleTs = eventCacheTimestamp(binding.event(), record, json);
+            if (!passesSelectionTimeBarrier(lifecycleTs, selection)
+                    || !passesOffsetBarrier(new TopicPartition(record.topic(), record.partition()), record.offset())) {
+                reportSourceStale(selection, "switch-barrier");
+                return false;
+            }
+            return matchesActiveSelection(json, selection);
         }
         // opb-v2-by-option is a normal per-contract signal (symbol|expiry|strike) — fall through to the
         // default contract routing (passesSelectionBarrier + matchesActiveSelection) below.
@@ -2762,6 +2800,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = gexCacheKey(json, key);
         } else if ("es-gex".equals(event)) {
             key = esGexCacheKey(json, key);
+        } else if ("gex-strike-lifecycle".equals(event)) {
+            key = strikeLifecycleCacheKey(json, key);
         } else if ("max-pain".equals(event)) {
             key = maxPainCacheKey(json, key);
         } else if ("option-price-behavior".equals(event)) {
@@ -2775,6 +2815,13 @@ public class FeedGatewayService implements ReplayRunner {
             key = opbV2ByOptionCacheKey(json, key);
         } else if ("opb-v2-session".equals(event)) {
             key = opbV2SessionCacheKey(json, key);
+        }
+        // A per-event cache-key deriver may FAIL CLOSED by returning null (currently gex-strike-lifecycle:
+        // a badge without its own symbol|expiry|strike identity is unusable). Stop here — never build a
+        // "event:null" version key, never cache, never replay, never forward. The caller treats a null
+        // return as "dropped" (see strikeLifecycleDropped in the live-forward gate).
+        if (key == null) {
+            return null;
         }
         if (!"pace".equals(event) && !"pace-rank".equals(event)) {
             // pace-rank's record key is already the epoch-qualified boardKey (includes source) — don't re-prefix.
@@ -2969,6 +3016,16 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 esGex.put(key, json);
+                return key;
+            }
+            case "gex-strike-lifecycle" -> {
+                // Per-strike (symbol|expiry|strike) last-value-wins upsert (mirrors gex-by-strike). rev-17:
+                // the producer emits only ACTIVE strikes + a one-shot NEUTRAL clear per departure; the UI
+                // applies each per-strike record directly (NEUTRAL removes the badge), so the gateway needs no
+                // frameId bookkeeping or tombstones — the last value per strike is the whole truth.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gexStrikeLifecycle.put(key, json);
                 return key;
             }
             case "max-pain" -> {
@@ -3410,6 +3467,15 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("es-gex", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "gex-strike-lifecycle" -> gexStrikeLifecycle.entrySet().stream()
+                        // DATABENTO-only Avro per-strike lifecycle labels (last-value-wins, like gex-by-strike).
+                        .filter(entry -> isCacheFresh("gex-strike-lifecycle:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("gex-strike-lifecycle:" + entry.getKey(), selection, false, false))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("gex-strike-lifecycle", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "max-pain" -> maxPain.entrySet().stream()
                         // DATABENTO-only stream: IBKR-selected sessions never receive max pain.
                         // isCacheFresh is event-aware (12h max-pain window); the selection barrier relaxes
@@ -3603,6 +3669,12 @@ public class FeedGatewayService implements ReplayRunner {
             // last-value-wins window (default 12h, like gex-by-strike) so a mid-session reconnect gets the
             // latest book. Freshness/roll-forward is governed by the payload emitEventTimeMs (below).
             return CachePolicy.expiring(settings.esGexTtlMs());
+        }
+        if ("gex-strike-lifecycle".equals(event)) {
+            // rev-17: an active strike re-emits its label every frame, so a long last-value-wins window (default
+            // 12h, like gex-by-strike) lets a mid-session reconnect replay the latest badge for still-active
+            // strikes; a departed strike's one-shot NEUTRAL is the last cached value and replays as "no badge".
+            return CachePolicy.expiring(settings.gexStrikeLifecycleTtlMs());
         }
         if ("liquidity-heatmap".equals(event)) {
             // Per-second column frames: SHORT window (default 5s), never the generic 15-min TTL —
@@ -3802,6 +3874,14 @@ public class FeedGatewayService implements ReplayRunner {
             // (a re-emitted/replayed book must order by emit time). Missing ⇒ -1 (fail closed).
             return esGexTimestamp(json);
         }
+        if ("gex-strike-lifecycle".equals(event)) {
+            // Track the PAYLOAD event time (eventTimeMs), not Kafka arrival — a backfilling producer appends
+            // fresh-arrival records whose eventTimeMs is old; arrival time would let a stale badge render live.
+            // Return it UNCONDITIONALLY (no Kafka fallback): a missing/unparseable eventTimeMs yields -1, which
+            // reads as ancient so updateCache rejects the record (cacheKey==null) and every live-forward gate
+            // fails closed — a malformed lifecycle record is never cached, replayed, or rendered.
+            return strikeLifecycleTimestamp(json);
+        }
         return cacheTimestamp(record);
     }
 
@@ -3998,6 +4078,8 @@ public class FeedGatewayService implements ReplayRunner {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
         } else if (versionKey.startsWith("strike-sr:")) {
             strikeSr.remove(versionKey.substring("strike-sr:".length()));
+        } else if (versionKey.startsWith("gex-strike-lifecycle:")) {
+            gexStrikeLifecycle.remove(versionKey.substring("gex-strike-lifecycle:".length()));
         } else if (versionKey.startsWith("gex-magnet:")) {
             gexMagnet.remove(versionKey.substring("gex-magnet:".length()));
         } else if (versionKey.startsWith("hot-strike:")) {
@@ -4252,6 +4334,39 @@ public class FeedGatewayService implements ReplayRunner {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
         }
         return fallback;
+    }
+
+    /**
+     * Per-strike gamma-lifecycle cache key: {@code symbol|expiry|strike} (mirrors {@link #gexCacheKey};
+     * lifecycle is per-strike like gex-by-strike). Source is prepended by updateCache → the cache key
+     * matches the UI contract (source|symbol|expiry|strike).
+     */
+    private String strikeLifecycleCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            double strike = doubleField(root, "strike", Double.NaN);
+            if (!symbol.isBlank() && !expiry.isBlank() && Double.isFinite(strike)) {
+                return symbol + "|" + expiry + "|" + formatStrike(strike);
+            }
+        } catch (JsonProcessingException ignored) {
+            // fall through to the fail-closed return below
+        }
+        // FAIL CLOSED (Codex review): a lifecycle badge is meaningless without its own symbol|expiry|strike
+        // identity. Falling back to the Kafka key would let a malformed record occupy a cache slot and
+        // replay a badge that cannot be matched to any strike — so reject it: updateCache returns null,
+        // the record is never cached, never replayed, and strikeLifecycleDropped blocks the live forward.
+        return null;
+    }
+
+    /** Per-strike gamma-lifecycle payload event time (eventTimeMs); -1 when absent/unparseable. */
+    private long strikeLifecycleTimestamp(String json) {
+        try {
+            return longField(mapper.readTree(json), "eventTimeMs", -1L);
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
     }
 
     /**
@@ -4894,6 +5009,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "gex-magnet", gexMagnet);
         replayCacheMap(session, "es-gex", esGex);
+        replayCacheMap(session, "gex-strike-lifecycle", gexStrikeLifecycle);
         // strike-cluster (dashboard + recent-signals trail): broadcast is unconditional live, so the
         // replay is unconditional too — the client symbol-filters (fail-closed). Without this a
         // refreshed page shows an EMPTY trail until the next dashboard interval (§9b).
@@ -4972,6 +5088,7 @@ public class FeedGatewayService implements ReplayRunner {
                 || "strike-sr".equals(event)
                 || "gex-magnet".equals(event)
                 || "es-gex".equals(event)
+                || "gex-strike-lifecycle".equals(event)
                 || "liquidity-heatmap".equals(event)
                 || "mission-pace".equals(event)
                 || "mission-control".equals(event)
@@ -5201,6 +5318,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.databentoMaxPainTopic(), "max-pain");
                 avroTopics.put(settings.unifiedSrTopic(), "strike-sr");
                 avroTopics.put(settings.databentoGexMagnetTopic(), "gex-magnet");
+                avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.strikeIntelByStrikeTopic(), "strike-intel");
@@ -5994,6 +6112,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "strike-sr" -> pendingStrikeSr;
             case "gex-magnet" -> pendingGexMagnet;
             case "es-gex" -> pendingEsGex;
+            case "gex-strike-lifecycle" -> pendingGexStrikeLifecycle;
             case "max-pain" -> pendingMaxPain;
             case "option-price-behavior" -> pendingOptionPriceBehaviors;
             case "opb-v2-by-option" -> pendingOpbV2ByOptions;
@@ -6046,6 +6165,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingGexByStrike.values()),
                         new ArrayList<>(pendingStrikeSr.values()),
                         new ArrayList<>(pendingGexMagnet.values()),
+                        new ArrayList<>(pendingGexStrikeLifecycle.values()),
                         new ArrayList<>(pendingMaxPain.values()),
                         new ArrayList<>(pendingOptionPriceBehaviors.values()),
                         new ArrayList<>(pendingOpbV2ByOptions.values()),
@@ -6097,6 +6217,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingStrikeSr.size()
                 + pendingGexMagnet.size()
                 + pendingEsGex.size()
+                + pendingGexStrikeLifecycle.size()
                 + pendingMaxPain.size()
                 + pendingOptionPriceBehaviors.size()
                 + pendingOpbV2ByOptions.size()
@@ -6128,6 +6249,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingStrikeSr.clear();
         pendingGexMagnet.clear();
         pendingEsGex.clear();
+        pendingGexStrikeLifecycle.clear();
         pendingMaxPain.clear();
         pendingOptionPriceBehaviors.clear();
         pendingOpbV2ByOptions.clear();
@@ -6164,6 +6286,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> strikeSrJsons = new ArrayList<>();
         List<String> gexMagnetJsons = new ArrayList<>();
         List<String> esGexJsons = new ArrayList<>();
+        List<String> gexStrikeLifecycleJsons = new ArrayList<>();
         List<String> maxPainJsons = new ArrayList<>();
         List<String> optionPriceBehaviorJsons = new ArrayList<>();
         List<String> opbV2ByOptionJsons = new ArrayList<>();
@@ -6194,6 +6317,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "strike-sr" -> strikeSrJsons.add(cachedEvent.json());
                 case "gex-magnet" -> gexMagnetJsons.add(cachedEvent.json());
                 case "es-gex" -> esGexJsons.add(cachedEvent.json());
+                case "gex-strike-lifecycle" -> gexStrikeLifecycleJsons.add(cachedEvent.json());
                 case "max-pain" -> maxPainJsons.add(cachedEvent.json());
                 case "option-price-behavior" -> optionPriceBehaviorJsons.add(cachedEvent.json());
                 case "opb-v2-by-option" -> opbV2ByOptionJsons.add(cachedEvent.json());
@@ -6227,6 +6351,7 @@ public class FeedGatewayService implements ReplayRunner {
                 gexByStrikeJsons,
                 strikeSrJsons,
                 gexMagnetJsons,
+                gexStrikeLifecycleJsons,
                 maxPainJsons,
                 optionPriceBehaviorJsons,
                 opbV2ByOptionJsons,
@@ -6259,6 +6384,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> gexByStrikeJsons,
             List<String> strikeSrJsons,
             List<String> gexMagnetJsons,
+            List<String> gexStrikeLifecycleJsons,
             List<String> maxPainJsons,
             List<String> optionPriceBehaviorJsons,
             List<String> opbV2ByOptionJsons,
@@ -6299,6 +6425,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"strikeSr\":" + jsonArray(strikeSrJsons) + ","
                 + "\"gexMagnets\":" + jsonArray(gexMagnetJsons) + ","
                 + "\"esGex\":" + jsonArray(esGexJsons) + ","
+                + "\"gexStrikeLifecycle\":" + jsonArray(gexStrikeLifecycleJsons) + ","
                 + "\"maxPains\":" + jsonArray(maxPainJsons) + ","
                 + "\"optionPriceBehaviors\":" + jsonArray(optionPriceBehaviorJsons) + ","
                 + "\"opbV2ByOptions\":" + jsonArray(opbV2ByOptionJsons) + ","

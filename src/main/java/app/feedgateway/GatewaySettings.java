@@ -614,6 +614,10 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_GEX_MAGNET_TOPIC", "options.databento.gex.magnet");
     }
 
+    public String databentoGexStrikeLifecycleTopic() {
+        return value("KAFKA_DATABENTO_GEX_STRIKE_LIFECYCLE_TOPIC", "options.databento.gex.strike-lifecycle");
+    }
+
     /**
      * ES-on-SPX aligned GEX (JSON whole-book per symbol|expiry, compacted, roll-forward). Broadcast as event
      * "es-gex". Default OFF — the whole ES-GEX-on-SPX feature ships dark until {@code GATEWAY_ES_GEX_ENABLED}.
@@ -798,6 +802,11 @@ public final class GatewaySettings {
      */
     public long gexByStrikeTtlMs() {
         return longValue("GATEWAY_GEX_BY_STRIKE_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
+    /** Per-strike gamma-lifecycle TTL — like gex-by-strike, a long last-value-wins window (default 12h). */
+    public long gexStrikeLifecycleTtlMs() {
+        return longValue("GATEWAY_GEX_STRIKE_LIFECYCLE_TTL_MS", maxPainTtlMs(), 0L);
     }
 
     /** Agent A short-premium recommendation output topic (JSON, key = trade_id). */
