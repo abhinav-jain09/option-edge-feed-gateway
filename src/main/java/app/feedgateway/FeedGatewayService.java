@@ -1571,6 +1571,15 @@ public class FeedGatewayService implements ReplayRunner {
                         evictEsStrikeIntelTombstone(binding, record);
                         continue;
                     }
+                    // This topic is a production market-data boundary. A retired dev helper once
+                    // published synthetic prices into it at 4 Hz and overwrote the naturally sparser
+                    // Databento trade in the last-value cache. Enforce provenance before either cache
+                    // or routing so live, reconnect, replay, and per-session paths behave identically.
+                    if (!isTrustedIndexPrice(binding, json)) {
+                        inactiveDroppedEvents.incrementAndGet();
+                        droppedByOtherReasons.incrementAndGet();
+                        continue;
+                    }
                     updateCache(binding, record, json);
                 }
                 purgeExpiredCache(System.currentTimeMillis());
@@ -1692,6 +1701,11 @@ public class FeedGatewayService implements ReplayRunner {
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
                         evictEsStrikeIntelTombstone(binding, record);
+                        continue;
+                    }
+                    if (!isTrustedIndexPrice(binding, json)) {
+                        inactiveDroppedEvents.incrementAndGet();
+                        droppedByOtherReasons.incrementAndGet();
                         continue;
                     }
                     if ("turn-alert".equals(binding.event())) {
@@ -2427,6 +2441,25 @@ public class FeedGatewayService implements ReplayRunner {
         return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
     }
 
+    /**
+     * An index price is trusted only when the payload explicitly proves Databento provenance.
+     * Missing, malformed, synthetic, or differently sourced payloads fail closed. Other event
+     * types are intentionally unaffected.
+     */
+    private boolean isTrustedIndexPrice(TopicBinding binding, String json) {
+        if (binding == null || !"index-price".equals(binding.event())) {
+            return true;
+        }
+        if (!"DATABENTO".equals(binding.source()) || json == null || json.isBlank()) {
+            return false;
+        }
+        try {
+            return "DATABENTO".equalsIgnoreCase(text(mapper.readTree(json), "source").trim());
+        } catch (JsonProcessingException ignored) {
+            return false;
+        }
+    }
+
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
         return shouldForward(binding, json, record, activeSelection.get());
     }
@@ -2442,7 +2475,9 @@ public class FeedGatewayService implements ReplayRunner {
             return passesSelectionBarrier(record, selection);
         }
         if ("index-price".equals(binding.event())) {
-            return "DATABENTO".equals(selection.source()) && passesSelectionBarrier(record, selection);
+            return "DATABENTO".equals(selection.source())
+                    && isTrustedIndexPrice(binding, json)
+                    && passesSelectionBarrier(record, selection);
         }
         if ("mission-pace".equals(binding.event())) {
             // Mission-pace is a low-frequency, per-MARKET signal (symbol|expiry), not per-strike. The
