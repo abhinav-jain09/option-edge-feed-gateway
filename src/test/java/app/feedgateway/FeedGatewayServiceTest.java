@@ -60,7 +60,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "max-pain", "gex-strike-lifecycle"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -275,6 +275,129 @@ class FeedGatewayServiceTest {
         setActiveSelection(service, "DATABENTO", "SPX", "20260622");
         assertTrue(cachedEvents(service, List.of("es-gex"), now).isEmpty(),
                 "a stale (old emitEventTimeMs) book must not replay — roll-forward freshness uses payload time");
+    }
+
+    // ----- es-strike-intel (ES strike-intel projected onto SPX, per ES strike, with withdrawal) ---------
+
+    /** A projected ES signal as the align service emits it: restamped onto the SPX chain at the translated
+     *  strike, native ES coordinates + basis provenance preserved, tagged source=ES_ON_SPX. */
+    private static String esStrikeIntelSignal() {
+        return "{\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"strike\":5580.0,\"spxStrike\":5580.0,"
+                + "\"esSymbol\":\"ES\",\"esStrike\":5620.0,\"role\":\"CALL_CHASE_LEVEL\",\"actionBias\":\"BUY_CALL\","
+                + "\"source\":\"ES_ON_SPX\",\"basis\":40.0,\"basisState\":\"MEASURED\",\"basisEventTimeMs\":1}";
+    }
+
+    @Test
+    void healthReportsEsStrikeIntelDisabledNotZeroWhenFeatureOff() throws Exception {
+        System.clearProperty("GATEWAY_ES_STRIKE_INTEL_ENABLED");
+        FeedGatewayService service = service();
+        String health = service.healthJson();
+        assertTrue(health.contains("\"esStrikeIntelEnabled\":false"), "health carries the explicit enable flag");
+        assertTrue(health.contains("\"esStrikeIntel\":\"disabled\""), "disabled env must not report a misleading 0");
+        assertFalse(health.contains("\"esStrikeIntel\":0"), "no bare zero for a feature that is off");
+    }
+
+    @Test
+    void healthReportsEsStrikeIntelCountWhenFeatureOn() throws Exception {
+        System.setProperty("GATEWAY_ES_STRIKE_INTEL_ENABLED", "true");
+        try {
+            FeedGatewayService service = service();
+            String health = service.healthJson();
+            assertTrue(health.contains("\"esStrikeIntelEnabled\":true"), "flag reflects the enabled state");
+            assertTrue(health.contains("\"esStrikeIntel\":0"), "enabled env reports the real (initially 0) count");
+        } finally {
+            System.clearProperty("GATEWAY_ES_STRIKE_INTEL_ENABLED");
+        }
+    }
+
+    @Test
+    void cachedReplayIncludesEsStrikeIntelForMatchingSpxSelectionOnly() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = esStrikeIntelSignal();
+        // Keyed by the NATIVE ES identity (the align service's output key), rendered on the SPX chain.
+        updateCache(service, topicBinding("DATABENTO", "es-strike-intel"),
+                recordAt(settings.esStrikeIntelSpxAlignedTopic(), 0, 1L, "ES|20260622|5620", json, now), json);
+
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        assertEquals(1, cachedEvents(service, List.of("es-strike-intel"), now).size(),
+                "a projected ES signal replays to a matching SPX DATABENTO client");
+
+        setActiveSelection(service, "DATABENTO", "SPY", "20260622");
+        assertTrue(cachedEvents(service, List.of("es-strike-intel"), now).isEmpty(),
+                "a different symbol must not receive the ES overlay");
+    }
+
+    @Test
+    void esStrikeIntelTombstoneWithdrawsFromReplay() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = esStrikeIntelSignal();
+        Object binding = topicBinding("DATABENTO", "es-strike-intel");
+        updateCache(service, binding,
+                recordAt(settings.esStrikeIntelSpxAlignedTopic(), 0, 1L, "ES|20260622|5620", json, now), json);
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        assertEquals(1, cachedEvents(service, List.of("es-strike-intel"), now).size(), "projected first");
+
+        // The align service withdraws the signal with a tombstone (null value) keyed by the same ES identity.
+        evictEsStrikeIntelTombstone(service, binding,
+                tombstoneRecord(settings.esStrikeIntelSpxAlignedTopic(), "ES|20260622|5620", now + 1));
+        assertTrue(cachedEvents(service, List.of("es-strike-intel"), now + 1).isEmpty(),
+                "a withdrawn ES signal is evicted so it never replays");
+    }
+
+    @Test
+    void esStrikeIntelLateOlderUpsertDoesNotResurrectAfterTombstone() throws Exception {
+        // Race: the cache consumer applies the tombstone (t+1) while the live consumer replays the older
+        // upsert (t) it withdraws. The roll-forward watermark must reject that late older upsert.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = esStrikeIntelSignal();
+        Object binding = topicBinding("DATABENTO", "es-strike-intel");
+        String topic = settings.esStrikeIntelSpxAlignedTopic();
+        updateCache(service, binding, recordAt(topic, 0, 1L, "ES|20260622|5620", json, now), json);
+        evictEsStrikeIntelTombstone(service, binding, tombstoneRecord(topic, "ES|20260622|5620", now + 1));
+        // the withdrawn record re-delivered by the other consumer at its ORIGINAL (older) time:
+        updateCache(service, binding, recordAt(topic, 0, 1L, "ES|20260622|5620", json, now), json);
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        assertTrue(cachedEvents(service, List.of("es-strike-intel"), now + 2).isEmpty(),
+                "a late older upsert after a newer tombstone must not resurrect the withdrawn ES signal");
+    }
+
+    @Test
+    void esStrikeIntelEqualTimestampUpsertDoesNotResurrectAfterTombstone() throws Exception {
+        // Equal-millisecond tie: the tombstone (always the higher Kafka offset) must win, so a same-ms
+        // racing upsert cannot resurrect. The watermark is tombstoneTime+1 to break the tie.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = esStrikeIntelSignal();
+        Object binding = topicBinding("DATABENTO", "es-strike-intel");
+        String topic = settings.esStrikeIntelSpxAlignedTopic();
+        updateCache(service, binding, recordAt(topic, 0, 1L, "ES|20260622|5620", json, now), json);
+        evictEsStrikeIntelTombstone(service, binding, tombstoneRecord(topic, "ES|20260622|5620", now));
+        updateCache(service, binding, recordAt(topic, 0, 1L, "ES|20260622|5620", json, now), json); // same ms
+        setActiveSelection(service, "DATABENTO", "SPX", "20260622");
+        assertTrue(cachedEvents(service, List.of("es-strike-intel"), now + 1).isEmpty(),
+                "a same-millisecond upsert must not resurrect a withdrawn ES signal (tombstone wins the tie)");
+    }
+
+    private static void evictEsStrikeIntelTombstone(FeedGatewayService service, Object binding,
+            ConsumerRecord<String, Object> record) throws Exception {
+        Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Method m = FeedGatewayService.class.getDeclaredMethod(
+                "evictEsStrikeIntelTombstone", bindingType, ConsumerRecord.class);
+        m.setAccessible(true);
+        m.invoke(service, binding, record);
+    }
+
+    private static ConsumerRecord<String, Object> tombstoneRecord(String topic, String key, long timestampMs) {
+        return new ConsumerRecord<>(topic, 0, 1L, timestampMs,
+                org.apache.kafka.common.record.TimestampType.CREATE_TIME, -1, -1, key, null,
+                new org.apache.kafka.common.header.internals.RecordHeaders(), java.util.Optional.empty());
     }
 
     // ----- gex-strike-lifecycle gateway consumer (per-strike GexStrikeLifecycle) ------------------
@@ -2944,7 +3067,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3079,7 +3202,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3095,7 +3218,7 @@ class FeedGatewayServiceTest {
                 strikeSr, List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3111,7 +3234,7 @@ class FeedGatewayServiceTest {
                 List.of(), gexMagnet, List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3127,7 +3250,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3143,7 +3266,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), maxPains,
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3162,7 +3285,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 optionPriceBehaviors, List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3178,7 +3301,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), opbV2ByOptions, List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3194,7 +3317,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), opbV2Sessions, List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3210,7 +3333,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3226,7 +3349,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3242,7 +3365,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3264,7 +3387,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of()
+                List.of(), List.of()
         );
     }
 
@@ -3275,7 +3398,7 @@ class FeedGatewayServiceTest {
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class
+                List.class, List.class, List.class, List.class
         );
     }
 }

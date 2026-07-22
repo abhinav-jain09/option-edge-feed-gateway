@@ -100,6 +100,7 @@ public final class GatewayRecordMapper {
             case "strike-sr" -> EventType.STRIKE_SR;
             case "max-pain" -> EventType.MAX_PAIN;
             case "es-gex" -> EventType.ES_GEX;
+            case "es-strike-intel" -> EventType.ES_STRIKE_INTEL;
             case "liquidity-heatmap" -> EventType.LIQUIDITY_HEATMAP;
             case "option-price-behavior" -> EventType.OPTION_PRICE_BEHAVIOR;
             case "dealer-ledger" -> EventType.DEALER_LEDGER;

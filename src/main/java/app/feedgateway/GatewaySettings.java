@@ -636,6 +636,26 @@ public final class GatewaySettings {
     }
 
     /**
+     * ES strike-intelligence projected onto SPX strikes (JSON, one record per NATIVE ES identity
+     * symbol|expiry|esStrike, compacted, roll-forward with withdrawal tombstones). Broadcast as event
+     * "es-strike-intel" — a separate ES-origin overlay layer on the SPX board, distinct from the native
+     * SPX "strike-intel". Default OFF: ships dark until {@code GATEWAY_ES_STRIKE_INTEL_ENABLED}.
+     */
+    public String esStrikeIntelSpxAlignedTopic() {
+        return value("KAFKA_ES_STRIKE_INTEL_SPX_ALIGNED_TOPIC", "options.es-strike-intel-spx-aligned");
+    }
+
+    public boolean esStrikeIntelEnabled() {
+        return "true".equalsIgnoreCase(value("GATEWAY_ES_STRIKE_INTEL_ENABLED", "false"));
+    }
+
+    /** Long last-value-wins window (like es-gex/gex-by-strike): a quiet-but-valid ES signal must not evict;
+     *  withdrawal is explicit via the align service's tombstones, not TTL. */
+    public long esStrikeIntelTtlMs() {
+        return longValue("GATEWAY_ES_STRIKE_INTEL_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
+    /**
      * Databento per-strike GEX history topic. JSON on the wire (the databento-gex-history Kafka
      * Streams service emits enriched JSON: the gex fields + a {@code history} window map), unlike
      * the Avro {@link #databentoGexTopic()}. Merged onto the same DATABENTO gex-by-strike rows.
