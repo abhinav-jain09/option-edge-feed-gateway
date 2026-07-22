@@ -1306,6 +1306,9 @@ public class FeedGatewayService implements ReplayRunner {
         // open-direction siblings, OPTIONAL topic — on the SHORT greekMoveAuthTtlMs window (default 5 min),
         // which also bounds its seek-back here to the last few minutes.
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
+        if (settings.esAggressorFlowEnabled()) {
+            topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
+        }
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
@@ -1393,6 +1396,9 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the greek-move-authenticity CURRENT
         // verdict (JSON, key = symbol, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
+        if (settings.esAggressorFlowEnabled()) {
+            topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
+        }
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
@@ -6026,7 +6032,10 @@ public class FeedGatewayService implements ReplayRunner {
             // out in per-session (auth) mode too, not only legacy mode. Staleness is enforced upstream:
             // updateCache's SHORT 5-min greekMoveAuthTtlMs window returns null for a stale verdict, which
             // suppresses the broadcast entirely.
-            "greek-move-auth");
+            "greek-move-auth",
+            // Continuous ES futures buyer/seller pressure is an ES-global advisory card. The payload is
+            // symbol-filtered by the browser and deliberately has no option-chain expiry identity.
+            "es-aggressor-flow");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);

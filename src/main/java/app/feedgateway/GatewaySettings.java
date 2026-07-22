@@ -238,6 +238,16 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_ES_TRADES_TOPIC", value("KAFKA_HPSF_ES_TRADES_TOPIC", "underlying.es.trades"));
     }
 
+    /** Latest continuous ES futures aggressor-flow snapshot (JSON, keyed by ES.v.0). */
+    public String esAggressorFlowTopic() {
+        return value("KAFKA_ES_AGGRESSOR_FLOW_TOPIC", "futures.aggressor-flow");
+    }
+
+    /** Opt-in because the ES-only topic does not exist on the SPX production cluster. */
+    public boolean esAggressorFlowEnabled() {
+        return boolValue("GATEWAY_ES_AGGRESSOR_FLOW_ENABLED", false);
+    }
+
     public String databentoDirectionalPressureTopic() {
         return value("KAFKA_DATABENTO_DIRECTIONAL_PRESSURE_TOPIC", "options.databento.directional-pressure");
     }
