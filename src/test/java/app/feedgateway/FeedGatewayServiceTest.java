@@ -30,6 +30,24 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FeedGatewayServiceTest {
     @Test
+    void indexPriceRejectsSyntheticOrUnprovenSourcesBeforeCacheAndRouting() throws Exception {
+        FeedGatewayService service = service();
+        Object binding = topicBinding("DATABENTO", "index-price");
+
+        assertTrue(isTrustedIndexPrice(service, binding,
+                "{\"source\":\"DATABENTO\",\"symbol\":\"ES.v.0\",\"price\":7524.25}"));
+        assertFalse(isTrustedIndexPrice(service, binding,
+                "{\"source\":\"SYNTHETIC_DEV\",\"symbol\":\"ES.v.0\",\"price\":7590.0}"));
+        assertFalse(isTrustedIndexPrice(service, binding,
+                "{\"symbol\":\"ES.v.0\",\"price\":7590.0}"),
+                "an index price without explicit Databento provenance must fail closed");
+        assertFalse(isTrustedIndexPrice(service, binding, "not-json"));
+        assertTrue(isTrustedIndexPrice(service, topicBinding("DATABENTO", "strike-flow"),
+                "{\"source\":\"SYNTHETIC_DEV\"}"),
+                "the provenance gate must remain scoped to index-price");
+    }
+
+    @Test
     void epochOnlySelectionReassertDoesNotRollOrReplaceTheActiveBoard() {
         FeedGatewayService service = service();
         service.seedReadySelectionForTest("DATABENTO", "ES", "20260715", 100L);
@@ -2874,6 +2892,15 @@ class FeedGatewayServiceTest {
         Method method = FeedGatewayService.class.getDeclaredMethod("shouldForward", bindingType, String.class, ConsumerRecord.class);
         method.setAccessible(true);
         return (boolean) method.invoke(service, binding, json, record);
+    }
+
+    private static boolean isTrustedIndexPrice(FeedGatewayService service, Object binding, String json)
+            throws Exception {
+        Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "isTrustedIndexPrice", bindingType, String.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, binding, json);
     }
 
     @SuppressWarnings("unchecked")
