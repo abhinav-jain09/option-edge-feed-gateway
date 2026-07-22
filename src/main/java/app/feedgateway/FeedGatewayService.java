@@ -1744,6 +1744,15 @@ public class FeedGatewayService implements ReplayRunner {
                         forwardedEvents.incrementAndGet();
                         continue;
                     }
+                    if ("es-aggressor-flow".equals(binding.event())) {
+                        // One compacted ES.v.0 snapshot is published every second. Deliver it directly in
+                        // both legacy and per-session routing modes: it has no option expiry identity and
+                        // therefore must not fall through the generic cache-key switch (which correctly
+                        // returns null for unknown per-market cache shapes).
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                        continue;
+                    }
                     String cacheKey = updateCache(binding, record, json);
                     // Dealer-ledger forwards the JOINED envelope (not the raw profile/state record); for
                     // every other event forwardJson is just `json`, so the block below is unchanged.
