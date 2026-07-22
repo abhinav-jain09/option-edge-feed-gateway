@@ -131,6 +131,7 @@ public class FeedGatewayService implements ReplayRunner {
             "strike-sr",
             "gex-magnet",
             "es-gex",
+            "es-strike-intel",
             "gex-strike-lifecycle",
             "max-pain",
             "liquidity-heatmap",
@@ -198,6 +199,9 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     // ES-on-SPX aligned whole-book per symbol|expiry (JSON, roll-forward: latest emitEventTimeMs wins).
     private final Map<String, String> esGex = new ConcurrentHashMap<>();
+    // ES strike-intelligence projected onto SPX strikes, keyed by NATIVE ES identity (symbol|expiry|esStrike,
+    // the Kafka key) so colliding SPX strikes stay distinct; withdrawn by tombstone (evictEsStrikeIntelTombstone).
+    private final Map<String, String> esStrikeIntel = new ConcurrentHashMap<>();
     // Per-strike gamma lifecycle (emerging/sticky/fading), keyed symbol|expiry|strike (last-value-wins,
     // like gex-by-strike). rev-17: the producer emits ONLY active strikes plus a one-shot NEUTRAL "clear"
     // when a strike goes inactive; that NEUTRAL overwrites the cache entry, so a reconnect replays NEUTRAL
@@ -270,6 +274,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingStrikeSr = new LinkedHashMap<>();
     private final Map<String, String> pendingGexMagnet = new LinkedHashMap<>();
     private final Map<String, String> pendingEsGex = new LinkedHashMap<>();
+    private final Map<String, String> pendingEsStrikeIntel = new LinkedHashMap<>();
     private final Map<String, String> pendingGexStrikeLifecycle = new LinkedHashMap<>();
     private final Map<String, String> pendingMaxPain = new LinkedHashMap<>();
     private final Map<String, String> pendingOptionPriceBehaviors = new LinkedHashMap<>();
@@ -525,7 +530,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gex-strike-lifecycle"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "es-gex"));
+            sendCachedState(session, List.of("vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "es-gex", "es-strike-intel"));
             replayOptionTruthCachedLegacy(session);
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
@@ -897,6 +902,8 @@ public class FeedGatewayService implements ReplayRunner {
                 // data fault. Report "disabled" + an explicit flag instead of a misleading count.
                 + "\"esGexEnabled\":" + settings.esGexEnabled() + ","
                 + "\"esGex\":" + (settings.esGexEnabled() ? String.valueOf(esGex.size()) : "\"disabled\"") + ","
+                + "\"esStrikeIntelEnabled\":" + settings.esStrikeIntelEnabled() + ","
+                + "\"esStrikeIntel\":" + (settings.esStrikeIntelEnabled() ? String.valueOf(esStrikeIntel.size()) : "\"disabled\"") + ","
                 + "\"gexStrikeLifecycle\":" + gexStrikeLifecycle.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
                 + "\"optionPriceBehaviors\":" + optionPriceBehaviors.size() + ","
@@ -1019,6 +1026,11 @@ public class FeedGatewayService implements ReplayRunner {
                         ? "# HELP options_edge_feed_gateway_es_gex Cached per-(symbol,expiry) ES-on-SPX aligned book count.\n"
                           + "# TYPE options_edge_feed_gateway_es_gex gauge\n"
                           + "options_edge_feed_gateway_es_gex " + esGex.size() + "\n"
+                        : "")
+                + (settings.esStrikeIntelEnabled()
+                        ? "# HELP options_edge_feed_gateway_es_strike_intel Cached per-ES-strike projected strike-intel count.\n"
+                          + "# TYPE options_edge_feed_gateway_es_strike_intel gauge\n"
+                          + "options_edge_feed_gateway_es_strike_intel " + esStrikeIntel.size() + "\n"
                         : "")
                 + "# HELP options_edge_feed_gateway_gex_strike_lifecycle Cached per-strike gamma-lifecycle count.\n"
                 + "# TYPE options_edge_feed_gateway_gex_strike_lifecycle gauge\n"
@@ -1240,6 +1252,9 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.esGexEnabled()) {
             topicEvents.put(settings.esGexSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-gex"));
         }
+        if (settings.esStrikeIntelEnabled()) {
+            topicEvents.put(settings.esStrikeIntelSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-strike-intel"));
+        }
         // delta-flow-by-strike is plain JSON (DeltaFlowStrikeSnapshot), per-strike keyed
         // (symbol|date|expiry|strike) — this JSON-state consumer, never the Avro one.
         topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
@@ -1332,6 +1347,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         if (settings.esGexEnabled()) {
             topicEvents.put(settings.esGexSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-gex"));
+        }
+        if (settings.esStrikeIntelEnabled()) {
+            topicEvents.put(settings.esStrikeIntelSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-strike-intel"));
         }
         // delta-flow-by-strike is plain JSON, per-strike keyed — keep the cache + live JSON consumer
         // topic sets symmetric (same rule as gex-history/strike-flow above).
@@ -1544,6 +1562,7 @@ public class FeedGatewayService implements ReplayRunner {
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
+                        evictEsStrikeIntelTombstone(binding, record);
                         continue;
                     }
                     updateCache(binding, record, json);
@@ -1666,6 +1685,7 @@ public class FeedGatewayService implements ReplayRunner {
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
+                        evictEsStrikeIntelTombstone(binding, record);
                         continue;
                     }
                     if ("turn-alert".equals(binding.event())) {
@@ -1822,10 +1842,16 @@ public class FeedGatewayService implements ReplayRunner {
                         // returns a non-null key and still routes by source|symbol|expiry.
                         boolean strikeLifecycleDropped = "gex-strike-lifecycle".equals(binding.event())
                                 && cacheKey == null;
+                        // ES strike-intel fail-closed (like es-open-direction / gamma-lifecycle): a null cacheKey
+                        // means updateCache classified this record as SUPERSEDED (an out-of-order/older producer
+                        // time than the cached value lost roll-forward) or a tombstone. Live-routing it would
+                        // paint a stale ES overlay onto a strike — so drop it.
+                        boolean esStrikeIntelDropped = "es-strike-intel".equals(binding.event())
+                                && cacheKey == null;
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
                                 && !strikeIntelStale && !optionTruthStale && !strikeInvasionStale && !spreadSkewStale
-                                && !esOpenDirectionDropped && !strikeLifecycleDropped) {
+                                && !esOpenDirectionDropped && !strikeLifecycleDropped && !esStrikeIntelDropped) {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -1865,6 +1891,12 @@ public class FeedGatewayService implements ReplayRunner {
                             // ui-batch avoids changing the established batch schema and lets the outbound
                             // channel coalesce latest-by-strike updates directly.
                             broadcast(binding.event(), forwardJson);
+                        } else if ("es-strike-intel".equals(binding.event())) {
+                            // Enqueue ATOMICALLY with the tombstone: the helper holds `this` (then batchLock)
+                            // exactly as evictEsStrikeIntelTombstone does, so a withdrawal that lands between
+                            // updateCache above and this enqueue cannot leave a post-withdrawal ghost in the
+                            // next batch (it either evicts before we check, or after we put — then it removes).
+                            enqueueEsStrikeIntelPendingIfLive(cacheKey, forwardJson);
                         } else {
                             enqueuePending(binding.event(), cacheKey, forwardJson);
                         }
@@ -2377,7 +2409,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "max-pain", "gex-strike-lifecycle");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
     }
 
     private boolean shouldForward(TopicBinding binding, String json, ConsumerRecord<?, ?> record) {
@@ -2647,6 +2679,61 @@ public class FeedGatewayService implements ReplayRunner {
         if (strikeSr.remove(key) != null) {
             removeCacheEntry("strike-sr:" + key);
         }
+    }
+
+    /**
+     * Withdraw a projected ES strike-intel signal on the align service's tombstone (null value). The cache key
+     * is {@code source|<Kafka key>} — the SAME key the live upsert stored (es-strike-intel adds no cache-key
+     * derivation, so the map key is exactly {@code source|record.key()}), so the removal targets the right
+     * entry.
+     *
+     * <p><b>Synchronized on the same monitor as {@link #updateCache}</b> so a tombstone can never interleave
+     * with an upsert of the same key, even across the cache + live consumers that both bind this topic.
+     * Roll-forward-aware: the tombstone's Kafka producer time is written as a WATERMARK into
+     * {@code cacheEventTimes}, so a racing OLDER upsert (the very record being withdrawn, arriving late from
+     * the other consumer) is rejected by updateCache's {@code previousEventTime > eventTime} guard and cannot
+     * resurrect the signal; a genuinely NEWER re-projection (later time) still re-adds it. An out-of-order
+     * OLD tombstone is itself ignored so it cannot evict a newer live upsert. It also clears any queued
+     * {@code pendingEsStrikeIntel} upsert so the next UI batch can't emit a ghost after withdrawal.
+     */
+    private synchronized void evictEsStrikeIntelTombstone(TopicBinding binding, ConsumerRecord<String, Object> record) {
+        if (binding == null || !"es-strike-intel".equals(binding.event()) || record.value() != null) {
+            return;
+        }
+        if (record.key() == null || record.key().isBlank()) {
+            return;
+        }
+        String key = binding.source() + "|" + record.key();
+        String versionKey = "es-strike-intel:" + key;
+        long tombstoneTime = cacheTimestamp(record); // Kafka producer time — same clock the upserts order by
+        Long previous = cacheEventTimes.get(versionKey);
+        if (previous != null && previous > tombstoneTime) {
+            return; // out-of-order stale tombstone — never evict a newer upsert
+        }
+        esStrikeIntel.remove(key);
+        // Watermark = tombstoneTime + 1 so the tombstone wins an EQUAL-millisecond tie: the withdrawn upsert
+        // (same or older producer time) is rejected by updateCache's `previous > eventTime` guard, while a
+        // genuinely later re-projection (time > tombstoneTime) still re-adds. The tombstone is always the
+        // higher Kafka offset than the upsert it withdraws, so breaking the tie in its favour is correct.
+        cacheEventTimes.put(versionKey, tombstoneTime + 1);
+        cachePositions.remove(versionKey);
+        synchronized (batchLock) {
+            pendingEsStrikeIntel.remove(key); // cancel a queued upsert so no post-withdrawal ghost broadcasts
+        }
+    }
+
+    /**
+     * Legacy-batch enqueue for es-strike-intel that is ATOMIC with {@link #evictEsStrikeIntelTombstone}. Both
+     * take {@code this} then {@code batchLock} (same order — no inversion), so a tombstone that fires between
+     * this record's {@link #updateCache} and its enqueue cannot leave a post-withdrawal ghost: the enqueue
+     * only fires while the entry is still cached, and if the tombstone wins it removes both the cache entry
+     * and any pending row.
+     */
+    private synchronized void enqueueEsStrikeIntelPendingIfLive(String cacheKey, String json) {
+        if (cacheKey == null || !esStrikeIntel.containsKey(cacheKey)) {
+            return; // withdrawn before we could enqueue — never resurrect it into the batch
+        }
+        enqueuePending("es-strike-intel", cacheKey, json);
     }
 
     private boolean matchesCachedSelection(String json, ActiveSelection selection) {
@@ -3016,6 +3103,15 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 esGex.put(key, json);
+                return key;
+            }
+            case "es-strike-intel" -> {
+                // ES strike-intel projected onto SPX, per NATIVE ES identity (source|symbol|expiry|esStrike).
+                // Last-value-wins upsert; withdrawal arrives as a tombstone (evictEsStrikeIntelTombstone), so
+                // there is no eviction branch here. Roll-forward orders by Kafka producer time (eventTime).
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                esStrikeIntel.put(key, json);
                 return key;
             }
             case "gex-strike-lifecycle" -> {
@@ -3467,6 +3563,16 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("es-gex", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "es-strike-intel" -> esStrikeIntel.entrySet().stream()
+                        // DATABENTO-rendered ES-origin overlay (per ES strike). Replay while the entry is alive;
+                        // a withdrawn signal was already evicted, so it never replays.
+                        .filter(entry -> isCacheFresh("es-strike-intel:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("es-strike-intel:" + entry.getKey(), selection, false, false))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("es-strike-intel", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "gex-strike-lifecycle" -> gexStrikeLifecycle.entrySet().stream()
                         // DATABENTO-only Avro per-strike lifecycle labels (last-value-wins, like gex-by-strike).
                         .filter(entry -> isCacheFresh("gex-strike-lifecycle:" + entry.getKey(), nowMs))
@@ -3669,6 +3775,12 @@ public class FeedGatewayService implements ReplayRunner {
             // last-value-wins window (default 12h, like gex-by-strike) so a mid-session reconnect gets the
             // latest book. Freshness/roll-forward is governed by the payload emitEventTimeMs (below).
             return CachePolicy.expiring(settings.esGexTtlMs());
+        }
+        if ("es-strike-intel".equals(event)) {
+            // Projected ES strike-intel: a quiet-but-valid signal must not evict (withdrawal is explicit via
+            // tombstone), so use the same long last-value-wins window as es-gex. Roll-forward/freshness track
+            // the Kafka producer time (default cacheTimestamp), which advances on every re-emit.
+            return CachePolicy.expiring(settings.esStrikeIntelTtlMs());
         }
         if ("gex-strike-lifecycle".equals(event)) {
             // rev-17: an active strike re-emits its label every frame, so a long last-value-wins window (default
@@ -4086,6 +4198,8 @@ public class FeedGatewayService implements ReplayRunner {
             hotStrikes.remove(versionKey.substring("hot-strike:".length()));
         } else if (versionKey.startsWith("es-gex:")) {
             esGex.remove(versionKey.substring("es-gex:".length()));
+        } else if (versionKey.startsWith("es-strike-intel:")) {
+            esStrikeIntel.remove(versionKey.substring("es-strike-intel:".length()));
         } else if (versionKey.startsWith("max-pain:")) {
             maxPain.remove(versionKey.substring("max-pain:".length()));
         } else if (versionKey.startsWith("option-price-behavior:")) {
@@ -5009,6 +5123,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "gex-magnet", gexMagnet);
         replayCacheMap(session, "es-gex", esGex);
+        replayCacheMap(session, "es-strike-intel", esStrikeIntel);
         replayCacheMap(session, "gex-strike-lifecycle", gexStrikeLifecycle);
         // strike-cluster (dashboard + recent-signals trail): broadcast is unconditional live, so the
         // replay is unconditional too — the client symbol-filters (fail-closed). Without this a
@@ -5088,6 +5203,7 @@ public class FeedGatewayService implements ReplayRunner {
                 || "strike-sr".equals(event)
                 || "gex-magnet".equals(event)
                 || "es-gex".equals(event)
+                || "es-strike-intel".equals(event)
                 || "gex-strike-lifecycle".equals(event)
                 || "liquidity-heatmap".equals(event)
                 || "mission-pace".equals(event)
@@ -5330,6 +5446,9 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
                 if (settings.esGexEnabled()) {
                     stringTopics.put(settings.esGexSpxAlignedTopic(), "es-gex");
+                }
+                if (settings.esStrikeIntelEnabled()) {
+                    stringTopics.put(settings.esStrikeIntelSpxAlignedTopic(), "es-strike-intel");
                 }
             } else {
                 avroTopics.put(settings.ibkrDisplayTopic(), "snapshot");
@@ -6112,6 +6231,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "strike-sr" -> pendingStrikeSr;
             case "gex-magnet" -> pendingGexMagnet;
             case "es-gex" -> pendingEsGex;
+            case "es-strike-intel" -> pendingEsStrikeIntel;
             case "gex-strike-lifecycle" -> pendingGexStrikeLifecycle;
             case "max-pain" -> pendingMaxPain;
             case "option-price-behavior" -> pendingOptionPriceBehaviors;
@@ -6175,7 +6295,8 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingHpsfTopCandidates.values()),
                         new ArrayList<>(pendingHpsfAudits.values()),
                         new ArrayList<>(pendingHpsfExitIntents.values()),
-                        new ArrayList<>(pendingEsGex.values())
+                        new ArrayList<>(pendingEsGex.values()),
+                        new ArrayList<>(pendingEsStrikeIntel.values())
                 );
                 clearPendingLocked();
             }
@@ -6217,6 +6338,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingStrikeSr.size()
                 + pendingGexMagnet.size()
                 + pendingEsGex.size()
+                + pendingEsStrikeIntel.size()
                 + pendingGexStrikeLifecycle.size()
                 + pendingMaxPain.size()
                 + pendingOptionPriceBehaviors.size()
@@ -6249,6 +6371,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingStrikeSr.clear();
         pendingGexMagnet.clear();
         pendingEsGex.clear();
+        pendingEsStrikeIntel.clear();
         pendingGexStrikeLifecycle.clear();
         pendingMaxPain.clear();
         pendingOptionPriceBehaviors.clear();
@@ -6286,6 +6409,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> strikeSrJsons = new ArrayList<>();
         List<String> gexMagnetJsons = new ArrayList<>();
         List<String> esGexJsons = new ArrayList<>();
+        List<String> esStrikeIntelJsons = new ArrayList<>();
         List<String> gexStrikeLifecycleJsons = new ArrayList<>();
         List<String> maxPainJsons = new ArrayList<>();
         List<String> optionPriceBehaviorJsons = new ArrayList<>();
@@ -6317,6 +6441,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "strike-sr" -> strikeSrJsons.add(cachedEvent.json());
                 case "gex-magnet" -> gexMagnetJsons.add(cachedEvent.json());
                 case "es-gex" -> esGexJsons.add(cachedEvent.json());
+                case "es-strike-intel" -> esStrikeIntelJsons.add(cachedEvent.json());
                 case "gex-strike-lifecycle" -> gexStrikeLifecycleJsons.add(cachedEvent.json());
                 case "max-pain" -> maxPainJsons.add(cachedEvent.json());
                 case "option-price-behavior" -> optionPriceBehaviorJsons.add(cachedEvent.json());
@@ -6361,7 +6486,8 @@ public class FeedGatewayService implements ReplayRunner {
                 hpsfTopCandidatesJsons,
                 hpsfAuditJsons,
                 hpsfExitIntentJsons,
-                esGexJsons
+                esGexJsons,
+                esStrikeIntelJsons
         );
     }
 
@@ -6394,7 +6520,8 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> hpsfTopCandidatesJsons,
             List<String> hpsfAuditJsons,
             List<String> hpsfExitIntentJsons,
-            List<String> esGexJsons
+            List<String> esGexJsons,
+            List<String> esStrikeIntelJsons
     ) {
         ActiveSelection selection = activeSelection.get();
         return "{"
@@ -6425,6 +6552,11 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"strikeSr\":" + jsonArray(strikeSrJsons) + ","
                 + "\"gexMagnets\":" + jsonArray(gexMagnetJsons) + ","
                 + "\"esGex\":" + jsonArray(esGexJsons) + ","
+                // Gated so the disabled wire is unchanged (the web reads batchItems('esStrikeIntels') which
+                // tolerates an absent key). Status keeps the EXPLICIT esStrikeIntel(Enabled) fields on purpose
+                // — a missing/"0" count misled a live prod triage (2026-07-19), same as esGex.
+                + (settings.esStrikeIntelEnabled()
+                        ? "\"esStrikeIntels\":" + jsonArray(esStrikeIntelJsons) + "," : "")
                 + "\"gexStrikeLifecycle\":" + jsonArray(gexStrikeLifecycleJsons) + ","
                 + "\"maxPains\":" + jsonArray(maxPainJsons) + ","
                 + "\"optionPriceBehaviors\":" + jsonArray(optionPriceBehaviorJsons) + ","

@@ -46,6 +46,10 @@ public enum EventType {
     // ES-on-SPX aligned GEX — one whole-book record per (symbol=SPX,expiry) covering every mapped strike,
     // so it routes CONTRACT-scoped by source|symbol|expiry with NO strike filter (like MAX_PAIN).
     ES_GEX(Scope.CONTRACT),
+    // ES strike-intelligence projected onto SPX strikes — per-strike (symbol=SPX,expiry,strike=spxStrike),
+    // routed CONTRACT-scoped by source|symbol|expiry and strike-filtered per user (like STRIKE_INTEL). A
+    // separate ES-origin overlay layer, distinct from the native SPX STRIKE_INTEL.
+    ES_STRIKE_INTEL(Scope.CONTRACT),
     // Strike-liquidity heatmap column frame — one per-second record per (symbol,expiry) chain
     // covering every strike, so it routes CONTRACT-scoped with NO strike filter (like MAX_PAIN).
     LIQUIDITY_HEATMAP(Scope.CONTRACT),
