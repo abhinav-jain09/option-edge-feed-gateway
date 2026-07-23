@@ -665,6 +665,16 @@ public final class GatewaySettings {
         return longValue("GATEWAY_ES_STRIKE_INTEL_TTL_MS", maxPainTtlMs(), 0L);
     }
 
+    /** NATIVE per-strike strike-intel (the es4/SPX board's own strike-intelligence levels). A published
+     *  level must stay visible for its whole 0DTE session and be removed ONLY at expiry (the per-strike
+     *  replay is expiry-filtered and DashboardAssembler.expiryOpen drops it at 16:00 ET) — NOT evicted by
+     *  the generic {@link #cacheTtlMs()} (default 15 min, sized for fast-ticking quote data) when a strike
+     *  goes quiet. Same "quiet-but-valid must not evict" contract as {@link #esStrikeIntelTtlMs()}; default
+     *  a long last-value-wins window (12h, like max-pain). */
+    public long strikeIntelTtlMs() {
+        return longValue("GATEWAY_STRIKE_INTEL_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
     /**
      * Databento per-strike GEX history topic. JSON on the wire (the databento-gex-history Kafka
      * Streams service emits enriched JSON: the gex fields + a {@code history} window map), unlike
