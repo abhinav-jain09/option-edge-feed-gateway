@@ -55,6 +55,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -274,6 +275,9 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingMissionControls = new LinkedHashMap<>();
     private final Map<String, String> pendingSpreadSkews = new LinkedHashMap<>();
     private final Map<String, String> pendingIndexPrices = new LinkedHashMap<>();
+    // Canonical SPX spot pending queue — separate from pendingIndexPrices so the legacy batch carries
+    // it under its own `spxPrices` envelope field (event identity preserved end to end).
+    private final Map<String, String> pendingSpxPrices = new LinkedHashMap<>();
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingMissionSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
@@ -2479,23 +2483,46 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * A canonical SPX spot record is valid only when it names the SPX symbol and carries a positive,
-     * finite price. Malformed or foreign payloads fail closed — the topic is the spot SSOT boundary, so
-     * garbage must never reach the cache or a client. NOTE: unlike index-price there is NO payload
-     * source=="DATABENTO" requirement — the payload source legitimately names the spot-cascade tier
-     * (NATIVE_SPX_INDEX / ES_BASIS_DERIVED / SYNTHETIC_OPTION_SPOT), which is the honest provenance of
-     * the canonical spot in both dev and prod. Other event types are intentionally unaffected.
+     * The exhaustive set of provenance tokens the feed may stamp on {@code underlying.spx.price}
+     * (config.py allowed_sources: the cascade tiers plus the static/legacy providers). Anything else —
+     * including a MISSING source, which {@link #enrichJson} would have rewritten to the binding source
+     * "DATABENTO" before validation — fails closed: "DATABENTO" is deliberately NOT in this set, so a
+     * record that never declared its cascade provenance can never launder itself into the spot SSOT.
+     */
+    private static final Set<String> SPX_SPOT_ALLOWED_SOURCES = Set.of(
+            "NATIVE_SPX_INDEX", "ES_BASIS_DERIVED", "SYNTHETIC_OPTION_SPOT",
+            "IBKR_INDEX", "STATIC_DEV", "CASCADED");
+
+    /**
+     * A canonical SPX spot record is valid only when it names the SPX symbol, carries a positive finite
+     * price, and declares one of the feed's legal cascade/static provenance tiers
+     * ({@link #SPX_SPOT_ALLOWED_SOURCES}). Malformed, foreign-symbol, unpriced, or unproven payloads
+     * fail closed — the topic is the spot SSOT boundary, so garbage must never reach the cache or a
+     * client. NOTE: this deliberately replaces (not reuses) the index-price source=="DATABENTO" gate —
+     * the canonical spot's honest provenance is its cascade tier, never a market-data source token.
+     * Applied identically at cache-consume, live-consume, live-forward, and historical-replay emission.
+     * Other event types are intentionally unaffected.
      */
     private boolean isValidSpxPrice(TopicBinding binding, String json) {
         if (binding == null || !"spx-price".equals(binding.event())) {
             return true;
         }
+        return isValidSpxPriceJson(json);
+    }
+
+    /** Event-scoped core of {@link #isValidSpxPrice}, reused by the replay path (which has no binding). */
+    private boolean isValidSpxPriceJson(String json) {
         if (json == null || json.isBlank()) {
             return false;
         }
         try {
             JsonNode root = mapper.readTree(json);
             if (!"SPX".equalsIgnoreCase(text(root, "symbol"))) {
+                return false;
+            }
+            // Tolerate case drift on an otherwise-legal token (the producer uppercases), but an unknown
+            // or missing token fails closed.
+            if (!SPX_SPOT_ALLOWED_SOURCES.contains(text(root, "source").toUpperCase(Locale.ROOT))) {
                 return false;
             }
             JsonNode price = root.get("price");
@@ -6069,7 +6096,13 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** A replay record matches the session: same contract (symbol+expiry) and inside the strike window. */
     private boolean replayMatches(ReplayParams params, String event, String json) {
-        if ("index-price".equals(event) || "vix-price".equals(event) || "spx-price".equals(event)) {
+        if ("spx-price".equals(event)) {
+            // Underlying-scoped like index/vix (no strike/expiry match), but the SSOT boundary holds on
+            // replay too: a malformed/foreign/unproven archived record must never reach a session
+            // (Codex round-1 P0 — cache, live, forward, and replay behave identically).
+            return isValidSpxPriceJson(json);
+        }
+        if ("index-price".equals(event) || "vix-price".equals(event)) {
             return true; // underlying/vix carry no strike and a different symbol — always relevant
         }
         try {
@@ -6358,7 +6391,11 @@ public class FeedGatewayService implements ReplayRunner {
             case "mission-pace" -> pendingMissionPaces;
             case "mission-control" -> pendingMissionControls;
             case "spread-skew" -> pendingSpreadSkews;
-            case "vix-price", "index-price", "spx-price" -> pendingIndexPrices;
+            case "vix-price", "index-price" -> pendingIndexPrices;
+            // Dedicated pending queue: the canonical SPX spot must keep its event identity through the
+            // legacy batch too (its own additive `spxPrices` envelope field), never flattened into the
+            // shared indexPrices collection (Codex round-1 P0).
+            case "spx-price" -> pendingSpxPrices;
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "mission-sandwich" -> pendingMissionSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
@@ -6430,7 +6467,10 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingHpsfAudits.values()),
                         new ArrayList<>(pendingHpsfExitIntents.values()),
                         new ArrayList<>(pendingEsGex.values()),
-                        new ArrayList<>(pendingEsStrikeIntel.values())
+                        new ArrayList<>(pendingEsStrikeIntel.values()),
+                        // Appended LAST (not next to indexPrices) so the positional test reflection
+                        // helpers stay stable; the JSON field order below is independent of this order.
+                        new ArrayList<>(pendingSpxPrices.values())
                 );
                 clearPendingLocked();
             }
@@ -6466,6 +6506,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingMissionControls.size()
                 + pendingSpreadSkews.size()
                 + pendingIndexPrices.size()
+                + pendingSpxPrices.size()
                 + pendingVolumeSandwiches.size()
                 + pendingMissionSandwiches.size()
                 + pendingGexByStrike.size()
@@ -6499,6 +6540,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingMissionControls.clear();
         pendingSpreadSkews.clear();
         pendingIndexPrices.clear();
+        pendingSpxPrices.clear();
         pendingVolumeSandwiches.clear();
         pendingMissionSandwiches.clear();
         pendingGexByStrike.clear();
@@ -6537,6 +6579,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> missionControlJsons = new ArrayList<>();
         List<String> spreadSkewJsons = new ArrayList<>();
         List<String> indexPriceJsons = new ArrayList<>();
+        List<String> spxPriceJsons = new ArrayList<>();
         List<String> volumeSandwichJsons = new ArrayList<>();
         List<String> missionSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
@@ -6568,7 +6611,10 @@ public class FeedGatewayService implements ReplayRunner {
                 case "mission-pace" -> missionPaceJsons.add(cachedEvent.json());
                 case "mission-control" -> missionControlJsons.add(cachedEvent.json());
                 case "spread-skew" -> spreadSkewJsons.add(cachedEvent.json());
-                case "vix-price", "index-price", "spx-price" -> indexPriceJsons.add(cachedEvent.json());
+                case "vix-price", "index-price" -> indexPriceJsons.add(cachedEvent.json());
+                // Dedicated envelope field — the canonical SPX spot's event identity survives the batch
+                // (never flattened into indexPrices; Codex round-1 P0).
+                case "spx-price" -> spxPriceJsons.add(cachedEvent.json());
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "mission-sandwich" -> missionSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
@@ -6621,7 +6667,8 @@ public class FeedGatewayService implements ReplayRunner {
                 hpsfAuditJsons,
                 hpsfExitIntentJsons,
                 esGexJsons,
-                esStrikeIntelJsons
+                esStrikeIntelJsons,
+                spxPriceJsons
         );
     }
 
@@ -6655,7 +6702,10 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> hpsfAuditJsons,
             List<String> hpsfExitIntentJsons,
             List<String> esGexJsons,
-            List<String> esStrikeIntelJsons
+            List<String> esStrikeIntelJsons,
+            // Appended LAST so the positional test reflection helpers stay stable; the JSON field sits
+            // next to indexPrices below regardless.
+            List<String> spxPriceJsons
     ) {
         ActiveSelection selection = activeSelection.get();
         return "{"
@@ -6680,6 +6730,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"missionControls\":" + jsonArray(missionControlJsons) + ","
                 + "\"spreadSkews\":" + jsonArray(spreadSkewJsons) + ","
                 + "\"indexPrices\":" + jsonArray(indexPriceJsons) + ","
+                // Additive field: the canonical SPX spot keeps its own event identity through the batch
+                // (older UIs ignore the unknown key; never flattened into indexPrices).
+                + "\"spxPrices\":" + jsonArray(spxPriceJsons) + ","
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
                 + "\"missionSandwiches\":" + jsonArray(missionSandwichJsons) + ","
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
