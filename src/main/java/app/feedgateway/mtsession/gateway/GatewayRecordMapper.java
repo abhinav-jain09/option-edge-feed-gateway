@@ -108,6 +108,7 @@ public final class GatewayRecordMapper {
             case "opb-v2-session" -> EventType.OPB_V2_SESSION;
             case "vix-price" -> EventType.VIX_PRICE;
             case "index-price" -> EventType.INDEX_PRICE;
+            case "spx-price" -> EventType.SPX_PRICE;
             default -> null; // hpsf-* and others: caller falls back to broadcast
         };
     }

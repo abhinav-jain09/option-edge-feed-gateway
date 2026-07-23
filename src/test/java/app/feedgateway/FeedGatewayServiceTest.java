@@ -48,6 +48,93 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void spxPriceAcceptsOnlyLegalCascadeTiersAndFailsClosedOnMalformedPayloads() throws Exception {
+        FeedGatewayService service = service();
+        Object binding = topicBinding("DATABENTO", "spx-price");
+
+        // The canonical spot's honest provenance is one of the feed's legal cascade/static tiers —
+        // including SYNTHETIC in prod. There is deliberately NO source=="DATABENTO" acceptance.
+        assertTrue(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"SYNTHETIC_OPTION_SPOT\",\"quality\":\"SYNTHETIC\"}"));
+        assertTrue(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"NATIVE_SPX_INDEX\"}"));
+        assertTrue(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"es_basis_derived\"}"),
+                "case drift on a legal tier token is tolerated (producer uppercases)");
+        // Provenance fail-closed set (Codex round-1 P1): missing source; "DATABENTO" (what enrichJson
+        // stamps onto a source-less record — laundering must not pass); unknown token; non-text source.
+        assertFalse(isValidSpxPrice(service, binding, "{\"symbol\":\"SPX\",\"price\":6402.75}"),
+                "a record that never declared its cascade provenance must fail closed");
+        assertFalse(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"DATABENTO\"}"),
+                "the binding-source stamp is not cascade provenance");
+        assertFalse(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"SYNTHETIC_DEV\"}"));
+        assertFalse(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":42}"));
+        // Symbol / price fail-closed set.
+        assertFalse(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"ES.v.0\",\"price\":7524.25,\"source\":\"NATIVE_SPX_INDEX\"}"),
+                "a foreign symbol must fail closed on the SPX spot boundary");
+        assertFalse(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"source\":\"NATIVE_SPX_INDEX\"}"));
+        assertFalse(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":0,\"source\":\"NATIVE_SPX_INDEX\"}"));
+        assertFalse(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":-1.5,\"source\":\"NATIVE_SPX_INDEX\"}"));
+        assertFalse(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":\"6402.75\",\"source\":\"NATIVE_SPX_INDEX\"}"));
+        assertFalse(isValidSpxPrice(service, binding, "not-json"));
+        assertTrue(isValidSpxPrice(service, topicBinding("DATABENTO", "index-price"),
+                "{\"symbol\":\"ES.v.0\"}"),
+                "the validity gate must remain scoped to spx-price");
+    }
+
+    @Test
+    void spxPriceReplayEmissionAppliesTheSameFailClosedValidation() throws Exception {
+        // Historical replay must not bypass the SSOT boundary (Codex round-1 P0): replayMatches is the
+        // replay-side gate, so a poison archived record fails there exactly as cache/live ingest would.
+        FeedGatewayService service = service();
+        ReplayParams params = new ReplayParams("app:u1", "SPX", "20260612", 1_000L, 2_000L, 1000, null);
+        assertTrue(replayMatches(service, params, "spx-price",
+                "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"ES_BASIS_DERIVED\"}"));
+        assertFalse(replayMatches(service, params, "spx-price",
+                "{\"symbol\":\"ES.v.0\",\"price\":7524.25,\"source\":\"NATIVE_SPX_INDEX\"}"),
+                "a foreign-symbol archived record must not replay to a session");
+        assertFalse(replayMatches(service, params, "spx-price",
+                "{\"symbol\":\"SPX\",\"price\":0,\"source\":\"NATIVE_SPX_INDEX\"}"));
+        assertFalse(replayMatches(service, params, "spx-price",
+                "{\"symbol\":\"SPX\",\"price\":6402.75}"),
+                "an archived record without cascade provenance must not replay");
+        assertFalse(replayMatches(service, params, "spx-price", "not-json"));
+        assertTrue(replayMatches(service, params, "vix-price", "{\"value\":18.2}"),
+                "vix/index replay behavior is intentionally unchanged");
+    }
+
+    @Test
+    void spxPriceTravelsTheBatchUnderItsOwnFieldNeverInsideIndexPrices() throws Exception {
+        FeedGatewayService service = service();
+        String spx = "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"SYNTHETIC_OPTION_SPOT\"}";
+        String envelope = uiBatchEnvelopeJsonSpxPrice(service, List.of(spx));
+        assertTrue(envelope.contains("\"spxPrices\":[" + spx + "]"),
+                "the canonical spot must ride its own additive envelope field");
+        assertTrue(envelope.contains("\"indexPrices\":[]"),
+                "the canonical spot must never be flattened into indexPrices");
+    }
+
+    @Test
+    void spxPriceCachesUnderItsOwnEventTypeAndSymbolKey() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"ES_BASIS_DERIVED\","
+                + "\"eventTime\":\"2026-07-23T14:30:00Z\"}";
+        assertEquals("DATABENTO|SPX", updateCache(service, topicBinding("DATABENTO", "spx-price"),
+                recordAt(settings.underlyingSpxPriceTopic(), 0, 1L, "SPX", json, now), json),
+                "the canonical spot must cache under the source-prefixed symbol key (one last-value-wins entry)");
+    }
+
+    @Test
     void epochOnlySelectionReassertDoesNotRollOrReplaceTheActiveBoard() {
         FeedGatewayService service = service();
         service.seedReadySelectionForTest("DATABENTO", "ES", "20260715", 100L);
@@ -78,7 +165,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -2903,6 +2990,15 @@ class FeedGatewayServiceTest {
         return (boolean) method.invoke(service, binding, json);
     }
 
+    private static boolean isValidSpxPrice(FeedGatewayService service, Object binding, String json)
+            throws Exception {
+        Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "isValidSpxPrice", bindingType, String.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, binding, json);
+    }
+
     @SuppressWarnings("unchecked")
     @Test
     void autoRollOverridesStaleExpiredSelection() throws Exception {
@@ -3094,7 +3190,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3229,7 +3325,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3245,7 +3341,7 @@ class FeedGatewayServiceTest {
                 strikeSr, List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3261,7 +3357,7 @@ class FeedGatewayServiceTest {
                 List.of(), gexMagnet, List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3277,7 +3373,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3293,7 +3389,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), maxPains,
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3312,7 +3408,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 optionPriceBehaviors, List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3328,7 +3424,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), opbV2ByOptions, List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3344,7 +3440,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), opbV2Sessions, List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3360,7 +3456,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3376,7 +3472,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3392,7 +3488,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3414,7 +3510,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of()
+                List.of(), List.of(), List.of()
         );
     }
 
@@ -3425,7 +3521,24 @@ class FeedGatewayServiceTest {
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class
+        );
+    }
+
+    /** spxPriceJsons is the (appended-last) 31st parameter of uiBatchEnvelopeJson. */
+    private static String uiBatchEnvelopeJsonSpxPrice(FeedGatewayService service, List<String> spxPrices) throws Exception {
+        Method method = uiBatchEnvelopeMethod();
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), spxPrices
         );
     }
 }
