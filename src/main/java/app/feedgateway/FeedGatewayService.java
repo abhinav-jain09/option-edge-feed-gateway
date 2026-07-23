@@ -1832,15 +1832,16 @@ public class FeedGatewayService implements ReplayRunner {
                         boolean liquidityHeatmapStale = "liquidity-heatmap".equals(binding.event())
                                 && eventCacheTimestamp(binding.event(), record, json)
                                 < System.currentTimeMillis() - settings.liquidityHeatmapTtlMs();
-                        // Strike-intel fail-closed (freshness): a per-strike signal carries no per-session
-                        // selectionEpoch (epoch 0 bypasses passesBarrier), so add an explicit maxStale gate on
-                        // the PAYLOAD event time — a backfilled/catching-up producer must never live-route a
-                        // stale action onto a strike. Its useful life is the generic cache window (the
-                        // delta-flow sibling shares the same 15-min cachePolicy); the cached-replay path
-                        // already gates the same way via isCacheFresh("strike-intel:...").
-                        boolean strikeIntelStale = "strike-intel".equals(binding.event())
-                                && eventCacheTimestamp(binding.event(), record, json)
-                                < System.currentTimeMillis() - settings.cacheTtlMs();
+                        // Strike-intel fail-closed (like es-open-direction / gamma-lifecycle): a null cacheKey
+                        // means updateCache classified the record as stale (PAYLOAD event time older than the
+                        // long strikeIntelTtlMs window) or SUPERSEDED (out-of-order/older than the cached value)
+                        // — never live-route it. Gating live-route AND replay off the SAME updateCache verdict
+                        // (12h strikeIntelTtlMs) keeps them consistent: a published 0DTE level persists for its
+                        // whole session (not 15-min TTL-evicted when the strike goes quiet) and is removed only
+                        // at expiry (per-strike replay is expiry-filtered; DashboardAssembler.expiryOpen purges
+                        // at 16:00 ET), while a >12h backfill/superseded record is dropped from both paths.
+                        boolean strikeIntelDropped = "strike-intel".equals(binding.event())
+                                && cacheKey == null;
                         boolean optionTruthStale = "option-truth".equals(binding.event())
                                 && eventCacheTimestamp(binding.event(), record, json)
                                 < System.currentTimeMillis() - settings.optionTruthTtlMs();
@@ -1879,7 +1880,7 @@ public class FeedGatewayService implements ReplayRunner {
                                 && cacheKey == null;
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
-                                && !strikeIntelStale && !optionTruthStale && !strikeInvasionStale && !spreadSkewStale
+                                && !strikeIntelDropped && !optionTruthStale && !strikeInvasionStale && !spreadSkewStale
                                 && !esOpenDirectionDropped && !strikeLifecycleDropped && !esStrikeIntelDropped) {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
@@ -3831,6 +3832,13 @@ public class FeedGatewayService implements ReplayRunner {
             // tombstone), so use the same long last-value-wins window as es-gex. Roll-forward/freshness track
             // the Kafka producer time (default cacheTimestamp), which advances on every re-emit.
             return CachePolicy.expiring(settings.esStrikeIntelTtlMs());
+        }
+        if ("strike-intel".equals(event)) {
+            // NATIVE per-strike strike-intel: a published 0DTE level must persist for the whole session and
+            // drop ONLY at expiry (per-strike replay is expiry-filtered; DashboardAssembler.expiryOpen purges
+            // at 16:00 ET) — a strike that goes quiet must NOT be evicted by the generic 15-min cacheTtlMs.
+            // Same "quiet-but-valid must not evict" contract as the projected es-strike-intel sibling.
+            return CachePolicy.expiring(settings.strikeIntelTtlMs());
         }
         if ("gex-strike-lifecycle".equals(event)) {
             // rev-17: an active strike re-emits its label every frame, so a long last-value-wins window (default
