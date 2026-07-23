@@ -55,6 +55,20 @@ class GatewayRecordMapperTest {
     }
 
     @Test
+    void mapsSpxPriceAsUnderlyingEventDespiteCascadeTierSource() throws Exception {
+        // The canonical spot's payload source names the cascade tier (never a market-data source
+        // token), so it must not contradict the DATABENTO binding — the record stays routable.
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "spx-price",
+                node("{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"SYNTHETIC_OPTION_SPOT\","
+                        + "\"quality\":\"SYNTHETIC\"}")).orElseThrow();
+        assertEquals(EventType.SPX_PRICE, rec.eventType());
+        assertTrue(rec.eventType().isUnderlying());
+        assertEquals("SPX", rec.eventType().underlyingSymbol());
+        assertTrue(rec.strike().isEmpty());
+        assertEquals(EventType.SPX_PRICE, GatewayRecordMapper.eventTypeFor("spx-price"));
+    }
+
+    @Test
     void contractEventWithoutStrikeHasEmptyStrike() throws Exception {
         RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "strike-flow",
                 node("{\"symbol\":\"SPX\",\"expiry\":\"20260617\"}")).orElseThrow();

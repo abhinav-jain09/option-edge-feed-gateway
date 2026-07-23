@@ -238,6 +238,16 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_ES_TRADES_TOPIC", value("KAFKA_HPSF_ES_TRADES_TOPIC", "underlying.es.trades"));
     }
 
+    /**
+     * Canonical SPX spot stream ({@code UnderlyingPriceEvent} JSON, keyed by symbol). This is the SAME
+     * topic HPSF and strike-flow source their spot from, forwarded to the UI as the dedicated
+     * {@code spx-price} event, so the displayed SPX spot is the canonical value rather than a spot
+     * embedded in an arbitrarily-ordered display-snapshot batch.
+     */
+    public String underlyingSpxPriceTopic() {
+        return value("KAFKA_UNDERLYING_SPX_PRICE_TOPIC", "underlying.spx.price");
+    }
+
     /** Latest continuous ES futures aggressor-flow snapshot (JSON, keyed by ES.v.0). */
     public String esAggressorFlowTopic() {
         return value("KAFKA_ES_AGGRESSOR_FLOW_TOPIC", "futures.aggressor-flow");

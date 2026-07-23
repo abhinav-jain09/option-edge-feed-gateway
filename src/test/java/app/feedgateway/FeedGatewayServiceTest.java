@@ -48,6 +48,42 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void spxPriceAcceptsCascadeTiersButFailsClosedOnMalformedPayloads() throws Exception {
+        FeedGatewayService service = service();
+        Object binding = topicBinding("DATABENTO", "spx-price");
+
+        // The canonical spot's honest provenance is the cascade tier — including SYNTHETIC in prod —
+        // so unlike index-price there is deliberately NO source=="DATABENTO" requirement.
+        assertTrue(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"SYNTHETIC_OPTION_SPOT\",\"quality\":\"SYNTHETIC\"}"));
+        assertTrue(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"NATIVE_SPX_INDEX\"}"));
+        assertFalse(isValidSpxPrice(service, binding,
+                "{\"symbol\":\"ES.v.0\",\"price\":7524.25,\"source\":\"DATABENTO\"}"),
+                "a foreign symbol must fail closed on the SPX spot boundary");
+        assertFalse(isValidSpxPrice(service, binding, "{\"symbol\":\"SPX\",\"source\":\"NATIVE_SPX_INDEX\"}"));
+        assertFalse(isValidSpxPrice(service, binding, "{\"symbol\":\"SPX\",\"price\":0}"));
+        assertFalse(isValidSpxPrice(service, binding, "{\"symbol\":\"SPX\",\"price\":-1.5}"));
+        assertFalse(isValidSpxPrice(service, binding, "{\"symbol\":\"SPX\",\"price\":\"6402.75\"}"));
+        assertFalse(isValidSpxPrice(service, binding, "not-json"));
+        assertTrue(isValidSpxPrice(service, topicBinding("DATABENTO", "index-price"),
+                "{\"symbol\":\"ES.v.0\"}"),
+                "the validity gate must remain scoped to spx-price");
+    }
+
+    @Test
+    void spxPriceCachesUnderItsOwnEventTypeAndSymbolKey() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = "{\"symbol\":\"SPX\",\"price\":6402.75,\"source\":\"ES_BASIS_DERIVED\","
+                + "\"eventTime\":\"2026-07-23T14:30:00Z\"}";
+        assertEquals("DATABENTO|SPX", updateCache(service, topicBinding("DATABENTO", "spx-price"),
+                recordAt(settings.underlyingSpxPriceTopic(), 0, 1L, "SPX", json, now), json),
+                "the canonical spot must cache under the source-prefixed symbol key (one last-value-wins entry)");
+    }
+
+    @Test
     void epochOnlySelectionReassertDoesNotRollOrReplaceTheActiveBoard() {
         FeedGatewayService service = service();
         service.seedReadySelectionForTest("DATABENTO", "ES", "20260715", 100L);
@@ -78,7 +114,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -2899,6 +2935,15 @@ class FeedGatewayServiceTest {
         Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
         Method method = FeedGatewayService.class.getDeclaredMethod(
                 "isTrustedIndexPrice", bindingType, String.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, binding, json);
+    }
+
+    private static boolean isValidSpxPrice(FeedGatewayService service, Object binding, String json)
+            throws Exception {
+        Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "isValidSpxPrice", bindingType, String.class);
         method.setAccessible(true);
         return (boolean) method.invoke(service, binding, json);
     }
