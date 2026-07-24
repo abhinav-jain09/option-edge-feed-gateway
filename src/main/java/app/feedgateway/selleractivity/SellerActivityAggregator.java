@@ -38,6 +38,13 @@ public final class SellerActivityAggregator {
      */
     static final int MAX_STRIKES = 1024;
     static final int MAX_POINTS_PER_STRIKE = 1500;
+    /**
+     * Worst-case PROCESSING ceilings (not just output): a malformed/oversized snapshot cannot force
+     * unbounded parsing/sorting work — at most {@link #MAX_STRIKE_NODES} strike nodes are examined and at
+     * most {@link #MAX_RAW_POINTS_PER_STRIKE} raw points per strike are read. Far above real data.
+     */
+    static final int MAX_STRIKE_NODES = 8192;
+    static final int MAX_RAW_POINTS_PER_STRIKE = 8192;
 
     private final ObjectMapper mapper;
 
@@ -64,7 +71,11 @@ public final class SellerActivityAggregator {
         JsonNode root = readTree(snapshotJson);
         if (root != null) {
             asOfMs = root.path("timestampMs").asLong(0L);
+            int examinedNodes = 0;
             for (JsonNode strikeNode : root.path("strikes")) {
+                if (++examinedNodes > MAX_STRIKE_NODES) {
+                    break; // worst-case processing ceiling — real chains never approach this
+                }
                 double strike = strikeNode.path("strike").asDouble(Double.NaN);
                 if (!Double.isFinite(strike)) {
                     continue;
@@ -113,7 +124,11 @@ public final class SellerActivityAggregator {
             return result;
         }
         List<JsonNode> valid = new ArrayList<>();
+        int seen = 0;
         for (JsonNode p : activity.get("points")) {
+            if (++seen > MAX_RAW_POINTS_PER_STRIKE) {
+                break; // worst-case processing ceiling on raw input (upstream caps at 1440/strike)
+            }
             long tsMs = p.path("timestampMs").asLong(Long.MIN_VALUE);
             if (tsMs != Long.MIN_VALUE && Math.max(0L, p.path("sellTradeCount").asLong(0L)) > 0L) {
                 valid.add(p);

@@ -4452,17 +4452,19 @@ public class FeedGatewayService implements ReplayRunner {
         if (symbol == null || expiry == null) {
             return null;
         }
-        // strikeFlows keys are SOURCE-prefixed by updateCache (line ~3045: key = source + "|" + key), e.g.
-        // "DATABENTO|SPX|20260724". Match the source-agnostic "SYMBOL|EXPIRY" suffix so the endpoint
-        // resolves live data regardless of the active source (a bare "SYMBOL|EXPIRY" get would always miss).
-        String suffix = symbol.toUpperCase() + "|" + normalizeExpiry(expiry);
-        for (Map.Entry<String, String> entry : strikeFlows.entrySet()) {
-            String key = entry.getKey();
-            if (key.equals(suffix) || key.endsWith("|" + suffix)) {
-                return entry.getValue();
-            }
+        // Seller-activity is a DATABENTO product — the classifier that produces sellerActivity binds source
+        // DATABENTO (see databentoStrikeFlowTopic binding). updateCache SOURCE-prefixes the cache key
+        // (line ~3045: key = source + "|" + key), so look up the EXACT "DATABENTO|SYMBOL|EXPIRY" key:
+        // deterministic and O(1), never returning another source's snapshot (vs a suffix scan whose order
+        // is nondeterministic across sources), and never the bare "SYMBOL|EXPIRY" that always missed.
+        String key = "DATABENTO|" + symbol.toUpperCase() + "|" + normalizeExpiry(expiry);
+        String snapshot = strikeFlows.get(key);
+        if (snapshot == null) {
+            return null;
         }
-        return null;
+        // Apply the SAME freshness gate the gateway uses when it serves strike-flow (the isCacheFresh filter
+        // in the cached-state send): never expose an expired / previous-session snapshot as current.
+        return isCacheFresh("strike-flow:" + key, System.currentTimeMillis()) ? snapshot : null;
     }
 
     /**
@@ -7167,10 +7169,14 @@ public class FeedGatewayService implements ReplayRunner {
      * SAME key updateCache writes — the integration gap that a mocked accessor conceals. Returns the
      * cache key updateCache produced.
      */
-    String cacheStrikeFlowForTest(String bindingSource, String recordKey, String json) {
+    String cacheStrikeFlowForTest(String bindingSource, String recordKey, String json, long recordTimestampMs) {
         TopicBinding binding = new TopicBinding(bindingSource, "strike-flow");
-        ConsumerRecord<String, String> record =
-                new ConsumerRecord<>("test-strike-flow", 0, 0L, recordKey, json);
+        // strike-flow freshness tracks the Kafka record timestamp (eventCacheTimestamp default), so a test
+        // must set it explicitly to exercise the isCacheFresh gate.
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                "test-strike-flow", 0, 0L, recordTimestampMs,
+                org.apache.kafka.common.record.TimestampType.CREATE_TIME, -1, -1, recordKey, json,
+                new org.apache.kafka.common.header.internals.RecordHeaders(), java.util.Optional.empty());
         return updateCache(binding, record, json);
     }
 
