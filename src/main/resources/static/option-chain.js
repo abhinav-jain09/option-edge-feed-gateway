@@ -196,8 +196,11 @@
       const strike = Number(payload?.strike);
       if (!Number.isFinite(strike)) return false;
       const missing = String(payload?.status || '').toUpperCase() === 'OI_MISSING';
-      const status = { symbol: payload.symbol, expiry: payload.expiry, strike, uwGexOiMissing: missing };
-      const key = contractKey(status);
+      // Keep the producer's source identity: contractKey() prefixes the source, and dropping it would
+      // key this as LEGACY|... while snapshot/GEX rows live under DATABENTO|... (badge would never merge).
+      const status = { source: payload.source || payload.marketDataSource, symbol: payload.symbol,
+        expiry: payload.expiry, strike, uwGexOiMissing: missing };
+      const key = contractKey(payload);
       gexOiStatusRef.current.set(key, status);
       const row = rowsRef.current.get(key);
       if (!row || row.uwGexOiMissing === missing) return false;
