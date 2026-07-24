@@ -3387,6 +3387,18 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void gexOiStatusCacheAcceptsOnlyKnownStatusValues() throws Exception {
+        // A malformed/schema-drifted record must never displace a cached OI_MISSING warning (a reconnect
+        // would replay the malformed value and silently lose the badge).
+        FeedGatewayService service = service();
+        assertTrue(service.isKnownOiStatus("{\"status\":\"OI_MISSING\"}"));
+        assertTrue(service.isKnownOiStatus("{\"status\":\"oi_ok\"}"));
+        assertFalse(service.isKnownOiStatus("{\"status\":\"OI_ARRIVED\"}"));
+        assertFalse(service.isKnownOiStatus("{}"));
+        assertFalse(service.isKnownOiStatus("not-json"));
+    }
+
+    @Test
     void gexMagnetTopicBindsToGexMagnetEventOnTheAvroConsumers() throws Exception {
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         // gex-magnet is DATABENTO-only Avro: bound in the Avro consumers + avroTopics (verbatim passthrough).

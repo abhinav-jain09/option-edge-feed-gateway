@@ -3325,6 +3325,13 @@ public class FeedGatewayService implements ReplayRunner {
                 return key;
             }
             case "gex-oi-status" -> {
+                // Fail-closed semantics guard (Codex round-4 P1): only the two known status values may
+                // enter the replay cache. A malformed/schema-drifted record must not displace a valid
+                // cached OI_MISSING warning — a reconnecting client would replay only the malformed value
+                // and silently lose the badge.
+                if (!isKnownOiStatus(json)) {
+                    return null;
+                }
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gexOiStatus.put(key, json);
@@ -4811,6 +4818,16 @@ public class FeedGatewayService implements ReplayRunner {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
         }
         return fallback;
+    }
+
+    /** True when a gex-oi-status payload carries exactly OI_MISSING or OI_OK (package-visible for tests). */
+    boolean isKnownOiStatus(String json) {
+        try {
+            String status = text(mapper.readTree(json), "status").toUpperCase();
+            return "OI_MISSING".equals(status) || "OI_OK".equals(status);
+        } catch (JsonProcessingException ignored) {
+            return false;
+        }
     }
 
     private String gexCacheKey(String json, String fallback) {
