@@ -19,6 +19,7 @@ import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.Semaphore;
 import java.util.regex.Pattern;
 
 /**
@@ -41,18 +42,32 @@ public class SellerActivityController {
     private static final String DEFAULT_MODE = "combined";
     /** Per-principal request budget — bounds amplification on this synchronous, per-request-parsing endpoint. */
     private static final int RATE_LIMIT_PER_MIN = 120;
+    /**
+     * Max CONCURRENT aggregations. Each parses one cached snapshot (bounded by MAX_SNAPSHOT_BYTES), so peak
+     * heap for this endpoint is bounded to {@code MAX_CONCURRENT_AGGREGATIONS × MAX_SNAPSHOT_BYTES},
+     * protecting the shared single-replica gateway from an authenticated burst. Excess -> 503 Retry-After.
+     */
+    private static final int MAX_CONCURRENT_AGGREGATIONS = 4;
 
     private final FeedGatewayService service;
     private final LiquidityHistoryAuth auth;
     private final SellerActivityAggregator aggregator;
     private final ObjectMapper mapper;
     private final RateLimiter rateLimiter = new RateLimiter(RATE_LIMIT_PER_MIN, 60_000L);
+    final Semaphore aggregationSlots; // package-visible so a test can exhaust it
 
     public SellerActivityController(FeedGatewayService service, LiquidityHistoryAuth auth, ObjectMapper mapper) {
+        this(service, auth, mapper, MAX_CONCURRENT_AGGREGATIONS);
+    }
+
+    /** Test seam: explicit concurrency limit. */
+    SellerActivityController(FeedGatewayService service, LiquidityHistoryAuth auth, ObjectMapper mapper,
+                             int maxConcurrentAggregations) {
         this.service = service;
         this.auth = auth;
         this.mapper = mapper;
         this.aggregator = new SellerActivityAggregator(mapper);
+        this.aggregationSlots = new Semaphore(maxConcurrentAggregations);
     }
 
     @GetMapping(value = "/api/seller-activity", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -88,9 +103,18 @@ public class SellerActivityController {
             return badRequest("mode must be one of " + SellerActivityAggregator.MODES);
         }
         String normalizedSymbol = symbol.trim().toUpperCase(Locale.ROOT);
-        String snapshot = service.cachedStrikeFlowSnapshot(normalizedSymbol, canonicalExpiry);
-        ObjectNode envelope = aggregator.aggregate(snapshot, normalizedSymbol, canonicalExpiry, sample, mode);
-        return ResponseEntity.ok(envelope);
+        // Bound peak concurrent parsing so an authenticated burst can't exhaust the shared gateway heap.
+        if (!aggregationSlots.tryAcquire()) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .header(HttpHeaders.RETRY_AFTER, "1").build();
+        }
+        try {
+            String snapshot = service.cachedStrikeFlowSnapshot(normalizedSymbol, canonicalExpiry);
+            ObjectNode envelope = aggregator.aggregate(snapshot, normalizedSymbol, canonicalExpiry, sample, mode);
+            return ResponseEntity.ok(envelope);
+        } finally {
+            aggregationSlots.release();
+        }
     }
 
     /**

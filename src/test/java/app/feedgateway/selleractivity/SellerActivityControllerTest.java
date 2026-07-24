@@ -78,6 +78,25 @@ class SellerActivityControllerTest {
     }
 
     @Test
+    void boundsConcurrentAggregationsWith503WhenSlotsAreExhausted() {
+        SellerActivityController limited =
+                new SellerActivityController(service, auth, new ObjectMapper(), 1); // one aggregation slot
+        when(auth.authenticate(any())).thenReturn(new LiquidityHistoryAuth.Result(200, "user"));
+        // simulate an in-flight aggregation holding the only slot
+        limited.aggregationSlots.acquireUninterruptibly();
+        try {
+            assertEquals(503, limited.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token")
+                    .getStatusCode().value(), "no free slot -> 503 (protects the shared gateway heap)");
+        } finally {
+            limited.aggregationSlots.release();
+        }
+        // slot freed -> served, and the finally-release keeps the pool from leaking
+        assertEquals(200, limited.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token")
+                .getStatusCode().value());
+        assertEquals(1, limited.aggregationSlots.availablePermits(), "permit released after serving");
+    }
+
+    @Test
     void authenticatedRequestNormalizesSymbolAndAggregatesCachedSnapshot() {
         authOk();
         String snapshot = "{\"symbol\":\"SPX\",\"expiry\":\"20260724\",\"timestampMs\":1780000500000,"
