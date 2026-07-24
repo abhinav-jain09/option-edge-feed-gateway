@@ -39,6 +39,13 @@ public final class SellerActivityAggregator {
     static final int MAX_STRIKES = 1024;
     static final int MAX_POINTS_PER_STRIKE = 1500;
     /**
+     * Hard ceiling on TOTAL points across the whole response, so the serialized envelope (and the heap it
+     * occupies while the controller serializes it under the concurrency semaphore) is bounded regardless of
+     * how the strikes/points distribute. ~200k points ≈ a few MB of JSON — far above a real chain, well
+     * below the {@code MAX_STRIKES × MAX_POINTS_PER_STRIKE} theoretical max.
+     */
+    static final int MAX_TOTAL_POINTS = 200_000;
+    /**
      * Parse-cost ceiling enforced BEFORE JSON materialization: reject a snapshot larger than this so a
      * malformed/oversized cache entry cannot force unbounded parse time/heap on this synchronous,
      * rate-limited endpoint. Far above a real strike-flow snapshot (a few MB); an over-cap snapshot
@@ -72,6 +79,7 @@ public final class SellerActivityAggregator {
         JsonNode root = readTree(snapshotJson);
         if (root != null) {
             asOfMs = root.path("timestampMs").asLong(0L);
+            int totalPoints = 0;
             for (JsonNode strikeNode : root.path("strikes")) {
                 double strike = strikeNode.path("strike").asDouble(Double.NaN);
                 if (!Double.isFinite(strike)) {
@@ -79,9 +87,13 @@ public final class SellerActivityAggregator {
                 }
                 List<long[]> points = aggregatePoints(strikeNode.path("sellerActivity"), sampleMinutes, mode);
                 if (!points.isEmpty()) {
+                    if (totalPoints + points.size() > MAX_TOTAL_POINTS) {
+                        break; // adding this strike would exceed the total-output cap -> stop (strictly bounded)
+                    }
                     series.add(new StrikeSeries(strike, points));
+                    totalPoints += points.size();
                     if (series.size() >= MAX_STRIKES) {
-                        break; // defensive ceiling — real chains never approach this
+                        break; // defensive strike ceiling — real chains never approach this
                     }
                 }
             }

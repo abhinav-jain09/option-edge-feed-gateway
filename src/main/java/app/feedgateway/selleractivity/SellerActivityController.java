@@ -2,6 +2,7 @@ package app.feedgateway.selleractivity;
 
 import app.feedgateway.FeedGatewayService;
 import app.feedgateway.liquidityhistory.LiquidityHistoryAuth;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.http.HttpHeaders;
@@ -71,7 +72,7 @@ public class SellerActivityController {
     }
 
     @GetMapping(value = "/api/seller-activity", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<ObjectNode> sellerActivity(
+    public ResponseEntity<byte[]> sellerActivity(
             @RequestParam(value = "symbol", required = false) String symbol,
             @RequestParam(value = "expiry", required = false) String expiry,
             @RequestParam(value = "sample", required = false) String sampleRaw,
@@ -111,7 +112,12 @@ public class SellerActivityController {
         try {
             String snapshot = service.cachedStrikeFlowSnapshot(normalizedSymbol, canonicalExpiry);
             ObjectNode envelope = aggregator.aggregate(snapshot, normalizedSymbol, canonicalExpiry, sample, mode);
-            return ResponseEntity.ok(envelope);
+            // Serialize UNDER the semaphore so the (bounded) envelope and its bytes are held only while a
+            // slot is occupied — peak heap is MAX_CONCURRENT_AGGREGATIONS × (parse budget + serialized out).
+            return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
+                    .body(mapper.writeValueAsBytes(envelope));
+        } catch (JsonProcessingException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         } finally {
             aggregationSlots.release();
         }
@@ -149,10 +155,15 @@ public class SellerActivityController {
         }
     }
 
-    private ResponseEntity<ObjectNode> badRequest(String message) {
+    private ResponseEntity<byte[]> badRequest(String message) {
         ObjectNode body = mapper.createObjectNode();
         body.put("error", message);
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+        try {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .contentType(MediaType.APPLICATION_JSON).body(mapper.writeValueAsBytes(body));
+        } catch (JsonProcessingException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).build();
+        }
     }
 
     /** Fixed-window per-principal limiter (mirrors the /api/liquidity-history limiter). */

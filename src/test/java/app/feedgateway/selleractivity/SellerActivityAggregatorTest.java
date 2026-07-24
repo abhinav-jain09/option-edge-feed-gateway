@@ -179,6 +179,34 @@ class SellerActivityAggregatorTest {
     }
 
     @Test
+    void enforcesMaxTotalPointsSoTheSerializedResponseIsBounded() {
+        ObjectNode snap = mapper.createObjectNode();
+        snap.put("timestampMs", 1L);
+        ArrayNode strikes = snap.putArray("strikes");
+        int perStrike = 1500; // == MAX_POINTS_PER_STRIKE
+        int strikeCount = (SellerActivityAggregator.MAX_TOTAL_POINTS / perStrike) + 5; // exceed the total cap
+        for (int i = 0; i < strikeCount; i++) {
+            ObjectNode s = strikes.addObject();
+            s.put("strike", 1000.0 + i);
+            ObjectNode a = s.putObject("sellerActivity");
+            a.put("bucketMinutes", 1);
+            ArrayNode pts = a.putArray("points");
+            for (int t = 0; t < perStrike; t++) {
+                point(pts, (long) t * 60_000L, 1, 1, 0);
+            }
+        }
+        ObjectNode env = aggregator.aggregate(snap.toString(), "SPX", "2026-07-24", 1, "combined");
+        int total = 0;
+        for (JsonNode row : env.path("series")) {
+            total += row.path("points").size();
+        }
+        assertTrue(total <= SellerActivityAggregator.MAX_TOTAL_POINTS,
+                "total points must be bounded, was " + total);
+        assertTrue(total > SellerActivityAggregator.MAX_TOTAL_POINTS - perStrike,
+                "and should fill close to the cap, was " + total);
+    }
+
+    @Test
     void rejectsAnOversizedSnapshotBeforeParsingWithAnEmptyEnvelope() {
         // A snapshot larger than MAX_SNAPSHOT_BYTES must be rejected BEFORE readTree (bounded parse cost),
         // returning a valid empty envelope. (Compact strings keep this ~32MB, not 64MB.)

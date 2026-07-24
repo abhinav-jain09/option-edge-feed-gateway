@@ -2,11 +2,13 @@ package app.feedgateway.selleractivity;
 
 import app.feedgateway.FeedGatewayService;
 import app.feedgateway.liquidityhistory.LiquidityHistoryAuth;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.ResponseEntity;
+
+import java.io.IOException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -55,12 +57,12 @@ class SellerActivityControllerTest {
     }
 
     @Test
-    void missingSnapshotReturns200WithEmptyEnvelope() {
+    void missingSnapshotReturns200WithEmptyEnvelope() throws IOException {
         authOk();
         when(service.cachedStrikeFlowSnapshot("SPX", "2026-07-24")).thenReturn(null);
-        ResponseEntity<ObjectNode> r = controller.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token");
+        ResponseEntity<byte[]> r = controller.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token");
         assertEquals(200, r.getStatusCode().value());
-        ObjectNode body = r.getBody();
+        JsonNode body = new ObjectMapper().readTree(r.getBody());
         assertEquals("SPX", body.path("symbol").asText());
         assertEquals(30, body.path("sampleMinutes").asInt());       // default
         assertEquals("combined", body.path("mode").asText());       // default
@@ -97,7 +99,7 @@ class SellerActivityControllerTest {
     }
 
     @Test
-    void authenticatedRequestNormalizesSymbolAndAggregatesCachedSnapshot() {
+    void authenticatedRequestNormalizesSymbolAndAggregatesCachedSnapshot() throws IOException {
         authOk();
         String snapshot = "{\"symbol\":\"SPX\",\"expiry\":\"20260724\",\"timestampMs\":1780000500000,"
                 + "\"strikes\":[{\"strike\":7515.0,\"sellerActivity\":{\"bucketMinutes\":1,\"points\":["
@@ -105,9 +107,9 @@ class SellerActivityControllerTest {
         when(service.cachedStrikeFlowSnapshot("SPX", "2026-07-24")).thenReturn(snapshot);
 
         // lower-case, padded symbol must normalize to the cache key "SPX".
-        ResponseEntity<ObjectNode> r = controller.sellerActivity(" spx ", "2026-07-24", "30", "combined", "Bearer token");
+        ResponseEntity<byte[]> r = controller.sellerActivity(" spx ", "2026-07-24", "30", "combined", "Bearer token");
         assertEquals(200, r.getStatusCode().value());
-        ObjectNode body = r.getBody();
+        JsonNode body = new ObjectMapper().readTree(r.getBody());
         assertEquals("SPX", body.path("symbol").asText());
         assertEquals(1_780_000_500_000L, body.path("asOfMs").asLong());
         assertEquals(1, body.path("series").size());
