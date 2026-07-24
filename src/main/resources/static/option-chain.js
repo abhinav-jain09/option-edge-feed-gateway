@@ -461,7 +461,7 @@
 		            const strike = Number(payload.strike);
 		            const removeAllSources = String(payload.source || payload.marketDataSource || '').toUpperCase() === 'ALL';
 		            const keys = removeAllSources
-		              ? matchingStrikeKeys([rowsRef.current, pacesRef.current, gexByStrikeRef.current, strikeFlowRef.current, deltaFlowRef.current], payload)
+		              ? matchingStrikeKeys([rowsRef.current, pacesRef.current, gexByStrikeRef.current, gexOiStatusRef.current, strikeFlowRef.current, deltaFlowRef.current], payload)
 		              : [activeContractKey(payload, config)];
 		            keys.forEach(key => {
 		              rowsRef.current.delete(key);
@@ -482,6 +482,12 @@
 			          } else if (message.type === 'gex-by-strike') {
 			            if (!shouldAcceptStreamPayload(payload, config)) return;
 			            if (mergeGexPayload(payload)) {
+			              bumpRows();
+			            }
+			          } else if (message.type === 'gex-oi-status') {
+			            // Per-session routing delivers cached/live records standalone, not only via ui-batch.
+			            if (!shouldAcceptStreamPayload(payload, config)) return;
+			            if (mergeGexOiStatusPayload(payload)) {
 			              bumpRows();
 			            }
                       } else if (message.type === 'strike-flow') {
