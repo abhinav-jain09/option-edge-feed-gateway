@@ -3219,6 +3219,14 @@ public class FeedGatewayService implements ReplayRunner {
                 // precedence: once the session's verdict is cached, later interims are dead.
                 int marker = key.indexOf("|I|");
                 if (marker >= 0) {
+                    // CD-R30 short-class INGESTION freshness for interims: a delayed or
+                    // backfilled monitoring record older than the interim window must never
+                    // cache or live-broadcast (the long 12h policy below governs only the
+                    // VERDICT + seek-back). Returning null suppresses both.
+                    if (System.currentTimeMillis() - eventTime
+                            > settings.closeDirectionInterimFreshMs()) {
+                        return null;
+                    }
                     String verdictKey = key.substring(0, marker) + "|V|"
                             + key.substring(marker + 3);
                     if (closeDirectionVerdicts.containsKey(verdictKey)) {

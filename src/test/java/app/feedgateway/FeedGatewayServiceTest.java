@@ -1041,6 +1041,55 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void closeDirectionMissingFieldsAndStaleInterimIngestDrop() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        // Missing sessionDate / missing direction: null, never cached (CD-R30).
+        String noDate = "{\"phase\":\"MONITORING\",\"direction\":\"UP\",\"asOfMs\":" + now + "}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                recordAt(settings.closeDirectionSignalTopic(), 0, 11L, "SPX|20260724",
+                        noDate, now), noDate));
+        String noDirection = "{\"phase\":\"MONITORING\",\"sessionDate\":\"2026-07-24\","
+                + "\"asOfMs\":" + now + "}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                recordAt(settings.closeDirectionSignalTopic(), 0, 12L, "SPX|20260724",
+                        noDirection, now), noDirection));
+        // Stale-interim INGESTION drop: a backfilled monitoring record older than the
+        // interim freshness window must not cache or live-broadcast — while a verdict of
+        // the same age stays valid on the long window.
+        long stale = now - settings.closeDirectionInterimFreshMs() - 60_000;
+        String staleInterim = "{\"phase\":\"MONITORING\",\"sessionDate\":\"2026-07-23\","
+                + "\"direction\":\"UP\",\"asOfMs\":" + stale + "}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                recordAt(settings.closeDirectionSignalTopic(), 0, 13L, "SPX|20260723",
+                        staleInterim, stale), staleInterim));
+        String oldVerdict = "{\"phase\":\"VERDICT\",\"sessionDate\":\"2026-07-23\","
+                + "\"direction\":\"DOWN\",\"verdictId\":\"CDV1:2026-07-23:SPX:20260723\","
+                + "\"asOfMs\":" + stale + "}";
+        assertEquals("DATABENTO|V|2026-07-23",
+                updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                        recordAt(settings.closeDirectionSignalTopic(), 0, 14L, "SPX|20260723",
+                                oldVerdict, stale), oldVerdict));
+    }
+
+    @Test
+    void closeDirectionTopicIsOptionalAndPrefixAware() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertTrue(isOptionalTopic(service, settings.closeDirectionSignalTopic()),
+                "close-direction topic absence must never starve the shared JSON consumer");
+        // TOPIC_PREFIX (es4) applies through the *_TOPIC helper — no code change per env.
+        System.setProperty("TOPIC_PREFIX", "es.");
+        try {
+            assertEquals("es.close.direction.signal",
+                    new GatewaySettings().closeDirectionSignalTopic());
+        } finally {
+            System.clearProperty("TOPIC_PREFIX");
+        }
+    }
+
+    @Test
     void closeDirectionUsesLongTtlWindow() throws Exception {
         // The frozen 15:49 verdict must still replay to a client connecting at 15:59; the long
         // 12h window also drives the restart seek-back. (Interim REPLAY freshness is separately
