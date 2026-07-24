@@ -915,6 +915,37 @@ public final class GatewaySettings {
     }
 
     /**
+     * SPX close-direction signal topic (JSON, key = symbol|expiry; interim signals 1/min in the
+     * final 65 minutes + ONE frozen UP/DOWN/CHOPPY verdict in the T-11m power minute — design
+     * CLOSE-DIRECTION-GATE1 §6). Resolved through the {@code _TOPIC} prefix helper, so on es4
+     * ({@code TOPIC_PREFIX=es.}) this becomes {@code es.close.direction.signal} with no code change.
+     */
+    public String closeDirectionSignalTopic() {
+        return value("KAFKA_CLOSE_DIRECTION_SIGNAL_TOPIC", "close.direction.signal");
+    }
+
+    /**
+     * Freshness TTL for the close-direction cache. The VERDICT is emitted once (T-11m) and stays
+     * decision-relevant until the close — the max-pain/es-open-direction long last-value-wins class
+     * (default 12h), which also bounds the seek-back so a restarted gateway re-bootstraps the
+     * session's signals. Interim signals share the window for eviction; their REPLAY freshness is
+     * additionally gated by {@link #closeDirectionInterimFreshMs()} so a stale interim never replays
+     * as live (design CD-R30's short-class requirement, enforced at the replay seam).
+     */
+    public long closeDirectionTtlMs() {
+        return longValue("GATEWAY_CLOSE_DIRECTION_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
+    /**
+     * Replay freshness bound for close-direction INTERIM signals (default 5 min — the
+     * es-open-direction-status heartbeat class): an interim older than this is simply absent on
+     * late-join/replay; the frozen VERDICT is exempt (long window above).
+     */
+    public long closeDirectionInterimFreshMs() {
+        return longValue("GATEWAY_CLOSE_DIRECTION_INTERIM_FRESH_MS", 300_000L, 0L);
+    }
+
+    /**
      * Greek-move-authenticity CURRENT verdict topic (JSON, key = symbol; the compacted last-value-wins
      * {@code MoveAuthenticityVerdict} — see {@link GreekMoveAuthTopics#GREEK_MOVE_AUTH_CURRENT}). One
      * record per symbol ("SPX"/"ES"); the standalone service re-publishes as the greeks move. Resolved

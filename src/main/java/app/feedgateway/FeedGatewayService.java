@@ -239,6 +239,15 @@ public class FeedGatewayService implements ReplayRunner {
     // ui-batch. JSON pass-through; keyed by symbol (updateCache source-prefixes it to source|symbol,
     // exactly like es-open-direction-status keys by source|tradeDate and zero-dte by source|symbol|session).
     private final Map<String, String> greekMoveAuthCurrent = new ConcurrentHashMap<>();
+    // SPX close-direction (design CLOSE-DIRECTION-GATE1 §8/CD-R30): ONE topic, two cache classes.
+    // VERDICTS (key V|sessionDate) are once-a-session frozen decisions on the LONG
+    // closeDirectionTtlMs window; INTERIMS (key I|sessionDate) are 1/min monitoring reads whose
+    // REPLAY is additionally bounded by closeDirectionInterimFreshMs (stale interim = absent).
+    // Precedence: once a session's VERDICT is cached, later interims for that session are ignored
+    // (verdictId dedupe upstream keeps re-published verdicts idempotent). Standalone/global/JSON
+    // pass-through delivery class, same as the open-direction siblings; never in the ui-batch.
+    private final Map<String, String> closeDirectionVerdicts = new ConcurrentHashMap<>();
+    private final Map<String, String> closeDirectionInterims = new ConcurrentHashMap<>();
     // Current SPX 0DTE binary direction, keyed by source|symbol|sessionDate. This is a short-lived
     // standalone UI control signal: stale/malformed data must disappear instead of leaving a chain
     // tinted green/red after the underlying evidence is no longer current.
@@ -560,6 +569,9 @@ public class FeedGatewayService implements ReplayRunner {
             // fresh cached verdict per symbol so a page reload mid-session restores the move-authenticity
             // track rather than waiting for the next live verdict.
             replayGreekMoveAuthCached(session);
+            // Close-direction: replay the session's frozen verdict (or the current interim) so a page
+            // reload in the final hour restores the card instead of waiting for the next minute tick.
+            replayCloseDirectionCached(session);
             replayZeroDteIntelligenceCached(session);
         }
         // gex-by-strike is the one MULTI-SOURCE cache: IBKR/Unusual-Whales gex arrives via the JSON state
@@ -1323,6 +1335,10 @@ public class FeedGatewayService implements ReplayRunner {
         // open-direction siblings, OPTIONAL topic — on the SHORT greekMoveAuthTtlMs window (default 5 min),
         // which also bounds its seek-back here to the last few minutes.
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
+        // SPX close-direction interims + frozen verdict (JSON, key = symbol|expiry): standalone global
+        // advisory, OPTIONAL topic — LONG closeDirectionTtlMs window (verdict class) bounds the seek-back;
+        // interim replay freshness is separately bounded (closeDirectionInterimFreshMs).
+        topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
         if (settings.esAggressorFlowEnabled()) {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
@@ -1416,6 +1432,9 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the greek-move-authenticity CURRENT
         // verdict (JSON, key = symbol, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
+        // Keep the cache + live JSON consumer topic sets symmetric: the SPX close-direction signal
+        // (JSON, standalone/optional — same rule as the open-direction siblings above).
+        topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
         if (settings.esAggressorFlowEnabled()) {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
@@ -1806,6 +1825,17 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                         continue;
                     }
+                    if ("close-direction".equals(binding.event())) {
+                        // Close-direction: GLOBAL advisory track, its own websocket event, never a
+                        // ui-batch row and never selection-routed. cacheKey == null covers malformed
+                        // payloads AND interims after the session's verdict (dead by precedence) —
+                        // neither is ever live-broadcast (design CD-R30).
+                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                            broadcast(binding.event(), forwardJson);
+                            forwardedEvents.incrementAndGet();
+                        }
+                        continue;
+                    }
                     if ("greek-move-auth".equals(binding.event())) {
                         // Move-authenticity CURRENT verdict: a GLOBAL advisory track, its own websocket event,
                         // never a ui-batch row and never selection-routed. Every client receives it and filters
@@ -2124,6 +2154,9 @@ public class FeedGatewayService implements ReplayRunner {
                     // the topic is absent after the daily Kafka wipe until it first produces) — optional, so
                     // its absence can never starve the shared JSON consumer.
                     || topic.equals(settings.greekMoveAuthCurrentTopic())
+                    // Close-direction is a brand-new standalone service that may not be deployed (and the
+                    // topic is absent until it first produces) — optional like its advisory siblings.
+                    || topic.equals(settings.closeDirectionSignalTopic())
                     || topic.equals(settings.vixOptionInteligenceTopic()));
     }
 
@@ -2235,6 +2268,14 @@ public class FeedGatewayService implements ReplayRunner {
             if (events.contains("greek-move-auth")) {
                 for (WebSocketSession client : clients) {
                     replayGreekMoveAuthCached(client);
+                }
+            }
+            // Close-direction is STANDALONE (never in the ui-batch) too: re-push the session's frozen
+            // verdict / current interim to already-connected clients once this consumer's cache is
+            // caught up, so a dashboard left open across a gateway restart gets the card back.
+            if (events.contains("close-direction")) {
+                for (WebSocketSession client : clients) {
+                    replayCloseDirectionCached(client);
                 }
             }
             System.out.println("Feed gateway " + name + " cache caught up; replayed cached state to clients.");
@@ -3001,6 +3042,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = esOpenDirectionStatusCacheKey(json, key);
         } else if ("greek-move-auth".equals(event)) {
             key = greekMoveAuthCacheKey(json, key);
+        } else if ("close-direction".equals(event)) {
+            key = closeDirectionCacheKey(json, key);
         } else if ("zero-dte-intelligence".equals(event)) {
             key = zeroDteIntelligenceCacheKey(json, key);
         } else if ("liquidity-heatmap".equals(event)) {
@@ -3166,6 +3209,47 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 greekMoveAuthCurrent.put(key, json); // ONE current verdict per symbol — last-value-wins
+                return key;
+            }
+            case "close-direction" -> {
+                // key here is already source-prefixed: SOURCE|V|sessionDate (verdict) or
+                // SOURCE|I|sessionDate (interim) — the helper returned V|/I| + sessionDate and
+                // updateCache prepended the binding source. Malformed payloads never reach this
+                // case (helper returns null → dropped, design CD-R30). Verdict-over-interim
+                // precedence: once the session's verdict is cached, later interims are dead.
+                int marker = key.indexOf("|I|");
+                if (marker >= 0) {
+                    // CD-R30 short-class INGESTION freshness for interims — BOTH clocks:
+                    // the Kafka record timestamp (delayed/backfilled delivery) AND the
+                    // payload asOfMs (fresh redelivery of an old evaluation). Either stale
+                    // ⇒ never cached, never live-broadcast; the long 12h policy governs
+                    // only the VERDICT + seek-back. Returning null suppresses both paths.
+                    long nowIngestMs = System.currentTimeMillis();
+                    if (nowIngestMs - eventTime > settings.closeDirectionInterimFreshMs()) {
+                        return null;
+                    }
+                    try {
+                        long asOfMs = mapper.readTree(json).path("asOfMs").asLong(0);
+                        if (asOfMs <= 0 || nowIngestMs - asOfMs
+                                > settings.closeDirectionInterimFreshMs()) {
+                            return null;
+                        }
+                    } catch (JsonProcessingException e) {
+                        return null;
+                    }
+                    String verdictKey = key.substring(0, marker) + "|V|"
+                            + key.substring(marker + 3);
+                    if (closeDirectionVerdicts.containsKey(verdictKey)) {
+                        return null;   // session already decided — interim ignored
+                    }
+                    cacheEventTimes.put(versionKey, eventTime);
+                    cachePositions.put(versionKey, recordPosition(record));
+                    closeDirectionInterims.put(key, json);   // last interim wins
+                    return key;
+                }
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                closeDirectionVerdicts.put(key, json);
                 return key;
             }
             case "zero-dte-intelligence" -> {
@@ -3901,6 +3985,14 @@ public class FeedGatewayService implements ReplayRunner {
             // seekBackMs) after a gateway restart.
             return CachePolicy.expiring(settings.greekMoveAuthTtlMs());
         }
+        if ("close-direction".equals(event)) {
+            // Long last-value-wins window (default 12h, the max-pain/es-open-direction class): the
+            // frozen T-11m VERDICT stays decision-relevant until the close and must survive a gateway
+            // restart (matching seek-back). Interim REPLAY freshness is additionally bounded by
+            // closeDirectionInterimFreshMs inside replayCloseDirectionCached — the long window here
+            // governs eviction and seek-back only.
+            return CachePolicy.expiring(settings.closeDirectionTtlMs());
+        }
         if (isEsOpenDirectionEvent(event)) {
             // The 09:15 forecast (and each horizon outcome) stays valid for the whole session: a long
             // last-value-wins window (default 12h, like max-pain) — NEVER the generic 15-min TTL — so a
@@ -4315,6 +4407,13 @@ public class FeedGatewayService implements ReplayRunner {
             esOpenDirectionStatuses.remove(versionKey.substring("es-open-direction-status:".length()));
         } else if (versionKey.startsWith("greek-move-auth:")) {
             greekMoveAuthCurrent.remove(versionKey.substring("greek-move-auth:".length()));
+        } else if (versionKey.startsWith("close-direction:")) {
+            String cdKey = versionKey.substring("close-direction:".length());
+            if (cdKey.contains("|V|")) {
+                closeDirectionVerdicts.remove(cdKey);
+            } else {
+                closeDirectionInterims.remove(cdKey);
+            }
         } else if (versionKey.startsWith("zero-dte-intelligence:")) {
             zeroDteIntelligence.remove(versionKey.substring("zero-dte-intelligence:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
@@ -4857,6 +4956,49 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    private void replayCloseDirectionCached(WebSocketSession session) {
+        // Late-join delivery for the close-direction advisory: replay the session's frozen VERDICT
+        // (long closeDirectionTtlMs window — a client connecting at 15:55 must still see the 15:49
+        // verdict) and, when no verdict exists yet, the latest interim ONLY while it is current
+        // (asOfMs within closeDirectionInterimFreshMs — a stale interim reads as absent, never live).
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        for (Map.Entry<String, String> entry : closeDirectionVerdicts.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("close-direction:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, "close-direction", json);
+        }
+        for (Map.Entry<String, String> entry : closeDirectionInterims.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            int marker = entry.getKey().indexOf("|I|");
+            if (marker >= 0 && closeDirectionVerdicts.containsKey(
+                    entry.getKey().substring(0, marker) + "|V|"
+                            + entry.getKey().substring(marker + 3))) {
+                continue;   // verdict wins — the interim is history
+            }
+            if (!isCacheFresh("close-direction:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            try {
+                long asOfMs = mapper.readTree(json).path("asOfMs").asLong(0);
+                if (asOfMs <= 0 || nowMs - asOfMs > settings.closeDirectionInterimFreshMs()) {
+                    continue;   // stale interim = absent (design CD-R30 short class)
+                }
+            } catch (JsonProcessingException e) {
+                continue;
+            }
+            send(session, "close-direction", json);
+        }
+    }
+
     private void replayGreekMoveAuthCached(WebSocketSession session) {
         // Late-join delivery for the greek-move-authenticity CURRENT verdict: replay the cached verdict
         // per symbol (SPX/ES live under distinct symbol keys, so both current verdicts survive
@@ -5116,6 +5258,33 @@ public class FeedGatewayService implements ReplayRunner {
      * by source|symbol|session), so the stored key, version key, eviction key, and replay key are one and
      * the same {@code DATABENTO|SPX} form everywhere.
      */
+    /**
+     * Cache key for close-direction: {@code V|sessionDate} (VERDICT) / {@code I|sessionDate}
+     * (MONITORING). Returns null for malformed payloads (missing/unknown phase, blank
+     * sessionDate or direction) — updateCache drops null-keyed records and they are never
+     * broadcast (design CD-R30 malformed-drop).
+     */
+    private String closeDirectionCacheKey(String json, String fallback) {
+        try {
+            JsonNode node = mapper.readTree(json);
+            String phase = text(node, "phase");
+            String sessionDate = text(node, "sessionDate");
+            String direction = text(node, "direction");
+            if (sessionDate.isBlank() || direction.isBlank()) {
+                return null;
+            }
+            if ("VERDICT".equals(phase)) {
+                return "V|" + sessionDate;
+            }
+            if ("MONITORING".equals(phase)) {
+                return "I|" + sessionDate;
+            }
+            return null;
+        } catch (JsonProcessingException e) {
+            return null;
+        }
+    }
+
     private String greekMoveAuthCacheKey(String json, String fallback) {
         try {
             String symbol = text(mapper.readTree(json), "symbol").toUpperCase();
@@ -6216,6 +6385,11 @@ public class FeedGatewayService implements ReplayRunner {
             // updateCache's SHORT 5-min greekMoveAuthTtlMs window returns null for a stale verdict, which
             // suppresses the broadcast entirely.
             "greek-move-auth",
+            // SPX close-direction interims + frozen verdict are the same class of GLOBAL advisory
+            // overlay (one session at a time, rendered in its own summary card) — allowlist so
+            // routeOrBroadcast/broadcast fan them out in per-session (auth) mode too. Malformed and
+            // post-verdict-interim records are suppressed upstream (updateCache returns null).
+            "close-direction",
             // Continuous ES futures buyer/seller pressure is an ES-global advisory card. The payload is
             // symbol-filtered by the browser and deliberately has no option-chain expiry identity.
             "es-aggressor-flow");
