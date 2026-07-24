@@ -14,9 +14,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Golden-master parity with the former client-side option-chain.js seller-activity aggregation
- * (option-chain-seller-activity.test.js). The exact same inputs must produce the exact same counts,
- * so moving the logic server-side shifts NOTHING for the UI.
+ * Parity with the former client-side option-chain.js seller-activity aggregation
+ * (its node:test values in option-chain-seller-activity.test.js), plus adversarial edges: the same
+ * inputs must produce the same counts, so moving the logic server-side shifts NOTHING for the UI.
  */
 class SellerActivityAggregatorTest {
 
@@ -124,5 +124,73 @@ class SellerActivityAggregatorTest {
         assertEquals(7515.0, env.path("series").get(0).path("strike").asDouble());
         assertEquals(7520.0, env.path("leaderStrike").asDouble());
         assertEquals(9L, env.path("series").get(1).path("points").get(0).path("count").asLong());
+    }
+
+    @Test
+    void handlesUnsortedAndDuplicateTimestamps() {
+        ObjectNode activity = mapper.createObjectNode();
+        activity.put("bucketMinutes", 1);
+        ArrayNode points = activity.putArray("points");
+        point(points, 10 * 60_000L, 3, 2, 1);   // out of order
+        point(points, 0L, 1, 1, 0);
+        point(points, 0L, 2, 0, 2);              // duplicate timestamp
+        // sample=5: bucket 0 = 1+2 = 3; the 10m point falls in its own 5m bucket = 3.
+        assertEquals(List.of(3L, 3L), counts(activity, 5, "combined"));
+        // Session cumulates over SORTED points: 1, 1+2=3, 3+3=6.
+        assertEquals(List.of(1L, 3L, 6L), counts(activity, SellerActivityAggregator.SESSION_MINUTES, "combined"));
+    }
+
+    @Test
+    void coercesMissingNumericFieldsToZeroAndFiltersEmptyPoints() {
+        ObjectNode activity = mapper.createObjectNode();
+        activity.put("bucketMinutes", 1);
+        ArrayNode points = activity.putArray("points");
+        ObjectNode noCount = points.addObject();  // no sellTradeCount -> 0 -> dropped by the >0 filter
+        noCount.put("timestampMs", 0L);
+        ObjectNode valid = points.addObject();
+        valid.put("timestampMs", 60_000L);
+        valid.put("sellTradeCount", 4);
+        valid.put("callSellTradeCount", 4);       // putSellTradeCount absent -> 0
+        assertEquals(List.of(4L), counts(activity, 1, "combined"));
+        assertEquals(List.of(), counts(activity, 1, "put"), "no put counts -> no surviving points");
+    }
+
+    @Test
+    void leaderTieResolvesToLowerStrikeAndNullWhenNoData() {
+        List<SellerActivityAggregator.StrikeSeries> tie = List.of(
+                new SellerActivityAggregator.StrikeSeries(7515, List.of(new long[]{5, 7})),
+                new SellerActivityAggregator.StrikeSeries(7520, List.of(new long[]{5, 7})));
+        assertEquals(7515.0, SellerActivityAggregator.leader(tie));
+        assertNull(SellerActivityAggregator.leader(List.of()));
+    }
+
+    @Test
+    void enforcesMaxPointsPerStrikeKeepingTheMostRecent() {
+        ObjectNode activity = mapper.createObjectNode();
+        activity.put("bucketMinutes", 1);
+        ArrayNode points = activity.putArray("points");
+        int n = SellerActivityAggregator.MAX_POINTS_PER_STRIKE + 250;
+        for (int i = 0; i < n; i++) {
+            point(points, i * 60_000L, 1, 1, 0);   // distinct 1-minute buckets
+        }
+        List<long[]> out = aggregator.aggregatePoints(activity, 1, "combined");
+        assertEquals(SellerActivityAggregator.MAX_POINTS_PER_STRIKE, out.size());
+        assertEquals((long) (n - 1) * 60_000L, out.get(out.size() - 1)[0], "keeps the newest bucket");
+    }
+
+    @Test
+    void enforcesMaxStrikesCeiling() {
+        ObjectNode snap = mapper.createObjectNode();
+        snap.put("timestampMs", 1L);
+        ArrayNode strikes = snap.putArray("strikes");
+        for (int i = 0; i < SellerActivityAggregator.MAX_STRIKES + 50; i++) {
+            ObjectNode s = strikes.addObject();
+            s.put("strike", 1000.0 + i);
+            ObjectNode a = s.putObject("sellerActivity");
+            a.put("bucketMinutes", 1);
+            point(a.putArray("points"), 60_000L, 1, 1, 0);
+        }
+        ObjectNode env = aggregator.aggregate(snap.toString(), "SPX", "2026-07-24", 30, "combined");
+        assertEquals(SellerActivityAggregator.MAX_STRIKES, env.path("series").size());
     }
 }

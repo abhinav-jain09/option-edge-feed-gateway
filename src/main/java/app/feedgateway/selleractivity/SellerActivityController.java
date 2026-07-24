@@ -13,6 +13,8 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
 import java.util.Locale;
 import java.util.regex.Pattern;
 
@@ -61,7 +63,8 @@ public class SellerActivityController {
         if (symbol == null || symbol.isBlank()) {
             return badRequest("symbol is required");
         }
-        if (expiry == null || !ISO_DATE.matcher(expiry.trim()).matches()) {
+        String canonicalExpiry = canonicalExpiry(expiry);
+        if (canonicalExpiry == null) {
             return badRequest("expiry must be a canonical ISO date (yyyy-MM-dd)");
         }
         int sample = resolveSample(sampleRaw);
@@ -74,10 +77,28 @@ public class SellerActivityController {
             return badRequest("mode must be one of " + SellerActivityAggregator.MODES);
         }
         String normalizedSymbol = symbol.trim().toUpperCase(Locale.ROOT);
-        String trimmedExpiry = expiry.trim();
-        String snapshot = service.cachedStrikeFlowSnapshot(normalizedSymbol, trimmedExpiry);
-        ObjectNode envelope = aggregator.aggregate(snapshot, normalizedSymbol, trimmedExpiry, sample, mode);
+        String snapshot = service.cachedStrikeFlowSnapshot(normalizedSymbol, canonicalExpiry);
+        ObjectNode envelope = aggregator.aggregate(snapshot, normalizedSymbol, canonicalExpiry, sample, mode);
         return ResponseEntity.ok(envelope);
+    }
+
+    /**
+     * Strict ISO-date validation: shape-check then {@link LocalDate#parse} so impossible dates
+     * ({@code 2026-99-99}, {@code 2026-02-30}) are rejected, returning the canonical {@code yyyy-MM-dd}.
+     */
+    private static String canonicalExpiry(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String trimmed = raw.trim();
+        if (!ISO_DATE.matcher(trimmed).matches()) {
+            return null;
+        }
+        try {
+            return LocalDate.parse(trimmed).toString();
+        } catch (DateTimeParseException e) {
+            return null;
+        }
     }
 
     /** Resolve the sample-minutes parameter: default when absent, {@code -1} when not an allowed value. */

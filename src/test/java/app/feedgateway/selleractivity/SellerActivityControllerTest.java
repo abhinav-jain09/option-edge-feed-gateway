@@ -47,7 +47,9 @@ class SellerActivityControllerTest {
     void rejectsInvalidRequestParams() {
         authOk();
         assertEquals(400, status(null, "2026-07-24", null, null), "missing symbol");
-        assertEquals(400, status("SPX", "20260724", null, null), "non-ISO expiry");
+        assertEquals(400, status("SPX", "20260724", null, null), "non-ISO expiry shape");
+        assertEquals(400, status("SPX", "2026-99-99", null, null), "impossible date (strict parse)");
+        assertEquals(400, status("SPX", "2026-02-30", null, null), "non-existent day (strict parse)");
         assertEquals(400, status("SPX", "2026-07-24", "7", null), "unsupported sample");
         assertEquals(400, status("SPX", "2026-07-24", "30", "buy"), "unsupported mode");
     }

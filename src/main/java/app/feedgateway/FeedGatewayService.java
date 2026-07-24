@@ -4452,7 +4452,17 @@ public class FeedGatewayService implements ReplayRunner {
         if (symbol == null || expiry == null) {
             return null;
         }
-        return strikeFlows.get(symbol.toUpperCase() + "|" + normalizeExpiry(expiry));
+        // strikeFlows keys are SOURCE-prefixed by updateCache (line ~3045: key = source + "|" + key), e.g.
+        // "DATABENTO|SPX|20260724". Match the source-agnostic "SYMBOL|EXPIRY" suffix so the endpoint
+        // resolves live data regardless of the active source (a bare "SYMBOL|EXPIRY" get would always miss).
+        String suffix = symbol.toUpperCase() + "|" + normalizeExpiry(expiry);
+        for (Map.Entry<String, String> entry : strikeFlows.entrySet()) {
+            String key = entry.getKey();
+            if (key.equals(suffix) || key.endsWith("|" + suffix)) {
+                return entry.getValue();
+            }
+        }
+        return null;
     }
 
     /**
@@ -7149,6 +7159,19 @@ public class FeedGatewayService implements ReplayRunner {
 
     void bumpForwardedEventsForTest(long by) {
         forwardedEvents.addAndGet(by);
+    }
+
+    /**
+     * Test seam: drive a strike-flow record through the REAL {@link #updateCache} path (which
+     * source-prefixes the cache key), so a test can prove {@link #cachedStrikeFlowSnapshot} resolves the
+     * SAME key updateCache writes — the integration gap that a mocked accessor conceals. Returns the
+     * cache key updateCache produced.
+     */
+    String cacheStrikeFlowForTest(String bindingSource, String recordKey, String json) {
+        TopicBinding binding = new TopicBinding(bindingSource, "strike-flow");
+        ConsumerRecord<String, String> record =
+                new ConsumerRecord<>("test-strike-flow", 0, 0L, recordKey, json);
+        return updateCache(binding, record, json);
     }
 
     void invokeRolloverWarnForTest(String fromSource, String toSource) {

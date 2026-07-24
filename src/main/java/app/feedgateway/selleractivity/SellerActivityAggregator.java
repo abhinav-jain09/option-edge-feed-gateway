@@ -18,9 +18,10 @@ import java.util.TreeMap;
  * sellerActivityLeader) EXACTLY (golden-master tested against the JS outputs), so no numbers shift.
  *
  * <p>It counts SELLER-AGGRESSOR PRINTS (trades) — size- and money-blind, one classified sell print = 1,
- * matching the classifier's {@code SellerActivityHistory}. The output is bounded (aggregated to the
- * requested sample window), so no client ever flattens the raw ~1440 one-minute buckets/strike — the
- * {@code RangeError} that blanked the panel (option-chain PR #362) is structurally impossible here.
+ * matching the classifier's {@code SellerActivityHistory}. Output is EXPLICITLY bounded by
+ * {@link #MAX_STRIKES} and {@link #MAX_POINTS_PER_STRIKE} (defensive ceilings above the upstream
+ * invariant), so no client ever flattens the raw ~1440 one-minute buckets/strike (the {@code RangeError}
+ * that blanked the panel, option-chain PR #362) and the response can never grow without limit.
  */
 public final class SellerActivityAggregator {
 
@@ -28,6 +29,15 @@ public final class SellerActivityAggregator {
     public static final int SESSION_MINUTES = 1440;
     public static final Set<Integer> SAMPLE_MINUTES = Set.of(1, 5, 10, 15, 30, 60, 240, SESSION_MINUTES);
     public static final Set<String> MODES = Set.of("call", "put", "combined");
+
+    /**
+     * Defensive response ceilings ABOVE the upstream invariant (SellerActivityHistory keeps ≤ 24h of
+     * 1-minute buckets = 1440 points/strike; an option chain has at most a few hundred strikes). They cap
+     * the response even against a malformed/oversized snapshot — keeping the MOST RECENT data — so real
+     * data (well under both) is never affected.
+     */
+    static final int MAX_STRIKES = 1024;
+    static final int MAX_POINTS_PER_STRIKE = 1500;
 
     private final ObjectMapper mapper;
 
@@ -62,6 +72,9 @@ public final class SellerActivityAggregator {
                 List<long[]> points = aggregatePoints(strikeNode.path("sellerActivity"), sampleMinutes, mode);
                 if (!points.isEmpty()) {
                     series.add(new StrikeSeries(strike, points));
+                    if (series.size() >= MAX_STRIKES) {
+                        break; // defensive ceiling — real chains never approach this
+                    }
                 }
             }
             series.sort(Comparator.comparingDouble(StrikeSeries::strike));
@@ -116,7 +129,7 @@ public final class SellerActivityAggregator {
                     result.add(new long[]{p.path("timestampMs").asLong(), cumulative});
                 }
             }
-            return result;
+            return capPoints(result);
         }
         long bucketMinutes = Math.max(1L, activity.path("bucketMinutes").asLong(1L));
         long widthMs = Math.max(1L, Math.max(bucketMinutes, (long) sampleMinutes)) * 60_000L;
@@ -130,7 +143,15 @@ public final class SellerActivityAggregator {
                 result.add(new long[]{entry.getKey(), entry.getValue()});
             }
         }
-        return result;
+        return capPoints(result);
+    }
+
+    /** Keep at most {@link #MAX_POINTS_PER_STRIKE} points, retaining the MOST RECENT (points are ascending). */
+    private static List<long[]> capPoints(List<long[]> points) {
+        if (points.size() <= MAX_POINTS_PER_STRIKE) {
+            return points;
+        }
+        return new ArrayList<>(points.subList(points.size() - MAX_POINTS_PER_STRIKE, points.size()));
     }
 
     /** Port of sellerActivityValue(point, mode). */
