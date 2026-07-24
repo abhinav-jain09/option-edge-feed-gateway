@@ -1946,10 +1946,16 @@ public class FeedGatewayService implements ReplayRunner {
                         // paint a stale ES overlay onto a strike — so drop it.
                         boolean esStrikeIntelDropped = "es-strike-intel".equals(binding.event())
                                 && cacheKey == null;
+                        // gex-oi-status fail-closed (Codex round-5): a null cacheKey means updateCache
+                        // REJECTED the record (status not exactly OI_MISSING/OI_OK). Live-routing what the
+                        // cache refused would make the live and replay paths disagree — drop it.
+                        boolean gexOiStatusDropped = "gex-oi-status".equals(binding.event())
+                                && cacheKey == null;
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
                                 && !strikeIntelDropped && !optionTruthStale && !strikeInvasionStale && !spreadSkewStale
-                                && !esOpenDirectionDropped && !strikeLifecycleDropped && !esStrikeIntelDropped) {
+                                && !esOpenDirectionDropped && !strikeLifecycleDropped && !esStrikeIntelDropped
+                                && !gexOiStatusDropped) {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
