@@ -4565,28 +4565,63 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * Latest cached strike-flow snapshot JSON for {@code symbol|expiry} (the key
-     * {@link #strikeFlowCacheKey} produces), or {@code null} when none is cached. Source for the
-     * {@code /api/seller-activity} endpoint, which aggregates the snapshot's per-strike
-     * {@code sellerActivity} buckets server-side (SSOT for web + mobile).
+     * Build the chain-shaped seller-activity input consumed by the REST aggregator from the independently
+     * cached per-strike records. Seller history deliberately no longer travels inside strike-flow snapshots:
+     * doing so made the chain record grow throughout the session until Kafka rejected it.
      */
-    public String cachedStrikeFlowSnapshot(String symbol, String expiry) {
+    public String cachedSellerActivitySnapshot(String symbol, String expiry) {
         if (symbol == null || expiry == null) {
             return null;
         }
-        // Seller-activity is a DATABENTO product — the classifier that produces sellerActivity binds source
-        // DATABENTO (see databentoStrikeFlowTopic binding). updateCache SOURCE-prefixes the cache key
-        // (line ~3045: key = source + "|" + key), so look up the EXACT "DATABENTO|SYMBOL|EXPIRY" key:
-        // deterministic and O(1), never returning another source's snapshot (vs a suffix scan whose order
-        // is nondeterministic across sources), and never the bare "SYMBOL|EXPIRY" that always missed.
-        String key = "DATABENTO|" + symbol.toUpperCase() + "|" + normalizeExpiry(expiry);
-        String snapshot = strikeFlows.get(key);
-        if (snapshot == null) {
+        String normalizedSymbol = symbol.trim().toUpperCase(Locale.ROOT);
+        String normalizedExpiry = normalizeExpiry(expiry);
+        String prefix = "DATABENTO|" + normalizedSymbol + "|" + normalizedExpiry + "|";
+        long now = System.currentTimeMillis();
+        ObjectNode root = mapper.createObjectNode();
+        root.put("symbol", normalizedSymbol);
+        root.put("expiry", normalizedExpiry);
+        var strikes = root.putArray("strikes");
+        long asOfMs = 0L;
+        int includedBytes = 0;
+
+        List<Map.Entry<String, String>> records = sellerActivities.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(prefix))
+                .filter(entry -> isCacheFresh("seller-activity:" + entry.getKey(), now))
+                .sorted(Map.Entry.comparingByKey())
+                .toList();
+        for (Map.Entry<String, String> entry : records) {
+            String json = entry.getValue();
+            if (json == null || includedBytes + json.length() > 32 * 1024 * 1024 || strikes.size() >= 1024) {
+                break;
+            }
+            try {
+                JsonNode activity = mapper.readTree(json);
+                double strike = doubleField(activity, "strike", Double.NaN);
+                if (!Double.isFinite(strike)
+                        || !normalizedSymbol.equals(text(activity, "symbol").toUpperCase(Locale.ROOT))
+                        || !normalizedExpiry.equals(normalizeExpiry(text(activity, "expiry")))) {
+                    continue;
+                }
+                ObjectNode strikeNode = strikes.addObject();
+                strikeNode.put("strike", strike);
+                ObjectNode sellerActivity = strikeNode.putObject("sellerActivity");
+                sellerActivity.set("bucketMinutes", activity.path("bucketMinutes"));
+                sellerActivity.set("points", activity.path("points"));
+                asOfMs = Math.max(asOfMs, activity.path("timestampMs").asLong(0L));
+                includedBytes += json.length();
+            } catch (JsonProcessingException ignored) {
+                // Ignore one malformed compacted record; other strikes remain independently usable.
+            }
+        }
+        if (strikes.isEmpty()) {
             return null;
         }
-        // Apply the SAME freshness gate the gateway uses when it serves strike-flow (the isCacheFresh filter
-        // in the cached-state send): never expose an expired / previous-session snapshot as current.
-        return isCacheFresh("strike-flow:" + key, System.currentTimeMillis()) ? snapshot : null;
+        root.put("timestampMs", asOfMs);
+        try {
+            return mapper.writeValueAsString(root);
+        } catch (JsonProcessingException impossible) {
+            return null;
+        }
     }
 
     /**
@@ -7419,7 +7454,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     /**
      * Test seam: drive a strike-flow record through the REAL {@link #updateCache} path (which
-     * source-prefixes the cache key), so a test can prove {@link #cachedStrikeFlowSnapshot} resolves the
+     * source-prefixes the cache key), so a test can prove {@link #cachedSellerActivitySnapshot} resolves the
      * SAME key updateCache writes — the integration gap that a mocked accessor conceals. Returns the
      * cache key updateCache produced.
      */
@@ -7429,6 +7464,15 @@ public class FeedGatewayService implements ReplayRunner {
         // must set it explicitly to exercise the isCacheFresh gate.
         ConsumerRecord<String, String> record = new ConsumerRecord<>(
                 "test-strike-flow", 0, 0L, recordTimestampMs,
+                org.apache.kafka.common.record.TimestampType.CREATE_TIME, -1, -1, recordKey, json,
+                new org.apache.kafka.common.header.internals.RecordHeaders(), java.util.Optional.empty());
+        return updateCache(binding, record, json);
+    }
+
+    String cacheSellerActivityForTest(String bindingSource, String recordKey, String json, long recordTimestampMs) {
+        TopicBinding binding = new TopicBinding(bindingSource, "seller-activity");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                "test-seller-activity", 0, 0L, recordTimestampMs,
                 org.apache.kafka.common.record.TimestampType.CREATE_TIME, -1, -1, recordKey, json,
                 new org.apache.kafka.common.header.internals.RecordHeaders(), java.util.Optional.empty());
         return updateCache(binding, record, json);

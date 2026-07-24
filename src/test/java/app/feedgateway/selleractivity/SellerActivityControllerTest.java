@@ -68,7 +68,7 @@ class SellerActivityControllerTest {
     @Test
     void missingSnapshotReturns200WithEmptyEnvelope() throws IOException {
         authOk();
-        when(service.cachedStrikeFlowSnapshot("SPX", "2026-07-24")).thenReturn(null);
+        when(service.cachedSellerActivitySnapshot("SPX", "2026-07-24")).thenReturn(null);
         ResponseEntity<StreamingResponseBody> r = controller.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token");
         assertEquals(200, r.getStatusCode().value());
         JsonNode body = read(r);
@@ -121,7 +121,7 @@ class SellerActivityControllerTest {
         String snapshot = "{\"symbol\":\"SPX\",\"expiry\":\"20260724\",\"timestampMs\":1780000500000,"
                 + "\"strikes\":[{\"strike\":7515.0,\"sellerActivity\":{\"bucketMinutes\":1,\"points\":["
                 + "{\"timestampMs\":60000,\"sellTradeCount\":5,\"callSellTradeCount\":3,\"putSellTradeCount\":2}]}}]}";
-        when(service.cachedStrikeFlowSnapshot("SPX", "2026-07-24")).thenReturn(snapshot);
+        when(service.cachedSellerActivitySnapshot("SPX", "2026-07-24")).thenReturn(snapshot);
 
         // lower-case, padded symbol must normalize to the cache key "SPX".
         ResponseEntity<StreamingResponseBody> r = controller.sellerActivity(" spx ", "2026-07-24", "30", "combined", "Bearer token");
