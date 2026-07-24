@@ -58,6 +58,7 @@ public class SellerActivityController {
     private final RateLimiter rateLimiter = new RateLimiter(RATE_LIMIT_PER_MIN, 60_000L);
     final Semaphore aggregationSlots; // package-visible so a test can exhaust it
 
+    @org.springframework.beans.factory.annotation.Autowired
     public SellerActivityController(FeedGatewayService service, LiquidityHistoryAuth auth, ObjectMapper mapper) {
         this(service, auth, mapper, MAX_CONCURRENT_AGGREGATIONS);
     }
