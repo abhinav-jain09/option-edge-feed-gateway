@@ -140,7 +140,7 @@ public class FeedGatewayService implements ReplayRunner {
             "dealer-ledger",
             "zero-dte-intelligence",
             "greek-move-auth",
-            "opb-v2-by-option", "opb-v2-session",
+            "opb-by-option", "opb-session",
             "index-price", "vix-price", "spx-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
     // Clock-skew allowance for the greek-move-authenticity verdict's PAYLOAD decision time
@@ -259,8 +259,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> dealerLedgerProfiles = new ConcurrentHashMap<>();
     private final Map<String, String> dealerLedgerStates = new ConcurrentHashMap<>();
     private final Map<String, String> dealerLedgers = new ConcurrentHashMap<>();
-    private final Map<String, String> opbV2ByOptions = new ConcurrentHashMap<>();
-    private final Map<String, String> opbV2Sessions = new ConcurrentHashMap<>();
+    private final Map<String, String> opbByOptions = new ConcurrentHashMap<>();
+    private final Map<String, String> opbSessions = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfLatestSignals = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfMarketFlows = new ConcurrentHashMap<>();
     private final Map<String, String> hpsfTopCandidates = new ConcurrentHashMap<>();
@@ -299,8 +299,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingGexStrikeLifecycle = new LinkedHashMap<>();
     private final Map<String, String> pendingMaxPain = new LinkedHashMap<>();
     private final Map<String, String> pendingOptionPriceBehaviors = new LinkedHashMap<>();
-    private final Map<String, String> pendingOpbV2ByOptions = new LinkedHashMap<>();
-    private final Map<String, String> pendingOpbV2Sessions = new LinkedHashMap<>();
+    private final Map<String, String> pendingOpbByOptions = new LinkedHashMap<>();
+    private final Map<String, String> pendingOpbSessions = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfLatestSignals = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfMarketFlows = new LinkedHashMap<>();
     private final Map<String, String> pendingHpsfTopCandidates = new LinkedHashMap<>();
@@ -551,7 +551,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gex-strike-lifecycle"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "es-gex", "es-strike-intel"));
+            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
             replayOptionTruthCachedLegacy(session);
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
@@ -932,8 +932,8 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"gexStrikeLifecycle\":" + gexStrikeLifecycle.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
                 + "\"optionPriceBehaviors\":" + optionPriceBehaviors.size() + ","
-                + "\"opbV2ByOptions\":" + opbV2ByOptions.size() + ","
-                + "\"opbV2Sessions\":" + opbV2Sessions.size() + ","
+                + "\"opbByOptions\":" + opbByOptions.size() + ","
+                + "\"opbSessions\":" + opbSessions.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
                 + "\"hpsfMarketFlows\":" + hpsfMarketFlows.size() + ","
                 + "\"hpsfTopCandidates\":" + hpsfTopCandidates.size() + ","
@@ -1069,12 +1069,12 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_option_price_behaviors Cached option price behavior dashboard count.\n"
                 + "# TYPE options_edge_feed_gateway_option_price_behaviors gauge\n"
                 + "options_edge_feed_gateway_option_price_behaviors " + optionPriceBehaviors.size() + "\n"
-                + "# HELP options_edge_feed_gateway_opb_v2_by_options Cached OPB V2 by-option count.\n"
-                + "# TYPE options_edge_feed_gateway_opb_v2_by_options gauge\n"
-                + "options_edge_feed_gateway_opb_v2_by_options " + opbV2ByOptions.size() + "\n"
-                + "# HELP options_edge_feed_gateway_opb_v2_sessions Cached OPB V2 session count.\n"
-                + "# TYPE options_edge_feed_gateway_opb_v2_sessions gauge\n"
-                + "options_edge_feed_gateway_opb_v2_sessions " + opbV2Sessions.size() + "\n"
+                + "# HELP options_edge_feed_gateway_opb_by_options Cached OPB by-option count.\n"
+                + "# TYPE options_edge_feed_gateway_opb_by_options gauge\n"
+                + "options_edge_feed_gateway_opb_by_options " + opbByOptions.size() + "\n"
+                + "# HELP options_edge_feed_gateway_opb_sessions Cached OPB session count.\n"
+                + "# TYPE options_edge_feed_gateway_opb_sessions gauge\n"
+                + "options_edge_feed_gateway_opb_sessions " + opbSessions.size() + "\n"
                 + "# HELP options_edge_feed_gateway_hpsf_latest_signals Cached HPSF latest-signal view count.\n"
                 + "# TYPE options_edge_feed_gateway_hpsf_latest_signals gauge\n"
                 + "options_edge_feed_gateway_hpsf_latest_signals " + hpsfLatestSignals.size() + "\n"
@@ -1322,8 +1322,8 @@ public class FeedGatewayService implements ReplayRunner {
         // spread-skew.events: discrete FIRE/EXIT/REVERSAL/RESTART transitions, broadcast STANDALONE (never cached).
         topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding("DATABENTO", "spread-skew-event"));
         topicEvents.put(settings.optionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
-        topicEvents.put(settings.optionPriceBehaviorV2ByOptionTopic(), new TopicBinding("DATABENTO", "opb-v2-by-option"));
-        topicEvents.put(settings.optionPriceBehaviorV2SessionTopic(), new TopicBinding("DATABENTO", "opb-v2-session"));
+        topicEvents.put(settings.optionPriceBehaviorByOptionTopic(), new TopicBinding("DATABENTO", "opb-by-option"));
+        topicEvents.put(settings.optionPriceBehaviorSessionTopic(), new TopicBinding("DATABENTO", "opb-session"));
         // ES 09:15 open-direction forecast + per-horizon outcomes: plain JSON (key = tradeDate),
         // standalone global advisories (never in the ui-batch), OPTIONAL topics — this JSON-state
         // consumer, never the Avro one. Their long TTL (esOpenDirectionTtlMs, default 12h) drives a
@@ -1424,8 +1424,8 @@ public class FeedGatewayService implements ReplayRunner {
         // spread-skew.events: discrete FIRE/EXIT/REVERSAL/RESTART transitions, broadcast STANDALONE (never cached).
         topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding("DATABENTO", "spread-skew-event"));
         topicEvents.put(settings.optionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
-        topicEvents.put(settings.optionPriceBehaviorV2ByOptionTopic(), new TopicBinding("DATABENTO", "opb-v2-by-option"));
-        topicEvents.put(settings.optionPriceBehaviorV2SessionTopic(), new TopicBinding("DATABENTO", "opb-v2-session"));
+        topicEvents.put(settings.optionPriceBehaviorByOptionTopic(), new TopicBinding("DATABENTO", "opb-by-option"));
+        topicEvents.put(settings.optionPriceBehaviorSessionTopic(), new TopicBinding("DATABENTO", "opb-session"));
         // Keep the cache + live JSON consumer topic sets symmetric: ES open-direction forecast +
         // outcomes (JSON, standalone/optional — same rule as the cache consumer above).
         topicEvents.put(settings.esOpenDirectionForecastTopic(), new TopicBinding("DATABENTO", "es-open-direction-forecast"));
@@ -2489,8 +2489,8 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.missionControlTopic(),
                     settings.spreadSkewTopic(),
                     settings.optionPriceBehaviorDashboardTopic(),
-                    settings.optionPriceBehaviorV2ByOptionTopic(),
-                    settings.optionPriceBehaviorV2SessionTopic(),
+                    settings.optionPriceBehaviorByOptionTopic(),
+                    settings.optionPriceBehaviorSessionTopic(),
                     settings.databentoGexTopic(),
                     settings.unifiedSrTopic(),
                     settings.databentoGexMagnetTopic(),
@@ -2506,7 +2506,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
     }
 
     /**
@@ -2677,7 +2677,7 @@ public class FeedGatewayService implements ReplayRunner {
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesOptionPriceBehaviorSelection(json, selection);
         }
-        if ("opb-v2-session".equals(binding.event())) {
+        if ("opb-session".equals(binding.event())) {
             return binding.source().equals(selection.source())
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesOptionPriceBehaviorSelection(json, selection);
@@ -2700,7 +2700,7 @@ public class FeedGatewayService implements ReplayRunner {
             }
             return matchesActiveSelection(json, selection);
         }
-        // opb-v2-by-option is a normal per-contract signal (symbol|expiry|strike) — fall through to the
+        // opb-by-option is a normal per-contract signal (symbol|expiry|strike) — fall through to the
         // default contract routing (passesSelectionBarrier + matchesActiveSelection) below.
         if (!binding.source().equals(selection.source())) {
             return false;
@@ -3078,10 +3078,10 @@ public class FeedGatewayService implements ReplayRunner {
             // event-time gates — otherwise a profile could be false-dropped by a newer state (or vice
             // versa). The join + envelope cache use the role-stripped base key (dealerLedgerBaseKey).
             key = dealerLedgerCacheKey(json, record, key);
-        } else if ("opb-v2-by-option".equals(event)) {
-            key = opbV2ByOptionCacheKey(json, key);
-        } else if ("opb-v2-session".equals(event)) {
-            key = opbV2SessionCacheKey(json, key);
+        } else if ("opb-by-option".equals(event)) {
+            key = opbByOptionCacheKey(json, key);
+        } else if ("opb-session".equals(event)) {
+            key = opbSessionCacheKey(json, key);
         }
         // A per-event cache-key deriver may FAIL CLOSED by returning null (currently gex-strike-lifecycle:
         // a badge without its own symbol|expiry|strike identity is unusable). Stop here — never build a
@@ -3397,16 +3397,16 @@ public class FeedGatewayService implements ReplayRunner {
                 // The forward/replay payload is the JOINED envelope, resolved by base key downstream.
                 return baseKey;
             }
-            case "opb-v2-by-option" -> {
+            case "opb-by-option" -> {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
-                opbV2ByOptions.put(key, json);
+                opbByOptions.put(key, json);
                 return key;
             }
-            case "opb-v2-session" -> {
+            case "opb-session" -> {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
-                opbV2Sessions.put(key, json);
+                opbSessions.put(key, json);
                 return key;
             }
             default -> {
@@ -3856,21 +3856,21 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("option-price-behavior", entry.getValue()))
                         .forEach(cachedEvents::add);
-                case "opb-v2-by-option" -> opbV2ByOptions.entrySet().stream()
-                        .filter(entry -> isCacheFresh("opb-v2-by-option:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("opb-v2-by-option:" + entry.getKey(), selection))
+                case "opb-by-option" -> opbByOptions.entrySet().stream()
+                        .filter(entry -> isCacheFresh("opb-by-option:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("opb-by-option:" + entry.getKey(), selection))
                         .filter(entry -> "DATABENTO".equals(selection.source()))
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
-                        .map(entry -> new CachedEvent("opb-v2-by-option", entry.getValue()))
+                        .map(entry -> new CachedEvent("opb-by-option", entry.getValue()))
                         .forEach(cachedEvents::add);
-                case "opb-v2-session" -> opbV2Sessions.entrySet().stream()
-                        .filter(entry -> isCacheFresh("opb-v2-session:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("opb-v2-session:" + entry.getKey(), selection, true, false))
+                case "opb-session" -> opbSessions.entrySet().stream()
+                        .filter(entry -> isCacheFresh("opb-session:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("opb-session:" + entry.getKey(), selection, true, false))
                         .filter(entry -> "DATABENTO".equals(selection.source()))
                         .filter(entry -> matchesOptionPriceBehaviorSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
-                        .map(entry -> new CachedEvent("opb-v2-session", entry.getValue()))
+                        .map(entry -> new CachedEvent("opb-session", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "hpsf-latest-signal" -> hpsfLatestSignals.entrySet().stream()
                         .filter(entry -> isCacheFresh("hpsf-latest-signal:" + entry.getKey(), nowMs))
@@ -4500,10 +4500,10 @@ public class FeedGatewayService implements ReplayRunner {
             } else {
                 dealerLedgers.put(baseKey, rebuilt);
             }
-        } else if (versionKey.startsWith("opb-v2-by-option:")) {
-            opbV2ByOptions.remove(versionKey.substring("opb-v2-by-option:".length()));
-        } else if (versionKey.startsWith("opb-v2-session:")) {
-            opbV2Sessions.remove(versionKey.substring("opb-v2-session:".length()));
+        } else if (versionKey.startsWith("opb-by-option:")) {
+            opbByOptions.remove(versionKey.substring("opb-by-option:".length()));
+        } else if (versionKey.startsWith("opb-session:")) {
+            opbSessions.remove(versionKey.substring("opb-session:".length()));
         } else if (versionKey.startsWith("hpsf-latest-signal:")) {
             hpsfLatestSignals.remove(versionKey.substring("hpsf-latest-signal:".length()));
         } else if (versionKey.startsWith("hpsf-market-flow:")) {
@@ -5156,11 +5156,11 @@ public class FeedGatewayService implements ReplayRunner {
         return fallback;
     }
 
-    private String opbV2SessionCacheKey(String json, String fallback) {
+    private String opbSessionCacheKey(String json, String fallback) {
         return optionPriceBehaviorCacheKey(json, fallback);
     }
 
-    private String opbV2ByOptionCacheKey(String json, String fallback) {
+    private String opbByOptionCacheKey(String json, String fallback) {
         try {
             JsonNode root = mapper.readTree(json);
             String symbol = text(root, "symbol").toUpperCase();
@@ -5550,8 +5550,8 @@ public class FeedGatewayService implements ReplayRunner {
         // The joined dealer-ledger envelope, standalone per session. dealerLedgers holds only envelopes
         // built from fresh halves (joinDealerLedger) and evicted on role expiry (removeCacheEntry).
         replayCacheMap(session, "dealer-ledger", dealerLedgers);
-        replayCacheMap(session, "opb-v2-by-option", opbV2ByOptions);
-        replayCacheMap(session, "opb-v2-session", opbV2Sessions);
+        replayCacheMap(session, "opb-by-option", opbByOptions);
+        replayCacheMap(session, "opb-session", opbSessions);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
         // as index-price — so a VIX record is never delivered mislabelled as index-price.
         replayCacheMap(session, "vix-price", vixPrices);
@@ -6666,8 +6666,8 @@ public class FeedGatewayService implements ReplayRunner {
             case "gex-strike-lifecycle" -> pendingGexStrikeLifecycle;
             case "max-pain" -> pendingMaxPain;
             case "option-price-behavior" -> pendingOptionPriceBehaviors;
-            case "opb-v2-by-option" -> pendingOpbV2ByOptions;
-            case "opb-v2-session" -> pendingOpbV2Sessions;
+            case "opb-by-option" -> pendingOpbByOptions;
+            case "opb-session" -> pendingOpbSessions;
             case "hpsf-latest-signal" -> pendingHpsfLatestSignals;
             case "hpsf-market-flow" -> pendingHpsfMarketFlows;
             case "hpsf-top-candidates" -> pendingHpsfTopCandidates;
@@ -6720,8 +6720,8 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingGexStrikeLifecycle.values()),
                         new ArrayList<>(pendingMaxPain.values()),
                         new ArrayList<>(pendingOptionPriceBehaviors.values()),
-                        new ArrayList<>(pendingOpbV2ByOptions.values()),
-                        new ArrayList<>(pendingOpbV2Sessions.values()),
+                        new ArrayList<>(pendingOpbByOptions.values()),
+                        new ArrayList<>(pendingOpbSessions.values()),
                         new ArrayList<>(pendingHpsfLatestSignals.values()),
                         new ArrayList<>(pendingHpsfMarketFlows.values()),
                         new ArrayList<>(pendingHpsfTopCandidates.values()),
@@ -6779,8 +6779,8 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingGexStrikeLifecycle.size()
                 + pendingMaxPain.size()
                 + pendingOptionPriceBehaviors.size()
-                + pendingOpbV2ByOptions.size()
-                + pendingOpbV2Sessions.size()
+                + pendingOpbByOptions.size()
+                + pendingOpbSessions.size()
                 + pendingHpsfLatestSignals.size()
                 + pendingHpsfMarketFlows.size()
                 + pendingHpsfTopCandidates.size()
@@ -6814,8 +6814,8 @@ public class FeedGatewayService implements ReplayRunner {
         pendingGexStrikeLifecycle.clear();
         pendingMaxPain.clear();
         pendingOptionPriceBehaviors.clear();
-        pendingOpbV2ByOptions.clear();
-        pendingOpbV2Sessions.clear();
+        pendingOpbByOptions.clear();
+        pendingOpbSessions.clear();
         pendingHpsfLatestSignals.clear();
         pendingHpsfMarketFlows.clear();
         pendingHpsfTopCandidates.clear();
@@ -6854,8 +6854,8 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> gexStrikeLifecycleJsons = new ArrayList<>();
         List<String> maxPainJsons = new ArrayList<>();
         List<String> optionPriceBehaviorJsons = new ArrayList<>();
-        List<String> opbV2ByOptionJsons = new ArrayList<>();
-        List<String> opbV2SessionJsons = new ArrayList<>();
+        List<String> opbByOptionJsons = new ArrayList<>();
+        List<String> opbSessionJsons = new ArrayList<>();
         List<String> hpsfLatestSignalJsons = new ArrayList<>();
         List<String> hpsfMarketFlowJsons = new ArrayList<>();
         List<String> hpsfTopCandidatesJsons = new ArrayList<>();
@@ -6890,8 +6890,8 @@ public class FeedGatewayService implements ReplayRunner {
                 case "gex-strike-lifecycle" -> gexStrikeLifecycleJsons.add(cachedEvent.json());
                 case "max-pain" -> maxPainJsons.add(cachedEvent.json());
                 case "option-price-behavior" -> optionPriceBehaviorJsons.add(cachedEvent.json());
-                case "opb-v2-by-option" -> opbV2ByOptionJsons.add(cachedEvent.json());
-                case "opb-v2-session" -> opbV2SessionJsons.add(cachedEvent.json());
+                case "opb-by-option" -> opbByOptionJsons.add(cachedEvent.json());
+                case "opb-session" -> opbSessionJsons.add(cachedEvent.json());
                 case "hpsf-latest-signal" -> hpsfLatestSignalJsons.add(cachedEvent.json());
                 case "hpsf-market-flow" -> hpsfMarketFlowJsons.add(cachedEvent.json());
                 case "hpsf-top-candidates" -> hpsfTopCandidatesJsons.add(cachedEvent.json());
@@ -6925,8 +6925,8 @@ public class FeedGatewayService implements ReplayRunner {
                 gexStrikeLifecycleJsons,
                 maxPainJsons,
                 optionPriceBehaviorJsons,
-                opbV2ByOptionJsons,
-                opbV2SessionJsons,
+                opbByOptionJsons,
+                opbSessionJsons,
                 hpsfLatestSignalJsons,
                 hpsfMarketFlowJsons,
                 hpsfTopCandidatesJsons,
@@ -6962,8 +6962,8 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> gexStrikeLifecycleJsons,
             List<String> maxPainJsons,
             List<String> optionPriceBehaviorJsons,
-            List<String> opbV2ByOptionJsons,
-            List<String> opbV2SessionJsons,
+            List<String> opbByOptionJsons,
+            List<String> opbSessionJsons,
             List<String> hpsfLatestSignalJsons,
             List<String> hpsfMarketFlowJsons,
             List<String> hpsfTopCandidatesJsons,
@@ -6981,7 +6981,7 @@ public class FeedGatewayService implements ReplayRunner {
                 missionPaceJsons, missionControlJsons, spreadSkewJsons, indexPriceJsons,
                 volumeSandwichJsons, missionSandwichJsons, gexByStrikeJsons, strikeSrJsons,
                 gexMagnetJsons, gexStrikeLifecycleJsons, maxPainJsons, optionPriceBehaviorJsons,
-                opbV2ByOptionJsons, opbV2SessionJsons, hpsfLatestSignalJsons, hpsfMarketFlowJsons,
+                opbByOptionJsons, opbSessionJsons, hpsfLatestSignalJsons, hpsfMarketFlowJsons,
                 hpsfTopCandidatesJsons, hpsfAuditJsons, hpsfExitIntentJsons, esGexJsons,
                 esStrikeIntelJsons, spxPriceJsons);
     }
@@ -7009,8 +7009,8 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> gexStrikeLifecycleJsons,
             List<String> maxPainJsons,
             List<String> optionPriceBehaviorJsons,
-            List<String> opbV2ByOptionJsons,
-            List<String> opbV2SessionJsons,
+            List<String> opbByOptionJsons,
+            List<String> opbSessionJsons,
             List<String> hpsfLatestSignalJsons,
             List<String> hpsfMarketFlowJsons,
             List<String> hpsfTopCandidatesJsons,
@@ -7061,8 +7061,8 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"gexStrikeLifecycle\":" + jsonArray(gexStrikeLifecycleJsons) + ","
                 + "\"maxPains\":" + jsonArray(maxPainJsons) + ","
                 + "\"optionPriceBehaviors\":" + jsonArray(optionPriceBehaviorJsons) + ","
-                + "\"opbV2ByOptions\":" + jsonArray(opbV2ByOptionJsons) + ","
-                + "\"opbV2Sessions\":" + jsonArray(opbV2SessionJsons) + ","
+                + "\"opbByOptions\":" + jsonArray(opbByOptionJsons) + ","
+                + "\"opbSessions\":" + jsonArray(opbSessionJsons) + ","
                 + "\"hpsfLatestSignals\":" + jsonArray(hpsfLatestSignalJsons) + ","
                 + "\"hpsfMarketFlows\":" + jsonArray(hpsfMarketFlowJsons) + ","
                 + "\"hpsfTopCandidates\":" + jsonArray(hpsfTopCandidatesJsons) + ","
@@ -7107,8 +7107,8 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
                 + "\"maxPain\":" + maxPain.size() + ","
                 + "\"optionPriceBehaviors\":" + optionPriceBehaviors.size() + ","
-                + "\"opbV2ByOptions\":" + opbV2ByOptions.size() + ","
-                + "\"opbV2Sessions\":" + opbV2Sessions.size() + ","
+                + "\"opbByOptions\":" + opbByOptions.size() + ","
+                + "\"opbSessions\":" + opbSessions.size() + ","
                 + "\"hpsfLatestSignals\":" + hpsfLatestSignals.size() + ","
                 + "\"hpsfMarketFlows\":" + hpsfMarketFlows.size() + ","
                 + "\"hpsfTopCandidates\":" + hpsfTopCandidates.size() + ","
