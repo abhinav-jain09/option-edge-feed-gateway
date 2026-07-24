@@ -49,7 +49,7 @@ public final class GatewayRecordMapper {
             symbol = root.hasNonNull("underlying") ? root.get("underlying").asText("") : "";
         }
         String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
-        if (expiry.isBlank() && (type == EventType.OPTION_PRICE_BEHAVIOR || type == EventType.OPB_V2_SESSION)) {
+        if (expiry.isBlank() && (type == EventType.OPTION_PRICE_BEHAVIOR || type == EventType.OPB_SESSION)) {
             expiry = root.hasNonNull("tradingDate") ? root.get("tradingDate").asText("") : "";
         }
         OptionalDouble strike = root.hasNonNull("strike")
@@ -104,8 +104,8 @@ public final class GatewayRecordMapper {
             case "liquidity-heatmap" -> EventType.LIQUIDITY_HEATMAP;
             case "option-price-behavior" -> EventType.OPTION_PRICE_BEHAVIOR;
             case "dealer-ledger" -> EventType.DEALER_LEDGER;
-            case "opb-v2-by-option" -> EventType.OPB_V2_BY_OPTION;
-            case "opb-v2-session" -> EventType.OPB_V2_SESSION;
+            case "opb-by-option" -> EventType.OPB_BY_OPTION;
+            case "opb-session" -> EventType.OPB_SESSION;
             case "vix-price" -> EventType.VIX_PRICE;
             case "index-price" -> EventType.INDEX_PRICE;
             case "spx-price" -> EventType.SPX_PRICE;

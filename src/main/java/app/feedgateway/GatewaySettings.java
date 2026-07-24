@@ -710,14 +710,14 @@ public final class GatewaySettings {
                 value("KAFKA_OPTION_PRICE_BEHAVIOR_DASHBOARD_TOPIC", "option-price-behavior-dashboard"));
     }
 
-    /** SURFACE_RESIDUAL_V2 per-contract topic (JSON, per symbol|expiry|strike). */
-    public String optionPriceBehaviorV2ByOptionTopic() {
-        return value("KAFKA_OPTION_PRICE_BEHAVIOR_V2_BY_OPTION_TOPIC", "option-price-behavior-v2-by-option");
+    /** Surface-residual per-contract topic (JSON, per symbol|expiry|strike). */
+    public String optionPriceBehaviorByOptionTopic() {
+        return value("KAFKA_OPTION_PRICE_BEHAVIOR_BY_OPTION_TOPIC", "option-price-behavior-by-option");
     }
 
-    /** SURFACE_RESIDUAL_V2 session aggregate topic (JSON, per symbol|trading-date). */
-    public String optionPriceBehaviorV2SessionTopic() {
-        return value("KAFKA_OPTION_PRICE_BEHAVIOR_V2_SESSION_TOPIC", "option-price-behavior-v2-session");
+    /** Surface-residual session aggregate topic (JSON, per symbol|trading-date). */
+    public String optionPriceBehaviorSessionTopic() {
+        return value("KAFKA_OPTION_PRICE_BEHAVIOR_SESSION_TOPIC", "option-price-behavior-session");
     }
 
     public String hpsfLatestSignalTopic() {

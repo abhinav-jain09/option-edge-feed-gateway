@@ -55,8 +55,8 @@
 	    const gexByStrikeRef = useRef(new Map());
 	    const strikeFlowRef = useRef(new Map());
 	    const deltaFlowRef = useRef(new Map());
-	    const opbV2ByOptionsRef = useRef(new Map());
-	    const opbV2SessionsRef = useRef(new Map());
+	    const opbByOptionsRef = useRef(new Map());
+	    const opbSessionsRef = useRef(new Map());
     const visibleStrikesRef = useRef([]);
 	    const tableWrapRef = useRef(null);
     const tableBodyRef = useRef(null);
@@ -123,8 +123,8 @@
                       gexByStrikeRef.current.clear();
                       strikeFlowRef.current.clear();
                       deltaFlowRef.current.clear();
-                      opbV2ByOptionsRef.current.clear();
-                      opbV2SessionsRef.current.clear();
+                      opbByOptionsRef.current.clear();
+                      opbSessionsRef.current.clear();
 		                      setLatestSnapshot(undefined);
 		                      setSelectedSpread(undefined);
 			                      setVolumeSandwichState(emptySandwichState);
@@ -215,19 +215,19 @@
       return true;
     }, []);
 
-    // SURFACE_RESIDUAL_V2 (design §7): per-contract mispricing events keyed symbol|expiry|strike|side,
+    // Surface-residual signal (design §7; wire records carry the modelVersion payload stamp): per-contract mispricing events keyed symbol|expiry|strike|side,
     // and the symbol-wide SESSION aggregate keyed by window. Both feed a dedicated analytic panel and
-    // are NOT merged into the per-strike chain rows (the V2 signal is a separate layer).
-    const mergeOpbV2ByOption = useCallback(payload => {
-      const key = opbV2ByOptionKey(payload);
+    // are NOT merged into the per-strike chain rows (the surface-residual signal is a separate layer).
+    const mergeOpbByOption = useCallback(payload => {
+      const key = opbByOptionKey(payload);
       if (!key) return false;
-      opbV2ByOptionsRef.current.set(key, payload);
+      opbByOptionsRef.current.set(key, payload);
       return true;
     }, []);
 
-    const mergeOpbV2Session = useCallback(payload => {
+    const mergeOpbSession = useCallback(payload => {
       const key = String(payload?.window || 'session');
-      opbV2SessionsRef.current.set(key, payload);
+      opbSessionsRef.current.set(key, payload);
       return true;
     }, []);
 
@@ -303,11 +303,11 @@
         if (!shouldAcceptStrikeFlowPayload(deltaFlow, activeConfig)) return;
         rowsChanged = mergeDeltaFlowPayload(deltaFlow) || rowsChanged;
       });
-      batchItems(payload, 'opbV2ByOptions').forEach(item => {
-        rowsChanged = mergeOpbV2ByOption(item) || rowsChanged;
+      batchItems(payload, 'opbByOptions').forEach(item => {
+        rowsChanged = mergeOpbByOption(item) || rowsChanged;
       });
-      batchItems(payload, 'opbV2Sessions').forEach(item => {
-        rowsChanged = mergeOpbV2Session(item) || rowsChanged;
+      batchItems(payload, 'opbSessions').forEach(item => {
+        rowsChanged = mergeOpbSession(item) || rowsChanged;
       });
       if (latestAcceptedSnapshot) setLatestSnapshot(latestAcceptedSnapshot);
 	      const latestPressure = lastAcceptedPayload(batchItems(payload, 'directionalPressures'), activeConfig);
@@ -331,7 +331,7 @@
         validation: lastPayload(batchItems(payload, 'hpsfValidations'))
       });
       if (rowsChanged) bumpRows();
-    }, [applyHpsfViews, applyVolumeSandwichAlertPayload, applyVolumeSandwichPayload, bumpRows, mergeDeltaFlowPayload, mergeGexPayload, mergeOpbV2ByOption, mergeOpbV2Session, mergePacePayload, mergeSnapshotPayload, mergeStrikeFlowPayload]);
+    }, [applyHpsfViews, applyVolumeSandwichAlertPayload, applyVolumeSandwichPayload, bumpRows, mergeDeltaFlowPayload, mergeGexPayload, mergeOpbByOption, mergeOpbSession, mergePacePayload, mergeSnapshotPayload, mergeStrikeFlowPayload]);
 
     useEffect(() => {
       fetch(apiUrl('/api/config'), { cache: 'no-store' })
@@ -463,12 +463,12 @@
                         if (mergeDeltaFlowPayload(payload)) {
                           bumpRows();
                         }
-                      } else if (message.type === 'opb-v2-by-option') {
-                        if (mergeOpbV2ByOption(payload)) {
+                      } else if (message.type === 'opb-by-option') {
+                        if (mergeOpbByOption(payload)) {
                           bumpRows();
                         }
-                      } else if (message.type === 'opb-v2-session') {
-                        if (mergeOpbV2Session(payload)) {
+                      } else if (message.type === 'opb-session') {
+                        if (mergeOpbSession(payload)) {
                           bumpRows();
                         }
 					                          } else if (message.type === 'directional-pressure') {
@@ -532,7 +532,7 @@
           wsRef.current.close();
         }
       };
-	    }, [applyConfigState, applyHpsfViews, applyUiBatch, applyVolumeSandwichAlertPayload, applyVolumeSandwichPayload, bumpRows, clearData, config, configReady, mergeDeltaFlowPayload, mergeGexPayload, mergeOpbV2ByOption, mergeOpbV2Session, mergePacePayload, mergeSnapshotPayload, mergeStrikeFlowPayload]);
+	    }, [applyConfigState, applyHpsfViews, applyUiBatch, applyVolumeSandwichAlertPayload, applyVolumeSandwichPayload, bumpRows, clearData, config, configReady, mergeDeltaFlowPayload, mergeGexPayload, mergeOpbByOption, mergeOpbSession, mergePacePayload, mergeSnapshotPayload, mergeStrikeFlowPayload]);
 
     useEffect(() => () => {
       centerTimersRef.current.forEach(window.clearTimeout);
@@ -584,8 +584,8 @@
     const topCallVolumeStrikes = useMemo(() => topVolumeStrikes(data, 'call'), [data]);
     const topPutVolumeStrikes = useMemo(() => topVolumeStrikes(data, 'put'), [data]);
     const strikeFlowLeaders = useMemo(() => strikeFlowLeaderboard(cachedData), [cachedData]);
-    const opbV2Session = useMemo(() => opbV2SessionView(opbV2SessionsRef.current), [rowsVersion]);
-    const opbV2Leaders = useMemo(() => opbV2Leaderboard(opbV2ByOptionsRef.current), [rowsVersion]);
+    const opbSession = useMemo(() => opbSessionView(opbSessionsRef.current), [rowsVersion]);
+    const opbLeaders = useMemo(() => opbLeaderboard(opbByOptionsRef.current), [rowsVersion]);
 	    const maxCallPace = Math.max(0, ...data.map(row => Number(row[paceFields.call] || 0)));
 	    const maxPutPace = Math.max(0, ...data.map(row => Number(row[paceFields.put] || 0)));
 			                    const blinkCallStrike = highestPaceStrike(data, paceFields.call);
@@ -725,7 +725,7 @@
                               h(HpsfDashboard, { hpsfState, pulse: hpsfPulse, spotFallback: spot, config, status }),
 						                      h(SummaryGrid, { spot, vixPrice, esPrice, totalCallVolume, totalPutVolume, totalPace, paceWindow, directionalPressure, pressureWindow, onPressureWindowChange: setPressureWindow }),
                               h(StrikeFlowLeaderboard, { leaders: strikeFlowLeaders }),
-                              h(OpbV2Panel, { session: opbV2Session, leaders: opbV2Leaders }),
+                              h(OpbPanel, { session: opbSession, leaders: opbLeaders }),
 	                      h('section', { className: 'chain-card' },
         h('div', { className: 'chain-toolbar' },
           h('div', null,
@@ -874,7 +874,7 @@
                     const displayState = hpsfDisplayState(signal);
                     const dataUnsafe = displayState === 'DATA_STALE';
                     const mixedFlow = displayState === 'MIXED_FLOW' || hpsfState.marketFlow?.mixedFlow === true;
-                    return h('section', { className: 'hpsf-dashboard', 'aria-label': 'HPSF V2 signal dashboard' },
+                    return h('section', { className: 'hpsf-dashboard', 'aria-label': 'HPSF surface-residual signal dashboard' },
                       dataUnsafe ? h('div', { className: 'hpsf-alert hpsf-alert-danger' }, 'DATA NOT SAFE - NO BUY SIGNALS') : null,
                       mixedFlow ? h('div', { className: 'hpsf-alert hpsf-alert-warn' }, 'MIXED FLOW - NO TRADE') : null,
                       h(HpsfDataHealthBar, { signal, marketFlow: hpsfState.marketFlow, config, status }),
@@ -1265,50 +1265,50 @@
                     );
                   }
 
-                  function OpbV2Panel({ session, leaders }) {
-                    // SURFACE_RESIDUAL_V2 (design §7): the headline is directionalPressureZ — the
+                  function OpbPanel({ session, leaders }) {
+                    // Surface-residual signal (design §7; wire records carry the modelVersion payload stamp): the headline is directionalPressureZ — the
                     // exposure-weighted Stouffer z of first-difference mispricing residuals. Positive =
                     // net call-side over-performance (bullish pressure); negative = put-side (bearish).
                     if (!session && (!leaders || !leaders.length)) return null;
                     const dirZ = session ? Number(session.directionalPressureZ) : undefined;
                     const breadthZ = session ? Number(session.perContractAnomalyZ) : undefined;
-                    const tone = opbV2ZTone(dirZ);
-                    return h('section', { className: 'opb-v2-panel', 'aria-label': 'Surface Residual V2' },
-                      h('div', { className: 'opb-v2-header' },
-                        h('strong', null, 'Surface Residual (V2)'),
+                    const tone = opbZTone(dirZ);
+                    return h('section', { className: 'opb-panel', 'aria-label': 'Surface Residual' },
+                      h('div', { className: 'opb-header' },
+                        h('strong', null, 'Surface Residual'),
                         h('span', null, 'Sticky-strike mispricing pressure — shadow signal')
                       ),
-                      h('div', { className: 'opb-v2-body' },
-                        h('div', { className: `opb-v2-headline opb-v2-${tone.className}` },
-                          h('span', { className: 'opb-v2-headline-label' }, 'Directional pressure z'),
-                          h('strong', { className: 'opb-v2-headline-value' }, fmtOpbV2Z(dirZ)),
-                          h('span', { className: 'opb-v2-headline-tag' }, tone.label)
+                      h('div', { className: 'opb-body' },
+                        h('div', { className: `opb-headline opb-${tone.className}` },
+                          h('span', { className: 'opb-headline-label' }, 'Directional pressure z'),
+                          h('strong', { className: 'opb-headline-value' }, fmtOpbZ(dirZ)),
+                          h('span', { className: 'opb-headline-tag' }, tone.label)
                         ),
-                        h('div', { className: 'opb-v2-metrics' },
-                          h(OpbV2Metric, { label: 'Breadth z', value: fmtOpbV2Z(breadthZ), title: 'Equal-weight Stouffer anomaly z (per-contract breadth)' }),
-                          h(OpbV2Metric, { label: 'Window', value: session ? String(session.window || '--') : '--' }),
-                          h(OpbV2Metric, { label: 'Included', value: session ? `${fmtOpbV2Count(session.n)} / ${fmtOpbV2Count(session.samplesEligible)}` : '--', title: 'Contracts scored / eligible in window' }),
-                          h(OpbV2Metric, { label: 'Excluded', value: session ? fmtOpbV2Count(session.samplesExcluded) : '--', title: opbV2ExclusionTitle(session) })
+                        h('div', { className: 'opb-metrics' },
+                          h(OpbMetric, { label: 'Breadth z', value: fmtOpbZ(breadthZ), title: 'Equal-weight Stouffer anomaly z (per-contract breadth)' }),
+                          h(OpbMetric, { label: 'Window', value: session ? String(session.window || '--') : '--' }),
+                          h(OpbMetric, { label: 'Included', value: session ? `${fmtOpbCount(session.n)} / ${fmtOpbCount(session.samplesEligible)}` : '--', title: 'Contracts scored / eligible in window' }),
+                          h(OpbMetric, { label: 'Excluded', value: session ? fmtOpbCount(session.samplesExcluded) : '--', title: opbExclusionTitle(session) })
                         ),
                         leaders && leaders.length
-                          ? h('div', { className: 'opb-v2-leaders' },
-                              h('div', { className: 'opb-v2-leaders-title' }, 'Most anomalous contracts'),
+                          ? h('div', { className: 'opb-leaders' },
+                              h('div', { className: 'opb-leaders-title' }, 'Most anomalous contracts'),
                               h('ol', null, leaders.map(row => h('li', { key: row.key, title: row.title },
-                                h('span', { className: `opb-v2-side opb-v2-side-${row.side}` }, row.sideLabel),
-                                h('span', { className: 'opb-v2-strike' }, row.strike),
-                                h('strong', { className: `opb-v2-z opb-v2-${row.tone}` }, row.z),
-                                h('small', { className: 'opb-v2-label' }, row.label)
+                                h('span', { className: `opb-side opb-side-${row.side}` }, row.sideLabel),
+                                h('span', { className: 'opb-strike' }, row.strike),
+                                h('strong', { className: `opb-z opb-${row.tone}` }, row.z),
+                                h('small', { className: 'opb-label' }, row.label)
                               )))
                             )
-                          : h('p', { className: 'opb-v2-empty' }, 'Waiting for scored contracts')
+                          : h('p', { className: 'opb-empty' }, 'Waiting for scored contracts')
                       )
                     );
                   }
 
-                  function OpbV2Metric({ label, value, title }) {
-                    return h('div', { className: 'opb-v2-metric', title: title || undefined },
-                      h('span', { className: 'opb-v2-metric-label' }, label),
-                      h('strong', { className: 'opb-v2-metric-value' }, value)
+                  function OpbMetric({ label, value, title }) {
+                    return h('div', { className: 'opb-metric', title: title || undefined },
+                      h('span', { className: 'opb-metric-label' }, label),
+                      h('strong', { className: 'opb-metric-value' }, value)
                     );
                   }
 
@@ -1758,8 +1758,8 @@
                     return { buy, sell };
                   }
 
-                  // --- SURFACE_RESIDUAL_V2 (design §7) view helpers ---
-                  function opbV2ByOptionKey(payload) {
+                  // --- Surface-residual signal (design §7; wire records carry the modelVersion payload stamp) view helpers ---
+                  function opbByOptionKey(payload) {
                     const symbol = String(payload?.symbol || '').toUpperCase();
                     const expiry = normalizeExpiry(String(payload?.expiry || ''));
                     const strike = Number(payload?.strike);
@@ -1771,7 +1771,7 @@
                     return `${symbol}|${expiry}|${strike}|${side}`;
                   }
 
-                  function opbV2SessionView(sessions) {
+                  function opbSessionView(sessions) {
                     // Prefer the shortest configured window (freshest, most reactive); fall back to any.
                     const values = [...(sessions?.values?.() || [])].filter(Boolean);
                     if (!values.length) return undefined;
@@ -1784,31 +1784,31 @@
                     })[0];
                   }
 
-                  function opbV2Leaderboard(byOption) {
+                  function opbLeaderboard(byOption) {
                     return [...(byOption?.values?.() || [])]
                       .filter(item => item && item.included === true && Number.isFinite(Number(item.residualZScore)))
                       .sort((a, b) => Math.abs(Number(b.residualZScore)) - Math.abs(Number(a.residualZScore)))
                       .slice(0, 6)
-                      .map(item => opbV2LeaderRow(item));
+                      .map(item => opbLeaderRow(item));
                   }
 
-                  function opbV2LeaderRow(item) {
+                  function opbLeaderRow(item) {
                     const z = Number(item.residualZScore);
                     const side = String(item.optionType || '').toUpperCase() === 'PUT' ? 'put' : 'call';
-                    const label = opbV2LabelText(item.behaviorLabel);
+                    const label = opbLabelText(item.behaviorLabel);
                     return {
-                      key: opbV2ByOptionKey(item) || `${item.strike}-${side}`,
+                      key: opbByOptionKey(item) || `${item.strike}-${side}`,
                       side,
                       sideLabel: side === 'put' ? 'PUT' : 'CALL',
                       strike: Number.isFinite(Number(item.strike)) ? String(Number(item.strike)) : '--',
-                      z: fmtOpbV2Z(z),
-                      tone: opbV2ZTone(z).className,
+                      z: fmtOpbZ(z),
+                      tone: opbZTone(z).className,
                       label,
-                      title: `${side.toUpperCase()} ${item.strike} · residual z ${fmtOpbV2Z(z)} · ${label}`
+                      title: `${side.toUpperCase()} ${item.strike} · residual z ${fmtOpbZ(z)} · ${label}`
                     };
                   }
 
-                  function opbV2ZTone(z) {
+                  function opbZTone(z) {
                     const value = Number(z);
                     if (!Number.isFinite(value)) return { className: 'neutral', label: 'No signal' };
                     if (value >= 1.5) return { className: 'bull', label: 'Bullish pressure' };
@@ -1816,13 +1816,13 @@
                     return { className: 'neutral', label: 'Balanced' };
                   }
 
-                  function opbV2LabelText(label) {
+                  function opbLabelText(label) {
                     const text = String(label || '').trim();
                     if (!text) return '--';
                     return text.replace(/_/g, ' ').toLowerCase().replace(/^\w/, ch => ch.toUpperCase());
                   }
 
-                  function opbV2ExclusionTitle(session) {
+                  function opbExclusionTitle(session) {
                     if (!session) return undefined;
                     const parts = [
                       ['no baseline trade', session.noBaselineTrade],
@@ -1837,13 +1837,13 @@
                     return parts.length ? `Excluded — ${parts.join(', ')}` : 'No exclusions';
                   }
 
-                  function fmtOpbV2Z(value) {
+                  function fmtOpbZ(value) {
                     const num = Number(value);
                     if (!Number.isFinite(num)) return '--';
                     return `${num > 0 ? '+' : ''}${num.toFixed(2)}`;
                   }
 
-                  function fmtOpbV2Count(value) {
+                  function fmtOpbCount(value) {
                     const num = Number(value);
                     if (!Number.isFinite(num)) return '--';
                     return String(Math.trunc(num));
