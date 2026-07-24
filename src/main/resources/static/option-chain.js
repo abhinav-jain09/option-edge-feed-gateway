@@ -195,7 +195,11 @@
     const mergeGexOiStatusPayload = useCallback(payload => {
       const strike = Number(payload?.strike);
       if (!Number.isFinite(strike)) return false;
-      const missing = String(payload?.status || '').toUpperCase() === 'OI_MISSING';
+      const statusText = String(payload?.status || '').toUpperCase();
+      // Fail-closed semantics: only the two known values act. An unknown/misspelled/schema-drifted status
+      // must be IGNORED — never interpreted as "OI arrived" and never allowed to clear a live warning.
+      if (statusText !== 'OI_MISSING' && statusText !== 'OI_OK') return false;
+      const missing = statusText === 'OI_MISSING';
       // Keep the producer's source identity: contractKey() prefixes the source, and dropping it would
       // key this as LEGACY|... while snapshot/GEX rows live under DATABENTO|... (badge would never merge).
       const status = { source: payload.source || payload.marketDataSource, symbol: payload.symbol,
