@@ -4443,6 +4443,19 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
+     * Latest cached strike-flow snapshot JSON for {@code symbol|expiry} (the key
+     * {@link #strikeFlowCacheKey} produces), or {@code null} when none is cached. Source for the
+     * {@code /api/seller-activity} endpoint, which aggregates the snapshot's per-strike
+     * {@code sellerActivity} buckets server-side (SSOT for web + mobile).
+     */
+    public String cachedStrikeFlowSnapshot(String symbol, String expiry) {
+        if (symbol == null || expiry == null) {
+            return null;
+        }
+        return strikeFlows.get(symbol.toUpperCase() + "|" + normalizeExpiry(expiry));
+    }
+
+    /**
      * Per-strike delta-flow cache key: {@code symbol|expiry|strike} (mirrors {@link #gexCacheKey},
      * since delta-flow is per-strike not chain-level). Derived from payload identity so the cache key
      * matches the UI contract (source is prepended by updateCache → source|symbol|expiry|strike).
