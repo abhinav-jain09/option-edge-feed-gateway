@@ -53,6 +53,7 @@
 	    const rowsRef = useRef(new Map());
 	    const pacesRef = useRef(new Map());
 	    const gexByStrikeRef = useRef(new Map());
+	    const gexOiStatusRef = useRef(new Map());
 	    const strikeFlowRef = useRef(new Map());
 	    const deltaFlowRef = useRef(new Map());
 	    const opbByOptionsRef = useRef(new Map());
@@ -121,6 +122,7 @@
 	      rowsRef.current.clear();
 	                      pacesRef.current.clear();
                       gexByStrikeRef.current.clear();
+                      gexOiStatusRef.current.clear();
                       strikeFlowRef.current.clear();
                       deltaFlowRef.current.clear();
                       opbByOptionsRef.current.clear();
@@ -145,12 +147,17 @@
       const key = contractKey(payload);
       const pace = pacesRef.current.get(key);
       const gex = gexByStrikeRef.current.get(key);
+      // OI-arrival badge state must survive row re-creation: a snapshot row born AFTER the OI_MISSING
+      // status arrived still shows the badge (the watchdog re-publishes only every check interval).
+      const oiStatus = gexOiStatusRef.current.get(key);
       const strikeFlow = strikeFlowRef.current.get(key);
       const cachedDeltaFlow = deltaFlowRef.current.get(key);
       // FIX 3: do NOT re-merge a STALE cached delta-flow onto a fresh snapshot row — otherwise an old
       // value reappears forever on every later snapshot as a false live signal once publishing stops.
       const deltaFlow = deltaFlowIsFresh(cachedDeltaFlow?.deltaFlow, Date.now()) ? cachedDeltaFlow : null;
-      rowsRef.current.set(key, { ...payload, ...(pace || {}), ...(gex || {}), ...(strikeFlow || {}), ...(deltaFlow || {}) });
+      rowsRef.current.set(key, { ...payload, ...(pace || {}), ...(gex || {}),
+        ...(oiStatus ? { uwGexOiMissing: oiStatus.uwGexOiMissing } : {}),
+        ...(strikeFlow || {}), ...(deltaFlow || {}) });
       return true;
     }, []);
 
@@ -179,6 +186,22 @@
       const row = rowsRef.current.get(key);
       if (!row) return false;
       rowsRef.current.set(key, { ...row, ...gex });
+      return true;
+    }, []);
+
+    // Per-strike OI-arrival status from the gex watchdog (gexOiStatus envelope array): OI_MISSING marks
+    // the strike's GEX cell "OI missing" (fail-closed GEX publishes nothing, so a blank would be
+    // ambiguous); OI_OK clears it the moment today's baseline lands.
+    const mergeGexOiStatusPayload = useCallback(payload => {
+      const strike = Number(payload?.strike);
+      if (!Number.isFinite(strike)) return false;
+      const missing = String(payload?.status || '').toUpperCase() === 'OI_MISSING';
+      const status = { symbol: payload.symbol, expiry: payload.expiry, strike, uwGexOiMissing: missing };
+      const key = contractKey(status);
+      gexOiStatusRef.current.set(key, status);
+      const row = rowsRef.current.get(key);
+      if (!row || row.uwGexOiMissing === missing) return false;
+      rowsRef.current.set(key, { ...row, uwGexOiMissing: missing });
       return true;
     }, []);
 
@@ -294,6 +317,10 @@
       batchItems(payload, 'gexByStrike').forEach(gex => {
         if (!shouldAcceptStreamPayload(gex, activeConfig)) return;
         rowsChanged = mergeGexPayload(gex) || rowsChanged;
+      });
+      batchItems(payload, 'gexOiStatus').forEach(status => {
+        if (!shouldAcceptStreamPayload(status, activeConfig)) return;
+        rowsChanged = mergeGexOiStatusPayload(status) || rowsChanged;
       });
       batchItems(payload, 'strikeFlows').forEach(strikeFlow => {
         if (!shouldAcceptStrikeFlowPayload(strikeFlow, activeConfig)) return;
@@ -437,6 +464,7 @@
 		              rowsRef.current.delete(key);
 		              pacesRef.current.delete(key);
 		              gexByStrikeRef.current.delete(key);
+		              gexOiStatusRef.current.delete(key);
 		              strikeFlowRef.current.delete(key);
 		              deltaFlowRef.current.delete(key);
 		            });
@@ -3143,6 +3171,17 @@
 	  function gexStrikeState(row, maxAbsGex) {
 	    const hasGex = row?.uwGexUpdatedAt || row?.uwGammaSign || Number.isFinite(Number(row?.uwNetGex));
 	    if (!hasGex) {
+	      if (row?.uwGexOiMissing) {
+	        // Explicit fail-closed marker from the gex OI-arrival watchdog: today's open-interest baseline
+	        // has not arrived, so NO GEX values exist for this session yet (deliberately — never a stale or
+	        // false-zero value). Live GEX resuming (hasGex) or an OI_OK status clears this.
+	        return {
+	          className: 'gamma-oi-missing', stale: false, visible: true, text: 'OI missing',
+	          title: "Today's open-interest baseline has NOT arrived — GEX is fail-closed (absent) until it does",
+	          strengthPercent: 0, fillPercent: 0, arrowPosition: 50,
+	          moveDirection: '', arrow: '', arrowClass: '', changeTitle: ''
+	        };
+	      }
 	      return { className: '', stale: false, visible: false, text: '', title: 'Waiting for gamma exposure' };
 	    }
 	    const updatedAtMs = Date.parse(row.uwGexUpdatedAt || '');
