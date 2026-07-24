@@ -3219,12 +3219,22 @@ public class FeedGatewayService implements ReplayRunner {
                 // precedence: once the session's verdict is cached, later interims are dead.
                 int marker = key.indexOf("|I|");
                 if (marker >= 0) {
-                    // CD-R30 short-class INGESTION freshness for interims: a delayed or
-                    // backfilled monitoring record older than the interim window must never
-                    // cache or live-broadcast (the long 12h policy below governs only the
-                    // VERDICT + seek-back). Returning null suppresses both.
-                    if (System.currentTimeMillis() - eventTime
-                            > settings.closeDirectionInterimFreshMs()) {
+                    // CD-R30 short-class INGESTION freshness for interims — BOTH clocks:
+                    // the Kafka record timestamp (delayed/backfilled delivery) AND the
+                    // payload asOfMs (fresh redelivery of an old evaluation). Either stale
+                    // ⇒ never cached, never live-broadcast; the long 12h policy governs
+                    // only the VERDICT + seek-back. Returning null suppresses both paths.
+                    long nowIngestMs = System.currentTimeMillis();
+                    if (nowIngestMs - eventTime > settings.closeDirectionInterimFreshMs()) {
+                        return null;
+                    }
+                    try {
+                        long asOfMs = mapper.readTree(json).path("asOfMs").asLong(0);
+                        if (asOfMs <= 0 || nowIngestMs - asOfMs
+                                > settings.closeDirectionInterimFreshMs()) {
+                            return null;
+                        }
+                    } catch (JsonProcessingException e) {
                         return null;
                     }
                     String verdictKey = key.substring(0, marker) + "|V|"

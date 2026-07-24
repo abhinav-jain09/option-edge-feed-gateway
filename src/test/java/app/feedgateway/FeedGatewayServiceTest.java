@@ -1090,6 +1090,57 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void closeDirectionReplayOnConnect_freshInterim_verdictPrecedence_staleSuppression()
+            throws Exception {
+        // CD-R30 replay behavior on the REAL replay path: a fresh interim replays; once
+        // the session's verdict is cached the verdict replays and the interim does not;
+        // a stale-asOfMs interim never replays.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        Method replay = FeedGatewayService.class.getDeclaredMethod(
+                "replayCloseDirectionCached", WebSocketSession.class);
+        replay.setAccessible(true);
+
+        String interim = "{\"phase\":\"MONITORING\",\"sessionDate\":\"2026-07-24\","
+                + "\"direction\":\"UP\",\"asOfMs\":" + (now - 30_000) + "}";
+        updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                recordAt(settings.closeDirectionSignalTopic(), 0, 21L, "SPX|20260724",
+                        interim, now - 30_000), interim);
+        List<String> sink = new java.util.ArrayList<>();
+        replay.invoke(service, recordingSession(sink));
+        assertEquals(1, sink.size(), "fresh interim replays on connect");
+        assertTrue(sink.get(0).contains("\"phase\":\"MONITORING\""));
+
+        // Verdict lands → replay sends the verdict, never the interim (precedence).
+        String verdict = "{\"phase\":\"VERDICT\",\"sessionDate\":\"2026-07-24\","
+                + "\"direction\":\"DOWN\",\"verdictId\":\"CDV1:2026-07-24:SPX:20260724\","
+                + "\"asOfMs\":" + now + "}";
+        updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                recordAt(settings.closeDirectionSignalTopic(), 0, 22L, "SPX|20260724",
+                        verdict, now), verdict);
+        sink.clear();
+        replay.invoke(service, recordingSession(sink));
+        assertEquals(1, sink.size(), "verdict-over-interim on replay");
+        assertTrue(sink.get(0).contains("\"phase\":\"VERDICT\""));
+
+        // Stale-asOfMs interim for another session: cached fresh by record time is now
+        // impossible (ingestion gate) — simulate staleness by aging: replay must suppress
+        // an interim whose asOfMs has fallen outside the freshness window.
+        String agingInterim = "{\"phase\":\"MONITORING\",\"sessionDate\":\"2026-07-25\","
+                + "\"direction\":\"UP\",\"asOfMs\":"
+                + (now - settings.closeDirectionInterimFreshMs() + 2_000) + "}";
+        updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                recordAt(settings.closeDirectionSignalTopic(), 0, 23L, "SPX|20260725",
+                        agingInterim, now), agingInterim);
+        Thread.sleep(2_100);   // asOfMs crosses the freshness boundary
+        sink.clear();
+        replay.invoke(service, recordingSession(sink));
+        assertEquals(1, sink.size(), "stale interim suppressed; only the verdict replays");
+        assertTrue(sink.get(0).contains("\"phase\":\"VERDICT\""));
+    }
+
+    @Test
     void closeDirectionUsesLongTtlWindow() throws Exception {
         // The frozen 15:49 verdict must still replay to a client connecting at 15:59; the long
         // 12h window also drives the restart seek-back. (Interim REPLAY freshness is separately
