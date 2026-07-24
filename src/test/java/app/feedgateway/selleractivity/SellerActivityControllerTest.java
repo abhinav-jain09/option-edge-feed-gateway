@@ -7,7 +7,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -38,6 +40,13 @@ class SellerActivityControllerTest {
         return controller.sellerActivity(symbol, expiry, sample, mode, "Bearer token").getStatusCode().value();
     }
 
+    /** Invoke the streaming body (which also RELEASES the aggregation permit) and parse the JSON. */
+    private static JsonNode read(ResponseEntity<StreamingResponseBody> r) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        r.getBody().writeTo(baos);
+        return new ObjectMapper().readTree(baos.toByteArray());
+    }
+
     @Test
     void unauthenticatedReturnsAuthStatusAndNeverTouchesTheCache() {
         when(auth.authenticate(any())).thenReturn(new LiquidityHistoryAuth.Result(401, null));
@@ -60,9 +69,9 @@ class SellerActivityControllerTest {
     void missingSnapshotReturns200WithEmptyEnvelope() throws IOException {
         authOk();
         when(service.cachedStrikeFlowSnapshot("SPX", "2026-07-24")).thenReturn(null);
-        ResponseEntity<byte[]> r = controller.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token");
+        ResponseEntity<StreamingResponseBody> r = controller.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token");
         assertEquals(200, r.getStatusCode().value());
-        JsonNode body = new ObjectMapper().readTree(r.getBody());
+        JsonNode body = read(r);
         assertEquals("SPX", body.path("symbol").asText());
         assertEquals(30, body.path("sampleMinutes").asInt());       // default
         assertEquals("combined", body.path("mode").asText());       // default
@@ -72,19 +81,24 @@ class SellerActivityControllerTest {
 
     @Test
     void rateLimitsPerPrincipalAfterTheBudgetIsExhausted() {
-        authOk(); // principal "user"; snapshot is unstubbed -> null -> 200 empty envelopes
+        // High concurrency limit so the SEMAPHORE never gates here (streams aren't invoked in this test) —
+        // this exercises the per-minute RATE limiter. Snapshot unstubbed -> null -> 200 empty envelopes.
+        SellerActivityController c = new SellerActivityController(service, auth, new ObjectMapper(), 1000);
+        when(auth.authenticate(any())).thenReturn(new LiquidityHistoryAuth.Result(200, "user"));
         for (int i = 0; i < 120; i++) {
-            assertEquals(200, status("SPX", "2026-07-24", null, null), "within budget");
+            assertEquals(200, c.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token")
+                    .getStatusCode().value(), "within budget");
         }
-        assertEquals(429, status("SPX", "2026-07-24", null, null), "over the per-minute budget -> 429");
+        assertEquals(429, c.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token")
+                .getStatusCode().value(), "over the per-minute budget -> 429");
     }
 
     @Test
-    void boundsConcurrentAggregationsWith503WhenSlotsAreExhausted() {
+    void holdsTheAggregationSlotThroughTheWriteAnd503sWhenExhausted() throws IOException {
         SellerActivityController limited =
                 new SellerActivityController(service, auth, new ObjectMapper(), 1); // one aggregation slot
         when(auth.authenticate(any())).thenReturn(new LiquidityHistoryAuth.Result(200, "user"));
-        // simulate an in-flight aggregation holding the only slot
+        // simulate an in-flight request holding the only slot
         limited.aggregationSlots.acquireUninterruptibly();
         try {
             assertEquals(503, limited.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token")
@@ -92,10 +106,13 @@ class SellerActivityControllerTest {
         } finally {
             limited.aggregationSlots.release();
         }
-        // slot freed -> served, and the finally-release keeps the pool from leaking
-        assertEquals(200, limited.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token")
-                .getStatusCode().value());
-        assertEquals(1, limited.aggregationSlots.availablePermits(), "permit released after serving");
+        // slot free -> served; the permit is held UNTIL the write completes (bounds slow-client backpressure)
+        ResponseEntity<StreamingResponseBody> served =
+                limited.sellerActivity("SPX", "2026-07-24", null, null, "Bearer token");
+        assertEquals(200, served.getStatusCode().value());
+        assertEquals(0, limited.aggregationSlots.availablePermits(), "slot held while the response is unwritten");
+        served.getBody().writeTo(new ByteArrayOutputStream()); // complete the write
+        assertEquals(1, limited.aggregationSlots.availablePermits(), "permit released after the write completes");
     }
 
     @Test
@@ -107,9 +124,9 @@ class SellerActivityControllerTest {
         when(service.cachedStrikeFlowSnapshot("SPX", "2026-07-24")).thenReturn(snapshot);
 
         // lower-case, padded symbol must normalize to the cache key "SPX".
-        ResponseEntity<byte[]> r = controller.sellerActivity(" spx ", "2026-07-24", "30", "combined", "Bearer token");
+        ResponseEntity<StreamingResponseBody> r = controller.sellerActivity(" spx ", "2026-07-24", "30", "combined", "Bearer token");
         assertEquals(200, r.getStatusCode().value());
-        JsonNode body = new ObjectMapper().readTree(r.getBody());
+        JsonNode body = read(r);
         assertEquals("SPX", body.path("symbol").asText());
         assertEquals(1_780_000_500_000L, body.path("asOfMs").asLong());
         assertEquals(1, body.path("series").size());

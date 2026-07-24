@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
@@ -72,7 +73,7 @@ public class SellerActivityController {
     }
 
     @GetMapping(value = "/api/seller-activity", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<byte[]> sellerActivity(
+    public ResponseEntity<StreamingResponseBody> sellerActivity(
             @RequestParam(value = "symbol", required = false) String symbol,
             @RequestParam(value = "expiry", required = false) String expiry,
             @RequestParam(value = "sample", required = false) String sampleRaw,
@@ -109,17 +110,27 @@ public class SellerActivityController {
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                     .header(HttpHeaders.RETRY_AFTER, "1").build();
         }
+        boolean streamOwnsPermit = false;
         try {
             String snapshot = service.cachedStrikeFlowSnapshot(normalizedSymbol, canonicalExpiry);
             ObjectNode envelope = aggregator.aggregate(snapshot, normalizedSymbol, canonicalExpiry, sample, mode);
-            // Serialize UNDER the semaphore so the (bounded) envelope and its bytes are held only while a
-            // slot is occupied — peak heap is MAX_CONCURRENT_AGGREGATIONS × (parse budget + serialized out).
-            return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON)
-                    .body(mapper.writeValueAsBytes(envelope));
-        } catch (JsonProcessingException e) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+            // Stream the (bounded, MAX_TOTAL_POINTS-capped) envelope straight to the socket and hold the
+            // aggregation slot until the WRITE completes — so concurrent parse+serialize+write, including
+            // under slow-client backpressure, is bounded to MAX_CONCURRENT_AGGREGATIONS. The permit is
+            // owned by the stream once returned, so the finally below only releases it on an early failure.
+            StreamingResponseBody stream = out -> {
+                try {
+                    mapper.writeValue(out, envelope);
+                } finally {
+                    aggregationSlots.release();
+                }
+            };
+            streamOwnsPermit = true;
+            return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON).body(stream);
         } finally {
-            aggregationSlots.release();
+            if (!streamOwnsPermit) {
+                aggregationSlots.release();
+            }
         }
     }
 
@@ -155,15 +166,17 @@ public class SellerActivityController {
         }
     }
 
-    private ResponseEntity<byte[]> badRequest(String message) {
-        ObjectNode body = mapper.createObjectNode();
-        body.put("error", message);
+    private ResponseEntity<StreamingResponseBody> badRequest(String message) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("error", message);
+        byte[] body;
         try {
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                    .contentType(MediaType.APPLICATION_JSON).body(mapper.writeValueAsBytes(body));
+            body = mapper.writeValueAsBytes(node);
         } catch (JsonProcessingException e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).build();
         }
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .contentType(MediaType.APPLICATION_JSON).body(out -> out.write(body));
     }
 
     /** Fixed-window per-principal limiter (mirrors the /api/liquidity-history limiter). */
