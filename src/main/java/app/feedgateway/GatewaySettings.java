@@ -282,6 +282,11 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_STRIKE_FLOW_TOPIC", "options.databento.strike-flow");
     }
 
+    /** Per-strike, compacted Seller Activity histories split from the chain-wide strike-flow snapshot. */
+    public String databentoSellerActivityTopic() {
+        return value("KAFKA_DATABENTO_SELLER_ACTIVITY_TOPIC", "options.databento.seller-activity");
+    }
+
     /**
      * Per-strike delta-flow topic (JSON {@code DeltaFlowStrikeSnapshot}, one record per
      * {@code symbol|date|expiry|strike}) from delta-flow-service. Broadcast as event

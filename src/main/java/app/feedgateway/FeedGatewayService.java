@@ -128,7 +128,7 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "strike-sr",
             "gex-magnet",
             "es-gex",
@@ -156,6 +156,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> paceRanks = new ConcurrentHashMap<>(); // board-level pace ranking, keyed by boardKey
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
     private final Map<String, String> strikeFlows = new ConcurrentHashMap<>();
+    private final Map<String, String> sellerActivities = new ConcurrentHashMap<>();
     // Per-strike delta-flow snapshots, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (DeltaFlowStrikeSnapshot) — lives on the JSON-state consumer.
     private final Map<String, String> deltaFlows = new ConcurrentHashMap<>();
@@ -276,6 +277,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingPaceRanks = new LinkedHashMap<>();
     private final Map<String, String> pendingDirectionalPressures = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeFlows = new LinkedHashMap<>();
+    private final Map<String, String> pendingSellerActivities = new LinkedHashMap<>();
     private final Map<String, String> pendingDeltaFlows = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeIntels = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeInvasions = new LinkedHashMap<>();
@@ -549,7 +551,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gex-strike-lifecycle"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "es-gex", "es-strike-intel"));
+            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "es-gex", "es-strike-intel"));
             replayOptionTruthCachedLegacy(session);
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
@@ -1278,6 +1280,7 @@ public class FeedGatewayService implements ReplayRunner {
         // history-preservation gate in cacheRecord()).
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
+        topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
         if (settings.esGexEnabled()) {
             topicEvents.put(settings.esGexSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-gex"));
         }
@@ -1384,6 +1387,7 @@ public class FeedGatewayService implements ReplayRunner {
         // topic sets symmetric, exactly as the UW gex/gex-history pair and the databento-gex Avro pair).
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
+        topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
         if (settings.esGexEnabled()) {
             topicEvents.put(settings.esGexSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-gex"));
         }
@@ -2475,6 +2479,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.databentoEsTradesTopic(),
                     settings.underlyingSpxPriceTopic(),
                     settings.databentoStrikeFlowTopic(),
+                    settings.databentoSellerActivityTopic(),
                     settings.databentoDeltaFlowByStrikeTopic(),
                     settings.strikeIntelByStrikeTopic(),
                     settings.optionTruthByStrikeTopic(),
@@ -2501,7 +2506,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-v2-by-option", "opb-v2-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
     }
 
     /**
@@ -3026,6 +3031,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = indexPriceCacheKey(json, key);
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
+        } else if ("seller-activity".equals(event)) {
+            key = deltaFlowCacheKey(json, key);
         } else if ("delta-flow".equals(event)) {
             key = deltaFlowCacheKey(json, key);
         } else if ("strike-intel".equals(event)) {
@@ -3161,6 +3168,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 strikeFlows.put(key, json);
+                return key;
+            }
+            case "seller-activity" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                sellerActivities.put(key, json);
                 return key;
             }
             case "delta-flow" -> {
@@ -3648,6 +3661,14 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("strike-flow", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "seller-activity" -> sellerActivities.entrySet().stream()
+                        .filter(entry -> isCacheFresh("seller-activity:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("seller-activity:" + entry.getKey(), selection))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("seller-activity", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "delta-flow" -> deltaFlows.entrySet().stream()
                         .filter(entry -> isCacheFresh("delta-flow:" + entry.getKey(), nowMs))
@@ -4418,6 +4439,8 @@ public class FeedGatewayService implements ReplayRunner {
             zeroDteIntelligence.remove(versionKey.substring("zero-dte-intelligence:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
             strikeFlows.remove(versionKey.substring("strike-flow:".length()));
+        } else if (versionKey.startsWith("seller-activity:")) {
+            sellerActivities.remove(versionKey.substring("seller-activity:".length()));
         } else if (versionKey.startsWith("delta-flow:")) {
             deltaFlows.remove(versionKey.substring("delta-flow:".length()));
         } else if (versionKey.startsWith("strike-invasion:")) {
@@ -5457,6 +5480,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "pace-rank", paceRanks);
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
+        replayCacheMap(session, "seller-activity", sellerActivities);
         replayCacheMap(session, "delta-flow", deltaFlows);
         replayCacheMap(session, "strike-intel", strikeIntels);
         replayCacheMap(session, "option-truth", optionTruths);
@@ -5787,6 +5811,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.databentoGexMagnetTopic(), "gex-magnet");
                 avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
+                stringTopics.put(settings.databentoSellerActivityTopic(), "seller-activity");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.strikeIntelByStrikeTopic(), "strike-intel");
                 stringTopics.put(settings.strikeInvasionTopic(), "strike-invasion");
@@ -6583,6 +6608,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "pace-rank" -> pendingPaceRanks;
             case "directional-pressure" -> pendingDirectionalPressures;
             case "strike-flow" -> pendingStrikeFlows;
+            case "seller-activity" -> pendingSellerActivities;
             case "delta-flow" -> pendingDeltaFlows;
             case "strike-intel" -> pendingStrikeIntels;
             case "strike-invasion" -> pendingStrikeInvasions;
@@ -6642,6 +6668,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingPaceRanks.values()),
                         new ArrayList<>(pendingDirectionalPressures.values()),
                         new ArrayList<>(pendingStrikeFlows.values()),
+                        new ArrayList<>(pendingSellerActivities.values()),
                         new ArrayList<>(pendingDeltaFlows.values()),
                         new ArrayList<>(pendingStrikeIntels.values()),
                         new ArrayList<>(pendingStrikeInvasions.values()),
@@ -6697,6 +6724,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingPaceRanks.size()
                 + pendingDirectionalPressures.size()
                 + pendingStrikeFlows.size()
+                + pendingSellerActivities.size()
                 + pendingDeltaFlows.size()
                 + pendingStrikeIntels.size()
                 + pendingStrikeInvasions.size()
@@ -6731,6 +6759,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingPaceRanks.clear();
         pendingDirectionalPressures.clear();
         pendingStrikeFlows.clear();
+        pendingSellerActivities.clear();
         pendingDeltaFlows.clear();
         pendingStrikeIntels.clear();
         pendingStrikeInvasions.clear();
@@ -6770,6 +6799,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> paceRankJsons = new ArrayList<>();
         List<String> directionalPressureJsons = new ArrayList<>();
         List<String> strikeFlowJsons = new ArrayList<>();
+        List<String> sellerActivityJsons = new ArrayList<>();
         List<String> deltaFlowJsons = new ArrayList<>();
         List<String> strikeIntelJsons = new ArrayList<>();
         List<String> strikeInvasionJsons = new ArrayList<>();
@@ -6803,6 +6833,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "pace-rank" -> paceRankJsons.add(cachedEvent.json());
                 case "directional-pressure" -> directionalPressureJsons.add(cachedEvent.json());
                 case "strike-flow" -> strikeFlowJsons.add(cachedEvent.json());
+                case "seller-activity" -> sellerActivityJsons.add(cachedEvent.json());
                 case "delta-flow" -> deltaFlowJsons.add(cachedEvent.json());
                 case "strike-intel" -> strikeIntelJsons.add(cachedEvent.json());
                 case "strike-invasion" -> strikeInvasionJsons.add(cachedEvent.json());
@@ -6842,6 +6873,7 @@ public class FeedGatewayService implements ReplayRunner {
                 paceRankJsons,
                 directionalPressureJsons,
                 strikeFlowJsons,
+                sellerActivityJsons,
                 deltaFlowJsons,
                 strikeIntelJsons,
                 strikeInvasionJsons,
@@ -6871,6 +6903,8 @@ public class FeedGatewayService implements ReplayRunner {
         );
     }
 
+    // Backward-compatible test/reflection seam for the established batch contract. New callers use the
+    // overload below with sellerActivityJsons; old callers receive an empty additive array.
     private String uiBatchEnvelopeJson(
             List<String> snapshotJsons,
             List<String> paceJsons,
@@ -6906,6 +6940,51 @@ public class FeedGatewayService implements ReplayRunner {
             // next to indexPrices below regardless.
             List<String> spxPriceJsons
     ) {
+        return uiBatchEnvelopeJson(
+                snapshotJsons, paceJsons, paceRankJsons, directionalPressureJsons, strikeFlowJsons,
+                List.of(), deltaFlowJsons, strikeIntelJsons, strikeInvasionJsons, liquidityHeatmapJsons,
+                missionPaceJsons, missionControlJsons, spreadSkewJsons, indexPriceJsons,
+                volumeSandwichJsons, missionSandwichJsons, gexByStrikeJsons, strikeSrJsons,
+                gexMagnetJsons, gexStrikeLifecycleJsons, maxPainJsons, optionPriceBehaviorJsons,
+                opbV2ByOptionJsons, opbV2SessionJsons, hpsfLatestSignalJsons, hpsfMarketFlowJsons,
+                hpsfTopCandidatesJsons, hpsfAuditJsons, hpsfExitIntentJsons, esGexJsons,
+                esStrikeIntelJsons, spxPriceJsons);
+    }
+
+    private String uiBatchEnvelopeJson(
+            List<String> snapshotJsons,
+            List<String> paceJsons,
+            List<String> paceRankJsons,
+            List<String> directionalPressureJsons,
+            List<String> strikeFlowJsons,
+            List<String> sellerActivityJsons,
+            List<String> deltaFlowJsons,
+            List<String> strikeIntelJsons,
+            List<String> strikeInvasionJsons,
+            List<String> liquidityHeatmapJsons,
+            List<String> missionPaceJsons,
+            List<String> missionControlJsons,
+            List<String> spreadSkewJsons,
+            List<String> indexPriceJsons,
+            List<String> volumeSandwichJsons,
+            List<String> missionSandwichJsons,
+            List<String> gexByStrikeJsons,
+            List<String> strikeSrJsons,
+            List<String> gexMagnetJsons,
+            List<String> gexStrikeLifecycleJsons,
+            List<String> maxPainJsons,
+            List<String> optionPriceBehaviorJsons,
+            List<String> opbV2ByOptionJsons,
+            List<String> opbV2SessionJsons,
+            List<String> hpsfLatestSignalJsons,
+            List<String> hpsfMarketFlowJsons,
+            List<String> hpsfTopCandidatesJsons,
+            List<String> hpsfAuditJsons,
+            List<String> hpsfExitIntentJsons,
+            List<String> esGexJsons,
+            List<String> esStrikeIntelJsons,
+            List<String> spxPriceJsons
+    ) {
         ActiveSelection selection = activeSelection.get();
         return "{"
                 + "\"type\":\"ui-batch\","
@@ -6921,6 +7000,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"paceRanks\":" + jsonArray(paceRankJsons) + ","
                 + "\"directionalPressures\":" + jsonArray(directionalPressureJsons) + ","
                 + "\"strikeFlows\":" + jsonArray(strikeFlowJsons) + ","
+                + "\"sellerActivities\":" + jsonArray(sellerActivityJsons) + ","
                 + "\"deltaFlows\":" + jsonArray(deltaFlowJsons) + ","
                 + "\"strikeIntels\":" + jsonArray(strikeIntelJsons) + ","
                 + "\"strikeInvasions\":" + jsonArray(strikeInvasionJsons) + ","
