@@ -39,12 +39,13 @@ public final class SellerActivityAggregator {
     static final int MAX_STRIKES = 1024;
     static final int MAX_POINTS_PER_STRIKE = 1500;
     /**
-     * Worst-case PROCESSING ceilings (not just output): a malformed/oversized snapshot cannot force
-     * unbounded parsing/sorting work — at most {@link #MAX_STRIKE_NODES} strike nodes are examined and at
-     * most {@link #MAX_RAW_POINTS_PER_STRIKE} raw points per strike are read. Far above real data.
+     * Parse-cost ceiling enforced BEFORE JSON materialization: reject a snapshot larger than this so a
+     * malformed/oversized cache entry cannot force unbounded parse time/heap on this synchronous,
+     * rate-limited endpoint. Far above a real strike-flow snapshot (a few MB); an over-cap snapshot
+     * yields an empty envelope. Bounding total bytes bounds total strikes and points, so no separate
+     * per-strike raw ceiling is needed — and capPoints then keeps the MOST RECENT output per strike.
      */
-    static final int MAX_STRIKE_NODES = 8192;
-    static final int MAX_RAW_POINTS_PER_STRIKE = 8192;
+    static final int MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
 
     private final ObjectMapper mapper;
 
@@ -71,11 +72,7 @@ public final class SellerActivityAggregator {
         JsonNode root = readTree(snapshotJson);
         if (root != null) {
             asOfMs = root.path("timestampMs").asLong(0L);
-            int examinedNodes = 0;
             for (JsonNode strikeNode : root.path("strikes")) {
-                if (++examinedNodes > MAX_STRIKE_NODES) {
-                    break; // worst-case processing ceiling — real chains never approach this
-                }
                 double strike = strikeNode.path("strike").asDouble(Double.NaN);
                 if (!Double.isFinite(strike)) {
                     continue;
@@ -124,11 +121,7 @@ public final class SellerActivityAggregator {
             return result;
         }
         List<JsonNode> valid = new ArrayList<>();
-        int seen = 0;
         for (JsonNode p : activity.get("points")) {
-            if (++seen > MAX_RAW_POINTS_PER_STRIKE) {
-                break; // worst-case processing ceiling on raw input (upstream caps at 1440/strike)
-            }
             long tsMs = p.path("timestampMs").asLong(Long.MIN_VALUE);
             if (tsMs != Long.MIN_VALUE && Math.max(0L, p.path("sellTradeCount").asLong(0L)) > 0L) {
                 valid.add(p);
@@ -211,8 +204,8 @@ public final class SellerActivityAggregator {
     }
 
     private JsonNode readTree(String json) {
-        if (json == null || json.isBlank()) {
-            return null;
+        if (json == null || json.isBlank() || json.length() > MAX_SNAPSHOT_BYTES) {
+            return null; // bound parse cost BEFORE materialization; over-cap -> empty envelope
         }
         try {
             return mapper.readTree(json);

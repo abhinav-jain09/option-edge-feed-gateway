@@ -69,6 +69,15 @@ class SellerActivityControllerTest {
     }
 
     @Test
+    void rateLimitsPerPrincipalAfterTheBudgetIsExhausted() {
+        authOk(); // principal "user"; snapshot is unstubbed -> null -> 200 empty envelopes
+        for (int i = 0; i < 120; i++) {
+            assertEquals(200, status("SPX", "2026-07-24", null, null), "within budget");
+        }
+        assertEquals(429, status("SPX", "2026-07-24", null, null), "over the per-minute budget -> 429");
+    }
+
+    @Test
     void authenticatedRequestNormalizesSymbolAndAggregatesCachedSnapshot() {
         authOk();
         String snapshot = "{\"symbol\":\"SPX\",\"expiry\":\"20260724\",\"timestampMs\":1780000500000,"

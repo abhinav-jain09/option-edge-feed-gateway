@@ -15,7 +15,10 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayDeque;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
@@ -36,11 +39,14 @@ public class SellerActivityController {
     private static final Pattern ISO_DATE = Pattern.compile("\\d{4}-\\d{2}-\\d{2}");
     private static final int DEFAULT_SAMPLE = 30;
     private static final String DEFAULT_MODE = "combined";
+    /** Per-principal request budget — bounds amplification on this synchronous, per-request-parsing endpoint. */
+    private static final int RATE_LIMIT_PER_MIN = 120;
 
     private final FeedGatewayService service;
     private final LiquidityHistoryAuth auth;
     private final SellerActivityAggregator aggregator;
     private final ObjectMapper mapper;
+    private final RateLimiter rateLimiter = new RateLimiter(RATE_LIMIT_PER_MIN, 60_000L);
 
     public SellerActivityController(FeedGatewayService service, LiquidityHistoryAuth auth, ObjectMapper mapper) {
         this.service = service;
@@ -59,6 +65,11 @@ public class SellerActivityController {
         LiquidityHistoryAuth.Result authResult = auth.authenticate(authorization);
         if (authResult.status() != 200) {
             return ResponseEntity.status(authResult.status()).build();
+        }
+        long retryAfterSeconds = rateLimiter.tryAcquire(authResult.principal(), System.currentTimeMillis());
+        if (retryAfterSeconds > 0) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                    .header(HttpHeaders.RETRY_AFTER, Long.toString(retryAfterSeconds)).build();
         }
         if (symbol == null || symbol.isBlank()) {
             return badRequest("symbol is required");
@@ -118,5 +129,35 @@ public class SellerActivityController {
         ObjectNode body = mapper.createObjectNode();
         body.put("error", message);
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+    }
+
+    /** Fixed-window per-principal limiter (mirrors the /api/liquidity-history limiter). */
+    static final class RateLimiter {
+        private final int limit;
+        private final long windowMs;
+        private final Map<String, ArrayDeque<Long>> byPrincipal = new HashMap<>();
+
+        RateLimiter(int limit, long windowMs) {
+            this.limit = limit;
+            this.windowMs = windowMs;
+        }
+
+        /** 0 when admitted; else seconds until the oldest in-window request expires (Retry-After). */
+        synchronized long tryAcquire(String principal, long nowMs) {
+            ArrayDeque<Long> window = byPrincipal.computeIfAbsent(principal, p -> new ArrayDeque<>());
+            while (!window.isEmpty() && nowMs - window.peekFirst() >= windowMs) {
+                window.pollFirst();
+            }
+            if (window.size() >= limit) {
+                long oldest = window.peekFirst();
+                return Math.max(1L, (oldest + windowMs - nowMs + 999L) / 1_000L);
+            }
+            window.addLast(nowMs);
+            if (byPrincipal.size() > 10_000) {
+                byPrincipal.entrySet().removeIf(e -> e.getValue().isEmpty()
+                        || nowMs - e.getValue().peekLast() >= windowMs);
+            }
+            return 0L;
+        }
     }
 }

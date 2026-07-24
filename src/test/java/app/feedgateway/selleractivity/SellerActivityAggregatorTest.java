@@ -179,6 +179,17 @@ class SellerActivityAggregatorTest {
     }
 
     @Test
+    void rejectsAnOversizedSnapshotBeforeParsingWithAnEmptyEnvelope() {
+        // A snapshot larger than MAX_SNAPSHOT_BYTES must be rejected BEFORE readTree (bounded parse cost),
+        // returning a valid empty envelope. (Compact strings keep this ~32MB, not 64MB.)
+        String oversized = "a".repeat(SellerActivityAggregator.MAX_SNAPSHOT_BYTES + 1);
+        ObjectNode env = aggregator.aggregate(oversized, "SPX", "2026-07-24", 30, "combined");
+        assertEquals(0, env.path("series").size());
+        assertTrue(env.path("leaderStrike").isNull());
+        assertEquals(0L, env.path("asOfMs").asLong());
+    }
+
+    @Test
     void enforcesMaxStrikesCeiling() {
         ObjectNode snap = mapper.createObjectNode();
         snap.put("timestampMs", 1L);
