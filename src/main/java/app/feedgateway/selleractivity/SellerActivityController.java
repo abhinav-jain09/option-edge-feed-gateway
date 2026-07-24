@@ -33,7 +33,7 @@ import java.util.regex.Pattern;
  * <p>Bearer auth reuses {@link LiquidityHistoryAuth} (same token validation as the WS handshake and the
  * {@code /api/liquidity-history} endpoint): invalid/expired → 401, valid-but-unentitled → 403. The
  * aggregation is {@link SellerActivityAggregator}; the data source is the gateway's in-memory strike-flow
- * cache ({@link FeedGatewayService#cachedStrikeFlowSnapshot}) — a bounded, cheap read (no Kafka), so no
+ * cache ({@link FeedGatewayService#cachedSellerActivitySnapshot}) — a bounded, cheap read (no Kafka), so no
  * rate limiter is needed the way {@code /api/liquidity-history} needs one for its Kafka fold.
  */
 @RestController
@@ -113,7 +113,7 @@ public class SellerActivityController {
         }
         boolean streamOwnsPermit = false;
         try {
-            String snapshot = service.cachedStrikeFlowSnapshot(normalizedSymbol, canonicalExpiry);
+            String snapshot = service.cachedSellerActivitySnapshot(normalizedSymbol, canonicalExpiry);
             ObjectNode envelope = aggregator.aggregate(snapshot, normalizedSymbol, canonicalExpiry, sample, mode);
             // Stream the (bounded, MAX_TOTAL_POINTS-capped) envelope straight to the socket and hold the
             // aggregation slot until the WRITE completes — so concurrent parse+serialize+write, including
