@@ -1004,6 +1004,56 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void closeDirectionCacheKeysPhaseSplitAndMalformedDrop() throws Exception {
+        // Design CLOSE-DIRECTION-GATE1 CD-R30: V|/I| phase split (source prepended by
+        // updateCache), malformed payloads (bad JSON, unknown phase, missing sessionDate or
+        // direction) return null and are never cached or broadcast.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String interim = "{\"phase\":\"MONITORING\",\"sessionDate\":\"2026-07-24\","
+                + "\"direction\":\"UP\",\"asOfMs\":" + now + "}";
+        assertEquals("DATABENTO|I|2026-07-24",
+                updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                        recordAt(settings.closeDirectionSignalTopic(), 0, 1L, "SPX|20260724",
+                                interim, now), interim));
+        String verdict = "{\"phase\":\"VERDICT\",\"sessionDate\":\"2026-07-24\","
+                + "\"direction\":\"DOWN\",\"verdictId\":\"CDV1:2026-07-24:SPX:20260724\","
+                + "\"asOfMs\":" + now + "}";
+        assertEquals("DATABENTO|V|2026-07-24",
+                updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                        recordAt(settings.closeDirectionSignalTopic(), 0, 2L, "SPX|20260724",
+                                verdict, now), verdict));
+        // Verdict-over-interim precedence: an interim AFTER the verdict is dead (null).
+        String lateInterim = "{\"phase\":\"MONITORING\",\"sessionDate\":\"2026-07-24\","
+                + "\"direction\":\"UP\",\"asOfMs\":" + (now + 1000) + "}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                recordAt(settings.closeDirectionSignalTopic(), 0, 3L, "SPX|20260724",
+                        lateInterim, now + 1000), lateInterim));
+        // Malformed: unknown phase / missing fields / non-JSON.
+        assertNull(updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                recordAt(settings.closeDirectionSignalTopic(), 0, 4L, "SPX|20260724",
+                        "{\"phase\":\"WEIRD\",\"sessionDate\":\"2026-07-24\",\"direction\":\"UP\"}",
+                        now), "{\"phase\":\"WEIRD\",\"sessionDate\":\"2026-07-24\",\"direction\":\"UP\"}"));
+        assertNull(updateCache(service, topicBinding("DATABENTO", "close-direction"),
+                recordAt(settings.closeDirectionSignalTopic(), 0, 5L, "SPX|20260724",
+                        "not json", now), "not json"));
+    }
+
+    @Test
+    void closeDirectionUsesLongTtlWindow() throws Exception {
+        // The frozen 15:49 verdict must still replay to a client connecting at 15:59; the long
+        // 12h window also drives the restart seek-back. (Interim REPLAY freshness is separately
+        // bounded by closeDirectionInterimFreshMs in replayCloseDirectionCached.)
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long ttl = new GatewaySettings().closeDirectionTtlMs();
+        assertTrue(ttl >= 12L * 3_600_000L, "close-direction TTL must cover the session");
+        assertFalse(isExpired(service, "close-direction", now - 2L * 3_600_000L, now));
+        assertTrue(isExpired(service, "close-direction", now - ttl - 1, now));
+    }
+
+    @Test
     void esOpenDirectionUsesLongSessionTtlNotGenericCacheWindow() throws Exception {
         // The whole point of the panel: a forecast published at 09:15 must still be served to a client
         // that connects at 11:00 (and at 15:59). A 2h-old (even 7h-old) forecast/outcome must be FRESH
