@@ -129,6 +129,7 @@ public class FeedGatewayService implements ReplayRunner {
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
             "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "gex-oi-status",
             "strike-sr",
             "gex-magnet",
             "es-gex",
@@ -203,6 +204,9 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> spxPrices = new ConcurrentHashMap<>();
     private final Map<String, String> currentStates = new ConcurrentHashMap<>();
     private final Map<String, String> gexByStrike = new ConcurrentHashMap<>();
+    // Per-strike OI-arrival status (OI_MISSING/OI_OK) from the gex watchdog, keyed symbol|expiry|strike
+    // (last-value-wins like gex-by-strike): the UI's explicit badge when fail-closed GEX publishes nothing.
+    private final Map<String, String> gexOiStatus = new ConcurrentHashMap<>();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     // ES-on-SPX aligned whole-book per symbol|expiry (JSON, roll-forward: latest emitEventTimeMs wins).
@@ -292,6 +296,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingVolumeSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingMissionSandwiches = new LinkedHashMap<>();
     private final Map<String, String> pendingGexByStrike = new LinkedHashMap<>();
+    private final Map<String, String> pendingGexOiStatus = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeSr = new LinkedHashMap<>();
     private final Map<String, String> pendingGexMagnet = new LinkedHashMap<>();
     private final Map<String, String> pendingEsGex = new LinkedHashMap<>();
@@ -581,6 +586,11 @@ public class FeedGatewayService implements ReplayRunner {
         // BOTH have caught up, so gate it on both flags (avoids a first-send that omits one source's gex).
         if (avroCaughtUp.get() && stateCaughtUp.get()) {
             sendCachedState(session, List.of("gex-by-strike"));
+        }
+        // gex-oi-status rides the JSON state consumer only; replay once it has caught up so a reconnect
+        // during an OI_MISSING morning restores the badge (last-value-wins per strike).
+        if (stateCaughtUp.get()) {
+            sendCachedState(session, List.of("gex-oi-status"));
         }
         if (hpsfCaughtUp.get()) {
             sendCachedState(session, List.of(
@@ -1279,6 +1289,8 @@ public class FeedGatewayService implements ReplayRunner {
         // the UW gex/gex-history pairing above; the history record is a superset and wins via the
         // history-preservation gate in cacheRecord()).
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
+        // Per-strike OI-arrival status (JSON, gex watchdog): OI_MISSING/OI_OK badge rows for the UI.
+        topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
         if (settings.esGexEnabled()) {
@@ -1386,6 +1398,8 @@ public class FeedGatewayService implements ReplayRunner {
         // DATABENTO gex HISTORY topic IS JSON, so it lives here (keep the cache + live JSON consumer
         // topic sets symmetric, exactly as the UW gex/gex-history pair and the databento-gex Avro pair).
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
+        // Keep cache + live symmetric: per-strike OI-arrival status (JSON, gex watchdog).
+        topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
         if (settings.esGexEnabled()) {
@@ -1932,10 +1946,16 @@ public class FeedGatewayService implements ReplayRunner {
                         // paint a stale ES overlay onto a strike — so drop it.
                         boolean esStrikeIntelDropped = "es-strike-intel".equals(binding.event())
                                 && cacheKey == null;
+                        // gex-oi-status fail-closed (Codex round-5): a null cacheKey means updateCache
+                        // REJECTED the record (status not exactly OI_MISSING/OI_OK). Live-routing what the
+                        // cache refused would make the live and replay paths disagree — drop it.
+                        boolean gexOiStatusDropped = "gex-oi-status".equals(binding.event())
+                                && cacheKey == null;
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
                                 && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
                                 && !strikeIntelDropped && !optionTruthStale && !strikeInvasionStale && !spreadSkewStale
-                                && !esOpenDirectionDropped && !strikeLifecycleDropped && !esStrikeIntelDropped) {
+                                && !esOpenDirectionDropped && !strikeLifecycleDropped && !esStrikeIntelDropped
+                                && !gexOiStatusDropped) {
                             routeOrBroadcast(binding.source(), binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -2506,7 +2526,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
     }
 
     /**
@@ -3065,6 +3085,9 @@ public class FeedGatewayService implements ReplayRunner {
             key = spreadSkewCacheKey(json, key);
         } else if ("gex-by-strike".equals(event)) {
             key = gexCacheKey(json, key);
+        } else if ("gex-oi-status".equals(event)) {
+            // Same symbol|expiry|strike identity as gex rows -> same per-strike key derivation.
+            key = gexCacheKey(json, key);
         } else if ("es-gex".equals(event)) {
             key = esGexCacheKey(json, key);
         } else if ("gex-strike-lifecycle".equals(event)) {
@@ -3305,6 +3328,19 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gexByStrike.put(key, json);
+                return key;
+            }
+            case "gex-oi-status" -> {
+                // Fail-closed semantics guard (Codex round-4 P1): only the two known status values may
+                // enter the replay cache. A malformed/schema-drifted record must not displace a valid
+                // cached OI_MISSING warning — a reconnecting client would replay only the malformed value
+                // and silently lose the badge.
+                if (!isKnownOiStatus(json)) {
+                    return null;
+                }
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gexOiStatus.put(key, json);
                 return key;
             }
             case "liquidity-heatmap" -> {
@@ -3781,6 +3817,20 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "gex-oi-status" -> gexOiStatus.entrySet().stream()
+                        // Slow watchdog signal (a few records per day at most): replay like gex-by-strike —
+                        // relaxed time/offset barriers, source/symbol/expiry isolation still enforced.
+                        .filter(entry -> isCacheFresh("gex-oi-status:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier(
+                                "gex-oi-status:" + entry.getKey(),
+                                selection,
+                                enforceCachedReplayMaxStale("gex-oi-status", selection == null ? "" : selection.source()),
+                                enforceCachedReplayOffsetBarrier("gex-oi-status", selection == null ? "" : selection.source())
+                        ))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("gex-oi-status", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "strike-sr" -> strikeSr.entrySet().stream()
                         // DATABENTO-only Avro per-bucket S/R map. These are compacted current-state levels:
                         // unchanged active levels are not re-emitted every maxStaleMs, and retractions arrive as
@@ -4027,6 +4077,11 @@ public class FeedGatewayService implements ReplayRunner {
             // (default 12h) so a valid-but-slow GEX is not evicted and still replays on connect.
             return CachePolicy.expiring(settings.gexByStrikeTtlMs());
         }
+        if ("gex-oi-status".equals(event)) {
+            // OI-arrival badge state: at most a handful of records per day, must survive reconnects all
+            // session — same long last-value-wins window as gex-by-strike/max-pain (default 12h).
+            return CachePolicy.expiring(settings.gexOiStatusTtlMs());
+        }
         if ("es-gex".equals(event)) {
             // ES-on-SPX aligned book: the align service re-emits ~5s, but a quiet chain may pause; a long
             // last-value-wins window (default 12h, like gex-by-strike) so a mid-session reconnect gets the
@@ -4148,14 +4203,16 @@ public class FeedGatewayService implements ReplayRunner {
         // older than the client's selectedAtMs — enforcing the max-stale/selected-time barrier here would
         // re-drop them even after the TTL seam admits them. Selection isolation is still enforced by
         // matchesCachedSelection + the DATABENTO source filter; this only relaxes the time-freshness barrier.
-        return !"snapshot".equals(event) && !"max-pain".equals(event) && !"gex-by-strike".equals(event);
+        return !"snapshot".equals(event) && !"max-pain".equals(event) && !"gex-by-strike".equals(event)
+                && !"gex-oi-status".equals(event);
     }
 
     static boolean enforceCachedReplayOffsetBarrier(String event, String source) {
         // Same rationale as enforceCachedReplayMaxStale: a slow max-pain/GEX latest record can sit below the
         // session's per-partition offset barrier (set when other fast topics advanced past selection), so
         // the offset barrier would wrongly filter the current max-pain/GEX on replay. Exempt like snapshot.
-        return !"snapshot".equals(event) && !"max-pain".equals(event) && !"gex-by-strike".equals(event);
+        return !"snapshot".equals(event) && !"max-pain".equals(event) && !"gex-by-strike".equals(event)
+                && !"gex-oi-status".equals(event);
     }
 
     private boolean passesOffsetBarrier(TopicPartition partition, long offset) {
@@ -4463,6 +4520,8 @@ public class FeedGatewayService implements ReplayRunner {
             currentStates.remove(versionKey);
         } else if (versionKey.startsWith("gex-by-strike:")) {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
+        } else if (versionKey.startsWith("gex-oi-status:")) {
+            gexOiStatus.remove(versionKey.substring("gex-oi-status:".length()));
         } else if (versionKey.startsWith("strike-sr:")) {
             strikeSr.remove(versionKey.substring("strike-sr:".length()));
         } else if (versionKey.startsWith("gex-strike-lifecycle:")) {
@@ -4765,6 +4824,16 @@ public class FeedGatewayService implements ReplayRunner {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
         }
         return fallback;
+    }
+
+    /** True when a gex-oi-status payload carries exactly OI_MISSING or OI_OK (package-visible for tests). */
+    boolean isKnownOiStatus(String json) {
+        try {
+            String status = text(mapper.readTree(json), "status").toUpperCase();
+            return "OI_MISSING".equals(status) || "OI_OK".equals(status);
+        } catch (JsonProcessingException ignored) {
+            return false;
+        }
     }
 
     private String gexCacheKey(String json, String fallback) {
@@ -5526,6 +5595,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "mission-control", missionControls);
         replayCacheMap(session, "spread-skew", spreadSkews);
         replayCacheMap(session, "gex-by-strike", gexByStrike);
+        replayCacheMap(session, "gex-oi-status", gexOiStatus);
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "gex-magnet", gexMagnet);
         replayCacheMap(session, "es-gex", esGex);
@@ -6659,6 +6729,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "volume-sandwich" -> pendingVolumeSandwiches;
             case "mission-sandwich" -> pendingMissionSandwiches;
             case "gex-by-strike" -> pendingGexByStrike;
+            case "gex-oi-status" -> pendingGexOiStatus;
             case "strike-sr" -> pendingStrikeSr;
             case "gex-magnet" -> pendingGexMagnet;
             case "es-gex" -> pendingEsGex;
@@ -6715,6 +6786,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingVolumeSandwiches.values()),
                         new ArrayList<>(pendingMissionSandwiches.values()),
                         new ArrayList<>(pendingGexByStrike.values()),
+                        new ArrayList<>(pendingGexOiStatus.values()),
                         new ArrayList<>(pendingStrikeSr.values()),
                         new ArrayList<>(pendingGexMagnet.values()),
                         new ArrayList<>(pendingGexStrikeLifecycle.values()),
@@ -6772,6 +6844,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingVolumeSandwiches.size()
                 + pendingMissionSandwiches.size()
                 + pendingGexByStrike.size()
+                + pendingGexOiStatus.size()
                 + pendingStrikeSr.size()
                 + pendingGexMagnet.size()
                 + pendingEsGex.size()
@@ -6807,6 +6880,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingVolumeSandwiches.clear();
         pendingMissionSandwiches.clear();
         pendingGexByStrike.clear();
+        pendingGexOiStatus.clear();
         pendingStrikeSr.clear();
         pendingGexMagnet.clear();
         pendingEsGex.clear();
@@ -6847,6 +6921,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> volumeSandwichJsons = new ArrayList<>();
         List<String> missionSandwichJsons = new ArrayList<>();
         List<String> gexByStrikeJsons = new ArrayList<>();
+        List<String> gexOiStatusJsons = new ArrayList<>();
         List<String> strikeSrJsons = new ArrayList<>();
         List<String> gexMagnetJsons = new ArrayList<>();
         List<String> esGexJsons = new ArrayList<>();
@@ -6883,6 +6958,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "volume-sandwich" -> volumeSandwichJsons.add(cachedEvent.json());
                 case "mission-sandwich" -> missionSandwichJsons.add(cachedEvent.json());
                 case "gex-by-strike" -> gexByStrikeJsons.add(cachedEvent.json());
+                case "gex-oi-status" -> gexOiStatusJsons.add(cachedEvent.json());
                 case "strike-sr" -> strikeSrJsons.add(cachedEvent.json());
                 case "gex-magnet" -> gexMagnetJsons.add(cachedEvent.json());
                 case "es-gex" -> esGexJsons.add(cachedEvent.json());
@@ -6920,6 +6996,7 @@ public class FeedGatewayService implements ReplayRunner {
                 volumeSandwichJsons,
                 missionSandwichJsons,
                 gexByStrikeJsons,
+                gexOiStatusJsons,
                 strikeSrJsons,
                 gexMagnetJsons,
                 gexStrikeLifecycleJsons,
@@ -6957,6 +7034,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> volumeSandwichJsons,
             List<String> missionSandwichJsons,
             List<String> gexByStrikeJsons,
+            List<String> gexOiStatusJsons,
             List<String> strikeSrJsons,
             List<String> gexMagnetJsons,
             List<String> gexStrikeLifecycleJsons,
@@ -6979,7 +7057,7 @@ public class FeedGatewayService implements ReplayRunner {
                 snapshotJsons, paceJsons, paceRankJsons, directionalPressureJsons, strikeFlowJsons,
                 List.of(), deltaFlowJsons, strikeIntelJsons, strikeInvasionJsons, liquidityHeatmapJsons,
                 missionPaceJsons, missionControlJsons, spreadSkewJsons, indexPriceJsons,
-                volumeSandwichJsons, missionSandwichJsons, gexByStrikeJsons, strikeSrJsons,
+                volumeSandwichJsons, missionSandwichJsons, gexByStrikeJsons, gexOiStatusJsons, strikeSrJsons,
                 gexMagnetJsons, gexStrikeLifecycleJsons, maxPainJsons, optionPriceBehaviorJsons,
                 opbByOptionJsons, opbSessionJsons, hpsfLatestSignalJsons, hpsfMarketFlowJsons,
                 hpsfTopCandidatesJsons, hpsfAuditJsons, hpsfExitIntentJsons, esGexJsons,
@@ -7004,6 +7082,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> volumeSandwichJsons,
             List<String> missionSandwichJsons,
             List<String> gexByStrikeJsons,
+            List<String> gexOiStatusJsons,
             List<String> strikeSrJsons,
             List<String> gexMagnetJsons,
             List<String> gexStrikeLifecycleJsons,
@@ -7050,6 +7129,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"volumeSandwiches\":" + jsonArray(volumeSandwichJsons) + ","
                 + "\"missionSandwiches\":" + jsonArray(missionSandwichJsons) + ","
                 + "\"gexByStrike\":" + jsonArray(gexByStrikeJsons) + ","
+                // Additive field: per-strike OI-arrival status (OI_MISSING/OI_OK badge rows). Older UIs
+                // ignore the unknown key.
+                + "\"gexOiStatus\":" + jsonArray(gexOiStatusJsons) + ","
                 + "\"strikeSr\":" + jsonArray(strikeSrJsons) + ","
                 + "\"gexMagnets\":" + jsonArray(gexMagnetJsons) + ","
                 + "\"esGex\":" + jsonArray(esGexJsons) + ","

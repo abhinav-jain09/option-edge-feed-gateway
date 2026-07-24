@@ -165,7 +165,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -3340,7 +3340,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3362,6 +3362,40 @@ class FeedGatewayServiceTest {
         assertTrue(envelope.contains("\"gexMagnets\":[" + json + "]"),
                 "batch envelope must carry the gexMagnets array; was: " + envelope);
         assertTrue(envelope.contains("\"strikeSr\":[]"));
+    }
+
+    @Test
+    void uiBatchEnvelopeCarriesGexOiStatusArrayKey() throws Exception {
+        FeedGatewayService service = service();
+        String json = "{\"messageType\":\"GEX_OI_STATUS\",\"symbol\":\"SPX\",\"expiry\":\"20260727\","
+                + "\"strike\":7500,\"status\":\"OI_MISSING\",\"attempts\":3}";
+        String envelope = uiBatchEnvelopeJsonGexOiStatus(service, List.of(json));
+        assertTrue(envelope.contains("\"gexOiStatus\":[" + json + "]"),
+                "batch envelope must carry the gexOiStatus array; was: " + envelope);
+        assertTrue(envelope.contains("\"gexByStrike\":[]"));
+    }
+
+    @Test
+    void gexOiStatusTopicBindsToGexOiStatusEventOnTheJsonConsumers() throws Exception {
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        // gex-oi-status is DATABENTO-only JSON (gex watchdog): bound on BOTH JSON state consumers (cache +
+        // live symmetric), exempt from the cached-replay staleness + offset barriers like gex-by-strike.
+        assertEquals(2, source.split(
+                "topicEvents\\.put\\(settings\\.databentoGexOiStatusTopic\\(\\), new TopicBinding\\(\"DATABENTO\", \"gex-oi-status\"\\)\\);", -1).length - 1);
+        assertFalse(FeedGatewayService.enforceCachedReplayMaxStale("gex-oi-status", "DATABENTO"));
+        assertFalse(FeedGatewayService.enforceCachedReplayOffsetBarrier("gex-oi-status", "DATABENTO"));
+    }
+
+    @Test
+    void gexOiStatusCacheAcceptsOnlyKnownStatusValues() throws Exception {
+        // A malformed/schema-drifted record must never displace a cached OI_MISSING warning (a reconnect
+        // would replay the malformed value and silently lose the badge).
+        FeedGatewayService service = service();
+        assertTrue(service.isKnownOiStatus("{\"status\":\"OI_MISSING\"}"));
+        assertTrue(service.isKnownOiStatus("{\"status\":\"oi_ok\"}"));
+        assertFalse(service.isKnownOiStatus("{\"status\":\"OI_ARRIVED\"}"));
+        assertFalse(service.isKnownOiStatus("{}"));
+        assertFalse(service.isKnownOiStatus("not-json"));
     }
 
     @Test
@@ -3475,7 +3509,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3488,10 +3522,26 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                strikeSr, List.of(), List.of(), List.of(),
+                List.of(), strikeSr, List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
+        );
+    }
+
+    private static String uiBatchEnvelopeJsonGexOiStatus(FeedGatewayService service, List<String> gexOiStatus) throws Exception {
+        Method method = uiBatchEnvelopeMethod();
+        method.setAccessible(true);
+        return (String) method.invoke(
+                service,
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                gexOiStatus, List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3504,10 +3554,10 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), gexMagnet, List.of(), List.of(),
+                List.of(), List.of(), gexMagnet, List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3523,7 +3573,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3536,10 +3586,10 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of(), maxPains,
                 List.of(), List.of(), List.of(), List.of(),
+                maxPains, List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3556,9 +3606,9 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                optionPriceBehaviors, List.of(), List.of(), List.of(),
+                List.of(), optionPriceBehaviors, List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3572,9 +3622,9 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), opbByOptions, List.of(), List.of(),
+                List.of(), List.of(), opbByOptions, List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3588,9 +3638,9 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), opbSessions, List.of(),
+                List.of(), List.of(), List.of(), opbSessions,
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3606,7 +3656,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3622,7 +3672,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3638,7 +3688,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3660,7 +3710,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), List.of()
+                List.of(), List.of(), List.of(), List.of()
         );
     }
 
@@ -3671,7 +3721,7 @@ class FeedGatewayServiceTest {
                 List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
                 List.class, List.class, List.class, List.class, List.class, List.class, List.class,
-                List.class, List.class, List.class, List.class, List.class
+                List.class, List.class, List.class, List.class, List.class, List.class
         );
     }
 
@@ -3688,7 +3738,7 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), List.of(),
-                List.of(), List.of(), spxPrices
+                List.of(), List.of(), List.of(), spxPrices
         );
     }
 }

@@ -629,6 +629,16 @@ public final class GatewaySettings {
         return value("KAFKA_DATABENTO_GEX_TOPIC", "options.databento.gex.strike");
     }
 
+    /**
+     * Per-strike GEX OI-arrival status topic (JSON, from the gex service's OI-arrival watchdog). Carries
+     * {@code status=OI_MISSING|OI_OK} per strike when TODAY's OI baseline has not arrived by the pre-open
+     * deadline (fail-closed GEX = no records on {@link #databentoGexTopic()}, so this is the UI's only
+     * explicit signal). Broadcast as event "gex-oi-status".
+     */
+    public String databentoGexOiStatusTopic() {
+        return value("KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC", "options.databento.gex.oi-status");
+    }
+
     /** Unified support/resistance map (Avro, per SPX-equivalent bucket). Broadcast as event "strike-sr". */
     public String unifiedSrTopic() {
         return value("KAFKA_UNIFIED_SR_TOPIC", "options.spx.strike-sr.current");
@@ -857,6 +867,12 @@ public final class GatewaySettings {
      */
     public long gexByStrikeTtlMs() {
         return longValue("GATEWAY_GEX_BY_STRIKE_TTL_MS", maxPainTtlMs(), 0L);
+    }
+
+    /** Per-strike GEX OI-status TTL — like gex-by-strike, a long last-value-wins window (default 12h): the
+     *  badge is a slow, at-most-a-few-times-a-day signal and must survive reconnects all session. */
+    public long gexOiStatusTtlMs() {
+        return longValue("GATEWAY_GEX_OI_STATUS_TTL_MS", maxPainTtlMs(), 0L);
     }
 
     /** Per-strike gamma-lifecycle TTL — like gex-by-strike, a long last-value-wins window (default 12h). */

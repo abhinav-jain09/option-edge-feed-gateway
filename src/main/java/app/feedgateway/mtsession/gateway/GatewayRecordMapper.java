@@ -97,6 +97,7 @@ public final class GatewayRecordMapper {
             case "volume-sandwich" -> EventType.VOLUME_SANDWICH;
             case "mission-sandwich" -> EventType.MISSION_SANDWICH;
             case "gex-by-strike" -> EventType.GEX_BY_STRIKE;
+            case "gex-oi-status" -> EventType.GEX_OI_STATUS;
             case "strike-sr" -> EventType.STRIKE_SR;
             case "max-pain" -> EventType.MAX_PAIN;
             case "es-gex" -> EventType.ES_GEX;

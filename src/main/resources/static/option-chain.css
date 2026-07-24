@@ -1445,6 +1445,19 @@ td.sandwich-role-outer {
     box-shadow: inset 0 0 0 1px rgba(255, 204, 102, 0.5);
 }
 
+/* Fail-closed OI marker: today's open-interest baseline has not arrived, GEX deliberately absent. */
+.strike-cell.gamma-oi-missing {
+    background:
+        linear-gradient(135deg, rgba(120, 52, 52, 0.55), rgba(25, 26, 37, 0.96)),
+        #191a25;
+    box-shadow: inset 0 0 0 1px rgba(255, 92, 92, 0.65);
+}
+
+.strike-cell.gamma-oi-missing .uw-gex-value {
+    color: #ff8a8a;
+    font-weight: 600;
+}
+
 .gamma-stale-marker {
     position: absolute;
     top: 4px;

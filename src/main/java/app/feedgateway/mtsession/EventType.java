@@ -39,6 +39,9 @@ public enum EventType {
     VOLUME_SANDWICH(Scope.CONTRACT),
     MISSION_SANDWICH(Scope.CONTRACT),
     GEX_BY_STRIKE(Scope.CONTRACT),
+    // Per-strike OI-arrival status from the gex service's watchdog (OI_MISSING/OI_OK). Routes exactly like
+    // GEX_BY_STRIKE (CONTRACT scope, per-strike), so the option-chain UI can badge each strike.
+    GEX_OI_STATUS(Scope.CONTRACT),
     STRIKE_SR(Scope.CONTRACT),
     // Max pain is a per-(symbol,expiry) aggregate (one value covers the whole chain), so it routes
     // CONTRACT-scoped by source|symbol|expiry with NO strike filter — every session on that chain receives it.
