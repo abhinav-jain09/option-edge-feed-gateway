@@ -205,11 +205,18 @@
       const status = { source: payload.source || payload.marketDataSource, symbol: payload.symbol,
         expiry: payload.expiry, strike, uwGexOiMissing: missing };
       const key = contractKey(payload);
+      const previous = gexOiStatusRef.current.get(key);
       gexOiStatusRef.current.set(key, status);
+      // Report "changed" whenever the stored STATUS state changed — even with no strike row yet
+      // (pre-open the chain can be empty): the page-level OI-missing banner reads this map directly,
+      // so the render must be bumped for it to appear/clear before rows exist.
+      let changed = !previous || previous.uwGexOiMissing !== missing;
       const row = rowsRef.current.get(key);
-      if (!row || row.uwGexOiMissing === missing) return false;
-      rowsRef.current.set(key, { ...row, uwGexOiMissing: missing });
-      return true;
+      if (row && row.uwGexOiMissing !== missing) {
+        rowsRef.current.set(key, { ...row, uwGexOiMissing: missing });
+        changed = true;
+      }
+      return changed;
     }, []);
 
     const mergeStrikeFlowPayload = useCallback(payload => {
@@ -761,6 +768,13 @@
 	        }, gexStatusLabel),
 	        h('span', { id: 'rowCount' }, `${data.length.toLocaleString()} records`)
 				                      ),
+	                      // Page-level fail-closed alarm: visible the moment the OI-arrival watchdog publishes
+	                      // OI_MISSING (~08:20 ET) — deliberately independent of strike rows, which may not
+	                      // populate until the 09:30 open. Clears on OI_OK.
+	                      Array.from(gexOiStatusRef.current.values()).some(s => s.uwGexOiMissing)
+	                        ? h('div', { id: 'oiMissingBanner', className: 'oi-missing-banner', role: 'alert' },
+	                            "⚠ TODAY'S OPEN-INTEREST BASELINE HAS NOT ARRIVED — GEX IS FAIL-CLOSED (NO VALUES) UNTIL IT DOES")
+	                        : null,
 				                      h(Controls, { form, updateForm, reconnect, connectPending }),
 				                      notice ? h('div', { className: `feed-notice ${feedUnavailable ? 'unavailable' : ''}`.trim() }, notice) : null,
                               h(HpsfDashboard, { hpsfState, pulse: hpsfPulse, spotFallback: spot, config, status }),
