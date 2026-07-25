@@ -455,6 +455,46 @@ public final class GatewaySettings {
         return firstNonBlank(value("pinflow.postgres.jdbc-url", ""), value("POSTGRES_JDBC_URL", ""));
     }
 
+    // ── System Status page (design §3.5/§3.6): read-only oe_watch ledger + lag registry ──
+    /** JDBC URL for the read-only oe_watch ledger; blank → the page reports LEDGER UNAVAILABLE. */
+    public String systemStatusJdbcUrl() {
+        return firstNonBlank(value("systemstatus.postgres.jdbc-url", ""),
+                             value("OE_WATCH_JDBC_URL", ""));
+    }
+
+    public String systemStatusDbUser() {
+        return firstNonBlank(value("systemstatus.postgres.user", ""),
+                             value("OE_WATCH_DB_USER", "oe_watch_reader"));
+    }
+
+    public String systemStatusDbPassword() {
+        return firstNonBlank(value("systemstatus.postgres.password", ""),
+                             value("OE_WATCH_DB_PASSWORD", ""));
+    }
+
+    /** Which env's ledger rows this gateway serves (rows carry env; a gateway shows only its own). */
+    public String systemStatusEnv() {
+        return firstNonBlank(value("systemstatus.env", ""), value("OE_ENV", "dev"));
+    }
+
+    /** {@code service:group:topic1,topic2;…} allowlist — lag is only computed for registered services. */
+    public String systemStatusLagRegistry() {
+        return firstNonBlank(value("systemstatus.lag-registry", ""),
+                             value("OE_SYSTEM_STATUS_LAG_REGISTRY", ""));
+    }
+
+    public int systemStatusCacheMs() {
+        return intValue("OE_SYSTEM_STATUS_CACHE_MS", 30_000, 1_000);
+    }
+
+    public int systemStatusQueryTimeoutSeconds() {
+        return intValue("OE_SYSTEM_STATUS_QUERY_TIMEOUT_S", 3, 1);
+    }
+
+    public int systemStatusAdminTimeoutMs() {
+        return intValue("OE_SYSTEM_STATUS_ADMIN_TIMEOUT_MS", 5_000, 1_000);
+    }
+
     public String pinFlowDbUser() {
         return firstNonBlank(value("pinflow.postgres.user", ""), value("POSTGRES_USER", ""));
     }
