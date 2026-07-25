@@ -649,6 +649,14 @@
                             const gexStatusClass = gexStatus.className;
                             const gexStatusLabel = gexStatus.label;
                             const gexOptional = gexStatus.state === 'optional';
+	                    // OI-baseline alarm state for the page-level banner. Row-independent (pre-open the
+	                    // chain can be empty) and self-healing: any live GEX value proves the baseline
+	                    // arrived (GEX is fail-closed on OI), so it overrides a stale/uncleared OI_MISSING.
+	                    const oiBaselineMissing = useMemo(() => {
+	                      if (!Array.from(gexOiStatusRef.current.values()).some(s => s.uwGexOiMissing)) return false;
+	                      return !data.some(row => Number.isFinite(Number(row?.uwNetGex))
+	                        && Number(row.uwNetGex) !== 0);
+	                    }, [data, rowsVersion]);
 		                    const subtitle = config.symbol
         ? `${config.symbol} ${formatExpiry(config.expiry)} | ${String(config.marketDataSource || '').toUpperCase()} market data | ${String(config.provider || '').toUpperCase()} orders`
         : 'Loading config...';
@@ -771,7 +779,12 @@
 	                      // Page-level fail-closed alarm: visible the moment the OI-arrival watchdog publishes
 	                      // OI_MISSING (~08:20 ET) — deliberately independent of strike rows, which may not
 	                      // populate until the 09:30 open. Clears on OI_OK.
-	                      Array.from(gexOiStatusRef.current.values()).some(s => s.uwGexOiMissing)
+	                      // Two independent clear paths, because a stuck red banner is its own outage:
+	                      //  1. an OI_OK status (the producer publishes it once the baseline lands), and
+	                      //  2. live GEX values existing at all — GEX is fail-closed on OI by construction,
+	                      //     so a single real netGex PROVES the baseline arrived even if an OI_OK was
+	                      //     missed (e.g. the record was produced by a pod that has since restarted).
+	                      oiBaselineMissing
 	                        ? h('div', { id: 'oiMissingBanner', className: 'oi-missing-banner', role: 'alert' },
 	                            "⚠ TODAY'S OPEN-INTEREST BASELINE HAS NOT ARRIVED — GEX IS FAIL-CLOSED (NO VALUES) UNTIL IT DOES")
 	                        : null,
