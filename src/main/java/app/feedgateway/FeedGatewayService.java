@@ -157,7 +157,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> paceRanks = new ConcurrentHashMap<>(); // board-level pace ranking, keyed by boardKey
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
     private final Map<String, String> strikeFlows = new ConcurrentHashMap<>();
-    private final Map<String, String> sellerActivities = new ConcurrentHashMap<>();
+    private final SellerActivityDiskStore sellerActivityStore = new SellerActivityDiskStore();
     // Per-strike delta-flow snapshots, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (DeltaFlowStrikeSnapshot) — lives on the JSON-state consumer.
     private final Map<String, String> deltaFlows = new ConcurrentHashMap<>();
@@ -511,6 +511,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         outbound.clear();
         shutdownExecutorGracefully(outboundWriters);
+        sellerActivityStore.close();
     }
 
     static void shutdownExecutorGracefully(ExecutorService executor) {
@@ -556,7 +557,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gex-strike-lifecycle"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
+            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
             replayOptionTruthCachedLegacy(session);
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
@@ -1825,6 +1826,13 @@ public class FeedGatewayService implements ReplayRunner {
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
+                    if ("seller-activity".equals(binding.event())) {
+                        // REST-only: every record contains one strike's full session history. Replaying or
+                        // forwarding hundreds of these through the option-chain WebSocket recreates the
+                        // oversized chain payload and fills its outbound queue before initial rows arrive.
+                        // updateCache above remains the ingestion path for /api/seller-activity.
+                        continue;
+                    }
                     // Dealer-ledger forwards the JOINED envelope (not the raw profile/state record); for
                     // every other event forwardJson is just `json`, so the block below is unchanged.
                     String forwardJson = "dealer-ledger".equals(binding.event())
@@ -3194,9 +3202,7 @@ public class FeedGatewayService implements ReplayRunner {
                 return key;
             }
             case "seller-activity" -> {
-                cacheEventTimes.put(versionKey, eventTime);
-                cachePositions.put(versionKey, recordPosition(record));
-                sellerActivities.put(key, json);
+                sellerActivityStore.put(key, json, eventTime);
                 return key;
             }
             case "delta-flow" -> {
@@ -3697,14 +3703,6 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("strike-flow", entry.getValue()))
-                        .forEach(cachedEvents::add);
-                case "seller-activity" -> sellerActivities.entrySet().stream()
-                        .filter(entry -> isCacheFresh("seller-activity:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("seller-activity:" + entry.getKey(), selection))
-                        .filter(entry -> "DATABENTO".equals(selection.source()))
-                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
-                        .sorted(Map.Entry.comparingByKey())
-                        .map(entry -> new CachedEvent("seller-activity", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "delta-flow" -> deltaFlows.entrySet().stream()
                         .filter(entry -> isCacheFresh("delta-flow:" + entry.getKey(), nowMs))
@@ -4497,7 +4495,7 @@ public class FeedGatewayService implements ReplayRunner {
         } else if (versionKey.startsWith("strike-flow:")) {
             strikeFlows.remove(versionKey.substring("strike-flow:".length()));
         } else if (versionKey.startsWith("seller-activity:")) {
-            sellerActivities.remove(versionKey.substring("seller-activity:".length()));
+            sellerActivityStore.remove(versionKey.substring("seller-activity:".length()));
         } else if (versionKey.startsWith("delta-flow:")) {
             deltaFlows.remove(versionKey.substring("delta-flow:".length()));
         } else if (versionKey.startsWith("strike-invasion:")) {
@@ -4634,7 +4632,6 @@ public class FeedGatewayService implements ReplayRunner {
         }
         String normalizedSymbol = symbol.trim().toUpperCase(Locale.ROOT);
         String normalizedExpiry = normalizeExpiry(expiry);
-        String prefix = "DATABENTO|" + normalizedSymbol + "|" + normalizedExpiry + "|";
         long now = System.currentTimeMillis();
         ObjectNode root = mapper.createObjectNode();
         root.put("symbol", normalizedSymbol);
@@ -4643,13 +4640,11 @@ public class FeedGatewayService implements ReplayRunner {
         long asOfMs = 0L;
         int includedBytes = 0;
 
-        List<Map.Entry<String, String>> records = sellerActivities.entrySet().stream()
-                .filter(entry -> entry.getKey().startsWith(prefix))
-                .filter(entry -> isCacheFresh("seller-activity:" + entry.getKey(), now))
-                .sorted(Map.Entry.comparingByKey())
-                .toList();
-        for (Map.Entry<String, String> entry : records) {
-            String json = entry.getValue();
+        long oldest = now - settings.cacheTtlMs();
+        List<SellerActivityDiskStore.Stored> records = sellerActivityStore.readChain(
+                "DATABENTO", normalizedSymbol, normalizedExpiry, oldest, 1024, 8 * 1024 * 1024);
+        for (SellerActivityDiskStore.Stored entry : records) {
+            String json = entry.json();
             if (json == null || includedBytes + json.length() > 32 * 1024 * 1024 || strikes.size() >= 1024) {
                 break;
             }
@@ -5584,7 +5579,6 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "pace-rank", paceRanks);
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
-        replayCacheMap(session, "seller-activity", sellerActivities);
         replayCacheMap(session, "delta-flow", deltaFlows);
         replayCacheMap(session, "strike-intel", strikeIntels);
         replayCacheMap(session, "option-truth", optionTruths);
@@ -5916,7 +5910,6 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.databentoGexMagnetTopic(), "gex-magnet");
                 avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
-                stringTopics.put(settings.databentoSellerActivityTopic(), "seller-activity");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.strikeIntelByStrikeTopic(), "strike-intel");
                 stringTopics.put(settings.strikeInvasionTopic(), "strike-invasion");
@@ -6713,7 +6706,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "pace-rank" -> pendingPaceRanks;
             case "directional-pressure" -> pendingDirectionalPressures;
             case "strike-flow" -> pendingStrikeFlows;
-            case "seller-activity" -> pendingSellerActivities;
+            // Seller activity is REST-only and must never enter the option-chain WebSocket batch.
             case "delta-flow" -> pendingDeltaFlows;
             case "strike-intel" -> pendingStrikeIntels;
             case "strike-invasion" -> pendingStrikeInvasions;
@@ -6943,7 +6936,9 @@ public class FeedGatewayService implements ReplayRunner {
                 case "pace-rank" -> paceRankJsons.add(cachedEvent.json());
                 case "directional-pressure" -> directionalPressureJsons.add(cachedEvent.json());
                 case "strike-flow" -> strikeFlowJsons.add(cachedEvent.json());
-                case "seller-activity" -> sellerActivityJsons.add(cachedEvent.json());
+                case "seller-activity" -> {
+                    // REST-only. Keep the additive sellerActivities field empty for older clients.
+                }
                 case "delta-flow" -> deltaFlowJsons.add(cachedEvent.json());
                 case "strike-intel" -> strikeIntelJsons.add(cachedEvent.json());
                 case "strike-invasion" -> strikeInvasionJsons.add(cachedEvent.json());
