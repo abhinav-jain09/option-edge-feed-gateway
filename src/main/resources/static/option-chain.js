@@ -654,9 +654,12 @@
 	                    // arrived (GEX is fail-closed on OI), so it overrides a stale/uncleared OI_MISSING.
 	                    const oiBaselineMissing = useMemo(() => {
 	                      if (!Array.from(gexOiStatusRef.current.values()).some(s => s.uwGexOiMissing)) return false;
-	                      return !data.some(row => Number.isFinite(Number(row?.uwNetGex))
-	                        && Number(row.uwNetGex) !== 0);
-	                    }, [data, rowsVersion]);
+	                      // Scan the whole GEX cache, not the rendered rows: `data` is the maxStrikes-limited
+	                      // visible window, so a live GEX on a hidden strike would otherwise be missed and a
+	                      // stale OI_MISSING could keep the page red forever.
+	                      return !Array.from(gexByStrikeRef.current.values()).some(gex =>
+	                        Number.isFinite(Number(gex?.uwNetGex)) && Number(gex.uwNetGex) !== 0);
+	                    }, [rowsVersion]);
 		                    const subtitle = config.symbol
         ? `${config.symbol} ${formatExpiry(config.expiry)} | ${String(config.marketDataSource || '').toUpperCase()} market data | ${String(config.provider || '').toUpperCase()} orders`
         : 'Loading config...';
