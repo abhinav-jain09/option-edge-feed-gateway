@@ -649,6 +649,21 @@
                             const gexStatusClass = gexStatus.className;
                             const gexStatusLabel = gexStatus.label;
                             const gexOptional = gexStatus.state === 'optional';
+	                    // OI-baseline alarm state for the page-level banner. Row-independent (pre-open the
+	                    // chain can be empty) and self-healing: any live GEX value proves the baseline
+	                    // arrived (GEX is fail-closed on OI), so it overrides a stale/uncleared OI_MISSING.
+	                    const oiBaselineMissing = useMemo(() => {
+	                      if (!Array.from(gexOiStatusRef.current.values()).some(s => s.uwGexOiMissing)) return false;
+	                      // Scan the whole GEX cache, not the rendered rows: `data` is the maxStrikes-limited
+	                      // visible window, so a live GEX on a hidden strike would otherwise be missed and a
+	                      // stale OI_MISSING could keep the page red forever. A record counts as proof only
+	                      // while it is FRESH by the same rule the GEX cell uses (a cached value from an
+	                      // earlier session must not silence today's alarm), and ANY valid publication counts
+	                      // — including a legitimate netGex of exactly 0, which still required OI to compute.
+	                      const nowMs = Date.now();
+	                      return !Array.from(gexByStrikeRef.current.values()).some(gex =>
+	                        gexRecordIsFresh(gex, nowMs));
+	                    }, [rowsVersion]);
 		                    const subtitle = config.symbol
         ? `${config.symbol} ${formatExpiry(config.expiry)} | ${String(config.marketDataSource || '').toUpperCase()} market data | ${String(config.provider || '').toUpperCase()} orders`
         : 'Loading config...';
@@ -771,7 +786,12 @@
 	                      // Page-level fail-closed alarm: visible the moment the OI-arrival watchdog publishes
 	                      // OI_MISSING (~08:20 ET) — deliberately independent of strike rows, which may not
 	                      // populate until the 09:30 open. Clears on OI_OK.
-	                      Array.from(gexOiStatusRef.current.values()).some(s => s.uwGexOiMissing)
+	                      // Two independent clear paths, because a stuck red banner is its own outage:
+	                      //  1. an OI_OK status (the producer publishes it once the baseline lands), and
+	                      //  2. live GEX values existing at all — GEX is fail-closed on OI by construction,
+	                      //     so a single real netGex PROVES the baseline arrived even if an OI_OK was
+	                      //     missed (e.g. the record was produced by a pod that has since restarted).
+	                      oiBaselineMissing
 	                        ? h('div', { id: 'oiMissingBanner', className: 'oi-missing-banner', role: 'alert' },
 	                            "⚠ TODAY'S OPEN-INTEREST BASELINE HAS NOT ARRIVED — GEX IS FAIL-CLOSED (NO VALUES) UNTIL IT DOES")
 	                        : null,
@@ -3193,6 +3213,20 @@
 	      return { name: 'databento', short: 'DBN', display: 'Databento' };
 	    }
 	    return { name: 'unusual-whales', short: 'UW', display: 'Unusual Whales' };
+	  }
+
+	  /**
+	   * True when a normalized GEX record is a CURRENT publication (same freshness rule the GEX cell
+	   * renders with: a parseable updatedAt within its own staleAfterMs). Used as proof that today's OI
+	   * baseline arrived — GEX is fail-closed on OI, so any fresh publication implies OI, including one
+	   * whose netGex is legitimately 0. A stale/previous-session record proves nothing.
+	   */
+	  function gexRecordIsFresh(gex, nowMs) {
+	    if (!gex || !Number.isFinite(Number(gex.uwNetGex))) return false;
+	    const updatedAtMs = Date.parse(gex.uwGexUpdatedAt || '');
+	    if (!Number.isFinite(updatedAtMs)) return false;
+	    const staleAfterMs = Number(gex.uwGexStaleAfterMs || 90_000);
+	    return nowMs - updatedAtMs <= staleAfterMs;
 	  }
 
 	  function gexStrikeState(row, maxAbsGex) {
