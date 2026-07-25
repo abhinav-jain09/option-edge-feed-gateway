@@ -656,9 +656,13 @@
 	                      if (!Array.from(gexOiStatusRef.current.values()).some(s => s.uwGexOiMissing)) return false;
 	                      // Scan the whole GEX cache, not the rendered rows: `data` is the maxStrikes-limited
 	                      // visible window, so a live GEX on a hidden strike would otherwise be missed and a
-	                      // stale OI_MISSING could keep the page red forever.
+	                      // stale OI_MISSING could keep the page red forever. A record counts as proof only
+	                      // while it is FRESH by the same rule the GEX cell uses (a cached value from an
+	                      // earlier session must not silence today's alarm), and ANY valid publication counts
+	                      // — including a legitimate netGex of exactly 0, which still required OI to compute.
+	                      const nowMs = Date.now();
 	                      return !Array.from(gexByStrikeRef.current.values()).some(gex =>
-	                        Number.isFinite(Number(gex?.uwNetGex)) && Number(gex.uwNetGex) !== 0);
+	                        gexRecordIsFresh(gex, nowMs));
 	                    }, [rowsVersion]);
 		                    const subtitle = config.symbol
         ? `${config.symbol} ${formatExpiry(config.expiry)} | ${String(config.marketDataSource || '').toUpperCase()} market data | ${String(config.provider || '').toUpperCase()} orders`
@@ -3209,6 +3213,20 @@
 	      return { name: 'databento', short: 'DBN', display: 'Databento' };
 	    }
 	    return { name: 'unusual-whales', short: 'UW', display: 'Unusual Whales' };
+	  }
+
+	  /**
+	   * True when a normalized GEX record is a CURRENT publication (same freshness rule the GEX cell
+	   * renders with: a parseable updatedAt within its own staleAfterMs). Used as proof that today's OI
+	   * baseline arrived — GEX is fail-closed on OI, so any fresh publication implies OI, including one
+	   * whose netGex is legitimately 0. A stale/previous-session record proves nothing.
+	   */
+	  function gexRecordIsFresh(gex, nowMs) {
+	    if (!gex || !Number.isFinite(Number(gex.uwNetGex))) return false;
+	    const updatedAtMs = Date.parse(gex.uwGexUpdatedAt || '');
+	    if (!Number.isFinite(updatedAtMs)) return false;
+	    const staleAfterMs = Number(gex.uwGexStaleAfterMs || 90_000);
+	    return nowMs - updatedAtMs <= staleAfterMs;
 	  }
 
 	  function gexStrikeState(row, maxAbsGex) {
