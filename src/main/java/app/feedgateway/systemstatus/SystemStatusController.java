@@ -61,6 +61,7 @@ public class SystemStatusController {
         if (!store.configured()) {
             ledger.put("available", false);
             ledger.put("reason", "NOT_CONFIGURED");
+            ledger.put("transport", transport());
         } else {
             try {
                 List<Map<String, Object>> observed = store.topics(env);
@@ -70,11 +71,13 @@ public class SystemStatusController {
                 ledger.put("available", true);
                 ledger.put("lastRunAt", lastRun.get("startedAt"));
                 ledger.put("lastRunOutcome", lastRun.get("outcome"));
+                ledger.put("transport", transport());
                 topics = observed;
             } catch (Exception e) {
                 ledger.put("available", false);
                 ledger.put("reason", "QUERY_FAILED");
                 ledger.put("error", e.getClass().getSimpleName());
+                ledger.put("transport", transport());
             }
         }
         out.put("ledger", ledger);
@@ -149,6 +152,21 @@ public class SystemStatusController {
             out.put("lagError", lag.error());
         }
         return ResponseEntity.ok(mapper.writeValueAsString(out));
+    }
+
+    /**
+     * How the ledger link is protected. Surfaced so an accepted plaintext link is VISIBLE on the page
+     * rather than a silent posture nobody revisits.
+     */
+    private String transport() {
+        String url = settings.systemStatusJdbcUrl();
+        if (url == null || url.isBlank()) {
+            return "NONE";
+        }
+        if (url.contains("//localhost") || url.contains("//127.0.0.1") || url.contains("//[::1]")) {
+            return "LOOPBACK_TUNNEL";
+        }
+        return settings.systemStatusAllowPlaintext() ? "PLAINTEXT_ACCEPTED" : "TLS_VERIFY_FULL";
     }
 
     /**

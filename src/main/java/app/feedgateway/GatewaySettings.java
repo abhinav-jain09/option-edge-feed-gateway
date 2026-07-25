@@ -483,6 +483,20 @@ public final class GatewaySettings {
                              value("OE_SYSTEM_STATUS_LAG_REGISTRY", ""));
     }
 
+    /**
+     * Explicit operator opt-out from TLS on the ledger link. Default FALSE (fail-closed): a
+     * non-loopback ledger URL is forced to {@code sslmode=verify-full}. Set true ONLY where the
+     * Postgres genuinely has no TLS (both dev and the .252 prod server are plaintext today, and every
+     * other service already talks to them unencrypted) — the endpoint then reports
+     * {@code ledger.transport = PLAINTEXT_ACCEPTED} and the page shows it, so the accepted risk stays
+     * visible instead of being forgotten.
+     */
+    public boolean systemStatusAllowPlaintext() {
+        return "true".equalsIgnoreCase(firstNonBlank(
+                value("systemstatus.allow-plaintext", ""),
+                value("OE_WATCH_ALLOW_PLAINTEXT", "false")));
+    }
+
     public int systemStatusCacheMs() {
         return intValue("OE_SYSTEM_STATUS_CACHE_MS", 30_000, 1_000);
     }

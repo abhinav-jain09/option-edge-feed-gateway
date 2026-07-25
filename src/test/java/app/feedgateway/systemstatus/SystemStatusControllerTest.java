@@ -167,6 +167,28 @@ class SystemStatusControllerTest {
     }
 
     @Test
+    void ledgerTransportIsReportedSoAnAcceptedPlaintextLinkStaysVisible() throws Exception {
+        // Default: TLS is required for a non-loopback ledger URL.
+        System.setProperty("OE_WATCH_JDBC_URL", "jdbc:postgresql://192.168.100.252:5432/options_flow");
+        try {
+            JsonNode out = call(storeWith(List.of(), Map.of()), noLag());
+            assertEquals("TLS_VERIFY_FULL", out.path("ledger").path("transport").asText());
+            // Explicit opt-out must be REPORTED, not silent.
+            System.setProperty("OE_WATCH_ALLOW_PLAINTEXT", "true");
+            out = call(storeWith(List.of(), Map.of()), noLag());
+            assertEquals("PLAINTEXT_ACCEPTED", out.path("ledger").path("transport").asText());
+            // A loopback URL is the ssh-tunnel endpoint: already encrypted.
+            System.clearProperty("OE_WATCH_ALLOW_PLAINTEXT");
+            System.setProperty("OE_WATCH_JDBC_URL", "jdbc:postgresql://localhost:15432/options_flow");
+            out = call(storeWith(List.of(), Map.of()), noLag());
+            assertEquals("LOOPBACK_TUNNEL", out.path("ledger").path("transport").asText());
+        } finally {
+            System.clearProperty("OE_WATCH_JDBC_URL");
+            System.clearProperty("OE_WATCH_ALLOW_PLAINTEXT");
+        }
+    }
+
+    @Test
     void lagRegistryParsingIgnoresMalformedEntries() {
         List<ConsumerLagReader.Entry> parsed = ConsumerLagReader.parseRegistry(
                 "svc-a:group-a:t1,t2; broken-entry ; svc-b:group-b:t3");
