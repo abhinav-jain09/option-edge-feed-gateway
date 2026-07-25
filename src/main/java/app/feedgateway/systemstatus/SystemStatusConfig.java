@@ -36,8 +36,13 @@ public class SystemStatusConfig {
         // without sslmode would otherwise connect in plaintext and carry ledger credentials over the
         // LAN. Loopback is the one exception — that is the ssh-tunnel endpoint, already encrypted, and
         // requiring server certs on a tunnel would make the tunnel impossible to use.
+        // Fail-closed by DEFAULT: TLS is enforced unless the URL is loopback (an ssh-tunnel endpoint,
+        // already encrypted) or the operator has explicitly accepted plaintext for a server that has
+        // none. Enforcing silently would just disable the feature — the Postgres here answers
+        // "server does not support SSL" — so the choice is explicit and reported to the page.
         boolean loopback = url.contains("//localhost") || url.contains("//127.0.0.1")
                 || url.contains("//[::1]");
+        boolean plaintextAccepted = settings.systemStatusAllowPlaintext();
         String user = settings.systemStatusDbUser();
         if (!user.isBlank()) {
             cfg.setUsername(user);
@@ -58,7 +63,7 @@ public class SystemStatusConfig {
         dsProps.setProperty("connectTimeout", "2");
         dsProps.setProperty("loginTimeout", "2");
         dsProps.setProperty("ApplicationName", "feed-gateway-system-status");
-        if (!loopback) {
+        if (!loopback && !plaintextAccepted) {
             dsProps.setProperty("ssl", "true");
             dsProps.setProperty("sslmode", "verify-full");
         }
