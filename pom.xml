@@ -21,6 +21,9 @@
         <confluent.version>8.2.1</confluent.version>
         <options-edge-contracts.version>0.1.0-SNAPSHOT</options-edge-contracts.version>
         <postgresql.version>42.7.8</postgresql.version>
+        <!-- Override Spring Boot's managed 1.21.0: Docker Engine 29 removed the older Engine API
+             versions that 1.21.0's docker-java client negotiates, so it cannot reach a local daemon. -->
+        <testcontainers.version>1.21.4</testcontainers.version>
     </properties>
 
     <repositories>
@@ -31,6 +34,22 @@
     </repositories>
 
     <dependencies>
+        <!--
+          Testcontainers: the partition-expansion behaviour this project depends on lives in the Kafka
+          CLIENT contract, not in our code — assign() preserving positions, partitionsFor() answering from
+          a cache bounded by metadata.max.age.ms, a grown partition starting empty. Mocks cannot falsify
+          any of those, so they are proven against a real broker. Test scope only.
+        -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>com.optionsedge</groupId>
             <artifactId>options-edge-contracts</artifactId>

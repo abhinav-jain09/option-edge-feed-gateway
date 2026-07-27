@@ -280,22 +280,49 @@ class FeedGatewayServiceTest {
     void bootstrapExemptionIsRetiredExactlyWhenThePartitionReachesItsBarrier() {
         TopicPartition replaying = new TopicPartition("t", 0);
         TopicPartition arrived = new TopicPartition("t", 1);
-        TopicPartition orphan = new TopicPartition("t", 2); // exempt but no barrier — must fail CLOSED
+        TopicPartition foreign = new TopicPartition("other-consumers-topic", 9);
 
-        Set<TopicPartition> bootstrapping =
-                new java.util.LinkedHashSet<>(List.of(replaying, arrived, orphan));
-        Map<TopicPartition, Long> barriers = new java.util.LinkedHashMap<>(Map.of(
-                replaying, 100L,
-                arrived, 100L));
-        Map<TopicPartition, Long> positions = Map.of(replaying, 40L, arrived, 100L, orphan, 0L);
+        FeedGatewayService service = service();
+        service.registerBootstrapForTest(replaying, "DATABENTO", 100L, 1L);
+        service.registerBootstrapForTest(arrived, "DATABENTO", 100L, 1L);
+        service.registerBootstrapForTest(foreign, "IBKR", 100L, 1L);
 
-        FeedGatewayService.clearReachedBootstrapBarriers(
-                bootstrapping, barriers, partition -> positions.get(partition));
+        Map<TopicPartition, Long> positions = Map.of(replaying, 40L, arrived, 100L);
+        // `foreign` belongs to a different consumer: position() would throw on it, so the pass must skip it.
+        Set<TopicPartition> stillExempt = service.retireReachedBootstrapForTest(
+                List.of(replaying, arrived),
+                partition -> {
+                    Long p = positions.get(partition);
+                    if (p == null) {
+                        throw new IllegalStateException("position() called on an unassigned partition: " + partition);
+                    }
+                    return p;
+                });
 
-        assertEquals(Set.of(replaying), bootstrapping,
-                "only the partition still behind its barrier keeps the lag-skip exemption");
-        assertEquals(Map.of(replaying, 100L), barriers,
-                "retired barriers must be dropped too, or both collections grow for the consumer's life");
+        assertEquals(Set.of(replaying, foreign), stillExempt,
+                "only the partition still behind its barrier keeps the exemption; another consumer's stays");
+    }
+
+    @Test
+    void sourceReadinessIsWithheldWhileThatSourceIsStillBootstrapping() {
+        FeedGatewayService service = service();
+        service.registerBootstrapForTest(
+                new TopicPartition("ibkr.display", 7), "IBKR", 500L, 1L);
+
+        assertTrue(service.hasIncompleteBootstrapForSourceForTest("IBKR"),
+                "a switch to IBKR must not be announced ready while an IBKR partition is still replaying");
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
+                "the currently selected source is unaffected by growth on another source");
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest(null),
+                "a null/blank source must never be reported incomplete");
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest(""),
+                "a null/blank source must never be reported incomplete");
+
+        // Retiring the barrier releases the hold, so readiness is DEFERRED, never dropped.
+        service.retireReachedBootstrapForTest(
+                List.of(new TopicPartition("ibkr.display", 7)), partition -> 500L);
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest("IBKR"),
+                "once the partition reaches its barrier the source may be announced ready");
     }
 
     @Test

@@ -330,6 +330,25 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong lastLagCheckMs = new AtomicLong();
     /** Optional topics currently absent from metadata — shared across consumer threads, so log-once. */
     private final Set<String> absentOptionalTopics = ConcurrentHashMap.newKeySet();
+    /**
+     * Partitions discovered mid-run that are still replaying their cache rebuild, published at SERVICE
+     * scope because two independent threads need them: the owning cache consumer (to keep them out of the
+     * lag guard until they reach their barrier) and {@link #applySelection} on the selection thread (to
+     * refuse to announce a source READY while its data is still incomplete).
+     */
+    private final Map<TopicPartition, BootstrapState> bootstrappingPartitions = new ConcurrentHashMap<>();
+    /** Live refresh state per consumer, for the diagnostics snapshot. The original incident was SILENT. */
+    private final Map<String, PartitionRefresh> partitionRefreshes = new ConcurrentHashMap<>();
+    /** Current assignment size per consumer, so "assigned != discovered" is externally checkable. */
+    private final Map<String, Integer> assignedPartitionCounts = new ConcurrentHashMap<>();
+
+    /**
+     * @param source   the market-data source this partition feeds — the axis {@link #applySelection} asks about.
+     * @param barrier  the end offset at discovery; the partition is complete once its position reaches it.
+     * @param sinceMs  when the rebuild started, so a partition stuck replaying is externally visible.
+     */
+    private record BootstrapState(String source, long barrier, long sinceMs) {
+    }
     private final AtomicReference<String> readySelectionKey = new AtomicReference<>("");
 
     // ---- Rollover-diagnostics instrumentation (additive; no behavior changes) ----
@@ -1621,7 +1640,16 @@ public class FeedGatewayService implements ReplayRunner {
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
-                    seekToDiscoveryWindow(consumer, refresh.added(), refresh.observedSinceMs());
+                    // Alerts are DISCRETE events with no cache consumer behind them, so nothing else would
+                    // ever recover the gap. A partition on a topic that merely GREW was created empty, so
+                    // BEGINNING is the exact missed set; a partition on a topic that just APPEARED can hold
+                    // a full retention, so it follows bootstrap semantics (END).
+                    if (!refresh.addedOnGrownTopics().isEmpty()) {
+                        consumer.seekToBeginning(refresh.addedOnGrownTopics());
+                    }
+                    if (!refresh.addedOnNewTopics().isEmpty()) {
+                        consumer.seekToEnd(refresh.addedOnNewTopics());
+                    }
                 }
                 for (ConsumerRecord<String, String> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
@@ -1658,8 +1686,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
             boolean live = caughtUp(consumer, catchUpEndOffsets);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
-            Set<TopicPartition> bootstrapping = new LinkedHashSet<>();
-            Map<TopicPartition, Long> bootstrapBarriers = new LinkedHashMap<>();
+            String barriersSelectionKey = selectionKey(activeSelection.get());
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
             }
@@ -1697,11 +1724,40 @@ public class FeedGatewayService implements ReplayRunner {
                     // measured as lag. The response to lag is seekToEnd across all selected partitions,
                     // which would erase this rebuild (and the healthy partitions' positions) and re-hide
                     // the strikes. Tracked against raw end offsets so a barrier always exists to clear it.
-                    bootstrapBarriers.putAll(addedEndOffsets);
-                    bootstrapping.addAll(addedEndOffsets.keySet());
+                    long discoveredAtMs = System.currentTimeMillis();
+                    addedEndOffsets.forEach((partition, endOffset) -> {
+                        TopicBinding binding = topicEvents.get(partition.topic());
+                        bootstrappingPartitions.put(partition, new BootstrapState(
+                                binding == null ? "" : binding.source(), endOffset, discoveredAtMs));
+                    });
                 }
-                clearReachedBootstrapBarriers(bootstrapping, bootstrapBarriers, consumer::position);
-                maybeSeekSelectedSourceToLatest(consumer, partitions, topicEvents, bootstrapping);
+                clearReachedBootstrapBarriers(bootstrappingPartitions, partitions, consumer::position);
+                maybeSeekSelectedSourceToLatest(consumer, partitions, topicEvents,
+                        bootstrappingPartitions.keySet());
+
+                // A source switch invalidates this consumer's catch-up barriers: they were filtered to the
+                // source selected when they were computed. Nothing else recomputes them — applySelection
+                // never touched them — so before this fix, switching to a source whose partitions were still
+                // replaying announced it READY over an incomplete cache. Recompute against the NEW selection
+                // and let the existing catch-up machinery converge.
+                String currentSelectionKey = selectionKey(activeSelection.get());
+                if (!currentSelectionKey.equals(barriersSelectionKey)) {
+                    barriersSelectionKey = currentSelectionKey;
+                    catchUpEndOffsets.clear();
+                    catchUpEndOffsets.putAll(
+                            catchUpEndOffsets(consumer.endOffsets(partitions), topicEvents));
+                    live = caughtUp(consumer, catchUpEndOffsets);
+                    if (live) {
+                        // Converge unconditionally. applySelection may have withheld readiness on seeing a
+                        // bootstrapping partition that finished in the interim; without this the selection
+                        // would never be announced ready at all. Both calls are idempotent — markCacheCaughtUp
+                        // is a no-op when the flag is already true, markSelectionReady is one-shot per key.
+                        markCacheCaughtUp(name, events, caughtUpFlag);
+                        markSelectionReady(activeSelection.get());
+                    } else {
+                        markCacheRecovering(caughtUpFlag);
+                    }
+                }
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
@@ -1788,56 +1844,50 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * Seek JUST-discovered partitions back to {@code observedSinceMs} — the last instant the topology was
-     * known not to contain them, so exactly the records that may have been missed and nothing older.
+     * Seek partitions a LIVE consumer just discovered. Two independent axes decide the answer, and both
+     * matter — getting either wrong silently loses or duplicates user-visible events.
      *
-     * <p>Only for uncached DISCRETE-EVENT broadcast topics (alerts). It is deliberately NOT used by the
-     * live consumers over cached last-value topics: there, replaying anything backwards can hand
-     * {@code routeOrBroadcast} a record the cache consumer has already superseded, and the per-session
-     * routing path does not gate generic events on cache acceptance — so a stale snapshot would regress
-     * the UI. Those consumers seek new partitions to END and let the cache consumer cover the gap.
-     */
-    /**
-     * Seek partitions a LIVE consumer just discovered, per binding, because the two classes of event on
-     * these topics have opposite correct answers:
+     * <p><b>Axis 1 — can anything else recover this event?</b> CACHED last-value events (snapshot, pace,
+     * gex, max-pain, …) are independently rebuilt by the cache consumer, so the live consumer seeks them to
+     * END: replaying here could hand {@code routeOrBroadcast} a record the cache has already superseded,
+     * and the per-session routing path does not gate generic events on cache acceptance, so a stale
+     * snapshot would regress the UI. {@link #isLiveOnlyRebuiltEvent} events have NO such rebuild path and
+     * must be recovered here or lost outright.
      *
-     * <ul>
-     *   <li>CACHED last-value events (snapshot, pace, gex, max-pain, …) seek to END. The cache consumer
-     *       independently rebuilds their window for connecting clients, and replaying here can hand
-     *       {@code routeOrBroadcast} a record the cache has already superseded — the per-session routing
-     *       path does not gate generic events on cache acceptance, so a stale snapshot would regress the UI.</li>
-     *   <li>DISCRETE never-cached events ({@link #isDiscreteUncachedBroadcastEvent}) seek back to the
-     *       discovery window. Nothing else in the system carries them: the cache consumer reads the record
-     *       but only calls updateCache, and these bindings are explicitly not cached, so seeking to END
-     *       would DELETE the event outright. Re-broadcasting one inside the discovery window is safe —
-     *       the producers re-assert and the payloads are TTL-keyed.</li>
-     * </ul>
+     * <p><b>Axis 2 — why is the partition new?</b> Only for the live-only events, and only when the topic
+     * was ALREADY assigned and merely grew, is the partition guaranteed EMPTY at creation — so
+     * {@code seekToBeginning} recovers exactly the missed records and nothing older, with no clock
+     * assumption. A partition belonging to a topic that just APPEARED (an optional producer finally
+     * deploying) can hold a full retention of history; beginning-seeking it would replay hours into every
+     * connected WebSocket, so it follows this consumer's bootstrap semantics instead: END.
      */
-    private void seekAddedLivePartitions(KafkaConsumer<?, ?> consumer, List<TopicPartition> added,
-                                         Map<String, TopicBinding> topicEvents, long observedSinceMs) {
-        List<TopicPartition> discrete = new ArrayList<>();
-        List<TopicPartition> cached = new ArrayList<>();
-        for (TopicPartition partition : added) {
+    private void seekAddedLivePartitions(KafkaConsumer<?, ?> consumer, Refresh refresh,
+                                         Map<String, TopicBinding> topicEvents) {
+        Set<TopicPartition> onGrownTopics = Set.copyOf(refresh.addedOnGrownTopics());
+        List<TopicPartition> recoverFromBeginning = new ArrayList<>();
+        List<TopicPartition> toEnd = new ArrayList<>();
+        for (TopicPartition partition : refresh.added()) {
             TopicBinding binding = topicEvents.get(partition.topic());
-            if (binding != null && isLiveOnlyRebuiltEvent(binding.event())) {
-                discrete.add(partition);
+            boolean liveOnly = binding != null && isLiveOnlyRebuiltEvent(binding.event());
+            if (liveOnly && onGrownTopics.contains(partition)) {
+                recoverFromBeginning.add(partition);
             } else {
-                cached.add(partition);
+                toEnd.add(partition);
             }
         }
-        if (!cached.isEmpty()) {
-            consumer.seekToEnd(cached);
+        if (!toEnd.isEmpty()) {
+            consumer.seekToEnd(toEnd);
         }
-        if (!discrete.isEmpty()) {
-            seekToDiscoveryWindow(consumer, discrete, observedSinceMs);
+        if (!recoverFromBeginning.isEmpty()) {
+            consumer.seekToBeginning(recoverFromBeginning);
         }
     }
 
     /**
      * Events whose ONLY writer is the live consumer, so the cache consumer cannot recover them and seeking
      * a newly discovered partition to END loses them. The test is "does the cache path rebuild it?", NOT
-     * "is it cached?" — {@code strike-cluster} IS cached, but only by the live branch below; {@code
-     * updateCache} has no case for it, so the cache consumer reads those records and drops them.
+     * "is it cached?" — {@code strike-cluster} IS cached, but only by the live branch; {@code updateCache}
+     * has no case for it, so the cache consumer reads those records and drops them.
      *
      * <ul>
      *   <li>{@code turn-alert}, {@code spread-skew-event} — discrete one-shot transitions, never cached.</li>
@@ -1855,16 +1905,6 @@ public class FeedGatewayService implements ReplayRunner {
         return "turn-alert".equals(event)
                 || "spread-skew-event".equals(event)
                 || "strike-cluster".equals(event);
-    }
-
-    private void seekToDiscoveryWindow(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions,
-                                       long observedSinceMs) {
-        long cutoffMs = observedSinceMs;
-        Map<TopicPartition, Long> timestamps = new HashMap<>();
-        for (TopicPartition partition : partitions) {
-            timestamps.put(partition, cutoffMs);
-        }
-        seekToTimestampsOrEnd(consumer, timestamps, new ArrayList<>());
     }
 
     /** Per-partition Kafka cache-rebuild seek-back: the bound event's bounded seek window, else the generic one. */
@@ -1907,8 +1947,7 @@ public class FeedGatewayService implements ReplayRunner {
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
-                    seekAddedLivePartitions(consumer, refresh.added(), topicEvents,
-                            refresh.observedSinceMs());
+                    seekAddedLivePartitions(consumer, refresh, topicEvents);
                 }
                 // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
                 // is only read by dumpDiagnosticState() to distinguish "consumers polling" from "forward gate stuck".
@@ -2398,13 +2437,40 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics) {
-        long deadlineMs = System.currentTimeMillis() + settings.metadataTimeoutMs();
+        return partitionsFor(name, consumer, topics, settings.metadataTimeoutMs());
+    }
+
+    /**
+     * Resolve every topic's partitions, or fail with {@link TopicMetadataTimeoutException}.
+     *
+     * <p>{@code budgetMs} is a TOTAL deadline for the whole call, enforced before EVERY per-topic metadata
+     * request — not merely once per pass. Each request against a topic the client does not know blocks for
+     * its own timeout, so an unbounded per-topic timeout made the real cost {@code 1s x absent-topics}:
+     * with ~8 optional topics undeployed (the normal state after the daily Kafka wipe) a single pass could
+     * stall ~8s. At bootstrap that is harmless; from {@link PartitionRefresh} it runs ON THE POLL THREAD
+     * every refresh interval, so it stalls consumption, and the resulting backlog can trip
+     * {@link #maybeSeekSelectedSourceToLatest} into seeking the selected partitions to END — turning a
+     * metadata hiccup into real skipped data.
+     *
+     * <p>Running out of budget mid-pass yields an INCOMPLETE view, which must never be mistaken for a
+     * complete one: {@code complete} is cleared so the call throws rather than returning a short list that
+     * a caller could read as "these topics no longer have those partitions".
+     */
+    private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics,
+                                               long budgetMs) {
+        long deadlineMs = System.currentTimeMillis() + budgetMs;
         Map<String, List<PartitionInfo>> metadata = new HashMap<>();
         while (running.get() && System.currentTimeMillis() < deadlineMs) {
             metadata.clear();
             boolean complete = true;
             for (String topic : topics) {
-                List<PartitionInfo> partitions = consumer.partitionsFor(topic, Duration.ofMillis(1_000));
+                long remainingMs = deadlineMs - System.currentTimeMillis();
+                if (remainingMs <= 0L) {
+                    complete = false; // partial pass — never publish it as an observation
+                    break;
+                }
+                List<PartitionInfo> partitions =
+                        consumer.partitionsFor(topic, Duration.ofMillis(Math.min(1_000L, remainingMs)));
                 if (partitions == null || partitions.isEmpty()) {
                     if (isOptionalTopic(topic)) {
                         // OPTIONAL topic (producer not deployed yet / absent): skip it so its
@@ -2481,19 +2547,44 @@ public class FeedGatewayService implements ReplayRunner {
      * so it must fail CLOSED. An entry that could never be cleared would disable lag protection for that
      * partition permanently and silently.
      */
-    static void clearReachedBootstrapBarriers(
-            Set<TopicPartition> bootstrapping,
-            Map<TopicPartition, Long> barriers,
+    private void clearReachedBootstrapBarriers(
+            Map<TopicPartition, BootstrapState> bootstrapping,
+            List<TopicPartition> ownedByThisConsumer,
             java.util.function.ToLongFunction<TopicPartition> position
     ) {
-        bootstrapping.removeIf(partition -> {
-            Long barrier = barriers.get(partition);
-            if (barrier == null || position.applyAsLong(partition) >= barrier) {
-                barriers.remove(partition);
-                return true;
+        if (bootstrapping.isEmpty()) {
+            return;
+        }
+        // Only this consumer's own partitions: position() throws on anything it does not assign, and the
+        // registry is shared across consumers.
+        Set<TopicPartition> owned = Set.copyOf(ownedByThisConsumer);
+        bootstrapping.keySet().removeIf(partition -> {
+            if (!owned.contains(partition)) {
+                return false;
             }
-            return false;
+            BootstrapState state = bootstrapping.get(partition);
+            return state == null || position.applyAsLong(partition) >= state.barrier();
         });
+    }
+
+    /**
+     * True while any partition feeding {@code source} is still replaying a mid-run rebuild — i.e. the cache
+     * for that source is knowably incomplete right now.
+     */
+    private List<TopicPartition> bootstrappingPartitionsForSource(String source) {
+        return bootstrappingPartitions.entrySet().stream()
+                .filter(e -> source != null && source.equalsIgnoreCase(e.getValue().source()))
+                .map(Map.Entry::getKey)
+                .sorted(Comparator.comparing(TopicPartition::topic).thenComparingInt(TopicPartition::partition))
+                .toList();
+    }
+
+    private boolean hasIncompleteBootstrapForSource(String source) {
+        if (source == null || source.isBlank() || bootstrappingPartitions.isEmpty()) {
+            return false;
+        }
+        return bootstrappingPartitions.values().stream()
+                .anyMatch(state -> source.equalsIgnoreCase(state.source()));
     }
 
     static List<TopicPartition> mergedAssignment(
@@ -2527,13 +2618,10 @@ public class FeedGatewayService implements ReplayRunner {
         private final String name;
         private final Set<String> topics;
         private long nextRefreshMs;
-        /**
-         * When the topology was last observed successfully. Newly added partitions provably did not exist
-         * as of this instant, so it is the EXACT lower bound for "records we may have missed" — no
-         * reverse-engineering of refresh/timeout multipliers, and correct under any configuration.
-         */
-        private long lastObservedMs;
-        private boolean refreshFailing;
+        /** When the topology was last observed successfully — diagnostics only, never a seek input. */
+        private volatile long lastObservedMs;
+        private volatile boolean refreshFailing;
+        private volatile int lastDiscoveredCount;
 
         PartitionRefresh(String name, Set<String> topics) {
             this.name = name;
@@ -2542,6 +2630,11 @@ public class FeedGatewayService implements ReplayRunner {
             // The caller has just completed its bootstrap partitionsFor(), so the topology is known good now.
             this.lastObservedMs = nowMs;
             this.nextRefreshMs = nowMs + settings.partitionMetadataRefreshMs();
+            // Self-register for diagnostics. Deliberately here rather than at each of the six call sites:
+            // a consumer loop that is observable only if someone remembered to wire it up is exactly how a
+            // partial assignment stays invisible. Consumer names are unique, and a restarted consumer
+            // replaces its own entry.
+            partitionRefreshes.put(name, this);
         }
 
         /**
@@ -2554,13 +2647,14 @@ public class FeedGatewayService implements ReplayRunner {
          */
         Refresh apply(KafkaConsumer<?, ?> consumer, List<TopicPartition> assigned) {
             long nowMs = System.currentTimeMillis();
+            assignedPartitionCounts.put(name, assigned.size());
             if (nowMs < nextRefreshMs) {
-                return new Refresh(assigned, List.of(), lastObservedMs);
+                return Refresh.unchanged(assigned);
             }
-            long observedSinceMs = lastObservedMs;
             List<TopicPartition> discovered;
             try {
-                discovered = partitionsFor(name, consumer, topics);
+                discovered = partitionsFor(name, consumer, topics,
+                        settings.partitionRefreshMetadataTimeoutMs());
             } catch (TopicMetadataTimeoutException e) {
                 // The ONLY condition we absorb, and now a dedicated type rather than "any RuntimeException":
                 // partitionsFor() exceeded its metadata deadline. At bootstrap that failure is correct;
@@ -2575,36 +2669,88 @@ public class FeedGatewayService implements ReplayRunner {
                             + settings.partitionMetadataRefreshMs() + "ms: " + e);
                 }
                 nextRefreshMs = System.currentTimeMillis() + settings.partitionMetadataRefreshMs();
-                return new Refresh(assigned, List.of(), observedSinceMs);
+                return Refresh.unchanged(assigned);
             }
             if (refreshFailing) {
                 refreshFailing = false;
                 System.out.println("Feed gateway " + name + " partition metadata refresh recovered");
             }
             lastObservedMs = System.currentTimeMillis();
+            lastDiscoveredCount = discovered.size();
             // Bound from the END of the attempt: a slow metadata call must not tight-loop.
             nextRefreshMs = lastObservedMs + settings.partitionMetadataRefreshMs();
 
             List<TopicPartition> added = addedPartitions(assigned, discovered);
             if (added.isEmpty()) {
-                return new Refresh(assigned, List.of(), lastObservedMs);
+                return Refresh.unchanged(assigned);
             }
             List<TopicPartition> merged = mergedAssignment(assigned, added);
             consumer.assign(merged);
+            Refresh refresh = Refresh.grown(merged, added, assigned);
             System.out.println("Feed gateway " + name + " discovered " + added.size()
-                    + " new Kafka partition(s): " + added + " (now assigned " + merged.size() + ")");
-            return new Refresh(merged, added, observedSinceMs);
+                    + " new Kafka partition(s): " + added + " (now assigned " + merged.size()
+                    + ", onGrownTopics=" + refresh.addedOnGrownTopics().size()
+                    + ", onNewTopics=" + refresh.addedOnNewTopics().size() + ")");
+            return refresh;
+        }
+
+        long lastObservedMs() {
+            return lastObservedMs;
+        }
+
+        boolean refreshFailing() {
+            return refreshFailing;
+        }
+
+        int lastDiscoveredCount() {
+            return lastDiscoveredCount;
         }
     }
 
     /**
-     * @param partitions     the assignment now in effect — the caller MUST adopt it before seeking, so a
-     *                       seek failure cannot leave the caller tracking a stale list.
-     * @param added          partitions assigned by this refresh and not yet seeked by the caller.
-     * @param observedSinceMs the last instant the topology was known NOT to contain {@code added} — the
-     *                       exact lower bound for records that may have been missed.
+     * The outcome of one refresh. {@code added} is split by WHY the partition is new, because the two cases
+     * have opposite safe recovery boundaries:
+     *
+     * <ul>
+     *   <li>{@code addedOnGrownTopics} — the topic was ALREADY assigned and its partition count grew. Kafka
+     *       creates such a partition EMPTY, so its log holds exactly the records written since creation:
+     *       seeking it to BEGINNING recovers precisely what was missed, bounded by the discovery delay, with
+     *       no dependency on any clock.</li>
+     *   <li>{@code addedOnNewTopics} — the whole topic just appeared (an OPTIONAL topic whose producer was
+     *       not yet deployed; see {@link #isOptionalTopic}). Its partitions can hold a FULL retention of
+     *       history, so beginning-seeking them would replay hours into the broadcast path. These must be
+     *       treated exactly as bootstrap would treat them.</li>
+     * </ul>
+     *
+     * <p>This split replaced a timestamp-based recovery window that fed the gateway's wall clock into
+     * {@code offsetsForTimes}. That was unsound: {@code offsetsForTimes} matches on RECORD timestamps, which
+     * on a {@code CreateTime} topic are the PRODUCER's clock. A producer running behind the gateway could
+     * write a discrete event whose timestamp preceded the cutoff, and the seek would skip it — silently and
+     * permanently losing a {@code turn-alert} or {@code spread-skew-event}. Offsets carry no such
+     * assumption.
+     *
+     * @param partitions the assignment now in effect — the caller MUST adopt it before seeking, so a seek
+     *                   failure cannot leave the caller tracking a stale list.
      */
-    private record Refresh(List<TopicPartition> partitions, List<TopicPartition> added, long observedSinceMs) {
+    private record Refresh(
+            List<TopicPartition> partitions,
+            List<TopicPartition> added,
+            List<TopicPartition> addedOnGrownTopics,
+            List<TopicPartition> addedOnNewTopics
+    ) {
+        static Refresh unchanged(List<TopicPartition> assigned) {
+            return new Refresh(assigned, List.of(), List.of(), List.of());
+        }
+
+        static Refresh grown(List<TopicPartition> merged, List<TopicPartition> added,
+                             List<TopicPartition> previouslyAssigned) {
+            Set<String> knownTopics = previouslyAssigned.stream()
+                    .map(TopicPartition::topic)
+                    .collect(java.util.stream.Collectors.toUnmodifiableSet());
+            List<TopicPartition> onGrown = added.stream().filter(p -> knownTopics.contains(p.topic())).toList();
+            List<TopicPartition> onNew = added.stream().filter(p -> !knownTopics.contains(p.topic())).toList();
+            return new Refresh(merged, added, onGrown, onNew);
+        }
     }
 
     private boolean caughtUp(KafkaConsumer<?, ?> consumer, Map<TopicPartition, Long> endOffsets) {
@@ -2779,7 +2925,17 @@ public class FeedGatewayService implements ReplayRunner {
             broadcast("reset", resetJson);
             broadcast("source-switching", activeSelectionJson(next, "source-switching"));
             broadcast("status", statusJson());
-            if (broadcastCachedState(sourceSwitchReplayEvents())) {
+            boolean replayed = broadcastCachedState(sourceSwitchReplayEvents());
+            // WITHHOLD readiness while the newly selected source has partitions still replaying a mid-run
+            // rebuild. Announcing source-ready here would certify a cache that is knowably missing every
+            // strike on those partitions — the original incident's symptom, reached by a different route.
+            // The owning cache consumer recomputes its barriers for this selection on its next poll and
+            // calls markSelectionReady once they are met, so readiness is deferred, never dropped.
+            if (hasIncompleteBootstrapForSource(next.source())) {
+                System.out.println("RGW_SELECTION_READY_DEFERRED event=selection_ready_deferred"
+                        + " selection=" + describeSelection(next)
+                        + " bootstrappingPartitions=" + bootstrappingPartitionsForSource(next.source()));
+            } else if (replayed) {
                 markSelectionReady(next);
             }
         }
@@ -7699,6 +7855,59 @@ public class FeedGatewayService implements ReplayRunner {
      *
      * <p>Called by {@link #diagnosticsExecutor} every 60s (and directly from tests).
      */
+    /**
+     * Make partition-assignment health EXTERNALLY OBSERVABLE. The 4→32 incident was silent precisely
+     * because a partial assignment looks identical to a healthy one from outside: the pod is Ready, the
+     * consumer polls, records flow — they are simply the wrong subset. Every line below exists so that
+     * failure mode is greppable and alertable rather than something a human notices on a chart.
+     *
+     * <p>Two conditions are escalated to RGW_ALERT because they are actionable and cannot be benign:
+     * <ul>
+     *   <li>{@code assigned != discovered} — the consumer is knowably not reading a partition that exists.</li>
+     *   <li>cache reporting CAUGHT UP while the SELECTED source still has a partition replaying — the exact
+     *       "we certified an incomplete cache" shape this whole programme exists to prevent.</li>
+     * </ul>
+     */
+    private void emitPartitionRefreshDiagnostics(long nowMs, ActiveSelection selection) {
+        String selectedSource = selection == null ? "" : selection.source();
+        List<TopicPartition> selectedBootstrapping = bootstrappingPartitionsForSource(selectedSource);
+        long oldestBootstrapAgeMs = bootstrappingPartitions.values().stream()
+                .mapToLong(state -> Math.max(0L, nowMs - state.sinceMs()))
+                .max()
+                .orElse(0L);
+        partitionRefreshes.forEach((consumerName, refresh) -> {
+            int assigned = assignedPartitionCounts.getOrDefault(consumerName, -1);
+            int discovered = refresh.lastDiscoveredCount();
+            long staleMs = Math.max(0L, nowMs - refresh.lastObservedMs());
+            System.out.println("RGW_PARTITIONS event=partition_refresh_state"
+                    + " consumer=" + quote(consumerName)
+                    + " assignedPartitions=" + assigned
+                    + " discoveredPartitions=" + discovered
+                    + " refreshFailing=" + refresh.refreshFailing()
+                    + " msSinceLastTopologyObservation=" + staleMs
+                    + " bootstrappingPartitions=" + bootstrappingPartitions.size()
+                    + " oldestBootstrapAgeMs=" + oldestBootstrapAgeMs);
+            if (discovered > 0 && assigned >= 0 && assigned != discovered) {
+                System.err.println("RGW_ALERT event=GATEWAY_PARTITION_ASSIGNMENT_INCOMPLETE"
+                        + " consumer=" + quote(consumerName)
+                        + " assignedPartitions=" + assigned
+                        + " discoveredPartitions=" + discovered);
+            }
+            if (staleMs > 2L * settings.partitionMetadataRefreshMs()) {
+                System.err.println("RGW_ALERT event=GATEWAY_PARTITION_METADATA_STALE"
+                        + " consumer=" + quote(consumerName)
+                        + " msSinceLastTopologyObservation=" + staleMs
+                        + " refreshIntervalMs=" + settings.partitionMetadataRefreshMs());
+            }
+        });
+        boolean cacheClaimsReady = stateCaughtUp.get() && avroCaughtUp.get();
+        if (cacheClaimsReady && !selectedBootstrapping.isEmpty()) {
+            System.err.println("RGW_ALERT event=GATEWAY_CACHE_READY_WITH_INCOMPLETE_BOOTSTRAP"
+                    + " selectedSource=" + quote(selectedSource)
+                    + " bootstrappingPartitions=" + selectedBootstrapping);
+        }
+    }
+
     void dumpDiagnosticState() {
         if (!diagnosticsEnabled) {
             return;
@@ -7750,6 +7959,8 @@ public class FeedGatewayService implements ReplayRunner {
                     + " offsetBarriers=" + offsetBarriers.get().size()
                     + " running=" + running.get()
                     + " nowMs=" + nowMs);
+
+            emitPartitionRefreshDiagnostics(nowMs, selection);
 
             boolean marketHours = isRegularTradingHours(nowMs);
             boolean consumersAdvancing = eligibleDelta > 0L;
@@ -7909,6 +8120,23 @@ public class FeedGatewayService implements ReplayRunner {
         long before = seekToLatestEvents.get();
         maybeSeekSelectedSourceToLatest(consumer, partitions, topicEvents, bootstrapping);
         return seekToLatestEvents.get() > before;
+    }
+
+    /** Test seam: register a partition as mid-run bootstrapping, exactly as a refresh would. */
+    void registerBootstrapForTest(TopicPartition partition, String source, long barrier, long sinceMs) {
+        bootstrappingPartitions.put(partition, new BootstrapState(source, barrier, sinceMs));
+    }
+
+    /** Test seam: run one retirement pass and report which partitions remain exempt. */
+    Set<TopicPartition> retireReachedBootstrapForTest(
+            List<TopicPartition> owned,
+            java.util.function.ToLongFunction<TopicPartition> position) {
+        clearReachedBootstrapBarriers(bootstrappingPartitions, owned, position);
+        return Set.copyOf(bootstrappingPartitions.keySet());
+    }
+
+    boolean hasIncompleteBootstrapForSourceForTest(String source) {
+        return hasIncompleteBootstrapForSource(source);
     }
 
     long activeSelectionEpochForTest() {
