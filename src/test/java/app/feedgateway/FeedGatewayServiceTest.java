@@ -248,9 +248,9 @@ class FeedGatewayServiceTest {
     @Test
     void initialBootstrapBacklogIsExemptFromTheLagGuardUntilCaughtUp() throws Exception {
         // A RESTARTED cache consumer replays its full cache window — a backlog that dwarfs maxLagRecords.
-        // Its exemptions from the previous attempt were correctly released on exit, so the replacement MUST
-        // register its own for the initial bootstrap; otherwise the guard seeks the rebuild away and the
-        // untouched barriers are trivially met — caught-up over an incomplete cache, at every restart.
+        // The replacement attempt MUST register exemptions for that initial bootstrap; otherwise the guard
+        // seeks the rebuild away and the untouched barriers are trivially met — caught-up over an
+        // incomplete cache, at every restart.
         FeedGatewayService service = service();
         TopicPartition partition = new TopicPartition("databento.display", 0);
 
@@ -266,10 +266,6 @@ class FeedGatewayServiceTest {
 
         assertTrue(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
                 "the initial bootstrap is a replay-in-progress and must carry a lag-guard exemption");
-
-        // ...and the attempt's death releases exactly its own entries (the restart cycle is leak-free).
-        service.releaseBootstrapEntriesOwnedByForTest("avro");
-        assertFalse(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"));
     }
 
     @Test
@@ -386,18 +382,31 @@ class FeedGatewayServiceTest {
     }
 
     @Test
-    void deadConsumerAttemptsBootstrapEntriesAreReleasedWithIt() {
-        // A dead attempt's entry can never be retired (retirement needs that consumer's position()), so
-        // leaving it behind would withhold readiness for its source forever. The exit hook must drop
-        // exactly the dead owner's entries and nothing else.
+    void deadAttemptsEntriesFailClosedUntilTheReplacementSupersedesThem() {
+        // A dead attempt's entries deliberately SURVIVE its death: while its source's cache is knowably
+        // incomplete, readiness must keep failing closed. Releasing them on exit opened a window (death →
+        // replacement's re-registration) in which another consumer's convergence could announce the
+        // incomplete source READY — permanently, since readiness is one-shot per key. The replacement's
+        // bootstrap supersedes them: same keys overwritten with fresh barriers, leftover owned keys pruned.
         FeedGatewayService service = service();
-        service.registerBootstrapForTest(new TopicPartition("a", 0), "DATABENTO", 100L, 1L); // owner "test"
-        service.releaseBootstrapEntriesOwnedByForTest("avro");
+        TopicPartition kept = new TopicPartition("a", 0);
+        TopicPartition leftover = new TopicPartition("a", 9); // e.g. from a growth event, gone after wipe
+        service.registerBootstrapForTest(kept, "DATABENTO", 100L, 1L);      // owner "test"
+        service.registerBootstrapForTest(leftover, "DATABENTO", 100L, 1L);  // owner "test"
+
+        // The attempt dies. NOTHING is released — the source stays incomplete across the gap.
         assertTrue(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
-                "another owner's entries survive an unrelated consumer's death");
-        service.releaseBootstrapEntriesOwnedByForTest("test");
+                "a dead attempt's entries keep failing closed until superseded");
+
+        // The replacement bootstraps with a fresh barrier for `kept`; `leftover` is pruned.
+        service.supersedeBootstrapEntriesForTest("test", Map.of(kept, 250L), "a", "DATABENTO");
+        assertTrue(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
+                "superseded entries gate readiness on the REPLACEMENT's rebuild");
+        Set<TopicPartition> remaining = service.retireReachedBootstrapForTest(
+                List.of(kept, leftover), partition -> 250L);
+        assertFalse(remaining.contains(leftover), "leftover owned keys are pruned by supersession");
         assertFalse(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
-                "the dead owner's entries are gone, so its source can become ready again");
+                "once the replacement reaches its own barrier the source may become ready");
     }
 
     @Test

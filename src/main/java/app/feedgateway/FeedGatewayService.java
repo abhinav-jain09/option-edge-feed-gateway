@@ -350,9 +350,9 @@ public class FeedGatewayService implements ReplayRunner {
      * @param source   the market-data source this partition feeds — the axis {@link #applySelection} asks about.
      * @param barrier  the end offset at discovery; the partition is complete once its position reaches it.
      * @param sinceMs  when the rebuild started, so a partition stuck replaying is externally visible.
-     * @param owner    the consumer attempt that created the entry; its exit removes the entry (see
-     *                 {@link #releaseBootstrapEntriesOwnedBy}) — a dead attempt's entry could never be
-     *                 retired and would withhold readiness for its source forever.
+     * @param owner    the consumer attempt that created the entry. Entries SURVIVE the attempt's death,
+     *                 failing closed for their source, and are superseded by the replacement attempt's
+     *                 bootstrap — see {@link #supersedeBootstrapEntries}.
      */
     private record BootstrapState(String source, long barrier, long sinceMs, String owner) {
     }
@@ -1677,13 +1677,7 @@ public class FeedGatewayService implements ReplayRunner {
     private void runAssignedCacheConsumer(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
         runRetryingConsumer(
                 name,
-                retry -> {
-                    try {
-                        runAssignedCacheConsumerOnce(name, topicEvents, avro, caughtUpFlag);
-                    } finally {
-                        releaseBootstrapEntriesOwnedBy(name);
-                    }
-                },
+                retry -> runAssignedCacheConsumerOnce(name, topicEvents, avro, caughtUpFlag),
                 () -> markCacheRecovering(caughtUpFlag)
         );
     }
@@ -1699,9 +1693,21 @@ public class FeedGatewayService implements ReplayRunner {
         });
     }
 
-    /** See the ownership comment in runAssignedCacheConsumerOnce — a dead attempt's entries must die with it. */
-    private void releaseBootstrapEntriesOwnedBy(String owner) {
-        bootstrappingPartitions.values().removeIf(state -> owner.equals(state.owner()));
+    /**
+     * A dead attempt's registry entries are deliberately NOT released when it dies. They keep FAILING
+     * CLOSED: while they exist, markSelectionReady refuses their source, which is correct — the attempt
+     * died mid-rebuild, so that source's cache IS incomplete. Releasing them on exit opened a window
+     * (dead attempt → replacement's re-registration) in which another consumer's per-poll convergence
+     * could announce the incomplete source READY, permanently, since readiness is one-shot per key.
+     * Instead the REPLACEMENT attempt supersedes them here: {@code put} overwrites each partition's entry
+     * with a fresh barrier, and the prune drops any leftover owned key no longer in the bootstrap set. On
+     * process shutdown the entries die with the process.
+     */
+    private void supersedeBootstrapEntries(String owner, Map<TopicPartition, Long> freshEndOffsets,
+                                           Map<String, TopicBinding> topicEvents) {
+        registerBootstrapEntries(owner, freshEndOffsets, topicEvents);
+        bootstrappingPartitions.entrySet().removeIf(entry ->
+                owner.equals(entry.getValue().owner()) && !freshEndOffsets.containsKey(entry.getKey()));
     }
 
     private void runAssignedCacheConsumerOnce(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
@@ -1727,9 +1733,10 @@ public class FeedGatewayService implements ReplayRunner {
             // The INITIAL cache-window replay is exactly as much "intended backlog" as a mid-run discovery:
             // without these exemptions, a consumer RESTART with a window larger than maxLagRecords lets the
             // lag guard seekToEnd the whole rebuild away, after which the untouched catch-up barriers are
-            // trivially met and the gateway reports caught-up over an incomplete cache. Entries are owned by
-            // this attempt (released on exit) and retire per partition as its barrier is reached.
-            registerBootstrapEntries(name, bootstrapEndOffsets, topicEvents);
+            // trivially met and the gateway reports caught-up over an incomplete cache. Entries are owned
+            // by this attempt, retire per partition at barrier, SURVIVE the attempt's death (failing
+            // closed), and are superseded here by the next attempt.
+            supersedeBootstrapEntries(name, bootstrapEndOffsets, topicEvents);
             Map<TopicPartition, Long> catchUpEndOffsets =
                     new LinkedHashMap<>(catchUpEndOffsets(bootstrapEndOffsets, topicEvents));
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
@@ -1774,43 +1781,8 @@ public class FeedGatewayService implements ReplayRunner {
                     // the strikes. Tracked against raw end offsets so a barrier always exists to clear it.
                     registerBootstrapEntries(name, addedEndOffsets, topicEvents);
                 }
-                clearReachedBootstrapBarriers(bootstrappingPartitions, partitions, consumer::position);
                 maybeSeekSelectedSourceToLatest(consumer, partitions, topicEvents,
                         bootstrappingPartitions.keySet());
-                // Explicit convergence: readiness withheld by applySelection (or refused by the fail-closed
-                // check in markSelectionReady) is only DEFERRED if something retries once the last barrier
-                // for the live selection retires. Nothing else would -- markCacheCaughtUp is one-shot on a
-                // false->true flag transition that may never come again. markSelectionReady is idempotent,
-                // re-validates against the live selection under readyLock, and now fails closed itself, so
-                // calling it every poll is safe and cheap.
-                ActiveSelection liveSelection = activeSelection.get();
-                if (liveSelection != null && !selectionKey(liveSelection).equals(readySelectionKey.get())) {
-                    markSelectionReady(liveSelection);
-                }
-
-                // A source switch invalidates this consumer's catch-up barriers: they were filtered to the
-                // source selected when they were computed. Nothing else recomputes them — applySelection
-                // never touched them — so before this fix, switching to a source whose partitions were still
-                // replaying announced it READY over an incomplete cache. Recompute against the NEW selection
-                // and let the existing catch-up machinery converge.
-                String currentSelectionKey = selectionKey(activeSelection.get());
-                if (!currentSelectionKey.equals(barriersSelectionKey)) {
-                    barriersSelectionKey = currentSelectionKey;
-                    catchUpEndOffsets.clear();
-                    catchUpEndOffsets.putAll(
-                            catchUpEndOffsets(boundedEndOffsets(consumer, partitions), topicEvents));
-                    live = caughtUp(consumer, catchUpEndOffsets);
-                    if (live) {
-                        // Converge unconditionally. applySelection may have withheld readiness on seeing a
-                        // bootstrapping partition that finished in the interim; without this the selection
-                        // would never be announced ready at all. Both calls are idempotent — markCacheCaughtUp
-                        // is a no-op when the flag is already true, markSelectionReady is one-shot per key.
-                        markCacheCaughtUp(name, events, caughtUpFlag);
-                        markSelectionReady(activeSelection.get());
-                    } else {
-                        markCacheRecovering(caughtUpFlag);
-                    }
-                }
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
@@ -1831,9 +1803,45 @@ public class FeedGatewayService implements ReplayRunner {
                     updateCache(binding, record, json);
                 }
                 purgeExpiredCache(System.currentTimeMillis());
+
+                // ORDER IS LOAD-BEARING: everything below runs AFTER the polled records are applied to the
+                // cache. poll() advances position() past records it merely RETURNED, so on the final
+                // bootstrap batch the barrier reads as reached while those records are still in `records`,
+                // unapplied. Retiring the exemption or announcing readiness before updateCache would
+                // broadcast the one-shot cached replay WITHOUT the final batch -- permanently, since
+                // markSelectionReady is one-shot per selection key. (The lag guard above is the opposite
+                // case: it must see the PRE-retirement exemption set, so it stays before processing.)
+                clearReachedBootstrapBarriers(bootstrappingPartitions, partitions, consumer::position);
+
+                // A source switch invalidates this consumer's catch-up barriers: they were filtered to the
+                // source selected when they were computed, and nothing else recomputes them. Recompute
+                // against the NEW selection and let the existing catch-up machinery converge.
+                String currentSelectionKey = selectionKey(activeSelection.get());
+                if (!currentSelectionKey.equals(barriersSelectionKey)) {
+                    barriersSelectionKey = currentSelectionKey;
+                    catchUpEndOffsets.clear();
+                    catchUpEndOffsets.putAll(
+                            catchUpEndOffsets(boundedEndOffsets(consumer, partitions), topicEvents));
+                    live = caughtUp(consumer, catchUpEndOffsets);
+                    if (!live) {
+                        markCacheRecovering(caughtUpFlag);
+                    }
+                }
                 if (!live && caughtUp(consumer, catchUpEndOffsets)) {
                     live = true;
+                }
+                if (live) {
+                    // Converge every poll, not on a one-shot flag transition: readiness withheld by the
+                    // fail-closed check in markSelectionReady (bootstrap still replaying) must be retried
+                    // once the last barrier retires, and markCacheCaughtUp's false->true CAS may never fire
+                    // again. Both calls are idempotent and markSelectionReady re-validates under readyLock,
+                    // so this is safe and cheap.
                     markCacheCaughtUp(name, events, caughtUpFlag);
+                    ActiveSelection liveSelection = activeSelection.get();
+                    if (liveSelection != null
+                            && !selectionKey(liveSelection).equals(readySelectionKey.get())) {
+                        markSelectionReady(liveSelection);
+                    }
                 }
             }
         }
@@ -8276,8 +8284,10 @@ public class FeedGatewayService implements ReplayRunner {
         bootstrappingPartitions.put(partition, new BootstrapState(source, barrier, sinceMs, "test"));
     }
 
-    void releaseBootstrapEntriesOwnedByForTest(String owner) {
-        releaseBootstrapEntriesOwnedBy(owner);
+    void supersedeBootstrapEntriesForTest(String owner, Map<TopicPartition, Long> freshEndOffsets,
+                                          String topic, String source) {
+        supersedeBootstrapEntries(owner, freshEndOffsets,
+                Map.of(topic, new TopicBinding(source, "snapshot")));
     }
 
     /** Test seam: run one retirement pass and report which partitions remain exempt. */
