@@ -204,7 +204,13 @@ class FeedGatewayServiceTest {
         List<TopicPartition> partitions = List.of(old, fresh);
 
         KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
-        org.mockito.Mockito.when(consumer.endOffsets(org.mockito.ArgumentMatchers.anyCollection()))
+        // Stub ONLY the bounded overload. The guard must never call the no-timeout endOffsets(Collection) —
+        // that blocks the poll thread for default.api.timeout.ms (60s) on a broker hiccup — so leaving the
+        // 1-arg overload unstubbed (returns an empty map, no lag measured, no fire) pins the production
+        // code to the bounded call: the "does fire" assertion below fails if anyone reverts it.
+        org.mockito.Mockito.when(consumer.endOffsets(
+                        org.mockito.ArgumentMatchers.anyCollection(),
+                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
                 .thenReturn(Map.of(old, 10L, fresh, 5_000_000L));
         org.mockito.Mockito.when(consumer.position(old)).thenReturn(10L);
         org.mockito.Mockito.when(consumer.position(fresh)).thenReturn(0L);
@@ -218,6 +224,52 @@ class FeedGatewayServiceTest {
         notExempt.applySelectionForTest("DATABENTO", "ES", "20260731", 1L);
         assertTrue(notExempt.lagSkipFiredForTest(consumer, partitions, "DATABENTO", "snapshot", Set.of()),
                 "without the exemption the same backlog does fire the lag skip — the guard is load-bearing");
+    }
+
+    @Test
+    void lagCheckThatCannotCompleteIsSkippedNotActedOn() {
+        // A lag CHECK failing is a skipped check. Acting on it — seekToEnd, source-stale, or unwinding into
+        // a consumer rebuild — would turn a broker metadata hiccup into real data movement.
+        TopicPartition partition = new TopicPartition("t", 0);
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(consumer.endOffsets(
+                        org.mockito.ArgumentMatchers.anyCollection(),
+                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
+                .thenThrow(new org.apache.kafka.common.errors.TimeoutException("metadata hiccup"));
+
+        FeedGatewayService service = service();
+        service.applySelectionForTest("DATABENTO", "ES", "20260731", 1L);
+        assertFalse(service.lagSkipFiredForTest(consumer, List.of(partition), "DATABENTO", "snapshot", Set.of()),
+                "an endOffsets timeout must not fire the lag response");
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never())
+                .seekToEnd(org.mockito.ArgumentMatchers.anyCollection());
+    }
+
+    @Test
+    void initialBootstrapBacklogIsExemptFromTheLagGuardUntilCaughtUp() throws Exception {
+        // A RESTARTED cache consumer replays its full cache window — a backlog that dwarfs maxLagRecords.
+        // Its exemptions from the previous attempt were correctly released on exit, so the replacement MUST
+        // register its own for the initial bootstrap; otherwise the guard seeks the rebuild away and the
+        // untouched barriers are trivially met — caught-up over an incomplete cache, at every restart.
+        FeedGatewayService service = service();
+        TopicPartition partition = new TopicPartition("databento.display", 0);
+
+        Method register = FeedGatewayService.class.getDeclaredMethod(
+                "registerBootstrapEntries", String.class, Map.class, Map.class);
+        register.setAccessible(true);
+        Class<?> bindingClass = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Constructor<?> ctor = bindingClass.getDeclaredConstructor(String.class, String.class);
+        ctor.setAccessible(true);
+        Map<String, Object> topicEvents = new java.util.LinkedHashMap<>();
+        topicEvents.put("databento.display", ctor.newInstance("DATABENTO", "snapshot"));
+        register.invoke(service, "avro", Map.of(partition, 4_000_000L), topicEvents);
+
+        assertTrue(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
+                "the initial bootstrap is a replay-in-progress and must carry a lag-guard exemption");
+
+        // ...and the attempt's death releases exactly its own entries (the restart cycle is leak-free).
+        service.releaseBootstrapEntriesOwnedByForTest("avro");
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"));
     }
 
     @Test

@@ -1688,6 +1688,17 @@ public class FeedGatewayService implements ReplayRunner {
         );
     }
 
+    /** Register a replay-in-progress exemption per partition: owned by this attempt, retired at its barrier. */
+    private void registerBootstrapEntries(String owner, Map<TopicPartition, Long> endOffsets,
+                                          Map<String, TopicBinding> topicEvents) {
+        long nowMs = System.currentTimeMillis();
+        endOffsets.forEach((partition, endOffset) -> {
+            TopicBinding binding = topicEvents.get(partition.topic());
+            bootstrappingPartitions.put(partition, new BootstrapState(
+                    binding == null ? "" : binding.source(), endOffset, nowMs, owner));
+        });
+    }
+
     /** See the ownership comment in runAssignedCacheConsumerOnce — a dead attempt's entries must die with it. */
     private void releaseBootstrapEntriesOwnedBy(String owner) {
         bootstrappingPartitions.values().removeIf(state -> owner.equals(state.owner()));
@@ -1703,12 +1714,22 @@ public class FeedGatewayService implements ReplayRunner {
             List<TopicPartition> partitions = partitionsFor(name, consumer, topicEvents.keySet());
             consumer.assign(partitions);
             seekToCacheWindow(consumer, partitions, topicEvents);
-            Map<TopicPartition, Long> bootstrapEndOffsets = boundedEndOffsets(consumer, partitions);
+            // Bootstrap gets the BOOTSTRAP budget: a broker that answers in 10s is slow, not broken, and
+            // must bootstrap rather than crash-loop. The 2s refresh budget applies only inside the poll
+            // loop, where blocking is the cost and a failed call is a free retry.
+            Map<TopicPartition, Long> bootstrapEndOffsets =
+                    boundedEndOffsets(consumer, partitions, settings.metadataTimeoutMs());
             // Capture the key BEFORE deriving barriers from the selection. Captured after, a selection that
             // rolled in between would leave OLD-source barriers labelled with the NEW key -- a mismatch that
             // never fires, so the recompute below would never run. Captured before, the worst case is one
             // redundant recompute, which is idempotent.
             String barriersSelectionKey = selectionKey(activeSelection.get());
+            // The INITIAL cache-window replay is exactly as much "intended backlog" as a mid-run discovery:
+            // without these exemptions, a consumer RESTART with a window larger than maxLagRecords lets the
+            // lag guard seekToEnd the whole rebuild away, after which the untouched catch-up barriers are
+            // trivially met and the gateway reports caught-up over an incomplete cache. Entries are owned by
+            // this attempt (released on exit) and retire per partition as its barrier is reached.
+            registerBootstrapEntries(name, bootstrapEndOffsets, topicEvents);
             Map<TopicPartition, Long> catchUpEndOffsets =
                     new LinkedHashMap<>(catchUpEndOffsets(bootstrapEndOffsets, topicEvents));
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
@@ -1751,12 +1772,7 @@ public class FeedGatewayService implements ReplayRunner {
                     // measured as lag. The response to lag is seekToEnd across all selected partitions,
                     // which would erase this rebuild (and the healthy partitions' positions) and re-hide
                     // the strikes. Tracked against raw end offsets so a barrier always exists to clear it.
-                    long discoveredAtMs = System.currentTimeMillis();
-                    addedEndOffsets.forEach((partition, endOffset) -> {
-                        TopicBinding binding = topicEvents.get(partition.topic());
-                        bootstrappingPartitions.put(partition, new BootstrapState(
-                                binding == null ? "" : binding.source(), endOffset, discoveredAtMs, name));
-                    });
+                    registerBootstrapEntries(name, addedEndOffsets, topicEvents);
                 }
                 clearReachedBootstrapBarriers(bootstrappingPartitions, partitions, consumer::position);
                 maybeSeekSelectedSourceToLatest(consumer, partitions, topicEvents,
@@ -2408,7 +2424,16 @@ public class FeedGatewayService implements ReplayRunner {
         if (selectedPartitions.isEmpty()) {
             return;
         }
-        Map<TopicPartition, Long> endOffsets = consumer.endOffsets(selectedPartitions);
+        Map<TopicPartition, Long> endOffsets;
+        try {
+            // Bounded: the no-timeout overload blocks for default.api.timeout.ms (60s) ON THE POLL THREAD.
+            endOffsets = boundedEndOffsets(consumer, selectedPartitions);
+        } catch (org.apache.kafka.common.errors.TimeoutException e) {
+            // A lag CHECK that cannot complete is a skipped check, nothing more. Acting on it — seeking,
+            // reporting stale, or letting the exception unwind and rebuild the consumer — would convert a
+            // broker metadata hiccup into real data movement. The guard re-arms in 5s.
+            return;
+        }
         long maxLag = 0L;
         for (TopicPartition partition : selectedPartitions) {
             long endOffset = endOffsets.getOrDefault(partition, 0L);
@@ -2855,8 +2880,13 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private Map<TopicPartition, Long> boundedEndOffsets(KafkaConsumer<?, ?> consumer,
                                                         Collection<TopicPartition> partitions) {
-        return consumer.endOffsets(partitions,
-                Duration.ofMillis(settings.partitionRefreshMetadataTimeoutMs()));
+        return boundedEndOffsets(consumer, partitions, settings.partitionRefreshMetadataTimeoutMs());
+    }
+
+    private Map<TopicPartition, Long> boundedEndOffsets(KafkaConsumer<?, ?> consumer,
+                                                        Collection<TopicPartition> partitions,
+                                                        long budgetMs) {
+        return consumer.endOffsets(partitions, Duration.ofMillis(budgetMs));
     }
 
     private boolean caughtUp(KafkaConsumer<?, ?> consumer, Map<TopicPartition, Long> endOffsets) {
