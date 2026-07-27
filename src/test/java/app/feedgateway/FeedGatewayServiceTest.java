@@ -3,6 +3,7 @@ package app.feedgateway;
 import app.feedgateway.mtsession.gateway.ReplayParams;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.Test;
 
 import org.springframework.web.socket.TextMessage;
@@ -132,6 +133,32 @@ class FeedGatewayServiceTest {
         assertEquals("DATABENTO|SPX", updateCache(service, topicBinding("DATABENTO", "spx-price"),
                 recordAt(settings.underlyingSpxPriceTopic(), 0, 1L, "SPX", json, now), json),
                 "the canonical spot must cache under the source-prefixed symbol key (one last-value-wins entry)");
+    }
+
+    @Test
+    void detectsPartitionsAddedAfterManualAssignment() {
+        List<TopicPartition> assigned = List.of(
+                new TopicPartition("es.options.databento.seller-activity", 0),
+                new TopicPartition("es.options.databento.seller-activity", 1),
+                new TopicPartition("other", 0));
+        List<TopicPartition> discovered = List.of(
+                new TopicPartition("es.options.databento.seller-activity", 0),
+                new TopicPartition("es.options.databento.seller-activity", 1),
+                new TopicPartition("es.options.databento.seller-activity", 2),
+                new TopicPartition("es.options.databento.seller-activity", 3),
+                new TopicPartition("other", 0));
+
+        assertEquals(List.of(
+                        new TopicPartition("es.options.databento.seller-activity", 2),
+                        new TopicPartition("es.options.databento.seller-activity", 3)),
+                FeedGatewayService.addedPartitions(assigned, discovered));
+    }
+
+    @Test
+    void partitionMetadataRefreshIsBoundedAndEnabledByDefault() {
+        long refreshMs = new GatewaySettings().partitionMetadataRefreshMs();
+        assertTrue(refreshMs >= 1_000L);
+        assertTrue(refreshMs <= 60_000L);
     }
 
     @Test
