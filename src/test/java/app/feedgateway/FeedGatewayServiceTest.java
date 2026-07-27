@@ -155,10 +155,52 @@ class FeedGatewayServiceTest {
     }
 
     @Test
-    void partitionMetadataRefreshIsBoundedAndEnabledByDefault() {
-        long refreshMs = new GatewaySettings().partitionMetadataRefreshMs();
-        assertTrue(refreshMs >= 1_000L);
-        assertTrue(refreshMs <= 60_000L);
+    void partitionRefreshNeverDropsAnOptionalTopicThatWentMissingFromMetadata() {
+        // partitionsFor() SKIPS an optional topic that is momentarily absent, so a refresh that happens to
+        // land in that window sees a SHORTER list. Assigning it verbatim would silently unassign the
+        // dealer-ledger feed for the life of the consumer. The merged assignment must keep it.
+        List<TopicPartition> assigned = List.of(
+                new TopicPartition("es.options.databento.seller-activity", 0),
+                new TopicPartition("es.options.databento.seller-activity", 1),
+                new TopicPartition("dealer.ledger.state", 0));
+        List<TopicPartition> discovered = List.of(
+                new TopicPartition("es.options.databento.seller-activity", 0),
+                new TopicPartition("es.options.databento.seller-activity", 1),
+                new TopicPartition("es.options.databento.seller-activity", 2));
+
+        List<TopicPartition> added = FeedGatewayService.addedPartitions(assigned, discovered);
+        assertEquals(List.of(new TopicPartition("es.options.databento.seller-activity", 2)), added);
+
+        List<TopicPartition> merged = FeedGatewayService.mergedAssignment(assigned, added);
+        assertTrue(merged.contains(new TopicPartition("dealer.ledger.state", 0)),
+                "a transient metadata gap must never unassign an optional topic — it may only delay growth");
+        assertEquals(List.of(
+                        new TopicPartition("dealer.ledger.state", 0),
+                        new TopicPartition("es.options.databento.seller-activity", 0),
+                        new TopicPartition("es.options.databento.seller-activity", 1),
+                        new TopicPartition("es.options.databento.seller-activity", 2)),
+                merged);
+    }
+
+    @Test
+    void mergedAssignmentIsIdentityWhenNothingWasAdded() {
+        List<TopicPartition> assigned = List.of(
+                new TopicPartition("a", 0),
+                new TopicPartition("a", 1));
+        assertEquals(assigned, FeedGatewayService.mergedAssignment(assigned, List.of()));
+    }
+
+    @Test
+    void partitionMetadataRefreshHasABoundedFloor() {
+        // Env/system-property overrides are legitimate in a deployed shell, so assert the INVARIANT rather
+        // than the ambient value: a 0/negative/garbage setting must never turn the in-loop metadata refresh
+        // into a hot loop. (The old form asserted refreshMs <= 60_000, which no code enforces — it failed
+        // for anyone running with GATEWAY_PARTITION_METADATA_REFRESH_MS set above a minute.)
+        assertTrue(new GatewaySettings().partitionMetadataRefreshMs() >= 1_000L);
+        assertEquals(1_000L,
+                GatewaySettings.longValue("GATEWAY_PARTITION_REFRESH_FLOOR_PROBE_UNSET", 10L, 1_000L));
+        assertEquals(30_000L,
+                GatewaySettings.longValue("GATEWAY_PARTITION_REFRESH_DEFAULT_PROBE_UNSET", 30_000L, 1_000L));
     }
 
     @Test
