@@ -304,6 +304,74 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void markSelectionReadyItselfFailsClosedOnAnIncompleteBootstrap() throws Exception {
+        // applySelection is not the only path to source-ready: either cache consumer reaching caught-up
+        // also announces it, and consumer A can be complete while consumer B still replays this source.
+        // The choke point itself must refuse — otherwise the check in applySelection is bypassable.
+        FeedGatewayService service = service();
+        service.applySelectionForTest("DATABENTO", "SPX", "20260731", 1L);
+        service.registerBootstrapForTest(new TopicPartition("databento.display", 5), "DATABENTO", 900L, 1L);
+
+        Method mark = FeedGatewayService.class.getDeclaredMethod("markSelectionReady",
+                Class.forName("app.feedgateway.FeedGatewayService$ActiveSelection"));
+        mark.setAccessible(true);
+        Field selRef = FeedGatewayService.class.getDeclaredField("activeSelection");
+        selRef.setAccessible(true);
+        Object selection = ((AtomicReference<?>) selRef.get(service)).get();
+        Field readyKey = FeedGatewayService.class.getDeclaredField("readySelectionKey");
+        readyKey.setAccessible(true);
+
+        mark.invoke(service, selection);
+        assertEquals("", ((AtomicReference<?>) readyKey.get(service)).get(),
+                "source-ready must NOT be announced while the selected source has a replaying partition");
+
+        // Barrier reached → the same call now succeeds: readiness was deferred, not dropped.
+        service.retireReachedBootstrapForTest(
+                List.of(new TopicPartition("databento.display", 5)), partition -> 900L);
+        mark.invoke(service, selection);
+        assertFalse(((AtomicReference<?>) readyKey.get(service)).get().toString().isEmpty(),
+                "once the bootstrap completes the identical call announces readiness");
+    }
+
+    @Test
+    void deadConsumerAttemptsBootstrapEntriesAreReleasedWithIt() {
+        // A dead attempt's entry can never be retired (retirement needs that consumer's position()), so
+        // leaving it behind would withhold readiness for its source forever. The exit hook must drop
+        // exactly the dead owner's entries and nothing else.
+        FeedGatewayService service = service();
+        service.registerBootstrapForTest(new TopicPartition("a", 0), "DATABENTO", 100L, 1L); // owner "test"
+        service.releaseBootstrapEntriesOwnedByForTest("avro");
+        assertTrue(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
+                "another owner's entries survive an unrelated consumer's death");
+        service.releaseBootstrapEntriesOwnedByForTest("test");
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
+                "the dead owner's entries are gone, so its source can become ready again");
+    }
+
+    @Test
+    void probeOrderPutsKnownTopicsFirstAndRotatesTheUnknowns() {
+        // Known topics answer from the client metadata cache in microseconds and are the ones that detect
+        // growth; unknown (absent optional) topics each BLOCK for their full timeout. If the unknowns ran
+        // first, ~8 undeployed producers would eat the whole refresh budget and growth detection would be
+        // permanently dead — the 4→32 incident restored by its own fix. Rotation guarantees no unknown
+        // topic is permanently starved by the ones ahead of it either.
+        FeedGatewayService service = service();
+        Set<String> topics = new java.util.LinkedHashSet<>(
+                List.of("z-absent-1", "known-a", "m-absent-2", "known-b", "a-absent-3"));
+        Set<String> known = Set.of("known-a", "known-b");
+
+        List<String> first = service.probeOrder(topics, known);
+        assertEquals(List.of("known-a", "known-b"), first.subList(0, 2),
+                "assigned topics are probed before any potentially blocking unknown topic");
+        assertEquals(Set.of("z-absent-1", "m-absent-2", "a-absent-3"), Set.copyOf(first.subList(2, 5)),
+                "every unknown topic is still probed");
+
+        List<String> second = service.probeOrder(topics, known);
+        assertFalse(first.get(2).equals(second.get(2)),
+                "the head unknown rotates between passes, so no absent topic is permanently starved");
+    }
+
+    @Test
     void sourceReadinessIsWithheldWhileThatSourceIsStillBootstrapping() {
         FeedGatewayService service = service();
         service.registerBootstrapForTest(

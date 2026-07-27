@@ -49,6 +49,7 @@ import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -330,6 +331,9 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong lastLagCheckMs = new AtomicLong();
     /** Optional topics currently absent from metadata — shared across consumer threads, so log-once. */
     private final Set<String> absentOptionalTopics = ConcurrentHashMap.newKeySet();
+    /** Rotates which absent optional topic gets probed first, so none is permanently starved. */
+    private final java.util.concurrent.atomic.AtomicInteger unknownProbeRotation =
+            new java.util.concurrent.atomic.AtomicInteger();
     /**
      * Partitions discovered mid-run that are still replaying their cache rebuild, published at SERVICE
      * scope because two independent threads need them: the owning cache consumer (to keep them out of the
@@ -346,8 +350,11 @@ public class FeedGatewayService implements ReplayRunner {
      * @param source   the market-data source this partition feeds — the axis {@link #applySelection} asks about.
      * @param barrier  the end offset at discovery; the partition is complete once its position reaches it.
      * @param sinceMs  when the rebuild started, so a partition stuck replaying is externally visible.
+     * @param owner    the consumer attempt that created the entry; its exit removes the entry (see
+     *                 {@link #releaseBootstrapEntriesOwnedBy}) — a dead attempt's entry could never be
+     *                 retired and would withhold readiness for its source forever.
      */
-    private record BootstrapState(String source, long barrier, long sinceMs) {
+    private record BootstrapState(String source, long barrier, long sinceMs, String owner) {
     }
     private final AtomicReference<String> readySelectionKey = new AtomicReference<>("");
 
@@ -1670,23 +1677,43 @@ public class FeedGatewayService implements ReplayRunner {
     private void runAssignedCacheConsumer(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
         runRetryingConsumer(
                 name,
-                retry -> runAssignedCacheConsumerOnce(name, topicEvents, avro, caughtUpFlag),
+                retry -> {
+                    try {
+                        runAssignedCacheConsumerOnce(name, topicEvents, avro, caughtUpFlag);
+                    } finally {
+                        releaseBootstrapEntriesOwnedBy(name);
+                    }
+                },
                 () -> markCacheRecovering(caughtUpFlag)
         );
     }
 
+    /** See the ownership comment in runAssignedCacheConsumerOnce — a dead attempt's entries must die with it. */
+    private void releaseBootstrapEntriesOwnedBy(String owner) {
+        bootstrappingPartitions.values().removeIf(state -> owner.equals(state.owner()));
+    }
+
     private void runAssignedCacheConsumerOnce(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
+        // Entries in the service-scoped bootstrap registry are owned by ONE consumer attempt. When this
+        // attempt exits -- crash, Kafka error, shutdown -- its entries MUST go with it: the replacement
+        // attempt re-bootstraps every partition through the full catch-up gate, so the incremental entries
+        // are obsolete, and a dead attempt's entry could never be retired (retirement needs this consumer's
+        // position()), which would withhold readiness for that source forever.
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
             List<TopicPartition> partitions = partitionsFor(name, consumer, topicEvents.keySet());
             consumer.assign(partitions);
             seekToCacheWindow(consumer, partitions, topicEvents);
-            Map<TopicPartition, Long> bootstrapEndOffsets = consumer.endOffsets(partitions);
+            Map<TopicPartition, Long> bootstrapEndOffsets = boundedEndOffsets(consumer, partitions);
+            // Capture the key BEFORE deriving barriers from the selection. Captured after, a selection that
+            // rolled in between would leave OLD-source barriers labelled with the NEW key -- a mismatch that
+            // never fires, so the recompute below would never run. Captured before, the worst case is one
+            // redundant recompute, which is idempotent.
+            String barriersSelectionKey = selectionKey(activeSelection.get());
             Map<TopicPartition, Long> catchUpEndOffsets =
                     new LinkedHashMap<>(catchUpEndOffsets(bootstrapEndOffsets, topicEvents));
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
             boolean live = caughtUp(consumer, catchUpEndOffsets);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
-            String barriersSelectionKey = selectionKey(activeSelection.get());
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
             }
@@ -1697,7 +1724,7 @@ public class FeedGatewayService implements ReplayRunner {
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
                     seekToCacheWindow(consumer, refresh.added(), topicEvents);
-                    Map<TopicPartition, Long> addedEndOffsets = consumer.endOffsets(refresh.added());
+                    Map<TopicPartition, Long> addedEndOffsets = boundedEndOffsets(consumer, refresh.added());
                     // TWO barriers, deliberately not the same set.
                     // Readiness is per-SELECTED-SOURCE, so it uses the source-filtered barriers: a partition
                     // on the non-selected source must not hold the cache in RECOVERING forever (there would
@@ -1728,12 +1755,22 @@ public class FeedGatewayService implements ReplayRunner {
                     addedEndOffsets.forEach((partition, endOffset) -> {
                         TopicBinding binding = topicEvents.get(partition.topic());
                         bootstrappingPartitions.put(partition, new BootstrapState(
-                                binding == null ? "" : binding.source(), endOffset, discoveredAtMs));
+                                binding == null ? "" : binding.source(), endOffset, discoveredAtMs, name));
                     });
                 }
                 clearReachedBootstrapBarriers(bootstrappingPartitions, partitions, consumer::position);
                 maybeSeekSelectedSourceToLatest(consumer, partitions, topicEvents,
                         bootstrappingPartitions.keySet());
+                // Explicit convergence: readiness withheld by applySelection (or refused by the fail-closed
+                // check in markSelectionReady) is only DEFERRED if something retries once the last barrier
+                // for the live selection retires. Nothing else would -- markCacheCaughtUp is one-shot on a
+                // false->true flag transition that may never come again. markSelectionReady is idempotent,
+                // re-validates against the live selection under readyLock, and now fails closed itself, so
+                // calling it every poll is safe and cheap.
+                ActiveSelection liveSelection = activeSelection.get();
+                if (liveSelection != null && !selectionKey(liveSelection).equals(readySelectionKey.get())) {
+                    markSelectionReady(liveSelection);
+                }
 
                 // A source switch invalidates this consumer's catch-up barriers: they were filtered to the
                 // source selected when they were computed. Nothing else recomputes them — applySelection
@@ -1745,7 +1782,7 @@ public class FeedGatewayService implements ReplayRunner {
                     barriersSelectionKey = currentSelectionKey;
                     catchUpEndOffsets.clear();
                     catchUpEndOffsets.putAll(
-                            catchUpEndOffsets(consumer.endOffsets(partitions), topicEvents));
+                            catchUpEndOffsets(boundedEndOffsets(consumer, partitions), topicEvents));
                     live = caughtUp(consumer, catchUpEndOffsets);
                     if (live) {
                         // Converge unconditionally. applySelection may have withheld readiness on seeing a
@@ -2458,28 +2495,63 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics,
                                                long budgetMs) {
+        return partitionsFor(name, consumer, topics, budgetMs, Set.of());
+    }
+
+    /**
+     * Resolve every topic's partitions, or fail with {@link TopicMetadataTimeoutException}.
+     *
+     * <p><b>Probe order is load-bearing, not cosmetic.</b> A metadata lookup for a topic the client already
+     * knows is answered from its cache in microseconds; a lookup for an UNKNOWN topic BLOCKS for its whole
+     * timeout while the client retries. With ~8 optional producers undeployed -- the normal state after the
+     * daily Kafka wipe -- probing in arbitrary order under one shared budget lets the absent topics consume
+     * it entirely and the pass never completes. Under the small refresh budget that is fatal: every refresh
+     * throws, growth is never discovered, and the 4->32 incident silently returns. So:
+     *
+     * <ol>
+     *   <li>{@code alreadyKnownTopics} (the caller's current assignment) are probed FIRST. These are the
+     *       cheap cache reads, and they are the ones that actually detect growth -- the mission.</li>
+     *   <li>Everything else is probed afterwards with whatever budget remains, starting at a ROTATING
+     *       offset so no topic is permanently starved by the ones ahead of it. Running out of budget on an
+     *       OPTIONAL one is not a failure -- it is simply still absent, which the union assignment already
+     *       tolerates.</li>
+     * </ol>
+     *
+     * <p>Bootstrap passes an empty {@code alreadyKnownTopics} and the full 30s budget: nothing is known
+     * yet and every topic must resolve, so ordering is irrelevant and strictness is correct.
+     *
+     * <p>Running out of budget on a MANDATORY topic still fails the pass, and a partial pass is never
+     * published as an observation -- a short list must never be read as "those partitions are gone".
+     */
+    private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics,
+                                               long budgetMs, Set<String> alreadyKnownTopics) {
         long deadlineMs = System.currentTimeMillis() + budgetMs;
         Map<String, List<PartitionInfo>> metadata = new HashMap<>();
         while (running.get() && System.currentTimeMillis() < deadlineMs) {
             metadata.clear();
             boolean complete = true;
-            for (String topic : topics) {
+            for (String topic : probeOrder(topics, alreadyKnownTopics)) {
+                boolean known = alreadyKnownTopics.contains(topic);
                 long remainingMs = deadlineMs - System.currentTimeMillis();
                 if (remainingMs <= 0L) {
-                    complete = false; // partial pass — never publish it as an observation
-                    break;
+                    if (known || !isOptionalTopic(topic)) {
+                        complete = false; // partial view of a topic we must resolve -- never publish it
+                        break;
+                    }
+                    // Budget spent probing other absent optional topics. Leave this one for a later cycle;
+                    // its absence is an expected steady state and must not starve growth detection.
+                    continue;
                 }
                 List<PartitionInfo> partitions =
                         consumer.partitionsFor(topic, Duration.ofMillis(Math.min(1_000L, remainingMs)));
                 if (partitions == null || partitions.isEmpty()) {
                     if (isOptionalTopic(topic)) {
-                        // OPTIONAL topic (producer not deployed yet / absent): skip it so its
-                        // absence can NEVER block or crash-loop the shared consumer and starve
-                        // the mandatory feeds. It is now picked up by the periodic PartitionRefresh
-                        // once the producer creates it — no gateway restart required.
-                        // Log the TRANSITION only: this runs on every refresh interval (30s by default,
-                        // 1s at the configurable floor) for every consumer that binds an optional topic,
-                        // and an undeployed producer is an expected steady state after the daily wipe.
+                        // OPTIONAL topic (producer not deployed yet / absent): skip it so its absence can
+                        // NEVER block or crash-loop the shared consumer and starve the mandatory feeds. It
+                        // is picked up by the periodic PartitionRefresh once the producer creates it -- no
+                        // gateway restart required. Log the TRANSITION only: this runs every refresh
+                        // interval for every consumer that binds an optional topic, and an undeployed
+                        // producer is an expected steady state after the daily wipe.
                         if (absentOptionalTopics.add(name + "|" + topic)) {
                             System.err.println("Feed gateway " + name
                                     + ": optional topic absent, consuming without it: " + topic);
@@ -2506,6 +2578,25 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
         throw new TopicMetadataTimeoutException("Timed out waiting for Kafka topic metadata: " + topics);
+    }
+
+    /** Known topics first (cheap, detects growth), then the rest from a rotating offset (never starved). */
+    List<String> probeOrder(Set<String> topics, Set<String> alreadyKnownTopics) {
+        List<String> known = new ArrayList<>();
+        List<String> unknown = new ArrayList<>();
+        for (String topic : new java.util.TreeSet<>(topics)) { // stable order so rotation is meaningful
+            if (alreadyKnownTopics.contains(topic)) {
+                known.add(topic);
+            } else {
+                unknown.add(topic);
+            }
+        }
+        if (unknown.size() > 1) {
+            int offset = Math.floorMod(unknownProbeRotation.getAndIncrement(), unknown.size());
+            java.util.Collections.rotate(unknown, -offset);
+        }
+        known.addAll(unknown);
+        return known;
     }
 
     /**
@@ -2653,8 +2744,11 @@ public class FeedGatewayService implements ReplayRunner {
             }
             List<TopicPartition> discovered;
             try {
+                Set<String> assignedTopics = assigned.stream()
+                        .map(TopicPartition::topic)
+                        .collect(java.util.stream.Collectors.toUnmodifiableSet());
                 discovered = partitionsFor(name, consumer, topics,
-                        settings.partitionRefreshMetadataTimeoutMs());
+                        settings.partitionRefreshMetadataTimeoutMs(), assignedTopics);
             } catch (TopicMetadataTimeoutException e) {
                 // The ONLY condition we absorb, and now a dedicated type rather than "any RuntimeException":
                 // partitionsFor() exceeded its metadata deadline. At bootstrap that failure is correct;
@@ -2751,6 +2845,18 @@ public class FeedGatewayService implements ReplayRunner {
             List<TopicPartition> onNew = added.stream().filter(p -> !knownTopics.contains(p.topic())).toList();
             return new Refresh(merged, added, onGrown, onNew);
         }
+    }
+
+    /**
+     * {@code endOffsets} with an explicit bound. The no-timeout overload blocks for
+     * {@code default.api.timeout.ms} — 60s — and the refresh/selection-switch paths call this ON THE POLL
+     * THREAD, where a broker hiccup would freeze consumption for a minute and pressure the whole pipeline.
+     * Callers treat a thrown TimeoutException like any other refresh failure: unwind or retry next poll.
+     */
+    private Map<TopicPartition, Long> boundedEndOffsets(KafkaConsumer<?, ?> consumer,
+                                                        Collection<TopicPartition> partitions) {
+        return consumer.endOffsets(partitions,
+                Duration.ofMillis(settings.partitionRefreshMetadataTimeoutMs()));
     }
 
     private boolean caughtUp(KafkaConsumer<?, ?> consumer, Map<TopicPartition, Long> endOffsets) {
@@ -3329,6 +3435,15 @@ public class FeedGatewayService implements ReplayRunner {
                 return;
             }
             if (key.equals(readySelectionKey.get())) {
+                return;
+            }
+            // FAIL CLOSED at the single choke point. applySelection performs the same check, but it is not
+            // the only caller: either cache consumer reaching caught-up also lands here, and consumer A can
+            // be complete while consumer B still has partitions of this source replaying. Announcing
+            // source-ready then would certify a cache that is knowably incomplete -- the original incident's
+            // symptom via a different route. Convergence is retried from the poll loop, so this defers
+            // readiness, never drops it.
+            if (hasIncompleteBootstrapForSource(selection.source())) {
                 return;
             }
             readySelectionKey.set(key);
@@ -7887,7 +8002,11 @@ public class FeedGatewayService implements ReplayRunner {
                     + " msSinceLastTopologyObservation=" + staleMs
                     + " bootstrappingPartitions=" + bootstrappingPartitions.size()
                     + " oldestBootstrapAgeMs=" + oldestBootstrapAgeMs);
-            if (discovered > 0 && assigned >= 0 && assigned != discovered) {
+            // Alert ONLY when discovery sees MORE than is assigned: partitions exist that this consumer is
+            // knowably not reading. The opposite direction (assigned > discovered) is healthy and expected:
+            // the union assignment deliberately RETAINS an optional topic's partitions while that topic is
+            // momentarily absent from a discovery pass, so equality is not an invariant.
+            if (discovered > 0 && assigned >= 0 && discovered > assigned) {
                 System.err.println("RGW_ALERT event=GATEWAY_PARTITION_ASSIGNMENT_INCOMPLETE"
                         + " consumer=" + quote(consumerName)
                         + " assignedPartitions=" + assigned
@@ -8124,7 +8243,11 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** Test seam: register a partition as mid-run bootstrapping, exactly as a refresh would. */
     void registerBootstrapForTest(TopicPartition partition, String source, long barrier, long sinceMs) {
-        bootstrappingPartitions.put(partition, new BootstrapState(source, barrier, sinceMs));
+        bootstrappingPartitions.put(partition, new BootstrapState(source, barrier, sinceMs, "test"));
+    }
+
+    void releaseBootstrapEntriesOwnedByForTest(String owner) {
+        releaseBootstrapEntriesOwnedBy(owner);
     }
 
     /** Test seam: run one retirement pass and report which partitions remain exempt. */
