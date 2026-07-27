@@ -221,6 +221,62 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void everyLiveOnlyRebuiltEventIsClassifiedForDiscoveryReplay() throws Exception {
+        // These events have NO cache-consumer rebuild path: updateCache has no case for them, so the live
+        // consumer is their only writer. Seeking a newly discovered partition to END would lose them —
+        // permanently for the one-shot transitions, and until the next dashboard interval for the trail.
+        Method classify = FeedGatewayService.class
+                .getDeclaredMethod("isLiveOnlyRebuiltEvent", String.class);
+        classify.setAccessible(true);
+
+        for (String event : List.of("turn-alert", "spread-skew-event", "strike-cluster")) {
+            assertTrue((boolean) classify.invoke(null, event),
+                    event + " is broadcast/cached ONLY by the live consumer and must replay on discovery");
+        }
+        // hot-strike is rebuilt by updateCache -> cacheHotStrike, and es-aggressor-flow is a compacted
+        // snapshot re-emitted every second, so both are correctly left seeking to END.
+        for (String event : List.of("hot-strike", "es-aggressor-flow", "snapshot", "gex", "max-pain")) {
+            assertFalse((boolean) classify.invoke(null, event),
+                    event + " has independent recovery and must not replay into the broadcast path");
+        }
+    }
+
+    @Test
+    void addedNonSelectedSourcePartitionsDoNotGateCacheReadiness() throws Exception {
+        // catchUpEndOffsets() falls back to "return them all" when nothing matches the selected source —
+        // correct for the bootstrap set, wrong for an incremental subset, where empty genuinely means
+        // "none of these are selected". Through the fallback, growth on IBKR while DATABENTO is selected
+        // would hold the cache in RECOVERING on a source nobody is watching.
+        FeedGatewayService service = service();
+        service.applySelectionForTest("DATABENTO", "ES", "20260731", 1L);
+
+        TopicPartition ibkr = new TopicPartition("ibkr.topic", 7);
+        Map<TopicPartition, Long> addedEndOffsets = Map.of(ibkr, 500L);
+
+        assertTrue(selectedSourceBarriers(service, addedEndOffsets, "ibkr.topic", "IBKR").isEmpty(),
+                "an added partition on the non-selected source contributes no readiness barrier");
+        assertEquals(1, selectedSourceBarriers(service, addedEndOffsets, "ibkr.topic", "DATABENTO").size(),
+                "an added partition on the selected source does contribute one");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<TopicPartition, Long> selectedSourceBarriers(
+            FeedGatewayService service, Map<TopicPartition, Long> endOffsets,
+            String topic, String bindingSource) throws Exception {
+        Class<?> bindingClass = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Constructor<?> ctor = bindingClass.getDeclaredConstructor(String.class, String.class);
+        ctor.setAccessible(true);
+        Object binding = ctor.newInstance(bindingSource, "snapshot");
+        Map<String, Object> topicEvents = new java.util.LinkedHashMap<>();
+        topicEvents.put(topic, binding);
+
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "selectedSourceBarriers", Map.class, Map.class);
+        method.setAccessible(true);
+        return (Map<TopicPartition, Long>) method.invoke(service, endOffsets, topicEvents);
+    }
+
+    @Test
     void bootstrapExemptionIsRetiredExactlyWhenThePartitionReachesItsBarrier() {
         TopicPartition replaying = new TopicPartition("t", 0);
         TopicPartition arrived = new TopicPartition("t", 1);

@@ -1675,8 +1675,14 @@ public class FeedGatewayService implements ReplayRunner {
                     // Readiness is per-SELECTED-SOURCE, so it uses the source-filtered barriers: a partition
                     // on the non-selected source must not hold the cache in RECOVERING forever (there would
                     // be nothing to clear it, since catchUpEndOffsets drops it).
+                    // NOT catchUpEndOffsets(): its "no selected partitions -> return them all" fallback is
+                    // right for the BOOTSTRAP set (a consumer with nothing on the selected source must
+                    // still gate on something) and wrong for an incremental subset, where an empty result
+                    // genuinely means "none of these belong to the selected source". Through the fallback,
+                    // adding only non-selected partitions would push their barriers into the readiness map
+                    // and hold the cache in RECOVERING on a source nobody is watching.
                     Map<TopicPartition, Long> addedSelected =
-                            catchUpEndOffsets(addedEndOffsets, topicEvents);
+                            selectedSourceBarriers(addedEndOffsets, topicEvents);
                     catchUpEndOffsets.putAll(addedSelected);
                     if (!addedSelected.isEmpty()) {
                         // The cache is NOT complete again until these have replayed. Without this the flag
@@ -1813,7 +1819,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<TopicPartition> cached = new ArrayList<>();
         for (TopicPartition partition : added) {
             TopicBinding binding = topicEvents.get(partition.topic());
-            if (binding != null && isDiscreteUncachedBroadcastEvent(binding.event())) {
+            if (binding != null && isLiveOnlyRebuiltEvent(binding.event())) {
                 discrete.add(partition);
             } else {
                 cached.add(partition);
@@ -1828,12 +1834,27 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * Events the live consumer broadcasts STANDALONE and deliberately never caches, so no cache consumer
-     * can recover them and seeking their partition to END loses them permanently. Keep in sync with the
-     * "never cached" branches in {@link #runLiveConsumerOnce}.
+     * Events whose ONLY writer is the live consumer, so the cache consumer cannot recover them and seeking
+     * a newly discovered partition to END loses them. The test is "does the cache path rebuild it?", NOT
+     * "is it cached?" — {@code strike-cluster} IS cached, but only by the live branch below; {@code
+     * updateCache} has no case for it, so the cache consumer reads those records and drops them.
+     *
+     * <ul>
+     *   <li>{@code turn-alert}, {@code spread-skew-event} — discrete one-shot transitions, never cached.</li>
+     *   <li>{@code strike-cluster} — dashboard + recent-signals trail, cached into {@code strikeClusters}
+     *       by the live branch only and replayed to connecting clients from there.</li>
+     * </ul>
+     *
+     * <p>Deliberately excluded: {@code hot-strike} (updateCache calls cacheHotStrike, so the cache consumer
+     * does rebuild it) and {@code es-aggressor-flow} (a compacted snapshot re-emitted every second — END
+     * loses only records something newer immediately supersedes).
+     *
+     * <p>Keep in sync with the standalone-broadcast branches in {@link #runLiveConsumerOnce}.
      */
-    private static boolean isDiscreteUncachedBroadcastEvent(String event) {
-        return "turn-alert".equals(event) || "spread-skew-event".equals(event);
+    private static boolean isLiveOnlyRebuiltEvent(String event) {
+        return "turn-alert".equals(event)
+                || "spread-skew-event".equals(event)
+                || "strike-cluster".equals(event);
     }
 
     private void seekToDiscoveryWindow(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions,
@@ -2611,6 +2632,27 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
         return selectedEndOffsets.isEmpty() ? endOffsets : selectedEndOffsets;
+    }
+
+    /**
+     * The same active-source filter as {@link #catchUpEndOffsets} WITHOUT its empty-result fallback, for
+     * partitions added mid-run. An empty result here means "none of the added partitions are on the
+     * selected source", which must stay empty — falling back to "all of them" would gate cache readiness
+     * on a source nobody is watching.
+     */
+    private Map<TopicPartition, Long> selectedSourceBarriers(
+            Map<TopicPartition, Long> endOffsets,
+            Map<String, TopicBinding> topicEvents
+    ) {
+        ActiveSelection selection = activeSelection.get();
+        Map<TopicPartition, Long> selected = new LinkedHashMap<>();
+        for (Map.Entry<TopicPartition, Long> entry : endOffsets.entrySet()) {
+            TopicBinding binding = topicEvents.get(entry.getKey().topic());
+            if (binding != null && requiresCatchUpForActiveSource(selection.source(), binding.source())) {
+                selected.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return selected;
     }
 
     static boolean requiresCatchUpForActiveSource(String activeSource, String bindingSource) {
@@ -6409,12 +6451,12 @@ public class FeedGatewayService implements ReplayRunner {
             if (!avroTopics.isEmpty()) {
                 avro = new KafkaConsumer<>(replayConsumerProps(appSessionId, true));
                 handle.avroConsumer = avro; // publish for wakeup() before any blocking call
-                openReplayPartitions(avro, params, avroTopics, true, parts);
+                openReplayPartitions(appSessionId, avro, params, avroTopics, true, parts);
             }
             if (!stringTopics.isEmpty()) {
                 str = new KafkaConsumer<>(replayConsumerProps(appSessionId, false));
                 handle.stringConsumer = str;
-                openReplayPartitions(str, params, stringTopics, false, parts);
+                openReplayPartitions(appSessionId, str, params, stringTopics, false, parts);
             }
             if (parts.isEmpty()) {
                 return new ReplayResult(0L, ReplayOutcome.COMPLETED);
@@ -6467,10 +6509,15 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** Assign + seek this consumer's partitions for the window (or full runId topics) and register state. */
-    private void openReplayPartitions(KafkaConsumer<String, Object> consumer, ReplayParams params,
+    private void openReplayPartitions(String appSessionId, KafkaConsumer<String, Object> consumer,
+                                      ReplayParams params,
                                       Map<String, String> topicEvents, boolean avro,
                                       Map<TopicPartition, ReplayPartitionState> parts) {
-        List<TopicPartition> partitions = partitionsFor("replay", consumer, topicEvents.keySet());
+        // Session-scoped name: concurrent replays would otherwise share one optional-topic log state and
+        // suppress each other's absent/present transitions.
+        List<TopicPartition> partitions =
+                partitionsFor("replay-" + appSessionId + (avro ? "-avro" : "-str"),
+                        consumer, topicEvents.keySet());
         consumer.assign(partitions);
         Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
         if (params.hasRun()) {
