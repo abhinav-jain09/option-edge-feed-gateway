@@ -36,9 +36,6 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.errors.AuthenticationException;
-import org.apache.kafka.common.errors.AuthorizationException;
-import org.apache.kafka.common.errors.InterruptException;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.springframework.stereotype.Service;
@@ -1239,7 +1236,7 @@ public class FeedGatewayService implements ReplayRunner {
     private void runSelectionConsumerOnce() {
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("selection"))) {
             Set<String> topics = Set.of(settings.marketDataSelectionTopic());
-            List<TopicPartition> partitions = partitionsFor(consumer, topics);
+            List<TopicPartition> partitions = partitionsFor("selection", consumer, topics);
             consumer.assign(partitions);
             consumer.seekToBeginning(partitions);
             PartitionRefresh partitionRefresh = new PartitionRefresh("selection", topics);
@@ -1496,7 +1493,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void runHpsfCacheConsumerOnce() {
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("hpsf-cache"))) {
-            List<TopicPartition> partitions = partitionsFor(consumer, hpsfTopics());
+            List<TopicPartition> partitions = partitionsFor("hpsf-cache", consumer, hpsfTopics());
             consumer.assign(partitions);
             seekToCacheWindow(consumer, partitions);
             Map<TopicPartition, Long> bootstrapEndOffsets =
@@ -1533,7 +1530,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void runHpsfLiveConsumerOnce(boolean retry) {
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("hpsf-live"))) {
-            List<TopicPartition> partitions = partitionsFor(consumer, hpsfTopics());
+            List<TopicPartition> partitions = partitionsFor("hpsf-live", consumer, hpsfTopics());
             consumer.assign(partitions);
             if (retry) {
                 seekToCacheWindow(consumer, partitions);
@@ -1613,7 +1610,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void runAlertConsumerOnce(Map<String, TopicBinding> topicEvents) {
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(stringConsumerProperties("alerts"))) {
-            List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
+            List<TopicPartition> partitions = partitionsFor("alerts", consumer, topicEvents.keySet());
             consumer.assign(partitions);
             consumer.seekToEnd(partitions);
             PartitionRefresh partitionRefresh = new PartitionRefresh("alerts", topicEvents.keySet());
@@ -1652,7 +1649,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void runAssignedCacheConsumerOnce(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
-            List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
+            List<TopicPartition> partitions = partitionsFor(name, consumer, topicEvents.keySet());
             consumer.assign(partitions);
             seekToCacheWindow(consumer, partitions, topicEvents);
             Map<TopicPartition, Long> bootstrapEndOffsets = consumer.endOffsets(partitions);
@@ -1662,6 +1659,7 @@ public class FeedGatewayService implements ReplayRunner {
             boolean live = caughtUp(consumer, catchUpEndOffsets);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
             Set<TopicPartition> bootstrapping = new LinkedHashSet<>();
+            Map<TopicPartition, Long> bootstrapBarriers = new LinkedHashMap<>();
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
             }
@@ -1672,24 +1670,31 @@ public class FeedGatewayService implements ReplayRunner {
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
                     seekToCacheWindow(consumer, refresh.added(), topicEvents);
-                    Map<TopicPartition, Long> addedBarriers =
-                            catchUpEndOffsets(consumer.endOffsets(refresh.added()), topicEvents);
-                    catchUpEndOffsets.putAll(addedBarriers);
-                    // The cache is NOT complete again until the added partitions have replayed. Without
-                    // this the flag stays CAUGHT UP and clients trust a cache missing every strike on the
-                    // new partitions — the exact user-visible symptom of the incident being fixed.
-                    live = false;
-                    markCacheRecovering(caughtUpFlag);
-                    // Exempt them from lag-skip until they reach their barrier: the window backlog we just
-                    // deliberately created looks like "selected source is lagging", and the lag-skip
-                    // response is seekToEnd on ALL selected partitions — which would erase this rebuild
-                    // (and the pre-existing partitions' too) and re-hide the strikes.
-                    bootstrapping.addAll(addedBarriers.keySet());
+                    Map<TopicPartition, Long> addedEndOffsets = consumer.endOffsets(refresh.added());
+                    // TWO barriers, deliberately not the same set.
+                    // Readiness is per-SELECTED-SOURCE, so it uses the source-filtered barriers: a partition
+                    // on the non-selected source must not hold the cache in RECOVERING forever (there would
+                    // be nothing to clear it, since catchUpEndOffsets drops it).
+                    Map<TopicPartition, Long> addedSelected =
+                            catchUpEndOffsets(addedEndOffsets, topicEvents);
+                    catchUpEndOffsets.putAll(addedSelected);
+                    if (!addedSelected.isEmpty()) {
+                        // The cache is NOT complete again until these have replayed. Without this the flag
+                        // stays CAUGHT UP and clients trust a cache missing every strike on the new
+                        // partitions — the exact user-visible symptom of the incident being fixed. Gated on
+                        // addedSelected so growth on a non-selected source cannot flap readiness for nothing.
+                        live = false;
+                        markCacheRecovering(caughtUpFlag);
+                    }
+                    // Lag-skip protection covers EVERY added partition, source-filtered or not: the
+                    // selection can change while a partition is still replaying, and it would then be
+                    // measured as lag. The response to lag is seekToEnd across all selected partitions,
+                    // which would erase this rebuild (and the healthy partitions' positions) and re-hide
+                    // the strikes. Tracked against raw end offsets so a barrier always exists to clear it.
+                    bootstrapBarriers.putAll(addedEndOffsets);
+                    bootstrapping.addAll(addedEndOffsets.keySet());
                 }
-                bootstrapping.removeIf(partition -> {
-                    Long barrier = catchUpEndOffsets.get(partition);
-                    return barrier == null || consumer.position(partition) >= barrier;
-                });
+                clearReachedBootstrapBarriers(bootstrapping, bootstrapBarriers, consumer::position);
                 maybeSeekSelectedSourceToLatest(consumer, partitions, topicEvents, bootstrapping);
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
@@ -1786,6 +1791,51 @@ public class FeedGatewayService implements ReplayRunner {
      * routing path does not gate generic events on cache acceptance — so a stale snapshot would regress
      * the UI. Those consumers seek new partitions to END and let the cache consumer cover the gap.
      */
+    /**
+     * Seek partitions a LIVE consumer just discovered, per binding, because the two classes of event on
+     * these topics have opposite correct answers:
+     *
+     * <ul>
+     *   <li>CACHED last-value events (snapshot, pace, gex, max-pain, …) seek to END. The cache consumer
+     *       independently rebuilds their window for connecting clients, and replaying here can hand
+     *       {@code routeOrBroadcast} a record the cache has already superseded — the per-session routing
+     *       path does not gate generic events on cache acceptance, so a stale snapshot would regress the UI.</li>
+     *   <li>DISCRETE never-cached events ({@link #isDiscreteUncachedBroadcastEvent}) seek back to the
+     *       discovery window. Nothing else in the system carries them: the cache consumer reads the record
+     *       but only calls updateCache, and these bindings are explicitly not cached, so seeking to END
+     *       would DELETE the event outright. Re-broadcasting one inside the discovery window is safe —
+     *       the producers re-assert and the payloads are TTL-keyed.</li>
+     * </ul>
+     */
+    private void seekAddedLivePartitions(KafkaConsumer<?, ?> consumer, List<TopicPartition> added,
+                                         Map<String, TopicBinding> topicEvents, long observedSinceMs) {
+        List<TopicPartition> discrete = new ArrayList<>();
+        List<TopicPartition> cached = new ArrayList<>();
+        for (TopicPartition partition : added) {
+            TopicBinding binding = topicEvents.get(partition.topic());
+            if (binding != null && isDiscreteUncachedBroadcastEvent(binding.event())) {
+                discrete.add(partition);
+            } else {
+                cached.add(partition);
+            }
+        }
+        if (!cached.isEmpty()) {
+            consumer.seekToEnd(cached);
+        }
+        if (!discrete.isEmpty()) {
+            seekToDiscoveryWindow(consumer, discrete, observedSinceMs);
+        }
+    }
+
+    /**
+     * Events the live consumer broadcasts STANDALONE and deliberately never caches, so no cache consumer
+     * can recover them and seeking their partition to END loses them permanently. Keep in sync with the
+     * "never cached" branches in {@link #runLiveConsumerOnce}.
+     */
+    private static boolean isDiscreteUncachedBroadcastEvent(String event) {
+        return "turn-alert".equals(event) || "spread-skew-event".equals(event);
+    }
+
     private void seekToDiscoveryWindow(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions,
                                        long observedSinceMs) {
         long cutoffMs = observedSinceMs;
@@ -1823,7 +1873,7 @@ public class FeedGatewayService implements ReplayRunner {
             boolean retry
     ) {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
-            List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
+            List<TopicPartition> partitions = partitionsFor(name, consumer, topicEvents.keySet());
             consumer.assign(partitions);
             if (retry) {
                 seekToCacheWindow(consumer, partitions, topicEvents);
@@ -1833,14 +1883,11 @@ public class FeedGatewayService implements ReplayRunner {
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
-                // LIVE consumer over CACHED topics: seek new partitions to END, matching this consumer's
-                // own bootstrap. The cache consumer rebuilds their window for connecting clients; replaying
-                // it here would hand routeOrBroadcast records the cache has already superseded, and the
-                // per-session routing path does not gate generic events on cache acceptance.
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
-                    consumer.seekToEnd(refresh.added());
+                    seekAddedLivePartitions(consumer, refresh.added(), topicEvents,
+                            refresh.observedSinceMs());
                 }
                 // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
                 // is only read by dumpDiagnosticState() to distinguish "consumers polling" from "forward gate stuck".
@@ -2329,7 +2376,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
-    private List<TopicPartition> partitionsFor(KafkaConsumer<?, ?> consumer, Set<String> topics) {
+    private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics) {
         long deadlineMs = System.currentTimeMillis() + settings.metadataTimeoutMs();
         Map<String, List<PartitionInfo>> metadata = new HashMap<>();
         while (running.get() && System.currentTimeMillis() < deadlineMs) {
@@ -2346,17 +2393,17 @@ public class FeedGatewayService implements ReplayRunner {
                         // Log the TRANSITION only: this runs on every refresh interval (30s by default,
                         // 1s at the configurable floor) for every consumer that binds an optional topic,
                         // and an undeployed producer is an expected steady state after the daily wipe.
-                        if (absentOptionalTopics.add(topic)) {
-                            System.err.println("Feed gateway: optional topic absent, consuming without it: "
-                                    + topic);
+                        if (absentOptionalTopics.add(name + "|" + topic)) {
+                            System.err.println("Feed gateway " + name
+                                    + ": optional topic absent, consuming without it: " + topic);
                         }
                         continue;
                     }
                     complete = false;
                     break;
                 }
-                if (absentOptionalTopics.remove(topic)) {
-                    System.out.println("Feed gateway: optional topic present again: " + topic);
+                if (absentOptionalTopics.remove(name + "|" + topic)) {
+                    System.out.println("Feed gateway " + name + ": optional topic present again: " + topic);
                 }
                 metadata.put(topic, partitions);
             }
@@ -2371,7 +2418,19 @@ public class FeedGatewayService implements ReplayRunner {
                 return result;
             }
         }
-        throw new IllegalStateException("Timed out waiting for Kafka topic metadata: " + topics);
+        throw new TopicMetadataTimeoutException("Timed out waiting for Kafka topic metadata: " + topics);
+    }
+
+    /**
+     * {@link #partitionsFor} exceeded its metadata deadline. A distinct type so the in-loop refresh can
+     * absorb exactly this transient condition and nothing else — every other Kafka runtime failure
+     * (invalid topic, config, auth, wakeup) must still reach {@code runRetryingConsumer}. Extends
+     * IllegalStateException so bootstrap callers and existing handlers behave exactly as before.
+     */
+    static final class TopicMetadataTimeoutException extends IllegalStateException {
+        TopicMetadataTimeoutException(String message) {
+            super(message);
+        }
     }
 
     static List<TopicPartition> addedPartitions(
@@ -2393,6 +2452,29 @@ public class FeedGatewayService implements ReplayRunner {
      * silent-data-loss shape this refresh mechanism exists to prevent. Taking the union means a transient
      * metadata gap can only ever DELAY growth, never drop a live feed.
      */
+    /**
+     * Retire the lag-skip exemption for every partition that has replayed up to its bootstrap barrier, and
+     * drop its barrier with it so neither collection grows for the life of the consumer.
+     *
+     * <p>A missing barrier also retires the partition: the exemption suppresses a real stale-source guard,
+     * so it must fail CLOSED. An entry that could never be cleared would disable lag protection for that
+     * partition permanently and silently.
+     */
+    static void clearReachedBootstrapBarriers(
+            Set<TopicPartition> bootstrapping,
+            Map<TopicPartition, Long> barriers,
+            java.util.function.ToLongFunction<TopicPartition> position
+    ) {
+        bootstrapping.removeIf(partition -> {
+            Long barrier = barriers.get(partition);
+            if (barrier == null || position.applyAsLong(partition) >= barrier) {
+                barriers.remove(partition);
+                return true;
+            }
+            return false;
+        });
+    }
+
     static List<TopicPartition> mergedAssignment(
             List<TopicPartition> assigned,
             List<TopicPartition> added
@@ -2457,18 +2539,14 @@ public class FeedGatewayService implements ReplayRunner {
             long observedSinceMs = lastObservedMs;
             List<TopicPartition> discovered;
             try {
-                discovered = partitionsFor(consumer, topics);
-            } catch (WakeupException | InterruptException e) {
-                // Shutdown/interrupt signals belong to runRetryingConsumer, never to us.
-                throw e;
-            } catch (AuthenticationException | AuthorizationException e) {
-                // Not a transient metadata hiccup: silently retrying every interval would leave the
-                // consumer permanently unable to absorb growth while looking healthy.
-                throw e;
-            } catch (RuntimeException e) {
-                // The ONLY case we absorb: partitionsFor() times out waiting on mandatory-topic metadata.
-                // At bootstrap that failure is correct; inside the poll loop it would tear the consumer
-                // down and re-bootstrap the whole cache window over a broker hiccup. Retry next interval.
+                discovered = partitionsFor(name, consumer, topics);
+            } catch (TopicMetadataTimeoutException e) {
+                // The ONLY condition we absorb, and now a dedicated type rather than "any RuntimeException":
+                // partitionsFor() exceeded its metadata deadline. At bootstrap that failure is correct;
+                // inside the poll loop it would tear the consumer down and re-bootstrap the whole cache
+                // window over a broker hiccup. Retry next interval. Everything else -- wakeup, interrupt,
+                // auth, invalid topic, config, any other Kafka client failure -- propagates untouched to
+                // runRetryingConsumer, which is the component that knows how to rebuild.
                 if (!refreshFailing) {
                     refreshFailing = true; // log the TRANSITION only — this can fire every interval
                     System.err.println("Feed gateway " + name + " partition metadata refresh failing,"
@@ -2743,7 +2821,7 @@ public class FeedGatewayService implements ReplayRunner {
         // would return the last-stable offset and capture a too-low barrier while a pre-open txn is open).
         barrierProps.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, BARRIER_CONSUMER_ISOLATION);
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(barrierProps)) {
-            List<TopicPartition> partitions = partitionsFor(consumer, Set.copyOf(topics));
+            List<TopicPartition> partitions = partitionsFor("barrier", consumer, Set.copyOf(topics));
             Map<TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
             System.out.println("Feed gateway captured " + endOffsets.size()
                     + " switch offset barriers for " + selection.source()
@@ -6392,7 +6470,7 @@ public class FeedGatewayService implements ReplayRunner {
     private void openReplayPartitions(KafkaConsumer<String, Object> consumer, ReplayParams params,
                                       Map<String, String> topicEvents, boolean avro,
                                       Map<TopicPartition, ReplayPartitionState> parts) {
-        List<TopicPartition> partitions = partitionsFor(consumer, topicEvents.keySet());
+        List<TopicPartition> partitions = partitionsFor("replay", consumer, topicEvents.keySet());
         consumer.assign(partitions);
         Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
         if (params.hasRun()) {

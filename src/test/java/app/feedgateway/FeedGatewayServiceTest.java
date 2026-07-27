@@ -221,6 +221,28 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void bootstrapExemptionIsRetiredExactlyWhenThePartitionReachesItsBarrier() {
+        TopicPartition replaying = new TopicPartition("t", 0);
+        TopicPartition arrived = new TopicPartition("t", 1);
+        TopicPartition orphan = new TopicPartition("t", 2); // exempt but no barrier — must fail CLOSED
+
+        Set<TopicPartition> bootstrapping =
+                new java.util.LinkedHashSet<>(List.of(replaying, arrived, orphan));
+        Map<TopicPartition, Long> barriers = new java.util.LinkedHashMap<>(Map.of(
+                replaying, 100L,
+                arrived, 100L));
+        Map<TopicPartition, Long> positions = Map.of(replaying, 40L, arrived, 100L, orphan, 0L);
+
+        FeedGatewayService.clearReachedBootstrapBarriers(
+                bootstrapping, barriers, partition -> positions.get(partition));
+
+        assertEquals(Set.of(replaying), bootstrapping,
+                "only the partition still behind its barrier keeps the lag-skip exemption");
+        assertEquals(Map.of(replaying, 100L), barriers,
+                "retired barriers must be dropped too, or both collections grow for the consumer's life");
+    }
+
+    @Test
     void partitionMetadataRefreshHasABoundedFloor() {
         // Env/system-property overrides are legitimate in a deployed shell, so assert the INVARIANT rather
         // than the ambient value: a 0/negative/garbage setting must never turn the in-loop metadata refresh
