@@ -1612,14 +1612,31 @@ public class FeedGatewayService implements ReplayRunner {
             consumer.assign(partitions);
             seekToCacheWindow(consumer, partitions, topicEvents);
             Map<TopicPartition, Long> bootstrapEndOffsets = consumer.endOffsets(partitions);
-            Map<TopicPartition, Long> catchUpEndOffsets = catchUpEndOffsets(bootstrapEndOffsets, topicEvents);
+            Map<TopicPartition, Long> catchUpEndOffsets =
+                    new LinkedHashMap<>(catchUpEndOffsets(bootstrapEndOffsets, topicEvents));
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
             boolean live = caughtUp(consumer, catchUpEndOffsets);
+            long nextPartitionRefreshMs =
+                    System.currentTimeMillis() + settings.partitionMetadataRefreshMs();
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
             }
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                if (System.currentTimeMillis() >= nextPartitionRefreshMs) {
+                    List<TopicPartition> discovered = partitionsFor(consumer, topicEvents.keySet());
+                    List<TopicPartition> added = addedPartitions(partitions, discovered);
+                    if (!added.isEmpty()) {
+                        consumer.assign(discovered);
+                        seekToCacheWindow(consumer, added, topicEvents);
+                        catchUpEndOffsets.putAll(catchUpEndOffsets(consumer.endOffsets(added), topicEvents));
+                        System.out.println("Feed gateway " + name + " discovered " + added.size()
+                                + " new Kafka partition(s): " + added);
+                        partitions = discovered;
+                    }
+                    nextPartitionRefreshMs =
+                            System.currentTimeMillis() + settings.partitionMetadataRefreshMs();
+                }
                 maybeSeekSelectedSourceToLatest(consumer, partitions, topicEvents);
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
@@ -1728,8 +1745,25 @@ public class FeedGatewayService implements ReplayRunner {
             } else {
                 consumer.seekToEnd(partitions);
             }
+            long nextPartitionRefreshMs =
+                    System.currentTimeMillis() + settings.partitionMetadataRefreshMs();
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                if (System.currentTimeMillis() >= nextPartitionRefreshMs) {
+                    List<TopicPartition> discovered = partitionsFor(consumer, topicEvents.keySet());
+                    List<TopicPartition> added = addedPartitions(partitions, discovered);
+                    if (!added.isEmpty()) {
+                        consumer.assign(discovered);
+                        // Recover the bounded cache window, not just records appended after discovery:
+                        // expansion may have happened up to one refresh interval earlier.
+                        seekToCacheWindow(consumer, added, topicEvents);
+                        System.out.println("Feed gateway " + name + " discovered " + added.size()
+                                + " new Kafka partition(s): " + added);
+                        partitions = discovered;
+                    }
+                    nextPartitionRefreshMs =
+                            System.currentTimeMillis() + settings.partitionMetadataRefreshMs();
+                }
                 // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
                 // is only read by dumpDiagnosticState() to distinguish "consumers polling" from "forward gate stuck".
                 if (!records.isEmpty()) {
@@ -2232,6 +2266,14 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
         throw new IllegalStateException("Timed out waiting for Kafka topic metadata: " + topics);
+    }
+
+    static List<TopicPartition> addedPartitions(
+            List<TopicPartition> assigned,
+            List<TopicPartition> discovered
+    ) {
+        Set<TopicPartition> existing = Set.copyOf(assigned);
+        return discovered.stream().filter(partition -> !existing.contains(partition)).toList();
     }
 
     private boolean caughtUp(KafkaConsumer<?, ?> consumer, Map<TopicPartition, Long> endOffsets) {

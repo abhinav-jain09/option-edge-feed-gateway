@@ -808,6 +808,15 @@ public final class GatewaySettings {
         return intValue("GATEWAY_KAFKA_POLL_MS", 250, 10);
     }
 
+    /**
+     * Manual assignment is intentional because every gateway replica needs a complete cache. Kafka does
+     * not rebalance manually assigned consumers when a producer expands a topic, so refresh metadata
+     * periodically and add new partitions without requiring a gateway restart.
+     */
+    public long partitionMetadataRefreshMs() {
+        return longValue("GATEWAY_PARTITION_METADATA_REFRESH_MS", 30_000L, 1_000L);
+    }
+
     public int webSocketBatchMs() {
         return intValue("GATEWAY_WS_BATCH_MS", 125, 100);
     }
