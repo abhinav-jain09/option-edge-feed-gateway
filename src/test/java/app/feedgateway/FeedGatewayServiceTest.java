@@ -3,6 +3,7 @@ package app.feedgateway;
 import app.feedgateway.mtsession.gateway.ReplayParams;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.Test;
 
@@ -20,6 +21,8 @@ import java.nio.file.Path;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -155,10 +158,157 @@ class FeedGatewayServiceTest {
     }
 
     @Test
-    void partitionMetadataRefreshIsBoundedAndEnabledByDefault() {
-        long refreshMs = new GatewaySettings().partitionMetadataRefreshMs();
-        assertTrue(refreshMs >= 1_000L);
-        assertTrue(refreshMs <= 60_000L);
+    void partitionRefreshNeverDropsAnOptionalTopicThatWentMissingFromMetadata() {
+        // partitionsFor() SKIPS an optional topic that is momentarily absent, so a refresh that happens to
+        // land in that window sees a SHORTER list. Assigning it verbatim would silently unassign the
+        // dealer-ledger feed for the life of the consumer. The merged assignment must keep it.
+        List<TopicPartition> assigned = List.of(
+                new TopicPartition("es.options.databento.seller-activity", 0),
+                new TopicPartition("es.options.databento.seller-activity", 1),
+                new TopicPartition("dealer.ledger.state", 0));
+        List<TopicPartition> discovered = List.of(
+                new TopicPartition("es.options.databento.seller-activity", 0),
+                new TopicPartition("es.options.databento.seller-activity", 1),
+                new TopicPartition("es.options.databento.seller-activity", 2));
+
+        List<TopicPartition> added = FeedGatewayService.addedPartitions(assigned, discovered);
+        assertEquals(List.of(new TopicPartition("es.options.databento.seller-activity", 2)), added);
+
+        List<TopicPartition> merged = FeedGatewayService.mergedAssignment(assigned, added);
+        assertTrue(merged.contains(new TopicPartition("dealer.ledger.state", 0)),
+                "a transient metadata gap must never unassign an optional topic — it may only delay growth");
+        assertEquals(List.of(
+                        new TopicPartition("dealer.ledger.state", 0),
+                        new TopicPartition("es.options.databento.seller-activity", 0),
+                        new TopicPartition("es.options.databento.seller-activity", 1),
+                        new TopicPartition("es.options.databento.seller-activity", 2)),
+                merged);
+    }
+
+    @Test
+    void mergedAssignmentIsIdentityWhenNothingWasAdded() {
+        List<TopicPartition> assigned = List.of(
+                new TopicPartition("a", 0),
+                new TopicPartition("a", 1));
+        assertEquals(assigned, FeedGatewayService.mergedAssignment(assigned, List.of()));
+    }
+
+    @Test
+    void lagSkipIgnoresPartitionsStillReplayingTheirDiscoveryBootstrap() {
+        // A partition discovered mid-run is deliberately seeked back over its cache window, so it carries a
+        // huge intended backlog. If the lag guard measured it, its response — seekToEnd across EVERY
+        // selected partition — would erase that rebuild and the healthy partitions' positions too, re-hiding
+        // exactly the strikes this mechanism exists to recover.
+        TopicPartition old = new TopicPartition("es.options.databento.seller-activity", 0);
+        TopicPartition fresh = new TopicPartition("es.options.databento.seller-activity", 4);
+        List<TopicPartition> partitions = List.of(old, fresh);
+
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(consumer.endOffsets(org.mockito.ArgumentMatchers.anyCollection()))
+                .thenReturn(Map.of(old, 10L, fresh, 5_000_000L));
+        org.mockito.Mockito.when(consumer.position(old)).thenReturn(10L);
+        org.mockito.Mockito.when(consumer.position(fresh)).thenReturn(0L);
+
+        FeedGatewayService exempt = service();
+        exempt.applySelectionForTest("DATABENTO", "ES", "20260731", 1L);
+        assertFalse(exempt.lagSkipFiredForTest(consumer, partitions, "DATABENTO", "snapshot", Set.of(fresh)),
+                "a bootstrapping partition's intended replay backlog must never trigger the lag skip");
+
+        FeedGatewayService notExempt = service();
+        notExempt.applySelectionForTest("DATABENTO", "ES", "20260731", 1L);
+        assertTrue(notExempt.lagSkipFiredForTest(consumer, partitions, "DATABENTO", "snapshot", Set.of()),
+                "without the exemption the same backlog does fire the lag skip — the guard is load-bearing");
+    }
+
+    @Test
+    void everyLiveOnlyRebuiltEventIsClassifiedForDiscoveryReplay() throws Exception {
+        // These events have NO cache-consumer rebuild path: updateCache has no case for them, so the live
+        // consumer is their only writer. Seeking a newly discovered partition to END would lose them —
+        // permanently for the one-shot transitions, and until the next dashboard interval for the trail.
+        Method classify = FeedGatewayService.class
+                .getDeclaredMethod("isLiveOnlyRebuiltEvent", String.class);
+        classify.setAccessible(true);
+
+        for (String event : List.of("turn-alert", "spread-skew-event", "strike-cluster")) {
+            assertTrue((boolean) classify.invoke(null, event),
+                    event + " is broadcast/cached ONLY by the live consumer and must replay on discovery");
+        }
+        // hot-strike is rebuilt by updateCache -> cacheHotStrike, and es-aggressor-flow is a compacted
+        // snapshot re-emitted every second, so both are correctly left seeking to END.
+        for (String event : List.of("hot-strike", "es-aggressor-flow", "snapshot", "gex", "max-pain")) {
+            assertFalse((boolean) classify.invoke(null, event),
+                    event + " has independent recovery and must not replay into the broadcast path");
+        }
+    }
+
+    @Test
+    void addedNonSelectedSourcePartitionsDoNotGateCacheReadiness() throws Exception {
+        // catchUpEndOffsets() falls back to "return them all" when nothing matches the selected source —
+        // correct for the bootstrap set, wrong for an incremental subset, where empty genuinely means
+        // "none of these are selected". Through the fallback, growth on IBKR while DATABENTO is selected
+        // would hold the cache in RECOVERING on a source nobody is watching.
+        FeedGatewayService service = service();
+        service.applySelectionForTest("DATABENTO", "ES", "20260731", 1L);
+
+        TopicPartition ibkr = new TopicPartition("ibkr.topic", 7);
+        Map<TopicPartition, Long> addedEndOffsets = Map.of(ibkr, 500L);
+
+        assertTrue(selectedSourceBarriers(service, addedEndOffsets, "ibkr.topic", "IBKR").isEmpty(),
+                "an added partition on the non-selected source contributes no readiness barrier");
+        assertEquals(1, selectedSourceBarriers(service, addedEndOffsets, "ibkr.topic", "DATABENTO").size(),
+                "an added partition on the selected source does contribute one");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<TopicPartition, Long> selectedSourceBarriers(
+            FeedGatewayService service, Map<TopicPartition, Long> endOffsets,
+            String topic, String bindingSource) throws Exception {
+        Class<?> bindingClass = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Constructor<?> ctor = bindingClass.getDeclaredConstructor(String.class, String.class);
+        ctor.setAccessible(true);
+        Object binding = ctor.newInstance(bindingSource, "snapshot");
+        Map<String, Object> topicEvents = new java.util.LinkedHashMap<>();
+        topicEvents.put(topic, binding);
+
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "selectedSourceBarriers", Map.class, Map.class);
+        method.setAccessible(true);
+        return (Map<TopicPartition, Long>) method.invoke(service, endOffsets, topicEvents);
+    }
+
+    @Test
+    void bootstrapExemptionIsRetiredExactlyWhenThePartitionReachesItsBarrier() {
+        TopicPartition replaying = new TopicPartition("t", 0);
+        TopicPartition arrived = new TopicPartition("t", 1);
+        TopicPartition orphan = new TopicPartition("t", 2); // exempt but no barrier — must fail CLOSED
+
+        Set<TopicPartition> bootstrapping =
+                new java.util.LinkedHashSet<>(List.of(replaying, arrived, orphan));
+        Map<TopicPartition, Long> barriers = new java.util.LinkedHashMap<>(Map.of(
+                replaying, 100L,
+                arrived, 100L));
+        Map<TopicPartition, Long> positions = Map.of(replaying, 40L, arrived, 100L, orphan, 0L);
+
+        FeedGatewayService.clearReachedBootstrapBarriers(
+                bootstrapping, barriers, partition -> positions.get(partition));
+
+        assertEquals(Set.of(replaying), bootstrapping,
+                "only the partition still behind its barrier keeps the lag-skip exemption");
+        assertEquals(Map.of(replaying, 100L), barriers,
+                "retired barriers must be dropped too, or both collections grow for the consumer's life");
+    }
+
+    @Test
+    void partitionMetadataRefreshHasABoundedFloor() {
+        // Env/system-property overrides are legitimate in a deployed shell, so assert the INVARIANT rather
+        // than the ambient value: a 0/negative/garbage setting must never turn the in-loop metadata refresh
+        // into a hot loop. (The old form asserted refreshMs <= 60_000, which no code enforces — it failed
+        // for anyone running with GATEWAY_PARTITION_METADATA_REFRESH_MS set above a minute.)
+        assertTrue(new GatewaySettings().partitionMetadataRefreshMs() >= 1_000L);
+        assertEquals(1_000L,
+                GatewaySettings.longValue("GATEWAY_PARTITION_REFRESH_FLOOR_PROBE_UNSET", 10L, 1_000L));
+        assertEquals(30_000L,
+                GatewaySettings.longValue("GATEWAY_PARTITION_REFRESH_DEFAULT_PROBE_UNSET", 30_000L, 1_000L));
     }
 
     @Test
