@@ -3,6 +3,7 @@ package app.feedgateway;
 import app.feedgateway.mtsession.gateway.ReplayParams;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.Test;
 
@@ -20,6 +21,8 @@ import java.nio.file.Path;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -188,6 +191,33 @@ class FeedGatewayServiceTest {
                 new TopicPartition("a", 0),
                 new TopicPartition("a", 1));
         assertEquals(assigned, FeedGatewayService.mergedAssignment(assigned, List.of()));
+    }
+
+    @Test
+    void lagSkipIgnoresPartitionsStillReplayingTheirDiscoveryBootstrap() {
+        // A partition discovered mid-run is deliberately seeked back over its cache window, so it carries a
+        // huge intended backlog. If the lag guard measured it, its response — seekToEnd across EVERY
+        // selected partition — would erase that rebuild and the healthy partitions' positions too, re-hiding
+        // exactly the strikes this mechanism exists to recover.
+        TopicPartition old = new TopicPartition("es.options.databento.seller-activity", 0);
+        TopicPartition fresh = new TopicPartition("es.options.databento.seller-activity", 4);
+        List<TopicPartition> partitions = List.of(old, fresh);
+
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(consumer.endOffsets(org.mockito.ArgumentMatchers.anyCollection()))
+                .thenReturn(Map.of(old, 10L, fresh, 5_000_000L));
+        org.mockito.Mockito.when(consumer.position(old)).thenReturn(10L);
+        org.mockito.Mockito.when(consumer.position(fresh)).thenReturn(0L);
+
+        FeedGatewayService exempt = service();
+        exempt.applySelectionForTest("DATABENTO", "ES", "20260731", 1L);
+        assertFalse(exempt.lagSkipFiredForTest(consumer, partitions, "DATABENTO", "snapshot", Set.of(fresh)),
+                "a bootstrapping partition's intended replay backlog must never trigger the lag skip");
+
+        FeedGatewayService notExempt = service();
+        notExempt.applySelectionForTest("DATABENTO", "ES", "20260731", 1L);
+        assertTrue(notExempt.lagSkipFiredForTest(consumer, partitions, "DATABENTO", "snapshot", Set.of()),
+                "without the exemption the same backlog does fire the lag skip — the guard is load-bearing");
     }
 
     @Test
