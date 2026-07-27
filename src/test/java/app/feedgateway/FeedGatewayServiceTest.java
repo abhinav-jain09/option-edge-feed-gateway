@@ -204,7 +204,13 @@ class FeedGatewayServiceTest {
         List<TopicPartition> partitions = List.of(old, fresh);
 
         KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
-        org.mockito.Mockito.when(consumer.endOffsets(org.mockito.ArgumentMatchers.anyCollection()))
+        // Stub ONLY the bounded overload. The guard must never call the no-timeout endOffsets(Collection) —
+        // that blocks the poll thread for default.api.timeout.ms (60s) on a broker hiccup — so leaving the
+        // 1-arg overload unstubbed (returns an empty map, no lag measured, no fire) pins the production
+        // code to the bounded call: the "does fire" assertion below fails if anyone reverts it.
+        org.mockito.Mockito.when(consumer.endOffsets(
+                        org.mockito.ArgumentMatchers.anyCollection(),
+                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
                 .thenReturn(Map.of(old, 10L, fresh, 5_000_000L));
         org.mockito.Mockito.when(consumer.position(old)).thenReturn(10L);
         org.mockito.Mockito.when(consumer.position(fresh)).thenReturn(0L);
@@ -218,6 +224,48 @@ class FeedGatewayServiceTest {
         notExempt.applySelectionForTest("DATABENTO", "ES", "20260731", 1L);
         assertTrue(notExempt.lagSkipFiredForTest(consumer, partitions, "DATABENTO", "snapshot", Set.of()),
                 "without the exemption the same backlog does fire the lag skip — the guard is load-bearing");
+    }
+
+    @Test
+    void lagCheckThatCannotCompleteIsSkippedNotActedOn() {
+        // A lag CHECK failing is a skipped check. Acting on it — seekToEnd, source-stale, or unwinding into
+        // a consumer rebuild — would turn a broker metadata hiccup into real data movement.
+        TopicPartition partition = new TopicPartition("t", 0);
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(consumer.endOffsets(
+                        org.mockito.ArgumentMatchers.anyCollection(),
+                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
+                .thenThrow(new org.apache.kafka.common.errors.TimeoutException("metadata hiccup"));
+
+        FeedGatewayService service = service();
+        service.applySelectionForTest("DATABENTO", "ES", "20260731", 1L);
+        assertFalse(service.lagSkipFiredForTest(consumer, List.of(partition), "DATABENTO", "snapshot", Set.of()),
+                "an endOffsets timeout must not fire the lag response");
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never())
+                .seekToEnd(org.mockito.ArgumentMatchers.anyCollection());
+    }
+
+    @Test
+    void initialBootstrapBacklogIsExemptFromTheLagGuardUntilCaughtUp() throws Exception {
+        // A RESTARTED cache consumer replays its full cache window — a backlog that dwarfs maxLagRecords.
+        // The replacement attempt MUST register exemptions for that initial bootstrap; otherwise the guard
+        // seeks the rebuild away and the untouched barriers are trivially met — caught-up over an
+        // incomplete cache, at every restart.
+        FeedGatewayService service = service();
+        TopicPartition partition = new TopicPartition("databento.display", 0);
+
+        Method register = FeedGatewayService.class.getDeclaredMethod(
+                "registerBootstrapEntries", String.class, Map.class, Map.class);
+        register.setAccessible(true);
+        Class<?> bindingClass = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Constructor<?> ctor = bindingClass.getDeclaredConstructor(String.class, String.class);
+        ctor.setAccessible(true);
+        Map<String, Object> topicEvents = new java.util.LinkedHashMap<>();
+        topicEvents.put("databento.display", ctor.newInstance("DATABENTO", "snapshot"));
+        register.invoke(service, "avro", Map.of(partition, 4_000_000L), topicEvents);
+
+        assertTrue(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
+                "the initial bootstrap is a replay-in-progress and must carry a lag-guard exemption");
     }
 
     @Test
@@ -280,22 +328,130 @@ class FeedGatewayServiceTest {
     void bootstrapExemptionIsRetiredExactlyWhenThePartitionReachesItsBarrier() {
         TopicPartition replaying = new TopicPartition("t", 0);
         TopicPartition arrived = new TopicPartition("t", 1);
-        TopicPartition orphan = new TopicPartition("t", 2); // exempt but no barrier — must fail CLOSED
+        TopicPartition foreign = new TopicPartition("other-consumers-topic", 9);
 
-        Set<TopicPartition> bootstrapping =
-                new java.util.LinkedHashSet<>(List.of(replaying, arrived, orphan));
-        Map<TopicPartition, Long> barriers = new java.util.LinkedHashMap<>(Map.of(
-                replaying, 100L,
-                arrived, 100L));
-        Map<TopicPartition, Long> positions = Map.of(replaying, 40L, arrived, 100L, orphan, 0L);
+        FeedGatewayService service = service();
+        service.registerBootstrapForTest(replaying, "DATABENTO", 100L, 1L);
+        service.registerBootstrapForTest(arrived, "DATABENTO", 100L, 1L);
+        service.registerBootstrapForTest(foreign, "IBKR", 100L, 1L);
 
-        FeedGatewayService.clearReachedBootstrapBarriers(
-                bootstrapping, barriers, partition -> positions.get(partition));
+        Map<TopicPartition, Long> positions = Map.of(replaying, 40L, arrived, 100L);
+        // `foreign` belongs to a different consumer: position() would throw on it, so the pass must skip it.
+        Set<TopicPartition> stillExempt = service.retireReachedBootstrapForTest(
+                List.of(replaying, arrived),
+                partition -> {
+                    Long p = positions.get(partition);
+                    if (p == null) {
+                        throw new IllegalStateException("position() called on an unassigned partition: " + partition);
+                    }
+                    return p;
+                });
 
-        assertEquals(Set.of(replaying), bootstrapping,
-                "only the partition still behind its barrier keeps the lag-skip exemption");
-        assertEquals(Map.of(replaying, 100L), barriers,
-                "retired barriers must be dropped too, or both collections grow for the consumer's life");
+        assertEquals(Set.of(replaying, foreign), stillExempt,
+                "only the partition still behind its barrier keeps the exemption; another consumer's stays");
+    }
+
+    @Test
+    void markSelectionReadyItselfFailsClosedOnAnIncompleteBootstrap() throws Exception {
+        // applySelection is not the only path to source-ready: either cache consumer reaching caught-up
+        // also announces it, and consumer A can be complete while consumer B still replays this source.
+        // The choke point itself must refuse — otherwise the check in applySelection is bypassable.
+        FeedGatewayService service = service();
+        service.applySelectionForTest("DATABENTO", "SPX", "20260731", 1L);
+        service.registerBootstrapForTest(new TopicPartition("databento.display", 5), "DATABENTO", 900L, 1L);
+
+        Method mark = FeedGatewayService.class.getDeclaredMethod("markSelectionReady",
+                Class.forName("app.feedgateway.FeedGatewayService$ActiveSelection"));
+        mark.setAccessible(true);
+        Field selRef = FeedGatewayService.class.getDeclaredField("activeSelection");
+        selRef.setAccessible(true);
+        Object selection = ((AtomicReference<?>) selRef.get(service)).get();
+        Field readyKey = FeedGatewayService.class.getDeclaredField("readySelectionKey");
+        readyKey.setAccessible(true);
+
+        mark.invoke(service, selection);
+        assertEquals("", ((AtomicReference<?>) readyKey.get(service)).get(),
+                "source-ready must NOT be announced while the selected source has a replaying partition");
+
+        // Barrier reached → the same call now succeeds: readiness was deferred, not dropped.
+        service.retireReachedBootstrapForTest(
+                List.of(new TopicPartition("databento.display", 5)), partition -> 900L);
+        mark.invoke(service, selection);
+        assertFalse(((AtomicReference<?>) readyKey.get(service)).get().toString().isEmpty(),
+                "once the bootstrap completes the identical call announces readiness");
+    }
+
+    @Test
+    void deadAttemptsEntriesFailClosedUntilTheReplacementSupersedesThem() {
+        // A dead attempt's entries deliberately SURVIVE its death: while its source's cache is knowably
+        // incomplete, readiness must keep failing closed. Releasing them on exit opened a window (death →
+        // replacement's re-registration) in which another consumer's convergence could announce the
+        // incomplete source READY — permanently, since readiness is one-shot per key. The replacement's
+        // bootstrap supersedes them: same keys overwritten with fresh barriers, leftover owned keys pruned.
+        FeedGatewayService service = service();
+        TopicPartition kept = new TopicPartition("a", 0);
+        TopicPartition leftover = new TopicPartition("a", 9); // e.g. from a growth event, gone after wipe
+        service.registerBootstrapForTest(kept, "DATABENTO", 100L, 1L);      // owner "test"
+        service.registerBootstrapForTest(leftover, "DATABENTO", 100L, 1L);  // owner "test"
+
+        // The attempt dies. NOTHING is released — the source stays incomplete across the gap.
+        assertTrue(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
+                "a dead attempt's entries keep failing closed until superseded");
+
+        // The replacement bootstraps with a fresh barrier for `kept`; `leftover` is pruned.
+        service.supersedeBootstrapEntriesForTest("test", Map.of(kept, 250L), "a", "DATABENTO");
+        assertTrue(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
+                "superseded entries gate readiness on the REPLACEMENT's rebuild");
+        Set<TopicPartition> remaining = service.retireReachedBootstrapForTest(
+                List.of(kept, leftover), partition -> 250L);
+        assertFalse(remaining.contains(leftover), "leftover owned keys are pruned by supersession");
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
+                "once the replacement reaches its own barrier the source may become ready");
+    }
+
+    @Test
+    void probeOrderPutsKnownTopicsFirstAndRotatesTheUnknowns() {
+        // Known topics answer from the client metadata cache in microseconds and are the ones that detect
+        // growth; unknown (absent optional) topics each BLOCK for their full timeout. If the unknowns ran
+        // first, ~8 undeployed producers would eat the whole refresh budget and growth detection would be
+        // permanently dead — the 4→32 incident restored by its own fix. Rotation guarantees no unknown
+        // topic is permanently starved by the ones ahead of it either.
+        FeedGatewayService service = service();
+        Set<String> topics = new java.util.LinkedHashSet<>(
+                List.of("z-absent-1", "known-a", "m-absent-2", "known-b", "a-absent-3"));
+        Set<String> known = Set.of("known-a", "known-b");
+
+        List<String> first = service.probeOrder(topics, known);
+        assertEquals(List.of("known-a", "known-b"), first.subList(0, 2),
+                "assigned topics are probed before any potentially blocking unknown topic");
+        assertEquals(Set.of("z-absent-1", "m-absent-2", "a-absent-3"), Set.copyOf(first.subList(2, 5)),
+                "every unknown topic is still probed");
+
+        List<String> second = service.probeOrder(topics, known);
+        assertFalse(first.get(2).equals(second.get(2)),
+                "the head unknown rotates between passes, so no absent topic is permanently starved");
+    }
+
+    @Test
+    void sourceReadinessIsWithheldWhileThatSourceIsStillBootstrapping() {
+        FeedGatewayService service = service();
+        service.registerBootstrapForTest(
+                new TopicPartition("ibkr.display", 7), "IBKR", 500L, 1L);
+
+        assertTrue(service.hasIncompleteBootstrapForSourceForTest("IBKR"),
+                "a switch to IBKR must not be announced ready while an IBKR partition is still replaying");
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest("DATABENTO"),
+                "the currently selected source is unaffected by growth on another source");
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest(null),
+                "a null/blank source must never be reported incomplete");
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest(""),
+                "a null/blank source must never be reported incomplete");
+
+        // Retiring the barrier releases the hold, so readiness is DEFERRED, never dropped.
+        service.retireReachedBootstrapForTest(
+                List.of(new TopicPartition("ibkr.display", 7)), partition -> 500L);
+        assertFalse(service.hasIncompleteBootstrapForSourceForTest("IBKR"),
+                "once the partition reaches its barrier the source may be announced ready");
     }
 
     @Test

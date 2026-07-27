@@ -817,6 +817,16 @@ public final class GatewaySettings {
         return longValue("GATEWAY_PARTITION_METADATA_REFRESH_MS", 30_000L, 1_000L);
     }
 
+    /**
+     * TOTAL metadata budget for ONE in-poll-loop partition refresh. Deliberately far below
+     * {@link #metadataTimeoutMs} (the BOOTSTRAP budget): a refresh runs on the poll thread, so its cost is
+     * stalled consumption, and a refresh that fails is a harmless no-op retried on the next interval.
+     * Spending the full 30s bootstrap budget there would be self-inflicted lag.
+     */
+    public long partitionRefreshMetadataTimeoutMs() {
+        return longValue("GATEWAY_PARTITION_REFRESH_METADATA_TIMEOUT_MS", 2_000L, 250L);
+    }
+
     public int webSocketBatchMs() {
         return intValue("GATEWAY_WS_BATCH_MS", 125, 100);
     }
