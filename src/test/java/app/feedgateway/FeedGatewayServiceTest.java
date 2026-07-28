@@ -139,6 +139,43 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void strikeFlowFreshnessUsesPayloadSnapshotTimeInsteadOfOldKafkaCreateTime() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        service.applySelectionForTest("DATABENTO", "SPX", "20260728", 1L);
+        long now = System.currentTimeMillis() + 1_000L;
+        long oldKafkaTime = now - settings.maxStaleMs() - 60_000L;
+        String payload = "{\"eventType\":\"strike-flow\",\"marketDataSource\":\"DATABENTO\","
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260728\",\"timestampMs\":" + now
+                + ",\"strikes\":[]}";
+        ConsumerRecord<String, String> record = recordAt(settings.databentoStrikeFlowTopic(),
+                5, Long.MAX_VALUE, "SPX|20260728", payload, oldKafkaTime);
+
+        assertEquals(now, eventCacheTimestamp(service, "strike-flow", record),
+                "the current whole-board payload time must win over an inherited stale Kafka timestamp");
+
+        assertTrue(shouldForward(service, topicBinding("DATABENTO", "strike-flow"), payload, record),
+                "a current board must remain live even when Kafka CREATE_TIME is older than maxStaleMs");
+    }
+
+    @Test
+    void strikeFlowTimestampFailsClosedWhenMissingMalformedOrImplausiblyFuture() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        ConsumerRecord<String, String> record = recordAt(settings.databentoStrikeFlowTopic(),
+                0, 1L, "SPX|20260728", "{}", now);
+
+        assertEquals(-1L, eventCacheTimestamp(service, "strike-flow", record));
+        assertEquals(-1L, eventCacheTimestamp(service, "strike-flow",
+                recordAt(settings.databentoStrikeFlowTopic(), 0, 2L, "SPX|20260728",
+                        "{\"timestampMs\":\"bad\"}", now)));
+        assertEquals(-1L, eventCacheTimestamp(service, "strike-flow",
+                recordAt(settings.databentoStrikeFlowTopic(), 0, 3L, "SPX|20260728",
+                        "{\"timestampMs\":" + (now + 120_000L) + "}", now)));
+    }
+
+    @Test
     void detectsPartitionsAddedAfterManualAssignment() {
         List<TopicPartition> assigned = List.of(
                 new TopicPartition("es.options.databento.seller-activity", 0),
@@ -2273,8 +2310,10 @@ class FeedGatewayServiceTest {
         );
         GatewaySettings settings = new GatewaySettings();
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        long now = System.currentTimeMillis();
         String payload = "{\"eventType\":\"strike-flow\",\"marketDataSource\":\"DATABENTO\","
-                + "\"symbol\":\"SPX\",\"expiry\":\"20260619\",\"strikes\":[]}";
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260619\",\"timestampMs\":" + now
+                + ",\"strikes\":[]}";
         Object binding = topicBinding("DATABENTO", "strike-flow");
         ConsumerRecord<String, String> record = new ConsumerRecord<>(
                 settings.databentoStrikeFlowTopic(),
@@ -3130,7 +3169,8 @@ class FeedGatewayServiceTest {
 
         // Same age, a FAST event (strike-flow) is still evicted on ingest by the generic 15-min window.
         String sfJson = "{\"eventType\":\"strike-flow\",\"marketDataSource\":\"DATABENTO\","
-                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"strikes\":[]}";
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"timestampMs\":" + thirtyFiveMinAgo
+                + ",\"strikes\":[]}";
         String sfKey = updateCache(service, topicBinding("DATABENTO", "strike-flow"),
                 recordAt(settings.databentoStrikeFlowTopic(), 0, 1L, "SPX|20260622", sfJson, thirtyFiveMinAgo),
                 sfJson);
@@ -3163,7 +3203,8 @@ class FeedGatewayServiceTest {
         updateCache(service, topicBinding("DATABENTO", "max-pain"),
                 new ConsumerRecord<>(settings.databentoMaxPainTopic(), 0, 1L, "SPX|20260622", maxPainJson), maxPainJson);
         String sfJson = "{\"eventType\":\"strike-flow\",\"marketDataSource\":\"DATABENTO\","
-                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"strikes\":[]}";
+                + "\"symbol\":\"SPX\",\"expiry\":\"20260622\",\"timestampMs\":" + now
+                + ",\"strikes\":[]}";
         updateCache(service, topicBinding("DATABENTO", "strike-flow"),
                 new ConsumerRecord<>(settings.databentoStrikeFlowTopic(), 0, 1L, "SPX|20260622", sfJson), sfJson);
         assertTrue(service.healthJson().contains("\"maxPain\":1"));
