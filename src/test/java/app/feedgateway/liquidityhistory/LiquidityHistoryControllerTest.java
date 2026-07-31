@@ -114,6 +114,11 @@ class LiquidityHistoryControllerTest {
 
         JsonNode envelope = body(response);
         assertEquals(1, envelope.path("historySchemaVersion").asInt());
+        // Which percentile produced every bucket's rawP99. Additive to v1, and it exists because
+        // the field NAME encodes a percentile the value no longer necessarily carries — without
+        // this, a gateway/UI divergence would be invisible to the consumer.
+        assertEquals(SessionAggregate.BucketFold.SATURATION_PCT,
+                envelope.path("saturationPct").asDouble(), 1e-9);
         assertEquals(SYMBOL, envelope.path("symbol").asText());
         assertEquals(EXPIRY, envelope.path("expiry").asText());
         assertEquals(TRADING_DAY.toString(), envelope.path("tradeDate").asText(),

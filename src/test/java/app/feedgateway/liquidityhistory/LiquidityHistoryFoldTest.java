@@ -246,15 +246,30 @@ class LiquidityHistoryFoldTest {
     }
 
     /**
-     * LOCKSTEP: the history percentile primes the SAME adaptive ramp scale the live frames drive
-     * (liquidity-heatmap.js frameP99). If these diverge, opening the board ratchets the scale to
-     * the history value and the colours drift for a decay half-life before settling — so the
-     * default is pinned here rather than left to two independently-edited files.
+     * Pins THIS repo's default only. It cannot see liquidity-heatmap.js, so it does NOT prove the
+     * UI agrees — an earlier version of this test claimed it did, which was false: changing the UI
+     * back to 0.99 would leave it green.
+     *
+     * <p>The actual anti-drift mechanism is deployment-level: web and gateway both read the SAME
+     * {@code HEATMAP_COLOR_SATURATION_PCT} key from the shared options-edge-config ConfigMap, so
+     * one value feeds both. These in-code defaults only apply when that key is absent. The
+     * response's {@code saturationPct} field makes any residual divergence observable at runtime.
      */
     @Test
-    void saturationPercentileMatchesTheUiDefault() {
+    void saturationPercentileDefaultIsPinned() {
         assertEquals(0.95d, SessionAggregate.BucketFold.SATURATION_PCT, 1e-9,
-                "must equal HEATMAP_COLOR_SATURATION_PCT's default in liquidity-heatmap.js");
+                "gateway default; the UI default lives in liquidity-heatmap.js and is NOT checked here");
+    }
+
+    /** A malformed or out-of-range override must fall back, never zero or invert the scale. */
+    @Test
+    void malformedSaturationOverrideFallsBackToTheDefault() {
+        for (String bad : new String[] {"", "abc", "0", "-0.5", "1.5", "NaN"}) {
+            assertEquals(0.95d, SessionAggregate.BucketFold.resolveSaturationPct(bad), 1e-9,
+                    "rejected override: '" + bad + "'");
+        }
+        assertEquals(0.99d, SessionAggregate.BucketFold.resolveSaturationPct("0.99"), 1e-9);
+        assertEquals(1.0d, SessionAggregate.BucketFold.resolveSaturationPct("1.0"), 1e-9);
     }
 
     @Test

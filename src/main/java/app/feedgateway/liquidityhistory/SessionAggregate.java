@@ -165,7 +165,7 @@ final class SessionAggregate {
             if (finalizedRawP99 >= 0) {
                 return 0L;
             }
-            finalizedRawP99 = nearestRankP99(pool, poolSize);
+            finalizedRawP99 = nearestRankSaturation(pool, poolSize);
             long released = 8L * poolSize;
             pool = null;
             poolSize = 0;
@@ -173,7 +173,7 @@ final class SessionAggregate {
         }
 
         ChainSnapshot.BucketProjection project() {
-            long rawP99 = finalizedRawP99 >= 0 ? finalizedRawP99 : nearestRankP99(pool, poolSize);
+            long rawP99 = finalizedRawP99 >= 0 ? finalizedRawP99 : nearestRankSaturation(pool, poolSize);
             List<ChainSnapshot.CellProjection> projectedCells = new ArrayList<>(cells.size());
             for (CellFold cell : cells.values()) {
                 projectedCells.add(cell.project(degraded));
@@ -204,20 +204,25 @@ final class SessionAggregate {
          * measurement note on HEATMAP_COLOR_SATURATION_PCT. The wire field stays named
          * {@code rawP99} (frozen history contract, historySchemaVersion 1).
          */
-        static final double SATURATION_PCT = saturationPct();
+        static final double DEFAULT_SATURATION_PCT = 0.95d;
+        static final double SATURATION_PCT = resolveSaturationPct(
+                app.feedgateway.GatewaySettings.value("HEATMAP_COLOR_SATURATION_PCT", ""));
 
-        private static double saturationPct() {
-            double pct = 0.95d;
-            try {
-                pct = Double.parseDouble(
-                        app.feedgateway.GatewaySettings.value("HEATMAP_COLOR_SATURATION_PCT", "0.95"));
-            } catch (NumberFormatException ignored) {
-                // fall through to the default — a malformed override must never zero the scale
+        /** Package-private for tests: anything malformed or outside (0,1] falls back. */
+        static double resolveSaturationPct(String raw) {
+            if (raw == null || raw.isBlank()) {
+                return DEFAULT_SATURATION_PCT;
             }
-            return pct > 0.0d && pct <= 1.0d ? pct : 0.95d;
+            double pct;
+            try {
+                pct = Double.parseDouble(raw.trim());
+            } catch (NumberFormatException ignored) {
+                return DEFAULT_SATURATION_PCT; // a malformed override must never zero the scale
+            }
+            return Double.isFinite(pct) && pct > 0.0d && pct <= 1.0d ? pct : DEFAULT_SATURATION_PCT;
         }
 
-        static long nearestRankP99(long[] pool, int size) {
+        static long nearestRankSaturation(long[] pool, int size) {
             if (size <= 0) {
                 return 0L;
             }
