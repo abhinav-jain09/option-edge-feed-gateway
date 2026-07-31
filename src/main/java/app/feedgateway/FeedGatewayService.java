@@ -133,6 +133,7 @@ public class FeedGatewayService implements ReplayRunner {
             "gex-oi-status",
             "strike-sr",
             "gex-magnet",
+            "gamma-migration",
             "es-gex",
             "es-strike-intel",
             "gex-strike-lifecycle",
@@ -210,6 +211,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> gexOiStatus = new ConcurrentHashMap<>();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
+    private final Map<String, String> gammaMigration = new ConcurrentHashMap<>();
     // ES-on-SPX aligned whole-book per symbol|expiry (JSON, roll-forward: latest emitEventTimeMs wins).
     private final Map<String, String> esGex = new ConcurrentHashMap<>();
     // ES strike-intelligence projected onto SPX strikes, keyed by NATIVE ES identity (symbol|expiry|esStrike,
@@ -300,6 +302,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingGexOiStatus = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeSr = new LinkedHashMap<>();
     private final Map<String, String> pendingGexMagnet = new LinkedHashMap<>();
+    private final Map<String, String> pendingGammaMigration = new LinkedHashMap<>();
     private final Map<String, String> pendingEsGex = new LinkedHashMap<>();
     private final Map<String, String> pendingEsStrikeIntel = new LinkedHashMap<>();
     private final Map<String, String> pendingGexStrikeLifecycle = new LinkedHashMap<>();
@@ -582,7 +585,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (avroCaughtUp.get()) {
             // max-pain + strike-sr are DATABENTO-only Avro, so they bootstrap purely via the Avro consumer.
-            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gex-strike-lifecycle"));
+            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gamma-migration", "gex-strike-lifecycle"));
         }
         if (stateCaughtUp.get()) {
             sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
@@ -1303,6 +1306,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
+        topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
@@ -1416,6 +1420,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoMaxPainTopic(), new TopicBinding("DATABENTO", "max-pain"));
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
+        topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
@@ -3216,6 +3221,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.databentoGexTopic(),
                     settings.unifiedSrTopic(),
                     settings.databentoGexMagnetTopic(),
+                    settings.gammaMigrationTopic(),
                     settings.databentoMaxPainTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic(),
@@ -3228,7 +3234,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "gamma-migration", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
     }
 
     /**
@@ -3368,6 +3374,15 @@ public class FeedGatewayService implements ReplayRunner {
             // gateway has captured source-switch offset barriers, so applying that offset barrier can suppress
             // valid fresh levels indefinitely. Keep the same source/symbol/expiry and max-stale gates used by
             // mission-* while bypassing only the offset barrier.
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
+                    && matchesActiveSelection(json, selection);
+        }
+        if ("gamma-migration".equals(binding.event())) {
+            // Same class as gex-magnet: a low-frequency derived per-chain signal that may be
+            // (re)started after the source-switch offset barrier is captured, so applying that
+            // barrier would suppress valid fresh values indefinitely. Keep the source/symbol/
+            // expiry and max-stale gates; bypass only the offset barrier.
             return binding.source().equals(selection.source())
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesActiveSelection(json, selection);
@@ -4075,6 +4090,13 @@ public class FeedGatewayService implements ReplayRunner {
                 gexMagnet.put(key, json);
                 return key;
             }
+            case "gamma-migration" -> {
+                // Per-chain (symbol|expiry) last-value-wins upsert, same shape as gex-magnet.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gammaMigration.put(key, json);
+                return key;
+            }
             case "es-gex" -> {
                 // ES-on-SPX aligned WHOLE-BOOK per symbol|expiry (roll-forward: latest emitEventTimeMs wins;
                 // the align service is the single writer and stamps a monotonically-advancing emitEventTimeMs).
@@ -4543,6 +4565,15 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("strike-sr", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "gamma-migration" -> gammaMigration.entrySet().stream()
+                        .filter(entry -> isCacheFresh("gamma-migration:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("gamma-migration:" + entry.getKey(),
+                                selection, false, false))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("gamma-migration", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "gex-magnet" -> gexMagnet.entrySet().stream()
                         // DATABENTO-only Avro per-chain magnet value (last-value-wins). Replay while the
@@ -5229,6 +5260,8 @@ public class FeedGatewayService implements ReplayRunner {
             gexStrikeLifecycle.remove(versionKey.substring("gex-strike-lifecycle:".length()));
         } else if (versionKey.startsWith("gex-magnet:")) {
             gexMagnet.remove(versionKey.substring("gex-magnet:".length()));
+        } else if (versionKey.startsWith("gamma-migration:")) {
+            gammaMigration.remove(versionKey.substring("gamma-migration:".length()));
         } else if (versionKey.startsWith("hot-strike:")) {
             hotStrikes.remove(versionKey.substring("hot-strike:".length()));
         } else if (versionKey.startsWith("es-gex:")) {
@@ -5322,6 +5355,25 @@ public class FeedGatewayService implements ReplayRunner {
             // Fall back to Kafka key if the payload is unexpectedly not JSON.
         }
         return fallback;
+    }
+
+    /**
+     * The latest gamma-migration record for one chain, or null when none has arrived.
+     *
+     * <p>Keyed exactly as {@code updateCache} wrote it — the Kafka record key, which the producer
+     * sets to {@code source|symbol|expiry}. Reconstructing the key here rather than scanning the
+     * map keeps the read O(1) and, more importantly, makes a producer key change fail loudly as a
+     * miss instead of quietly matching the wrong chain.
+     *
+     * <p>Freshness is the caller's business: the raw record carries {@code eventTimeMs}, and a
+     * page that wants to grey out a stalled reading needs the timestamp, not a null.
+     */
+    public String cachedGammaMigration(String symbol, String expiry) {
+        if (symbol == null || expiry == null) {
+            return null;
+        }
+        String key = "DATABENTO|" + symbol.trim().toUpperCase(Locale.ROOT) + "|" + normalizeExpiry(expiry);
+        return gammaMigration.get(key);
     }
 
     /**
@@ -6295,6 +6347,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "gex-oi-status", gexOiStatus);
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "gex-magnet", gexMagnet);
+        replayCacheMap(session, "gamma-migration", gammaMigration);
         replayCacheMap(session, "es-gex", esGex);
         replayCacheMap(session, "es-strike-intel", esStrikeIntel);
         replayCacheMap(session, "gex-strike-lifecycle", gexStrikeLifecycle);
@@ -6379,6 +6432,7 @@ public class FeedGatewayService implements ReplayRunner {
         return "option-truth".equals(event)
                 || "strike-sr".equals(event)
                 || "gex-magnet".equals(event)
+                || "gamma-migration".equals(event)
                 || "es-gex".equals(event)
                 || "es-strike-intel".equals(event)
                 || "gex-strike-lifecycle".equals(event)
@@ -6611,6 +6665,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.databentoMaxPainTopic(), "max-pain");
                 avroTopics.put(settings.unifiedSrTopic(), "strike-sr");
                 avroTopics.put(settings.databentoGexMagnetTopic(), "gex-magnet");
+                avroTopics.put(settings.gammaMigrationTopic(), "gamma-migration");
                 avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
@@ -7433,6 +7488,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "gex-oi-status" -> pendingGexOiStatus;
             case "strike-sr" -> pendingStrikeSr;
             case "gex-magnet" -> pendingGexMagnet;
+            case "gamma-migration" -> pendingGammaMigration;
             case "es-gex" -> pendingEsGex;
             case "es-strike-intel" -> pendingEsStrikeIntel;
             case "gex-strike-lifecycle" -> pendingGexStrikeLifecycle;
@@ -7504,7 +7560,8 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingEsStrikeIntel.values()),
                         // Appended LAST (not next to indexPrices) so the positional test reflection
                         // helpers stay stable; the JSON field order below is independent of this order.
-                        new ArrayList<>(pendingSpxPrices.values())
+                        new ArrayList<>(pendingSpxPrices.values()),
+                        new ArrayList<>(pendingGammaMigration.values())
                 );
                 clearPendingLocked();
             }
@@ -7548,6 +7605,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingGexOiStatus.size()
                 + pendingStrikeSr.size()
                 + pendingGexMagnet.size()
+                + pendingGammaMigration.size()
                 + pendingEsGex.size()
                 + pendingEsStrikeIntel.size()
                 + pendingGexStrikeLifecycle.size()
@@ -7584,6 +7642,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingGexOiStatus.clear();
         pendingStrikeSr.clear();
         pendingGexMagnet.clear();
+        pendingGammaMigration.clear();
         pendingEsGex.clear();
         pendingEsStrikeIntel.clear();
         pendingGexStrikeLifecycle.clear();
@@ -7625,6 +7684,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> gexOiStatusJsons = new ArrayList<>();
         List<String> strikeSrJsons = new ArrayList<>();
         List<String> gexMagnetJsons = new ArrayList<>();
+        List<String> gammaMigrationJsons = new ArrayList<>();
         List<String> esGexJsons = new ArrayList<>();
         List<String> esStrikeIntelJsons = new ArrayList<>();
         List<String> gexStrikeLifecycleJsons = new ArrayList<>();
@@ -7664,6 +7724,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "gex-oi-status" -> gexOiStatusJsons.add(cachedEvent.json());
                 case "strike-sr" -> strikeSrJsons.add(cachedEvent.json());
                 case "gex-magnet" -> gexMagnetJsons.add(cachedEvent.json());
+                case "gamma-migration" -> gammaMigrationJsons.add(cachedEvent.json());
                 case "es-gex" -> esGexJsons.add(cachedEvent.json());
                 case "es-strike-intel" -> esStrikeIntelJsons.add(cachedEvent.json());
                 case "gex-strike-lifecycle" -> gexStrikeLifecycleJsons.add(cachedEvent.json());
@@ -7714,7 +7775,8 @@ public class FeedGatewayService implements ReplayRunner {
                 hpsfExitIntentJsons,
                 esGexJsons,
                 esStrikeIntelJsons,
-                spxPriceJsons
+                spxPriceJsons,
+                gammaMigrationJsons
         );
     }
 
@@ -7764,7 +7826,7 @@ public class FeedGatewayService implements ReplayRunner {
                 gexMagnetJsons, gexStrikeLifecycleJsons, maxPainJsons, optionPriceBehaviorJsons,
                 opbByOptionJsons, opbSessionJsons, hpsfLatestSignalJsons, hpsfMarketFlowJsons,
                 hpsfTopCandidatesJsons, hpsfAuditJsons, hpsfExitIntentJsons, esGexJsons,
-                esStrikeIntelJsons, spxPriceJsons);
+                esStrikeIntelJsons, spxPriceJsons, List.of());
     }
 
     private String uiBatchEnvelopeJson(
@@ -7800,7 +7862,10 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> hpsfExitIntentJsons,
             List<String> esGexJsons,
             List<String> esStrikeIntelJsons,
-            List<String> spxPriceJsons
+            List<String> spxPriceJsons,
+            // Appended LAST for the same reason spxPriceJsons was: the positional reflection
+            // helpers in the tests index this signature, so new fields go on the end.
+            List<String> gammaMigrationJsons
     ) {
         ActiveSelection selection = activeSelection.get();
         return "{"
@@ -7837,6 +7902,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"gexOiStatus\":" + jsonArray(gexOiStatusJsons) + ","
                 + "\"strikeSr\":" + jsonArray(strikeSrJsons) + ","
                 + "\"gexMagnets\":" + jsonArray(gexMagnetJsons) + ","
+                // Additive: where the magnet says which strike gamma sits ON, this says where it
+                // is GOING. Older UIs ignore the unknown key.
+                + "\"gammaMigrations\":" + jsonArray(gammaMigrationJsons) + ","
                 + "\"esGex\":" + jsonArray(esGexJsons) + ","
                 // Gated so the disabled wire is unchanged (the web reads batchItems('esStrikeIntels') which
                 // tolerates an absent key). Status keeps the EXPLICIT esStrikeIntel(Enabled) fields on purpose

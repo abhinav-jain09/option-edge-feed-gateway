@@ -698,6 +698,17 @@ public final class GatewaySettings {
         return value("KAFKA_UNIFIED_SR_TOPIC", "options.spx.strike-sr.current");
     }
 
+    /**
+     * Gamma migration (Avro, per-chain last-value-wins). Broadcast as event "gamma-migration".
+     *
+     * <p>Where the magnet says which strike gamma sits ON, this says where it is GOING: peak
+     * dwell and drift, the mass balance either side of spot, the strike heating up, and any wall
+     * that has crossed zero.
+     */
+    public String gammaMigrationTopic() {
+        return value("KAFKA_GAMMA_MIGRATION_TOPIC", "options.spx.gamma-migration.current");
+    }
+
     /** GEX magnet strike (Avro, per-chain last-value-wins). Broadcast as event "gex-magnet". */
     public String databentoGexMagnetTopic() {
         return value("KAFKA_DATABENTO_GEX_MAGNET_TOPIC", "options.databento.gex.magnet");
