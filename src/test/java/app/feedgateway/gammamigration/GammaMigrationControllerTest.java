@@ -8,6 +8,7 @@ import app.feedgateway.FeedGatewayService;
 import app.feedgateway.liquidityhistory.LiquidityHistoryAuth;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import org.junit.jupiter.api.Test;
@@ -31,8 +32,13 @@ class GammaMigrationControllerTest {
 
     /** A gateway whose only behaviour is the one cache lookup this endpoint makes. */
     private static FeedGatewayService gatewayReturning(String cached) {
+        return gatewayReturning(cached, new String[]{"SPX", "20260731"});
+    }
+
+    private static FeedGatewayService gatewayReturning(String cached, String[] activeSelection) {
         FeedGatewayService service = mock(FeedGatewayService.class);
         when(service.cachedGammaMigration(any(), any())).thenReturn(cached);
+        when(service.activeSymbolExpiry()).thenReturn(activeSelection);
         return service;
     }
 
@@ -80,11 +86,41 @@ class GammaMigrationControllerTest {
     }
 
     @Test
-    void missingParametersAreRejected() {
-        for (String[] args : new String[][]{{null, "20260731"}, {"", "20260731"}, {"SPX", null}, {"SPX", "  "}}) {
+    void missingParametersFallBackToTheChainTheAppIsOn() {
+        // The page is about "the current board", so opening /gamma-migration with no query string
+        // must show the current board. Requiring both params meant it answered 400 unless the user
+        // hand-typed an expiry — which is what it did in dev on the first live open.
+        for (String[] args : new String[][]{{null, "20260731"}, {"", "20260731"},
+                                            {"SPX", null}, {"SPX", "  "}, {null, null}}) {
             ResponseEntity<String> res = call(RECORD, 200, args[0], args[1]);
+            assertEquals(200, res.getStatusCode().value(),
+                    "symbol=" + args[0] + " expiry=" + args[1] + " should fall back, not 400");
+            assertEquals(RECORD, res.getBody());
+        }
+    }
+
+    @Test
+    void anExplicitChainStillWinsOverTheActiveSelection() {
+        // The fallback must not quietly override a caller who DID ask for a specific chain.
+        FeedGatewayService service = gatewayReturning(RECORD, new String[]{"NDX", "20260901"});
+        new GammaMigrationController(service, authReturning(200),
+                new com.fasterxml.jackson.databind.ObjectMapper())
+                .gammaMigration("SPX", "20260731", "Bearer t");
+        verify(service).cachedGammaMigration("SPX", "20260731");
+    }
+
+    @Test
+    void aGatewayWithNoSelectionYetIsStillA400() {
+        // The one case that is genuinely a bad request: nothing asked for, and nothing to default
+        // to. It must stay distinguishable from "asked for a chain that has no reading yet" (200
+        // with present:false), or a cold gateway looks like a routing mistake.
+        for (String[] active : new String[][]{{"", ""}, {null, null}, {"SPX", ""}}) {
+            ResponseEntity<String> res = new GammaMigrationController(
+                    gatewayReturning(RECORD, active), authReturning(200),
+                    new com.fasterxml.jackson.databind.ObjectMapper())
+                    .gammaMigration(null, null, "Bearer t");
             assertEquals(400, res.getStatusCode().value(),
-                    "symbol=" + args[0] + " expiry=" + args[1] + " must be rejected");
+                    "no request and no active selection is a real bad request");
         }
     }
 
