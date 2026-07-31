@@ -199,6 +199,14 @@ public class LiquidityHistoryController {
 
         ObjectNode root = mapper.createObjectNode();
         root.put("historySchemaVersion", 1);
+        // Which percentile produced every bucket's `rawP99`. ADDITIVE (v1-compatible: existing
+        // consumers ignore unknown fields), and it exists because the field NAME encodes a
+        // percentile the value no longer necessarily carries — the saturation percentile is
+        // configurable and defaults to 0.95 since the 2026-07-30 colour calibration. `rawP99`
+        // is, and always was, consumed as an opaque adaptive-scale saturation VALUE (it primes
+        // liquidity-heatmap.js's ramp scale; nothing reads it as a statistic). Publishing the
+        // percentile makes a gateway/UI divergence observable instead of silent.
+        root.put("saturationPct", SessionAggregate.BucketFold.SATURATION_PCT);
         root.put("symbol", symbol);
         root.put("expiry", expiry);
         root.put("tradeDate", tradeDate.toString());

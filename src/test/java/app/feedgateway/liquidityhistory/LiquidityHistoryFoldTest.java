@@ -239,8 +239,37 @@ class LiquidityHistoryFoldTest {
             strikes.add(6000.0 + i);
         }
         LiquidityHistoryStore store = publishedStore(frame(SYMBOL, EXPIRY, M0, "LIVE", "FULL", strikes, cells));
-        // N=100 -> rank = ceil(0.99*100) = 99 -> sorted[98] = 99 (NOT 100: nearest-rank, not max).
-        assertEquals(99L, snapshot(store, TRADING_DAY).buckets().get(0).rawP99());
+        // N=100 -> rank = ceil(0.95*100) = 95 -> sorted[94] = 95 (NOT 100: nearest-rank, not max).
+        // The percentile moved 0.99 -> 0.95 with the 2026-07-30 colour calibration; the wire
+        // field keeps its frozen `rawP99` name.
+        assertEquals(95L, snapshot(store, TRADING_DAY).buckets().get(0).rawP99());
+    }
+
+    /**
+     * Pins THIS repo's default only. It cannot see liquidity-heatmap.js, so it does NOT prove the
+     * UI agrees — an earlier version of this test claimed it did, which was false: changing the UI
+     * back to 0.99 would leave it green.
+     *
+     * <p>The actual anti-drift mechanism is deployment-level: web and gateway both read the SAME
+     * {@code HEATMAP_COLOR_SATURATION_PCT} key from the shared options-edge-config ConfigMap, so
+     * one value feeds both. These in-code defaults only apply when that key is absent. The
+     * response's {@code saturationPct} field makes any residual divergence observable at runtime.
+     */
+    @Test
+    void saturationPercentileDefaultIsPinned() {
+        assertEquals(0.95d, SessionAggregate.BucketFold.SATURATION_PCT, 1e-9,
+                "gateway default; the UI default lives in liquidity-heatmap.js and is NOT checked here");
+    }
+
+    /** A malformed or out-of-range override must fall back, never zero or invert the scale. */
+    @Test
+    void malformedSaturationOverrideFallsBackToTheDefault() {
+        for (String bad : new String[] {"", "abc", "0", "-0.5", "1.5", "NaN"}) {
+            assertEquals(0.95d, SessionAggregate.BucketFold.resolveSaturationPct(bad), 1e-9,
+                    "rejected override: '" + bad + "'");
+        }
+        assertEquals(0.99d, SessionAggregate.BucketFold.resolveSaturationPct("0.99"), 1e-9);
+        assertEquals(1.0d, SessionAggregate.BucketFold.resolveSaturationPct("1.0"), 1e-9);
     }
 
     @Test

@@ -165,7 +165,7 @@ final class SessionAggregate {
             if (finalizedRawP99 >= 0) {
                 return 0L;
             }
-            finalizedRawP99 = nearestRankP99(pool, poolSize);
+            finalizedRawP99 = nearestRankSaturation(pool, poolSize);
             long released = 8L * poolSize;
             pool = null;
             poolSize = 0;
@@ -173,7 +173,7 @@ final class SessionAggregate {
         }
 
         ChainSnapshot.BucketProjection project() {
-            long rawP99 = finalizedRawP99 >= 0 ? finalizedRawP99 : nearestRankP99(pool, poolSize);
+            long rawP99 = finalizedRawP99 >= 0 ? finalizedRawP99 : nearestRankSaturation(pool, poolSize);
             List<ChainSnapshot.CellProjection> projectedCells = new ArrayList<>(cells.size());
             for (CellFold cell : cells.values()) {
                 projectedCells.add(cell.project(degraded));
@@ -192,17 +192,43 @@ final class SessionAggregate {
         }
 
         /**
-         * §5 EXACT formula: nearest-rank 99th percentile of the pooled per-cell
-         * {@code lastBidSize+lastAskSize} samples — rank = ceil(0.99*N), value = sorted[rank-1];
+         * §5 formula: nearest-rank percentile of the pooled per-cell
+         * {@code lastBidSize+lastAskSize} samples — rank = ceil(pct*N), value = sorted[rank-1];
          * empty pool → 0 (identical sample basis to the live adaptive scaler).
+         *
+         * <p>MUST equal the UI's {@code HEATMAP_COLOR_SATURATION_PCT} (liquidity-heatmap.js,
+         * {@code frameP99}). The backfilled part of the ribbon primes the SAME adaptive ramp
+         * scale the live frames then drive; if the two percentiles diverge, opening the board
+         * ratchets the scale to the history value and the colours drift for one decay
+         * half-life (~5 min) before settling. Recalibrated 0.99 → 0.95 on 2026-07-30 — see the
+         * measurement note on HEATMAP_COLOR_SATURATION_PCT. The wire field stays named
+         * {@code rawP99} (frozen history contract, historySchemaVersion 1).
          */
-        static long nearestRankP99(long[] pool, int size) {
+        static final double DEFAULT_SATURATION_PCT = 0.95d;
+        static final double SATURATION_PCT = resolveSaturationPct(
+                app.feedgateway.GatewaySettings.value("HEATMAP_COLOR_SATURATION_PCT", ""));
+
+        /** Package-private for tests: anything malformed or outside (0,1] falls back. */
+        static double resolveSaturationPct(String raw) {
+            if (raw == null || raw.isBlank()) {
+                return DEFAULT_SATURATION_PCT;
+            }
+            double pct;
+            try {
+                pct = Double.parseDouble(raw.trim());
+            } catch (NumberFormatException ignored) {
+                return DEFAULT_SATURATION_PCT; // a malformed override must never zero the scale
+            }
+            return Double.isFinite(pct) && pct > 0.0d && pct <= 1.0d ? pct : DEFAULT_SATURATION_PCT;
+        }
+
+        static long nearestRankSaturation(long[] pool, int size) {
             if (size <= 0) {
                 return 0L;
             }
             long[] sorted = Arrays.copyOf(pool, size);
             Arrays.sort(sorted);
-            int rank = (int) Math.ceil(0.99d * size);
+            int rank = (int) Math.ceil(SATURATION_PCT * size);
             return sorted[Math.max(0, rank - 1)];
         }
 
