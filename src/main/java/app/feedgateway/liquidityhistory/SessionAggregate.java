@@ -192,17 +192,38 @@ final class SessionAggregate {
         }
 
         /**
-         * §5 EXACT formula: nearest-rank 99th percentile of the pooled per-cell
-         * {@code lastBidSize+lastAskSize} samples — rank = ceil(0.99*N), value = sorted[rank-1];
+         * §5 formula: nearest-rank percentile of the pooled per-cell
+         * {@code lastBidSize+lastAskSize} samples — rank = ceil(pct*N), value = sorted[rank-1];
          * empty pool → 0 (identical sample basis to the live adaptive scaler).
+         *
+         * <p>MUST equal the UI's {@code HEATMAP_COLOR_SATURATION_PCT} (liquidity-heatmap.js,
+         * {@code frameP99}). The backfilled part of the ribbon primes the SAME adaptive ramp
+         * scale the live frames then drive; if the two percentiles diverge, opening the board
+         * ratchets the scale to the history value and the colours drift for one decay
+         * half-life (~5 min) before settling. Recalibrated 0.99 → 0.95 on 2026-07-30 — see the
+         * measurement note on HEATMAP_COLOR_SATURATION_PCT. The wire field stays named
+         * {@code rawP99} (frozen history contract, historySchemaVersion 1).
          */
+        static final double SATURATION_PCT = saturationPct();
+
+        private static double saturationPct() {
+            double pct = 0.95d;
+            try {
+                pct = Double.parseDouble(
+                        app.feedgateway.GatewaySettings.value("HEATMAP_COLOR_SATURATION_PCT", "0.95"));
+            } catch (NumberFormatException ignored) {
+                // fall through to the default — a malformed override must never zero the scale
+            }
+            return pct > 0.0d && pct <= 1.0d ? pct : 0.95d;
+        }
+
         static long nearestRankP99(long[] pool, int size) {
             if (size <= 0) {
                 return 0L;
             }
             long[] sorted = Arrays.copyOf(pool, size);
             Arrays.sort(sorted);
-            int rank = (int) Math.ceil(0.99d * size);
+            int rank = (int) Math.ceil(SATURATION_PCT * size);
             return sorted[Math.max(0, rank - 1)];
         }
 

@@ -239,8 +239,22 @@ class LiquidityHistoryFoldTest {
             strikes.add(6000.0 + i);
         }
         LiquidityHistoryStore store = publishedStore(frame(SYMBOL, EXPIRY, M0, "LIVE", "FULL", strikes, cells));
-        // N=100 -> rank = ceil(0.99*100) = 99 -> sorted[98] = 99 (NOT 100: nearest-rank, not max).
-        assertEquals(99L, snapshot(store, TRADING_DAY).buckets().get(0).rawP99());
+        // N=100 -> rank = ceil(0.95*100) = 95 -> sorted[94] = 95 (NOT 100: nearest-rank, not max).
+        // The percentile moved 0.99 -> 0.95 with the 2026-07-30 colour calibration; the wire
+        // field keeps its frozen `rawP99` name.
+        assertEquals(95L, snapshot(store, TRADING_DAY).buckets().get(0).rawP99());
+    }
+
+    /**
+     * LOCKSTEP: the history percentile primes the SAME adaptive ramp scale the live frames drive
+     * (liquidity-heatmap.js frameP99). If these diverge, opening the board ratchets the scale to
+     * the history value and the colours drift for a decay half-life before settling — so the
+     * default is pinned here rather than left to two independently-edited files.
+     */
+    @Test
+    void saturationPercentileMatchesTheUiDefault() {
+        assertEquals(0.95d, SessionAggregate.BucketFold.SATURATION_PCT, 1e-9,
+                "must equal HEATMAP_COLOR_SATURATION_PCT's default in liquidity-heatmap.js");
     }
 
     @Test
