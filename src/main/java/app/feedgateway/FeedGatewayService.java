@@ -5358,6 +5358,25 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
+     * The latest gamma-migration record for one chain, or null when none has arrived.
+     *
+     * <p>Keyed exactly as {@code updateCache} wrote it — the Kafka record key, which the producer
+     * sets to {@code source|symbol|expiry}. Reconstructing the key here rather than scanning the
+     * map keeps the read O(1) and, more importantly, makes a producer key change fail loudly as a
+     * miss instead of quietly matching the wrong chain.
+     *
+     * <p>Freshness is the caller's business: the raw record carries {@code eventTimeMs}, and a
+     * page that wants to grey out a stalled reading needs the timestamp, not a null.
+     */
+    public String cachedGammaMigration(String symbol, String expiry) {
+        if (symbol == null || expiry == null) {
+            return null;
+        }
+        String key = "DATABENTO|" + symbol.trim().toUpperCase(Locale.ROOT) + "|" + normalizeExpiry(expiry);
+        return gammaMigration.get(key);
+    }
+
+    /**
      * Build the chain-shaped seller-activity input consumed by the REST aggregator from the independently
      * cached per-strike records. Seller history deliberately no longer travels inside strike-flow snapshots:
      * doing so made the chain record grow throughout the session until Kafka rejected it.
