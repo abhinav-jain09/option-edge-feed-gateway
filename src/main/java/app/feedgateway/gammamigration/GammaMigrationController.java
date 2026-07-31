@@ -64,11 +64,22 @@ public class GammaMigrationController {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                     .header(HttpHeaders.RETRY_AFTER, Long.toString(retryAfterSeconds)).build();
         }
-        if (symbol == null || symbol.isBlank()) {
-            return badRequest("symbol is required");
+        // Default to the chain the app is already on. Requiring both params meant the page only
+        // worked when the user hand-typed a query string, and opening /gamma-migration plainly
+        // answered 400 — the page is about "the current board", so the current board is the
+        // sensible default rather than an error.
+        if (symbol == null || symbol.isBlank() || expiry == null || expiry.isBlank()) {
+            String[] active = service.activeSymbolExpiry();
+            if (symbol == null || symbol.isBlank()) {
+                symbol = active[0];
+            }
+            if (expiry == null || expiry.isBlank()) {
+                expiry = active[1];
+            }
         }
-        if (expiry == null || expiry.isBlank()) {
-            return badRequest("expiry is required");
+        if (symbol == null || symbol.isBlank() || expiry == null || expiry.isBlank()) {
+            // Only when the gateway itself has no selection yet — a genuine "nothing to show".
+            return badRequest("no symbol/expiry given and the gateway has no active selection yet");
         }
 
         String cached = service.cachedGammaMigration(symbol, expiry);

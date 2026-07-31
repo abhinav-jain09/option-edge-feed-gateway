@@ -5368,6 +5368,12 @@ public class FeedGatewayService implements ReplayRunner {
      * <p>Freshness is the caller's business: the raw record carries {@code eventTimeMs}, and a
      * page that wants to grey out a stalled reading needs the timestamp, not a null.
      */
+    /** The chain the app is currently on, as {@code symbol|expiry}, for callers that omit it. */
+    public String[] activeSymbolExpiry() {
+        ActiveSelection sel = activeSelection.get();
+        return new String[]{sel.symbol(), sel.expiry()};
+    }
+
     public String cachedGammaMigration(String symbol, String expiry) {
         if (symbol == null || expiry == null) {
             return null;
