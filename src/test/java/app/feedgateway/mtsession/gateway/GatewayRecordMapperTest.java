@@ -259,4 +259,24 @@ class GatewayRecordMapperTest {
         assertEquals("20260704", rec.expiry());
         assertTrue(rec.strike().isEmpty());
     }
+
+    @Test
+    void gammaMigrationRoutesContractScopedWithNoStrikeFilter() throws Exception {
+        // The record describes the WHOLE chain even though it names a hot strike inside it.
+        // Routing per-strike would deliver it only to sessions already watching the strike that
+        // just heated up — precisely the session that does not need telling.
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "gamma-migration",
+                node("{\"messageType\":\"GAMMA_MIGRATION_SNAPSHOT\",\"symbol\":\"SPX\","
+                        + "\"marketDataSource\":\"DATABENTO\",\"expiry\":\"20260731\","
+                        + "\"hotStrike\":7450.0}"))
+                .orElseThrow(() -> new AssertionError(
+                        "gamma-migration must be routable, not fall through to broadcast"));
+        assertEquals(EventType.GAMMA_MIGRATION, rec.eventType());
+        assertEquals("SPX", rec.symbol());
+        assertEquals("20260731", rec.expiry());
+        assertTrue(EventType.GAMMA_MIGRATION.isContractScoped());
+        assertTrue(rec.strike().isEmpty(),
+                "no strike filter: hotStrike names a target, not an audience — routing on it would "
+                + "deliver the record only to sessions already watching that strike");
+    }
 }

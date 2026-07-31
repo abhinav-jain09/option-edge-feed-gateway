@@ -43,6 +43,12 @@ public enum EventType {
     // GEX_BY_STRIKE (CONTRACT scope, per-strike), so the option-chain UI can badge each strike.
     GEX_OI_STATUS(Scope.CONTRACT),
     STRIKE_SR(Scope.CONTRACT),
+    // Gamma migration: one record per (symbol,expiry) describing how the whole chain's gamma is
+    // MOVING, so it routes CONTRACT-scoped with no strike filter (like MAX_PAIN). It names a hot
+    // strike inside the payload, but the record is about the chain, not that strike — filtering it
+    // per-strike would deliver it only to sessions already watching the strike that just heated up,
+    // which is precisely the session that does not need telling.
+    GAMMA_MIGRATION(Scope.CONTRACT),
     // Max pain is a per-(symbol,expiry) aggregate (one value covers the whole chain), so it routes
     // CONTRACT-scoped by source|symbol|expiry with NO strike filter — every session on that chain receives it.
     MAX_PAIN(Scope.CONTRACT),

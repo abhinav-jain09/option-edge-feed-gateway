@@ -498,7 +498,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "gamma-migration", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -2943,7 +2943,7 @@ class FeedGatewayServiceTest {
         // Legacy caught-up gating: max-pain (DATABENTO-only Avro) under avroCaughtUp; gex-by-strike
         // (multi-source) under BOTH flags.
         assertTrue(source.contains(
-                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"pace-rank\", \"directional-pressure\", \"max-pain\", \"strike-sr\", \"gex-magnet\", \"gex-strike-lifecycle\"));"));
+                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"pace-rank\", \"directional-pressure\", \"max-pain\", \"strike-sr\", \"gex-magnet\", \"gamma-migration\", \"gex-strike-lifecycle\"));"));
         assertTrue(source.contains("if (avroCaughtUp.get() && stateCaughtUp.get()) {"));
         // gex legacy cached replay is source-aware (no hard IBKR-only filter).
         assertFalse(source.contains(".filter(entry -> \"IBKR\".equals(selection.source()))"));
@@ -3685,6 +3685,40 @@ class FeedGatewayServiceTest {
         assertTrue(envelope.contains("\"strikeSr\":[" + json + "]"),
                 "batch envelope must carry the strikeSr array; was: " + envelope);
         assertTrue(envelope.contains("\"gexByStrike\":[]"));
+    }
+
+    /**
+     * The FULL overload, located by parameter count rather than by a positional signature: it is
+     * the one that keeps growing, and pinning its exact shape here means every future field
+     * addition breaks this helper for no reason.
+     */
+    private static Method fullUiBatchEnvelopeMethod() {
+        return java.util.Arrays.stream(FeedGatewayService.class.getDeclaredMethods())
+                .filter(m -> m.getName().equals("uiBatchEnvelopeJson"))
+                .max(java.util.Comparator.comparingInt(Method::getParameterCount))
+                .orElseThrow();
+    }
+
+    @Test
+    void uiBatchEnvelopeCarriesGammaMigrationsArrayKey() throws Exception {
+        // Behavioural, not a source grep: it builds a real envelope and reads the wire.
+        FeedGatewayService service = service();
+        Method method = fullUiBatchEnvelopeMethod();
+        method.setAccessible(true);
+        Object[] args = new Object[method.getParameterCount()];
+        java.util.Arrays.fill(args, List.of());
+        String json = "{\"messageType\":\"GAMMA_MIGRATION_SNAPSHOT\",\"symbol\":\"SPX\","
+                + "\"expiry\":\"20260731\",\"regime\":\"PEAK_PARKED\",\"hotStrike\":7450.0,"
+                + "\"hotTrusted\":true,\"flipStrike\":7400.0}";
+        args[args.length - 1] = List.of(json);   // appended last, per the file's own convention
+        String envelope = (String) method.invoke(service, args);
+
+        assertTrue(envelope.contains("\"gammaMigrations\":[" + json + "]"),
+                "batch envelope must carry the gammaMigrations array; was: " + envelope);
+        // The neighbouring arrays must stay empty — proves the value landed in its OWN key and was
+        // not flattened into the magnet or SR arrays it sits beside.
+        assertTrue(envelope.contains("\"gexMagnets\":[]"), "must not leak into gexMagnets");
+        assertTrue(envelope.contains("\"strikeSr\":[]"), "must not leak into strikeSr");
     }
 
     @Test
