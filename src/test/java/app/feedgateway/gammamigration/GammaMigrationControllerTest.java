@@ -43,7 +43,8 @@ class GammaMigrationControllerTest {
     }
 
     private static ResponseEntity<String> call(String cached, int authStatus, String symbol, String expiry) {
-        return new GammaMigrationController(gatewayReturning(cached), authReturning(authStatus))
+        return new GammaMigrationController(gatewayReturning(cached), authReturning(authStatus),
+                new com.fasterxml.jackson.databind.ObjectMapper())
                 .gammaMigration(symbol, expiry, "Bearer t");
     }
 
@@ -98,18 +99,25 @@ class GammaMigrationControllerTest {
     }
 
     @Test
-    void aQuoteInTheSymbolCannotBreakOutOfTheAbsenceEnvelope() throws Exception {
-        // The absence envelope is hand-built JSON that echoes caller input.
-        ResponseEntity<String> res = call(null, 200, "SP\"X", "20260731");
-        assertEquals(200, res.getStatusCode().value());
-        assertTrue(res.getBody().contains("SP\\\"X"), "the quote must be escaped: " + res.getBody());
-        // Parses as one object rather than trailing garbage.
-        assertNotNull(new com.fasterxml.jackson.databind.ObjectMapper().readTree(res.getBody()));
+    void hostileInputInTheAbsenceEnvelopeStaysParseable() throws Exception {
+        // The envelope echoes caller-supplied symbol/expiry. Hand-escaping only quotes and
+        // backslashes let every control character through raw, so a percent-decoded newline
+        // produced a malformed body on an otherwise valid 200.
+        var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        for (String hostile : new String[]{"SP\"X", "SP\\X", "SP\nX", "SP\tX", "SP\u0001X"}) {
+            ResponseEntity<String> res = call(null, 200, hostile, "20260731");
+            assertEquals(200, res.getStatusCode().value());
+            var parsed = mapper.readTree(res.getBody());
+            assertNotNull(parsed, "body must parse: " + res.getBody());
+            assertEquals(hostile.trim().toUpperCase(java.util.Locale.ROOT), parsed.get("symbol").asText(),
+                    "and round-trip the value unchanged: " + res.getBody());
+        }
     }
 
     @Test
     void headerlessCallsStillGoThroughAuth() {
-        ResponseEntity<String> res = new GammaMigrationController(gatewayReturning(RECORD), authReturning(401))
+        ResponseEntity<String> res = new GammaMigrationController(gatewayReturning(RECORD),
+                authReturning(401), new com.fasterxml.jackson.databind.ObjectMapper())
                 .gammaMigration("SPX", "20260731", null);
         assertEquals(401, res.getStatusCode().value());
         assertEquals(HttpHeaders.AUTHORIZATION, HttpHeaders.AUTHORIZATION);

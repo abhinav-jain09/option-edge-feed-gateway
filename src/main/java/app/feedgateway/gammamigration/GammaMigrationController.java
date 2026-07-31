@@ -2,6 +2,9 @@ package app.feedgateway.gammamigration;
 
 import app.feedgateway.FeedGatewayService;
 import app.feedgateway.liquidityhistory.LiquidityHistoryAuth;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -37,11 +40,14 @@ public class GammaMigrationController {
 
     private final FeedGatewayService service;
     private final LiquidityHistoryAuth auth;
+    private final ObjectMapper mapper;
     private final RateLimiter rateLimiter = new RateLimiter(RATE_LIMIT_PER_MIN, 60_000L);
 
-    public GammaMigrationController(FeedGatewayService service, LiquidityHistoryAuth auth) {
+    public GammaMigrationController(FeedGatewayService service, LiquidityHistoryAuth auth,
+                                    ObjectMapper mapper) {
         this.service = service;
         this.auth = auth;
+        this.mapper = mapper == null ? new ObjectMapper() : mapper;
     }
 
     @GetMapping(value = "/api/gamma-migration", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -70,18 +76,37 @@ public class GammaMigrationController {
             // 200 with an explicit absence, not 404. "The service has not published for this chain
             // yet" is a normal state on a cold start or a thin board, and a page that renders
             // "warming up" for it must be able to tell that apart from a routing mistake.
-            return ResponseEntity.ok("{\"present\":false,\"symbol\":\"" + escape(symbol.trim().toUpperCase(Locale.ROOT))
-                    + "\",\"expiry\":\"" + escape(expiry.trim()) + "\"}");
+            ObjectNode absent = mapper.createObjectNode();
+            absent.put("present", false);
+            absent.put("symbol", symbol.trim().toUpperCase(Locale.ROOT));
+            absent.put("expiry", expiry.trim());
+            return ResponseEntity.ok(write(absent));
         }
         return ResponseEntity.ok(cached);
     }
 
-    private static ResponseEntity<String> badRequest(String message) {
-        return ResponseEntity.badRequest().body("{\"error\":\"" + escape(message) + "\"}");
+    private ResponseEntity<String> badRequest(String message) {
+        ObjectNode error = mapper.createObjectNode();
+        error.put("error", message);
+        return ResponseEntity.badRequest().body(write(error));
     }
 
-    private static String escape(String value) {
-        return value.replace("\\", "\\\\").replace("\"", "\\\"");
+    /**
+     * Serialise with Jackson rather than concatenating JSON.
+     *
+     * <p>These envelopes echo caller-supplied symbol/expiry. Hand-escaping only quotes and
+     * backslashes leaves every control character (a percent-decoded newline, tab, or U+0001)
+     * to pass through raw, producing a malformed body on an otherwise valid 200 — the client
+     * then fails to parse a response that says "no reading yet".
+     */
+    private String write(ObjectNode node) {
+        try {
+            return mapper.writeValueAsString(node);
+        } catch (JsonProcessingException e) {
+            // Cannot happen for a flat ObjectNode of strings and a boolean, but an unparseable body
+            // must never be the failure mode: fall back to a constant that is valid JSON.
+            return "{\"present\":false}";
+        }
     }
 
     /** Fixed-window per-principal budget, mirroring the seller-activity limiter. */
