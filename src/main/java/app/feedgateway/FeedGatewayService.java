@@ -153,6 +153,11 @@ public class FeedGatewayService implements ReplayRunner {
     // to absorb realistic inter-service NTP skew; tight enough that a poisoned record can never freeze a
     // symbol's track for more than this bound.
     private static final long GREEK_MOVE_AUTH_MAX_FUTURE_SKEW_MS = 60_000L;
+    // Strike-flow timestampMs is the classifier's whole-chain snapshot creation time. It is the
+    // freshness SSOT: Kafka CREATE_TIME can retain an old triggering trade timestamp even when the
+    // classifier has just assembled a current board. Reject material future skew as well, otherwise a
+    // poisoned timestamp could evade expiry and freeze the chain's monotonic last-value-wins gate.
+    private static final long STRIKE_FLOW_MAX_FUTURE_SKEW_MS = 60_000L;
     private final SessionRoutingEngine routingEngine;
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
@@ -2186,6 +2191,13 @@ public class FeedGatewayService implements ReplayRunner {
                         // same explicit maxStale gate — a STALE mission-control frame must never reach a socket.
                         boolean missionControlStale = "mission-control".equals(binding.event())
                                 && !recordWithinMaxStale(record);
+                        // Strike-flow freshness is defined by the whole-board payload timestampMs, not
+                        // Kafka CREATE_TIME. The latter may be inherited from an older triggering trade,
+                        // which previously caused a freshly assembled board to disappear at the 5-minute
+                        // gateway cutoff. eventCacheTimestamp also fails closed for malformed/future time.
+                        boolean strikeFlowStale = "strike-flow".equals(binding.event())
+                                && !eventTimeWithinMaxStale(
+                                        eventCacheTimestamp(binding.event(), record, json));
                         // Liquidity-heatmap fail-closed (freshness): frames carry no per-session
                         // selectionEpoch (epoch 0 bypasses passesBarrier) and their useful life is
                         // the SHORT liquidity TTL, not the generic maxStale window — a stale column
@@ -2245,7 +2257,8 @@ public class FeedGatewayService implements ReplayRunner {
                         boolean gexOiStatusDropped = "gex-oi-status".equals(binding.event())
                                 && cacheKey == null;
                         if ((cacheKey != null || !"max-pain".equals(binding.event()))
-                                && !missionPaceStale && !missionControlStale && !liquidityHeatmapStale
+                                && !missionPaceStale && !missionControlStale && !strikeFlowStale
+                                && !liquidityHeatmapStale
                                 && !strikeIntelDropped && !optionTruthStale && !strikeInvasionStale && !spreadSkewStale
                                 && !esOpenDirectionDropped && !strikeLifecycleDropped && !esStrikeIntelDropped
                                 && !gexOiStatusDropped) {
@@ -3432,6 +3445,22 @@ public class FeedGatewayService implements ReplayRunner {
             long lifecycleTs = eventCacheTimestamp(binding.event(), record, json);
             if (!passesSelectionTimeBarrier(lifecycleTs, selection)
                     || !passesOffsetBarrier(new TopicPartition(record.topic(), record.partition()), record.offset())) {
+                reportSourceStale(selection, "switch-barrier");
+                return false;
+            }
+            return matchesActiveSelection(json, selection);
+        }
+        if ("strike-flow".equals(binding.event())) {
+            // A strike-flow record is a freshly assembled whole-chain snapshot whose payload
+            // timestampMs is authoritative. Kafka CREATE_TIME can be inherited from the triggering
+            // trade and lag by minutes; using it here falsely drops a current board as stale.
+            if (!binding.source().equals(selection.source())) {
+                return false;
+            }
+            long strikeFlowTs = eventCacheTimestamp(binding.event(), record, json);
+            if (!passesSelectionTimeBarrier(strikeFlowTs, selection)
+                    || !passesOffsetBarrier(new TopicPartition(record.topic(), record.partition()),
+                    record.offset())) {
                 reportSourceStale(selection, "switch-barrier");
                 return false;
             }
@@ -4958,6 +4987,11 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private long eventCacheTimestamp(String event, ConsumerRecord<?, ?> record, String json) {
+        if ("strike-flow".equals(event)) {
+            // No Kafka-arrival fallback: timestampMs is required by the strike-flow contract. Falling
+            // back would recreate the outage when CREATE_TIME carries an old triggering trade time.
+            return strikeFlowTimestamp(json);
+        }
         if ("zero-dte-intelligence".equals(event)) {
             // Never use fresh Kafka arrival time for a replayed direction decision. A historical record
             // arriving now must expire from its decision time, otherwise an old unusual burst can tint
@@ -5048,6 +5082,23 @@ public class FeedGatewayService implements ReplayRunner {
             return strikeLifecycleTimestamp(json);
         }
         return cacheTimestamp(record);
+    }
+
+    /**
+     * Whole-chain strike-flow snapshot creation time; -1 means missing, malformed, non-positive, or
+     * implausibly future and therefore fails closed at cache and live-routing boundaries.
+     */
+    private long strikeFlowTimestamp(String json) {
+        try {
+            long timestampMs = longField(mapper.readTree(json), "timestampMs", -1L);
+            if (timestampMs <= 0L
+                    || timestampMs > System.currentTimeMillis() + STRIKE_FLOW_MAX_FUTURE_SKEW_MS) {
+                return -1L;
+            }
+            return timestampMs;
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
     }
 
     /** Event time (asOfEventTimeMs) of a raw dealer-ledger profile/state record; -1 if absent/unparseable. */
