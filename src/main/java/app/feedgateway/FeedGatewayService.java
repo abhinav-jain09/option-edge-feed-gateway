@@ -143,6 +143,7 @@ public class FeedGatewayService implements ReplayRunner {
             "dealer-ledger",
             "zero-dte-intelligence",
             "greek-move-auth",
+            "spot-vol-regime",
             "opb-by-option", "opb-session",
             "index-price", "vix-price", "spx-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
@@ -153,6 +154,10 @@ public class FeedGatewayService implements ReplayRunner {
     // to absorb realistic inter-service NTP skew; tight enough that a poisoned record can never freeze a
     // symbol's track for more than this bound.
     private static final long GREEK_MOVE_AUTH_MAX_FUTURE_SKEW_MS = 60_000L;
+    // Same clock-skew fail-closed bound for the spot-vol-regime snapshot's asOfEventTimeMs (a past
+    // stream-time observation): a future-dated record must neither evade the SHORT freshness window
+    // nor poison the monotonic supersede gate.
+    private static final long SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS = 60_000L;
     private final SessionRoutingEngine routingEngine;
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
@@ -247,6 +252,12 @@ public class FeedGatewayService implements ReplayRunner {
     // ui-batch. JSON pass-through; keyed by symbol (updateCache source-prefixes it to source|symbol,
     // exactly like es-open-direction-status keys by source|tradeDate and zero-dte by source|symbol|session).
     private final Map<String, String> greekMoveAuthCurrent = new ConcurrentHashMap<>();
+    // Spot-vol regime CURRENT snapshot (the standalone service's SpotVolRegimeSnapshot): ONE current
+    // value per symbol (last-value-wins) on the SHORT spotVolRegimeTtlMs window, so a stale regime
+    // (dead producer, overnight leftover) is evicted/suppressed rather than replayed — the UI regime
+    // pill simply vanishes. Same standalone/global/JSON pass-through delivery class as the
+    // greek-move-auth sibling above; NOT in the ui-batch. Keyed by symbol.
+    private final Map<String, String> spotVolRegime = new ConcurrentHashMap<>();
     // SPX close-direction (design CLOSE-DIRECTION-GATE1 §8/CD-R30): ONE topic, two cache classes.
     // VERDICTS (key V|sessionDate) are once-a-session frozen decisions on the LONG
     // closeDirectionTtlMs window; INTERIMS (key I|sessionDate) are 1/min monitoring reads whose
@@ -608,6 +619,7 @@ public class FeedGatewayService implements ReplayRunner {
             // fresh cached verdict per symbol so a page reload mid-session restores the move-authenticity
             // track rather than waiting for the next live verdict.
             replayGreekMoveAuthCached(session);
+            replaySpotVolRegimeCached(session);
             // Close-direction: replay the session's frozen verdict (or the current interim) so a page
             // reload in the final hour restores the card instead of waiting for the next minute tick.
             replayCloseDirectionCached(session);
@@ -1392,6 +1404,8 @@ public class FeedGatewayService implements ReplayRunner {
         // open-direction siblings, OPTIONAL topic — on the SHORT greekMoveAuthTtlMs window (default 5 min),
         // which also bounds its seek-back here to the last few minutes.
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
+        // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
+        topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         // SPX close-direction interims + frozen verdict (JSON, key = symbol|expiry): standalone global
         // advisory, OPTIONAL topic — LONG closeDirectionTtlMs window (verdict class) bounds the seek-back;
         // interim replay freshness is separately bounded (closeDirectionInterimFreshMs).
@@ -1493,6 +1507,8 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the greek-move-authenticity CURRENT
         // verdict (JSON, key = symbol, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
+        // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
+        topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         // Keep the cache + live JSON consumer topic sets symmetric: the SPX close-direction signal
         // (JSON, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
@@ -2159,6 +2175,17 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                         continue;
                     }
+                    if ("spot-vol-regime".equals(binding.event())) {
+                        // Spot-vol regime CURRENT snapshot: same GLOBAL advisory delivery class as
+                        // greek-move-auth above — own websocket event, never a ui-batch row, never
+                        // selection-routed. Freshness fail-closed via the SHORT spotVolRegimeTtlMs window
+                        // (stale snapshot => cacheKey == null => never live-broadcast).
+                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                            broadcast(binding.event(), forwardJson);
+                            forwardedEvents.incrementAndGet();
+                        }
+                        continue;
+                    }
                     // Selection captured ONCE for this record's forward+readiness decision (legacy mode).
                     ActiveSelection decided = null;
                     // Per-session mode: route directly via the engine using the authoritative
@@ -2499,6 +2526,10 @@ public class FeedGatewayService implements ReplayRunner {
                     // the topic is absent after the daily Kafka wipe until it first produces) — optional, so
                     // its absence can never starve the shared JSON consumer.
                     || topic.equals(settings.greekMoveAuthCurrentTopic())
+                    // Spot-vol-regime is a brand-new standalone service that may not be deployed (and the
+                    // topic is absent after the daily Kafka wipe until it first produces) — optional, so
+                    // its absence can never starve the shared JSON consumer.
+                    || topic.equals(settings.spotVolRegimeTopic())
                     // Close-direction is a brand-new standalone service that may not be deployed (and the
                     // topic is absent until it first produces) — optional like its advisory siblings.
                     || topic.equals(settings.closeDirectionSignalTopic())
@@ -2989,6 +3020,13 @@ public class FeedGatewayService implements ReplayRunner {
             if (events.contains("greek-move-auth")) {
                 for (WebSocketSession client : clients) {
                     replayGreekMoveAuthCached(client);
+                }
+            }
+            // Spot-vol-regime CURRENT is STANDALONE (never in the ui-batch) too: re-push it explicitly
+            // once this consumer's cache is caught up (fresh-window-gated inside the replay helper).
+            if (events.contains("spot-vol-regime")) {
+                for (WebSocketSession client : clients) {
+                    replaySpotVolRegimeCached(client);
                 }
             }
             // Close-direction is STANDALONE (never in the ui-batch) too: re-push the session's frozen
@@ -3795,6 +3833,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = esOpenDirectionStatusCacheKey(json, key);
         } else if ("greek-move-auth".equals(event)) {
             key = greekMoveAuthCacheKey(json, key);
+        } else if ("spot-vol-regime".equals(event)) {
+            key = spotVolRegimeCacheKey(json, key);
         } else if ("close-direction".equals(event)) {
             key = closeDirectionCacheKey(json, key);
         } else if ("zero-dte-intelligence".equals(event)) {
@@ -3969,6 +4009,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 greekMoveAuthCurrent.put(key, json); // ONE current verdict per symbol — last-value-wins
+                return key;
+            }
+            case "spot-vol-regime" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                spotVolRegime.put(key, json); // ONE current regime per symbol — last heartbeat wins
                 return key;
             }
             case "close-direction" -> {
@@ -4788,6 +4834,13 @@ public class FeedGatewayService implements ReplayRunner {
             // seekBackMs) after a gateway restart.
             return CachePolicy.expiring(settings.greekMoveAuthTtlMs());
         }
+        if ("spot-vol-regime".equals(event)) {
+            // Spot-vol regime CURRENT snapshot: SHORT window (default 5 min, the greek-move-auth /
+            // es-open-direction STATUS freshness class) — a regime is only meaningful while CURRENT.
+            // A stale regime (dead producer, overnight leftover) must read as absent, not replay as
+            // live. Same ONE-seam consequences as the sibling above.
+            return CachePolicy.expiring(settings.spotVolRegimeTtlMs());
+        }
         if ("close-direction".equals(event)) {
             // Long last-value-wins window (default 12h, the max-pain/es-open-direction class): the
             // frozen T-11m VERDICT stays decision-relevant until the close and must survive a gateway
@@ -4971,6 +5024,12 @@ public class FeedGatewayService implements ReplayRunner {
             // pass the SHORT greekMoveAuthTtlMs window and render the authenticity track as live.
             return greekMoveAuthTimestamp(json);
         }
+        if ("spot-vol-regime".equals(event)) {
+            // Same rule as greek-move-auth: freshness tracks the PAYLOAD stream-time (asOfEventTimeMs),
+            // never the Kafka ARRIVAL time, so a producer catching up on a backlog cannot render a
+            // stale regime as live.
+            return spotVolRegimeTimestamp(json);
+        }
         if ("liquidity-heatmap".equals(event)) {
             long payloadTime = liquidityHeatmapTimestamp(json);
             if (payloadTime >= 0) {
@@ -5106,6 +5165,23 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /**
+     * Stream-time (asOfEventTimeMs) of a spot-vol-regime snapshot; -1 means malformed/absent/
+     * implausibly-future and fails closed — same freeze-safety rationale as
+     * {@link #greekMoveAuthTimestamp}.
+     */
+    private long spotVolRegimeTimestamp(String json) {
+        try {
+            long eventTimeMs = longField(mapper.readTree(json), "asOfEventTimeMs", -1L);
+            if (eventTimeMs > System.currentTimeMillis() + SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS) {
+                return -1L; // implausibly future — fail closed, never cache/replay/poison the supersede gate
+            }
+            return eventTimeMs;
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
+    }
+
     /** Event time (asOfEventTimeMs) of a raw per-strike delta-flow record; -1 if absent/unparseable. */
     private long deltaFlowTimestamp(String json) {
         try {
@@ -5217,6 +5293,8 @@ public class FeedGatewayService implements ReplayRunner {
             esOpenDirectionStatuses.remove(versionKey.substring("es-open-direction-status:".length()));
         } else if (versionKey.startsWith("greek-move-auth:")) {
             greekMoveAuthCurrent.remove(versionKey.substring("greek-move-auth:".length()));
+        } else if (versionKey.startsWith("spot-vol-regime:")) {
+            spotVolRegime.remove(versionKey.substring("spot-vol-regime:".length()));
         } else if (versionKey.startsWith("close-direction:")) {
             String cdKey = versionKey.substring("close-direction:".length());
             if (cdKey.contains("|V|")) {
@@ -5904,6 +5982,26 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    private void replaySpotVolRegimeCached(WebSocketSession session) {
+        // Late-join delivery for the spot-vol-regime CURRENT snapshot: same GLOBAL advisory class as
+        // replayGreekMoveAuthCached above — intentionally NOT filtered by the active market selection,
+        // symbol-filtered client-side. Purge-first + isCacheFresh run on the SHORT spotVolRegimeTtlMs
+        // window: a late joiner gets the CURRENT regime only; anything older is simply absent and the
+        // UI regime pill stays hidden.
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        for (Map.Entry<String, String> entry : spotVolRegime.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("spot-vol-regime:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, "spot-vol-regime", json);
+        }
+    }
+
     /**
      * True for the three ES open-direction advisory events (once-a-day forecast + per-horizon outcome +
      * the 60s live status heartbeat). They share the standalone/global/never-selection-gated delivery
@@ -6181,6 +6279,19 @@ public class FeedGatewayService implements ReplayRunner {
         return fallback;
     }
 
+    private String spotVolRegimeCacheKey(String json, String fallback) {
+        try {
+            String symbol = text(mapper.readTree(json), "symbol").toUpperCase();
+            if (!symbol.isBlank()) {
+                return symbol;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Malformed payloads expire immediately via spotVolRegimeTimestamp; fallback only gives
+            // updateCache a stable eviction key (the Kafka record key is also the symbol).
+        }
+        return fallback;
+    }
+
     /** One current decision per symbol/session; horizon variants are carried inside the payload. */
     private String zeroDteIntelligenceCacheKey(String json, String fallback) {
         try {
@@ -6398,6 +6509,7 @@ public class FeedGatewayService implements ReplayRunner {
         // too, which restores the move-authenticity track in per-session (auth) mode and after
         // return-to-live from a historical replay (replayLiveCacheToAppSession -> replayCachedToSocket).
         replayGreekMoveAuthCached(session);
+        replaySpotVolRegimeCached(session);
     }
 
     private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {
@@ -7277,6 +7389,10 @@ public class FeedGatewayService implements ReplayRunner {
             // updateCache's SHORT 5-min greekMoveAuthTtlMs window returns null for a stale verdict, which
             // suppresses the broadcast entirely.
             "greek-move-auth",
+            // Spot-vol-regime CURRENT snapshot: same GLOBAL advisory class (per-symbol,
+            // symbol-filtered client-side); staleness enforced upstream by the SHORT
+            // spotVolRegimeTtlMs window in updateCache.
+            "spot-vol-regime",
             // SPX close-direction interims + frozen verdict are the same class of GLOBAL advisory
             // overlay (one session at a time, rendered in its own summary card) — allowlist so
             // routeOrBroadcast/broadcast fan them out in per-session (auth) mode too. Malformed and

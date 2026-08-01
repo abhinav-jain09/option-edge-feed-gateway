@@ -1756,6 +1756,127 @@ class FeedGatewayServiceTest {
         assertTrue(sink.isEmpty(), "a stale verdict must never replay to a late joiner; got: " + sink);
     }
 
+    // ----- spot-vol-regime CURRENT snapshot relay --------------------------------------------------
+
+    @Test
+    void spotVolRegimeTopicIsOptionalGlobalAndOnTheShortFiveMinuteWindow() throws Exception {
+        // The spot-vol regime CURRENT snapshot is a standalone global advisory (optional topic, global
+        // broadcast in per-session mode) whose only value is being CURRENT — the greek-move-auth
+        // freshness class: SHORT window, never a long window that would replay a stale overnight
+        // regime as live.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("options.spx.spot-vol-regime.current", settings.spotVolRegimeTopic(),
+                "default topic must be the contract constant SpotVolRegimeTopics.SPOT_VOL_REGIME_CURRENT");
+        assertTrue(isOptionalTopic(service, settings.spotVolRegimeTopic()),
+                "a brand-new standalone producer may be absent — the topic must be optional");
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("spot-vol-regime"),
+                "the regime must fan out in per-session (auth) mode like its advisory siblings");
+        assertEquals(300_000L, settings.spotVolRegimeTtlMs(), "default TTL must be 5 minutes");
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, "spot-vol-regime", now - 2L * 60_000L, now),
+                "a 2-min-old regime must still be fresh");
+        assertTrue(isExpired(service, "spot-vol-regime", now - 6L * 60_000L, now),
+                "a 6-min-old regime must be STALE — never routed or replayed as current");
+    }
+
+    @Test
+    void spotVolRegimeUsesPayloadStreamTimeAndSymbolKey() throws Exception {
+        // Freshness tracks the PAYLOAD asOfEventTimeMs (the service's stream time), not the Kafka
+        // arrival time; the cache key is the symbol source-prefixed to source|symbol — a fresh-arriving
+        // backfilled snapshot must expire from its own stream time.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long streamTime = System.currentTimeMillis() - 1_000L;
+        String payload = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + streamTime + ","
+                + "\"combinedRegime\":\"CONFIRMED_UP\",\"conviction\":\"ALIGNED\"}";
+        ConsumerRecord<String, String> record = recordAt(
+                settings.spotVolRegimeTopic(), 0, 1L, "SPX", payload, System.currentTimeMillis());
+
+        assertEquals(streamTime, eventCacheTimestamp(service, "spot-vol-regime", record),
+                "fresh Kafka arrival must not disguise a historical regime");
+        assertEquals("DATABENTO|SPX",
+                updateCache(service, topicBinding("DATABENTO", "spot-vol-regime"), record, payload),
+                "updateCache must key the regime by source|symbol");
+    }
+
+    @Test
+    void futureSpotVolRegimeSnapshotFailsClosedAndCannotPoisonLaterValidUpdates() throws Exception {
+        // Clock-skew freeze-safety: an implausibly future-stamped snapshot must fail closed at ingest —
+        // otherwise it would evade expiry AND poison the monotonic supersede gate, freezing the pill.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String future = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now + 60L * 60_000L)
+                + ",\"combinedRegime\":\"CONFIRMED_UP\",\"conviction\":\"ALIGNED\"}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "spot-vol-regime"),
+                        recordAt(settings.spotVolRegimeTopic(), 0, 1L, "SPX", future, now),
+                        future),
+                "an hour-ahead snapshot must be dropped at ingest (fail closed), never cached");
+
+        String current = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now - 5_000L)
+                + ",\"combinedRegime\":\"CONFIRMED_UP\",\"conviction\":\"ALIGNED\"}";
+        assertEquals("DATABENTO|SPX",
+                updateCache(service, topicBinding("DATABENTO", "spot-vol-regime"),
+                        recordAt(settings.spotVolRegimeTopic(), 0, 2L, "SPX", current, now),
+                        current),
+                "a valid snapshot after a future one must be accepted — no poison left behind");
+    }
+
+    @Test
+    void freshSpotVolRegimeSnapshotIsCachedBySymbolAndReplayedToLateJoiner() throws Exception {
+        // Late-join contract: the current (fresh) regime is cached last-value-wins under the symbol and
+        // replayed standalone on connect, so a client opening the dashboard mid-session immediately
+        // shows the regime pill instead of waiting for the next heartbeat.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String older = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now - 2L * 60_000L)
+                + ",\"combinedRegime\":\"NEUTRAL\",\"conviction\":\"ALIGNED\"}";
+        assertEquals("DATABENTO|SPX",
+                updateCache(service, topicBinding("DATABENTO", "spot-vol-regime"),
+                        recordAt(settings.spotVolRegimeTopic(), 0, 1L, "SPX", older, now - 2L * 60_000L),
+                        older),
+                "updateCache must key the regime by source|symbol");
+        String current = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now - 30_000L)
+                + ",\"combinedRegime\":\"CONFIRMED_UP\",\"conviction\":\"ALIGNED\"}";
+        assertEquals("DATABENTO|SPX",
+                updateCache(service, topicBinding("DATABENTO", "spot-vol-regime"),
+                        recordAt(settings.spotVolRegimeTopic(), 0, 2L, "SPX", current, now - 30_000L),
+                        current));
+
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replaySpotVolRegimeCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+
+        assertEquals(1, sink.size(), "exactly the CURRENT regime must replay (last-value-wins); got: " + sink);
+        assertTrue(sink.get(0).contains("\"type\":\"spot-vol-regime\"")
+                        && sink.get(0).contains("\"combinedRegime\":\"CONFIRMED_UP\""),
+                "the latest regime must replay verbatim (JSON pass-through); was: " + sink.get(0));
+    }
+
+    @Test
+    void staleSpotVolRegimeSnapshotIsNeitherCachedNorReplayed() throws Exception {
+        // Staleness fail-closed: a snapshot older than the 5-min window makes updateCache return null —
+        // suppressing the live broadcast — and nothing replays to a late joiner: the pill stays hidden.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String stale = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now - 6L * 60_000L)
+                + ",\"combinedRegime\":\"CONFIRMED_UP\",\"conviction\":\"ALIGNED\"}";
+        assertNull(updateCache(service, topicBinding("DATABENTO", "spot-vol-regime"),
+                        recordAt(settings.spotVolRegimeTopic(), 0, 1L, "SPX", stale, now - 6L * 60_000L),
+                        stale),
+                "a 6-min-old regime must be dropped at ingest (null cacheKey = never live-routed)");
+
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replaySpotVolRegimeCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertTrue(sink.isEmpty(), "a stale regime must never replay to a late joiner; got: " + sink);
+    }
+
     @Test
     void cachedReplayIncludesFreshStrikeIntelForMatchingDatabentoSelectionOnly() throws Exception {
         FeedGatewayService service = service();
