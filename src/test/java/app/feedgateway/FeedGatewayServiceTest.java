@@ -1877,6 +1877,191 @@ class FeedGatewayServiceTest {
         assertTrue(sink.isEmpty(), "a stale regime must never replay to a late joiner; got: " + sink);
     }
 
+    // ----- spot-vol-regime STRIKE BAND (latched glyph marking) -------------------------------------
+    //
+    // The band is the USER-approved (2026-08-02) latched strike marking: when the regime becomes
+    // DIVERGENT_UP or COMPLACENT_DOWN the spot at that moment sets an ANCHOR strike, and every strike
+    // from the anchor through the strikes the spot subsequently traverses is coloured on the chain.
+    // The producer owns the history and publishes the RESOLVED per-strike state; the gateway is the
+    // trust boundary and only decides whether what arrived is well formed and in-session.
+    //
+    // 2026-08-03 is a Monday. 10:00 ET is inside RTH; 08:00 and 16:01 ET are not.
+    private static final long BAND_RTH_MS = 1_785_765_600_000L;      // 2026-08-03 10:00 ET
+    private static final long BAND_PREMARKET_MS = 1_785_758_400_000L; // 2026-08-03 08:00 ET
+    private static final long BAND_AFTER_CLOSE_MS = 1_785_787_260_000L; // 2026-08-03 16:01 ET
+    private static final long BAND_NEXT_DAY_MS = 1_785_852_000_000L;  // 2026-08-04 10:00 ET
+
+    /** A snapshot carrying a two-strike COMPLACENT_DOWN band — the USER's 7410/7405 green example. */
+    private static String bandSnapshot(long asOfEventTimeMs, String sessionDate, String marks) {
+        return "{\"schemaVersion\":4,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + asOfEventTimeMs
+                + ",\"combinedRegime\":\"COMPLACENT_DOWN\",\"conviction\":\"ALIGNED\""
+                + ",\"strikeBand\":{\"schemaVersion\":1,\"sessionDate\":\"" + sessionDate + "\""
+                + ",\"strikeIncrement\":5,\"marks\":" + marks + "}}";
+    }
+
+    private static String twoGreenMarks(long markedAt) {
+        return "[{\"strike\":7405,\"regime\":\"COMPLACENT_DOWN\",\"markedAtEventTimeMs\":" + markedAt + "},"
+                + "{\"strike\":7410,\"regime\":\"COMPLACENT_DOWN\",\"markedAtEventTimeMs\":" + markedAt + "}]";
+    }
+
+    @Test
+    void validInSessionStrikeBandSurvivesEnrichmentIntact() throws Exception {
+        // The happy path must actually reach the browser: a well-formed band whose sessionDate matches
+        // the ET trading date of the snapshot's own stream time, computed inside RTH, passes through
+        // verbatim. Without this the whole feature could be "safely" sanitised into never rendering.
+        FeedGatewayService service = service();
+        String enriched = enrichJson(service,
+                bandSnapshot(BAND_RTH_MS, "2026-08-03", twoGreenMarks(BAND_RTH_MS - 60_000L)),
+                topicBinding("DATABENTO", "spot-vol-regime"));
+        assertTrue(enriched.contains("\"strikeBand\""),
+                "a valid in-session band must survive enrichJson; was: " + enriched);
+        assertTrue(enriched.contains("\"strike\":7405") && enriched.contains("\"strike\":7410"),
+                "both traversed strikes (anchor 7410 and 7405) must survive; was: " + enriched);
+        assertTrue(enriched.contains("\"combinedRegime\":\"COMPLACENT_DOWN\""),
+                "the regime snapshot itself must be untouched; was: " + enriched);
+    }
+
+    @Test
+    void strikeBandFromAnotherSessionIsStrippedButTheRegimeSnapshotIsNot() throws Exception {
+        // THE session-scoped latch rule (Codex requirements consult 2026-08-02): "latched" means the
+        // colour survives the end of the suspect MOVE, not that it becomes a permanent annotation. A
+        // trader seeing a coloured 7410 at 09:31 on Tuesday reads it as TODAY's traversal, so Monday's
+        // band must never ride along. Stripping the band must never take the regime pill down with it.
+        FeedGatewayService service = service();
+        String enriched = enrichJson(service,
+                bandSnapshot(BAND_NEXT_DAY_MS, "2026-08-03", twoGreenMarks(BAND_RTH_MS)),
+                topicBinding("DATABENTO", "spot-vol-regime"));
+        assertFalse(enriched.contains("strikeBand"),
+                "yesterday's band must be stripped from today's snapshot; was: " + enriched);
+        assertTrue(enriched.contains("\"combinedRegime\":\"COMPLACENT_DOWN\""),
+                "only the band is suppressed — the regime snapshot still forwards; was: " + enriched);
+    }
+
+    @Test
+    void strikeBandComputedOutsideRegularTradingHoursIsStripped() throws Exception {
+        // The producer classifies RTH-only; a band stamped outside the session is either a producer
+        // defect or overnight drift, and neither may paint the chain. Early closes are handled by
+        // GatewayMarketCalendar, so this is not a plain "is it a weekday" check.
+        FeedGatewayService service = service();
+        String premarket = enrichJson(service,
+                bandSnapshot(BAND_PREMARKET_MS, "2026-08-03", twoGreenMarks(BAND_PREMARKET_MS - 1_000L)),
+                topicBinding("DATABENTO", "spot-vol-regime"));
+        assertFalse(premarket.contains("strikeBand"),
+                "an 08:00 ET band must be stripped; was: " + premarket);
+        String afterClose = enrichJson(service,
+                bandSnapshot(BAND_AFTER_CLOSE_MS, "2026-08-03", twoGreenMarks(BAND_RTH_MS)),
+                topicBinding("DATABENTO", "spot-vol-regime"));
+        assertFalse(afterClose.contains("strikeBand"),
+                "a 16:01 ET band must be stripped; was: " + afterClose);
+    }
+
+    @Test
+    void malformedStrikeBandsAreRefusedWholesaleRatherThanPartiallyPainted() throws Exception {
+        // A half-valid band is worse than none: the user would read the surviving strikes as "the spot
+        // stopped here". Every defect therefore drops the WHOLE band. The regime vocabulary is frozen
+        // to the two SUSPECT regimes, and marks is the complete resolved state (duplicates mean the
+        // producer never resolved overlapping episodes — the gateway must not invent "last one wins").
+        FeedGatewayService service = service();
+        Object binding = topicBinding("DATABENTO", "spot-vol-regime");
+        record Case(String name, String json) { }
+        long marked = BAND_RTH_MS - 30_000L;
+        List<Case> cases = List.of(
+                new Case("unsupported nested schemaVersion",
+                        bandSnapshot(BAND_RTH_MS, "2026-08-03", twoGreenMarks(marked))
+                                .replace("\"schemaVersion\":1", "\"schemaVersion\":2")),
+                new Case("band is not an object",
+                        "{\"schemaVersion\":4,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + BAND_RTH_MS
+                                + ",\"combinedRegime\":\"COMPLACENT_DOWN\",\"strikeBand\":\"green\"}"),
+                new Case("empty marks",
+                        bandSnapshot(BAND_RTH_MS, "2026-08-03", "[]")),
+                new Case("non-numeric strike",
+                        bandSnapshot(BAND_RTH_MS, "2026-08-03",
+                                "[{\"strike\":\"7410\",\"regime\":\"COMPLACENT_DOWN\",\"markedAtEventTimeMs\":" + marked + "}]")),
+                new Case("duplicate strike",
+                        bandSnapshot(BAND_RTH_MS, "2026-08-03",
+                                "[{\"strike\":7410,\"regime\":\"COMPLACENT_DOWN\",\"markedAtEventTimeMs\":" + marked + "},"
+                                        + "{\"strike\":7410,\"regime\":\"DIVERGENT_UP\",\"markedAtEventTimeMs\":" + marked + "}]")),
+                new Case("regime outside the frozen SUSPECT vocabulary",
+                        bandSnapshot(BAND_RTH_MS, "2026-08-03",
+                                "[{\"strike\":7410,\"regime\":\"CONFIRMED_UP\",\"markedAtEventTimeMs\":" + marked + "}]")),
+                new Case("mark stamped after the frame that reports it",
+                        bandSnapshot(BAND_RTH_MS, "2026-08-03",
+                                "[{\"strike\":7410,\"regime\":\"COMPLACENT_DOWN\",\"markedAtEventTimeMs\":"
+                                        + (BAND_RTH_MS + 1_000L) + "}]")),
+                new Case("snapshot without a stream time to scope the session to",
+                        bandSnapshot(BAND_RTH_MS, "2026-08-03", twoGreenMarks(marked))
+                                .replace("\"asOfEventTimeMs\":" + BAND_RTH_MS, "\"asOfEventTimeMs\":0")));
+        for (Case c : cases) {
+            String enriched = enrichJson(service, c.json(), binding);
+            assertFalse(enriched.contains("strikeBand"),
+                    "band must be refused wholesale — " + c.name() + "; was: " + enriched);
+            assertTrue(enriched.contains("\"combinedRegime\":\"COMPLACENT_DOWN\""),
+                    "the regime snapshot must survive — " + c.name() + "; was: " + enriched);
+        }
+    }
+
+    @Test
+    void oversizedStrikeBandIsRefusedRatherThanTruncated() throws Exception {
+        // 513 marks at the 5-point grid is 2,565 SPX points in one session — impossible, so it is a
+        // producer bug. It is REFUSED, not clipped: a truncated band looks complete and would
+        // understate how far the spot actually travelled.
+        FeedGatewayService service = service();
+        StringBuilder marks = new StringBuilder("[");
+        for (int i = 0; i <= 512; i++) {
+            marks.append(i == 0 ? "" : ",")
+                    .append("{\"strike\":").append(5000 + i * 5)
+                    .append(",\"regime\":\"DIVERGENT_UP\",\"markedAtEventTimeMs\":").append(BAND_RTH_MS - 1_000L)
+                    .append("}");
+        }
+        marks.append("]");
+        String enriched = enrichJson(service, bandSnapshot(BAND_RTH_MS, "2026-08-03", marks.toString()),
+                topicBinding("DATABENTO", "spot-vol-regime"));
+        assertFalse(enriched.contains("strikeBand"),
+                "513 marks must refuse the whole band; was: " + enriched.substring(0, Math.min(200, enriched.length())));
+    }
+
+    @Test
+    void lateJoinerAfterTheCloseGetsTheRegimeButNotTheBand() throws Exception {
+        // The 5-minute spot-vol-regime TTL outlives the 16:00 close by four minutes, so ingest-time
+        // checks alone would let a browser opened at 16:01 late-join into a coloured chain. The band is
+        // suppressed at SEND time once the session is over — the snapshot itself still replays.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String json = "{\"schemaVersion\":4,\"symbol\":\"SPX\",\"asOfEventTimeMs\":" + (now - 30_000L)
+                + ",\"combinedRegime\":\"COMPLACENT_DOWN\",\"conviction\":\"ALIGNED\""
+                + ",\"strikeBand\":{\"schemaVersion\":1,\"sessionDate\":\"2026-08-03\",\"strikeIncrement\":5"
+                + ",\"marks\":[{\"strike\":7410,\"regime\":\"COMPLACENT_DOWN\",\"markedAtEventTimeMs\":"
+                + (now - 60_000L) + "}]}}";
+        assertEquals("DATABENTO|SPX",
+                updateCache(service, topicBinding("DATABENTO", "spot-vol-regime"),
+                        recordAt(settings.spotVolRegimeTopic(), 0, 1L, "SPX", json, now - 30_000L), json),
+                "the snapshot must cache normally — this test is about the SEND-time band rule");
+
+        Method override = FeedGatewayService.class.getDeclaredMethod(
+                "overrideRegularTradingHoursForTest", Boolean.class);
+        override.setAccessible(true);
+        Method replay = FeedGatewayService.class.getDeclaredMethod(
+                "replaySpotVolRegimeCached", WebSocketSession.class);
+        replay.setAccessible(true);
+
+        override.invoke(service, Boolean.TRUE);
+        List<String> inSession = new ArrayList<>();
+        replay.invoke(service, recordingSession(inSession));
+        assertEquals(1, inSession.size(), "the snapshot must replay in-session; got: " + inSession);
+        assertTrue(inSession.get(0).contains("strikeBand"),
+                "during RTH the late joiner must receive the band; was: " + inSession.get(0));
+
+        override.invoke(service, Boolean.FALSE);
+        List<String> afterClose = new ArrayList<>();
+        replay.invoke(service, recordingSession(afterClose));
+        assertEquals(1, afterClose.size(), "the regime snapshot must still replay after the close");
+        assertFalse(afterClose.get(0).contains("strikeBand"),
+                "after the close the band must be suppressed at send time; was: " + afterClose.get(0));
+        assertTrue(afterClose.get(0).contains("\"combinedRegime\":\"COMPLACENT_DOWN\""),
+                "only the band is suppressed, never the snapshot; was: " + afterClose.get(0));
+    }
+
     @Test
     void cachedReplayIncludesFreshStrikeIntelForMatchingDatabentoSelectionOnly() throws Exception {
         FeedGatewayService service = service();

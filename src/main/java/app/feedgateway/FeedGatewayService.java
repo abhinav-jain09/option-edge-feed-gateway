@@ -158,6 +158,20 @@ public class FeedGatewayService implements ReplayRunner {
     // stream-time observation): a future-dated record must neither evade the SHORT freshness window
     // nor poison the monotonic supersede gate.
     private static final long SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS = 60_000L;
+    /** Only shape the gateway knows how to police; anything else is refused, never guessed at. */
+    private static final int STRIKE_BAND_SCHEMA_VERSION = 1;
+    /**
+     * Hard ceiling on the latched strike list. A US RTH session that traversed 512 strikes at the SPX
+     * 5-point grid would have moved 2,560 points — impossible. The bound exists so a producer bug can
+     * never push an unbounded array through the cache and out to every connected browser.
+     */
+    private static final int STRIKE_BAND_MAX_MARKS = 512;
+    /**
+     * FROZEN vocabulary: only the two SUSPECT regimes mark strikes. CONFIRMED_UP/CONFIRMED_DOWN/
+     * STABLE_UP/NEUTRAL/UNKNOWN never do — a band claiming otherwise is a producer defect, not a new
+     * feature to pass through.
+     */
+    private static final Set<String> STRIKE_BAND_REGIMES = Set.of("DIVERGENT_UP", "COMPLACENT_DOWN");
     private final SessionRoutingEngine routingEngine;
     private final Map<String, String> snapshots = new ConcurrentHashMap<>();
     private final Map<String, String> paces = new ConcurrentHashMap<>();
@@ -386,6 +400,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong droppedByStaleness = new AtomicLong();         // records dropped by selection-barrier / stale gate
     private final AtomicLong droppedByCacheGate = new AtomicLong();         // records dropped because cacheCaughtUpFlag was false
     private final AtomicLong droppedByOtherReasons = new AtomicLong();      // caught-up + non-forwardable (source/symbol/expiry mismatch, etc.)
+    private final AtomicLong strikeBandsRejected = new AtomicLong();        // spot-vol-regime strikeBand blocks refused by sanitizeStrikeBand
+    private final AtomicBoolean strikeBandRejectionLogged = new AtomicBoolean(false); // log the first rejection only; the rest are counted
     private final AtomicLong rolloverCount = new AtomicLong();              // number of session-boundary rollovers observed
     private final AtomicLong forwardStalledAlerts = new AtomicLong();       // number of GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS emissions
     private final AtomicLong lastRolloverAtMs = new AtomicLong();           // wall-clock ms of the most recent rollover
@@ -3784,9 +3800,141 @@ public class FeedGatewayService implements ReplayRunner {
                     object.put("expiry", expiry);
                 }
             }
+            if ("spot-vol-regime".equals(binding.event())) {
+                sanitizeStrikeBand(object);
+            }
             return mapper.writeValueAsString(object);
         } catch (JsonProcessingException ignored) {
             return json;
+        }
+    }
+
+    /**
+     * Fail-closed sanitation of the {@code strikeBand} block carried on a spot-vol-regime snapshot.
+     *
+     * <p>The band is the LATCHED strike marking (USER 2026-08-02): when the regime becomes
+     * DIVERGENT_UP or COMPLACENT_DOWN the spot at that moment sets an ANCHOR strike, and every strike
+     * from the anchor through the strikes the spot subsequently traverses carries the regime colour on
+     * the option chain. The producer owns the history and publishes the RESOLVED per-strike latch
+     * state; the gateway's job is only to guarantee that whatever reaches a browser is well formed and
+     * belongs to the session the snapshot was computed in.
+     *
+     * <p>Runs INSIDE {@link #enrichJson}'s existing parse (no second {@code readTree}) and mutates in
+     * place, so the sanitised band is what gets cached, live-broadcast AND late-join replayed — one
+     * enforcement point for all three paths, not three.
+     *
+     * <p>Every rejection REMOVES the whole band and leaves the rest of the snapshot untouched: a
+     * malformed band must never take the regime pill down with it, and a half-valid band must never
+     * paint a partial marking that the user would read as "the spot stopped here". A removed band is
+     * indistinguishable from no band at all, which the UI renders as no coloured strikes.
+     *
+     * <p>The session rule is measured against the snapshot's own {@code asOfEventTimeMs}, NOT the
+     * gateway wall clock — the same stream-time discipline the producer uses. Live, that is "now", so a
+     * latch carried across a session boundary is stripped; under replay, that is the historical instant,
+     * so a replayed session keeps its own band instead of being blanked by today's date.
+     *
+     * <p>THE LATCH IS SESSION-SCOPED (Codex requirements consult 2026-08-02). "Latched" means the
+     * colour survives the end of the suspect MOVE, not that it becomes a permanent annotation: a
+     * trader who sees a coloured 7410 at 09:31 on Tuesday reads it as today's traversal, so carrying
+     * Monday's range forward would be silently false. That is why the band must both belong to the ET
+     * session its snapshot was computed in AND have been computed inside that session's regular
+     * trading hours (early closes included, via {@link GatewayMarketCalendar}).
+     *
+     * @return the rejection reason, or {@code null} when the band was left intact (or was absent).
+     */
+    private String sanitizeStrikeBand(ObjectNode snapshot) {
+        JsonNode bandNode = snapshot.get("strikeBand");
+        if (bandNode == null || bandNode.isNull()) {
+            return null; // no band is a valid state — the common one before the first suspect regime
+        }
+        if (!(bandNode instanceof ObjectNode band)) {
+            return rejectStrikeBand(snapshot, "NOT_AN_OBJECT");
+        }
+        if (band.path("schemaVersion").asInt(-1) != STRIKE_BAND_SCHEMA_VERSION) {
+            // Unknown shape: refuse rather than guess at its meaning. The band evolves independently of
+            // the enclosing snapshot's schemaVersion, so a band-only change never blinds the pill.
+            return rejectStrikeBand(snapshot, "UNSUPPORTED_SCHEMA");
+        }
+        long asOfEventTimeMs = longField(snapshot, "asOfEventTimeMs", -1L);
+        if (asOfEventTimeMs <= 0L) {
+            return rejectStrikeBand(snapshot, "NO_EVENT_TIME"); // the session rule cannot be applied
+        }
+        JsonNode marks = band.get("marks");
+        if (marks == null || !marks.isArray() || marks.isEmpty()) {
+            return rejectStrikeBand(snapshot, "NO_MARKS");
+        }
+        if (marks.size() > STRIKE_BAND_MAX_MARKS) {
+            // Deliberately NOT truncated: a clipped band would look like a complete one and understate
+            // how far the spot actually travelled. Refusing it is the honest failure.
+            return rejectStrikeBand(snapshot, "TOO_MANY_MARKS");
+        }
+        Set<Double> seen = new HashSet<>();
+        for (JsonNode mark : marks) {
+            if (mark == null || !mark.isObject()) {
+                return rejectStrikeBand(snapshot, "MALFORMED_MARK");
+            }
+            JsonNode strike = mark.get("strike");
+            if (strike == null || !strike.isNumber() || !Double.isFinite(strike.asDouble())) {
+                return rejectStrikeBand(snapshot, "MALFORMED_MARK");
+            }
+            if (!seen.add(strike.asDouble())) {
+                // marks is the COMPLETE resolved state, one entry per strike. A duplicate means the
+                // producer failed to resolve overlapping episodes; "last element wins" would silently
+                // invent a resolution the producer never made.
+                return rejectStrikeBand(snapshot, "DUPLICATE_STRIKE");
+            }
+            if (!STRIKE_BAND_REGIMES.contains(text(mark, "regime"))) {
+                return rejectStrikeBand(snapshot, "UNSUPPORTED_REGIME");
+            }
+            long markedAt = longField(mark, "markedAtEventTimeMs", -1L);
+            if (markedAt <= 0L || markedAt > asOfEventTimeMs) {
+                // A mark cannot have been made after the frame that reports it.
+                return rejectStrikeBand(snapshot, "MARK_TIME_OUT_OF_RANGE");
+            }
+        }
+        Instant asOf = Instant.ofEpochMilli(asOfEventTimeMs);
+        if (!marketCalendar.isRegularTradingHours(asOf)) {
+            return rejectStrikeBand(snapshot, "OUTSIDE_RTH");
+        }
+        String session = marketCalendar.currentTradingDate(asOf).format(DateTimeFormatter.ISO_LOCAL_DATE);
+        if (!session.equals(text(band, "sessionDate"))) {
+            return rejectStrikeBand(snapshot, "WRONG_SESSION");
+        }
+        return null;
+    }
+
+    /** Drop the band, count it, and name the reason once (never per client). */
+    private String rejectStrikeBand(ObjectNode snapshot, String reason) {
+        snapshot.remove("strikeBand");
+        strikeBandsRejected.incrementAndGet();
+        if (strikeBandRejectionLogged.compareAndSet(false, true)) {
+            System.err.println("WARN: spot-vol-regime strikeBand rejected (" + reason
+                    + ") — the regime pill still forwards; only the strike marking is suppressed."
+                    + " Further rejections are counted, not logged.");
+        }
+        return reason;
+    }
+
+    /**
+     * Send-time half of the session rule: the ingest checks above prove the band BELONGED to a live RTH
+     * session when it was computed, but a snapshot minted at 15:59 stays inside the 5-minute
+     * spot-vol-regime cache TTL until 16:04. Without this, a browser opened at 16:01 would late-join
+     * into a coloured chain after the session it describes has closed. Only the band is stripped — the
+     * late joiner still gets the regime snapshot itself for the rest of its TTL.
+     */
+    private String suppressStrikeBandAfterClose(String json, long nowMs) {
+        if (json == null || json.isBlank() || isRegularTradingHours(nowMs) || !json.contains("strikeBand")) {
+            return json;
+        }
+        try {
+            JsonNode root = mapper.readTree(json);
+            if (!(root instanceof ObjectNode object) || !object.has("strikeBand")) {
+                return json;
+            }
+            object.remove("strikeBand");
+            return mapper.writeValueAsString(object);
+        } catch (JsonProcessingException ignored) {
+            return json; // unparseable payloads are already refused downstream by the freshness gate
         }
     }
 
@@ -5998,7 +6146,10 @@ public class FeedGatewayService implements ReplayRunner {
             if (!isCacheFresh("spot-vol-regime:" + entry.getKey(), nowMs)) {
                 continue;
             }
-            send(session, "spot-vol-regime", json);
+            // Session-scoped latch: the strike marking describes ONE RTH session, and the 5-minute TTL
+            // outlives the close by 4 minutes. Strip the band (never the snapshot) once the session is
+            // over so a browser opened at 16:01 does not late-join into a coloured chain.
+            send(session, "spot-vol-regime", suppressStrikeBandAfterClose(json, nowMs));
         }
     }
 
@@ -8302,6 +8453,7 @@ public class FeedGatewayService implements ReplayRunner {
                     + " droppedByOtherReasons=" + droppedByOtherReasons.get()
                     + " inactiveDroppedEvents=" + inactiveDroppedEvents.get()
                     + " staleDroppedEvents=" + staleDroppedEvents.get()
+                    + " strikeBandsRejected=" + strikeBandsRejected.get()
                     + " sourceStaleEvents=" + sourceStaleEvents.get()
                     + " offsetBarriers=" + offsetBarriers.get().size()
                     + " running=" + running.get()
