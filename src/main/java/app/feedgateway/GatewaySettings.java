@@ -1,6 +1,7 @@
 package app.feedgateway;
 
 import com.optionsedge.contracts.greekmoveauth.GreekMoveAuthTopics;
+import com.optionsedge.contracts.spotvolregime.SpotVolRegimeTopics;
 import com.optionsedge.contracts.strikeintelligence.StrikeIntelligenceTopics;
 import org.springframework.stereotype.Component;
 
@@ -1071,6 +1072,26 @@ public final class GatewaySettings {
      */
     public long greekMoveAuthTtlMs() {
         return longValue("GATEWAY_GREEK_MOVE_AUTH_TTL_MS", 300_000L, 0L);
+    }
+
+    /**
+     * Compacted CURRENT topic of the standalone spot-vol-regime service (JSON
+     * {@code SpotVolRegimeSnapshot} — see {@link SpotVolRegimeTopics#SPOT_VOL_REGIME_CURRENT}). One
+     * record per symbol ("SPX"); the service heartbeats it every frame. Resolved through the platform
+     * topic-prefix helper at deploy time, matching the greek-move-auth sibling above.
+     */
+    public String spotVolRegimeTopic() {
+        return value("KAFKA_SPOT_VOL_REGIME_CURRENT_TOPIC", SpotVolRegimeTopics.SPOT_VOL_REGIME_CURRENT);
+    }
+
+    /**
+     * Freshness TTL for the spot-vol-regime CURRENT cache. Same SHORT freshness class and rationale
+     * as {@link #greekMoveAuthTtlMs()}: a regime read minutes old (dead producer, overnight leftover)
+     * is misleading and must read as absent — the UI regime pill simply vanishes — never replay as
+     * live. Default 5 min.
+     */
+    public long spotVolRegimeTtlMs() {
+        return longValue("GATEWAY_SPOT_VOL_REGIME_TTL_MS", 300_000L, 0L);
     }
 
     /**
