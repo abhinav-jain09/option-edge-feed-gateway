@@ -4437,4 +4437,39 @@ class FeedGatewayServiceTest {
                 FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains("ibkr-preopen-status"),
                 "auth-mode sockets must receive the standalone window-state broadcasts");
     }
+
+    @org.junit.jupiter.api.Test
+    @SuppressWarnings("unchecked")
+    void ibkrPreOpenCacheIsOffsetOrderedAndWrapsTheRawKafkaKey() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String topic = settings.ibkrPreOpenStatusTopic();
+        String status = "{\"state\":\"FRESH\",\"recordRevision\":7}";
+        long now = System.currentTimeMillis();
+        // Offset 5 accepted.
+        org.junit.jupiter.api.Assertions.assertNotNull(updateCache(service,
+                topicBinding("IBKR", "ibkr-preopen-status"),
+                recordAt(topic, 0, 5L, "SPX|20260803|6300", status, now), status));
+        // EQUAL Kafka timestamp but HIGHER offset: accepted (offset-ordered, not timestamp).
+        String newer = "{\"state\":\"FRESH\",\"recordRevision\":8}";
+        org.junit.jupiter.api.Assertions.assertNotNull(updateCache(service,
+                topicBinding("IBKR", "ibkr-preopen-status"),
+                recordAt(topic, 0, 6L, "SPX|20260803|6300", newer, now), newer));
+        // LATER timestamp but LOWER offset: rejected — a stale duplicate can never overwrite.
+        org.junit.jupiter.api.Assertions.assertNull(updateCache(service,
+                topicBinding("IBKR", "ibkr-preopen-status"),
+                recordAt(topic, 0, 4L, "SPX|20260803|6300", status, now + 1_000L), status));
+        // The SAME offset replayed by the sibling consumer: rejected (strictly higher only).
+        org.junit.jupiter.api.Assertions.assertNull(updateCache(service,
+                topicBinding("IBKR", "ibkr-preopen-status"),
+                recordAt(topic, 0, 6L, "SPX|20260803|6300", newer, now), newer));
+        // The cached value wraps the RAW Kafka key (never the IBKR|-prefixed cache key) around
+        // the byte-untouched payload of the WINNING offset.
+        Field cacheField = FeedGatewayService.class.getDeclaredField("ibkrPreOpenStatus");
+        cacheField.setAccessible(true);
+        java.util.Map<String, String> cache = (java.util.Map<String, String>) cacheField.get(service);
+        String wrapped = cache.get("IBKR|SPX|20260803|6300");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                "{\"recordKey\":\"SPX|20260803|6300\",\"status\":" + newer + "}", wrapped);
+    }
 }

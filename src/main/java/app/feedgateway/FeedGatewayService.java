@@ -2513,7 +2513,11 @@ public class FeedGatewayService implements ReplayRunner {
                     // (esOpenDirectionTtlMs) already bounds how far back they bootstrap. The 60s status
                     // heartbeat rides along (trivial volume; each record it reads through is dropped by
                     // its own SHORT 5-min window when stale, so no stale status ever routes).
-                    return !"max-pain".equals(binding.event()) && !isEsOpenDirectionEvent(binding.event());
+                    // Never lag-skip the pre-open IBKR status/control stream either: R-WIRE.2 is
+                    // a NON-DROP control path — a seekToEnd could permanently skip a revocation,
+                    // generation close or path transition. Volume is tiny (one window's statuses).
+                    return !"max-pain".equals(binding.event()) && !isEsOpenDirectionEvent(binding.event())
+                            && !"ibkr-preopen-status".equals(binding.event());
                 })
                 .toList();
         if (selectedPartitions.isEmpty()) {
@@ -4085,6 +4089,21 @@ public class FeedGatewayService implements ReplayRunner {
             key = binding.source() + "|" + key;
         }
         String versionKey = event + ":" + key;
+        if ("ibkr-preopen-status".equals(event)) {
+            // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5): the status topic is single-
+            // partition and strictly ordered by offset — Kafka timestamps may tie or regress
+            // across legitimate later offsets (and the cache + live consumers read the same
+            // partition). Accept ONLY a strictly higher offset on the same partition; a
+            // DIFFERENT partition for the same key is impossible on the 1-partition contract
+            // (fail-closed: reject, never reorder).
+            RecordPosition incoming = recordPosition(record);
+            RecordPosition previousPosition = cachePositions.get(versionKey);
+            if (previousPosition != null
+                    && (!previousPosition.partition().equals(incoming.partition())
+                        || incoming.offset() <= previousPosition.offset())) {
+                return null;
+            }
+        }
         long eventTime = eventCacheTimestamp(event, record, json);
         Long previousEventTime = cacheEventTimes.get(versionKey);
         // Terminal max-pain MUST always reach the EXPIRED branch (eviction + return key for the
@@ -4092,8 +4111,9 @@ public class FeedGatewayService implements ReplayRunner {
         // with an older Kafka timestamp would be silently dropped before the UI sees the transition.
         boolean isTerminalMaxPainShortCircuitBypass = "max-pain".equals(event) && isMaxPainExpired(json);
         if (!isTerminalMaxPainShortCircuitBypass
+                && !"ibkr-preopen-status".equals(event)
                 && previousEventTime != null && previousEventTime > eventTime) {
-            return null;
+            return null;   // (the pre-open stream is offset-ordered above, never timestamp-gated)
         }
         if ("gex-by-strike".equals(event)
                 && previousEventTime != null
@@ -6765,7 +6785,12 @@ public class FeedGatewayService implements ReplayRunner {
         // return-to-live from a historical replay (replayLiveCacheToAppSession -> replayCachedToSocket).
         replayGreekMoveAuthCached(session);
         replaySpotVolRegimeCached(session);
-        replayIbkrPreOpenCached(session);
+        if (stateCaughtUp.get()) {
+            // R-WIRE.5 high-watermark-before-serving: a mid-bootstrap auth connection must not
+            // see strike/path rows that a not-yet-consumed revocation or generation supersedes.
+            // The caught-up re-push covers this client the moment the barrier clears.
+            replayIbkrPreOpenCached(session);
+        }
     }
 
     private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {
