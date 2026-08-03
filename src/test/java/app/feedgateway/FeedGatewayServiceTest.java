@@ -498,7 +498,7 @@ class FeedGatewayServiceTest {
     @Test
     void sourceSwitchReplayIncludesCachedVixPrice() {
         assertEquals(
-                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "ibkr-preopen-status", "strike-sr", "gex-magnet", "gamma-migration", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
+                List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "gamma-migration", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle"),
                 FeedGatewayService.sourceSwitchReplayEvents()
         );
     }
@@ -4413,5 +4413,21 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), List.of(),
                 List.of(), List.of(), List.of(), spxPrices
         );
+    }
+
+    @org.junit.jupiter.api.Test
+    void ibkrPreOpenWrapCarriesTheRecordKeyBesideTheUntouchedPayload() {
+        String wrapped = FeedGatewayService.wrapIbkrPreOpenStatus(
+                "SPX|20260803|6300", "{\"state\":\"FRESH\",\"recordRevision\":7}");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                "{\"recordKey\":\"SPX|20260803|6300\",\"status\":{\"state\":\"FRESH\",\"recordRevision\":7}}",
+                wrapped);
+        String control = FeedGatewayService.wrapIbkrPreOpenStatus(
+                "__path|20260803", "{\"state\":\"FREEZE\"}");
+        org.junit.jupiter.api.Assertions.assertTrue(control.startsWith("{\"recordKey\":\"__path|20260803\""));
+        // Keys with JSON-special characters stay valid JSON.
+        String quoted = FeedGatewayService.wrapIbkrPreOpenStatus("a\"b\\c", "{}");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                "{\"recordKey\":\"a\\\"b\\\\c\",\"status\":{}}", quoted);
     }
 }

@@ -129,7 +129,7 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike", "ibkr-preopen-status",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "gex-oi-status",
             "strike-sr",
             "gex-magnet",
@@ -640,6 +640,7 @@ public class FeedGatewayService implements ReplayRunner {
             // track rather than waiting for the next live verdict.
             replayGreekMoveAuthCached(session);
             replaySpotVolRegimeCached(session);
+            replayIbkrPreOpenCached(session);
             // Close-direction: replay the session's frozen verdict (or the current interim) so a page
             // reload in the final hour restores the card instead of waiting for the next minute tick.
             replayCloseDirectionCached(session);
@@ -655,9 +656,6 @@ public class FeedGatewayService implements ReplayRunner {
         // during an OI_MISSING morning restores the badge (last-value-wins per strike).
         if (stateCaughtUp.get()) {
             sendCachedState(session, List.of("gex-oi-status"));
-            if (settings.ibkrPreOpenEnabled()) {
-                sendCachedState(session, List.of("ibkr-preopen-status"));
-            }
         }
         if (hpsfCaughtUp.get()) {
             sendCachedState(session, List.of(
@@ -2169,6 +2167,21 @@ public class FeedGatewayService implements ReplayRunner {
                     if ("dealer-ledger".equals(binding.event()) && (forwardJson == null || forwardJson.isBlank())) {
                         continue; // join not ready / stale-dropped — nothing to forward for this record
                     }
+                    if ("ibkr-preopen-status".equals(binding.event())) {
+                        // Pre-open window state (rev13 R-STATE): a STANDALONE global stream like
+                        // close-direction/spot-vol-regime — its own websocket event, never a
+                        // ui-batch row, never selection-routed (payloads carry sessionId; clients
+                        // gate on it), never coalesced (controls must not drop). Broadcast the
+                        // WRAPPED cached form so the record key survives to the browser.
+                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                            String wrapped = ibkrPreOpenStatus.get(cacheKey);
+                            if (wrapped != null) {
+                                broadcast(binding.event(), wrapped);
+                                forwardedEvents.incrementAndGet();
+                            }
+                        }
+                        continue;
+                    }
                     if ("zero-dte-intelligence".equals(binding.event())) {
                         // Chain-level control signal: always its own websocket event, never a ui-batch row
                         // and never selection-routed. Every client receives it and filters symbol/session;
@@ -3056,6 +3069,11 @@ public class FeedGatewayService implements ReplayRunner {
                     replaySpotVolRegimeCached(client);
                 }
             }
+            if (events.contains("ibkr-preopen-status")) {
+                for (WebSocketSession client : clients) {
+                    replayIbkrPreOpenCached(client);
+                }
+            }
             // Close-direction is STANDALONE (never in the ui-batch) too: re-push the session's frozen
             // verdict / current interim to already-connected clients once this consumer's cache is
             // caught up, so a dashboard left open across a gateway restart gets the card back.
@@ -3299,7 +3317,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "ibkr-preopen-status", "strike-sr", "gex-magnet", "gamma-migration", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "gamma-migration", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
     }
 
     /**
@@ -4273,11 +4291,13 @@ public class FeedGatewayService implements ReplayRunner {
                 return key;
             }
             case "ibkr-preopen-status" -> {
-                // Last-value-wins per key: strike rows AND "__" control keys both cache — a
-                // reconnecting client replays the full pre-open window state (rev13 R-STATE).
+                // Last-value-wins per Kafka record key: strike rows AND "__" control keys both
+                // cache. The record KEY carries the identity (rev13 wire contract: values omit
+                // it), so the cached/broadcast payload is the WRAPPED form
+                // {"recordKey":…,"status":…} — a browser can tell "SPX|D|6300" from "__path|D".
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
-                ibkrPreOpenStatus.put(key, json);
+                ibkrPreOpenStatus.put(key, wrapIbkrPreOpenStatus(key, json));
                 return key;
             }
             case "liquidity-heatmap" -> {
@@ -4752,13 +4772,6 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
-                        .forEach(cachedEvents::add);
-                case "ibkr-preopen-status" -> ibkrPreOpenStatus.entrySet().stream()
-                        // Window-state stream (small): replay every fresh row; no source/selection
-                        // narrowing — the payloads carry sessionId, the client gates on it (R-STATE).
-                        .filter(entry -> isCacheFresh("ibkr-preopen-status:" + entry.getKey(), nowMs))
-                        .sorted(Map.Entry.comparingByKey())
-                        .map(entry -> new CachedEvent("ibkr-preopen-status", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "gex-oi-status" -> gexOiStatus.entrySet().stream()
                         // Slow watchdog signal (a few records per day at most): replay like gex-by-strike —
@@ -6186,6 +6199,36 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** The wrapped wire form for the pre-open status stream: the Kafka record key IS the
+     *  identity (strike row "SPX|D|6300" vs control "__path|D"), so it rides alongside the
+     *  untouched producer payload. */
+    static String wrapIbkrPreOpenStatus(String recordKey, String json) {
+        StringBuilder sb = new StringBuilder("{\"recordKey\":\"");
+        for (int i = 0; i < recordKey.length(); i++) {
+            char c = recordKey.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\');
+            }
+            sb.append(c);
+        }
+        return sb.append("\",\"status\":").append(json).append('}').toString();
+    }
+
+    /** Re-push the fresh pre-open window state to one client (standalone advisory class). */
+    private void replayIbkrPreOpenCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        for (Map.Entry<String, String> entry : ibkrPreOpenStatus.entrySet()) {
+            String wrapped = entry.getValue();
+            if (wrapped == null || wrapped.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("ibkr-preopen-status:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, "ibkr-preopen-status", wrapped);
+        }
+    }
+
     /**
      * True for the three ES open-direction advisory events (once-a-day forecast + per-horizon outcome +
      * the 60s live status heartbeat). They share the standalone/global/never-selection-gated delivery
@@ -6646,7 +6689,6 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "spread-skew", spreadSkews);
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "gex-oi-status", gexOiStatus);
-        replayCacheMap(session, "ibkr-preopen-status", ibkrPreOpenStatus);
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "gex-magnet", gexMagnet);
         replayCacheMap(session, "gamma-migration", gammaMigration);
@@ -6695,6 +6737,7 @@ public class FeedGatewayService implements ReplayRunner {
         // return-to-live from a historical replay (replayLiveCacheToAppSession -> replayCachedToSocket).
         replayGreekMoveAuthCached(session);
         replaySpotVolRegimeCached(session);
+        replayIbkrPreOpenCached(session);
     }
 
     private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {
