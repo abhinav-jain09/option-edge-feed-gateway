@@ -4416,19 +4416,34 @@ class FeedGatewayServiceTest {
     }
 
     @org.junit.jupiter.api.Test
-    void ibkrPreOpenWrapCarriesTheRecordKeyBesideTheUntouchedPayload() {
+    void ibkrPreOpenWrapCarriesKeyOffsetAndUntouchedPayloadWithFullEscaping() throws Exception {
         String wrapped = FeedGatewayService.wrapIbkrPreOpenStatus(
-                "SPX|20260803|6300", "{\"state\":\"FRESH\",\"recordRevision\":7}");
+                "SPX|20260803|6300", 41L, "{\"state\":\"FRESH\",\"recordRevision\":7}");
         org.junit.jupiter.api.Assertions.assertEquals(
-                "{\"recordKey\":\"SPX|20260803|6300\",\"status\":{\"state\":\"FRESH\",\"recordRevision\":7}}",
+                "{\"recordKey\":\"SPX|20260803|6300\",\"offset\":41,"
+                        + "\"status\":{\"state\":\"FRESH\",\"recordRevision\":7}}",
                 wrapped);
-        String control = FeedGatewayService.wrapIbkrPreOpenStatus(
-                "__path|20260803", "{\"state\":\"FREEZE\"}");
-        org.junit.jupiter.api.Assertions.assertTrue(control.startsWith("{\"recordKey\":\"__path|20260803\""));
-        // Keys with JSON-special characters stay valid JSON.
-        String quoted = FeedGatewayService.wrapIbkrPreOpenStatus("a\"b\\c", "{}");
-        org.junit.jupiter.api.Assertions.assertEquals(
-                "{\"recordKey\":\"a\\\"b\\\\c\",\"status\":{}}", quoted);
+        // EVERY control character stays valid JSON (parse-verified, not eyeballed).
+        com.fasterxml.jackson.databind.ObjectMapper jackson = new com.fasterxml.jackson.databind.ObjectMapper();
+        String nasty = "a\"b\\c\nd\re\tf\u0001g";
+        com.fasterxml.jackson.databind.JsonNode parsed = jackson.readTree(
+                FeedGatewayService.wrapIbkrPreOpenStatus(nasty, 7L, "{}"));
+        org.junit.jupiter.api.Assertions.assertEquals(nasty, parsed.get("recordKey").asText());
+        org.junit.jupiter.api.Assertions.assertEquals(7L, parsed.get("offset").asLong());
+    }
+
+    @org.junit.jupiter.api.Test
+    void ibkrPreOpenBroadcastIsExactlyOncePerOffsetAcrossBothConsumers() throws Exception {
+        FeedGatewayService service = service();
+        // Cache consumer reaches offset 5 first: it broadcasts.
+        org.junit.jupiter.api.Assertions.assertTrue(service.shouldBroadcastIbkrPreOpen(5L));
+        // The live consumer's duplicate of offset 5: suppressed (exactly once).
+        org.junit.jupiter.api.Assertions.assertFalse(service.shouldBroadcastIbkrPreOpen(5L));
+        // Live reaches 6 first, cache's later duplicate suppressed; a regressed 4 never fires.
+        org.junit.jupiter.api.Assertions.assertTrue(service.shouldBroadcastIbkrPreOpen(6L));
+        org.junit.jupiter.api.Assertions.assertFalse(service.shouldBroadcastIbkrPreOpen(6L));
+        org.junit.jupiter.api.Assertions.assertFalse(service.shouldBroadcastIbkrPreOpen(4L));
+        org.junit.jupiter.api.Assertions.assertTrue(service.shouldBroadcastIbkrPreOpen(7L));
     }
 
     @org.junit.jupiter.api.Test
@@ -4470,6 +4485,6 @@ class FeedGatewayServiceTest {
         java.util.Map<String, String> cache = (java.util.Map<String, String>) cacheField.get(service);
         String wrapped = cache.get("IBKR|SPX|20260803|6300");
         org.junit.jupiter.api.Assertions.assertEquals(
-                "{\"recordKey\":\"SPX|20260803|6300\",\"status\":" + newer + "}", wrapped);
+                "{\"recordKey\":\"SPX|20260803|6300\",\"offset\":6,\"status\":" + newer + "}", wrapped);
     }
 }

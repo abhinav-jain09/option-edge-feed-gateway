@@ -2186,14 +2186,17 @@ public class FeedGatewayService implements ReplayRunner {
                         // Pre-open window state (rev13 R-STATE): a STANDALONE global stream like
                         // close-direction/spot-vol-regime — its own websocket event, never a
                         // ui-batch row, never selection-routed (payloads carry sessionId; clients
-                        // gate on it), never coalesced (controls must not drop). Broadcast the
-                        // WRAPPED cached form so the record key survives to the browser.
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
-                            String wrapped = ibkrPreOpenStatus.get(cacheKey);
-                            if (wrapped != null) {
-                                broadcast(binding.event(), wrapped);
-                                forwardedEvents.incrementAndGet();
-                            }
+                        // gate on it), never coalesced (controls must not drop). BOTH consumers
+                        // ingest this topic: the offset CAS gate delivers each offset EXACTLY
+                        // once, in order, from whichever consumer reaches it first — updateCache's
+                        // duplicate rejection (cacheKey == null for the second consumer) never
+                        // suppresses a live delivery. The wrap carries (recordKey, offset) so the
+                        // client renders last-writer-wins even when a replay interleaves.
+                        if (cacheCaughtUpFlag.get() && shouldBroadcastIbkrPreOpen(record.offset())) {
+                            broadcast(binding.event(),
+                                    wrapIbkrPreOpenStatus(String.valueOf(record.key()),
+                                            record.offset(), json));
+                            forwardedEvents.incrementAndGet();
                         }
                         continue;
                     }
@@ -4345,7 +4348,7 @@ public class FeedGatewayService implements ReplayRunner {
                 String rawKey = String.valueOf(record.key());
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
-                ibkrPreOpenStatus.put(key, wrapIbkrPreOpenStatus(rawKey, json));
+                ibkrPreOpenStatus.put(key, wrapIbkrPreOpenStatus(rawKey, record.offset(), json));
                 return key;
             }
             case "liquidity-heatmap" -> {
@@ -6248,18 +6251,49 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** The wrapped wire form for the pre-open status stream: the Kafka record key IS the
-     *  identity (strike row "SPX|D|6300" vs control "__path|D"), so it rides alongside the
-     *  untouched producer payload. */
-    static String wrapIbkrPreOpenStatus(String recordKey, String json) {
+     *  identity (strike row "SPX|D|6300" vs control "__path|D") and the OFFSET is the ordering
+     *  token — replay and live deliveries can interleave at the socket, so the client renders
+     *  last-writer-wins per (recordKey, offset) and a stale replay can never override a newer
+     *  live delta. The producer payload rides byte-untouched. */
+    static String wrapIbkrPreOpenStatus(String recordKey, long offset, String json) {
         StringBuilder sb = new StringBuilder("{\"recordKey\":\"");
         for (int i = 0; i < recordKey.length(); i++) {
             char c = recordKey.charAt(i);
-            if (c == '"' || c == '\\') {
-                sb.append('\\');
+            switch (c) {
+                case '"' -> sb.append("\\\"");
+                case '\\' -> sb.append("\\\\");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                default -> {
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+                }
             }
-            sb.append(c);
         }
-        return sb.append("\",\"status\":").append(json).append('}').toString();
+        return sb.append("\",\"offset\":").append(offset)
+                .append(",\"status\":").append(json).append('}').toString();
+    }
+
+    /** Exactly-one, in-order live delivery per offset across the TWO ingesting consumers
+     *  (cache + live): whichever consumer reaches an offset FIRST broadcasts it; the loser's
+     *  duplicate — and any lower offset — is suppressed. Single-partition contract. */
+    private final java.util.concurrent.atomic.AtomicLong ibkrPreOpenBroadcastOffset =
+            new java.util.concurrent.atomic.AtomicLong(-1L);
+
+    boolean shouldBroadcastIbkrPreOpen(long offset) {
+        while (true) {
+            long current = ibkrPreOpenBroadcastOffset.get();
+            if (offset <= current) {
+                return false;
+            }
+            if (ibkrPreOpenBroadcastOffset.compareAndSet(current, offset)) {
+                return true;
+            }
+        }
     }
 
     /** Re-push the fresh pre-open window state to one client (standalone advisory class). */
