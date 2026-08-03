@@ -129,7 +129,7 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike", "ibkr-preopen-status",
             "gex-oi-status",
             "strike-sr",
             "gex-magnet",
@@ -228,6 +228,10 @@ public class FeedGatewayService implements ReplayRunner {
     // Per-strike OI-arrival status (OI_MISSING/OI_OK) from the gex watchdog, keyed symbol|expiry|strike
     // (last-value-wins like gex-by-strike): the UI's explicit badge when fail-closed GEX publishes nothing.
     private final Map<String, String> gexOiStatus = new ConcurrentHashMap<>();
+    // Pre-open IBKR GEX status/control rows (rev13 Phase 3), keyed by the record key: strike
+    // rows ("SPX|<D>|<strike>") AND "__"-prefixed controls (path/manifest/heartbeat/ownership)
+    // — the UI needs BOTH to drive per-strike chips + window state. Dark unless enabled.
+    private final Map<String, String> ibkrPreOpenStatus = new ConcurrentHashMap<>();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     private final Map<String, String> gammaMigration = new ConcurrentHashMap<>();
@@ -651,6 +655,9 @@ public class FeedGatewayService implements ReplayRunner {
         // during an OI_MISSING morning restores the badge (last-value-wins per strike).
         if (stateCaughtUp.get()) {
             sendCachedState(session, List.of("gex-oi-status"));
+            if (settings.ibkrPreOpenEnabled()) {
+                sendCachedState(session, List.of("ibkr-preopen-status"));
+            }
         }
         if (hpsfCaughtUp.get()) {
             sendCachedState(session, List.of(
@@ -1361,6 +1368,10 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         // Per-strike OI-arrival status (JSON, gex watchdog): OI_MISSING/OI_OK badge rows for the UI.
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
+        if (settings.ibkrPreOpenEnabled()) {
+            // Pre-open IBKR GEX status/control stream (rev13 Phase 3) — JSON on the wire.
+            topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
+        }
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
         if (settings.esGexEnabled()) {
@@ -3288,7 +3299,7 @@ public class FeedGatewayService implements ReplayRunner {
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "gamma-migration", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "ibkr-preopen-status", "strike-sr", "gex-magnet", "gamma-migration", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
     }
 
     /**
@@ -4261,6 +4272,14 @@ public class FeedGatewayService implements ReplayRunner {
                 gexOiStatus.put(key, json);
                 return key;
             }
+            case "ibkr-preopen-status" -> {
+                // Last-value-wins per key: strike rows AND "__" control keys both cache — a
+                // reconnecting client replays the full pre-open window state (rev13 R-STATE).
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                ibkrPreOpenStatus.put(key, json);
+                return key;
+            }
             case "liquidity-heatmap" -> {
                 // Latest column frame per symbol|expiry, last-value-wins; short TTL keeps a dead
                 // producer from replaying minutes-old liquidity as live on connect.
@@ -4734,6 +4753,13 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gex-by-strike", entry.getValue()))
                         .forEach(cachedEvents::add);
+                case "ibkr-preopen-status" -> ibkrPreOpenStatus.entrySet().stream()
+                        // Window-state stream (small): replay every fresh row; no source/selection
+                        // narrowing — the payloads carry sessionId, the client gates on it (R-STATE).
+                        .filter(entry -> isCacheFresh("ibkr-preopen-status:" + entry.getKey(), nowMs))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("ibkr-preopen-status", entry.getValue()))
+                        .forEach(cachedEvents::add);
                 case "gex-oi-status" -> gexOiStatus.entrySet().stream()
                         // Slow watchdog signal (a few records per day at most): replay like gex-by-strike —
                         // relaxed time/offset barriers, source/symbol/expiry isolation still enforced.
@@ -5014,6 +5040,11 @@ public class FeedGatewayService implements ReplayRunner {
             // OI-arrival badge state: at most a handful of records per day, must survive reconnects all
             // session — same long last-value-wins window as gex-by-strike/max-pain (default 12h).
             return CachePolicy.expiring(settings.gexOiStatusTtlMs());
+        }
+        if ("ibkr-preopen-status".equals(event)) {
+            // Pre-open window state: one session's horizon (default 4h) — survives an intra-window
+            // reconnect, can never replay yesterday's window as live (rev13 R-STATE).
+            return CachePolicy.expiring(settings.ibkrPreOpenStatusTtlMs());
         }
         if ("es-gex".equals(event)) {
             // ES-on-SPX aligned book: the align service re-emits ~5s, but a quiet chain may pause; a long
@@ -5480,6 +5511,8 @@ public class FeedGatewayService implements ReplayRunner {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
         } else if (versionKey.startsWith("gex-oi-status:")) {
             gexOiStatus.remove(versionKey.substring("gex-oi-status:".length()));
+        } else if (versionKey.startsWith("ibkr-preopen-status:")) {
+            ibkrPreOpenStatus.remove(versionKey.substring("ibkr-preopen-status:".length()));
         } else if (versionKey.startsWith("strike-sr:")) {
             strikeSr.remove(versionKey.substring("strike-sr:".length()));
         } else if (versionKey.startsWith("gex-strike-lifecycle:")) {
@@ -6613,6 +6646,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "spread-skew", spreadSkews);
         replayCacheMap(session, "gex-by-strike", gexByStrike);
         replayCacheMap(session, "gex-oi-status", gexOiStatus);
+        replayCacheMap(session, "ibkr-preopen-status", ibkrPreOpenStatus);
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "gex-magnet", gexMagnet);
         replayCacheMap(session, "gamma-migration", gammaMigration);
