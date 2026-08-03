@@ -4414,4 +4414,77 @@ class FeedGatewayServiceTest {
                 List.of(), List.of(), List.of(), spxPrices
         );
     }
+
+    @org.junit.jupiter.api.Test
+    void ibkrPreOpenWrapCarriesKeyOffsetAndUntouchedPayloadWithFullEscaping() throws Exception {
+        String wrapped = FeedGatewayService.wrapIbkrPreOpenStatus(
+                "SPX|20260803|6300", 41L, "{\"state\":\"FRESH\",\"recordRevision\":7}");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                "{\"recordKey\":\"SPX|20260803|6300\",\"offset\":41,"
+                        + "\"status\":{\"state\":\"FRESH\",\"recordRevision\":7}}",
+                wrapped);
+        // EVERY control character stays valid JSON (parse-verified, not eyeballed).
+        com.fasterxml.jackson.databind.ObjectMapper jackson = new com.fasterxml.jackson.databind.ObjectMapper();
+        String nasty = "a\"b\\c\nd\re\tf\u0001g";
+        com.fasterxml.jackson.databind.JsonNode parsed = jackson.readTree(
+                FeedGatewayService.wrapIbkrPreOpenStatus(nasty, 7L, "{}"));
+        org.junit.jupiter.api.Assertions.assertEquals(nasty, parsed.get("recordKey").asText());
+        org.junit.jupiter.api.Assertions.assertEquals(7L, parsed.get("offset").asLong());
+    }
+
+    @org.junit.jupiter.api.Test
+    void ibkrPreOpenBroadcastIsExactlyOncePerOffsetAcrossBothConsumers() throws Exception {
+        FeedGatewayService service = service();
+        // Cache consumer reaches offset 5 first: it broadcasts.
+        org.junit.jupiter.api.Assertions.assertTrue(service.shouldBroadcastIbkrPreOpen(5L));
+        // The live consumer's duplicate of offset 5: suppressed (exactly once).
+        org.junit.jupiter.api.Assertions.assertFalse(service.shouldBroadcastIbkrPreOpen(5L));
+        // Live reaches 6 first, cache's later duplicate suppressed; a regressed 4 never fires.
+        org.junit.jupiter.api.Assertions.assertTrue(service.shouldBroadcastIbkrPreOpen(6L));
+        org.junit.jupiter.api.Assertions.assertFalse(service.shouldBroadcastIbkrPreOpen(6L));
+        org.junit.jupiter.api.Assertions.assertFalse(service.shouldBroadcastIbkrPreOpen(4L));
+        org.junit.jupiter.api.Assertions.assertTrue(service.shouldBroadcastIbkrPreOpen(7L));
+    }
+
+    @org.junit.jupiter.api.Test
+    void ibkrPreOpenIsAGlobalBroadcastEventInPerSessionMode() {
+        org.junit.jupiter.api.Assertions.assertTrue(
+                FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains("ibkr-preopen-status"),
+                "auth-mode sockets must receive the standalone window-state broadcasts");
+    }
+
+    @org.junit.jupiter.api.Test
+    @SuppressWarnings("unchecked")
+    void ibkrPreOpenCacheIsOffsetOrderedAndWrapsTheRawKafkaKey() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String topic = settings.ibkrPreOpenStatusTopic();
+        String status = "{\"state\":\"FRESH\",\"recordRevision\":7}";
+        long now = System.currentTimeMillis();
+        // Offset 5 accepted.
+        org.junit.jupiter.api.Assertions.assertNotNull(updateCache(service,
+                topicBinding("IBKR", "ibkr-preopen-status"),
+                recordAt(topic, 0, 5L, "SPX|20260803|6300", status, now), status));
+        // EQUAL Kafka timestamp but HIGHER offset: accepted (offset-ordered, not timestamp).
+        String newer = "{\"state\":\"FRESH\",\"recordRevision\":8}";
+        org.junit.jupiter.api.Assertions.assertNotNull(updateCache(service,
+                topicBinding("IBKR", "ibkr-preopen-status"),
+                recordAt(topic, 0, 6L, "SPX|20260803|6300", newer, now), newer));
+        // LATER timestamp but LOWER offset: rejected — a stale duplicate can never overwrite.
+        org.junit.jupiter.api.Assertions.assertNull(updateCache(service,
+                topicBinding("IBKR", "ibkr-preopen-status"),
+                recordAt(topic, 0, 4L, "SPX|20260803|6300", status, now + 1_000L), status));
+        // The SAME offset replayed by the sibling consumer: rejected (strictly higher only).
+        org.junit.jupiter.api.Assertions.assertNull(updateCache(service,
+                topicBinding("IBKR", "ibkr-preopen-status"),
+                recordAt(topic, 0, 6L, "SPX|20260803|6300", newer, now), newer));
+        // The cached value wraps the RAW Kafka key (never the IBKR|-prefixed cache key) around
+        // the byte-untouched payload of the WINNING offset.
+        Field cacheField = FeedGatewayService.class.getDeclaredField("ibkrPreOpenStatus");
+        cacheField.setAccessible(true);
+        java.util.Map<String, String> cache = (java.util.Map<String, String>) cacheField.get(service);
+        String wrapped = cache.get("IBKR|SPX|20260803|6300");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                "{\"recordKey\":\"SPX|20260803|6300\",\"offset\":6,\"status\":" + newer + "}", wrapped);
+    }
 }

@@ -228,6 +228,10 @@ public class FeedGatewayService implements ReplayRunner {
     // Per-strike OI-arrival status (OI_MISSING/OI_OK) from the gex watchdog, keyed symbol|expiry|strike
     // (last-value-wins like gex-by-strike): the UI's explicit badge when fail-closed GEX publishes nothing.
     private final Map<String, String> gexOiStatus = new ConcurrentHashMap<>();
+    // Pre-open IBKR GEX status/control rows (rev13 Phase 3), keyed by the record key: strike
+    // rows ("SPX|<D>|<strike>") AND "__"-prefixed controls (path/manifest/heartbeat/ownership)
+    // — the UI needs BOTH to drive per-strike chips + window state. Dark unless enabled.
+    private final Map<String, String> ibkrPreOpenStatus = new ConcurrentHashMap<>();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     private final Map<String, String> gammaMigration = new ConcurrentHashMap<>();
@@ -636,6 +640,7 @@ public class FeedGatewayService implements ReplayRunner {
             // track rather than waiting for the next live verdict.
             replayGreekMoveAuthCached(session);
             replaySpotVolRegimeCached(session);
+            replayIbkrPreOpenCached(session);
             // Close-direction: replay the session's frozen verdict (or the current interim) so a page
             // reload in the final hour restores the card instead of waiting for the next minute tick.
             replayCloseDirectionCached(session);
@@ -1361,6 +1366,10 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
         // Per-strike OI-arrival status (JSON, gex watchdog): OI_MISSING/OI_OK badge rows for the UI.
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
+        if (settings.ibkrPreOpenEnabled()) {
+            // Pre-open IBKR GEX status/control stream (rev13 Phase 3) — JSON on the wire.
+            topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
+        }
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
         if (settings.esGexEnabled()) {
@@ -1458,6 +1467,11 @@ public class FeedGatewayService implements ReplayRunner {
     private void runJsonStateLiveConsumer() {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
+        if (settings.ibkrPreOpenEnabled()) {
+            // Pre-open IBKR GEX status/control stream (rev13 Phase 3) — keep the cache + live
+            // JSON consumer topic sets symmetric so live statuses actually flow post-bootstrap.
+            topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
+        }
         topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
         // Canonical SPX spot — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
@@ -1822,7 +1836,12 @@ public class FeedGatewayService implements ReplayRunner {
                         bootstrappingPartitions.keySet());
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
-                    String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
+                    // The pre-open status payload is a PRODUCER-authored contract (revision-equal
+                    // pairing fields, control JSON): it reaches the browser byte-untouched —
+                    // never enriched/reserialized.
+                    String json = binding != null && "ibkr-preopen-status".equals(binding.event())
+                            ? stringJson(record.value())
+                            : enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
                         evictEsStrikeIntelTombstone(binding, record);
@@ -2072,7 +2091,12 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
-                    String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
+                    // The pre-open status payload is a PRODUCER-authored contract (revision-equal
+                    // pairing fields, control JSON): it reaches the browser byte-untouched —
+                    // never enriched/reserialized.
+                    String json = binding != null && "ibkr-preopen-status".equals(binding.event())
+                            ? stringJson(record.value())
+                            : enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
                         evictEsStrikeIntelTombstone(binding, record);
@@ -2157,6 +2181,24 @@ public class FeedGatewayService implements ReplayRunner {
                             : json;
                     if ("dealer-ledger".equals(binding.event()) && (forwardJson == null || forwardJson.isBlank())) {
                         continue; // join not ready / stale-dropped — nothing to forward for this record
+                    }
+                    if ("ibkr-preopen-status".equals(binding.event())) {
+                        // Pre-open window state (rev13 R-STATE): a STANDALONE global stream like
+                        // close-direction/spot-vol-regime — its own websocket event, never a
+                        // ui-batch row, never selection-routed (payloads carry sessionId; clients
+                        // gate on it), never coalesced (controls must not drop). BOTH consumers
+                        // ingest this topic: the offset CAS gate delivers each offset EXACTLY
+                        // once, in order, from whichever consumer reaches it first — updateCache's
+                        // duplicate rejection (cacheKey == null for the second consumer) never
+                        // suppresses a live delivery. The wrap carries (recordKey, offset) so the
+                        // client renders last-writer-wins even when a replay interleaves.
+                        if (cacheCaughtUpFlag.get() && shouldBroadcastIbkrPreOpen(record.offset())) {
+                            broadcast(binding.event(),
+                                    wrapIbkrPreOpenStatus(String.valueOf(record.key()),
+                                            record.offset(), json));
+                            forwardedEvents.incrementAndGet();
+                        }
+                        continue;
                     }
                     if ("zero-dte-intelligence".equals(binding.event())) {
                         // Chain-level control signal: always its own websocket event, never a ui-batch row
@@ -2474,7 +2516,11 @@ public class FeedGatewayService implements ReplayRunner {
                     // (esOpenDirectionTtlMs) already bounds how far back they bootstrap. The 60s status
                     // heartbeat rides along (trivial volume; each record it reads through is dropped by
                     // its own SHORT 5-min window when stale, so no stale status ever routes).
-                    return !"max-pain".equals(binding.event()) && !isEsOpenDirectionEvent(binding.event());
+                    // Never lag-skip the pre-open IBKR status/control stream either: R-WIRE.2 is
+                    // a NON-DROP control path — a seekToEnd could permanently skip a revocation,
+                    // generation close or path transition. Volume is tiny (one window's statuses).
+                    return !"max-pain".equals(binding.event()) && !isEsOpenDirectionEvent(binding.event())
+                            && !"ibkr-preopen-status".equals(binding.event());
                 })
                 .toList();
         if (selectedPartitions.isEmpty()) {
@@ -2969,7 +3015,11 @@ public class FeedGatewayService implements ReplayRunner {
             if (binding == null) {
                 continue;
             }
-            if (requiresCatchUpForActiveSource(selection.source(), binding.source())) {
+            if ("ibkr-preopen-status".equals(binding.event())
+                    || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
+                // The pre-open status/control stream is SOURCE-INDEPENDENT window state:
+                // stateCaughtUp must include its partition regardless of the active market-data
+                // source, or replay could expose a pre-revocation snapshot (round-2 finding 4).
                 selectedEndOffsets.put(entry.getKey(), entry.getValue());
             }
         }
@@ -2989,6 +3039,11 @@ public class FeedGatewayService implements ReplayRunner {
         ActiveSelection selection = activeSelection.get();
         Map<TopicPartition, Long> selected = new LinkedHashMap<>();
         for (Map.Entry<TopicPartition, Long> entry : endOffsets.entrySet()) {
+            TopicBinding preOpenBinding = topicEvents.get(entry.getKey().topic());
+            if (preOpenBinding != null && "ibkr-preopen-status".equals(preOpenBinding.event())) {
+                selected.put(entry.getKey(), entry.getValue());
+                continue;
+            }
             TopicBinding binding = topicEvents.get(entry.getKey().topic());
             if (binding != null && requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 selected.put(entry.getKey(), entry.getValue());
@@ -3043,6 +3098,11 @@ public class FeedGatewayService implements ReplayRunner {
             if (events.contains("spot-vol-regime")) {
                 for (WebSocketSession client : clients) {
                     replaySpotVolRegimeCached(client);
+                }
+            }
+            if (events.contains("ibkr-preopen-status")) {
+                for (WebSocketSession client : clients) {
+                    replayIbkrPreOpenCached(client);
                 }
             }
             // Close-direction is STANDALONE (never in the ui-batch) too: re-push the session's frozen
@@ -4032,6 +4092,21 @@ public class FeedGatewayService implements ReplayRunner {
             key = binding.source() + "|" + key;
         }
         String versionKey = event + ":" + key;
+        if ("ibkr-preopen-status".equals(event)) {
+            // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5): the status topic is single-
+            // partition and strictly ordered by offset — Kafka timestamps may tie or regress
+            // across legitimate later offsets (and the cache + live consumers read the same
+            // partition). Accept ONLY a strictly higher offset on the same partition; a
+            // DIFFERENT partition for the same key is impossible on the 1-partition contract
+            // (fail-closed: reject, never reorder).
+            RecordPosition incoming = recordPosition(record);
+            RecordPosition previousPosition = cachePositions.get(versionKey);
+            if (previousPosition != null
+                    && (!previousPosition.partition().equals(incoming.partition())
+                        || incoming.offset() <= previousPosition.offset())) {
+                return null;
+            }
+        }
         long eventTime = eventCacheTimestamp(event, record, json);
         Long previousEventTime = cacheEventTimes.get(versionKey);
         // Terminal max-pain MUST always reach the EXPIRED branch (eviction + return key for the
@@ -4039,8 +4114,9 @@ public class FeedGatewayService implements ReplayRunner {
         // with an older Kafka timestamp would be silently dropped before the UI sees the transition.
         boolean isTerminalMaxPainShortCircuitBypass = "max-pain".equals(event) && isMaxPainExpired(json);
         if (!isTerminalMaxPainShortCircuitBypass
+                && !"ibkr-preopen-status".equals(event)
                 && previousEventTime != null && previousEventTime > eventTime) {
-            return null;
+            return null;   // (the pre-open stream is offset-ordered above, never timestamp-gated)
         }
         if ("gex-by-strike".equals(event)
                 && previousEventTime != null
@@ -4259,6 +4335,20 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gexOiStatus.put(key, json);
+                return key;
+            }
+            case "ibkr-preopen-status" -> {
+                // Last-value-wins per Kafka record key: strike rows AND "__" control keys both
+                // cache. The record KEY carries the identity (rev13 wire contract: values omit
+                // it), so the cached/broadcast payload is the WRAPPED form
+                // {"recordKey":…,"status":…} — a browser can tell "SPX|D|6300" from "__path|D".
+                // The RAW Kafka key is wrapped, NEVER the source-prefixed cache key ("IBKR|…"),
+                // and the RAW producer value rides byte-untouched (enrichJson is bypassed for
+                // this event at ingest).
+                String rawKey = String.valueOf(record.key());
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                ibkrPreOpenStatus.put(key, wrapIbkrPreOpenStatus(rawKey, record.offset(), json));
                 return key;
             }
             case "liquidity-heatmap" -> {
@@ -5015,6 +5105,11 @@ public class FeedGatewayService implements ReplayRunner {
             // session — same long last-value-wins window as gex-by-strike/max-pain (default 12h).
             return CachePolicy.expiring(settings.gexOiStatusTtlMs());
         }
+        if ("ibkr-preopen-status".equals(event)) {
+            // Pre-open window state: one session's horizon (default 4h) — survives an intra-window
+            // reconnect, can never replay yesterday's window as live (rev13 R-STATE).
+            return CachePolicy.expiring(settings.ibkrPreOpenStatusTtlMs());
+        }
         if ("es-gex".equals(event)) {
             // ES-on-SPX aligned book: the align service re-emits ~5s, but a quiet chain may pause; a long
             // last-value-wins window (default 12h, like gex-by-strike) so a mid-session reconnect gets the
@@ -5480,6 +5575,8 @@ public class FeedGatewayService implements ReplayRunner {
             gexByStrike.remove(versionKey.substring("gex-by-strike:".length()));
         } else if (versionKey.startsWith("gex-oi-status:")) {
             gexOiStatus.remove(versionKey.substring("gex-oi-status:".length()));
+        } else if (versionKey.startsWith("ibkr-preopen-status:")) {
+            ibkrPreOpenStatus.remove(versionKey.substring("ibkr-preopen-status:".length()));
         } else if (versionKey.startsWith("strike-sr:")) {
             strikeSr.remove(versionKey.substring("strike-sr:".length()));
         } else if (versionKey.startsWith("gex-strike-lifecycle:")) {
@@ -6153,6 +6250,67 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** The wrapped wire form for the pre-open status stream: the Kafka record key IS the
+     *  identity (strike row "SPX|D|6300" vs control "__path|D") and the OFFSET is the ordering
+     *  token — replay and live deliveries can interleave at the socket, so the client renders
+     *  last-writer-wins per (recordKey, offset) and a stale replay can never override a newer
+     *  live delta. The producer payload rides byte-untouched. */
+    static String wrapIbkrPreOpenStatus(String recordKey, long offset, String json) {
+        StringBuilder sb = new StringBuilder("{\"recordKey\":\"");
+        for (int i = 0; i < recordKey.length(); i++) {
+            char c = recordKey.charAt(i);
+            switch (c) {
+                case '"' -> sb.append("\\\"");
+                case '\\' -> sb.append("\\\\");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                default -> {
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+                }
+            }
+        }
+        return sb.append("\",\"offset\":").append(offset)
+                .append(",\"status\":").append(json).append('}').toString();
+    }
+
+    /** Exactly-one, in-order live delivery per offset across the TWO ingesting consumers
+     *  (cache + live): whichever consumer reaches an offset FIRST broadcasts it; the loser's
+     *  duplicate — and any lower offset — is suppressed. Single-partition contract. */
+    private final java.util.concurrent.atomic.AtomicLong ibkrPreOpenBroadcastOffset =
+            new java.util.concurrent.atomic.AtomicLong(-1L);
+
+    boolean shouldBroadcastIbkrPreOpen(long offset) {
+        while (true) {
+            long current = ibkrPreOpenBroadcastOffset.get();
+            if (offset <= current) {
+                return false;
+            }
+            if (ibkrPreOpenBroadcastOffset.compareAndSet(current, offset)) {
+                return true;
+            }
+        }
+    }
+
+    /** Re-push the fresh pre-open window state to one client (standalone advisory class). */
+    private void replayIbkrPreOpenCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        for (Map.Entry<String, String> entry : ibkrPreOpenStatus.entrySet()) {
+            String wrapped = entry.getValue();
+            if (wrapped == null || wrapped.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("ibkr-preopen-status:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, "ibkr-preopen-status", wrapped);
+        }
+    }
+
     /**
      * True for the three ES open-direction advisory events (once-a-day forecast + per-horizon outcome +
      * the 60s live status heartbeat). They share the standalone/global/never-selection-gated delivery
@@ -6661,6 +6819,12 @@ public class FeedGatewayService implements ReplayRunner {
         // return-to-live from a historical replay (replayLiveCacheToAppSession -> replayCachedToSocket).
         replayGreekMoveAuthCached(session);
         replaySpotVolRegimeCached(session);
+        if (stateCaughtUp.get()) {
+            // R-WIRE.5 high-watermark-before-serving: a mid-bootstrap auth connection must not
+            // see strike/path rows that a not-yet-consumed revocation or generation supersedes.
+            // The caught-up re-push covers this client the moment the barrier clears.
+            replayIbkrPreOpenCached(session);
+        }
     }
 
     private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {
@@ -7513,6 +7677,11 @@ public class FeedGatewayService implements ReplayRunner {
      */
     static final Set<String> GLOBAL_BROADCAST_EVENTS = Set.of(
             "status", "reset", "source-switching", "source-ready", "source-stale",
+            // Pre-open IBKR GEX window state (rev13 R-STATE): a GLOBAL control/status stream —
+            // identical for all users, sessionId-gated client-side. Allowlisted so the
+            // standalone broadcast reaches sockets in per-session (auth) mode too
+            // (GatewayRecordMapper deliberately has no route for it).
+            "ibkr-preopen-status",
             // Agent A short-premium recommendation is a GLOBAL advisory overlay (the UI filters by
             // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
             // in per-session (auth) mode too, not only legacy mode — otherwise it is silently

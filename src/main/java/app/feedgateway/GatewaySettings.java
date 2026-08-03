@@ -731,6 +731,26 @@ public final class GatewaySettings {
         return "true".equalsIgnoreCase(value("GATEWAY_ES_GEX_ENABLED", "false"));
     }
 
+    /**
+     * Pre-open IBKR GEX status stream (OVERNIGHT-IBKR-GEX-GATE1-REQUIREMENT.md rev13 Phase 3):
+     * per-strike FRESH/STALE/GATED/ABSENT statuses + path/manifest/heartbeat controls (JSON,
+     * keyed strike rows + {@code __}-prefixed control keys) from the gex-service's IBKR
+     * pre-open path. Broadcast as event "ibkr-preopen-status". Default OFF — the whole
+     * feature ships dark until {@code GATEWAY_IBKR_PREOPEN_ENABLED}.
+     */
+    public boolean ibkrPreOpenEnabled() {
+        return "true".equalsIgnoreCase(value("GATEWAY_IBKR_PREOPEN_ENABLED", "false"));
+    }
+
+    public String ibkrPreOpenStatusTopic() {
+        return value("KAFKA_IBKR_GEX_STATUS_TOPIC", "options.ibkr.gex.status");
+    }
+
+    /** Status rows age out with the window: one full session covers restarts, never a stale next-day replay. */
+    public long ibkrPreOpenStatusTtlMs() {
+        return longValue("GATEWAY_IBKR_PREOPEN_STATUS_TTL_MS", 4 * 3_600_000L, 0L);
+    }
+
     /** Long last-value-wins window for the aligned book (like gex-by-strike); the align service re-emits ~5s. */
     public long esGexTtlMs() {
         return longValue("GATEWAY_ES_GEX_TTL_MS", maxPainTtlMs(), 0L);
