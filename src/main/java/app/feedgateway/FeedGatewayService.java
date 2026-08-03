@@ -1467,6 +1467,11 @@ public class FeedGatewayService implements ReplayRunner {
     private void runJsonStateLiveConsumer() {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
+        if (settings.ibkrPreOpenEnabled()) {
+            // Pre-open IBKR GEX status/control stream (rev13 Phase 3) — keep the cache + live
+            // JSON consumer topic sets symmetric so live statuses actually flow post-bootstrap.
+            topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
+        }
         topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
         // Canonical SPX spot — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
@@ -1831,7 +1836,12 @@ public class FeedGatewayService implements ReplayRunner {
                         bootstrappingPartitions.keySet());
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
-                    String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
+                    // The pre-open status payload is a PRODUCER-authored contract (revision-equal
+                    // pairing fields, control JSON): it reaches the browser byte-untouched —
+                    // never enriched/reserialized.
+                    String json = binding != null && "ibkr-preopen-status".equals(binding.event())
+                            ? stringJson(record.value())
+                            : enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
                         evictEsStrikeIntelTombstone(binding, record);
@@ -2081,7 +2091,12 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
-                    String json = enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
+                    // The pre-open status payload is a PRODUCER-authored contract (revision-equal
+                    // pairing fields, control JSON): it reaches the browser byte-untouched —
+                    // never enriched/reserialized.
+                    String json = binding != null && "ibkr-preopen-status".equals(binding.event())
+                            ? stringJson(record.value())
+                            : enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
                         evictEsStrikeIntelTombstone(binding, record);
@@ -2993,7 +3008,11 @@ public class FeedGatewayService implements ReplayRunner {
             if (binding == null) {
                 continue;
             }
-            if (requiresCatchUpForActiveSource(selection.source(), binding.source())) {
+            if ("ibkr-preopen-status".equals(binding.event())
+                    || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
+                // The pre-open status/control stream is SOURCE-INDEPENDENT window state:
+                // stateCaughtUp must include its partition regardless of the active market-data
+                // source, or replay could expose a pre-revocation snapshot (round-2 finding 4).
                 selectedEndOffsets.put(entry.getKey(), entry.getValue());
             }
         }
@@ -3013,6 +3032,11 @@ public class FeedGatewayService implements ReplayRunner {
         ActiveSelection selection = activeSelection.get();
         Map<TopicPartition, Long> selected = new LinkedHashMap<>();
         for (Map.Entry<TopicPartition, Long> entry : endOffsets.entrySet()) {
+            TopicBinding preOpenBinding = topicEvents.get(entry.getKey().topic());
+            if (preOpenBinding != null && "ibkr-preopen-status".equals(preOpenBinding.event())) {
+                selected.put(entry.getKey(), entry.getValue());
+                continue;
+            }
             TopicBinding binding = topicEvents.get(entry.getKey().topic());
             if (binding != null && requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 selected.put(entry.getKey(), entry.getValue());
@@ -4295,9 +4319,13 @@ public class FeedGatewayService implements ReplayRunner {
                 // cache. The record KEY carries the identity (rev13 wire contract: values omit
                 // it), so the cached/broadcast payload is the WRAPPED form
                 // {"recordKey":…,"status":…} — a browser can tell "SPX|D|6300" from "__path|D".
+                // The RAW Kafka key is wrapped, NEVER the source-prefixed cache key ("IBKR|…"),
+                // and the RAW producer value rides byte-untouched (enrichJson is bypassed for
+                // this event at ingest).
+                String rawKey = String.valueOf(record.key());
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
-                ibkrPreOpenStatus.put(key, wrapIbkrPreOpenStatus(key, json));
+                ibkrPreOpenStatus.put(key, wrapIbkrPreOpenStatus(rawKey, json));
                 return key;
             }
             case "liquidity-heatmap" -> {
@@ -7590,6 +7618,11 @@ public class FeedGatewayService implements ReplayRunner {
      */
     static final Set<String> GLOBAL_BROADCAST_EVENTS = Set.of(
             "status", "reset", "source-switching", "source-ready", "source-stale",
+            // Pre-open IBKR GEX window state (rev13 R-STATE): a GLOBAL control/status stream —
+            // identical for all users, sessionId-gated client-side. Allowlisted so the
+            // standalone broadcast reaches sockets in per-session (auth) mode too
+            // (GatewayRecordMapper deliberately has no route for it).
+            "ibkr-preopen-status",
             // Agent A short-premium recommendation is a GLOBAL advisory overlay (the UI filters by
             // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
             // in per-session (auth) mode too, not only legacy mode — otherwise it is silently

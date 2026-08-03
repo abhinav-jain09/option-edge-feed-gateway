@@ -4430,4 +4430,11 @@ class FeedGatewayServiceTest {
         org.junit.jupiter.api.Assertions.assertEquals(
                 "{\"recordKey\":\"a\\\"b\\\\c\",\"status\":{}}", quoted);
     }
+
+    @org.junit.jupiter.api.Test
+    void ibkrPreOpenIsAGlobalBroadcastEventInPerSessionMode() {
+        org.junit.jupiter.api.Assertions.assertTrue(
+                FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains("ibkr-preopen-status"),
+                "auth-mode sockets must receive the standalone window-state broadcasts");
+    }
 }
