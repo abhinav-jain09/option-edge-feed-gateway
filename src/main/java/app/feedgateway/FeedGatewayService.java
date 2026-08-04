@@ -242,6 +242,16 @@ public class FeedGatewayService implements ReplayRunner {
     // (emptiness probes, replay snapshots) need no lock.
     private final Map<String, IbkrPreOpenGexCandidate> ibkrPreOpenGexCandidates = new ConcurrentHashMap<>();
     private final Map<String, IbkrPreOpenGexCandidate> ibkrPreOpenFrozenProjections = new ConcurrentHashMap<>();
+    // Values provably committed BEFORE their fence whose revision-equal number-bearing status has
+    // not (yet) been OBSERVED — the two streams ride independent consumers, so a restarted gateway
+    // can read the value first (round-1 finding 1). Re-evaluated when a status arrives and at every
+    // sweep; never presented while pending; dies unpaired at fence+10min (frozen-blank forever).
+    private final Map<String, IbkrPreOpenGexCandidate> ibkrPreOpenPendingProjections = new ConcurrentHashMap<>();
+    // Strikes terminally evicted by a Databento takeover (identity -> that window's fence): a
+    // late-observed pre-fence value (compacted redelivery) or a late-completing pending pair must
+    // never resurrect a taken-over strike — evictions are terminal (R-ARB: frozen values die
+    // forever). Released with the window's bookkeeping at fence+10min. Access under the lock.
+    private final Map<String, Long> ibkrPreOpenTakenOverStrikes = new ConcurrentHashMap<>();
     private final Object ibkrPreOpenGexLock = new Object();
     // Highest broker offset OBSERVED per partition of the shared live gex topic (both consumers feed
     // it). Snapshotted per fence at the 09:30 takeover boundary: that snapshot IS the gateway's
@@ -567,6 +577,20 @@ public class FeedGatewayService implements ReplayRunner {
         // AUTO-expiry daily roll (no-op unless IB_EXPIRY is empty/AUTO). 60s cadence catches the overnight
         // ET trading-date change well before the open; the date never changes mid-session.
         batchExecutor.scheduleAtFixedRate(this::maybeAutoRollExpiry, 60L, 60L, TimeUnit.SECONDS);
+        if (settings.ibkrPreOpenEnabled()) {
+            // rev13 slice 2: the pre-open window transitions (fence capture / takeover snapshot /
+            // 09:35 destruction) are consumer-LOCAL — they must fire on wall clock even when both
+            // Kafka consumers are stalled or the brokers are down, or connected clients would keep
+            // frozen values past 09:35 (R-SLO's ≤10 s sweeper bound). 5s cadence; no-op when the
+            // plane is empty; exceptions cannot wedge the batch cadence (isolated runnable).
+            batchExecutor.scheduleAtFixedRate(() -> {
+                try {
+                    sweepIbkrPreOpenGexWindows(System.currentTimeMillis());
+                } catch (RuntimeException ignored) {
+                    // a sweep failure must not kill the scheduled task chain
+                }
+            }, 5L, 5L, TimeUnit.SECONDS);
+        }
         // Rollover-diagnostics 60s dump (additive; separate executor so a diag exception can never wedge
         // the batch/deadline/autoroll cadence). See dumpDiagnosticState() for the semantics.
         diagnosticsExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -689,10 +713,12 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("gex-by-strike"));
         }
         // Pre-open IBKR GEX value plane (rev13 R-ARB slice 2): standalone wrapped replay, gated on
-        // the AVRO consumer (the shared live gex topic's ingester) so a mid-bootstrap connect can't
-        // see a value a not-yet-consumed revocation/generation supersedes; the caught-up re-push in
-        // markCacheCaughtUp covers this client the moment the barrier clears.
-        if (settings.ibkrPreOpenEnabled() && avroCaughtUp.get()) {
+        // BOTH consumers — the AVRO consumer ingests the shared live gex topic, but the revocation/
+        // generation CONTROLS (and the pairing statuses) ride the JSON state consumer's status
+        // topic (R-WIRE.5 status/control-before-serving). Gating on avro alone could expose a value
+        // whose retained revocation has not been consumed yet (round-1 finding 2); the caught-up
+        // re-push in markCacheCaughtUp covers this client the moment the LAST barrier clears.
+        if (settings.ibkrPreOpenEnabled() && avroCaughtUp.get() && stateCaughtUp.get()) {
             replayIbkrPreOpenGexCached(session);
         }
         // gex-oi-status rides the JSON state consumer only; replay once it has caught up so a reconnect
@@ -1041,6 +1067,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"ibkrPreOpenStatus\":" + ibkrPreOpenStatus.size() + ","
                 + "\"ibkrPreOpenGexCandidates\":" + ibkrPreOpenGexCandidates.size() + ","
                 + "\"ibkrPreOpenFrozenProjections\":" + ibkrPreOpenFrozenProjections.size() + ","
+                + "\"ibkrPreOpenPendingProjections\":" + ibkrPreOpenPendingProjections.size() + ","
                 + "\"ibkrPreOpenGexDroppedSessioned\":" + ibkrPreOpenGexDroppedSessioned.get() + ","
                 + "\"ibkrPreOpenGexRejected\":" + ibkrPreOpenGexRejected.get() + ","
                 + "\"strikeSr\":" + strikeSr.size() + ","
@@ -1192,6 +1219,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_ibkr_preopen_gex_frozen_projections Frozen 09:25 projections awaiting takeover/eviction.\n"
                 + "# TYPE options_edge_feed_gateway_ibkr_preopen_gex_frozen_projections gauge\n"
                 + "options_edge_feed_gateway_ibkr_preopen_gex_frozen_projections " + ibkrPreOpenFrozenProjections.size() + "\n"
+                + "# HELP options_edge_feed_gateway_ibkr_preopen_gex_pending_projections Pre-fence-committed values awaiting their pairing status (reconstruction).\n"
+                + "# TYPE options_edge_feed_gateway_ibkr_preopen_gex_pending_projections gauge\n"
+                + "options_edge_feed_gateway_ibkr_preopen_gex_pending_projections " + ibkrPreOpenPendingProjections.size() + "\n"
                 + "# HELP options_edge_feed_gateway_ibkr_preopen_gex_dropped_sessioned Fail-closed drops of sessioned records on the shared gex topic.\n"
                 + "# TYPE options_edge_feed_gateway_ibkr_preopen_gex_dropped_sessioned counter\n"
                 + "options_edge_feed_gateway_ibkr_preopen_gex_dropped_sessioned " + ibkrPreOpenGexDroppedSessioned.get() + "\n"
@@ -2292,7 +2322,7 @@ public class FeedGatewayService implements ReplayRunner {
                         if (cacheCaughtUpFlag.get() && shouldBroadcastIbkrPreOpen(record.offset())) {
                             broadcast(binding.event(),
                                     wrapIbkrPreOpenStatus(String.valueOf(record.key()),
-                                            record.offset(), json));
+                                            record.offset(), record.timestamp(), json));
                             forwardedEvents.incrementAndGet();
                         }
                         continue;
@@ -3218,11 +3248,14 @@ public class FeedGatewayService implements ReplayRunner {
                     replayIbkrPreOpenCached(client);
                 }
             }
-            // Pre-open IBKR GEX value plane (slice 2): re-push once the ingesting (avro) consumer's
-            // cache catches up — a dashboard left open across a gateway restart gets its live
-            // candidates/frozen projections back without a reload. Replays are idempotent client-
-            // side (phase + per-key offset last-writer-wins).
-            if (settings.ibkrPreOpenEnabled() && events.contains("gex-by-strike")) {
+            // Pre-open IBKR GEX value plane (slice 2): re-push once BOTH barriers are up — the avro
+            // consumer ingests the values, the JSON state consumer the revocation/generation
+            // controls and pairing statuses (round-1 finding 2: serving before the control stream
+            // is caught up could expose a revoked value). Both consumers' event lists contain
+            // "gex-by-strike", so whichever catches up LAST triggers this re-push exactly once.
+            // Replays are idempotent client-side (phase + per-key offset last-writer-wins).
+            if (settings.ibkrPreOpenEnabled() && events.contains("gex-by-strike")
+                    && avroCaughtUp.get() && stateCaughtUp.get()) {
                 for (WebSocketSession client : clients) {
                     replayIbkrPreOpenGexCached(client);
                 }
@@ -4470,13 +4503,17 @@ public class FeedGatewayService implements ReplayRunner {
                 String rawKey = String.valueOf(record.key());
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
-                ibkrPreOpenStatus.put(key, wrapIbkrPreOpenStatus(rawKey, record.offset(), json));
+                ibkrPreOpenStatus.put(key,
+                        wrapIbkrPreOpenStatus(rawKey, record.offset(), record.timestamp(), json));
                 if (rawKey.startsWith("__revocation|")) {
                     // R-ROLL: a revocation control kills the named output generation on the value
                     // plane synchronously (gateway evict ≤30 s) — candidates AND frozen projections.
                     // Runs on the winning (offset-ordered) delivery only; application is idempotent.
                     applyIbkrPreOpenRevocation(rawKey);
                 }
+                // Reconstruction is order-INDEPENDENT (round-1 finding 1): a status arriving after
+                // its value completes the pending pair right here, not at some later poll.
+                reevaluateIbkrPreOpenPendingProjections(System.currentTimeMillis());
                 return key;
             }
             case "liquidity-heatmap" -> {
@@ -6382,11 +6419,14 @@ public class FeedGatewayService implements ReplayRunner {
      *  identity (strike row "SPX|D|6300" vs control "__path|D") and the OFFSET is the ordering
      *  token — replay and live deliveries can interleave at the socket, so the client renders
      *  last-writer-wins per (recordKey, offset) and a stale replay can never override a newer
-     *  live delta. The producer payload rides byte-untouched. */
-    static String wrapIbkrPreOpenStatus(String recordKey, long offset, String json) {
+     *  live delta. {@code timestampMs} is the status record's broker CreateTime — the R-STOP
+     *  pairing proof needs BOTH halves of a frozen pair committed before the fence (round-1
+     *  finding 4), and the cache stores only this wrap. The producer payload rides byte-untouched. */
+    static String wrapIbkrPreOpenStatus(String recordKey, long offset, long timestampMs, String json) {
         StringBuilder sb = new StringBuilder("{\"recordKey\":\"");
         appendJsonEscaped(sb, recordKey);
         return sb.append("\",\"offset\":").append(offset)
+                .append(",\"timestampMs\":").append(timestampMs)
                 .append(",\"status\":").append(json).append('}').toString();
     }
 
@@ -6511,20 +6551,29 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private boolean interceptSharedGexRecord(
             ConsumerRecord<String, Object> record, String rawJson, boolean liveBroadcast, long nowMs) {
+        boolean liveTopic = record.topic().equals(settings.databentoGexTopic());
         if (rawJson == null || rawJson.isBlank()) {
+            if (liveTopic) {
+                trackIbkrPreOpenObservedOffset(record);
+            }
             return false; // existing pipeline handles empty values (tombstone/eviction paths)
         }
         JsonNode root;
         try {
             root = mapper.readTree(rawJson);
         } catch (JsonProcessingException e) {
+            if (liveTopic) {
+                trackIbkrPreOpenObservedOffset(record);
+            }
             return false; // not JSON — cannot claim a session; existing pipeline behavior unchanged
         }
         if (!(root instanceof ObjectNode)) {
+            if (liveTopic) {
+                trackIbkrPreOpenObservedOffset(record);
+            }
             return false;
         }
         SharedGexClass cls = classifySharedGexRecord(root);
-        boolean liveTopic = record.topic().equals(settings.databentoGexTopic());
         if (cls == SharedGexClass.DATABENTO) {
             if (liveTopic) {
                 // Apply the per-strike takeover eviction, THEN track the observed high-watermark —
@@ -6534,9 +6583,17 @@ public class FeedGatewayService implements ReplayRunner {
                 // now, merging the record's own offset first would put it AT the watermark and
                 // self-suppress the takeover it should trigger.
                 maybeEvictIbkrProjectionOnTakeover(record, root, nowMs);
-                ibkrPreOpenSharedGexMaxSeenOffsets.merge(record.partition(), record.offset(), Math::max);
+                trackIbkrPreOpenObservedOffset(record);
             }
             return false;
+        }
+        if (liveTopic) {
+            // EVERY observed record advances the partition's high-watermark, whatever its class
+            // (round-1 finding 5): the 09:30 snapshot must be the gateway's real observed POSITION
+            // on the partition, or a delayed sibling-consumer delivery whose offset sits between
+            // the last Databento record and the true position would read as "newly ingested".
+            // For sessioned/malformed records there is no takeover interplay, so order is free.
+            trackIbkrPreOpenObservedOffset(record);
         }
         if (!liveTopic || cls == SharedGexClass.PREOPEN || cls == SharedGexClass.UNKNOWN_SESSIONED) {
             // Fail closed, never presented (R-WIRE.1). PREOPEN is a VALID tuple, but with this
@@ -6650,8 +6707,18 @@ public class FeedGatewayService implements ReplayRunner {
                 ibkrPreOpenGexRejected.incrementAndGet(); // committed at/after the fence — never enters
                 return null;
             }
+            if (ibkrPreOpenTakenOverStrikes.containsKey(identity)) {
+                // The strike's projection was terminally evicted by its Databento takeover: a
+                // late-observed pre-fence value (compacted redelivery) can never resurrect it.
+                ibkrPreOpenGexRejected.incrementAndGet();
+                return null;
+            }
             if (!isIbkrPreOpenPairedNumberBearing(incoming)) {
-                ibkrPreOpenGexRejected.incrementAndGet(); // numberless at the fence -> frozen-blank
+                // NOT a terminal reject: the revision-equal status may simply not have been
+                // OBSERVED yet (independent consumers — a restarted gateway can read the value
+                // first, round-1 finding 1). Hold the value pending; the status's arrival (or the
+                // next sweep) completes the pair. Unpaired at 09:35 -> frozen-blank forever.
+                stashIbkrPreOpenPendingLocked(incoming);
                 return null;
             }
             IbkrPreOpenGexCandidate previous = ibkrPreOpenFrozenProjections.get(identity);
@@ -6692,7 +6759,9 @@ public class FeedGatewayService implements ReplayRunner {
      */
     void sweepIbkrPreOpenGexWindows(long nowMs) {
         if (ibkrPreOpenGexCandidates.isEmpty() && ibkrPreOpenFrozenProjections.isEmpty()
-                && ibkrPreOpenTakeoverWatermarks.isEmpty()) {
+                && ibkrPreOpenTakeoverWatermarks.isEmpty()
+                && ibkrPreOpenPendingProjections.isEmpty()
+                && ibkrPreOpenTakenOverStrikes.isEmpty()) {
             return;
         }
         List<String> broadcasts = new ArrayList<>();
@@ -6708,6 +6777,14 @@ public class FeedGatewayService implements ReplayRunner {
                 if (nowMs >= candidate.validUntilMs() + IBKR_PREOPEN_EVICT_AFTER_MS) {
                     continue; // whole window already over (gateway slept through it) — dead
                 }
+                if (candidate.recordTimestampMs() <= 0L
+                        || candidate.recordTimestampMs() >= candidate.validUntilMs()) {
+                    // R-STOP demands the frozen pair be COMMITTED before the fence. A candidate
+                    // admitted live (gateway clock pre-fence) whose broker CreateTime is at/after
+                    // the fence — or absent — cannot prove that (round-1 finding 4): frozen-blank.
+                    ibkrPreOpenGexRejected.incrementAndGet();
+                    continue;
+                }
                 if (isIbkrPreOpenPairedNumberBearing(candidate)) {
                     IbkrPreOpenGexCandidate previous =
                             ibkrPreOpenFrozenProjections.get(candidate.identity());
@@ -6717,8 +6794,16 @@ public class FeedGatewayService implements ReplayRunner {
                         broadcasts.add(wrapIbkrPreOpenGex(
                                 candidate.recordKey(), candidate.offset(), "FROZEN", candidate.json()));
                     }
-                } // else: numberless at 09:25⁻ -> frozen-blank (absence IS the truthful state)
+                } else {
+                    // Numberless at 09:25⁻ can mean "the pairing status was not CONSUMED yet"
+                    // (independent consumers, round-1 finding 1) — hold pending; if the status
+                    // never proves a pre-fence pair, the strike stays frozen-blank truthfully.
+                    stashIbkrPreOpenPendingLocked(candidate);
+                }
             }
+            // 1b. Pending-pair promotion: a status observed since the last sweep may have
+            // completed a pending pair (order-independent reconstruction, round-1 finding 1).
+            broadcasts.addAll(promoteIbkrPreOpenPendingLocked(nowMs));
             // 2. Takeover watermark snapshot, once per fence at fence + 5 min.
             for (IbkrPreOpenGexCandidate projection : ibkrPreOpenFrozenProjections.values()) {
                 long fence = projection.validUntilMs();
@@ -6737,8 +6822,12 @@ public class FeedGatewayService implements ReplayRunner {
                     broadcasts.add(wrapIbkrPreOpenGexEviction(projection.recordKey(), "WINDOW_END"));
                 }
             }
-            // Bookkeeping release: watermarks for windows that are over, oldest revocations.
+            // Bookkeeping release: watermarks and takeover tombstones for windows that are over
+            // (nothing can enter a dead window, so terminality no longer needs the pin), oldest
+            // revocations.
             ibkrPreOpenTakeoverWatermarks.keySet().removeIf(
+                    fence -> nowMs >= fence + IBKR_PREOPEN_EVICT_AFTER_MS);
+            ibkrPreOpenTakenOverStrikes.values().removeIf(
                     fence -> nowMs >= fence + IBKR_PREOPEN_EVICT_AFTER_MS);
             while (ibkrPreOpenRevokedGenerations.size() > 128) {
                 Iterator<String> eldest = ibkrPreOpenRevokedGenerations.iterator();
@@ -6749,6 +6838,13 @@ public class FeedGatewayService implements ReplayRunner {
         for (String wrapped : broadcasts) {
             broadcast("ibkr-preopen-gex", wrapped);
         }
+    }
+
+    /** Advance the shared live gex topic's per-partition observed high-watermark. Fed by EVERY
+     *  record either consumer observes on the topic — Databento, sessioned, malformed alike —
+     *  so the 09:30 snapshot is the gateway's real observed position (round-1 finding 5). */
+    private void trackIbkrPreOpenObservedOffset(ConsumerRecord<String, Object> record) {
+        ibkrPreOpenSharedGexMaxSeenOffsets.merge(record.partition(), record.offset(), Math::max);
     }
 
     /**
@@ -6789,6 +6885,13 @@ public class FeedGatewayService implements ReplayRunner {
         boolean evicted = false;
         synchronized (ibkrPreOpenGexLock) {
             evicted = ibkrPreOpenFrozenProjections.remove(identity, projection);
+            if (evicted) {
+                // TERMINAL per strike: pin the identity so a late compacted redelivery or a
+                // late-completing pending pair can never resurrect it, and kill any pending
+                // entry outright (Databento now owns the strike).
+                ibkrPreOpenTakenOverStrikes.put(identity, projection.validUntilMs());
+                ibkrPreOpenPendingProjections.remove(identity);
+            }
         }
         if (evicted) {
             broadcast("ibkr-preopen-gex",
@@ -6830,7 +6933,8 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** Evict matching entries from BOTH plane maps; returns the eviction wraps (caller broadcasts
-     *  outside the lock where possible). MUST be called under {@link #ibkrPreOpenGexLock}. */
+     *  outside the lock where possible). Matching PENDING pairs die too — silently, they were
+     *  never presented. MUST be called under {@link #ibkrPreOpenGexLock}. */
     private List<String> evictIbkrPreOpenGexLocked(
             java.util.function.Predicate<IbkrPreOpenGexCandidate> matches, String reason) {
         List<String> wraps = new ArrayList<>();
@@ -6845,7 +6949,93 @@ public class FeedGatewayService implements ReplayRunner {
                 }
             }
         }
+        ibkrPreOpenPendingProjections.values().removeIf(matches::test);
         return wraps;
+    }
+
+    /**
+     * Hold a value that is provably committed BEFORE its fence but whose revision-equal
+     * number-bearing status has not been observed yet (round-1 finding 1). Same monotonic
+     * per-identity ordering as the presented planes; never presented while pending. MUST be
+     * called under {@link #ibkrPreOpenGexLock}.
+     */
+    private void stashIbkrPreOpenPendingLocked(IbkrPreOpenGexCandidate incoming) {
+        IbkrPreOpenGexCandidate frozen = ibkrPreOpenFrozenProjections.get(incoming.identity());
+        if (frozen != null && (frozen.partition() != incoming.partition()
+                || incoming.offset() <= frozen.offset())) {
+            ibkrPreOpenGexRejected.incrementAndGet(); // can never beat the established projection
+            return;
+        }
+        IbkrPreOpenGexCandidate previous = ibkrPreOpenPendingProjections.get(incoming.identity());
+        if (previous != null && (previous.partition() != incoming.partition()
+                || incoming.offset() <= previous.offset())) {
+            if (previous.partition() != incoming.partition()
+                    || incoming.offset() < previous.offset()) {
+                ibkrPreOpenGexRejected.incrementAndGet(); // regressed/cross-partition — fail closed
+            } // the sibling consumer's exact duplicate is not a rejection, just a no-op
+            return;
+        }
+        ibkrPreOpenPendingProjections.put(incoming.identity(), incoming);
+    }
+
+    /**
+     * Re-evaluate every pending pair: promote the ones whose status now proves a pre-fence
+     * revision-equal number-bearing pair, drop the dead ones (window over, generation revoked or
+     * superseded). Returns the FROZEN wraps to broadcast (caller does so OUTSIDE the lock).
+     * MUST be called under {@link #ibkrPreOpenGexLock}.
+     */
+    private List<String> promoteIbkrPreOpenPendingLocked(long nowMs) {
+        if (ibkrPreOpenPendingProjections.isEmpty()) {
+            return List.of();
+        }
+        List<String> wraps = new ArrayList<>();
+        for (Iterator<Map.Entry<String, IbkrPreOpenGexCandidate>> it =
+                ibkrPreOpenPendingProjections.entrySet().iterator(); it.hasNext(); ) {
+            IbkrPreOpenGexCandidate pending = it.next().getValue();
+            if (nowMs >= pending.validUntilMs() + IBKR_PREOPEN_EVICT_AFTER_MS) {
+                it.remove(); // never paired inside its window — frozen-blank forever
+                continue;
+            }
+            if (ibkrPreOpenRevokedGenerations.contains(
+                    ibkrPreOpenSessionDate(pending.sessionId()) + "|" + pending.outputGeneration())) {
+                it.remove(); // generation revoked while pending
+                continue;
+            }
+            Long maxGen = ibkrPreOpenMaxGeneration.get(pending.sessionId());
+            if (maxGen != null && pending.outputGeneration() < maxGen) {
+                it.remove(); // generation superseded while pending
+                continue;
+            }
+            if (!isIbkrPreOpenPairedNumberBearing(pending)) {
+                continue; // still unproven — keep waiting inside the window
+            }
+            it.remove();
+            IbkrPreOpenGexCandidate previous = ibkrPreOpenFrozenProjections.get(pending.identity());
+            if (previous != null && (previous.partition() != pending.partition()
+                    || pending.offset() <= previous.offset())) {
+                ibkrPreOpenGexRejected.incrementAndGet(); // a newer projection landed meanwhile
+                continue;
+            }
+            ibkrPreOpenFrozenProjections.put(pending.identity(), pending);
+            wraps.add(wrapIbkrPreOpenGex(
+                    pending.recordKey(), pending.offset(), "FROZEN", pending.json()));
+        }
+        return wraps;
+    }
+
+    /** Lock-taking wrapper around {@link #promoteIbkrPreOpenPendingLocked}: promotion driven by a
+     *  status-record arrival (the status ingest path holds no plane lock); broadcasts outside. */
+    private void reevaluateIbkrPreOpenPendingProjections(long nowMs) {
+        if (ibkrPreOpenPendingProjections.isEmpty()) {
+            return;
+        }
+        List<String> promoted;
+        synchronized (ibkrPreOpenGexLock) {
+            promoted = promoteIbkrPreOpenPendingLocked(nowMs);
+        }
+        for (String wrapped : promoted) {
+            broadcast("ibkr-preopen-gex", wrapped);
+        }
     }
 
     /**
@@ -6856,6 +7046,11 @@ public class FeedGatewayService implements ReplayRunner {
      * number-bearing state (FRESH or STALE — both render numbers per §0; GATED/ABSENT never do).
      * Status rows live in the slice-1 cache under the "IBKR|" + raw-record-key cache key (the
      * status topic's strike keys are normalized to the value key by contract).
+     *
+     * <p>R-STOP pins the frozen pair as committed BEFORE 09:25 — BOTH halves. The value half is
+     * proven by the caller (recordTimestampMs &lt; fence); the status half is proven here from the
+     * wrap's {@code timestampMs} (the status record's broker CreateTime, round-1 finding 4). A
+     * status without a provable pre-fence commit time can never prove a frozen pair.
      */
     private boolean isIbkrPreOpenPairedNumberBearing(IbkrPreOpenGexCandidate candidate) {
         String wrappedStatus = ibkrPreOpenStatus.get("IBKR|" + candidate.recordKey());
@@ -6864,6 +7059,10 @@ public class FeedGatewayService implements ReplayRunner {
         }
         try {
             JsonNode wrapper = mapper.readTree(wrappedStatus);
+            long statusTimestampMs = longField(wrapper, "timestampMs", 0L);
+            if (statusTimestampMs <= 0L || statusTimestampMs >= candidate.validUntilMs()) {
+                return false; // status committed at/after the fence (or unprovable) — no pair
+            }
             JsonNode status = wrapper.get("status");
             if (status == null || !status.isObject()) {
                 return false;
