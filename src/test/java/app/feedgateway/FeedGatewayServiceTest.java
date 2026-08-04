@@ -5010,6 +5010,37 @@ class FeedGatewayServiceTest {
         ((java.util.concurrent.atomic.AtomicBoolean) barrier.get(service)).set(value);
     }
 
+    /** Drive the REAL recovery transition (caught-up -> recovering) on the named barrier. */
+    private static void markRecovering(FeedGatewayService service, String field) throws Exception {
+        Field barrier = FeedGatewayService.class.getDeclaredField(field);
+        barrier.setAccessible(true);
+        Method recovering = FeedGatewayService.class.getDeclaredMethod(
+                "markCacheRecovering", java.util.concurrent.atomic.AtomicBoolean.class);
+        recovering.setAccessible(true);
+        recovering.invoke(service, barrier.get(service));
+    }
+
+    /** A serving gateway (both barriers up, latch proven by a delivered broadcast) holding one
+     *  frozen projection for SPX|20260804|6300 with the given fence. Returns the sink. */
+    private static List<String> servingServiceWithFrozenProjection(
+            FeedGatewayService service, long fence, long nowMs) throws Exception {
+        List<String> sink = new ArrayList<>();
+        addRecordingClient(service, sink);
+        setCaughtUpBarrier(service, "avroCaughtUp", true);
+        setCaughtUpBarrier(service, "stateCaughtUp", true);
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertTrue(interceptSharedGex(service, gexRecord(7L, "SPX|20260804|6300", json,
+                fence - 5_000L), json, true, nowMs));
+        assertEquals(1, planeMap(service, "ibkrPreOpenFrozenProjections").size());
+        assertTrue(sink.stream().anyMatch(m -> m.contains("FROZEN")),
+                "setup must prove the plane was SERVING before recovery: " + sink);
+        sink.clear();
+        return sink;
+    }
+
     @Test
     void valuePlaneLiveBroadcastRequiresBothConsumerBarriers() throws Exception {
         // Round-2 finding 1: gating replay alone is not enough — the LIVE broadcast path serves
@@ -5197,6 +5228,158 @@ class FeedGatewayServiceTest {
             ObjectMapper jackson = new ObjectMapper();
             assertNotNull(jackson.readTree(offHealth));
             assertNotNull(jackson.readTree(onHealth));
+        } finally {
+            System.clearProperty("GATEWAY_IBKR_PREOPEN_ENABLED");
+        }
+    }
+
+    @Test
+    void takeoverEvictionStillBroadcastsWhileTheAvroBarrierIsRecovering() throws Exception {
+        // Round-3 finding 1: the caught-up flags are NOT monotonic — markCacheRecovering flips
+        // one back to false. A terminal transition during that interval must still reach clients
+        // that already hold the value, or they keep a frozen projection forever.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        List<String> sink = servingServiceWithFrozenProjection(service, fence, boundary - 30_000L);
+        service.sweepIbkrPreOpenGexWindows(boundary + 1_000L); // watermark snapshot
+        markRecovering(service, "avroCaughtUp");
+        // The strike's first newly-ingested Databento record arrives mid-recovery.
+        assertFalse(interceptSharedGex(service, gexRecord(102L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 2_000L), databentoGexJson(), false, boundary + 2_000L));
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(sink.stream().anyMatch(m -> m.contains("TAKEOVER")),
+                "takeover eviction lost during avro recovery: " + sink);
+    }
+
+    @Test
+    void revocationEvictionStillBroadcastsWhileTheStateBarrierIsRecovering() throws Exception {
+        // Round-3 finding 1, revocation flavor, with the STATE barrier recovering.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 60_000L;
+        List<String> sink = servingServiceWithFrozenProjection(service, fence, now);
+        markRecovering(service, "stateCaughtUp");
+        seedIbkrStatus(service, "__revocation|2026-08-04|3", 9L, "{\"revoked\":true}");
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(sink.stream().anyMatch(m -> m.contains("REVOKED")),
+                "revocation eviction lost during state recovery: " + sink);
+    }
+
+    @Test
+    void windowDestructionStillBroadcastsWhileABarrierIsRecovering() throws Exception {
+        // Round-3 finding 1, 09:35 destruction flavor.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 60_000L;
+        List<String> sink = servingServiceWithFrozenProjection(service, fence, now);
+        markRecovering(service, "stateCaughtUp");
+        service.sweepIbkrPreOpenGexWindows(fence + 10 * 60_000L + 1L);
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(sink.stream().anyMatch(m -> m.contains("WINDOW_END")),
+                "09:35 destruction lost during recovery: " + sink);
+    }
+
+    @Test
+    void freshRestartDatabentoObservedBeforeReconstructionNeverResurrectsTheStrike() throws Exception {
+        // Round-3 finding 2: on a fresh restart the live consumer starts at END while the cache
+        // consumer rewinds. A post-boundary Databento record observed BEFORE any frozen/pending
+        // state exists must still terminally take over the strike once reconstruction is
+        // attempted — in either reconstruction order.
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+        // Order 1: status reconstructed first, then the value.
+        FeedGatewayService statusFirst = service();
+        assertFalse(interceptSharedGex(statusFirst, gexRecord(200L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 2_000L), databentoGexJson(), false, boundary + 2_000L));
+        seedIbkrStatus(statusFirst, "SPX|20260804|6300", 1L, fence - 10_000L, status);
+        assertNull(ingestIbkrGex(statusFirst, gexRecord(7L, "SPX|20260804|6300", json,
+                fence - 5_000L), json, boundary + 3_000L));
+        assertTrue(planeMap(statusFirst, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(planeMap(statusFirst, "ibkrPreOpenPendingProjections").isEmpty());
+        assertEquals(1, planeMap(statusFirst, "ibkrPreOpenTakenOverStrikes").size(),
+                "the prior post-boundary observation must convert to a terminal tombstone");
+        // Order 2: value first (would otherwise stash pending), then the status.
+        FeedGatewayService valueFirst = service();
+        assertFalse(interceptSharedGex(valueFirst, gexRecord(200L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 2_000L), databentoGexJson(), false, boundary + 2_000L));
+        assertNull(ingestIbkrGex(valueFirst, gexRecord(7L, "SPX|20260804|6300", json,
+                fence - 5_000L), json, boundary + 3_000L));
+        assertTrue(planeMap(valueFirst, "ibkrPreOpenPendingProjections").isEmpty(),
+                "a taken-over strike must not even stash a pending pair");
+        seedIbkrStatus(valueFirst, "SPX|20260804|6300", 1L, fence - 10_000L, status);
+        assertTrue(planeMap(valueFirst, "ibkrPreOpenFrozenProjections").isEmpty());
+        // Negative control: a Databento record committed BEFORE the boundary (bootstrap/compacted
+        // prior record) must NOT poison the reconstruction.
+        FeedGatewayService priorRecord = service();
+        assertFalse(interceptSharedGex(priorRecord, gexRecord(200L, "SPX|20260804|6300",
+                databentoGexJson(), boundary - 10_000L), databentoGexJson(), false, boundary + 2_000L));
+        seedIbkrStatus(priorRecord, "SPX|20260804|6300", 1L, fence - 10_000L, status);
+        assertNotNull(ingestIbkrGex(priorRecord, gexRecord(7L, "SPX|20260804|6300", json,
+                fence - 5_000L), json, boundary + 3_000L));
+        assertEquals(1, planeMap(priorRecord, "ibkrPreOpenFrozenProjections").size());
+    }
+
+    @Test
+    void replayAppliesTheSharedTopicClassificationTupleMatrix() throws Exception {
+        // Round-3 finding 3: the historical-replay reader must share the cache/live readers'
+        // R-WIRE.1 classification. Matrix on the ONE chokepoint...
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        assertTrue(service.isSessionedSharedGexJson(ibkrGexJson(IBKR_SESSION, 3, 2, 7, now)),
+                "exact IBKR tuple is pre-open-plane only — never an ordinary replay row");
+        assertTrue(service.isSessionedSharedGexJson(
+                "{\"symbol\":\"SPX\",\"source\":\"PREOPEN\",\"timeframe\":\"PREOPEN\"}"),
+                "conflicting PREOPEN tuple fails closed in replay like the live reader");
+        assertTrue(service.isSessionedSharedGexJson(
+                "{\"symbol\":\"SPX\",\"source\":\"IBKR\",\"timeframe\":\"0DTE\",\"sessionId\":\"weird\"}"),
+                "unknown sessioned tuple fails closed in replay like the live reader");
+        assertFalse(service.isSessionedSharedGexJson(databentoGexJson()));
+        assertFalse(service.isSessionedSharedGexJson("not-json"));
+        assertFalse(service.isSessionedSharedGexJson(""));
+        assertFalse(service.isSessionedSharedGexJson(null));
+        // ...and the wiring: emitReplayRecord drops each sessioned class (counted) with the flag
+        // ON, and passes a genuine Databento record through to the ordinary path.
+        System.setProperty("GATEWAY_IBKR_PREOPEN_ENABLED", "true");
+        try {
+            FeedGatewayService wired = service();
+            Method emit = FeedGatewayService.class.getDeclaredMethod("emitReplayRecord",
+                    String.class, ReplayParams.class, app.feedgateway.mtsession.MarketDataSource.class,
+                    FeedGatewayService.MergeRecord.class, FeedGatewayService.ReplayHandle.class);
+            emit.setAccessible(true);
+            ReplayParams params = new ReplayParams("app:u1", "SPX", "20260804", 1_000L, 2_000L, 1000, null);
+            FeedGatewayService.ReplayHandle handle = new FeedGatewayService.ReplayHandle(1L);
+            java.util.function.BiFunction<String, Long, Object> emitRaw = (payload, offset) -> {
+                try {
+                    return emit.invoke(wired, "app:u1", params,
+                            app.feedgateway.mtsession.MarketDataSource.DATABENTO,
+                            new FeedGatewayService.MergeRecord(
+                                    new app.feedgateway.mtsession.gateway.ReplayChronology.Cursor(
+                                            now, new GatewaySettings().databentoGexTopic(), 0, offset),
+                                    "gex-by-strike", payload, false),
+                            handle);
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            };
+            assertEquals(Boolean.FALSE, emitRaw.apply(ibkrGexJson(IBKR_SESSION, 3, 2, 7, now), 1L));
+            assertEquals(1L, planeCounter(wired, "ibkrPreOpenGexDroppedSessioned"),
+                    "an exact IBKR tuple must be dropped (counted) by the replay reader");
+            assertEquals(Boolean.FALSE, emitRaw.apply(
+                    "{\"symbol\":\"SPX\",\"source\":\"PREOPEN\",\"timeframe\":\"PREOPEN\"}", 2L));
+            assertEquals(Boolean.FALSE, emitRaw.apply(
+                    "{\"symbol\":\"SPX\",\"source\":\"IBKR\",\"timeframe\":\"0DTE\",\"sessionId\":\"x\"}", 3L));
+            assertEquals(3L, planeCounter(wired, "ibkrPreOpenGexDroppedSessioned"));
+            // A genuine Databento record passes the classifier (whatever the downstream
+            // session-routing outcome, it is not a sessioned drop).
+            emitRaw.apply(databentoGexJson(), 4L);
+            assertEquals(3L, planeCounter(wired, "ibkrPreOpenGexDroppedSessioned"),
+                    "a Databento record must never count as a sessioned drop in replay");
         } finally {
             System.clearProperty("GATEWAY_IBKR_PREOPEN_ENABLED");
         }
