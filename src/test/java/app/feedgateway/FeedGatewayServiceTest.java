@@ -4574,6 +4574,20 @@ class FeedGatewayServiceTest {
         return (boolean) method.invoke(service, identity, fence);
     }
 
+    /**
+     * Backdate the gateway's process-start so a window whose 09:30 boundary is in the test's past
+     * counts as OBSERVED LIVE. Real gateways that ran through the boundary are the common case;
+     * tests that construct the service after choosing a past fence must say so explicitly, because
+     * the takeover predicate deliberately differs for a gateway that restarted after 09:30.
+     */
+    private static void backdateProcessStart(FeedGatewayService service, long startMs)
+            throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("ibkrPreOpenProcessStartMs");
+        field.setAccessible(true);
+        // final long -> set via Unsafe-free reflection is not possible; the field is non-final.
+        field.setLong(service, startMs);
+    }
+
     /** Drive the window sweeper at an explicit wall-clock, so the 09:30 watermark snapshot exists. */
     private static void sweepWindows(FeedGatewayService service, long nowMs) throws Exception {
         Method method = FeedGatewayService.class.getDeclaredMethod(
@@ -4808,6 +4822,8 @@ class FeedGatewayServiceTest {
     void takeoverEvictsOnlyNewlyIngestedDatabentoRecords() throws Exception {
         FeedGatewayService service = service();
         long now = System.currentTimeMillis();
+        // This gateway was RUNNING when the 09:30 boundary passed: both takeover axes apply.
+        backdateProcessStart(service, now - 60 * 60_000L);
         long fence = now - 6 * 60_000L;          // fence 6 min ago -> takeover boundary 1 min ago
         long boundary = fence + 5 * 60_000L;
         seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
@@ -4950,6 +4966,8 @@ class FeedGatewayServiceTest {
         // delivery between the last Databento offset and the true position reads as new.
         FeedGatewayService service = service();
         long now = System.currentTimeMillis();
+        // This gateway was RUNNING when the 09:30 boundary passed: both takeover axes apply.
+        backdateProcessStart(service, now - 60 * 60_000L);
         long fence = now - 6 * 60_000L;
         long boundary = fence + 5 * 60_000L;
         seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
@@ -5369,6 +5387,129 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void arbitrationIsScopedToTheSharedLiveTopicOnly() throws Exception {
+        // Round-5 finding 4: the (DATABENTO, gex-by-strike) binding also carries the separate JSON
+        // history topic. Arbitrating there would drop session-claiming records out of a
+        // pre-existing Databento pipeline this feature must leave untouched, so BOTH consumer call
+        // sites gate on the record's topic. Asserted on the source, because the guard lives at the
+        // call sites rather than inside the interceptor.
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of(
+                "src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int guards = source.split("settings\\.databentoGexTopic\\(\\)\\.equals\\(record\\.topic\\(\\)\\)", -1).length - 1;
+        assertEquals(2, guards,
+                "both interceptSharedGexRecord call sites must require the shared LIVE topic");
+        for (String callSite : source.split("interceptSharedGexRecord\\(record")) {
+            // every call site's guard block must mention the topic check before it
+            if (!callSite.endsWith("(")) {
+                continue;
+            }
+        }
+        // The history topic really is bound to the same (source, event) pair — which is why the
+        // guard is needed at all.
+        assertTrue(source.contains("topicEvents.put(settings.databentoGexHistoryTopic(), "
+                        + "new TopicBinding(\"DATABENTO\", \"gex-by-strike\"))"),
+                "the history topic shares the binding this guard protects against");
+    }
+
+    @Test
+    void admissionIsFailClosedOnTheWholeContractNotJustTheTuple() throws Exception {
+        // Round-5 finding 3. A record can carry the exact source/timeframe pair and still be
+        // malformed, and every one of these must be refused rather than "helpfully" accepted.
+        ObjectMapper jackson = new ObjectMapper();
+
+        // (a) text() trims, so a PADDED tuple would otherwise read as exact.
+        assertEquals(FeedGatewayService.SharedGexClass.UNKNOWN_SESSIONED,
+                FeedGatewayService.classifySharedGexRecord(jackson.readTree(
+                        "{\"source\":\" IBKR \",\"timeframe\":\"IBKR_PREOPEN\",\"sessionId\":\""
+                                + IBKR_SESSION + "\"}")),
+                "a padded source must not be normalized into the exact tuple");
+        assertEquals(FeedGatewayService.SharedGexClass.UNKNOWN_SESSIONED,
+                FeedGatewayService.classifySharedGexRecord(jackson.readTree(
+                        "{\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN \",\"sessionId\":\""
+                                + IBKR_SESSION + "\"}")),
+                "a padded timeframe must not be normalized into the exact tuple");
+
+        long now = System.currentTimeMillis();
+        long fence = now + 60_000L;
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+
+        // (b) A session id outside the pinned IBKR_PREOPEN:<yyyy-MM-dd> shape.
+        FeedGatewayService badSession = service();
+        seedIbkrStatus(badSession, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        String malformed = ibkrGexJson("IBKR_PREOPEN:not-a-date", 3, 2, 7, fence);
+        assertNull(ingestIbkrGex(badSession, gexRecord(5L, "SPX|20260804|6300", malformed,
+                now - 5_000L), malformed, now));
+        assertTrue(planeMap(badSession, "ibkrPreOpenGexCandidates").isEmpty());
+
+        // (c) Zero/default ordering fields — R-WIRE.5 cannot order an unversioned record.
+        for (String unversioned : List.of(
+                ibkrGexJson(IBKR_SESSION, 0, 2, 7, fence),
+                ibkrGexJson(IBKR_SESSION, 3, 0, 7, fence),
+                ibkrGexJson(IBKR_SESSION, 3, 2, 0, fence))) {
+            FeedGatewayService svc = service();
+            seedIbkrStatus(svc, "SPX|20260804|6300", 1L, now - 10_000L, status);
+            assertNull(ingestIbkrGex(svc, gexRecord(5L, "SPX|20260804|6300", unversioned,
+                    now - 5_000L), unversioned, now), "unversioned record: " + unversioned);
+            assertTrue(planeMap(svc, "ibkrPreOpenGexCandidates").isEmpty());
+        }
+
+        // (d) The payload identity must agree with the Kafka key it was partitioned under.
+        FeedGatewayService mismatched = service();
+        seedIbkrStatus(mismatched, "SPX|20260804|6305", 1L, now - 10_000L, status);
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);   // payload says strike 6300
+        assertNull(ingestIbkrGex(mismatched, gexRecord(5L, "SPX|20260804|6305", json,
+                now - 5_000L), json, now),
+                "a record whose payload names another strike than its key must fail closed");
+        assertTrue(planeMap(mismatched, "ibkrPreOpenGexCandidates").isEmpty());
+
+        // Control: the fully-conforming record is still admitted.
+        FeedGatewayService ok = service();
+        seedIbkrStatus(ok, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        assertNotNull(ingestIbkrGex(ok, gexRecord(5L, "SPX|20260804|6300", json, now - 5_000L),
+                json, now));
+    }
+
+    @Test
+    void aGatewayThatRestartedAfterTheBoundaryNeverSynthesizesAWatermark() throws Exception {
+        // Round-5 finding 1: a watermark is a record of where THIS gateway stood on each partition
+        // when 09:30 passed. A gateway that started afterwards has no such record, and snapshotting
+        // now would capture offsets read AFTER the boundary — for a second strike that snapshot can
+        // contain a record already observed post-boundary, letting the first strike resurrect. The
+        // pinned recovery rule for that case is commit-time only, so no watermark may be created.
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        FeedGatewayService restarted = service();      // started AFTER the boundary — not backdated
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+        seedIbkrStatus(restarted, "SPX|20260804|6300", 1L, fence - 10_000L, status);
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        ingestIbkrGex(restarted, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, boundary + 1_000L);
+        sweepWindows(restarted, boundary + 2_000L);
+        assertNull(takeoverWatermark(restarted, fence),
+                "a restarted gateway must never synthesize a 09:30 watermark retrospectively");
+
+        // ...and its takeover judgment is commit-time only: a post-boundary commit takes over
+        // whatever its offset, because there is no position to compare against.
+        String identity = gexIdentity(restarted, "SPX|20260804|6300");
+        seedDatabentoObservation(restarted, identity, boundary + 1_000L, 0, 1L);
+        assertTrue(strikeTakenOver(restarted, identity, fence),
+                "commit-time-only recovery still honours a post-boundary takeover");
+
+        // A gateway that DID run through the boundary snapshots one, and uses both axes.
+        FeedGatewayService live = service();
+        backdateProcessStart(live, now - 60 * 60_000L);
+        seedIbkrStatus(live, "SPX|20260804|6300", 1L, fence - 10_000L, status);
+        ingestIbkrGex(live, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, boundary + 1_000L);
+        sweepWindows(live, boundary + 2_000L);
+        assertNotNull(takeoverWatermark(live, fence),
+                "a gateway running through the boundary records where it stood");
+    }
+
+    @Test
     void aPostBoundaryDatabentoRecordAtOrBelowTheWatermarkNeverTakesTheStrikeOver() throws Exception {
         // Round-4 finding 3: the observation memory carried COMMIT TIME ALONE, so a record the
         // immediate path correctly refused on the WATERMARK axis — committed after 09:30 but at or
@@ -5379,6 +5520,8 @@ class FeedGatewayServiceTest {
         long fence = now - 6 * 60_000L;
         long boundary = fence + 5 * 60_000L;
         FeedGatewayService service = service();
+        // This gateway was RUNNING when the 09:30 boundary passed: both takeover axes apply.
+        backdateProcessStart(service, now - 60 * 60_000L);
         String identity = gexIdentity(service, "SPX|20260804|6300");
         seedTakeoverWatermark(service, fence, 0, 500L);
 
