@@ -4541,6 +4541,64 @@ class FeedGatewayServiceTest {
         return ((java.util.concurrent.atomic.AtomicLong) counterField.get(service)).get();
     }
 
+    @SuppressWarnings("unchecked")
+    private static void seedTakeoverWatermark(FeedGatewayService service, long fence, int partition,
+            long offset) throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("ibkrPreOpenTakeoverWatermarks");
+        field.setAccessible(true);
+        ((Map<Long, Map<Integer, Long>>) field.get(service))
+                .computeIfAbsent(fence, k -> new java.util.concurrent.ConcurrentHashMap<>())
+                .put(partition, offset);
+    }
+
+    /** Seed the per-strike Databento observation with BOTH axes, as the live path records them. */
+    @SuppressWarnings("unchecked")
+    private static void seedDatabentoObservation(FeedGatewayService service, String identity,
+            long commitMs, int partition, long offset) throws Exception {
+        Class<?> type = Class.forName(
+                "app.feedgateway.FeedGatewayService$IbkrPreOpenDatabentoObservation");
+        java.lang.reflect.Constructor<?> ctor =
+                type.getDeclaredConstructor(long.class, int.class, long.class);
+        ctor.setAccessible(true);
+        Field field = FeedGatewayService.class.getDeclaredField("ibkrPreOpenDatabentoMaxCommitMs");
+        field.setAccessible(true);
+        ((Map<String, Object>) field.get(service))
+                .put(identity, ctor.newInstance(commitMs, partition, offset));
+    }
+
+    private static boolean strikeTakenOver(FeedGatewayService service, String identity, long fence)
+            throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "isIbkrPreOpenStrikeTakenOverLocked", String.class, long.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, identity, fence);
+    }
+
+    /** Drive the window sweeper at an explicit wall-clock, so the 09:30 watermark snapshot exists. */
+    private static void sweepWindows(FeedGatewayService service, long nowMs) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "sweepIbkrPreOpenGexWindows", long.class);
+        method.setAccessible(true);
+        method.invoke(service, nowMs);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<Integer, Long> takeoverWatermark(FeedGatewayService service, long fence)
+            throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("ibkrPreOpenTakeoverWatermarks");
+        field.setAccessible(true);
+        return ((Map<Long, Map<Integer, Long>>) field.get(service)).get(fence);
+    }
+
+    /** The per-strike identity the window keys its planes by, for a plain record key. */
+    private static String gexIdentity(FeedGatewayService service, String recordKey) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("gexIdentityFromNode",
+                com.fasterxml.jackson.databind.JsonNode.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service,
+                new ObjectMapper().readTree(databentoGexJson()), recordKey);
+    }
+
     private static Object candidateComponent(Object candidate, String accessor) throws Exception {
         Method method = candidate.getClass().getDeclaredMethod(accessor);
         method.setAccessible(true);
@@ -5279,6 +5337,86 @@ class FeedGatewayServiceTest {
         assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
         assertTrue(sink.stream().anyMatch(m -> m.contains("WINDOW_END")),
                 "09:35 destruction lost during recovery: " + sink);
+    }
+
+    @Test
+    void aPostFenceGenerationMustNotDestroyTheProvenPreFenceProjection() throws Exception {
+        // Round-4 finding 1: consumer loops process a whole BATCH before sweeping, so an unproven
+        // gen-4 record — one committed AT its own fence, which the capture branch will refuse —
+        // can arrive while gen-3 is still a valid paired live candidate. Generation supersession
+        // evicts every lower-generation candidate, so evicting on that unproven record destroyed
+        // gen-3's projection and then refused to capture gen-4: the window lost both.
+        long now = System.currentTimeMillis();
+        long fence = now + 60_000L;                    // fence ahead: gen-3 is provable
+        FeedGatewayService service = service();
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        String gen3 = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertNotNull(ingestIbkrGex(service, gexRecord(10L, "SPX|20260804|6300", gen3, now - 5_000L),
+                gen3, now), "gen-3 is pre-fence and paired — it must be admitted");
+        assertEquals(1, planeMap(service, "ibkrPreOpenGexCandidates").size());
+
+        // An unproven gen-4 for ANOTHER strike, committed AT its fence.
+        String gen4 = ibkrGexJson(IBKR_SESSION, 4, 3, 1, fence).replace("6300.0", "6305.0");
+        ingestIbkrGex(service, gexRecord(11L, "SPX|20260804|6305", gen4, fence), gen4, now);
+
+        Map<String, Object> candidates = planeMap(service, "ibkrPreOpenGexCandidates");
+        assertTrue(candidates.containsKey(gexIdentity(service, "SPX|20260804|6300")),
+                "the proven gen-3 candidate must SURVIVE an unproven higher generation");
+        assertEquals(3L, candidateComponent(
+                candidates.get(gexIdentity(service, "SPX|20260804|6300")), "outputGeneration"));
+    }
+
+    @Test
+    void aPostBoundaryDatabentoRecordAtOrBelowTheWatermarkNeverTakesTheStrikeOver() throws Exception {
+        // Round-4 finding 3: the observation memory carried COMMIT TIME ALONE, so a record the
+        // immediate path correctly refused on the WATERMARK axis — committed after 09:30 but at or
+        // below the snapshotted high-watermark, i.e. a prior record — could still kill a later
+        // pending promotion or pre-fence reconstruction through that memory. Both axes must travel
+        // together, and the predicate must apply both.
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        FeedGatewayService service = service();
+        String identity = gexIdentity(service, "SPX|20260804|6300");
+        seedTakeoverWatermark(service, fence, 0, 500L);
+
+        // Post-boundary commit, but AT the watermark: a prior record.
+        seedDatabentoObservation(service, identity, boundary + 1_000L, 0, 500L);
+        assertFalse(strikeTakenOver(service, identity, fence),
+                "an at/below-watermark record is a PRIOR record — it must not tombstone the strike");
+
+        // Same commit time, BEYOND the watermark: the real takeover.
+        seedDatabentoObservation(service, identity, boundary + 1_000L, 0, 501L);
+        assertTrue(strikeTakenOver(service, identity, fence),
+                "beyond the watermark AND after the boundary is the takeover");
+
+        // ...and a pre-boundary commit is never a takeover whatever its offset.
+        FeedGatewayService early = service();
+        String id2 = gexIdentity(early, "SPX|20260804|6300");
+        seedTakeoverWatermark(early, fence, 0, 500L);
+        seedDatabentoObservation(early, id2, boundary - 1_000L, 0, 9_999L);
+        assertFalse(strikeTakenOver(early, id2, fence),
+                "committed before 09:30 is a bootstrap/compacted record, never a takeover");
+    }
+
+    @Test
+    void theDatabentoObservationIsPublishedBeforeTheTakeoverCheck() throws Exception {
+        // Round-4 finding 2: the check/evict ran BEFORE the memory was published, leaving a gap in
+        // which a concurrently rewinding cache consumer could reconstruct a projection that the
+        // eviction had already passed and the memory did not yet cover. Publishing first closes it:
+        // reconstruction either sees the observation, or completes before it and is caught by the
+        // eviction — never neither. Asserted on the source order, because the race itself is not
+        // deterministically reproducible in a unit test.
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of(
+                "src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int publish = source.indexOf("ibkrPreOpenDatabentoMaxCommitMs.merge(observed, incoming");
+        int check = source.indexOf("maybeEvictIbkrProjectionOnTakeover(record, root, nowMs);");
+        assertTrue(publish > 0 && check > 0, "both sites must exist");
+        assertTrue(publish < check,
+                "the observation must be published BEFORE the takeover check, or a concurrent "
+                        + "reconstruction can slip between them");
     }
 
     @Test

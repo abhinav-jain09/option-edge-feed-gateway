@@ -262,7 +262,20 @@ public class FeedGatewayService implements ReplayRunner {
     // only decision-relevant while a window whose boundary its commit time crosses can still
     // reconstruct (≤5 min); the sweep retires entries at commit + 10 min (2x margin). Written by
     // the intercept path (concurrent map), read under the plane lock.
-    private final Map<String, Long> ibkrPreOpenDatabentoMaxCommitMs = new ConcurrentHashMap<>();
+    /**
+     * Per-strike memory of the newest Databento record OBSERVED for it, carrying BOTH axes of the
+     * newly-ingested predicate (round-4 finding 3): the broker commit time AND the partition
+     * position it was seen at. Commit time alone is not the predicate — a record committed after
+     * the 09:30 boundary but sitting at/below the snapshotted high-watermark is a prior record and
+     * must NOT take a strike over, so recording only its commit time would let a later pending
+     * promotion or pre-fence reconstruction be killed by something the immediate path correctly
+     * refused.
+     */
+    private record IbkrPreOpenDatabentoObservation(long commitMs, int partition, long offset) {
+    }
+
+    private final Map<String, IbkrPreOpenDatabentoObservation> ibkrPreOpenDatabentoMaxCommitMs =
+            new ConcurrentHashMap<>();
     private final Object ibkrPreOpenGexLock = new Object();
     // Highest broker offset OBSERVED per partition of the shared live gex topic (both consumers feed
     // it). Snapshotted per fence at the 09:30 takeover boundary: that snapshot IS the gateway's
@@ -6633,19 +6646,23 @@ public class FeedGatewayService implements ReplayRunner {
                 // one past the 09:30 boundary AND the sweep snapshots the watermark lazily right
                 // now, merging the record's own offset first would put it AT the watermark and
                 // self-suppress the takeover it should trigger.
+                // PUBLISH THE OBSERVATION FIRST (round-4 finding 2). On a fresh restart the
+                // live consumer can observe a post-boundary record while the rewinding cache
+                // consumer is reconstructing the same strike; publishing after the check left a
+                // gap in which reconstruction saw no observation and rebuilt a projection the
+                // eviction below would never revisit. Recording first means the reconstruction
+                // either sees the observation and tombstones, or completes before it and is
+                // caught by the eviction — never neither.
+                if (record.timestamp() > 0L) {
+                    String observed = gexIdentityFromNode(root,
+                            record.key() == null ? "" : String.valueOf(record.key()));
+                    IbkrPreOpenDatabentoObservation incoming = new IbkrPreOpenDatabentoObservation(
+                            record.timestamp(), record.partition(), record.offset());
+                    ibkrPreOpenDatabentoMaxCommitMs.merge(observed, incoming,
+                            (prev, next) -> next.commitMs() >= prev.commitMs() ? next : prev);
+                }
                 maybeEvictIbkrProjectionOnTakeover(record, root, nowMs);
                 trackIbkrPreOpenObservedOffset(record);
-                // Remember the strike's newest Databento commit time (round-3 finding 2): on a
-                // fresh restart the live consumer can observe a post-boundary record BEFORE the
-                // rewinding cache consumer reconstructs the strike — with no state above, the
-                // takeover would otherwise be lost. Reconstruction consults this memory and
-                // tombstones the strike instead of resurrecting it.
-                if (record.timestamp() > 0L) {
-                    ibkrPreOpenDatabentoMaxCommitMs.merge(
-                            gexIdentityFromNode(root,
-                                    record.key() == null ? "" : String.valueOf(record.key())),
-                            record.timestamp(), Math::max);
-                }
             }
             return false;
         }
@@ -6729,8 +6746,20 @@ public class FeedGatewayService implements ReplayRunner {
                 return null;
             }
             if (maxGen == null || outputGeneration > maxGen) {
+                // SUPERSESSION NEEDS PROOF (round-4 finding 1). The generation still advances —
+                // the producer HAS moved on, so later lower-generation records are stragglers —
+                // but EVICTING the lower generation's proven state is destructive and may only be
+                // driven by a record that proves ITSELF: its own broker commit time before its
+                // fence, the same proof the reconstruction branch below demands. Consumer loops
+                // process a whole BATCH before sweeping, so an unproven gen-4 committed at the
+                // fence can reach here while gen-3 is still the valid paired live candidate;
+                // evicting on it destroyed gen-3 and then refused to capture gen-4, losing the
+                // frozen projection outright. Admission itself is unchanged: a live candidate is
+                // governed by the gateway clock, and only the FENCE CAPTURE needs the commit proof.
+                boolean provesItself = incoming.recordTimestampMs() > 0L
+                        && incoming.recordTimestampMs() < validUntilMs;
                 ibkrPreOpenMaxGeneration.put(sessionDate, outputGeneration);
-                if (maxGen != null) {
+                if (maxGen != null && provesItself) {
                     // A NEW output generation supersedes every lower one (R-WIRE.2/.6): evict the
                     // lower-generation LIVE candidates and pending pairs, and TELL connected
                     // clients — an eviction is a state transition (the non-drop control class),
@@ -6921,7 +6950,7 @@ public class FeedGatewayService implements ReplayRunner {
             // Retire at T + 10 min (2x margin for clock skew); bounds the map to the strikes
             // active in the last few minutes.
             ibkrPreOpenDatabentoMaxCommitMs.values().removeIf(
-                    commitMs -> nowMs >= commitMs + IBKR_PREOPEN_EVICT_AFTER_MS);
+                    seen -> nowMs >= seen.commitMs() + IBKR_PREOPEN_EVICT_AFTER_MS);
             while (ibkrPreOpenRevokedGenerations.size() > 128) {
                 Iterator<String> eldest = ibkrPreOpenRevokedGenerations.iterator();
                 eldest.next();
@@ -6954,12 +6983,21 @@ public class FeedGatewayService implements ReplayRunner {
         if (ibkrPreOpenTakenOverStrikes.containsKey(identity)) {
             return true;
         }
-        Long maxCommit = ibkrPreOpenDatabentoMaxCommitMs.get(identity);
-        if (maxCommit != null && maxCommit >= fenceMs + IBKR_PREOPEN_FREEZE_WINDOW_MS) {
-            ibkrPreOpenTakenOverStrikes.merge(identity, fenceMs, Math::max);
-            return true;
+        IbkrPreOpenDatabentoObservation seen = ibkrPreOpenDatabentoMaxCommitMs.get(identity);
+        if (seen == null || seen.commitMs() < fenceMs + IBKR_PREOPEN_FREEZE_WINDOW_MS) {
+            return false;
         }
-        return false;
+        // BOTH axes, exactly as the immediate path applies them: a post-boundary commit that sits
+        // at/below the window's snapshotted high-watermark is a prior record, not a takeover.
+        Map<Integer, Long> watermark = ibkrPreOpenTakeoverWatermarks.get(fenceMs);
+        if (watermark != null) {
+            Long mark = watermark.get(seen.partition());
+            if (mark != null && seen.offset() <= mark) {
+                return false;
+            }
+        }
+        ibkrPreOpenTakenOverStrikes.merge(identity, fenceMs, Math::max);
+        return true;
     }
 
     /**
