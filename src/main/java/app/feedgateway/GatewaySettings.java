@@ -1126,6 +1126,21 @@ public final class GatewaySettings {
     }
 
     /**
+     * BOTH indicator CURRENT topics this environment must consume (rev 14 §7.3):
+     * the prefix-resolved local topic (dev/prod = SPX computed locally; es4 = the
+     * es.-prefixed native ES stream) PLUS the es4-mirrored ES topic
+     * {@code es.options.indicators.snapshot.current} on dev/prod. On es4 the two
+     * coincide and the set collapses to one — no duplicate subscription.
+     */
+    public java.util.Set<String> indicatorsSnapshotTopics() {
+        java.util.LinkedHashSet<String> topics = new java.util.LinkedHashSet<>();
+        topics.add(indicatorsSnapshotTopic());
+        topics.add("es." + com.optionsedge.contracts.indicators.IndicatorTopics
+                .INDICATORS_SNAPSHOT_CURRENT);
+        return topics;
+    }
+
+    /**
      * Freshness TTL for the indicators CURRENT cache — same SHORT class as
      * {@link #spotVolRegimeTtlMs()}: a minutes-old snapshot (dead producer) must
      * read as absent on late-join, never replay as live. The page's own

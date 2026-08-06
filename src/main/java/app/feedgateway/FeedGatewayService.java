@@ -285,8 +285,18 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> indicatorsCurrent = new ConcurrentHashMap<>();
     private final Map<String, String> indicatorsRunId = new ConcurrentHashMap<>();
     private final Map<String, Long> indicatorsRevision = new ConcurrentHashMap<>();
+    /** r1 finding 7: retired-run memory is BOUNDED — insertion-ordered, capped. */
+    private static final int INDICATORS_RETIRED_RUNS_CAP = 64;
     private final java.util.Set<String> indicatorsRetiredRuns =
-            ConcurrentHashMap.newKeySet();
+            java.util.Collections.synchronizedSet(
+                    new java.util.LinkedHashSet<>());
+    /**
+     * r1 finding 3: serializes the live (cache-update → broadcast-enqueue) pair
+     * against the connect/caught-up replay's (cache-read → session-send) pair, so a
+     * replay-captured older revision can never be enqueued AFTER a newer live frame
+     * (coalescing keeps the LAST enqueue).
+     */
+    private final Object indicatorsEmitLock = new Object();
     // SPX close-direction (design CLOSE-DIRECTION-GATE1 §8/CD-R30): ONE topic, two cache classes.
     // VERDICTS (key V|sessionDate) are once-a-session frozen decisions on the LONG
     // closeDirectionTtlMs window; INTERIMS (key I|sessionDate) are 1/min monitoring reads whose
@@ -623,6 +633,10 @@ public class FeedGatewayService implements ReplayRunner {
             // the same standalone way legacy mode does, so an auth-mode reload restores the overlay.
             replayShortPremiumCached(session);
             replayZeroDteIntelligenceCached(session);
+            // Indicators are the same GLOBAL advisory class (symbol-filtered
+            // client-side) — the production auth mode owes the connect replay too
+            // (r1 finding 5).
+            replayIndicatorsCached(session);
             return;
         }
         if (avroCaughtUp.get()) {
@@ -651,7 +665,6 @@ public class FeedGatewayService implements ReplayRunner {
             // track rather than waiting for the next live verdict.
             replayGreekMoveAuthCached(session);
             replaySpotVolRegimeCached(session);
-        replayIndicatorsCached(session);
             replayIndicatorsCached(session);
             replayIbkrPreOpenCached(session);
             // Close-direction: replay the session's frozen verdict (or the current interim) so a page
@@ -1444,7 +1457,11 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
-        topicEvents.put(settings.indicatorsSnapshotTopic(), new TopicBinding("DATABENTO", "indicators"));
+        // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
+        // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
+        for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
+            topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
+        }
         // SPX close-direction interims + frozen verdict (JSON, key = symbol|expiry): standalone global
         // advisory, OPTIONAL topic — LONG closeDirectionTtlMs window (verdict class) bounds the seek-back;
         // interim replay freshness is separately bounded (closeDirectionInterimFreshMs).
@@ -1553,7 +1570,11 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
-        topicEvents.put(settings.indicatorsSnapshotTopic(), new TopicBinding("DATABENTO", "indicators"));
+        // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
+        // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
+        for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
+            topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
+        }
         // Keep the cache + live JSON consumer topic sets symmetric: the SPX close-direction signal
         // (JSON, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
@@ -2264,8 +2285,12 @@ public class FeedGatewayService implements ReplayRunner {
                         // class — own websocket event, symbol-filtered client-side;
                         // (runId, revision) supersession applied in updateCache
                         // (regressions => cacheKey == null => never broadcast).
+                        // r1 finding 3: the broadcast-enqueue holds the emit lock so
+                        // it serializes against replay's read+send.
                         if (cacheKey != null && cacheCaughtUpFlag.get()) {
-                            broadcast(binding.event(), forwardJson);
+                            synchronized (indicatorsEmitLock) {
+                                broadcast(binding.event(), forwardJson);
+                            }
                             forwardedEvents.incrementAndGet();
                         }
                         continue;
@@ -3043,10 +3068,13 @@ public class FeedGatewayService implements ReplayRunner {
                 continue;
             }
             if ("ibkr-preopen-status".equals(binding.event())
+                    || "indicators".equals(binding.event())
                     || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 // The pre-open status/control stream is SOURCE-INDEPENDENT window state:
                 // stateCaughtUp must include its partition regardless of the active market-data
                 // source, or replay could expose a pre-revocation snapshot (round-2 finding 4).
+                // Indicators (r1 finding 4) are likewise source-independent GLOBAL truth —
+                // their partitions gate the barrier no matter which source is active.
                 selectedEndOffsets.put(entry.getKey(), entry.getValue());
             }
         }
@@ -3067,7 +3095,10 @@ public class FeedGatewayService implements ReplayRunner {
         Map<TopicPartition, Long> selected = new LinkedHashMap<>();
         for (Map.Entry<TopicPartition, Long> entry : endOffsets.entrySet()) {
             TopicBinding preOpenBinding = topicEvents.get(entry.getKey().topic());
-            if (preOpenBinding != null && "ibkr-preopen-status".equals(preOpenBinding.event())) {
+            if (preOpenBinding != null && ("ibkr-preopen-status".equals(preOpenBinding.event())
+                    || "indicators".equals(preOpenBinding.event()))) {
+                // Source-independent streams (pre-open control + indicators) always
+                // gate mid-run barriers too (r1 finding 4).
                 selected.put(entry.getKey(), entry.getValue());
                 continue;
             }
@@ -4127,13 +4158,15 @@ public class FeedGatewayService implements ReplayRunner {
             key = binding.source() + "|" + key;
         }
         String versionKey = event + ":" + key;
-        if ("ibkr-preopen-status".equals(event)) {
-            // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5): the status topic is single-
-            // partition and strictly ordered by offset — Kafka timestamps may tie or regress
-            // across legitimate later offsets (and the cache + live consumers read the same
-            // partition). Accept ONLY a strictly higher offset on the same partition; a
-            // DIFFERENT partition for the same key is impossible on the 1-partition contract
-            // (fail-closed: reject, never reorder).
+        if ("ibkr-preopen-status".equals(event) || "indicators".equals(event)) {
+            // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5; indicators rev 14
+            // §6.9 r1 finding 2): these topics are single-partition per symbol and
+            // strictly ordered by offset — Kafka timestamps may tie or regress
+            // across legitimate later offsets (and the cache + live consumers read
+            // the same partition). Accept ONLY a strictly higher offset on the same
+            // partition; a DIFFERENT partition for the same key is fail-closed
+            // (reject, never reorder) — each indicator symbol lives on exactly one
+            // topic/partition (§7.3).
             RecordPosition incoming = recordPosition(record);
             RecordPosition previousPosition = cachePositions.get(versionKey);
             if (previousPosition != null
@@ -4150,8 +4183,11 @@ public class FeedGatewayService implements ReplayRunner {
         boolean isTerminalMaxPainShortCircuitBypass = "max-pain".equals(event) && isMaxPainExpired(json);
         if (!isTerminalMaxPainShortCircuitBypass
                 && !"ibkr-preopen-status".equals(event)
+                && !"indicators".equals(event)
                 && previousEventTime != null && previousEventTime > eventTime) {
-            return null;   // (the pre-open stream is offset-ordered above, never timestamp-gated)
+            return null;   // (offset-ordered streams above are never timestamp-gated —
+                           // a publishedAt wall-clock regression must not outrank a
+                           // higher offset + higher revision, r1 finding 2)
         }
         if ("gex-by-strike".equals(event)
                 && previousEventTime != null
@@ -6315,29 +6351,60 @@ public class FeedGatewayService implements ReplayRunner {
     private void replayIndicatorsCached(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
-        for (Map.Entry<String, String> entry : indicatorsCurrent.entrySet()) {
-            String json = entry.getValue();
-            if (json == null || json.isBlank()) {
-                continue;
+        // r1 finding 3: the (cache-read → send-enqueue) pair is atomic under the
+        // emit lock — a live update either lands before (replay reads the newer
+        // value) or after (its enqueue supersedes ours via coalescing). The stale
+        // ordering "live N+1 enqueued, then replayed N enqueued" cannot happen.
+        synchronized (indicatorsEmitLock) {
+            for (Map.Entry<String, String> entry : indicatorsCurrent.entrySet()) {
+                String json = entry.getValue();
+                if (json == null || json.isBlank()) {
+                    continue;
+                }
+                if (!isCacheFresh("indicators:" + entry.getKey(), nowMs)) {
+                    continue;
+                }
+                send(session, "indicators", json);
             }
-            if (!isCacheFresh("indicators:" + entry.getKey(), nowMs)) {
-                continue;
-            }
-            send(session, "indicators", json);
         }
     }
 
-    /** Canonical symbol (ES|SPX) keys the indicator cache; fallback = record key. */
+    /**
+     * Canonical symbol (ES|SPX) keys the indicator cache — STRICT (r1 finding 6):
+     * the payload symbol must be exactly ES or SPX AND equal the Kafka record key
+     * (a keyed-SPX record claiming ES may never overwrite ES state); the frame must
+     * carry schemaVersion 1, a bounded runId, an INTEGRAL non-negative revision and
+     * a parseable publishedAt. Anything else is dropped (null), never cached or
+     * forwarded.
+     */
     private String indicatorsCacheKey(String json, String fallback) {
         try {
-            String symbol = text(mapper.readTree(json), "symbol").toUpperCase();
-            if (!symbol.isBlank()) {
-                return symbol;
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol");
+            if (!"ES".equals(symbol) && !"SPX".equals(symbol)) {
+                return null;
             }
-        } catch (JsonProcessingException ignored) {
-            // Malformed payloads expire immediately via indicatorsTimestamp.
+            if (fallback != null && !symbol.equals(fallback)) {
+                return null; // Kafka key / payload identity mismatch — poisoning guard
+            }
+            JsonNode sv = root.get("schemaVersion");
+            if (sv == null || !sv.isIntegralNumber() || sv.asInt() != 1) {
+                return null;
+            }
+            String runId = text(root, "runId");
+            if (runId.isBlank() || runId.length() > 64) {
+                return null;
+            }
+            JsonNode rev = root.get("revision");
+            if (rev == null || !rev.isIntegralNumber() || rev.asLong() < 0) {
+                return null;
+            }
+            String publishedAt = text(root, "publishedAt");
+            java.time.Instant.parse(publishedAt);
+            return symbol;
+        } catch (Exception malformed) {
+            return null;
         }
-        return fallback;
     }
 
     /** Payload publish time (publishedAt ISO) drives freshness; -1 = malformed. */
@@ -6362,10 +6429,14 @@ public class FeedGatewayService implements ReplayRunner {
         try {
             JsonNode root = mapper.readTree(json);
             String runId = text(root, "runId");
-            long revision = longField(root, "revision", -1L);
-            if (runId.isBlank() || revision < 0) {
+            JsonNode revNode = root.get("revision");
+            // r1 finding 6: revision must be an INTEGRAL JSON number — a textual
+            // number is a schema violation, never coerced.
+            if (runId.isBlank() || runId.length() > 64 || revNode == null
+                    || !revNode.isIntegralNumber() || revNode.asLong() < 0) {
                 return false;
             }
+            long revision = revNode.asLong();
             synchronized (indicatorsRevision) {
                 String currentRun = indicatorsRunId.get(symbol);
                 if (runId.equals(currentRun)) {
@@ -6378,7 +6449,18 @@ public class FeedGatewayService implements ReplayRunner {
                         return false; // a retired run may never return
                     }
                     if (currentRun != null) {
-                        indicatorsRetiredRuns.add(symbol + "|" + currentRun);
+                        // r1 finding 7: bounded insertion-ordered retirement — the
+                        // oldest retirements age out at the cap. A retired run that
+                        // aged out could only "return" via revision regression, which
+                        // the per-symbol revision guard + offset ordering still block.
+                        synchronized (indicatorsRetiredRuns) {
+                            indicatorsRetiredRuns.add(symbol + "|" + currentRun);
+                            while (indicatorsRetiredRuns.size() > INDICATORS_RETIRED_RUNS_CAP) {
+                                var it = indicatorsRetiredRuns.iterator();
+                                it.next();
+                                it.remove();
+                            }
+                        }
                     }
                     indicatorsRunId.put(symbol, runId);
                 }
