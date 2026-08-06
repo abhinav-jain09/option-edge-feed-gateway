@@ -144,6 +144,7 @@ public class FeedGatewayService implements ReplayRunner {
             "zero-dte-intelligence",
             "greek-move-auth",
             "spot-vol-regime",
+            "indicators",
             "opb-by-option", "opb-session",
             "index-price", "vix-price", "spx-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
@@ -276,6 +277,16 @@ public class FeedGatewayService implements ReplayRunner {
     // pill simply vanishes. Same standalone/global/JSON pass-through delivery class as the
     // greek-move-auth sibling above; NOT in the ui-batch. Keyed by symbol.
     private final Map<String, String> spotVolRegime = new ConcurrentHashMap<>();
+    // Indicator CURRENT snapshots: ONE per canonical symbol (ES|SPX), per-symbol
+    // cache + (runId, revision) supersession (rev 14 §6.9/§8): a new runId is
+    // accepted in arrival(=offset) order on the single-partition compacted topic and
+    // retires the prior; within a run, revisions must strictly increase; retired-run
+    // returns are rejected.
+    private final Map<String, String> indicatorsCurrent = new ConcurrentHashMap<>();
+    private final Map<String, String> indicatorsRunId = new ConcurrentHashMap<>();
+    private final Map<String, Long> indicatorsRevision = new ConcurrentHashMap<>();
+    private final java.util.Set<String> indicatorsRetiredRuns =
+            ConcurrentHashMap.newKeySet();
     // SPX close-direction (design CLOSE-DIRECTION-GATE1 §8/CD-R30): ONE topic, two cache classes.
     // VERDICTS (key V|sessionDate) are once-a-session frozen decisions on the LONG
     // closeDirectionTtlMs window; INTERIMS (key I|sessionDate) are 1/min monitoring reads whose
@@ -640,6 +651,8 @@ public class FeedGatewayService implements ReplayRunner {
             // track rather than waiting for the next live verdict.
             replayGreekMoveAuthCached(session);
             replaySpotVolRegimeCached(session);
+        replayIndicatorsCached(session);
+            replayIndicatorsCached(session);
             replayIbkrPreOpenCached(session);
             // Close-direction: replay the session's frozen verdict (or the current interim) so a page
             // reload in the final hour restores the card instead of waiting for the next minute tick.
@@ -1431,6 +1444,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
+        topicEvents.put(settings.indicatorsSnapshotTopic(), new TopicBinding("DATABENTO", "indicators"));
         // SPX close-direction interims + frozen verdict (JSON, key = symbol|expiry): standalone global
         // advisory, OPTIONAL topic — LONG closeDirectionTtlMs window (verdict class) bounds the seek-back;
         // interim replay freshness is separately bounded (closeDirectionInterimFreshMs).
@@ -1539,6 +1553,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
+        topicEvents.put(settings.indicatorsSnapshotTopic(), new TopicBinding("DATABENTO", "indicators"));
         // Keep the cache + live JSON consumer topic sets symmetric: the SPX close-direction signal
         // (JSON, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
@@ -2244,6 +2259,17 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                         continue;
                     }
+                    if ("indicators".equals(binding.event())) {
+                        // Indicator CURRENT snapshot (rev 14 §8): same GLOBAL advisory
+                        // class — own websocket event, symbol-filtered client-side;
+                        // (runId, revision) supersession applied in updateCache
+                        // (regressions => cacheKey == null => never broadcast).
+                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                            broadcast(binding.event(), forwardJson);
+                            forwardedEvents.incrementAndGet();
+                        }
+                        continue;
+                    }
                     // Selection captured ONCE for this record's forward+readiness decision (legacy mode).
                     ActiveSelection decided = null;
                     // Per-session mode: route directly via the engine using the authoritative
@@ -2592,6 +2618,7 @@ public class FeedGatewayService implements ReplayRunner {
                     // topic is absent after the daily Kafka wipe until it first produces) — optional, so
                     // its absence can never starve the shared JSON consumer.
                     || topic.equals(settings.spotVolRegimeTopic())
+                    || topic.equals(settings.indicatorsSnapshotTopic())
                     // Close-direction is a brand-new standalone service that may not be deployed (and the
                     // topic is absent until it first produces) — optional like its advisory siblings.
                     || topic.equals(settings.closeDirectionSignalTopic())
@@ -3098,6 +3125,12 @@ public class FeedGatewayService implements ReplayRunner {
             if (events.contains("spot-vol-regime")) {
                 for (WebSocketSession client : clients) {
                     replaySpotVolRegimeCached(client);
+                }
+            }
+            // Indicator CURRENT is STANDALONE too: explicit re-push once caught up.
+            if (events.contains("indicators")) {
+                for (WebSocketSession client : clients) {
+                    replayIndicatorsCached(client);
                 }
             }
             if (events.contains("ibkr-preopen-status")) {
@@ -4043,6 +4076,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = greekMoveAuthCacheKey(json, key);
         } else if ("spot-vol-regime".equals(event)) {
             key = spotVolRegimeCacheKey(json, key);
+        } else if ("indicators".equals(event)) {
+            key = indicatorsCacheKey(json, key);
         } else if ("close-direction".equals(event)) {
             key = closeDirectionCacheKey(json, key);
         } else if ("zero-dte-intelligence".equals(event)) {
@@ -4239,6 +4274,18 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 spotVolRegime.put(key, json); // ONE current regime per symbol — last heartbeat wins
+                return key;
+            }
+            case "indicators" -> {
+                // (runId, revision) supersession (rev 14 §6.9): accept a NEW runId in
+                // arrival order and retire the prior; require strictly increasing
+                // revision within the active run; reject retired-run returns.
+                if (!indicatorsSupersedes(key, json)) {
+                    return null; // regression/retired-run — never cached or broadcast
+                }
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                indicatorsCurrent.put(key, json);
                 return key;
             }
             case "close-direction" -> {
@@ -5079,6 +5126,11 @@ public class FeedGatewayService implements ReplayRunner {
             // live. Same ONE-seam consequences as the sibling above.
             return CachePolicy.expiring(settings.spotVolRegimeTtlMs());
         }
+        if ("indicators".equals(event)) {
+            // Indicator CURRENT snapshot: same SHORT freshness class — a dead
+            // producer's snapshot must read as ABSENT on late-join, never as live.
+            return CachePolicy.expiring(settings.indicatorsTtlMs());
+        }
         if ("close-direction".equals(event)) {
             // Long last-value-wins window (default 12h, the max-pain/es-open-direction class): the
             // frozen T-11m VERDICT stays decision-relevant until the close and must survive a gateway
@@ -5272,6 +5324,9 @@ public class FeedGatewayService implements ReplayRunner {
             // never the Kafka ARRIVAL time, so a producer catching up on a backlog cannot render a
             // stale regime as live.
             return spotVolRegimeTimestamp(json);
+        }
+        if ("indicators".equals(event)) {
+            return indicatorsTimestamp(json);
         }
         if ("liquidity-heatmap".equals(event)) {
             long payloadTime = liquidityHeatmapTimestamp(json);
@@ -5538,6 +5593,8 @@ public class FeedGatewayService implements ReplayRunner {
             greekMoveAuthCurrent.remove(versionKey.substring("greek-move-auth:".length()));
         } else if (versionKey.startsWith("spot-vol-regime:")) {
             spotVolRegime.remove(versionKey.substring("spot-vol-regime:".length()));
+        } else if (versionKey.startsWith("indicators:")) {
+            indicatorsCurrent.remove(versionKey.substring("indicators:".length()));
         } else if (versionKey.startsWith("close-direction:")) {
             String cdKey = versionKey.substring("close-direction:".length());
             if (cdKey.contains("|V|")) {
@@ -6247,6 +6304,89 @@ public class FeedGatewayService implements ReplayRunner {
             // outlives the close by 4 minutes. Strip the band (never the snapshot) once the session is
             // over so a browser opened at 16:01 does not late-join into a coloured chain.
             send(session, "spot-vol-regime", suppressStrikeBandAfterClose(json, nowMs));
+        }
+    }
+
+    /**
+     * Late-join delivery for indicator CURRENT snapshots (rev 14 §8): PER-SYMBOL —
+     * both ES and SPX replay independently; GLOBAL advisory class, symbol-filtered
+     * client-side; SHORT-TTL fresh-gated so a dead producer reads as absent.
+     */
+    private void replayIndicatorsCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        for (Map.Entry<String, String> entry : indicatorsCurrent.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("indicators:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, "indicators", json);
+        }
+    }
+
+    /** Canonical symbol (ES|SPX) keys the indicator cache; fallback = record key. */
+    private String indicatorsCacheKey(String json, String fallback) {
+        try {
+            String symbol = text(mapper.readTree(json), "symbol").toUpperCase();
+            if (!symbol.isBlank()) {
+                return symbol;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Malformed payloads expire immediately via indicatorsTimestamp.
+        }
+        return fallback;
+    }
+
+    /** Payload publish time (publishedAt ISO) drives freshness; -1 = malformed. */
+    private long indicatorsTimestamp(String json) {
+        try {
+            String publishedAt = text(mapper.readTree(json), "publishedAt");
+            if (publishedAt.isBlank()) {
+                return -1L;
+            }
+            long ms = java.time.Instant.parse(publishedAt).toEpochMilli();
+            if (ms > System.currentTimeMillis() + SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS) {
+                return -1L; // implausibly future — fail closed
+            }
+            return ms;
+        } catch (Exception ignored) {
+            return -1L;
+        }
+    }
+
+    /** Rev 14 §6.9 cross-run ordering; returns false on any regression. */
+    private boolean indicatorsSupersedes(String symbol, String json) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String runId = text(root, "runId");
+            long revision = longField(root, "revision", -1L);
+            if (runId.isBlank() || revision < 0) {
+                return false;
+            }
+            synchronized (indicatorsRevision) {
+                String currentRun = indicatorsRunId.get(symbol);
+                if (runId.equals(currentRun)) {
+                    Long last = indicatorsRevision.get(symbol);
+                    if (last != null && revision <= last) {
+                        return false; // stale revision within the active run
+                    }
+                } else {
+                    if (indicatorsRetiredRuns.contains(symbol + "|" + runId)) {
+                        return false; // a retired run may never return
+                    }
+                    if (currentRun != null) {
+                        indicatorsRetiredRuns.add(symbol + "|" + currentRun);
+                    }
+                    indicatorsRunId.put(symbol, runId);
+                }
+                indicatorsRevision.put(symbol, revision);
+            }
+            return true;
+        } catch (JsonProcessingException e) {
+            return false;
         }
     }
 
@@ -7713,6 +7853,7 @@ public class FeedGatewayService implements ReplayRunner {
             // symbol-filtered client-side); staleness enforced upstream by the SHORT
             // spotVolRegimeTtlMs window in updateCache.
             "spot-vol-regime",
+            "indicators",
             // SPX close-direction interims + frozen verdict are the same class of GLOBAL advisory
             // overlay (one session at a time, rendered in its own summary card) — allowlist so
             // routeOrBroadcast/broadcast fan them out in per-session (auth) mode too. Malformed and

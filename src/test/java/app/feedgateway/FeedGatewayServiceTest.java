@@ -1756,6 +1756,57 @@ class FeedGatewayServiceTest {
         assertTrue(sink.isEmpty(), "a stale verdict must never replay to a late joiner; got: " + sink);
     }
 
+    // ----- indicators CURRENT snapshot relay -------------------------------------------------------
+
+    @Test
+    void indicatorsTopicIsOptionalGlobalAndOnTheShortWindow() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("options.indicators.snapshot.current", settings.indicatorsSnapshotTopic(),
+                "default topic must be the contract constant IndicatorTopics.INDICATORS_SNAPSHOT_CURRENT");
+        assertTrue(isOptionalTopic(service, settings.indicatorsSnapshotTopic()),
+                "a brand-new standalone producer may be absent — the topic must be optional");
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("indicators"),
+                "indicator snapshots fan out in per-session (auth) mode like advisory siblings");
+        assertEquals(300_000L, settings.indicatorsTtlMs(), "default TTL must be 5 minutes");
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, "indicators", now - 2L * 60_000L, now));
+        assertTrue(isExpired(service, "indicators", now - 6L * 60_000L, now),
+                "a 6-min-old snapshot must be STALE — never replayed as current");
+    }
+
+    @Test
+    void indicatorsSupersessionAcceptsNewRunsRejectsRegressionsAndRetiredRuns() throws Exception {
+        // Rev 14 §6.9: per key, a NEW runId is accepted in arrival order and retires
+        // the prior; within the active run revisions strictly increase; a retired
+        // run may never return.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String base = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + java.time.Instant.ofEpochMilli(now) + "\",";
+        String runA5 = base + "\"runId\":\"run-A\",\"revision\":5}";
+        String runA4 = base + "\"runId\":\"run-A\",\"revision\":4}";
+        String runA6 = base + "\"runId\":\"run-A\",\"revision\":6}";
+        String runB1 = base + "\"runId\":\"run-B\",\"revision\":1}";
+        String runA9 = base + "\"runId\":\"run-A\",\"revision\":9}";
+        var binding = topicBinding("DATABENTO", "indicators");
+        assertEquals("DATABENTO|SPX", updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 1L, "SPX", runA5, now), runA5),
+                "first snapshot of run-A accepted");
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 2L, "SPX", runA4, now), runA4),
+                "revision regression within the active run rejected");
+        assertEquals("DATABENTO|SPX", updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 3L, "SPX", runA6, now), runA6));
+        assertEquals("DATABENTO|SPX", updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 4L, "SPX", runB1, now), runB1),
+                "a NEW run in arrival order supersedes (revision restarts)");
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 5L, "SPX", runA9, now), runA9),
+                "the retired run may never return, regardless of revision");
+    }
+
     // ----- spot-vol-regime CURRENT snapshot relay --------------------------------------------------
 
     @Test

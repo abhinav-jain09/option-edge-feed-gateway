@@ -1115,6 +1115,27 @@ public final class GatewaySettings {
     }
 
     /**
+     * Compacted CURRENT topic of the standalone indicator-service (JSON
+     * {@code IndicatorSnapshot}, rev 14 §7.1). One record per canonical symbol
+     * (ES|SPX) every 5 s during the active session plus event-triggered publishes.
+     * Resolved through the platform topic-prefix helper at deploy time.
+     */
+    public String indicatorsSnapshotTopic() {
+        return value("KAFKA_INDICATORS_SNAPSHOT_TOPIC",
+                com.optionsedge.contracts.indicators.IndicatorTopics.INDICATORS_SNAPSHOT_CURRENT);
+    }
+
+    /**
+     * Freshness TTL for the indicators CURRENT cache — same SHORT class as
+     * {@link #spotVolRegimeTtlMs()}: a minutes-old snapshot (dead producer) must
+     * read as absent on late-join, never replay as live. The page's own
+     * transport-staleness banner handles sub-TTL aging. Default 5 min.
+     */
+    public long indicatorsTtlMs() {
+        return longValue("GATEWAY_INDICATORS_TTL_MS", 300_000L, 0L);
+    }
+
+    /**
      * Freshness TTL for the structural option-chain cache (the {@code snapshot} strike ladder — see
      * {@code FeedGatewayService.MARKET_AWARE_CHAIN_EVENTS}) DURING regular trading hours — default 10 min.
      * Off-hours the chain is never evicted (see {@link FeedGatewayService} cache policy + {@link #marketCalendar()}),
