@@ -285,8 +285,11 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> indicatorsCurrent = new ConcurrentHashMap<>();
     private final Map<String, String> indicatorsRunId = new ConcurrentHashMap<>();
     private final Map<String, Long> indicatorsRevision = new ConcurrentHashMap<>();
-    /** r1 finding 7: retired-run memory is BOUNDED — insertion-ordered, capped. */
-    private static final int INDICATORS_RETIRED_RUNS_CAP = 64;
+    /** r1 finding 7 / r2 finding 4: retirement memory is bounded at a cap no real
+     * deployment approaches (one retirement per producer restart; 4096 ≈ years of
+     * restarts within one gateway uptime), so eviction can never let a genuinely
+     * retired run re-enter in practice — while heap stays bounded (~400 KiB max). */
+    private static final int INDICATORS_RETIRED_RUNS_CAP = 4096;
     private final java.util.Set<String> indicatorsRetiredRuns =
             java.util.Collections.synchronizedSet(
                     new java.util.LinkedHashSet<>());
@@ -297,6 +300,24 @@ public class FeedGatewayService implements ReplayRunner {
      * (coalescing keeps the LAST enqueue).
      */
     private final Object indicatorsEmitLock = new Object();
+    /** r2 finding 1: exactly-one in-order live delivery per offset across BOTH
+     * ingesting consumers — whichever reaches an offset first broadcasts it. */
+    private final Map<String, java.util.concurrent.atomic.AtomicLong>
+            indicatorsBroadcastOffset = new ConcurrentHashMap<>();
+
+    boolean shouldBroadcastIndicators(String cacheKey, long offset) {
+        var gate = indicatorsBroadcastOffset.computeIfAbsent(cacheKey,
+                k -> new java.util.concurrent.atomic.AtomicLong(-1L));
+        while (true) {
+            long current = gate.get();
+            if (offset <= current) {
+                return false;
+            }
+            if (gate.compareAndSet(current, offset)) {
+                return true;
+            }
+        }
+    }
     // SPX close-direction (design CLOSE-DIRECTION-GATE1 §8/CD-R30): ONE topic, two cache classes.
     // VERDICTS (key V|sessionDate) are once-a-session frozen decisions on the LONG
     // closeDirectionTtlMs window; INTERIMS (key I|sessionDate) are 1/min monitoring reads whose
@@ -1892,6 +1913,21 @@ public class FeedGatewayService implements ReplayRunner {
                         droppedByOtherReasons.incrementAndGet();
                         continue;
                     }
+                    if (binding != null && "indicators".equals(binding.event())) {
+                        // r2 findings 1+2: the cache consumer consumes this offset —
+                        // if it wins the CAS gate it must also BROADCAST, or the
+                        // live consumer's duplicate is suppressed and clients starve.
+                        // The emit lock covers mutation+enqueue as one unit.
+                        synchronized (indicatorsEmitLock) {
+                            String indicatorKey = updateCache(binding, record, json);
+                            if (indicatorKey != null && caughtUpFlag.get()
+                                    && shouldBroadcastIndicators(indicatorKey, record.offset())) {
+                                broadcast(binding.event(), json);
+                                forwardedEvents.incrementAndGet();
+                            }
+                        }
+                        continue;
+                    }
                     updateCache(binding, record, json);
                 }
                 purgeExpiredCache(System.currentTimeMillis());
@@ -2202,6 +2238,21 @@ public class FeedGatewayService implements ReplayRunner {
                         forwardedEvents.incrementAndGet();
                         continue;
                     }
+                    if ("indicators".equals(binding.event())) {
+                        // r2 findings 1+2: the whole supersede→cache→CAS→enqueue
+                        // decision is ONE unit under the emit lock, and the offset
+                        // CAS gate makes whichever consumer wins the broadcaster.
+                        synchronized (indicatorsEmitLock) {
+                            String indicatorsKey = updateCache(binding, record, json);
+                            if (indicatorsKey != null && cacheCaughtUpFlag.get()
+                                    && shouldBroadcastIndicators(indicatorsKey,
+                                            record.offset())) {
+                                broadcast(binding.event(), json);
+                                forwardedEvents.incrementAndGet();
+                            }
+                        }
+                        continue;
+                    }
                     String cacheKey = updateCache(binding, record, json);
                     if ("seller-activity".equals(binding.event())) {
                         // REST-only: every record contains one strike's full session history. Replaying or
@@ -2276,21 +2327,6 @@ public class FeedGatewayService implements ReplayRunner {
                         // (stale snapshot => cacheKey == null => never live-broadcast).
                         if (cacheKey != null && cacheCaughtUpFlag.get()) {
                             broadcast(binding.event(), forwardJson);
-                            forwardedEvents.incrementAndGet();
-                        }
-                        continue;
-                    }
-                    if ("indicators".equals(binding.event())) {
-                        // Indicator CURRENT snapshot (rev 14 §8): same GLOBAL advisory
-                        // class — own websocket event, symbol-filtered client-side;
-                        // (runId, revision) supersession applied in updateCache
-                        // (regressions => cacheKey == null => never broadcast).
-                        // r1 finding 3: the broadcast-enqueue holds the emit lock so
-                        // it serializes against replay's read+send.
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
-                            synchronized (indicatorsEmitLock) {
-                                broadcast(binding.event(), forwardJson);
-                            }
                             forwardedEvents.incrementAndGet();
                         }
                         continue;
@@ -2643,7 +2679,12 @@ public class FeedGatewayService implements ReplayRunner {
                     // topic is absent after the daily Kafka wipe until it first produces) — optional, so
                     // its absence can never starve the shared JSON consumer.
                     || topic.equals(settings.spotVolRegimeTopic())
-                    || topic.equals(settings.indicatorsSnapshotTopic())
+                    // BOTH indicator CURRENT topics are optional (r2 finding 3):
+                    // the local one until the service first produces, and the
+                    // es4-MIRRORED one whenever the mirror is not yet installed —
+                    // an absent mirror means ES goes stale (§7.3), never a dead
+                    // shared consumer.
+                    || settings.indicatorsSnapshotTopics().contains(topic)
                     // Close-direction is a brand-new standalone service that may not be deployed (and the
                     // topic is absent until it first produces) — optional like its advisory siblings.
                     || topic.equals(settings.closeDirectionSignalTopic())
@@ -6388,7 +6429,8 @@ public class FeedGatewayService implements ReplayRunner {
                 return null; // Kafka key / payload identity mismatch — poisoning guard
             }
             JsonNode sv = root.get("schemaVersion");
-            if (sv == null || !sv.isIntegralNumber() || sv.asInt() != 1) {
+            if (sv == null || !sv.isIntegralNumber() || !sv.canConvertToInt()
+                    || sv.asInt() != 1) {
                 return null;
             }
             String runId = text(root, "runId");
@@ -6396,7 +6438,8 @@ public class FeedGatewayService implements ReplayRunner {
                 return null;
             }
             JsonNode rev = root.get("revision");
-            if (rev == null || !rev.isIntegralNumber() || rev.asLong() < 0) {
+            if (rev == null || !rev.isIntegralNumber() || !rev.canConvertToLong()
+                    || rev.asLong() < 0) {
                 return null;
             }
             String publishedAt = text(root, "publishedAt");
@@ -6433,7 +6476,8 @@ public class FeedGatewayService implements ReplayRunner {
             // r1 finding 6: revision must be an INTEGRAL JSON number — a textual
             // number is a schema violation, never coerced.
             if (runId.isBlank() || runId.length() > 64 || revNode == null
-                    || !revNode.isIntegralNumber() || revNode.asLong() < 0) {
+                    || !revNode.isIntegralNumber() || !revNode.canConvertToLong()
+                    || revNode.asLong() < 0) {
                 return false;
             }
             long revision = revNode.asLong();

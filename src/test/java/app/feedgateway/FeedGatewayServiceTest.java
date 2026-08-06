@@ -1879,8 +1879,9 @@ class FeedGatewayServiceTest {
 
     @Test
     void indicatorsRetiredRunMemoryIsBounded() throws Exception {
-        // r1 finding 7: retirement memory is capped — a long-lived gateway must not
-        // grow without bound across producer restarts.
+        // r1 finding 7 / r2 finding 4: retirement memory is capped at 4096 — far
+        // beyond any real restart cadence, so an evicted retired run cannot
+        // practically re-enter, while heap stays bounded.
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
         var binding = topicBinding("DATABENTO", "indicators");
@@ -1896,7 +1897,16 @@ class FeedGatewayServiceTest {
                 .getDeclaredField("indicatorsRetiredRuns");
         f.setAccessible(true);
         java.util.Set<?> retired = (java.util.Set<?>) f.get(service);
-        assertTrue(retired.size() <= 64, "retired-run set capped, got " + retired.size());
+        assertTrue(retired.size() <= 4096, "retired-run set capped, got " + retired.size());
+        // r2 finding 4: BELOW the cap every retirement is remembered — a retired
+        // run may never return, even with a higher offset.
+        long now2 = System.currentTimeMillis();
+        String wall2 = java.time.Instant.ofEpochMilli(now2).toString();
+        String retiredReturn = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + wall2 + "\",\"runId\":\"run-0\",\"revision\":99}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 500L, "SPX", retiredReturn, now2),
+                retiredReturn), "an evicted-window-internal retired run may never return");
     }
 
     @Test
