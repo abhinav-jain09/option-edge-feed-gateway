@@ -6433,7 +6433,11 @@ public class FeedGatewayService implements ReplayRunner {
                     || sv.asInt() != 1) {
                 return null;
             }
-            String runId = text(root, "runId");
+            JsonNode runNode = root.get("runId");
+            if (runNode == null || !runNode.isTextual()) {
+                return null; // r3 finding 2: a numeric/boolean runId is type-invalid
+            }
+            String runId = runNode.asText();
             if (runId.isBlank() || runId.length() > 64) {
                 return null;
             }
@@ -6471,7 +6475,11 @@ public class FeedGatewayService implements ReplayRunner {
     private boolean indicatorsSupersedes(String symbol, String json) {
         try {
             JsonNode root = mapper.readTree(json);
-            String runId = text(root, "runId");
+            JsonNode runNode = root.get("runId");
+            if (runNode == null || !runNode.isTextual()) {
+                return false; // r3 finding 2: strict schema — runId is a string
+            }
+            String runId = runNode.asText();
             JsonNode revNode = root.get("revision");
             // r1 finding 6: revision must be an INTEGRAL JSON number — a textual
             // number is a schema violation, never coerced.
@@ -6493,17 +6501,16 @@ public class FeedGatewayService implements ReplayRunner {
                         return false; // a retired run may never return
                     }
                     if (currentRun != null) {
-                        // r1 finding 7: bounded insertion-ordered retirement — the
-                        // oldest retirements age out at the cap. A retired run that
-                        // aged out could only "return" via revision regression, which
-                        // the per-symbol revision guard + offset ordering still block.
+                        // r3 finding 1: the never-return rule is ABSOLUTE — eviction
+                        // is forbidden. At the (operationally unreachable) cap the
+                        // gateway FAILS CLOSED: no further run transitions are
+                        // accepted, the current run keeps serving, and memory stays
+                        // bounded. A retired run can never re-enter.
                         synchronized (indicatorsRetiredRuns) {
-                            indicatorsRetiredRuns.add(symbol + "|" + currentRun);
-                            while (indicatorsRetiredRuns.size() > INDICATORS_RETIRED_RUNS_CAP) {
-                                var it = indicatorsRetiredRuns.iterator();
-                                it.next();
-                                it.remove();
+                            if (indicatorsRetiredRuns.size() >= INDICATORS_RETIRED_RUNS_CAP) {
+                                return false;
                             }
+                            indicatorsRetiredRuns.add(symbol + "|" + currentRun);
                         }
                     }
                     indicatorsRunId.put(symbol, runId);
@@ -8089,6 +8096,11 @@ public class FeedGatewayService implements ReplayRunner {
         try {
             JsonNode root = mapper.readTree(json);
             String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
+            if ("indicators".equals(event)) {
+                // r3 finding 3: the frozen key is literally `indicators|symbol` —
+                // additive fields must never split the coalescing identity.
+                return event + "|" + symbol;
+            }
             String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
             String strike = root.hasNonNull("strike") ? root.get("strike").asText("") : "";
             String horizon = "option-truth".equals(event) && root.hasNonNull("horizon")

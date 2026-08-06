@@ -1898,6 +1898,12 @@ class FeedGatewayServiceTest {
         f.setAccessible(true);
         java.util.Set<?> retired = (java.util.Set<?>) f.get(service);
         assertTrue(retired.size() <= 4096, "retired-run set capped, got " + retired.size());
+        // r3 finding 2: a numeric runId is type-invalid — never accepted.
+        String numericRun = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + java.time.Instant.now() + "\",\"runId\":7,\"revision\":1}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 400L, "SPX", numericRun,
+                        System.currentTimeMillis()), numericRun));
         // r2 finding 4: BELOW the cap every retirement is remembered — a retired
         // run may never return, even with a higher offset.
         long now2 = System.currentTimeMillis();
