@@ -1756,6 +1756,192 @@ class FeedGatewayServiceTest {
         assertTrue(sink.isEmpty(), "a stale verdict must never replay to a late joiner; got: " + sink);
     }
 
+    // ----- indicators CURRENT snapshot relay -------------------------------------------------------
+
+    @Test
+    void indicatorsTopicIsOptionalGlobalAndOnTheShortWindow() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("options.indicators.snapshot.current", settings.indicatorsSnapshotTopic(),
+                "default topic must be the contract constant IndicatorTopics.INDICATORS_SNAPSHOT_CURRENT");
+        assertTrue(isOptionalTopic(service, settings.indicatorsSnapshotTopic()),
+                "a brand-new standalone producer may be absent — the topic must be optional");
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("indicators"),
+                "indicator snapshots fan out in per-session (auth) mode like advisory siblings");
+        assertEquals(300_000L, settings.indicatorsTtlMs(), "default TTL must be 5 minutes");
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, "indicators", now - 2L * 60_000L, now));
+        assertTrue(isExpired(service, "indicators", now - 6L * 60_000L, now),
+                "a 6-min-old snapshot must be STALE — never replayed as current");
+    }
+
+    @Test
+    void indicatorsSupersessionAcceptsNewRunsRejectsRegressionsAndRetiredRuns() throws Exception {
+        // Rev 14 §6.9: per key, a NEW runId is accepted in arrival order and retires
+        // the prior; within the active run revisions strictly increase; a retired
+        // run may never return.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String base = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + java.time.Instant.ofEpochMilli(now) + "\",";
+        String runA5 = base + "\"runId\":\"run-A\",\"revision\":5}";
+        String runA4 = base + "\"runId\":\"run-A\",\"revision\":4}";
+        String runA6 = base + "\"runId\":\"run-A\",\"revision\":6}";
+        String runB1 = base + "\"runId\":\"run-B\",\"revision\":1}";
+        String runA9 = base + "\"runId\":\"run-A\",\"revision\":9}";
+        var binding = topicBinding("DATABENTO", "indicators");
+        assertEquals("DATABENTO|SPX", updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 1L, "SPX", runA5, now), runA5),
+                "first snapshot of run-A accepted");
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 2L, "SPX", runA4, now), runA4),
+                "revision regression within the active run rejected");
+        assertEquals("DATABENTO|SPX", updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 3L, "SPX", runA6, now), runA6));
+        assertEquals("DATABENTO|SPX", updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 4L, "SPX", runB1, now), runB1),
+                "a NEW run in arrival order supersedes (revision restarts)");
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 5L, "SPX", runA9, now), runA9),
+                "the retired run may never return, regardless of revision");
+    }
+
+    @Test
+    void indicatorsConsumeBothLocalAndMirroredTopics() {
+        // r1 finding 1 (§7.3): dev/prod bind the locally-computed SPX topic AND the
+        // es4-mirrored ES topic; when the prefix makes them coincide (es4) the set
+        // collapses to one.
+        GatewaySettings settings = new GatewaySettings();
+        var topics = settings.indicatorsSnapshotTopics();
+        assertTrue(topics.contains("options.indicators.snapshot.current"), "local SPX topic");
+        assertTrue(topics.contains("es.options.indicators.snapshot.current"), "mirrored ES topic");
+        assertEquals(2, topics.size());
+    }
+
+    @Test
+    void indicatorsOffsetOrderingOutranksPublishedAtRegression() throws Exception {
+        // r1 finding 2 (§6.9): acceptance is OFFSET-ordered. A lower offset can
+        // never supersede (cache/live race), and a HIGHER offset with a higher
+        // revision is accepted even when its publishedAt wall clock regresses.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String olderWall = java.time.Instant.ofEpochMilli(now - 1500).toString();
+        String newerWall = java.time.Instant.ofEpochMilli(now).toString();
+        String rev1 = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + newerWall + "\",\"runId\":\"run-A\",\"revision\":1}";
+        String rev2OlderWall = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + olderWall + "\",\"runId\":\"run-A\",\"revision\":2}";
+        String rev3LowerOffset = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + newerWall + "\",\"runId\":\"run-A\",\"revision\":3}";
+        var binding = topicBinding("DATABENTO", "indicators");
+        assertEquals("DATABENTO|SPX", updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 10L, "SPX", rev1, now), rev1));
+        assertEquals("DATABENTO|SPX", updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 11L, "SPX", rev2OlderWall, now),
+                rev2OlderWall),
+                "higher offset + higher revision wins despite publishedAt regression");
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 9L, "SPX", rev3LowerOffset, now),
+                rev3LowerOffset),
+                "a lower offset may never supersede — cache/live interleave guard");
+    }
+
+    @Test
+    void indicatorsStrictIdentityRejectsPoisoningAndSchemaViolations() throws Exception {
+        // r1 finding 6: Kafka-key/payload-symbol mismatch, non-ES/SPX symbols,
+        // textual revisions, and missing schemaVersion are all dropped fail-closed.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String wall = java.time.Instant.ofEpochMilli(now).toString();
+        var binding = topicBinding("DATABENTO", "indicators");
+        String claimsEs = "{\"schemaVersion\":1,\"symbol\":\"ES\",\"publishedAt\":\""
+                + wall + "\",\"runId\":\"r\",\"revision\":1}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 1L, "SPX", claimsEs, now), claimsEs),
+                "SPX-keyed record claiming ES must never overwrite ES state");
+        String badSymbol = "{\"schemaVersion\":1,\"symbol\":\"VIX\",\"publishedAt\":\""
+                + wall + "\",\"runId\":\"r\",\"revision\":1}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 2L, "VIX", badSymbol, now), badSymbol));
+        String textualRevision = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + wall + "\",\"runId\":\"r\",\"revision\":\"3\"}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 3L, "SPX", textualRevision, now),
+                textualRevision), "textual revision is a schema violation, never coerced");
+        String noSchema = "{\"symbol\":\"SPX\",\"publishedAt\":\"" + wall
+                + "\",\"runId\":\"r\",\"revision\":1}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 4L, "SPX", noSchema, now), noSchema));
+    }
+
+    @Test
+    void indicatorsRetiredRunMemoryIsBounded() throws Exception {
+        // r1 finding 7 / r2 finding 4: retirement memory is capped at 4096 — far
+        // beyond any real restart cadence, so an evicted retired run cannot
+        // practically re-enter, while heap stays bounded.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        var binding = topicBinding("DATABENTO", "indicators");
+        long now = System.currentTimeMillis();
+        String wall = java.time.Instant.ofEpochMilli(now).toString();
+        for (int i = 0; i < 80; i++) {
+            String json = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\"" + wall
+                    + "\",\"runId\":\"run-" + i + "\",\"revision\":1}";
+            updateCache(service, binding,
+                    recordAt(settings.indicatorsSnapshotTopic(), 0, i, "SPX", json, now), json);
+        }
+        java.lang.reflect.Field f = FeedGatewayService.class
+                .getDeclaredField("indicatorsRetiredRuns");
+        f.setAccessible(true);
+        java.util.Set<?> retired = (java.util.Set<?>) f.get(service);
+        assertTrue(retired.size() <= 4096, "retired-run set capped, got " + retired.size());
+        // r3 finding 2: a numeric runId is type-invalid — never accepted.
+        String numericRun = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + java.time.Instant.now() + "\",\"runId\":7,\"revision\":1}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 400L, "SPX", numericRun,
+                        System.currentTimeMillis()), numericRun));
+        // r2 finding 4: BELOW the cap every retirement is remembered — a retired
+        // run may never return, even with a higher offset.
+        long now2 = System.currentTimeMillis();
+        String wall2 = java.time.Instant.ofEpochMilli(now2).toString();
+        String retiredReturn = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + wall2 + "\",\"runId\":\"run-0\",\"revision\":99}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 500L, "SPX", retiredReturn, now2),
+                retiredReturn), "an evicted-window-internal retired run may never return");
+    }
+
+    @Test
+    void indicatorsReplayDeliversFreshCachedFramesPerSymbol() throws Exception {
+        // r1 finding 5: the standalone replay used by BOTH connect paths (auth +
+        // legacy) delivers each symbol's fresh cached frame exactly once.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        var binding = topicBinding("DATABENTO", "indicators");
+        long now = System.currentTimeMillis();
+        String wall = java.time.Instant.ofEpochMilli(now).toString();
+        String spx = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\"" + wall
+                + "\",\"runId\":\"r\",\"revision\":1}";
+        String es = "{\"schemaVersion\":1,\"symbol\":\"ES\",\"publishedAt\":\"" + wall
+                + "\",\"runId\":\"r\",\"revision\":1}";
+        updateCache(service, binding,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 1L, "SPX", spx, now), spx);
+        updateCache(service, binding,
+                recordAt("es." + settings.indicatorsSnapshotTopic(), 0, 1L, "ES", es, now), es);
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class
+                .getDeclaredMethod("replayIndicatorsCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertEquals(2, sink.size(), "one frame per symbol; got: " + sink);
+        assertTrue(sink.stream().anyMatch(s -> s.contains("\"SPX\"")));
+        assertTrue(sink.stream().anyMatch(s -> s.contains("\"ES\"")));
+    }
+
     // ----- spot-vol-regime CURRENT snapshot relay --------------------------------------------------
 
     @Test

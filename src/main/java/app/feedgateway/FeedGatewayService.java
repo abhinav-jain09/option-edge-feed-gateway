@@ -144,6 +144,7 @@ public class FeedGatewayService implements ReplayRunner {
             "zero-dte-intelligence",
             "greek-move-auth",
             "spot-vol-regime",
+            "indicators",
             "opb-by-option", "opb-session",
             "index-price", "vix-price", "spx-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
@@ -276,6 +277,47 @@ public class FeedGatewayService implements ReplayRunner {
     // pill simply vanishes. Same standalone/global/JSON pass-through delivery class as the
     // greek-move-auth sibling above; NOT in the ui-batch. Keyed by symbol.
     private final Map<String, String> spotVolRegime = new ConcurrentHashMap<>();
+    // Indicator CURRENT snapshots: ONE per canonical symbol (ES|SPX), per-symbol
+    // cache + (runId, revision) supersession (rev 14 §6.9/§8): a new runId is
+    // accepted in arrival(=offset) order on the single-partition compacted topic and
+    // retires the prior; within a run, revisions must strictly increase; retired-run
+    // returns are rejected.
+    private final Map<String, String> indicatorsCurrent = new ConcurrentHashMap<>();
+    private final Map<String, String> indicatorsRunId = new ConcurrentHashMap<>();
+    private final Map<String, Long> indicatorsRevision = new ConcurrentHashMap<>();
+    /** r1 finding 7 / r2 finding 4: retirement memory is bounded at a cap no real
+     * deployment approaches (one retirement per producer restart; 4096 ≈ years of
+     * restarts within one gateway uptime), so eviction can never let a genuinely
+     * retired run re-enter in practice — while heap stays bounded (~400 KiB max). */
+    private static final int INDICATORS_RETIRED_RUNS_CAP = 4096;
+    private final java.util.Set<String> indicatorsRetiredRuns =
+            java.util.Collections.synchronizedSet(
+                    new java.util.LinkedHashSet<>());
+    /**
+     * r1 finding 3: serializes the live (cache-update → broadcast-enqueue) pair
+     * against the connect/caught-up replay's (cache-read → session-send) pair, so a
+     * replay-captured older revision can never be enqueued AFTER a newer live frame
+     * (coalescing keeps the LAST enqueue).
+     */
+    private final Object indicatorsEmitLock = new Object();
+    /** r2 finding 1: exactly-one in-order live delivery per offset across BOTH
+     * ingesting consumers — whichever reaches an offset first broadcasts it. */
+    private final Map<String, java.util.concurrent.atomic.AtomicLong>
+            indicatorsBroadcastOffset = new ConcurrentHashMap<>();
+
+    boolean shouldBroadcastIndicators(String cacheKey, long offset) {
+        var gate = indicatorsBroadcastOffset.computeIfAbsent(cacheKey,
+                k -> new java.util.concurrent.atomic.AtomicLong(-1L));
+        while (true) {
+            long current = gate.get();
+            if (offset <= current) {
+                return false;
+            }
+            if (gate.compareAndSet(current, offset)) {
+                return true;
+            }
+        }
+    }
     // SPX close-direction (design CLOSE-DIRECTION-GATE1 §8/CD-R30): ONE topic, two cache classes.
     // VERDICTS (key V|sessionDate) are once-a-session frozen decisions on the LONG
     // closeDirectionTtlMs window; INTERIMS (key I|sessionDate) are 1/min monitoring reads whose
@@ -612,6 +654,10 @@ public class FeedGatewayService implements ReplayRunner {
             // the same standalone way legacy mode does, so an auth-mode reload restores the overlay.
             replayShortPremiumCached(session);
             replayZeroDteIntelligenceCached(session);
+            // Indicators are the same GLOBAL advisory class (symbol-filtered
+            // client-side) — the production auth mode owes the connect replay too
+            // (r1 finding 5).
+            replayIndicatorsCached(session);
             return;
         }
         if (avroCaughtUp.get()) {
@@ -640,6 +686,7 @@ public class FeedGatewayService implements ReplayRunner {
             // track rather than waiting for the next live verdict.
             replayGreekMoveAuthCached(session);
             replaySpotVolRegimeCached(session);
+            replayIndicatorsCached(session);
             replayIbkrPreOpenCached(session);
             // Close-direction: replay the session's frozen verdict (or the current interim) so a page
             // reload in the final hour restores the card instead of waiting for the next minute tick.
@@ -1431,6 +1478,11 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
+        // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
+        // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
+        for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
+            topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
+        }
         // SPX close-direction interims + frozen verdict (JSON, key = symbol|expiry): standalone global
         // advisory, OPTIONAL topic — LONG closeDirectionTtlMs window (verdict class) bounds the seek-back;
         // interim replay freshness is separately bounded (closeDirectionInterimFreshMs).
@@ -1539,6 +1591,11 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
+        // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
+        // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
+        for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
+            topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
+        }
         // Keep the cache + live JSON consumer topic sets symmetric: the SPX close-direction signal
         // (JSON, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
@@ -1856,6 +1913,21 @@ public class FeedGatewayService implements ReplayRunner {
                         droppedByOtherReasons.incrementAndGet();
                         continue;
                     }
+                    if (binding != null && "indicators".equals(binding.event())) {
+                        // r2 findings 1+2: the cache consumer consumes this offset —
+                        // if it wins the CAS gate it must also BROADCAST, or the
+                        // live consumer's duplicate is suppressed and clients starve.
+                        // The emit lock covers mutation+enqueue as one unit.
+                        synchronized (indicatorsEmitLock) {
+                            String indicatorKey = updateCache(binding, record, json);
+                            if (indicatorKey != null && caughtUpFlag.get()
+                                    && shouldBroadcastIndicators(indicatorKey, record.offset())) {
+                                broadcast(binding.event(), json);
+                                forwardedEvents.incrementAndGet();
+                            }
+                        }
+                        continue;
+                    }
                     updateCache(binding, record, json);
                 }
                 purgeExpiredCache(System.currentTimeMillis());
@@ -2164,6 +2236,21 @@ public class FeedGatewayService implements ReplayRunner {
                         // returns null for unknown per-market cache shapes).
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("indicators".equals(binding.event())) {
+                        // r2 findings 1+2: the whole supersede→cache→CAS→enqueue
+                        // decision is ONE unit under the emit lock, and the offset
+                        // CAS gate makes whichever consumer wins the broadcaster.
+                        synchronized (indicatorsEmitLock) {
+                            String indicatorsKey = updateCache(binding, record, json);
+                            if (indicatorsKey != null && cacheCaughtUpFlag.get()
+                                    && shouldBroadcastIndicators(indicatorsKey,
+                                            record.offset())) {
+                                broadcast(binding.event(), json);
+                                forwardedEvents.incrementAndGet();
+                            }
+                        }
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
@@ -2592,6 +2679,12 @@ public class FeedGatewayService implements ReplayRunner {
                     // topic is absent after the daily Kafka wipe until it first produces) — optional, so
                     // its absence can never starve the shared JSON consumer.
                     || topic.equals(settings.spotVolRegimeTopic())
+                    // BOTH indicator CURRENT topics are optional (r2 finding 3):
+                    // the local one until the service first produces, and the
+                    // es4-MIRRORED one whenever the mirror is not yet installed —
+                    // an absent mirror means ES goes stale (§7.3), never a dead
+                    // shared consumer.
+                    || settings.indicatorsSnapshotTopics().contains(topic)
                     // Close-direction is a brand-new standalone service that may not be deployed (and the
                     // topic is absent until it first produces) — optional like its advisory siblings.
                     || topic.equals(settings.closeDirectionSignalTopic())
@@ -3016,10 +3109,13 @@ public class FeedGatewayService implements ReplayRunner {
                 continue;
             }
             if ("ibkr-preopen-status".equals(binding.event())
+                    || "indicators".equals(binding.event())
                     || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 // The pre-open status/control stream is SOURCE-INDEPENDENT window state:
                 // stateCaughtUp must include its partition regardless of the active market-data
                 // source, or replay could expose a pre-revocation snapshot (round-2 finding 4).
+                // Indicators (r1 finding 4) are likewise source-independent GLOBAL truth —
+                // their partitions gate the barrier no matter which source is active.
                 selectedEndOffsets.put(entry.getKey(), entry.getValue());
             }
         }
@@ -3040,7 +3136,10 @@ public class FeedGatewayService implements ReplayRunner {
         Map<TopicPartition, Long> selected = new LinkedHashMap<>();
         for (Map.Entry<TopicPartition, Long> entry : endOffsets.entrySet()) {
             TopicBinding preOpenBinding = topicEvents.get(entry.getKey().topic());
-            if (preOpenBinding != null && "ibkr-preopen-status".equals(preOpenBinding.event())) {
+            if (preOpenBinding != null && ("ibkr-preopen-status".equals(preOpenBinding.event())
+                    || "indicators".equals(preOpenBinding.event()))) {
+                // Source-independent streams (pre-open control + indicators) always
+                // gate mid-run barriers too (r1 finding 4).
                 selected.put(entry.getKey(), entry.getValue());
                 continue;
             }
@@ -3098,6 +3197,12 @@ public class FeedGatewayService implements ReplayRunner {
             if (events.contains("spot-vol-regime")) {
                 for (WebSocketSession client : clients) {
                     replaySpotVolRegimeCached(client);
+                }
+            }
+            // Indicator CURRENT is STANDALONE too: explicit re-push once caught up.
+            if (events.contains("indicators")) {
+                for (WebSocketSession client : clients) {
+                    replayIndicatorsCached(client);
                 }
             }
             if (events.contains("ibkr-preopen-status")) {
@@ -4043,6 +4148,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = greekMoveAuthCacheKey(json, key);
         } else if ("spot-vol-regime".equals(event)) {
             key = spotVolRegimeCacheKey(json, key);
+        } else if ("indicators".equals(event)) {
+            key = indicatorsCacheKey(json, key);
         } else if ("close-direction".equals(event)) {
             key = closeDirectionCacheKey(json, key);
         } else if ("zero-dte-intelligence".equals(event)) {
@@ -4092,13 +4199,15 @@ public class FeedGatewayService implements ReplayRunner {
             key = binding.source() + "|" + key;
         }
         String versionKey = event + ":" + key;
-        if ("ibkr-preopen-status".equals(event)) {
-            // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5): the status topic is single-
-            // partition and strictly ordered by offset — Kafka timestamps may tie or regress
-            // across legitimate later offsets (and the cache + live consumers read the same
-            // partition). Accept ONLY a strictly higher offset on the same partition; a
-            // DIFFERENT partition for the same key is impossible on the 1-partition contract
-            // (fail-closed: reject, never reorder).
+        if ("ibkr-preopen-status".equals(event) || "indicators".equals(event)) {
+            // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5; indicators rev 14
+            // §6.9 r1 finding 2): these topics are single-partition per symbol and
+            // strictly ordered by offset — Kafka timestamps may tie or regress
+            // across legitimate later offsets (and the cache + live consumers read
+            // the same partition). Accept ONLY a strictly higher offset on the same
+            // partition; a DIFFERENT partition for the same key is fail-closed
+            // (reject, never reorder) — each indicator symbol lives on exactly one
+            // topic/partition (§7.3).
             RecordPosition incoming = recordPosition(record);
             RecordPosition previousPosition = cachePositions.get(versionKey);
             if (previousPosition != null
@@ -4115,8 +4224,11 @@ public class FeedGatewayService implements ReplayRunner {
         boolean isTerminalMaxPainShortCircuitBypass = "max-pain".equals(event) && isMaxPainExpired(json);
         if (!isTerminalMaxPainShortCircuitBypass
                 && !"ibkr-preopen-status".equals(event)
+                && !"indicators".equals(event)
                 && previousEventTime != null && previousEventTime > eventTime) {
-            return null;   // (the pre-open stream is offset-ordered above, never timestamp-gated)
+            return null;   // (offset-ordered streams above are never timestamp-gated —
+                           // a publishedAt wall-clock regression must not outrank a
+                           // higher offset + higher revision, r1 finding 2)
         }
         if ("gex-by-strike".equals(event)
                 && previousEventTime != null
@@ -4239,6 +4351,18 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 spotVolRegime.put(key, json); // ONE current regime per symbol — last heartbeat wins
+                return key;
+            }
+            case "indicators" -> {
+                // (runId, revision) supersession (rev 14 §6.9): accept a NEW runId in
+                // arrival order and retire the prior; require strictly increasing
+                // revision within the active run; reject retired-run returns.
+                if (!indicatorsSupersedes(key, json)) {
+                    return null; // regression/retired-run — never cached or broadcast
+                }
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                indicatorsCurrent.put(key, json);
                 return key;
             }
             case "close-direction" -> {
@@ -5079,6 +5203,11 @@ public class FeedGatewayService implements ReplayRunner {
             // live. Same ONE-seam consequences as the sibling above.
             return CachePolicy.expiring(settings.spotVolRegimeTtlMs());
         }
+        if ("indicators".equals(event)) {
+            // Indicator CURRENT snapshot: same SHORT freshness class — a dead
+            // producer's snapshot must read as ABSENT on late-join, never as live.
+            return CachePolicy.expiring(settings.indicatorsTtlMs());
+        }
         if ("close-direction".equals(event)) {
             // Long last-value-wins window (default 12h, the max-pain/es-open-direction class): the
             // frozen T-11m VERDICT stays decision-relevant until the close and must survive a gateway
@@ -5272,6 +5401,9 @@ public class FeedGatewayService implements ReplayRunner {
             // never the Kafka ARRIVAL time, so a producer catching up on a backlog cannot render a
             // stale regime as live.
             return spotVolRegimeTimestamp(json);
+        }
+        if ("indicators".equals(event)) {
+            return indicatorsTimestamp(json);
         }
         if ("liquidity-heatmap".equals(event)) {
             long payloadTime = liquidityHeatmapTimestamp(json);
@@ -5538,6 +5670,8 @@ public class FeedGatewayService implements ReplayRunner {
             greekMoveAuthCurrent.remove(versionKey.substring("greek-move-auth:".length()));
         } else if (versionKey.startsWith("spot-vol-regime:")) {
             spotVolRegime.remove(versionKey.substring("spot-vol-regime:".length()));
+        } else if (versionKey.startsWith("indicators:")) {
+            indicatorsCurrent.remove(versionKey.substring("indicators:".length()));
         } else if (versionKey.startsWith("close-direction:")) {
             String cdKey = versionKey.substring("close-direction:".length());
             if (cdKey.contains("|V|")) {
@@ -6247,6 +6381,145 @@ public class FeedGatewayService implements ReplayRunner {
             // outlives the close by 4 minutes. Strip the band (never the snapshot) once the session is
             // over so a browser opened at 16:01 does not late-join into a coloured chain.
             send(session, "spot-vol-regime", suppressStrikeBandAfterClose(json, nowMs));
+        }
+    }
+
+    /**
+     * Late-join delivery for indicator CURRENT snapshots (rev 14 §8): PER-SYMBOL —
+     * both ES and SPX replay independently; GLOBAL advisory class, symbol-filtered
+     * client-side; SHORT-TTL fresh-gated so a dead producer reads as absent.
+     */
+    private void replayIndicatorsCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        // r1 finding 3: the (cache-read → send-enqueue) pair is atomic under the
+        // emit lock — a live update either lands before (replay reads the newer
+        // value) or after (its enqueue supersedes ours via coalescing). The stale
+        // ordering "live N+1 enqueued, then replayed N enqueued" cannot happen.
+        synchronized (indicatorsEmitLock) {
+            for (Map.Entry<String, String> entry : indicatorsCurrent.entrySet()) {
+                String json = entry.getValue();
+                if (json == null || json.isBlank()) {
+                    continue;
+                }
+                if (!isCacheFresh("indicators:" + entry.getKey(), nowMs)) {
+                    continue;
+                }
+                send(session, "indicators", json);
+            }
+        }
+    }
+
+    /**
+     * Canonical symbol (ES|SPX) keys the indicator cache — STRICT (r1 finding 6):
+     * the payload symbol must be exactly ES or SPX AND equal the Kafka record key
+     * (a keyed-SPX record claiming ES may never overwrite ES state); the frame must
+     * carry schemaVersion 1, a bounded runId, an INTEGRAL non-negative revision and
+     * a parseable publishedAt. Anything else is dropped (null), never cached or
+     * forwarded.
+     */
+    private String indicatorsCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol");
+            if (!"ES".equals(symbol) && !"SPX".equals(symbol)) {
+                return null;
+            }
+            if (fallback != null && !symbol.equals(fallback)) {
+                return null; // Kafka key / payload identity mismatch — poisoning guard
+            }
+            JsonNode sv = root.get("schemaVersion");
+            if (sv == null || !sv.isIntegralNumber() || !sv.canConvertToInt()
+                    || sv.asInt() != 1) {
+                return null;
+            }
+            JsonNode runNode = root.get("runId");
+            if (runNode == null || !runNode.isTextual()) {
+                return null; // r3 finding 2: a numeric/boolean runId is type-invalid
+            }
+            String runId = runNode.asText();
+            if (runId.isBlank() || runId.length() > 64) {
+                return null;
+            }
+            JsonNode rev = root.get("revision");
+            if (rev == null || !rev.isIntegralNumber() || !rev.canConvertToLong()
+                    || rev.asLong() < 0) {
+                return null;
+            }
+            String publishedAt = text(root, "publishedAt");
+            java.time.Instant.parse(publishedAt);
+            return symbol;
+        } catch (Exception malformed) {
+            return null;
+        }
+    }
+
+    /** Payload publish time (publishedAt ISO) drives freshness; -1 = malformed. */
+    private long indicatorsTimestamp(String json) {
+        try {
+            String publishedAt = text(mapper.readTree(json), "publishedAt");
+            if (publishedAt.isBlank()) {
+                return -1L;
+            }
+            long ms = java.time.Instant.parse(publishedAt).toEpochMilli();
+            if (ms > System.currentTimeMillis() + SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS) {
+                return -1L; // implausibly future — fail closed
+            }
+            return ms;
+        } catch (Exception ignored) {
+            return -1L;
+        }
+    }
+
+    /** Rev 14 §6.9 cross-run ordering; returns false on any regression. */
+    private boolean indicatorsSupersedes(String symbol, String json) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            JsonNode runNode = root.get("runId");
+            if (runNode == null || !runNode.isTextual()) {
+                return false; // r3 finding 2: strict schema — runId is a string
+            }
+            String runId = runNode.asText();
+            JsonNode revNode = root.get("revision");
+            // r1 finding 6: revision must be an INTEGRAL JSON number — a textual
+            // number is a schema violation, never coerced.
+            if (runId.isBlank() || runId.length() > 64 || revNode == null
+                    || !revNode.isIntegralNumber() || !revNode.canConvertToLong()
+                    || revNode.asLong() < 0) {
+                return false;
+            }
+            long revision = revNode.asLong();
+            synchronized (indicatorsRevision) {
+                String currentRun = indicatorsRunId.get(symbol);
+                if (runId.equals(currentRun)) {
+                    Long last = indicatorsRevision.get(symbol);
+                    if (last != null && revision <= last) {
+                        return false; // stale revision within the active run
+                    }
+                } else {
+                    if (indicatorsRetiredRuns.contains(symbol + "|" + runId)) {
+                        return false; // a retired run may never return
+                    }
+                    if (currentRun != null) {
+                        // r3 finding 1: the never-return rule is ABSOLUTE — eviction
+                        // is forbidden. At the (operationally unreachable) cap the
+                        // gateway FAILS CLOSED: no further run transitions are
+                        // accepted, the current run keeps serving, and memory stays
+                        // bounded. A retired run can never re-enter.
+                        synchronized (indicatorsRetiredRuns) {
+                            if (indicatorsRetiredRuns.size() >= INDICATORS_RETIRED_RUNS_CAP) {
+                                return false;
+                            }
+                            indicatorsRetiredRuns.add(symbol + "|" + currentRun);
+                        }
+                    }
+                    indicatorsRunId.put(symbol, runId);
+                }
+                indicatorsRevision.put(symbol, revision);
+            }
+            return true;
+        } catch (JsonProcessingException e) {
+            return false;
         }
     }
 
@@ -7713,6 +7986,7 @@ public class FeedGatewayService implements ReplayRunner {
             // symbol-filtered client-side); staleness enforced upstream by the SHORT
             // spotVolRegimeTtlMs window in updateCache.
             "spot-vol-regime",
+            "indicators",
             // SPX close-direction interims + frozen verdict are the same class of GLOBAL advisory
             // overlay (one session at a time, rendered in its own summary card) — allowlist so
             // routeOrBroadcast/broadcast fan them out in per-session (auth) mode too. Malformed and
@@ -7822,6 +8096,11 @@ public class FeedGatewayService implements ReplayRunner {
         try {
             JsonNode root = mapper.readTree(json);
             String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
+            if ("indicators".equals(event)) {
+                // r3 finding 3: the frozen key is literally `indicators|symbol` —
+                // additive fields must never split the coalescing identity.
+                return event + "|" + symbol;
+            }
             String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
             String strike = root.hasNonNull("strike") ? root.get("strike").asText("") : "";
             String horizon = "option-truth".equals(event) && root.hasNonNull("horizon")
