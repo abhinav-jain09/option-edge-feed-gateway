@@ -320,6 +320,14 @@ public class FeedGatewayService implements ReplayRunner {
      * observed post-boundary and let the first strike resurrect.
      */
     private long ibkrPreOpenProcessStartMs = System.currentTimeMillis();
+
+    /**
+     * Every fence this process has SEEN named by a value or a path control, whether or not a
+     * projection was ever built for it. The boundary snapshot is keyed off this rather than off the
+     * projection planes, so a process that crosses 09:30 while reconstruction lags still fences at
+     * the right instant instead of synthesizing one later.
+     */
+    private final Set<Long> ibkrPreOpenObservedFences = ConcurrentHashMap.newKeySet();
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     private final Map<String, String> gammaMigration = new ConcurrentHashMap<>();
@@ -2287,7 +2295,7 @@ public class FeedGatewayService implements ReplayRunner {
                                 && "DATABENTO".equals(binding.source())
                                 // Shared LIVE topic only — see the cache path for why.
                                 && settings.databentoGexTopic().equals(record.topic())
-                                
+
                                 && interceptSharedGexRecord(record, rawJson, cacheCaughtUpFlag.get(),
                                         System.currentTimeMillis())) {
                             continue;
@@ -6776,11 +6784,26 @@ public class FeedGatewayService implements ReplayRunner {
         // generation, epoch or revision is an UNVERSIONED record that R-WIRE.5 cannot order, and the
         // payload's own identity must agree with the Kafka key it arrived under — otherwise one
         // strike's record could be admitted under another's partitioned key.
-        if (!IBKR_PREOPEN_SESSION_ID.matcher(sessionId).matches()
+        String rawSessionId = root.path("sessionId").isTextual() ? root.path("sessionId").asText() : sessionId;
+        if (!rawSessionId.equals(sessionId)                       // text() trims — a padded id is NOT exact
+                || !isIbkrPreOpenSessionId(sessionId)             // shape AND a real calendar date
                 || outputGeneration <= 0L || baselineEpoch <= 0L || recordRevision <= 0L) {
             ibkrPreOpenGexDroppedSessioned.incrementAndGet();
             return null;
         }
+        // TIMESTAMP PROVENANCE (round-6 finding 1). The shared gex topic is CreateTime — the broker
+        // default, verified on the running cluster — so record.timestamp() is the PRODUCER's clock,
+        // not a broker commit stamp. R-STOP's "committed before the fence" is therefore proved here
+        // against a first-party clock: every IBKR_PREOPEN record on this topic is written by our own
+        // databento-gex-service, and the window/validUntil guards independently bound how far a
+        // record can be trusted. That is the honest scope of the proof, and it is NOT sound for a
+        // third-party producer — pinning message.timestamp.type=LogAppendTime on this topic would
+        // make it a broker fact, but that timestamp is shared with the existing Databento RTH
+        // pipeline (gamma-flow event times), so it is a separate, deliberate change.
+        //
+        // Rejecting non-LOG_APPEND_TIME outright was tried and reverted: on a CreateTime topic it
+        // disables the entire window rather than hardening it.
+        ibkrPreOpenObservedFences.add(validUntilMs);
         String identity = gexIdentityFromNode(root, recordKey);
         if (!identity.equals(gexIdentityFromNode(root, ""))
                 || !identityMatchesRecordKey(identity, recordKey)) {
@@ -7055,6 +7078,43 @@ public class FeedGatewayService implements ReplayRunner {
      * resurrect a strike past its first newly-ingested Databento record. MUST be called under
      * {@link #ibkrPreOpenGexLock}.
      */
+    /**
+     * True when a control committed at {@code controlCommitMs} can prove it precedes the live state
+     * it would supersede — i.e. it was committed before the fence of every candidate/pending entry
+     * it could reach. A control that arrives after those fences says nothing about them.
+     * MUST be called under {@link #ibkrPreOpenGexLock}.
+     */
+    private boolean ibkrPreOpenControlPrecedesLiveState(long controlCommitMs) {
+        for (Map<String, IbkrPreOpenGexCandidate> plane
+                : List.of(ibkrPreOpenGexCandidates, ibkrPreOpenPendingProjections)) {
+            for (IbkrPreOpenGexCandidate candidate : plane.values()) {
+                if (controlCommitMs >= candidate.validUntilMs()) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Snapshot the partition high-watermark for any window whose 09:30 boundary this process has
+     * crossed and which has no snapshot yet — even when no projection exists for it. Reads the
+     * boundaries from the window state the path plane maintains, so a session with no live
+     * projections is still fenced at the right instant.
+     */
+    private void captureIbkrPreOpenBoundaryWatermarkLocked(long nowMs) {
+        synchronized (ibkrPreOpenGexLock) {
+            for (Long fence : new java.util.ArrayList<>(ibkrPreOpenObservedFences)) {
+                if (nowMs >= fence + IBKR_PREOPEN_FREEZE_WINDOW_MS
+                        && ibkrPreOpenBoundaryObservedLive(fence)
+                        && !ibkrPreOpenTakeoverWatermarks.containsKey(fence)) {
+                    ibkrPreOpenTakeoverWatermarks.put(fence,
+                            Map.copyOf(ibkrPreOpenSharedGexMaxSeenOffsets));
+                }
+            }
+        }
+    }
+
     /** True when this process was running when the window's 09:30 boundary passed. */
     private boolean ibkrPreOpenBoundaryObservedLive(long fenceMs) {
         return fenceMs + IBKR_PREOPEN_FREEZE_WINDOW_MS > ibkrPreOpenProcessStartMs;
@@ -7122,7 +7182,15 @@ public class FeedGatewayService implements ReplayRunner {
             ConsumerRecord<String, Object> record, JsonNode root, long nowMs) {
         if (ibkrPreOpenFrozenProjections.isEmpty() && ibkrPreOpenPendingProjections.isEmpty()
                 && ibkrPreOpenTakeoverWatermarks.isEmpty()) {
-            return; // no window state anywhere — nothing a takeover could act on
+            // No projections YET does not mean no boundary (round-6 finding 2). A process that
+            // started before 09:30 while cache reconstruction lagged has genuinely OBSERVED the
+            // boundary, and returning early here left it un-snapshotted — reconstruction then saw a
+            // live-observed boundary with no watermark and admitted the projection, and the NEXT
+            // sweep snapshotted offsets that already included this takeover record, classifying it
+            // at/below its own watermark so the projection survived to 09:35. Record the position
+            // now, before anything can reconstruct against it.
+            captureIbkrPreOpenBoundaryWatermarkLocked(nowMs);
+            return;
         }
         // ONCE PER BOUNDARY, not once per record (round-5 finding 5). The sweep exists here only to
         // install a window's 09:30 watermark snapshot before this record is judged "newly-ingested";
@@ -7245,6 +7313,14 @@ public class FeedGatewayService implements ReplayRunner {
             Long maxGen = ibkrPreOpenMaxGeneration.get(sessionDate);
             if (maxGen != null && generation <= maxGen) {
                 return; // already at/behind the observed max — nothing new to supersede
+            }
+            // ADVANCING the max is destructive too, not just the eviction (round-6 finding 3): the
+            // pending re-evaluation and every later straggler check read this global maximum, so an
+            // unproven control erases or blocks the latest valid pre-fence pair by that route
+            // instead. A control that cannot prove it precedes the state it supersedes changes
+            // nothing at all.
+            if (controlCommitMs > 0L && !ibkrPreOpenControlPrecedesLiveState(controlCommitMs)) {
+                return;
             }
             ibkrPreOpenMaxGeneration.put(sessionDate, generation);
             // The control is authoritative for ORDERING, but eviction is destructive and needs the
@@ -7470,18 +7546,37 @@ public class FeedGatewayService implements ReplayRunner {
             java.util.regex.Pattern.compile("IBKR_PREOPEN:\\d{4}-\\d{2}-\\d{2}");
 
     /**
+     * The pinned session id: IBKR_PREOPEN:&lt;yyyy-MM-dd&gt; where the date is a REAL calendar date.
+     * The regex alone admits 2026-99-99, which is not a session and must not key a plane.
+     */
+    private static boolean isIbkrPreOpenSessionId(String sessionId) {
+        if (!IBKR_PREOPEN_SESSION_ID.matcher(sessionId).matches()) {
+            return false;
+        }
+        try {
+            java.time.LocalDate.parse(sessionId.substring("IBKR_PREOPEN:".length()));
+            return true;
+        } catch (java.time.format.DateTimeParseException e) {
+            return false;
+        }
+    }
+
+    /**
      * True when the canonical payload identity (symbol|expiry|strike) names the same strike as the
      * Kafka key it arrived under. Keys are "SPX|20260804|6300"; the identity carries the same three
      * components, so a mismatch means the record was partitioned under someone else's key and every
      * per-strike offset comparison downstream would be comparing across partitions.
      */
     private static boolean identityMatchesRecordKey(String identity, String recordKey) {
-        String[] left = identity.split("\\|");
-        String[] right = recordKey.split("\\|");
-        if (left.length < 3 || right.length < 3) {
+        String[] left = identity.split("\\|", -1);
+        String[] right = recordKey.split("\\|", -1);
+        // EXACTLY three components on both sides: a key carrying extras is not the canonical key,
+        // and accepting it would let an unrelated record ride a valid strike's partitioning.
+        if (left.length != 3 || right.length != 3) {
             return false;
         }
-        if (!left[0].equalsIgnoreCase(right[0]) || !left[1].equals(right[1])) {
+        // Case-SENSITIVE: the wire contract pins the symbol's casing like every other tuple field.
+        if (!left[0].equals(right[0]) || !left[1].equals(right[1])) {
             return false;
         }
         try {

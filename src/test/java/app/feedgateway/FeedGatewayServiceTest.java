@@ -5412,6 +5412,78 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void sessionIdAndKeyReconciliationAreExactNotMerelyWellShaped() throws Exception {
+        // Round-6 finding 4: text() trims before the regex, so a PADDED session id was accepted;
+        // the regex alone admits impossible dates like 2026-99-99; and key reconciliation compared
+        // only the first three components case-insensitively, so an over-long or mis-cased key
+        // passed. All four are the same contract: EXACT, or fail closed.
+        long now = System.currentTimeMillis();
+        long fence = now + 60_000L;
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+
+        // (a) padded session id
+        FeedGatewayService padded = service();
+        seedIbkrStatus(padded, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        String p = ibkrGexJson(" " + IBKR_SESSION + " ", 3, 2, 7, fence);
+        assertNull(ingestIbkrGex(padded, gexRecord(5L, "SPX|20260804|6300", p, now - 5_000L), p, now),
+                "a padded session id must not be trimmed into validity");
+
+        // (b) impossible calendar date
+        FeedGatewayService badDate = service();
+        seedIbkrStatus(badDate, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        String d = ibkrGexJson("IBKR_PREOPEN:2026-99-99", 3, 2, 7, fence);
+        assertNull(ingestIbkrGex(badDate, gexRecord(5L, "SPX|20260804|6300", d, now - 5_000L), d, now),
+                "the shape alone is not enough — the date must be real");
+
+        // (c) key with extra components
+        FeedGatewayService extra = service();
+        seedIbkrStatus(extra, "SPX|20260804|6300|X", 1L, now - 10_000L, status);
+        String j = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertNull(ingestIbkrGex(extra, gexRecord(5L, "SPX|20260804|6300|X", j, now - 5_000L), j, now),
+                "a key carrying extra components is not the canonical key");
+
+        // Control: the exact contract is still admitted.
+        FeedGatewayService ok = service();
+        seedIbkrStatus(ok, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        assertNotNull(ingestIbkrGex(ok, gexRecord(5L, "SPX|20260804|6300", j, now - 5_000L), j, now));
+    }
+
+    @Test
+    void aProcessCrossingTheBoundaryFencesEvenWithNoProjectionsYet() throws Exception {
+        // Round-6 finding 2: a process that started BEFORE 09:30 while cache reconstruction lagged
+        // met its first post-boundary Databento record with no state at all and returned early, so
+        // no watermark was taken. Reconstruction then saw a live-observed boundary with no
+        // watermark and admitted the projection, and the NEXT sweep snapshotted offsets that
+        // already included that takeover record — classifying it at/below its own watermark, so the
+        // projection survived to 09:35. The boundary must be fenced when it is crossed, not when a
+        // projection happens to exist.
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        FeedGatewayService service = service();
+        backdateProcessStart(service, now - 60 * 60_000L);   // live ACROSS the boundary
+
+        // The fence is KNOWN — a value named it — but nothing landed in any plane: this record is
+        // refused after the fence is observed (its key names another strike), which is exactly the
+        // pre-boundary-start shape where reconstruction has not produced state yet.
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6305", json, fence - 5_000L),
+                json, boundary + 1_000L);
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty()
+                        && planeMap(service, "ibkrPreOpenPendingProjections").isEmpty()
+                        && planeMap(service, "ibkrPreOpenGexCandidates").isEmpty(),
+                "test premise: the fence is observed but NO plane holds state");
+
+        // First post-boundary Databento record arrives.
+        String db = databentoGexJson();
+        interceptSharedGex(service, gexRecord(900L, "SPX|20260804|6300", db, boundary + 2_000L),
+                db, false, boundary + 2_000L);
+        assertNotNull(takeoverWatermark(service, fence),
+                "the boundary must be fenced when crossed, even with no projections yet");
+    }
+
+    @Test
     void admissionIsFailClosedOnTheWholeContractNotJustTheTuple() throws Exception {
         // Round-5 finding 3. A record can carry the exact source/timeframe pair and still be
         // malformed, and every one of these must be refused rather than "helpfully" accepted.
