@@ -1151,6 +1151,39 @@ public final class GatewaySettings {
     }
 
     /**
+     * Compacted CURRENT board of the standalone tape-zones service (plain JSON — NOT Avro — see
+     * TAPE-ZONES-REQUIREMENT §6.2: 1 partition, key {@code ES|sessionDate}, ≤1 msg/s on change,
+     * carrying the whole session's cell table + merged zones + aggregates + quality banner +
+     * {@code terminalFlushed}).
+     *
+     * <p>Resolved through the same {@code _TOPIC} prefix helper every other topic uses. The default
+     * is ALREADY {@code es.}-prefixed (the tape is an ES-only product — TAPE-ZONES-REQUIREMENT §6.2
+     * names the topic literally), so on es4 ({@code TOPIC_PREFIX=es.})
+     * {@link #applyTopicPrefix(String)}'s {@code startsWith} guard makes it a strict no-op and the
+     * name stays {@code es.tape-zones.board} — exactly the {@code es.open-direction.*} precedent.
+     * On dev/prod the same name resolves to the MM1-mirrored copy of the es4 topic (§6.2
+     * "Prod/dev visibility: per-topic MM1 mirror"), so ONE binary serves all three environments.
+     */
+    public String tapeZonesBoardTopic() {
+        return value("KAFKA_TAPE_ZONES_BOARD_TOPIC", "es.tape-zones.board");
+    }
+
+    /**
+     * Freshness TTL for the tape-zones board cache — the SHORT class shared with
+     * {@link #spotVolRegimeTtlMs()}/{@link #indicatorsTtlMs()}: a board minutes old (dead service,
+     * un-installed mirror, overnight leftover) must read as ABSENT on late-join rather than replay
+     * as live. Default 5 min.
+     *
+     * <p>This is the EVICTION window, deliberately far longer than the card's 10 s STALE overlay
+     * (TAPE-ZONES-UI-DESIGN §5): the board publishes only ON CHANGE, so a quiet minute is normal
+     * and must still render — dimmed by the card's own age read, never withheld. Evicting at 10 s
+     * would blank a perfectly healthy board between changes.
+     */
+    public long tapeZonesTtlMs() {
+        return longValue("GATEWAY_TAPE_ZONES_TTL_MS", 300_000L, 0L);
+    }
+
+    /**
      * Freshness TTL for the structural option-chain cache (the {@code snapshot} strike ladder — see
      * {@code FeedGatewayService.MARKET_AWARE_CHAIN_EVENTS}) DURING regular trading hours — default 10 min.
      * Off-hours the chain is never evicted (see {@link FeedGatewayService} cache policy + {@link #marketCalendar()}),
