@@ -145,6 +145,7 @@ public class FeedGatewayService implements ReplayRunner {
             "greek-move-auth",
             "spot-vol-regime",
             "indicators",
+            "tapeZones",
             "opb-by-option", "opb-session",
             "index-price", "vix-price", "spx-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
@@ -318,6 +319,38 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
     }
+    // Tape-zones CURRENT board (TAPE-ZONES-REQUIREMENT §6.2, UI design §3): the standalone
+    // service's whole-session snapshot on a compacted 1-partition topic keyed ES|sessionDate.
+    // The producer value is the SSOT and rides byte-untouched — the gateway performs NO
+    // computation or reshaping; every field the card needs (cells, merged zones, aggregates,
+    // quality banner, terminalFlushed) is already on it. Same standalone/global/JSON
+    // pass-through delivery class as spot-vol-regime/indicators; NOT in the ui-batch.
+    // Keyed by source|sessionDate; the parallel map holds (offset, kafkaRecordTimeMs) so the
+    // emitted wire form can carry the board's own age without mutating the payload.
+    private final Map<String, String> tapeZonesBoards = new ConcurrentHashMap<>();
+    private final Map<String, long[]> tapeZonesPositions = new ConcurrentHashMap<>();
+    /** Exactly-one, in-order live delivery per offset — single-partition contract (§6.2). */
+    private final java.util.concurrent.atomic.AtomicLong tapeZonesBroadcastOffset =
+            new java.util.concurrent.atomic.AtomicLong(-1L);
+    /**
+     * Serializes the live (cache-update → broadcast-enqueue) pair against the replay's
+     * (cache-read → session-send) pair, so a replay-captured older board can never be enqueued
+     * AFTER a newer live frame (coalescing keeps the LAST enqueue). Same seam as
+     * {@code indicatorsEmitLock}.
+     */
+    private final Object tapeZonesEmitLock = new Object();
+
+    boolean shouldBroadcastTapeZones(long offset) {
+        while (true) {
+            long current = tapeZonesBroadcastOffset.get();
+            if (offset <= current) {
+                return false;
+            }
+            if (tapeZonesBroadcastOffset.compareAndSet(current, offset)) {
+                return true;
+            }
+        }
+    }
     // SPX close-direction (design CLOSE-DIRECTION-GATE1 §8/CD-R30): ONE topic, two cache classes.
     // VERDICTS (key V|sessionDate) are once-a-session frozen decisions on the LONG
     // closeDirectionTtlMs window; INTERIMS (key I|sessionDate) are 1/min monitoring reads whose
@@ -447,6 +480,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong droppedByCacheGate = new AtomicLong();         // records dropped because cacheCaughtUpFlag was false
     private final AtomicLong droppedByOtherReasons = new AtomicLong();      // caught-up + non-forwardable (source/symbol/expiry mismatch, etc.)
     private final AtomicLong strikeBandsRejected = new AtomicLong();        // spot-vol-regime strikeBand blocks refused by sanitizeStrikeBand
+    private final AtomicLong tapeZonesRejected = new AtomicLong();          // tape-zones boards refused by the fail-closed identity contract
     private final AtomicBoolean strikeBandRejectionLogged = new AtomicBoolean(false); // log the first rejection only; the rest are counted
     private final AtomicLong rolloverCount = new AtomicLong();              // number of session-boundary rollovers observed
     private final AtomicLong forwardStalledAlerts = new AtomicLong();       // number of GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS emissions
@@ -658,6 +692,8 @@ public class FeedGatewayService implements ReplayRunner {
             // client-side) — the production auth mode owes the connect replay too
             // (r1 finding 5).
             replayIndicatorsCached(session);
+            // Tape-zones board is the same GLOBAL advisory class — auth mode owes it too.
+            replayTapeZonesCached(session);
             return;
         }
         if (avroCaughtUp.get()) {
@@ -687,6 +723,7 @@ public class FeedGatewayService implements ReplayRunner {
             replayGreekMoveAuthCached(session);
             replaySpotVolRegimeCached(session);
             replayIndicatorsCached(session);
+            replayTapeZonesCached(session);
             replayIbkrPreOpenCached(session);
             // Close-direction: replay the session's frozen verdict (or the current interim) so a page
             // reload in the final hour restores the card instead of waiting for the next minute tick.
@@ -1483,6 +1520,10 @@ public class FeedGatewayService implements ReplayRunner {
         for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
             topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
         }
+        // Tape-zones CURRENT board (plain JSON, key ES|sessionDate): standalone global advisory on
+        // the SHORT tapeZonesTtlMs window, OPTIONAL topic — absent on dev/prod until the MM1 mirror
+        // is installed and on es4 until the service first produces (§6.2).
+        topicEvents.put(settings.tapeZonesBoardTopic(), new TopicBinding("DATABENTO", "tapeZones"));
         // SPX close-direction interims + frozen verdict (JSON, key = symbol|expiry): standalone global
         // advisory, OPTIONAL topic — LONG closeDirectionTtlMs window (verdict class) bounds the seek-back;
         // interim replay freshness is separately bounded (closeDirectionInterimFreshMs).
@@ -1596,6 +1637,10 @@ public class FeedGatewayService implements ReplayRunner {
         for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
             topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
         }
+        // Tape-zones CURRENT board (plain JSON, key ES|sessionDate): standalone global advisory on
+        // the SHORT tapeZonesTtlMs window, OPTIONAL topic — absent on dev/prod until the MM1 mirror
+        // is installed and on es4 until the service first produces (§6.2).
+        topicEvents.put(settings.tapeZonesBoardTopic(), new TopicBinding("DATABENTO", "tapeZones"));
         // Keep the cache + live JSON consumer topic sets symmetric: the SPX close-direction signal
         // (JSON, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
@@ -1895,8 +1940,10 @@ public class FeedGatewayService implements ReplayRunner {
                     TopicBinding binding = topicEvents.get(record.topic());
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
                     // pairing fields, control JSON): it reaches the browser byte-untouched —
-                    // never enriched/reserialized.
-                    String json = binding != null && "ibkr-preopen-status".equals(binding.event())
+                    // never enriched/reserialized. The tape-zones board is the same class: it is
+                    // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
+                    // stamping must never overwrite the service's own sessionDate (UI design §3).
+                    String json = binding != null && isRawPassThroughEvent(binding.event())
                             ? stringJson(record.value())
                             : enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
@@ -1926,6 +1973,14 @@ public class FeedGatewayService implements ReplayRunner {
                                 forwardedEvents.incrementAndGet();
                             }
                         }
+                        continue;
+                    }
+                    if (binding != null && "tapeZones".equals(binding.event())) {
+                        // Same reason as indicators above: this consumer also ingests the board
+                        // topic, so whichever consumer wins updateCache for an offset must be the
+                        // one that broadcasts it — otherwise the live consumer's duplicate is
+                        // correctly rejected by the offset gate and clients starve.
+                        tapeZonesBroadcast(binding, record, json, caughtUpFlag);
                         continue;
                     }
                     updateCache(binding, record, json);
@@ -2165,8 +2220,10 @@ public class FeedGatewayService implements ReplayRunner {
                     TopicBinding binding = topicEvents.get(record.topic());
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
                     // pairing fields, control JSON): it reaches the browser byte-untouched —
-                    // never enriched/reserialized.
-                    String json = binding != null && "ibkr-preopen-status".equals(binding.event())
+                    // never enriched/reserialized. The tape-zones board is the same class: it is
+                    // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
+                    // stamping must never overwrite the service's own sessionDate (UI design §3).
+                    String json = binding != null && isRawPassThroughEvent(binding.event())
                             ? stringJson(record.value())
                             : enrichJson(avro ? avroJson(record.value()) : stringJson(record.value()), binding);
                     if (binding == null || json == null || json.isBlank()) {
@@ -2285,6 +2342,27 @@ public class FeedGatewayService implements ReplayRunner {
                                             record.offset(), json));
                             forwardedEvents.incrementAndGet();
                         }
+                        continue;
+                    }
+                    if ("tapeZones".equals(binding.event())) {
+                        // Tape-zones board: a STANDALONE global advisory — its own websocket event,
+                        // never a ui-batch row, never selection-routed (the board is ES-global; the
+                        // SPX view is a unit toggle on the SAME record). The board rides VERBATIM
+                        // inside the wrapper; only the gateway's own clock stamps are added (§3).
+                        //
+                        // DELIVERY IS GATED ON updateCache's RETURN, not merely on the offset CAS.
+                        // updateCache is where the fail-closed identity contract, the offset
+                        // ordering gate and the TTL all live, and it answers null for every record
+                        // that fails one of them. Broadcasting past a null would put a malformed,
+                        // duplicated, rewound or expired board on every authenticated socket while
+                        // the cache correctly refused it — the card and the cache would disagree
+                        // about the same offset. Nothing may reach a client that the cache rejected.
+                        //
+                        // Both consumers ingest this topic, so the (updateCache → CAS → enqueue)
+                        // decision is ONE unit under the emit lock: whichever consumer wins
+                        // updateCache for an offset is the one that broadcasts it, and the loser's
+                        // null correctly suppresses only its own duplicate.
+                        tapeZonesBroadcast(binding, record, json, cacheCaughtUpFlag);
                         continue;
                     }
                     if ("zero-dte-intelligence".equals(binding.event())) {
@@ -2685,6 +2763,11 @@ public class FeedGatewayService implements ReplayRunner {
                     // an absent mirror means ES goes stale (§7.3), never a dead
                     // shared consumer.
                     || settings.indicatorsSnapshotTopics().contains(topic)
+                    // The tape-zones board is OPTIONAL for the same two reasons: on dev/prod it does
+                    // not exist until the MM1 mirror is installed (§6.2, still pending), and on es4
+                    // not until the service first produces. An absent board must mean "the card says
+                    // no data", never a dead shared JSON consumer.
+                    || topic.equals(settings.tapeZonesBoardTopic())
                     // Close-direction is a brand-new standalone service that may not be deployed (and the
                     // topic is absent until it first produces) — optional like its advisory siblings.
                     || topic.equals(settings.closeDirectionSignalTopic())
@@ -3110,12 +3193,14 @@ public class FeedGatewayService implements ReplayRunner {
             }
             if ("ibkr-preopen-status".equals(binding.event())
                     || "indicators".equals(binding.event())
+                    || "tapeZones".equals(binding.event())
                     || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 // The pre-open status/control stream is SOURCE-INDEPENDENT window state:
                 // stateCaughtUp must include its partition regardless of the active market-data
                 // source, or replay could expose a pre-revocation snapshot (round-2 finding 4).
                 // Indicators (r1 finding 4) are likewise source-independent GLOBAL truth —
-                // their partitions gate the barrier no matter which source is active.
+                // their partitions gate the barrier no matter which source is active. The
+                // tape-zones board joins them: it is ES-global truth, not per-source market data.
                 selectedEndOffsets.put(entry.getKey(), entry.getValue());
             }
         }
@@ -3137,9 +3222,10 @@ public class FeedGatewayService implements ReplayRunner {
         for (Map.Entry<TopicPartition, Long> entry : endOffsets.entrySet()) {
             TopicBinding preOpenBinding = topicEvents.get(entry.getKey().topic());
             if (preOpenBinding != null && ("ibkr-preopen-status".equals(preOpenBinding.event())
-                    || "indicators".equals(preOpenBinding.event()))) {
-                // Source-independent streams (pre-open control + indicators) always
-                // gate mid-run barriers too (r1 finding 4).
+                    || "indicators".equals(preOpenBinding.event())
+                    || "tapeZones".equals(preOpenBinding.event()))) {
+                // Source-independent streams (pre-open control + indicators + tape-zones board)
+                // always gate mid-run barriers too (r1 finding 4).
                 selected.put(entry.getKey(), entry.getValue());
                 continue;
             }
@@ -3203,6 +3289,12 @@ public class FeedGatewayService implements ReplayRunner {
             if (events.contains("indicators")) {
                 for (WebSocketSession client : clients) {
                     replayIndicatorsCached(client);
+                }
+            }
+            // Tape-zones board is STANDALONE too: explicit re-push once caught up.
+            if (events.contains("tapeZones")) {
+                for (WebSocketSession client : clients) {
+                    replayTapeZonesCached(client);
                 }
             }
             if (events.contains("ibkr-preopen-status")) {
@@ -4150,6 +4242,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = spotVolRegimeCacheKey(json, key);
         } else if ("indicators".equals(event)) {
             key = indicatorsCacheKey(json, key);
+        } else if ("tapeZones".equals(event)) {
+            key = tapeZonesCacheKey(json, key);
         } else if ("close-direction".equals(event)) {
             key = closeDirectionCacheKey(json, key);
         } else if ("zero-dte-intelligence".equals(event)) {
@@ -4199,7 +4293,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = binding.source() + "|" + key;
         }
         String versionKey = event + ":" + key;
-        if ("ibkr-preopen-status".equals(event) || "indicators".equals(event)) {
+        if ("ibkr-preopen-status".equals(event) || "indicators".equals(event)
+                || "tapeZones".equals(event)) {
             // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5; indicators rev 14
             // §6.9 r1 finding 2): these topics are single-partition per symbol and
             // strictly ordered by offset — Kafka timestamps may tie or regress
@@ -4225,6 +4320,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (!isTerminalMaxPainShortCircuitBypass
                 && !"ibkr-preopen-status".equals(event)
                 && !"indicators".equals(event)
+                && !"tapeZones".equals(event)
                 && previousEventTime != null && previousEventTime > eventTime) {
             return null;   // (offset-ordered streams above are never timestamp-gated —
                            // a publishedAt wall-clock regression must not outrank a
@@ -4473,6 +4569,16 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 ibkrPreOpenStatus.put(key, wrapIbkrPreOpenStatus(rawKey, record.offset(), json));
+                return key;
+            }
+            case "tapeZones" -> {
+                // Last-value-wins per sessionDate on the compacted 1-partition board topic. The
+                // RAW producer value is cached (enrichJson bypassed at ingest); the wrapper is
+                // built at EMIT so replay carries the true age rather than a frozen stamp.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                tapeZonesBoards.put(key, json);
+                tapeZonesPositions.put(key, new long[]{record.offset(), eventTime});
                 return key;
             }
             case "liquidity-heatmap" -> {
@@ -5239,6 +5345,14 @@ public class FeedGatewayService implements ReplayRunner {
             // reconnect, can never replay yesterday's window as live (rev13 R-STATE).
             return CachePolicy.expiring(settings.ibkrPreOpenStatusTtlMs());
         }
+        if ("tapeZones".equals(event)) {
+            // Tape-zones board: the SHORT freshness class (spot-vol-regime/indicators). A board
+            // from a dead service or a stale mirror must read as ABSENT on late-join, never live.
+            // Sub-TTL aging is the card's own business — §5's 10 s STALE overlay reads the emitted
+            // ageMs; eviction here is deliberately much looser because the board publishes ON
+            // CHANGE and a quiet minute is a normal, renderable state.
+            return CachePolicy.expiring(settings.tapeZonesTtlMs());
+        }
         if ("es-gex".equals(event)) {
             // ES-on-SPX aligned book: the align service re-emits ~5s, but a quiet chain may pause; a long
             // last-value-wins window (default 12h, like gex-by-strike) so a mid-session reconnect gets the
@@ -5711,6 +5825,10 @@ public class FeedGatewayService implements ReplayRunner {
             gexOiStatus.remove(versionKey.substring("gex-oi-status:".length()));
         } else if (versionKey.startsWith("ibkr-preopen-status:")) {
             ibkrPreOpenStatus.remove(versionKey.substring("ibkr-preopen-status:".length()));
+        } else if (versionKey.startsWith("tapeZones:")) {
+            String tapeZonesKey = versionKey.substring("tapeZones:".length());
+            tapeZonesBoards.remove(tapeZonesKey);
+            tapeZonesPositions.remove(tapeZonesKey);
         } else if (versionKey.startsWith("strike-sr:")) {
             strikeSr.remove(versionKey.substring("strike-sr:".length()));
         } else if (versionKey.startsWith("gex-strike-lifecycle:")) {
@@ -6581,6 +6699,195 @@ public class FeedGatewayService implements ReplayRunner {
                 continue;
             }
             send(session, "ibkr-preopen-status", wrapped);
+        }
+    }
+
+    /**
+     * Events whose Kafka value is a PRODUCER-authored contract that must reach the browser
+     * byte-untouched: {@link #enrichJson} is bypassed at ingest so the gateway can never stamp
+     * {@code marketDataSource}/{@code source}/{@code sessionDate} over the producer's own fields.
+     */
+    private static boolean isRawPassThroughEvent(String event) {
+        return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event);
+    }
+
+    /**
+     * The wire form for the tape-zones board: the producer record rides VERBATIM under
+     * {@code board} and the gateway adds ONLY its own clock stamps around it (UI design §3 —
+     * "no gateway-side computation ... the board record already carries everything").
+     *
+     * <p>{@code boardTimeMs} is the KAFKA RECORD timestamp, i.e. when the service published this
+     * board — deliberately NOT the payload's {@code quality.watermark}. The watermark is STREAM
+     * time (max eventTime of released trades) and legitimately stops advancing on a quiet tape or
+     * is null before the first release, so using it for liveness would paint a healthy board STALE.
+     * The record timestamp answers the only question §5's 10 s overlay asks: is the producer alive.
+     *
+     * <p>{@code serverTime} + {@code ageMs} are stamped at EMIT, from ONE clock (the gateway's), so
+     * the card never differences a producer clock against a browser clock. {@code offset} is the
+     * ordering token: live and replay deliveries can interleave at the socket, so the client
+     * renders last-writer-wins by offset exactly as the pre-open sibling does.
+     */
+    static String wrapTapeZonesBoard(long offset, long boardTimeMs, long serverTimeMs, String json) {
+        long ageMs = boardTimeMs <= 0 ? -1L : Math.max(0L, serverTimeMs - boardTimeMs);
+        return "{\"offset\":" + offset
+                + ",\"boardTimeMs\":" + boardTimeMs
+                + ",\"serverTime\":" + serverTimeMs
+                + ",\"ageMs\":" + ageMs
+                + ",\"board\":" + json + "}";
+    }
+
+    /**
+     * The ONE live-delivery seam for the tape-zones board, shared by both ingesting consumers.
+     *
+     * <p>Order is load-bearing and the whole point of the fix: {@link #updateCache} runs FIRST and
+     * its return value is the gate. It answers null for a record that fails the fail-closed
+     * identity contract, that repeats or rewinds an offset on the single-partition topic, or whose
+     * event time is already outside the TTL — and in every one of those cases nothing is broadcast.
+     * A client can therefore never be shown a board the cache refused to keep.
+     *
+     * <p>The offset CAS behind it makes delivery exactly-once ACROSS the two consumers, and the
+     * emit lock makes (cache-mutate → enqueue) atomic against the replay's (cache-read → send), so
+     * a replayed older board can never be enqueued after a newer live one.
+     */
+    private void tapeZonesBroadcast(TopicBinding binding, ConsumerRecord<String, ?> record, String json,
+                                    AtomicBoolean caughtUpFlag) {
+        synchronized (tapeZonesEmitLock) {
+            String cacheKey = updateCache(binding, record, json);
+            if (cacheKey == null) {
+                return;   // refused by identity / ordering / TTL — never forwarded
+            }
+            if (!caughtUpFlag.get() || !shouldBroadcastTapeZones(record.offset())) {
+                return;
+            }
+            // Re-read the position the cache just committed rather than re-deriving it from the
+            // record: the replay path reads the SAME pair, so the two surfaces cannot disagree
+            // about a board's age.
+            long[] position = tapeZonesPositions.get(cacheKey);
+            if (position == null) {
+                return;
+            }
+            broadcast(binding.event(),
+                    wrapTapeZonesBoard(position[0], position[1], System.currentTimeMillis(), json));
+            forwardedEvents.incrementAndGet();
+        }
+    }
+
+    /**
+     * Late-join delivery for the tape-zones board: STANDALONE global advisory class, fresh-gated on
+     * the SHORT tapeZonesTtlMs window so a dead service (or an un-mirrored dev/prod broker) reads as
+     * absent rather than replaying yesterday's session as live. The age stamps are recomputed HERE,
+     * at emit, so a client connecting ten minutes after the last change sees the true age.
+     */
+    private void replayTapeZonesCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        // The (cache-read → send-enqueue) pair is atomic against the live seam: a live update
+        // either lands before (we read the newer value) or after (its enqueue supersedes ours via
+        // coalescing). The stale ordering "live N+1 enqueued, then replayed N enqueued" cannot happen.
+        synchronized (tapeZonesEmitLock) {
+            for (Map.Entry<String, String> entry : tapeZonesBoards.entrySet()) {
+                String board = entry.getValue();
+                if (board == null || board.isBlank()) {
+                    continue;
+                }
+                if (!isCacheFresh("tapeZones:" + entry.getKey(), nowMs)) {
+                    continue;
+                }
+                long[] position = tapeZonesPositions.get(entry.getKey());
+                if (position == null) {
+                    continue; // no ordering/age token — never emit an unaged board
+                }
+                send(session, "tapeZones", wrapTapeZonesBoard(position[0], position[1], nowMs, board));
+            }
+        }
+    }
+
+    /**
+     * Cache key for the tape-zones board — the payload's own {@code sessionDate} (§6.2 keys the
+     * topic {@code ES|sessionDate}). STRICT, fail-closed: the frame must carry schemaVersion 1 and
+     * a non-blank sessionDate, and when the Kafka key names a session it must MATCH the payload's
+     * (a record keyed for one session may never overwrite another's board). Anything else returns
+     * null — never cached, never forwarded.
+     */
+    /**
+     * The literal record-key prefix the tape-zones service writes. Verified against the producer,
+     * not the design doc: {@code TapeZonesRuntime} publishes
+     * {@code new ProducerRecord<>(boardTopic, "ES|" + session, board)}. The tape is ES-only by
+     * construction (TAPE-ZONES-REQUIREMENT §11 explicitly rules out an SPX/SPY tape variant), so
+     * this is a CONSTANT, not a symbol the gateway should be flexible about.
+     */
+    private static final String TAPE_ZONES_KEY_PREFIX = "ES|";
+
+    /**
+     * Cache key for the tape-zones board — FAIL-CLOSED on the full identity contract.
+     *
+     * <p>The board is a single-key compacted topic that every authenticated client renders as
+     * "the session". There is therefore no such thing as a partially-trusted board: a record whose
+     * identity cannot be proven must not enter the cache, because everything downstream (live
+     * broadcast, connect replay, the caught-up re-push) reads the cache and would fan it out.
+     *
+     * <p>ALL of the following must hold, or the record is rejected and counted:
+     * <ul>
+     *   <li>the payload carries {@code schemaVersion} exactly 1 — an unknown shape is refused,
+     *       never guessed at;</li>
+     *   <li>the Kafka key is present and starts with the exact {@code ES|} prefix. A null/blank
+     *       key, a bare {@code 2026-08-07}, or {@code NDX|2026-08-07} are all rejected: the second
+     *       cannot be attributed to a producer at all and the third is a DIFFERENT instrument's
+     *       record that would otherwise silently overwrite the ES board;</li>
+     *   <li>the keyed session is a strictly valid ISO {@code yyyy-MM-dd} calendar date (so
+     *       {@code 2026-02-30} or {@code 2026-8-7} are refused, not coerced);</li>
+     *   <li>the payload's own {@code sessionDate} is likewise a valid calendar date AND equal to
+     *       the keyed one — a record keyed for one session may never overwrite another's board.</li>
+     * </ul>
+     */
+    private String tapeZonesCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            JsonNode schemaVersion = root.get("schemaVersion");
+            if (schemaVersion == null || !schemaVersion.isIntegralNumber()
+                    || !schemaVersion.canConvertToInt() || schemaVersion.asInt() != 1) {
+                return rejectTapeZones();
+            }
+            // The Kafka key is REQUIRED, not a best-effort cross-check. Without it the record has
+            // no verifiable producer identity, and "trust the payload's own claim about itself" is
+            // exactly the hole a poisoned record walks through.
+            if (fallback == null || !fallback.startsWith(TAPE_ZONES_KEY_PREFIX)) {
+                return rejectTapeZones();
+            }
+            String keyedSession = fallback.substring(TAPE_ZONES_KEY_PREFIX.length());
+            if (!isIsoCalendarDate(keyedSession)) {
+                return rejectTapeZones();
+            }
+            String sessionDate = text(root, "sessionDate");
+            if (!isIsoCalendarDate(sessionDate) || !keyedSession.equals(sessionDate)) {
+                return rejectTapeZones();
+            }
+            return sessionDate;
+        } catch (Exception malformed) {
+            return rejectTapeZones();
+        }
+    }
+
+    /** Count the refusal and return null (the "dropped" contract updateCache's callers expect). */
+    private String rejectTapeZones() {
+        tapeZonesRejected.incrementAndGet();
+        return null;
+    }
+
+    /**
+     * Strict ISO calendar date: the shape {@code yyyy-MM-dd} AND a date that really exists.
+     * {@code LocalDate.parse} alone would accept neither {@code 2026-8-7} (wrong shape) nor
+     * {@code 2026-02-30} (not a real day), which is precisely the point — both are rejected.
+     */
+    static boolean isIsoCalendarDate(String text) {
+        if (text == null || !text.matches("\\d{4}-\\d{2}-\\d{2}")) {
+            return false;
+        }
+        try {
+            java.time.LocalDate.parse(text);
+            return true;
+        } catch (java.time.format.DateTimeParseException notADate) {
+            return false;
         }
     }
 
@@ -7987,6 +8294,12 @@ public class FeedGatewayService implements ReplayRunner {
             // spotVolRegimeTtlMs window in updateCache.
             "spot-vol-regime",
             "indicators",
+            // The tape-zones board is ES-global session truth rendered in its own card — the same
+            // GLOBAL advisory class. Allowlist it so the standalone broadcast reaches sockets in
+            // per-session (auth) mode too; GatewayRecordMapper deliberately has no route for it.
+            // Staleness is enforced upstream (SHORT tapeZonesTtlMs window) and downstream (the
+            // card's own 10 s overlay off the emitted ageMs).
+            "tapeZones",
             // SPX close-direction interims + frozen verdict are the same class of GLOBAL advisory
             // overlay (one session at a time, rendered in its own summary card) — allowlist so
             // routeOrBroadcast/broadcast fan them out in per-session (auth) mode too. Malformed and
@@ -8100,6 +8413,13 @@ public class FeedGatewayService implements ReplayRunner {
                 // r3 finding 3: the frozen key is literally `indicators|symbol` —
                 // additive fields must never split the coalescing identity.
                 return event + "|" + symbol;
+            }
+            if ("tapeZones".equals(event)) {
+                // ONE board per session (§6.2). The wrapper's own fields (offset/serverTime/ageMs)
+                // must NEVER enter the key — they change on every emit, so keying on them would
+                // defeat coalescing entirely and let a slow socket queue a session's worth of
+                // whole-board snapshots. Frozen key: the event name alone.
+                return event;
             }
             String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
             String strike = root.hasNonNull("strike") ? root.get("strike").asText("") : "";
@@ -8902,6 +9222,7 @@ public class FeedGatewayService implements ReplayRunner {
                     + " inactiveDroppedEvents=" + inactiveDroppedEvents.get()
                     + " staleDroppedEvents=" + staleDroppedEvents.get()
                     + " strikeBandsRejected=" + strikeBandsRejected.get()
+                    + " tapeZonesRejected=" + tapeZonesRejected.get()
                     + " sourceStaleEvents=" + sourceStaleEvents.get()
                     + " offsetBarriers=" + offsetBarriers.get().size()
                     + " running=" + running.get()

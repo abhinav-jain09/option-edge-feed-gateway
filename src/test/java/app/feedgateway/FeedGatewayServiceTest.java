@@ -1942,6 +1942,285 @@ class FeedGatewayServiceTest {
         assertTrue(sink.stream().anyMatch(s -> s.contains("\"ES\"")));
     }
 
+    // ----- tape-zones board relay ------------------------------------------------------------------
+
+    /** A minimal but shape-faithful board (TAPE-ZONES-REQUIREMENT §6.2). */
+    private static String tapeZonesBoard(String sessionDate, boolean terminalFlushed) {
+        return "{\"schemaVersion\":1,\"engineVersion\":\"1.0.0\",\"thresholdSetId\":\"ts-1\","
+                + "\"sessionDate\":\"" + sessionDate + "\",\"empty\":false,"
+                + "\"terminalFlushed\":" + terminalFlushed + ","
+                + "\"quality\":{\"uncalibratedThresholds\":true,\"feedGapCount\":0},"
+                + "\"aggregates\":{\"cellCount\":3,\"finalCellCount\":2},"
+                + "\"zones\":{\"DEALER_BUYING\":[{\"priceLo\":7715.00,\"priceHi\":7729.00,"
+                + "\"cellCount\":2,\"classifiedContracts\":900}],\"DEALER_SELLING\":\"none observed\"},"
+                + "\"cells\":[]}";
+    }
+
+    @Test
+    void tapeZonesTopicResolvesUnderTheEs4PrefixAndStaysOptionalAndGlobal() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("es.tape-zones.board", settings.tapeZonesBoardTopic(),
+                "default must be the §6.2 topic name");
+        // On es4 the platform sets TOPIC_PREFIX=es. — the default is ALREADY prefixed, so the
+        // helper's startsWith guard must make it a strict no-op (the es.open-direction precedent).
+        withSystemProperty("TOPIC_PREFIX", "es.", () ->
+                assertEquals("es.tape-zones.board", new GatewaySettings().tapeZonesBoardTopic(),
+                        "TOPIC_PREFIX must never double-prefix an already-es. default"));
+        // And an operator override still flows through the same helper.
+        withSystemProperty("KAFKA_TAPE_ZONES_BOARD_TOPIC", "tape-zones.board", () ->
+                withSystemProperty("TOPIC_PREFIX", "es.", () ->
+                        assertEquals("es.tape-zones.board",
+                                new GatewaySettings().tapeZonesBoardTopic(),
+                                "an unprefixed override IS prefixed on es4")));
+        assertTrue(isOptionalTopic(service, settings.tapeZonesBoardTopic()),
+                "the board is absent until the service produces / the MM1 mirror is installed");
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("tapeZones"),
+                "the board fans out in per-session (auth) mode like its advisory siblings");
+        assertEquals(300_000L, settings.tapeZonesTtlMs(), "default eviction window must be 5 minutes");
+    }
+
+    @Test
+    void tapeZonesBoardIsCachedVerbatimAndWrappedWithGatewayClockStamps() throws Exception {
+        // UI design §3: NO gateway-side computation — the board rides byte-identical inside the
+        // wrapper, which adds only offset + the gateway's own clock stamps.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String board = tapeZonesBoard("2026-08-07", false);
+        var binding = topicBinding("DATABENTO", "tapeZones");
+        assertEquals("DATABENTO|2026-08-07", updateCache(service, binding,
+                recordAt(settings.tapeZonesBoardTopic(), 0, 7L, "ES|2026-08-07", board, now), board),
+                "the board keys on its own sessionDate");
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class
+                .getDeclaredMethod("replayTapeZonesCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertEquals(1, sink.size(), "one board per session; got: " + sink);
+        String envelope = sink.get(0);
+        assertTrue(envelope.startsWith("{\"type\":\"tapeZones\",\"data\":"),
+                "gamma-migration envelope shape; got: " + envelope);
+        assertTrue(envelope.contains(board), "the board must ride VERBATIM; got: " + envelope);
+        assertTrue(envelope.contains("\"offset\":7"), "ordering token; got: " + envelope);
+        assertTrue(envelope.contains("\"serverTime\":"), "server stamp; got: " + envelope);
+        assertTrue(envelope.contains("\"ageMs\":"), "the record's own age; got: " + envelope);
+        assertFalse(envelope.contains("\"marketDataSource\""),
+                "enrichJson must be bypassed — the board is the SSOT: " + envelope);
+    }
+
+    @Test
+    void tapeZonesWrapperAgeIsMeasuredFromTheRecordTimestamp() {
+        // §5's 10 s STALE overlay reads ageMs, and ageMs must come from ONE clock (the gateway's)
+        // differenced against the record's publish time — never a producer-vs-browser difference.
+        String board = tapeZonesBoard("2026-08-07", false);
+        String wrapped = FeedGatewayService.wrapTapeZonesBoard(
+                3L, 1_000_000_000L, 1_000_012_000L, board);
+        assertTrue(wrapped.contains("\"boardTimeMs\":1000000000"), wrapped);
+        assertTrue(wrapped.contains("\"serverTime\":1000012000"), wrapped);
+        assertTrue(wrapped.contains("\"ageMs\":12000"), wrapped);
+        // A record stamped in the future must never read as a NEGATIVE age (which would render as
+        // "fresh forever"); clamp at 0 and let the next emit correct it.
+        assertTrue(FeedGatewayService.wrapTapeZonesBoard(3L, 2_000L, 1_000L, board)
+                .contains("\"ageMs\":0"));
+        // No usable record time ⇒ -1, an explicit "unknown age", never a fake zero.
+        assertTrue(FeedGatewayService.wrapTapeZonesBoard(3L, 0L, 1_000L, board)
+                .contains("\"ageMs\":-1"));
+    }
+
+    @Test
+    void tapeZonesStaleBoardIsNeverReplayedToALateJoiner() throws Exception {
+        // The SHORT window: a board older than tapeZonesTtlMs reads as ABSENT (the card renders
+        // "no data"), never as a live session. Overnight leftovers and dead mirrors both land here.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, "tapeZones", now - 60_000L, now),
+                "a one-minute-old board is normal — the topic publishes ON CHANGE");
+        assertTrue(isExpired(service, "tapeZones", now - 6L * 60_000L, now),
+                "a six-minute-old board must be STALE");
+        String stale = tapeZonesBoard("2026-08-06", true);
+        long staleTime = now - 6L * 60_000L;
+        var binding = topicBinding("DATABENTO", "tapeZones");
+        updateCache(service, binding,
+                recordAt(settings.tapeZonesBoardTopic(), 0, 1L, "ES|2026-08-06", stale, staleTime),
+                stale);
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class
+                .getDeclaredMethod("replayTapeZonesCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertTrue(sink.isEmpty(), "a stale board must never replay as live; got: " + sink);
+    }
+
+    @Test
+    void tapeZonesAcceptanceIsOffsetOrderedAndIdentityIsFailClosed() throws Exception {
+        // Single-partition compacted topic (§6.2): only a strictly higher offset supersedes, so the
+        // cache/live consumer race can never rewind the board. Identity is strict: a record keyed
+        // for one session may not overwrite another's, and a schema violation is dropped outright.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String topic = settings.tapeZonesBoardTopic();
+        long now = System.currentTimeMillis();
+        var binding = topicBinding("DATABENTO", "tapeZones");
+        String first = tapeZonesBoard("2026-08-07", false);
+        String second = tapeZonesBoard("2026-08-07", true);
+        assertEquals("DATABENTO|2026-08-07", updateCache(service, binding,
+                recordAt(topic, 0, 10L, "ES|2026-08-07", first, now), first));
+        assertEquals("DATABENTO|2026-08-07", updateCache(service, binding,
+                recordAt(topic, 0, 11L, "ES|2026-08-07", second, now - 5_000L), second),
+                "a higher offset wins even when the Kafka timestamp regresses");
+        assertNull(updateCache(service, binding,
+                recordAt(topic, 0, 9L, "ES|2026-08-07", first, now), first),
+                "a lower offset may never supersede");
+        String mismatched = tapeZonesBoard("2026-08-07", false);
+        assertNull(updateCache(service, binding,
+                recordAt(topic, 0, 12L, "ES|2026-08-06", mismatched, now), mismatched),
+                "record key / payload sessionDate mismatch is a poisoning guard");
+        String wrongSchema = tapeZonesBoard("2026-08-07", false)
+                .replace("\"schemaVersion\":1", "\"schemaVersion\":2");
+        assertNull(updateCache(service, binding,
+                recordAt(topic, 0, 13L, "ES|2026-08-07", wrongSchema, now), wrongSchema),
+                "an unknown schemaVersion is refused, never guessed at");
+        String noSession = "{\"schemaVersion\":1,\"empty\":true}";
+        assertNull(updateCache(service, binding,
+                recordAt(topic, 0, 14L, "ES|2026-08-07", noSession, now), noSession),
+                "a board without its own sessionDate has no identity");
+    }
+
+    /**
+     * Drives the REAL live-delivery seam both ingesting consumers call — NOT updateCache directly.
+     * Everything the delivery gate is supposed to enforce (identity, ordering, TTL) lives behind
+     * this call, so a test that skipped it would prove nothing about what reaches a client.
+     */
+    private static void tapeZonesBroadcast(FeedGatewayService service, Object binding,
+                                           ConsumerRecord<String, String> record, String json) throws Exception {
+        Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Method method = FeedGatewayService.class.getDeclaredMethod("tapeZonesBroadcast",
+                bindingType, ConsumerRecord.class, String.class, java.util.concurrent.atomic.AtomicBoolean.class);
+        method.setAccessible(true);
+        method.invoke(service, binding, record, json, new java.util.concurrent.atomic.AtomicBoolean(true));
+    }
+
+    private static long tapeZonesRejected(FeedGatewayService service) throws Exception {
+        java.lang.reflect.Field field = FeedGatewayService.class.getDeclaredField("tapeZonesRejected");
+        field.setAccessible(true);
+        return ((java.util.concurrent.atomic.AtomicLong) field.get(service)).get();
+    }
+
+    @Test
+    void tapeZonesLiveDeliveryForwardsNothingTheCacheRefused() throws Exception {
+        // Codex r1 finding 1: the delivery gate is updateCache's RETURN, not the offset CAS alone.
+        // Anything updateCache answers null for — malformed identity, a duplicate or rewound
+        // offset, an expired record — must never reach an authenticated socket, or the card and
+        // the cache would disagree about the same offset.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String topic = settings.tapeZonesBoardTopic();
+        var binding = topicBinding("DATABENTO", "tapeZones");
+        List<String> sent = new ArrayList<>();
+        addRecordingClient(service, sent);
+        long now = System.currentTimeMillis();
+
+        // A malformed identity (Kafka key names a different instrument) forwards NOTHING.
+        String board = tapeZonesBoard("2026-08-07", false);
+        tapeZonesBroadcast(service, binding, recordAt(topic, 0, 1L, "NDX|2026-08-07", board, now), board);
+        assertTrue(sent.isEmpty(), "a board that failed identity must never be forwarded; got: " + sent);
+
+        // A valid board IS forwarded, once.
+        tapeZonesBroadcast(service, binding, recordAt(topic, 0, 2L, "ES|2026-08-07", board, now), board);
+        assertEquals(1, sent.size(), "the valid board forwards exactly once; got: " + sent);
+        assertTrue(sent.get(0).startsWith("{\"type\":\"tapeZones\",\"data\":"), sent.get(0));
+        assertTrue(sent.get(0).contains(board), "the board must ride VERBATIM; got: " + sent.get(0));
+
+        // The SAME offset again (the second consumer's duplicate) forwards nothing.
+        tapeZonesBroadcast(service, binding, recordAt(topic, 0, 2L, "ES|2026-08-07", board, now), board);
+        assertEquals(1, sent.size(), "a duplicate offset must not re-forward; got: " + sent);
+
+        // A LOWER offset (a replay echo) forwards nothing — delivery can never rewind.
+        String older = tapeZonesBoard("2026-08-07", true);
+        tapeZonesBroadcast(service, binding, recordAt(topic, 0, 1L, "ES|2026-08-07", older, now), older);
+        assertEquals(1, sent.size(), "a rewound offset must not forward; got: " + sent);
+
+        // An EXPIRED record (older than the SHORT tapeZonesTtlMs window) forwards nothing: a dead
+        // producer's overnight leftover must read as absent, never arrive as a live session.
+        String stale = tapeZonesBoard("2026-08-08", false);
+        tapeZonesBroadcast(service, binding,
+                recordAt(topic, 0, 3L, "ES|2026-08-08", stale, now - 6L * 60_000L), stale);
+        assertEquals(1, sent.size(), "a TTL-expired board must not forward; got: " + sent);
+
+        // The gate is the CACHE's own decision, not a second opinion: exactly the one board the
+        // cache kept is the one a late joiner is shown. If these two ever disagreed, a client
+        // would be rendering a board the gateway does not believe in.
+        List<String> replayed = new ArrayList<>();
+        Method replay = FeedGatewayService.class
+                .getDeclaredMethod("replayTapeZonesCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(replayed));
+        assertEquals(1, replayed.size(), "one cached board, one replay; got: " + replayed);
+        assertTrue(replayed.get(0).contains("\"sessionDate\":\"2026-08-07\""),
+                "the refused sessions left nothing behind; got: " + replayed);
+    }
+
+    @Test
+    void tapeZonesIdentityIsFailClosedOnTheExactEsSessionDateKey() throws Exception {
+        // Codex r1 finding 2: the producer key contract is literally "ES|" + sessionDate
+        // (TapeZonesRuntime publishes exactly that). Every deviation is rejected AND counted —
+        // never cached, so never replayed and never broadcast.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String topic = settings.tapeZonesBoardTopic();
+        var binding = topicBinding("DATABENTO", "tapeZones");
+        long now = System.currentTimeMillis();
+        String board = tapeZonesBoard("2026-08-07", false);
+        long offset = 100L;
+        long rejectedBefore = tapeZonesRejected(service);
+
+        record Case(String key, String json, String why) {}
+        List<Case> refused = List.of(
+                new Case(null, board, "a null key carries no verifiable producer identity"),
+                new Case("", board, "a blank key likewise"),
+                new Case("   ", board, "a whitespace key is blank, not a session"),
+                new Case("2026-08-07", board, "a BARE date has no instrument — it could be any producer"),
+                new Case("NDX|2026-08-07", board, "another instrument may never overwrite the ES board"),
+                new Case("es|2026-08-07", board, "the prefix is a constant, not a case-insensitive hint"),
+                new Case("ES|", board, "an empty session component is not a date"),
+                new Case("ES|2026-8-7", board, "a non-ISO shape is refused, never coerced"),
+                new Case("ES|2026-02-30", tapeZonesBoard("2026-02-30", false),
+                        "a date that does not exist is refused even when the payload agrees"),
+                new Case("ES|not-a-date", board, "free text is not a session"),
+                new Case("ES|2026-08-06", board, "key/payload session mismatch is a poisoning guard"),
+                new Case("ES|2026-08-07", tapeZonesBoard("2026-08-07", false)
+                        .replace("\"sessionDate\":\"2026-08-07\"", "\"sessionDate\":\"\""),
+                        "a blank payload sessionDate is not a session"),
+                new Case("ES|2026-08-07", tapeZonesBoard("2026-08-07", false)
+                        .replace("\"sessionDate\":\"2026-08-07\"", "\"sessionDate\":\"2026-8-7\""),
+                        "a non-ISO payload sessionDate is refused too"));
+        for (Case refusedCase : refused) {
+            assertNull(updateCache(service, binding,
+                    recordAt(topic, 0, offset++, refusedCase.key(), refusedCase.json(), now),
+                    refusedCase.json()), refusedCase.why());
+        }
+        assertEquals(rejectedBefore + refused.size(), tapeZonesRejected(service),
+                "every refusal must be COUNTED, so a mis-keyed producer is visible in diagnostics");
+
+        // ...and none of them left anything behind that a late joiner could be shown.
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class
+                .getDeclaredMethod("replayTapeZonesCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertTrue(sink.isEmpty(), "a refused board must never be replayable; got: " + sink);
+
+        // The one canonical form the producer actually writes IS accepted.
+        assertEquals("DATABENTO|2026-08-07", updateCache(service, binding,
+                recordAt(topic, 0, offset, "ES|2026-08-07", board, now), board));
+        assertTrue(FeedGatewayService.isIsoCalendarDate("2026-08-07"));
+        assertFalse(FeedGatewayService.isIsoCalendarDate("2026-02-30"));
+        assertFalse(FeedGatewayService.isIsoCalendarDate("2026-8-7"));
+        assertFalse(FeedGatewayService.isIsoCalendarDate(null));
+    }
+
     // ----- spot-vol-regime CURRENT snapshot relay --------------------------------------------------
 
     @Test
