@@ -4,12 +4,14 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.Objects;
 
 /**
@@ -22,10 +24,16 @@ import java.util.Objects;
  * stock-gex service answers with a small vocabulary of statuses the UI branches on —
  * {@code 422 OI_SNAPSHOT_UNAVAILABLE} (symbol outside the nightly OI index universe, i.e. "ask for a
  * different ticker"), {@code 400 BAD_SYMBOL}, {@code 429 MAX_SYMBOLS}, {@code 503 WIRE_CAPACITY} /
- * {@code BOARD_SUBSCRIBE_FAILED} / {@code SHUTTING_DOWN} (i.e. "retry"). Folding those into a 500 would
- * destroy the only signal the page has for telling "this ticker will never work" apart from "come back in
- * a moment", so the status and body are carried through verbatim and only a genuinely unreachable service
- * becomes a gateway-authored error.
+ * {@code BOARD_SUBSCRIBE_FAILED} / {@code SHUTTING_DOWN} / {@code SSE_CLIENT_LIMIT},
+ * {@code 409 BOARD_GONE} (i.e. "retry"). Folding those into a 500 would destroy the only signal the page
+ * has for telling "this ticker will never work" apart from "come back in a moment", so the status and
+ * body are carried through verbatim and only a genuinely unreachable service becomes a gateway-authored
+ * error.
+ *
+ * <p><b>Bodies are carried as BYTES, never as {@code String}.</b> Decoding the upstream body and letting
+ * a message converter re-encode it puts two charset guesses in the path (the JDK's, then Spring's, whose
+ * {@code StringHttpMessageConverter} default is ISO-8859-1 for anything it does not recognise as JSON),
+ * and "verbatim" would then quietly mean "verbatim for ASCII". A {@code byte[]} has no charset to guess.
  *
  * <p>Timeouts are split by shape: the board is a request/response call with a whole-request budget; the
  * stream has a CONNECT budget only. An SSE response is long-lived by construction (heartbeats at ~10s,
@@ -38,15 +46,15 @@ public final class StockGexUpstream {
     /** Longest symbol we will put on the wire. Real tickers are <= 5-6 chars; this only stops abuse. */
     static final int MAX_SYMBOL_LENGTH = 32;
 
-    /** A completed board call: the upstream's status, content type and body, untouched. */
-    public record BoardResponse(int status, String contentType, String body) {}
+    /** A completed board call: the upstream's status, content type and body bytes, untouched. */
+    public record BoardResponse(int status, String contentType, byte[] body) {}
 
     /**
      * An opened stream. When {@link #ok()}, {@link #body()} is the live upstream byte stream and the
      * caller OWNS it (closing it cancels the exchange and releases the upstream's SSE listener slot).
      * Otherwise {@code body} is null and {@link #errorBody()} carries the upstream's error envelope.
      */
-    public record StreamResponse(int status, String contentType, InputStream body, String errorBody) {
+    public record StreamResponse(int status, String contentType, InputStream body, byte[] errorBody) {
         public boolean ok() {
             return status >= 200 && status < 300;
         }
@@ -64,7 +72,16 @@ public final class StockGexUpstream {
     private final HttpClient http;
 
     public StockGexUpstream(String baseUrl, Duration connectTimeout, Duration boardTimeout) {
-        this(baseUrl, boardTimeout, HttpClient.newBuilder().connectTimeout(connectTimeout).build());
+        this(baseUrl, boardTimeout, HttpClient.newBuilder()
+                .connectTimeout(connectTimeout)
+                // HTTP/1.1 on purpose. The upstream is a Python ASGI service and the default HTTP/2
+                // policy makes the JDK attempt an h2c upgrade on every cleartext request: extra
+                // negotiation for zero benefit, and an upgrade a server may answer in ways that are
+                // hard to reason about on a long-lived streaming response. 1.1 is what SSE was
+                // designed on and what the upstream actually speaks.
+                .version(HttpClient.Version.HTTP_1_1)
+                .followRedirects(HttpClient.Redirect.NEVER)
+                .build());
     }
 
     /** Test seam: inject a stub {@link HttpClient}. */
@@ -88,14 +105,20 @@ public final class StockGexUpstream {
                 .header("Accept", "application/json")
                 .GET()
                 .build();
-        HttpResponse<String> resp;
+        HttpResponse<byte[]> resp;
         try {
-            resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            resp = http.send(req, HttpResponse.BodyHandlers.ofByteArray());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new UnavailableException("interrupted while calling stock-gex-service", e);
         } catch (IOException transport) {
             throw new UnavailableException("stock-gex-service is unreachable", transport);
+        } catch (IllegalArgumentException | SecurityException misconfigured) {
+            // A base URL the JDK client refuses (no scheme, unsupported scheme, blocked by a security
+            // manager) is a CONFIGURATION fault, not a request fault. Letting it escape would answer
+            // the browser with a 500 and a stack trace; 502 with the ordinary envelope keeps the page
+            // on the "cannot reach the board service" path it already renders.
+            throw new UnavailableException("stock-gex-service address is not usable", misconfigured);
         }
         return new BoardResponse(resp.statusCode(), contentType(resp), resp.body());
     }
@@ -127,6 +150,8 @@ public final class StockGexUpstream {
             throw new UnavailableException("interrupted while opening the stock-gex stream", e);
         } catch (IOException transport) {
             throw new UnavailableException("stock-gex-service is unreachable", transport);
+        } catch (IllegalArgumentException | SecurityException misconfigured) {
+            throw new UnavailableException("stock-gex-service address is not usable", misconfigured);
         }
         int status = resp.statusCode();
         String contentType = contentType(resp);
@@ -137,9 +162,33 @@ public final class StockGexUpstream {
         return new StreamResponse(status, contentType, resp.body(), null);
     }
 
+    /**
+     * Build the upstream URI, refusing anything that is not an absolute http(s) address.
+     *
+     * <p>A misconfigured {@code STOCK_GEX_BASE_URL} must not become a 500 with a stack trace on the
+     * browser's side, and must not fail the whole gateway at boot either (see {@link StockGexConfig}):
+     * it becomes the same {@code UnavailableException} an unreachable service produces, i.e. a 502 with
+     * the ordinary JSON envelope. That is the honest answer — the board service cannot be reached —
+     * and it is the state the page already knows how to render.
+     */
     private URI uri(String path, String symbol) {
         String s = symbol == null ? "" : symbol.trim();
-        return URI.create(baseUrl + path + "?symbol=" + URLEncoder.encode(s, StandardCharsets.UTF_8));
+        String raw = baseUrl + path + "?symbol=" + URLEncoder.encode(s, StandardCharsets.UTF_8);
+        URI uri;
+        try {
+            uri = new URI(raw);
+        } catch (URISyntaxException malformed) {
+            throw new UnavailableException("stock-gex base url is not a valid URI", malformed);
+        }
+        String scheme = uri.getScheme();
+        if (!uri.isAbsolute() || uri.getHost() == null
+                || scheme == null
+                || !("http".equals(scheme.toLowerCase(Locale.ROOT))
+                     || "https".equals(scheme.toLowerCase(Locale.ROOT)))) {
+            throw new UnavailableException(
+                    "stock-gex base url must be an absolute http(s) address", null);
+        }
+        return uri;
     }
 
     /** Printable-ASCII, bounded ids only; anything else is treated as "no id" (full snapshot). */
@@ -160,9 +209,9 @@ public final class StockGexUpstream {
         return trimmed;
     }
 
-    private static String drain(InputStream in) {
+    private static byte[] drain(InputStream in) {
         if (in == null) {
-            return "";
+            return new byte[0];
         }
         try (InputStream body = in) {
             ByteArrayOutputStream buffer = new ByteArrayOutputStream();
@@ -171,9 +220,9 @@ public final class StockGexUpstream {
             while (buffer.size() < MAX_ERROR_BYTES && (n = body.read(chunk)) != -1) {
                 buffer.write(chunk, 0, Math.min(n, MAX_ERROR_BYTES - buffer.size()));
             }
-            return buffer.toString(StandardCharsets.UTF_8);
+            return buffer.toByteArray();
         } catch (IOException e) {
-            return "";
+            return new byte[0];
         }
     }
 
