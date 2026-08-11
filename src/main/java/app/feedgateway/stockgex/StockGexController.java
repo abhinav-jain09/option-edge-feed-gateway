@@ -300,10 +300,10 @@ public class StockGexController {
             // The lease owns BOTH the upstream stream and the permit from here on, and releases them
             // exactly once however this request ends.
             lease = new StreamLease(opened.body(), streamSlots);
-            lease.armIdleWatchdog(upstream.timers(), idleCheckMs, idleTimeoutMs);
+            lease.armIdleWatchdog(upstream.timers(), upstream.closer(), idleCheckMs, idleTimeoutMs);
             // Bind to the servlet async lifecycle BEFORE returning: if the executor rejects the body, or
             // the container discards the dispatch, writeTo never runs and this is the only thing left.
-            asyncCleanup.onAsyncCompletion(request, lease::release);
+            asyncCleanup.onAsyncCompletion(request, lease::finishFromLifecycle);
             StreamingResponseBody pump = pump(lease);
             ResponseEntity<StreamingResponseBody> response = ResponseEntity.status(opened.status())
                     .contentType(mediaType(opened.contentType(), MediaType.TEXT_EVENT_STREAM))
@@ -322,7 +322,7 @@ public class StockGexController {
             // releasing it is what returns both. On the success path `lease` is nulled after the
             // response is built, so this never undoes a handover.
             if (lease != null) {
-                lease.release();
+                lease.abandonBeforeHandover();
             } else {
                 streamSlots.release();
             }
@@ -378,11 +378,20 @@ public class StockGexController {
      * {@code finally} in each of the three places.
      */
     static final class StreamLease {
+
+        /** The pump has not begun copying; nothing owns the MVC thread yet. */
+        private static final int NOT_STARTED = 0;
+        /** The pump is running. It — and only it — may return the permit. */
+        private static final int PUMPING = 1;
+        /** Terminal. The permit has been returned (or is about to be, by the owner that got here). */
+        private static final int FINISHED = 2;
+
         private final InputStream upstream;
         private final Semaphore slots;
-        /** Whether this lease's ending should be counted; false for leases a test builds by hand. */
         private final boolean counted;
-        private final AtomicBoolean released = new AtomicBoolean(false);
+        private final java.util.concurrent.atomic.AtomicInteger state =
+                new java.util.concurrent.atomic.AtomicInteger(NOT_STARTED);
+        private final AtomicBoolean cancelled = new AtomicBoolean(false);
         /**
          * NANOTIME, not wall clock. This is the only mechanism bounding a silent upstream, and a
          * backward clock adjustment (NTP step, a VM resuming) would postpone it by exactly the size
@@ -390,6 +399,7 @@ public class StockGexController {
          */
         private final AtomicLong lastActivityNanos = new AtomicLong(System.nanoTime());
         private volatile ScheduledFuture<?> watchdog;
+        private volatile java.util.concurrent.Executor closer;
 
         StreamLease(InputStream upstream, Semaphore slots) {
             this(upstream, slots, true);
@@ -414,50 +424,111 @@ public class StockGexController {
         }
 
         boolean isReleased() {
-            return released.get();
+            return state.get() == FINISHED;
+        }
+
+        boolean isCancelled() {
+            return cancelled.get();
         }
 
         void armIdleWatchdog(java.util.concurrent.ScheduledExecutorService timers,
+                             java.util.concurrent.Executor closeOn,
                              long checkEveryMs, long idleTimeoutMs) {
+            this.closer = closeOn;
             ScheduledFuture<?> armed = timers.scheduleWithFixedDelay(() -> {
                 if (isIdleFor(idleTimeoutMs)) {
-                    release();
+                    // CANCEL ONLY. A silent upstream means this exchange is dead — but the MVC
+                    // thread may be blocked in out.write() against a browser that stopped reading,
+                    // and closing the upstream does not end that write. Returning the permit here
+                    // would admit a new stream while the old thread is still pinned, which defeats
+                    // the cap and walks into executor rejection instead.
+                    cancel();
                 }
             }, checkEveryMs, checkEveryMs, TimeUnit.MILLISECONDS);
             this.watchdog = armed;
-            // The task can fire — and the lease can be released by anything else — between scheduling
-            // and this assignment. release() would then have had nothing to cancel and the recurring
-            // task would run for the life of the JVM. A long GC pause is all it takes.
-            if (released.get()) {
+            // The lease can end between scheduling and this assignment, in which case there was
+            // nothing to cancel and the recurring task would outlive the request.
+            if (cancelled.get() || state.get() == FINISHED) {
                 armed.cancel(false);
             }
         }
 
         /**
-         * Closing the upstream stream is what unblocks a pump parked on a read that will never return —
-         * the JDK's stream has no read deadline of its own — so the close must happen before the permit
-         * goes back, or the slot would be reusable while the old exchange is still open.
+         * Abandon the upstream exchange. Idempotent, and NEVER returns the permit.
+         *
+         * <p>The close runs on a separate executor rather than on the caller's thread, because
+         * {@code InputStream.close()} is not contractually non-blocking and the caller here is
+         * usually a watchdog scheduler thread shared with every other stream's deadline.
          */
-        void release() {
-            if (!released.compareAndSet(false, true)) {
+        void cancel() {
+            if (!cancelled.compareAndSet(false, true)) {
                 return;
             }
             ScheduledFuture<?> alarm = watchdog;
             if (alarm != null) {
                 alarm.cancel(false);
             }
-            try {
-                if (upstream != null) {
-                    upstream.close();
+            InputStream doomed = upstream;
+            if (doomed == null) {
+                return;
+            }
+            java.util.concurrent.Executor on = closer;
+            Runnable close = () -> {
+                try {
+                    doomed.close();
+                } catch (IOException | RuntimeException ignored) {
+                    // The exchange is being abandoned either way.
                 }
-            } catch (IOException | RuntimeException ignored) {
-                // Best effort. The exchange is being abandoned either way, and a failure to close must
-                // never be the reason the permit is not returned.
-            } finally {
-                slots.release();
-                if (counted) {
-                    STREAMS_ENDED.incrementAndGet();
-                }
+            };
+            if (on == null) {
+                close.run();
+            } else {
+                on.execute(close);
+            }
+        }
+
+        /**
+         * The pump is about to start copying. Returns false when this lease has already ended —
+         * which happens when the container abandoned the dispatch before the body ran — in which
+         * case the pump must NOT begin, because the permit is already gone.
+         */
+        boolean beginPump() {
+            return state.compareAndSet(NOT_STARTED, PUMPING);
+        }
+
+        /**
+         * The pump has unwound. This is the ONLY path that returns a permit once the pump started,
+         * because until the pump unwinds the MVC thread it occupies is exactly what the permit
+         * accounts for.
+         */
+        void finishFromPump() {
+            cancel();
+            if (state.getAndSet(FINISHED) != FINISHED) {
+                returnPermit();
+            }
+        }
+
+        /**
+         * The servlet async lifecycle completed. If the pump never started — executor rejection, an
+         * abandoned dispatch, a client gone during setup — this is the only thing left to clean up,
+         * so it returns the permit. If the pump IS running, it may cancel but must not.
+         */
+        void finishFromLifecycle() {
+            cancel();
+            if (state.compareAndSet(NOT_STARTED, FINISHED)) {
+                returnPermit();
+            }
+        }
+
+        /** Give the permit back before anything has been handed to a pump at all. */
+        void abandonBeforeHandover() {
+            finishFromLifecycle();
+        }
+
+        private void returnPermit() {
+            slots.release();
+            if (counted) {
+                STREAMS_ENDED.incrementAndGet();
             }
         }
     }
@@ -477,12 +548,21 @@ public class StockGexController {
      */
     private static StreamingResponseBody pump(StreamLease lease) {
         return out -> {
+            if (!lease.beginPump()) {
+                // The lifecycle already ended this lease — the container abandoned the dispatch
+                // before the body ran — so the permit is gone and the upstream is closed. Copying
+                // now would be writing on behalf of a request nobody is accounting for.
+                return;
+            }
             try {
                 InputStream in = lease.stream();
                 byte[] chunk = new byte[8192];
                 int n;
                 while ((n = in.read(chunk)) != -1) {
                     if (n > 0) {
+                        // Activity is recorded BEFORE the downstream write, so a pump blocked writing
+                        // to a slow browser does not look idle. What makes that safe is that the
+                        // watchdog only cancels: the permit stays held until this finally runs.
                         lease.markActivity();
                         out.write(chunk, 0, n);
                         out.flush();
@@ -492,7 +572,7 @@ public class StockGexController {
                 // Normal termination for SSE: the client navigated away, the upstream ended the stream,
                 // or the watchdog closed a stream that had gone silent. None of those is a server error.
             } finally {
-                lease.release();
+                lease.finishFromPump();
             }
         };
     }

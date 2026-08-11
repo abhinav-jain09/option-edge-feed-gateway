@@ -689,7 +689,9 @@ class StockGexControllerTest {
 
         registrar.fireAll(); // the servlet async lifecycle completing without the body ever running
 
-        assertTrue(closed.get(), "the upstream exchange must be closed");
+        // The close is deliberately performed OFF the caller's thread (a watchdog scheduler thread
+        // must never perform a blocking close), so it is awaited rather than assumed.
+        assertTrue(waitFor(closed::get, 5_000L), "the upstream exchange must be closed");
         assertEquals(1, controller.streamSlots.availablePermits(), "and the slot must come back");
     }
 
@@ -705,13 +707,13 @@ class StockGexControllerTest {
 
         ResponseEntity<StreamingResponseBody> res =
                 liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
-        drain(res);            // pump completes -> release
-        registrar.fireAll();   // lifecycle completes -> release again
+        drain(res);            // pump completes -> the pump is the owner, so it returns the permit
+        registrar.fireAll();   // lifecycle completes afterwards -> must be a no-op
         registrar.fireAll();   // and again, for good measure
 
         assertEquals(1, controller.streamSlots.availablePermits(),
                 "the permit count must be exactly the cap, not more");
-        assertTrue(closed.get());
+        assertTrue(waitFor(closed::get, 5_000L));
     }
 
     @Test
@@ -738,7 +740,8 @@ class StockGexControllerTest {
         };
         res.getBody().writeTo(deadClient); // must not propagate: a gone client is not a server error
 
-        assertTrue(closed.get(), "the upstream stream must be closed when the client disappears");
+        assertTrue(waitFor(closed::get, 5_000L),
+                "the upstream stream must be closed when the client disappears");
         assertEquals(1, controller.streamSlots.availablePermits(),
                 "a disconnected client must also give this gateway its stream slot back");
     }
@@ -766,7 +769,7 @@ class StockGexControllerTest {
         };
         assertThrows(RuntimeException.class, () -> res.getBody().writeTo(exploding));
         assertEquals(1, controller.streamSlots.availablePermits());
-        assertTrue(closed.get());
+        assertTrue(waitFor(closed::get, 5_000L));
     }
 
     @Test
@@ -900,10 +903,10 @@ class StockGexControllerTest {
         lease.markActivity();
         assertFalse(lease.isIdleFor(60_000L), "a byte arriving resets the clock");
         assertFalse(lease.isReleased());
-        lease.release();
-        lease.release();
+        lease.finishFromLifecycle();
+        lease.finishFromLifecycle();
         assertTrue(lease.isReleased());
-        assertEquals(1, slots.availablePermits(), "released twice, returned once");
+        assertEquals(1, slots.availablePermits(), "ended twice, returned once");
     }
 
     @Test
@@ -1164,6 +1167,156 @@ class StockGexControllerTest {
         assertEquals(502, res.getStatusCode().value(), "a body that never ends must be cut off");
         assertTrue(elapsedMs < budgetMs * 2,
                 "the whole request took " + elapsedMs + "ms against a " + budgetMs + "ms budget");
+    }
+
+    @Test
+    void aWATCHDOGFiringWhileThePumpIsBlockedDoesNOTHandBackThePermit() throws Exception {
+        // THE defect this state machine exists for. The pump records activity before out.write(),
+        // so a browser that stops reading makes the stream look idle. The watchdog then fires — and
+        // closing the UPSTREAM does not unblock a thread stuck writing DOWNSTREAM. Returning the
+        // permit there would admit a new stream while the old MVC thread is still pinned: the cap
+        // stops bounding threads, occupancy climbs to the executor limit, and later clients get
+        // rejection 500s instead of the contracted 503.
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        StockGexController controller = new StockGexController(
+                upstream(clientStreaming(200, "text/event-stream",
+                        new ByteArrayInputStream("data: x\n\n".getBytes(StandardCharsets.UTF_8)))),
+                authReturning(200), new ObjectMapper(), 1, new CapturingRegistrar(),
+                20L, 40L);   // a watchdog fast enough to fire while the write is stuck
+        ResponseEntity<StreamingResponseBody> res =
+                liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
+        assertEquals(0, controller.streamSlots.availablePermits());
+
+        OutputStream stuckBrowser = new OutputStream() {
+            @Override
+            public void write(int b) throws IOException {
+                blockUntilReleased();
+            }
+
+            @Override
+            public void write(byte[] b, int off, int len) throws IOException {
+                blockUntilReleased();
+            }
+
+            private void blockUntilReleased() throws IOException {
+                writeEntered.countDown();
+                try {
+                    releaseWrite.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted", e);
+                }
+            }
+        };
+        Thread pump = new Thread(() -> {
+            try {
+                res.getBody().writeTo(stuckBrowser);
+            } catch (IOException ignored) {
+                // not expected on this path
+            }
+        });
+        pump.setDaemon(true);
+        pump.start();
+
+        assertTrue(writeEntered.await(5, TimeUnit.SECONDS), "the pump must reach the blocked write");
+        Thread.sleep(300L);   // several idle windows pass while the write is stuck
+
+        assertEquals(0, controller.streamSlots.availablePermits(),
+                "the permit must still be held: the MVC thread this permit accounts for is still busy");
+
+        releaseWrite.countDown();
+        pump.join(5000);
+        assertFalse(pump.isAlive(), "the pump must unwind once the client drains");
+        assertEquals(1, controller.streamSlots.availablePermits(),
+                "and ONLY the pump unwinding may return it");
+        liveResponses.remove(res);
+    }
+
+    @Test
+    void lifecycleCleanupWhileThePumpRunsCancelsButDoesNotReturnThePermit() throws Exception {
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        CapturingRegistrar registrar = new CapturingRegistrar();
+        StockGexController controller = controller(
+                clientStreaming(200, "text/event-stream",
+                        new ByteArrayInputStream("data: x\n\n".getBytes(StandardCharsets.UTF_8))),
+                200, 1, registrar);
+        ResponseEntity<StreamingResponseBody> res =
+                liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
+
+        Thread pump = new Thread(() -> {
+            try {
+                res.getBody().writeTo(new OutputStream() {
+                    @Override
+                    public void write(int b) throws IOException {
+                        writeEntered.countDown();
+                        try {
+                            releaseWrite.await(10, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+
+                    @Override
+                    public void write(byte[] b, int off, int len) throws IOException {
+                        write(b[off]);
+                    }
+                });
+            } catch (IOException ignored) {
+                // not expected
+            }
+        });
+        pump.setDaemon(true);
+        pump.start();
+        assertTrue(writeEntered.await(5, TimeUnit.SECONDS));
+
+        registrar.fireAll();   // the container reports completion while the pump is still inside
+
+        assertEquals(0, controller.streamSlots.availablePermits(),
+                "lifecycle completion may cancel, but the running pump still owns the permit");
+        releaseWrite.countDown();
+        pump.join(5000);
+        assertEquals(1, controller.streamSlots.availablePermits());
+        liveResponses.remove(res);
+    }
+
+    @Test
+    void aPumpThatLosesTheRaceToPreStartCleanupDoesNotCopyAtAll() throws Exception {
+        // Executor rejection / abandoned dispatch: the lifecycle ends the lease BEFORE the body is
+        // ever invoked. If the body then ran anyway it would copy on behalf of a request whose
+        // permit has already been handed to somebody else.
+        CapturingRegistrar registrar = new CapturingRegistrar();
+        AtomicBoolean closed = new AtomicBoolean(false);
+        StockGexController controller = controller(
+                clientStreaming(200, "text/event-stream", closeRecording(closed, "data: x\n\n")),
+                200, 1, registrar);
+        ResponseEntity<StreamingResponseBody> res =
+                liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
+
+        registrar.fireAll();   // pre-start cleanup wins
+        assertTrue(waitFor(() -> controller.streamSlots.availablePermits() == 1, 5_000L),
+                "with no pump running, lifecycle cleanup is the only thing that can return the permit");
+
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        res.getBody().writeTo(sink);
+
+        assertEquals(0, sink.size(), "a pump that lost the race must not copy anything");
+        assertEquals(1, controller.streamSlots.availablePermits(),
+                "and must not release a second permit either");
+        liveResponses.remove(res);
+    }
+
+    private static boolean waitFor(java.util.function.BooleanSupplier condition, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.getAsBoolean()) {
+                return true;
+            }
+            Thread.sleep(25L);
+        }
+        return condition.getAsBoolean();
     }
 
     // ---------------------------------------------------------------- metrics

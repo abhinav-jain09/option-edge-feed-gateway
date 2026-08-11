@@ -131,6 +131,12 @@ public final class StockGexUpstream implements AutoCloseable {
     /** Shared by the board read deadline and (via {@link #timers()}) the controller's idle watchdogs. */
     private final ScheduledExecutorService timers;
     private final boolean ownsTimers;
+    private final java.util.concurrent.ExecutorService closer =
+            Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "stock-gex-closer");
+                t.setDaemon(true);
+                return t;
+            });
 
     public StockGexUpstream(String baseUrl, Duration connectTimeout, Duration boardTimeout) {
         this(baseUrl, boardTimeout, HttpClient.newBuilder()
@@ -182,8 +188,17 @@ public final class StockGexUpstream implements AutoCloseable {
         return timers;
     }
 
+    /**
+     * Where a potentially blocking {@code close()} runs. Timer threads DETECT and INITIATE; they must
+     * never perform the blocking part, or a handful of stuck closes disables every remaining deadline.
+     */
+    java.util.concurrent.Executor closer() {
+        return closer;
+    }
+
     @Override
     public void close() {
+        closer.shutdownNow();
         if (ownsTimers) {
             timers.shutdownNow();
         }
