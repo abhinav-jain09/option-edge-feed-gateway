@@ -4,21 +4,30 @@ import app.feedgateway.liquidityhistory.LiquidityHistoryAuth;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.context.request.NativeWebRequest;
+import org.springframework.web.context.request.async.CallableProcessingInterceptor;
+import org.springframework.web.context.request.async.WebAsyncUtils;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -36,9 +45,17 @@ import java.util.concurrent.atomic.AtomicLong;
  * page renders a different thing for each, so this proxy forwards the upstream status AND body
  * byte-for-byte. The only statuses this class authors are 401/403 (auth, before anything else happens),
  * 400 for a symbol too long to put on the wire, 503 when this gateway is already carrying as many live
- * streams as it will hold, and 502 when the service cannot be reached at all — deliberately 502 rather
- * than 503, so "the gateway could not reach stock-gex" stays distinguishable from the upstream's own 503
- * capacity answer.
+ * streams as it will hold, and 502 when the service cannot be reached or did not answer with a usable
+ * response — deliberately 502 rather than 503, so "the gateway could not reach stock-gex" stays
+ * distinguishable from the upstream's own 503 capacity answer.
+ *
+ * <p><b>Every gateway-authored answer on the stream endpoint is written SYNCHRONOUSLY</b>, by throwing
+ * {@link StockGexRefusal} and letting the {@link ExceptionHandler} below answer it with a plain
+ * {@code byte[]}. This is not a style choice. A {@code StreamingResponseBody} — even one that writes 40
+ * bytes and returns — is dispatched through the MVC async executor, so answering "this gateway is out of
+ * stream slots" with one would require the very resource whose exhaustion it is reporting: during a
+ * burst the refusals would queue behind the streams they are refusing, and a client would get a rejected
+ * task (a 500) instead of the promised immediate JSON 503. Only the LIVE stream returns a streaming body.
  *
  * <p>Bearer auth reuses {@link LiquidityHistoryAuth}, exactly as {@code /api/seller-activity} and
  * {@code /api/gamma-migration} do — these are data endpoints and stay behind the same guard as every other
@@ -49,13 +66,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p><b>Why there IS a stream cap here and no rate limiter.</b> No request-rate limiter: the upstream owns
  * the request-capacity contract and expresses it in the 429/503 codes above, and a second gateway-authored
  * 429 with a different body would be indistinguishable from {@code MAX_SYMBOLS} to the page. But
- * CONCURRENCY is a gateway-local resource that the upstream cannot see: every live stream pins one thread
- * of this JVM's MVC async pool for the life of the session. That pool is finite (see
+ * CONCURRENCY is a gateway-local resource the upstream cannot see: every live stream pins one thread of
+ * this JVM's MVC async pool for the life of the session. That pool is finite (see
  * {@link StockGexAsyncConfig}), and an async response that cannot get a thread does not fail — it QUEUES,
- * answering nothing at all, which with {@code spring.mvc.async.request-timeout=-1} means forever. So the
- * streams are capped below the pool size and the overflow is answered immediately with the upstream's own
- * {@code 503 SSE_CLIENT_LIMIT} vocabulary, which the page already renders. A refused stream is a page that
- * says so and falls back to polling; a queued stream is a page that hangs.
+ * answering nothing at all. So streams are capped below the pool and the overflow is answered immediately
+ * with the upstream's own {@code 503 SSE_CLIENT_LIMIT} vocabulary, which the page already renders.
  */
 @RestController
 public class StockGexController {
@@ -68,29 +83,74 @@ public class StockGexController {
      */
     static final int MAX_CONCURRENT_STREAMS = 24;
 
+    /**
+     * How long a live stream may deliver NOTHING before this gateway closes it.
+     *
+     * <p>The upstream heartbeats about every 10 seconds, so six missed heartbeats is a stream that has
+     * stopped being a stream. Nothing else catches this: the request timeout stops applying the moment
+     * headers arrive, and a heartbeat only proves liveness while the upstream is still sending them — a
+     * silent upstream produces no evidence of its own silence. Without this, one half-open peer holds an
+     * async thread, a permit and an upstream exchange until the JVM restarts.
+     */
+    static final long STREAM_IDLE_TIMEOUT_MS = 60_000L;
+    /** How often the watchdog looks. Fine enough to bound overshoot, coarse enough to cost nothing. */
+    static final long STREAM_IDLE_CHECK_MS = 10_000L;
+
     /** Never log an unreachable-upstream failure more than this often: an outage is per-request. */
     private static final long UNREACHABLE_LOG_INTERVAL_MS = 30_000L;
+
+    private static final String CLEANUP_KEY = StockGexController.class.getName() + ".streamCleanup";
+
+    /**
+     * How a stream's cleanup is bound to the servlet async lifecycle. A seam because the production
+     * implementation reaches into {@code WebAsyncUtils}, and the property that actually matters — the
+     * lease is released even when the body is never invoked — has to be provable without a container.
+     */
+    interface AsyncCleanupRegistrar {
+        void onAsyncCompletion(HttpServletRequest request, Runnable cleanup);
+    }
+
+    /**
+     * The real binding. {@code WebAsyncManager} registers the interceptor chain's completion handler
+     * BEFORE it submits the task, and the container drives it from the async lifecycle — so
+     * {@code afterCompletion} runs whether the body ran to the end, the executor rejected it, the client
+     * vanished during async setup, or the dispatch was aborted. That is exactly the set of cases where
+     * {@code StreamingResponseBody.writeTo} is never called and its own {@code finally} never fires.
+     */
+    static final AsyncCleanupRegistrar SERVLET_ASYNC_CLEANUP = (request, cleanup) ->
+            WebAsyncUtils.getAsyncManager(request).registerCallableInterceptor(
+                    CLEANUP_KEY,
+                    new CallableProcessingInterceptor() {
+                        @Override
+                        public <T> void afterCompletion(NativeWebRequest r, Callable<T> task) {
+                            cleanup.run();
+                        }
+                    });
 
     private final StockGexUpstream upstream;
     private final LiquidityHistoryAuth auth;
     private final ObjectMapper mapper;
+    private final AsyncCleanupRegistrar asyncCleanup;
     /** Package-visible so a test can exhaust it. */
     final Semaphore streamSlots;
     private final AtomicLong lastUnreachableLogMs = new AtomicLong(0L);
 
     @org.springframework.beans.factory.annotation.Autowired
     public StockGexController(StockGexUpstream upstream, LiquidityHistoryAuth auth, ObjectMapper mapper) {
-        this(upstream, auth, mapper, MAX_CONCURRENT_STREAMS);
+        this(upstream, auth, mapper, MAX_CONCURRENT_STREAMS, SERVLET_ASYNC_CLEANUP);
     }
 
-    /** Test seam: explicit concurrency limit. */
+    /** Test seam: explicit concurrency limit and cleanup binding. */
     StockGexController(StockGexUpstream upstream, LiquidityHistoryAuth auth, ObjectMapper mapper,
-                       int maxConcurrentStreams) {
+                       int maxConcurrentStreams, AsyncCleanupRegistrar asyncCleanup) {
         this.upstream = upstream;
         this.auth = auth;
         this.mapper = mapper == null ? new ObjectMapper() : mapper;
         this.streamSlots = new Semaphore(maxConcurrentStreams);
+        this.asyncCleanup = asyncCleanup;
     }
+
+    // ------------------------------------------------------------------ board
 
     /**
      * No {@code produces} condition on purpose (same reason as the stream handler): the body is an
@@ -106,84 +166,215 @@ public class StockGexController {
             return ResponseEntity.status(authResult.status()).build();
         }
         if (tooLong(symbol)) {
-            return json(HttpStatus.BAD_REQUEST, error("BAD_SYMBOL", "symbol is too long"));
+            return json(HttpStatus.BAD_REQUEST, error("BAD_SYMBOL", "symbol is too long"), null);
         }
         StockGexUpstream.BoardResponse response;
         try {
             response = upstream.board(symbol);
         } catch (StockGexUpstream.UnavailableException unreachable) {
             logUnreachable("board", unreachable);
-            return json(HttpStatus.BAD_GATEWAY, unreachableError());
+            return json(HttpStatus.BAD_GATEWAY, unreachableError(unreachable), null);
         }
-        return ResponseEntity.status(response.status())
+        ResponseEntity.BodyBuilder out = ResponseEntity.status(response.status())
                 .contentType(mediaType(response.contentType(), MediaType.APPLICATION_JSON))
-                .body(response.body() == null ? new byte[0] : response.body());
+                // A board is a live measurement of a moving market. Nothing on the path — browser,
+                // ingress, corporate proxy — may ever replay one as if it were current.
+                .header(HttpHeaders.CACHE_CONTROL, "no-store");
+        if (response.retryAfter() != null) {
+            // The upstream's own backoff advice for its 429/503s. Dropping it would leave the page to
+            // guess a retry interval the service already told us.
+            out = out.header(HttpHeaders.RETRY_AFTER, response.retryAfter());
+        }
+        return out.body(response.body() == null ? new byte[0] : response.body());
     }
 
+    // ------------------------------------------------------------------ stream
+
     /**
-     * No {@code produces} condition on purpose: this handler answers {@code text/event-stream} on success
-     * and {@code application/json} on an upstream error passthrough, so declaring one media type would
-     * both misdescribe the endpoint and 406 a client that asked only for the other.
+     * No {@code produces} condition on purpose: this handler answers {@code text/event-stream}, and every
+     * other outcome is answered by the synchronous handler below, so declaring one media type would both
+     * misdescribe the endpoint and 406 a client that asked only for the other.
      */
     @GetMapping("/api/stock-gex/stream")
     public ResponseEntity<StreamingResponseBody> stream(
+            HttpServletRequest request,
             @RequestParam(value = "symbol", required = false) String symbol,
             @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId,
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
         LiquidityHistoryAuth.Result authResult = auth.authenticate(authorization);
         if (authResult.status() != 200) {
-            return ResponseEntity.status(authResult.status()).build();
+            throw new StockGexRefusal(authResult.status(), null, new byte[0], null);
         }
         if (tooLong(symbol)) {
-            return streamJson(HttpStatus.BAD_REQUEST, error("BAD_SYMBOL", "symbol is too long"));
+            throw refusal(HttpStatus.BAD_REQUEST, error("BAD_SYMBOL", "symbol is too long"), null);
         }
-        // Refuse BEFORE opening anything upstream. Answering now with a status the page already
-        // understands is strictly better than letting the request queue on an exhausted async pool,
-        // where it would answer nothing at all.
+        // Refuse BEFORE opening anything upstream. Answering now with a status the page understands is
+        // strictly better than letting the request queue on an exhausted async pool, where it would
+        // answer nothing at all.
         if (!streamSlots.tryAcquire()) {
-            byte[] body = bodyOf(error("SSE_CLIENT_LIMIT",
-                    "this gateway is already carrying its maximum number of live stock-gex streams"));
-            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .header(HttpHeaders.RETRY_AFTER, "5")
-                    .body(out -> out.write(body));
+            throw refusal(HttpStatus.SERVICE_UNAVAILABLE,
+                    error("SSE_CLIENT_LIMIT",
+                          "this gateway is already carrying its maximum number of live stock-gex streams"),
+                    "5");
         }
-        boolean streamOwnsPermit = false;
+        StreamLease lease = null;
         try {
             StockGexUpstream.StreamResponse opened;
             try {
                 opened = upstream.stream(symbol, lastEventId);
             } catch (StockGexUpstream.UnavailableException unreachable) {
                 logUnreachable("stream", unreachable);
-                return streamJson(HttpStatus.BAD_GATEWAY, unreachableError());
+                throw refusal(HttpStatus.BAD_GATEWAY, unreachableError(unreachable), null);
             }
-            if (!opened.ok()) {
-                // A rejected subscribe (422/429/503/…) is an ordinary error response, not a stream.
-                byte[] body = opened.errorBody() == null ? new byte[0] : opened.errorBody();
-                return ResponseEntity.status(opened.status())
-                        .contentType(mediaType(opened.contentType(), MediaType.APPLICATION_JSON))
-                        .body(out -> out.write(body));
+            if (!opened.live()) {
+                // Anything that is not a 200 — 4xx, 5xx, a redirect, even another 2xx — is an ordinary
+                // status+body response, carried through with the upstream's own status. A Location is
+                // deliberately NOT forwarded: it would name an internal host to the browser, and this
+                // endpoint's contract is a board or an error, never a redirect to somewhere else.
+                throw new StockGexRefusal(opened.status(), opened.contentType(),
+                        opened.errorBody() == null ? new byte[0] : opened.errorBody(),
+                        opened.retryAfter());
             }
-            StreamingResponseBody pump = pump(opened.body(), streamSlots);
-            // From here the permit belongs to the stream body, which releases it when the pump ends.
-            streamOwnsPermit = true;
-            return ResponseEntity.ok()
+            // The lease owns BOTH the upstream stream and the permit from here on, and releases them
+            // exactly once however this request ends.
+            lease = new StreamLease(opened.body(), streamSlots);
+            lease.armIdleWatchdog(upstream.timers(), STREAM_IDLE_CHECK_MS, STREAM_IDLE_TIMEOUT_MS);
+            // Bind to the servlet async lifecycle BEFORE returning: if the executor rejects the body, or
+            // the container discards the dispatch, writeTo never runs and this is the only thing left.
+            asyncCleanup.onAsyncCompletion(request, lease::release);
+            StreamingResponseBody pump = pump(lease);
+            ResponseEntity<StreamingResponseBody> response = ResponseEntity.status(opened.status())
                     .contentType(mediaType(opened.contentType(), MediaType.TEXT_EVENT_STREAM))
-                    .header(HttpHeaders.CACHE_CONTROL, "no-cache, no-transform")
+                    .header(HttpHeaders.CACHE_CONTROL, "no-cache, no-transform, no-store")
                     // Any buffering proxy in front of this (nginx/ingress) would hold events back until
                     // its buffer filled, which for a 200-byte-per-second stream reads exactly like a
                     // dead feed.
                     .header("X-Accel-Buffering", "no")
                     .body(pump);
-        } finally {
-            if (!streamOwnsPermit) {
+            lease = null; // handed over; the finally below must not undo it
+            return response;
+        } catch (RuntimeException | Error failed) {
+            // Exactly one owner at any moment: before the lease exists the permit is loose and goes
+            // straight back; once the lease exists it owns the permit AND the upstream stream, so
+            // releasing it is what returns both. On the success path `lease` is nulled after the
+            // response is built, so this never undoes a handover.
+            if (lease != null) {
+                lease.release();
+            } else {
                 streamSlots.release();
+            }
+            throw failed;
+        }
+    }
+
+    /**
+     * The one place a gateway-authored (or passed-through non-stream) answer is written, and it is
+     * written SYNCHRONOUSLY as a {@code byte[]}. Spring resolves handler exceptions on the request
+     * thread, before any async dispatch begins, so this path never touches the MVC async executor —
+     * which is exactly what makes "503, this gateway is out of stream slots" answerable while that
+     * executor is saturated.
+     */
+    @ExceptionHandler(StockGexRefusal.class)
+    public ResponseEntity<byte[]> refused(StockGexRefusal refusal) {
+        ResponseEntity.BodyBuilder out = ResponseEntity.status(refusal.status)
+                .contentType(mediaType(refusal.contentType, MediaType.APPLICATION_JSON))
+                .header(HttpHeaders.CACHE_CONTROL, "no-store");
+        if (refusal.retryAfter != null) {
+            out = out.header(HttpHeaders.RETRY_AFTER, refusal.retryAfter);
+        }
+        return out.body(refusal.body);
+    }
+
+    /** Any non-stream outcome of {@code /api/stock-gex/stream}: authored here, or passed through. */
+    static final class StockGexRefusal extends RuntimeException {
+        final int status;
+        final String contentType;
+        final byte[] body;
+        final String retryAfter;
+
+        StockGexRefusal(int status, String contentType, byte[] body, String retryAfter) {
+            super(null, null, false, false); // no stack trace: this is control flow, not a defect
+            this.status = status;
+            this.contentType = contentType;
+            this.body = body;
+            this.retryAfter = retryAfter;
+        }
+    }
+
+    /**
+     * Everything a live stream owns, released exactly once no matter who gets there first.
+     *
+     * <p>Three independent things can end a stream — the pump finishing or failing, the servlet async
+     * lifecycle completing, and the idle watchdog firing — and any of them can happen without the
+     * others. A permit released twice would hand out capacity this gateway does not have; a permit
+     * never released is capacity it never gets back. Hence one idempotent lease rather than a
+     * {@code finally} in each of the three places.
+     */
+    static final class StreamLease {
+        private final InputStream upstream;
+        private final Semaphore slots;
+        private final AtomicBoolean released = new AtomicBoolean(false);
+        private final AtomicLong lastActivityMs = new AtomicLong(System.currentTimeMillis());
+        private volatile ScheduledFuture<?> watchdog;
+
+        StreamLease(InputStream upstream, Semaphore slots) {
+            this.upstream = upstream;
+            this.slots = slots;
+        }
+
+        InputStream stream() {
+            return upstream;
+        }
+
+        void markActivity() {
+            lastActivityMs.set(System.currentTimeMillis());
+        }
+
+        boolean isIdleFor(long millis) {
+            return System.currentTimeMillis() - lastActivityMs.get() >= millis;
+        }
+
+        boolean isReleased() {
+            return released.get();
+        }
+
+        void armIdleWatchdog(java.util.concurrent.ScheduledExecutorService timers,
+                             long checkEveryMs, long idleTimeoutMs) {
+            this.watchdog = timers.scheduleWithFixedDelay(() -> {
+                if (isIdleFor(idleTimeoutMs)) {
+                    release();
+                }
+            }, checkEveryMs, checkEveryMs, TimeUnit.MILLISECONDS);
+        }
+
+        /**
+         * Closing the upstream stream is what unblocks a pump parked on a read that will never return —
+         * the JDK's stream has no read deadline of its own — so the close must happen before the permit
+         * goes back, or the slot would be reusable while the old exchange is still open.
+         */
+        void release() {
+            if (!released.compareAndSet(false, true)) {
+                return;
+            }
+            ScheduledFuture<?> alarm = watchdog;
+            if (alarm != null) {
+                alarm.cancel(false);
+            }
+            try {
+                if (upstream != null) {
+                    upstream.close();
+                }
+            } catch (IOException | RuntimeException ignored) {
+                // Best effort. The exchange is being abandoned either way, and a failure to close must
+                // never be the reason the permit is not returned.
+            } finally {
+                slots.release();
             }
         }
     }
 
     /**
-     * Copy upstream bytes to the client verbatim, flushing each chunk, then release the stream slot.
+     * Copy upstream bytes to the client verbatim, flushing each chunk, then release the lease.
      *
      * <p>Byte-level copying is the point: the upstream implements a strict replay/resume contract in its
      * {@code id:} lines, and the client's next {@code Last-Event-ID} must be an id the upstream itself
@@ -191,44 +382,49 @@ public class StockGexController {
      * dropped or renumbered id and the upstream sees a gap or a future id and answers the reconnect with
      * a full reset snapshot. So nothing is parsed and nothing is buffered beyond one 8 KiB chunk.
      *
-     * <p>The {@code try}-with-resources is how a client disconnect is propagated: when the client goes
-     * away the write (or its flush) throws, the upstream stream is closed on the way out, and closing it
-     * cancels the HTTP exchange — releasing the listener slot the upstream counts against its concurrent
-     * SSE cap. A client that vanishes without an RST is detected on the next heartbeat (~10s) rather than
-     * never, because the heartbeat is what gives us a write to fail on.
-     *
-     * <p>The permit is released in a {@code finally} that wraps EVERY exit, including a
-     * {@link RuntimeException} thrown by the servlet output stream: a leaked permit is a slot this
-     * gateway never gets back, so the release must not depend on the failure mode being the expected one.
+     * <p>A client that goes away makes the write (or its flush) throw; a client that vanishes without an
+     * RST is noticed on the next heartbeat, because the heartbeat is what gives us a write to fail on.
+     * An upstream that goes silent produces neither, which is what the idle watchdog is for.
      */
-    private static StreamingResponseBody pump(InputStream live, Semaphore slots) {
+    private static StreamingResponseBody pump(StreamLease lease) {
         return out -> {
             try {
-                try (InputStream in = live) {
-                    byte[] chunk = new byte[8192];
-                    int n;
-                    while ((n = in.read(chunk)) != -1) {
-                        if (n > 0) {
-                            out.write(chunk, 0, n);
-                            out.flush();
-                        }
+                InputStream in = lease.stream();
+                byte[] chunk = new byte[8192];
+                int n;
+                while ((n = in.read(chunk)) != -1) {
+                    if (n > 0) {
+                        lease.markActivity();
+                        out.write(chunk, 0, n);
+                        out.flush();
                     }
-                } catch (IOException | UncheckedIOException clientOrUpstreamGone) {
-                    // Normal termination for SSE: the client navigated away, or the upstream ended the
-                    // stream. Nothing to report — the close above already released the upstream listener.
                 }
+            } catch (IOException | UncheckedIOException clientOrUpstreamGone) {
+                // Normal termination for SSE: the client navigated away, the upstream ended the stream,
+                // or the watchdog closed a stream that had gone silent. None of those is a server error.
             } finally {
-                slots.release();
+                lease.release();
             }
         };
     }
 
+    // ------------------------------------------------------------------ helpers
+
+    /** Measures exactly what goes on the wire: the symbol is not trimmed anywhere on this path. */
     private boolean tooLong(String symbol) {
-        return symbol != null && symbol.trim().length() > StockGexUpstream.MAX_SYMBOL_LENGTH;
+        return symbol != null && symbol.length() > StockGexUpstream.MAX_SYMBOL_LENGTH;
     }
 
-    private String unreachableError() {
-        return error("UPSTREAM_UNAVAILABLE", "stock-gex-service is unreachable");
+    private String unreachableError(StockGexUpstream.UnavailableException cause) {
+        return StockGexUpstream.CODE_PROTOCOL.equals(cause.code())
+                ? error(StockGexUpstream.CODE_PROTOCOL,
+                        "stock-gex-service did not return a usable response")
+                : error(StockGexUpstream.CODE_UNAVAILABLE, "stock-gex-service is unreachable");
+    }
+
+    private StockGexRefusal refusal(HttpStatus status, String json, String retryAfter) {
+        return new StockGexRefusal(status.value(), MediaType.APPLICATION_JSON_VALUE,
+                json.getBytes(StandardCharsets.UTF_8), retryAfter);
     }
 
     /**
@@ -236,7 +432,7 @@ public class StockGexController {
      * way to tell "the board page is broken" from "the board service is down", but a 502 is per-request
      * and a down upstream would otherwise write a line for every poll of every open tab.
      */
-    private void logUnreachable(String endpoint, RuntimeException cause) {
+    private void logUnreachable(String endpoint, StockGexUpstream.UnavailableException cause) {
         long now = System.currentTimeMillis();
         long previous = lastUnreachableLogMs.get();
         if (now - previous < UNREACHABLE_LOG_INTERVAL_MS
@@ -245,8 +441,8 @@ public class StockGexController {
         }
         Throwable root = cause.getCause() == null ? cause : cause.getCause();
         // Message only, no stack trace: this is an expected operational state, not a defect.
-        System.out.println("stock-gex " + endpoint + " 502: upstream unreachable ("
-                + root.getClass().getSimpleName() + ": " + root.getMessage() + ")");
+        System.out.println("stock-gex " + endpoint + " 502 " + cause.code() + ": "
+                + cause.getMessage() + " (" + root.getClass().getSimpleName() + ")");
     }
 
     /**
@@ -275,18 +471,14 @@ public class StockGexController {
         }
     }
 
-    private static byte[] bodyOf(String json) {
-        return json.getBytes(StandardCharsets.UTF_8);
-    }
-
-    private static ResponseEntity<byte[]> json(HttpStatus status, String body) {
-        return ResponseEntity.status(status).contentType(MediaType.APPLICATION_JSON).body(bodyOf(body));
-    }
-
-    private static ResponseEntity<StreamingResponseBody> streamJson(HttpStatus status, String body) {
-        byte[] bytes = bodyOf(body);
-        return ResponseEntity.status(status).contentType(MediaType.APPLICATION_JSON)
-                .body(out -> out.write(bytes));
+    private static ResponseEntity<byte[]> json(HttpStatus status, String body, String retryAfter) {
+        ResponseEntity.BodyBuilder out = ResponseEntity.status(status)
+                .contentType(MediaType.APPLICATION_JSON)
+                .header(HttpHeaders.CACHE_CONTROL, "no-store");
+        if (retryAfter != null) {
+            out = out.header(HttpHeaders.RETRY_AFTER, retryAfter);
+        }
+        return out.body(body.getBytes(StandardCharsets.UTF_8));
     }
 
     /** Honour the upstream's content type when it is a usable one, else the caller's expectation. */

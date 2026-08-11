@@ -1,8 +1,11 @@
 package app.feedgateway.stockgex;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -25,8 +28,12 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.Test;
@@ -45,6 +52,12 @@ import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBo
  * the upstream's {@code id:} lines drive a strict resume contract, so the bytes must arrive unedited and
  * the client's {@code Last-Event-ID} must actually reach the upstream.
  *
+ * <p>The other half is RESOURCE OWNERSHIP. A live stream owns an MVC async thread, a semaphore permit and
+ * an upstream exchange for hours, and three unrelated things can end it — the pump, the servlet async
+ * lifecycle, and the idle watchdog. These tests drive each of those independently, including the case
+ * where the streaming body is returned and then NEVER INVOKED, which is what happens when the executor
+ * rejects the task or the container abandons the dispatch.
+ *
  * <p>Tests drive the real {@link StockGexUpstream} over a stubbed {@link HttpClient} rather than mocking
  * the upstream, so URL construction, header forwarding and timeout shape are covered too.
  */
@@ -56,27 +69,47 @@ class StockGexControllerTest {
 
     // ---------------------------------------------------------------- helpers
 
+    /** Captures the cleanup the controller binds to the servlet async lifecycle, so a test can fire it. */
+    private static final class CapturingRegistrar implements StockGexController.AsyncCleanupRegistrar {
+        private final List<Runnable> cleanups = new ArrayList<>();
+
+        @Override
+        public void onAsyncCompletion(jakarta.servlet.http.HttpServletRequest request, Runnable cleanup) {
+            cleanups.add(cleanup);
+        }
+
+        void fireAll() {
+            cleanups.forEach(Runnable::run);
+        }
+    }
+
     private static LiquidityHistoryAuth authReturning(int status) {
         LiquidityHistoryAuth auth = mock(LiquidityHistoryAuth.class);
         when(auth.authenticate(any())).thenReturn(new LiquidityHistoryAuth.Result(status, "tester"));
         return auth;
     }
 
-    private static HttpHeaders headers(String contentType) {
-        Map<String, List<String>> map = contentType == null
-                ? Map.of() : Map.of("content-type", List.of(contentType));
+    private static HttpHeaders headers(Map<String, List<String>> map) {
         return HttpHeaders.of(map, (k, v) -> true);
     }
 
+    private static HttpHeaders contentType(String value) {
+        return headers(value == null ? Map.of() : Map.of("content-type", List.of(value)));
+    }
+
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private static HttpClient clientReturning(int status, String contentType, String body) throws Exception {
+    private static HttpClient clientReturning(int status, HttpHeaders headers, byte[] body) throws Exception {
         HttpClient http = mock(HttpClient.class);
         HttpResponse resp = mock(HttpResponse.class);
         when(resp.statusCode()).thenReturn(status);
-        when(resp.headers()).thenReturn(headers(contentType));
-        when(resp.body()).thenReturn(body.getBytes(StandardCharsets.UTF_8));
+        when(resp.headers()).thenReturn(headers);
+        when(resp.body()).thenReturn(new ByteArrayInputStream(body));
         when(http.send(any(HttpRequest.class), any())).thenReturn(resp);
         return http;
+    }
+
+    private static HttpClient clientReturning(int status, String contentType, String body) throws Exception {
+        return clientReturning(status, contentType(contentType), body.getBytes(StandardCharsets.UTF_8));
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -84,20 +117,24 @@ class StockGexControllerTest {
         HttpClient http = mock(HttpClient.class);
         HttpResponse resp = mock(HttpResponse.class);
         when(resp.statusCode()).thenReturn(status);
-        when(resp.headers()).thenReturn(headers(contentType));
+        when(resp.headers()).thenReturn(contentType(contentType));
         when(resp.body()).thenReturn(body);
         when(http.send(any(HttpRequest.class), any())).thenReturn(resp);
         return http;
     }
 
-    private static StockGexController controller(HttpClient http, int authStatus) {
-        return controller(http, authStatus, StockGexController.MAX_CONCURRENT_STREAMS);
+    private static StockGexUpstream upstream(HttpClient http) {
+        return new StockGexUpstream("http://stock-gex-service:8021/", Duration.ofSeconds(5), http);
     }
 
-    private static StockGexController controller(HttpClient http, int authStatus, int maxStreams) {
-        StockGexUpstream upstream =
-                new StockGexUpstream("http://stock-gex-service:8021/", Duration.ofSeconds(5), http);
-        return new StockGexController(upstream, authReturning(authStatus), new ObjectMapper(), maxStreams);
+    private static StockGexController controller(HttpClient http, int authStatus) {
+        return controller(http, authStatus, StockGexController.MAX_CONCURRENT_STREAMS, new CapturingRegistrar());
+    }
+
+    private static StockGexController controller(HttpClient http, int authStatus, int maxStreams,
+                                                 StockGexController.AsyncCleanupRegistrar registrar) {
+        return new StockGexController(upstream(http), authReturning(authStatus), new ObjectMapper(),
+                maxStreams, registrar);
     }
 
     private static String bodyText(ResponseEntity<byte[]> res) {
@@ -116,6 +153,33 @@ class StockGexControllerTest {
         return req.getValue();
     }
 
+    /** Run the stream handler and return whatever it answered — a stream, or a refusal. */
+    private static Object streamOutcome(StockGexController controller, String symbol, String lastEventId,
+                                        String authorization) {
+        try {
+            return controller.stream(null, symbol, lastEventId, authorization);
+        } catch (StockGexController.StockGexRefusal refusal) {
+            return controller.refused(refusal);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ResponseEntity<byte[]> refusalOf(Object outcome) {
+        assertTrue(outcome instanceof ResponseEntity, "expected a response");
+        ResponseEntity<?> res = (ResponseEntity<?>) outcome;
+        assertTrue(res.getBody() == null || res.getBody() instanceof byte[],
+                "a refusal must be a SYNCHRONOUS byte[] body — a StreamingResponseBody would need the "
+                + "very async executor whose exhaustion it is reporting");
+        return (ResponseEntity<byte[]>) res;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ResponseEntity<StreamingResponseBody> liveStream(Object outcome) {
+        ResponseEntity<?> res = (ResponseEntity<?>) outcome;
+        assertTrue(res.getBody() instanceof StreamingResponseBody, "expected a live stream");
+        return (ResponseEntity<StreamingResponseBody>) res;
+    }
+
     // ---------------------------------------------------------------- board
 
     @Test
@@ -131,23 +195,37 @@ class StockGexControllerTest {
     }
 
     @Test
+    void aLiveBoardIsNeverCacheable() throws Exception {
+        // A board is a measurement of a moving market. Any intermediary replaying one would be showing
+        // a number that was true at a moment it does not name.
+        ResponseEntity<byte[]> res =
+                controller(clientReturning(200, "application/json", BOARD_JSON), 200).board("TSLA", "Bearer t");
+        assertTrue(res.getHeaders().getCacheControl().contains("no-store"), res.getHeaders().toString());
+    }
+
+    @Test
+    void arbitraryBytesSurviveByteForByte() throws Exception {
+        // "Verbatim" has to mean verbatim for BYTES. Carrying the body as a String makes the response
+        // charset a guess by a message converter, and neither of these payloads survives a guess:
+        // one is not valid UTF-8 at all, and the other contains a NUL.
+        byte[] hostile = {0x7B, (byte) 0xFF, (byte) 0xFE, 0x00, 0x41, (byte) 0xC3, 0x28, 0x7D};
+        HttpClient http = clientReturning(200, contentType("application/octet-stream"), hostile);
+
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+
+        assertArrayEquals(hostile, res.getBody(),
+                "no charset may be applied to a body this proxy promised to carry unchanged");
+    }
+
+    @Test
     void aNonAsciiBodySurvivesByteForByte() throws Exception {
-        // "Verbatim" has to mean verbatim for BYTES, not for ASCII. Carrying the body as a String makes
-        // the response charset a guess by a message converter (ISO-8859-1 for anything it does not
-        // recognise as JSON), and a stateReason with a non-ASCII character would arrive mangled.
         String body = "{\"error\":\"BAD_SYMBOL\",\"detail\":\"unknown root — try TSLA · 「日本」\"}";
         HttpClient http = clientReturning(400, "text/plain; charset=utf-8", body);
 
         ResponseEntity<byte[]> res = controller(http, 200).board("ZZZZ", "Bearer t");
 
         assertEquals(400, res.getStatusCode().value());
-        assertArrayEqualsUtf8(body, res.getBody());
-    }
-
-    private static void assertArrayEqualsUtf8(String expected, byte[] actual) {
-        assertEquals(expected, new String(actual, StandardCharsets.UTF_8));
-        assertEquals(expected.getBytes(StandardCharsets.UTF_8).length, actual.length,
-                "byte length must be identical — no charset was allowed to re-encode the body");
+        assertArrayEquals(body.getBytes(StandardCharsets.UTF_8), res.getBody());
     }
 
     @Test
@@ -164,6 +242,8 @@ class StockGexControllerTest {
             {"503", "{\"error\":\"BOARD_SUBSCRIBE_FAILED\"}"},
             {"503", "{\"error\":\"SHUTTING_DOWN\"}"},
             {"503", "{\"error\":\"SSE_CLIENT_LIMIT\"}"},
+            {"302", "{\"error\":\"MOVED\"}"},
+            {"204", ""},
         };
         for (String[] c : cases) {
             int status = Integer.parseInt(c[0]);
@@ -172,6 +252,81 @@ class StockGexControllerTest {
             assertEquals(status, res.getStatusCode().value(), "status must pass through: " + c[1]);
             assertEquals(c[1], bodyText(res), "body must pass through byte-for-byte");
         }
+    }
+
+    @Test
+    void theUpstreamsOwnRetryAfterIsCarriedThroughRatherThanGuessedAt() throws Exception {
+        HttpClient http = clientReturning(429,
+                headers(Map.of("content-type", List.of("application/json"), "retry-after", List.of("30"))),
+                "{\"error\":\"MAX_SYMBOLS\"}".getBytes(StandardCharsets.UTF_8));
+
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+
+        assertEquals("30", res.getHeaders().getFirst("Retry-After"),
+                "the service already said how long to wait; the page should not have to invent it");
+    }
+
+    @Test
+    void aMissingOrMalformedUpstreamContentTypeFallsBackRatherThanFailing() throws Exception {
+        for (String bad : new String[]{null, "", "not/a/media/type", "///"}) {
+            HttpClient http = clientReturning(200, contentType(bad), BOARD_JSON.getBytes(StandardCharsets.UTF_8));
+            ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+            assertEquals(200, res.getStatusCode().value(), "content-type: " + bad);
+            assertEquals(MediaType.APPLICATION_JSON, res.getHeaders().getContentType(), "content-type: " + bad);
+            assertEquals(BOARD_JSON, bodyText(res));
+        }
+    }
+
+    @Test
+    void aBoardBiggerThanTheCapIsAnHonest502NotATruncatedBoard() throws Exception {
+        // A prefix of a board delivered under the upstream's own 200 is the worst possible answer: the
+        // page would parse it and render whatever survived the cut as if it were the whole market.
+        byte[] huge = new byte[StockGexUpstream.MAX_BOARD_BYTES + 1];
+        java.util.Arrays.fill(huge, (byte) 'x');
+        HttpClient http = clientReturning(200, contentType("application/json"), huge);
+
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+
+        assertEquals(502, res.getStatusCode().value());
+        assertEquals("UPSTREAM_PROTOCOL_ERROR",
+                new ObjectMapper().readTree(res.getBody()).get("error").asText());
+    }
+
+    @Test
+    void aBodyThatFailsMidReadIsA502NotTheUpstreamStatusWithAnEmptyBody() throws Exception {
+        InputStream broken = new InputStream() {
+            private int served = 0;
+
+            @Override
+            public int read() throws IOException {
+                throw new IOException("connection reset");
+            }
+
+            @Override
+            public int read(byte[] b, int off, int len) throws IOException {
+                if (served++ == 0) {
+                    b[off] = '{';
+                    return 1;
+                }
+                throw new IOException("connection reset");
+            }
+        };
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        HttpClient http = mock(HttpClient.class);
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        HttpResponse resp = mock(HttpResponse.class);
+        when(resp.statusCode()).thenReturn(422);
+        when(resp.headers()).thenReturn(contentType("application/json"));
+        when(resp.body()).thenReturn(broken);
+        when(http.send(any(HttpRequest.class), any())).thenReturn(resp);
+
+        ResponseEntity<byte[]> res = controller(http, 200).board("ZZZZ", "Bearer t");
+
+        // NOT 422-with-an-empty-body: that would be this gateway inventing an answer and signing it with
+        // the upstream's status. The page would read "outside coverage" from a body we never received.
+        assertEquals(502, res.getStatusCode().value());
+        assertEquals("UPSTREAM_PROTOCOL_ERROR",
+                new ObjectMapper().readTree(res.getBody()).get("error").asText());
     }
 
     @Test
@@ -187,7 +342,6 @@ class StockGexControllerTest {
         assertEquals(502, res.getStatusCode().value());
         JsonNode body = new ObjectMapper().readTree(res.getBody());
         // Shape matches the stock-gex service's own envelope: `error` is the CODE, `detail` the sentence.
-        // The page has one error reader; a differently-shaped envelope reads as an unknown failure.
         assertEquals("UPSTREAM_UNAVAILABLE", body.get("error").asText());
         assertEquals("UPSTREAM_UNAVAILABLE", body.get("code").asText());
         assertNotNull(body.get("detail"));
@@ -196,25 +350,48 @@ class StockGexControllerTest {
     }
 
     @Test
-    void aMisconfiguredBaseUrlIsA502NotA500() throws Exception {
-        // A base URL with no scheme makes the JDK client throw IllegalArgumentException, which is NOT an
-        // IOException. Unhandled it becomes a 500 with a stack trace on the browser's side; the page has
-        // no entry for that. It is a configuration fault, and "cannot reach the board service" is the
-        // honest, renderable answer.
+    void anExceptionWhileBUILDINGTheRequestIsA502NotA500() throws Exception {
+        // Request construction — newBuilder, header validation, build — throws IllegalArgumentException,
+        // which is NOT an IOException. Outside the mapped block it reaches the browser as a 500 with a
+        // stack trace, and the page has no entry for that.
         HttpClient http = mock(HttpClient.class);
-        StockGexUpstream upstream =
+        StockGexUpstream misconfigured =
                 new StockGexUpstream("stock-gex-service:8021", Duration.ofSeconds(5), http);
-        StockGexController controller =
-                new StockGexController(upstream, authReturning(200), new ObjectMapper());
+        StockGexController controller = new StockGexController(
+                misconfigured, authReturning(200), new ObjectMapper(), 4, new CapturingRegistrar());
 
         ResponseEntity<byte[]> board = controller.board("TSLA", "Bearer t");
         assertEquals(502, board.getStatusCode().value());
         assertEquals("UPSTREAM_UNAVAILABLE",
                 new ObjectMapper().readTree(board.getBody()).get("error").asText());
 
-        ResponseEntity<StreamingResponseBody> stream = controller.stream("TSLA", null, "Bearer t");
+        ResponseEntity<byte[]> stream = refusalOf(streamOutcome(controller, "TSLA", null, "Bearer t"));
         assertEquals(502, stream.getStatusCode().value());
         verifyNoInteractions(http);
+    }
+
+    @Test
+    void anIllegalArgumentFromSENDIsAlsoA502NotA500() throws Exception {
+        // The JDK client itself throws IllegalArgumentException for some addresses it will not accept.
+        HttpClient http = mock(HttpClient.class);
+        when(http.send(any(HttpRequest.class), any()))
+                .thenThrow(new IllegalArgumentException("URI with undefined scheme"));
+
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+
+        assertEquals(502, res.getStatusCode().value());
+        assertFalse(bodyText(res).contains("IllegalArgument"), "no exception class in the body");
+    }
+
+    @Test
+    void aBlankBaseUrlDoesNotStopTheGatewayBootingAndAnswersA502PerRequest() {
+        // A gateway that refuses to start because ONE feature is misconfigured takes market data down
+        // with it. The board endpoint answering 502 is a state the page renders.
+        StockGexUpstream blank = new StockGexUpstream("   ", Duration.ofSeconds(5), mock(HttpClient.class));
+        StockGexController controller =
+                new StockGexController(blank, authReturning(200), new ObjectMapper(), 4, new CapturingRegistrar());
+
+        assertEquals(502, controller.board("TSLA", "Bearer t").getStatusCode().value());
     }
 
     @Test
@@ -222,102 +399,27 @@ class StockGexControllerTest {
         for (int status : new int[]{401, 403}) {
             HttpClient http = mock(HttpClient.class);
             assertEquals(status, controller(http, status).board("TSLA", null).getStatusCode().value());
-            assertEquals(status, controller(http, status).stream("TSLA", null, null).getStatusCode().value());
+            assertEquals(status,
+                    refusalOf(streamOutcome(controller(http, status), "TSLA", null, null))
+                            .getStatusCode().value());
             verifyNoInteractions(http);
         }
     }
 
     @Test
-    void aRefusedRequestNeverConsumesAStreamSlot() throws Exception {
-        // Auth failures and oversized symbols are answered before the permit is taken, and every early
-        // exit after it is taken releases it. A leaked permit is a slot this gateway never gets back.
-        HttpClient http = clientStreaming(200, "text/event-stream", new ByteArrayInputStream(new byte[0]));
-        StockGexController denied = controller(http, 401, 1);
-        denied.stream("TSLA", null, null);
-        assertEquals(1, denied.streamSlots.availablePermits(), "a 401 must not consume a slot");
-
-        StockGexController tooLong = controller(http, 200, 1);
-        tooLong.stream("T".repeat(64), null, "Bearer t");
-        assertEquals(1, tooLong.streamSlots.availablePermits(), "a rejected symbol must not consume a slot");
-    }
-
-    @Test
-    void aRejectedSubscribeAndAnUnreachableUpstreamBothReturnTheSlot() throws Exception {
-        StockGexController rejected = controller(
-                clientStreaming(429, "application/json",
-                        new ByteArrayInputStream("{\"error\":\"MAX_SYMBOLS\"}".getBytes(StandardCharsets.UTF_8))),
-                200, 1);
-        rejected.stream("TSLA", null, "Bearer t");
-        assertEquals(1, rejected.streamSlots.availablePermits(),
-                "an upstream refusal is not a live stream, so its slot must come straight back");
-
-        HttpClient dead = mock(HttpClient.class);
-        when(dead.send(any(HttpRequest.class), any())).thenThrow(new IOException("connect timed out"));
-        StockGexController unreachable = controller(dead, 200, 1);
-        unreachable.stream("TSLA", null, "Bearer t");
-        assertEquals(1, unreachable.streamSlots.availablePermits());
-    }
-
-    @Test
-    void streamsBeyondTheCapAreRefusedImmediatelyWithACodeThePageKnows() throws Exception {
-        // The failure this prevents is NOT "one user gets a slow board": an async response that cannot
-        // get a thread does not fail, it queues, and with spring.mvc.async.request-timeout=-1 it queues
-        // forever, having answered nothing at all. Refusing at the door is the only loud option.
-        HttpClient http = clientStreaming(200, "text/event-stream",
-                new ByteArrayInputStream("id: 1\ndata: {}\n\n".getBytes(StandardCharsets.UTF_8)));
-        StockGexController controller = controller(http, 200, 1);
-
-        ResponseEntity<StreamingResponseBody> first = controller.stream("TSLA", null, "Bearer t");
-        assertEquals(200, first.getStatusCode().value());
-
-        ResponseEntity<StreamingResponseBody> refused = controller.stream("AAPL", null, "Bearer t");
-        assertEquals(503, refused.getStatusCode().value());
-        assertEquals("5", refused.getHeaders().getFirst("Retry-After"));
-        JsonNode body = new ObjectMapper().readTree(drain(refused));
-        assertEquals("SSE_CLIENT_LIMIT", body.get("error").asText(),
-                "reuse the upstream's own vocabulary — the page already renders this one");
-
-        // Draining the first stream ends it, and the slot must come back for the next client.
-        drain(first);
-        assertEquals(1, controller.streamSlots.availablePermits());
-    }
-
-    @Test
-    void aStreamThatBlowsUpMidPumpStillReturnsItsSlot() throws Exception {
-        // A RuntimeException out of the servlet output stream is not the expected failure mode, which is
-        // exactly why the release must not be written only for the expected one.
-        StockGexController controller = controller(
-                clientStreaming(200, "text/event-stream",
-                        new ByteArrayInputStream("data: x\n\n".getBytes(StandardCharsets.UTF_8))),
-                200, 1);
-        ResponseEntity<StreamingResponseBody> res = controller.stream("TSLA", null, "Bearer t");
-        assertEquals(0, controller.streamSlots.availablePermits());
-
-        OutputStream exploding = new OutputStream() {
-            @Override
-            public void write(int b) {
-                throw new IllegalStateException("container went away");
-            }
-
-            @Override
-            public void write(byte[] b, int off, int len) {
-                throw new IllegalStateException("container went away");
-            }
-        };
-        try {
-            res.getBody().writeTo(exploding);
-        } catch (RuntimeException expected) {
-            // propagated on purpose: an unexpected fault is not something to swallow
-        }
-        assertEquals(1, controller.streamSlots.availablePermits());
+    void theSymbolIsUrlEncodedAndOTHERWISEUNTOUCHED() throws Exception {
+        HttpClient http = clientReturning(400, "application/json", "{\"error\":\"BAD_SYMBOL\"}");
+        controller(http, 200).board(" tsla ", "Bearer t");
+        // Not trimmed, not upper-cased. The upstream owns BAD_SYMBOL, and a gateway that quietly
+        // rewrites the symbol makes the service judge something the user never typed.
+        assertEquals("http://stock-gex-service:8021/api/stock-gex/board?symbol=+tsla+",
+                capturedRequest(http).uri().toString());
     }
 
     @Test
     void theSymbolIsUrlEncodedRatherThanTrustedIntoTheQueryString() throws Exception {
         HttpClient http = clientReturning(400, "application/json", "{\"error\":\"BAD_SYMBOL\"}");
         controller(http, 200).board("A B&x=1", "Bearer t");
-        // The upstream owns BAD_SYMBOL; our job is only to make sure what it judges is what was asked
-        // for, not a second parameter we accidentally injected.
         assertEquals("http://stock-gex-service:8021/api/stock-gex/board?symbol=A+B%26x%3D1",
                 capturedRequest(http).uri().toString());
     }
@@ -332,6 +434,17 @@ class StockGexControllerTest {
         verifyNoInteractions(http);
     }
 
+    @Test
+    void bothCallsRefuseTransferEncodingSoNothingArrivesCompressedAndUnlabelled() throws Exception {
+        HttpClient board = clientReturning(200, "application/json", BOARD_JSON);
+        controller(board, 200).board("TSLA", "Bearer t");
+        assertEquals("identity", capturedRequest(board).headers().firstValue("Accept-Encoding").orElse(""));
+
+        HttpClient stream = clientStreaming(200, "text/event-stream", new ByteArrayInputStream(new byte[0]));
+        streamOutcome(controller(stream, 200), "TSLA", null, "Bearer t");
+        assertEquals("identity", capturedRequest(stream).headers().firstValue("Accept-Encoding").orElse(""));
+    }
+
     // ---------------------------------------------------------------- stream
 
     @Test
@@ -339,7 +452,8 @@ class StockGexControllerTest {
         HttpClient http = clientStreaming(200, "text/event-stream",
                 new ByteArrayInputStream("id: 7\ndata: {}\n\n".getBytes(StandardCharsets.UTF_8)));
 
-        ResponseEntity<StreamingResponseBody> res = controller(http, 200).stream("TSLA", null, "Bearer t");
+        ResponseEntity<StreamingResponseBody> res =
+                liveStream(streamOutcome(controller(http, 200), "TSLA", null, "Bearer t"));
 
         assertEquals(200, res.getStatusCode().value());
         assertEquals(MediaType.TEXT_EVENT_STREAM, res.getHeaders().getContentType());
@@ -358,7 +472,8 @@ class StockGexControllerTest {
         HttpClient http = clientStreaming(200, "text/event-stream",
                 new ByteArrayInputStream(sse.getBytes(StandardCharsets.UTF_8)));
 
-        ResponseEntity<StreamingResponseBody> res = controller(http, 200).stream("TSLA", null, "Bearer t");
+        ResponseEntity<StreamingResponseBody> res =
+                liveStream(streamOutcome(controller(http, 200), "TSLA", null, "Bearer t"));
 
         assertEquals(sse, new String(drain(res), StandardCharsets.UTF_8));
     }
@@ -368,7 +483,7 @@ class StockGexControllerTest {
         HttpClient http = clientStreaming(200, "text/event-stream",
                 new ByteArrayInputStream(new byte[0]));
 
-        controller(http, 200).stream("TSLA", "42", "Bearer t");
+        streamOutcome(controller(http, 200), "TSLA", "42", "Bearer t");
 
         HttpRequest req = capturedRequest(http);
         assertEquals("42", req.headers().firstValue("Last-Event-ID").orElse(""));
@@ -376,31 +491,97 @@ class StockGexControllerTest {
     }
 
     @Test
-    void aMalformedLastEventIdIsDroppedRatherThanForwardedOrRejected() throws Exception {
-        // Forwarding a header with a newline throws on header validation, turning a resumable reconnect
-        // into an error page. Dropping it degrades to a full reset snapshot, which is always correct.
-        for (String hostile : new String[]{"42\r\nX-Injected: 1", "  ", " ", "9".repeat(300)}) {
+    void anEventIdIsForwardedEXACTLYOrNotAtAll() throws Exception {
+        // The id is an opaque token the upstream minted and keys its replay buffer on. Trimming " 42 "
+        // into "42" would resume from an id the upstream may never have issued; dropping it costs one
+        // full reset snapshot, which is always a correct answer.
+        for (String hostile : new String[]{"42\r\nX-Injected: 1", "  ", " ", "9".repeat(300), " 42", "42 ", ""}) {
             HttpClient http = clientStreaming(200, "text/event-stream", new ByteArrayInputStream(new byte[0]));
-            ResponseEntity<StreamingResponseBody> res = controller(http, 200).stream("TSLA", hostile, "Bearer t");
-            assertEquals(200, res.getStatusCode().value(), "must not fail the request: " + hostile);
+            Object outcome = streamOutcome(controller(http, 200), "TSLA", hostile, "Bearer t");
+            assertEquals(200, ((ResponseEntity<?>) outcome).getStatusCode().value(),
+                    "must not fail the request: [" + hostile + "]");
             assertTrue(capturedRequest(http).headers().firstValue("Last-Event-ID").isEmpty(),
-                    "hostile id must not reach the upstream: " + hostile);
+                    "an id that is not exactly forwardable must be dropped, not rewritten: [" + hostile + "]");
+        }
+
+        HttpClient good = clientStreaming(200, "text/event-stream", new ByteArrayInputStream(new byte[0]));
+        streamOutcome(controller(good, 200), "TSLA", "sess-7:41", "Bearer t");
+        assertEquals("sess-7:41", capturedRequest(good).headers().firstValue("Last-Event-ID").orElse(""));
+    }
+
+    @Test
+    void everyNon200IncludingOther2xxIsPassedThroughWithItsOwnStatus() throws Exception {
+        // ok() used to mean "any 2xx", which rewrote a 204 or 206 to 200 AND presented it to the browser
+        // as a live event stream that would never emit an event.
+        int[] statuses = {204, 206, 302, 400, 409, 422, 429, 500, 503};
+        for (int status : statuses) {
+            String body = "{\"error\":\"CODE_" + status + "\"}";
+            HttpClient http = clientStreaming(status, "application/json",
+                    new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
+
+            ResponseEntity<byte[]> res =
+                    refusalOf(streamOutcome(controller(http, 200), "TSLA", null, "Bearer t"));
+
+            assertEquals(status, res.getStatusCode().value(), "status must survive: " + status);
+            assertEquals(body, new String(res.getBody(), StandardCharsets.UTF_8));
         }
     }
 
     @Test
-    void aRejectedSubscribeKeepsTheUpstreamStatusAndBodyToo() throws Exception {
-        // The stream endpoint has the same contract as the board: capacity and universe errors are
-        // answered on the subscribe, and the page branches on them identically.
-        String body = "{\"error\":\"MAX_SYMBOLS\",\"limit\":25}";
-        HttpClient http = clientStreaming(429, "application/json",
-                new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
+    void aRedirectIsPassedThroughWithoutItsLocation() throws Exception {
+        HttpClient http = mock(HttpClient.class);
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        HttpResponse resp = mock(HttpResponse.class);
+        when(resp.statusCode()).thenReturn(302);
+        when(resp.headers()).thenReturn(headers(Map.of(
+                "content-type", List.of("text/html"),
+                "location", List.of("http://stock-gex-service.internal:8021/elsewhere"))));
+        when(resp.body()).thenReturn(new ByteArrayInputStream("moved".getBytes(StandardCharsets.UTF_8)));
+        when(http.send(any(HttpRequest.class), any())).thenReturn(resp);
 
-        ResponseEntity<StreamingResponseBody> res = controller(http, 200).stream("TSLA", null, "Bearer t");
+        ResponseEntity<byte[]> res = refusalOf(streamOutcome(controller(http, 200), "TSLA", null, "Bearer t"));
+
+        assertEquals(302, res.getStatusCode().value());
+        // Forwarding it would name an internal host to the browser, and this endpoint's contract is a
+        // board or an error — never a redirect somewhere else.
+        assertNull(res.getHeaders().getFirst("Location"),
+                "an internal Location must not be handed to the browser");
+        assertFalse(new String(res.getBody(), StandardCharsets.UTF_8).contains("internal")
+                        || res.getHeaders().toString().contains("internal"),
+                "no internal hostname anywhere in the response");
+    }
+
+    @Test
+    void aStreamErrorBodyOverTheCapIsAnHonest502NotATruncatedEnvelope() throws Exception {
+        byte[] huge = new byte[StockGexUpstream.MAX_ERROR_BYTES + 1];
+        java.util.Arrays.fill(huge, (byte) 'x');
+        HttpClient http = clientStreaming(503, "application/json", new ByteArrayInputStream(huge));
+
+        ResponseEntity<byte[]> res = refusalOf(streamOutcome(controller(http, 200), "TSLA", null, "Bearer t"));
+
+        assertEquals(502, res.getStatusCode().value());
+        assertEquals("UPSTREAM_PROTOCOL_ERROR",
+                new ObjectMapper().readTree(res.getBody()).get("error").asText());
+    }
+
+    @Test
+    void aRejectedSubscribeKeepsTheUpstreamStatusBodyAndRetryAfter() throws Exception {
+        String body = "{\"error\":\"MAX_SYMBOLS\",\"limit\":25}";
+        HttpClient http = mock(HttpClient.class);
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        HttpResponse resp = mock(HttpResponse.class);
+        when(resp.statusCode()).thenReturn(429);
+        when(resp.headers()).thenReturn(headers(Map.of(
+                "content-type", List.of("application/json"), "retry-after", List.of("12"))));
+        when(resp.body()).thenReturn(new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
+        when(http.send(any(HttpRequest.class), any())).thenReturn(resp);
+
+        ResponseEntity<byte[]> res = refusalOf(streamOutcome(controller(http, 200), "TSLA", null, "Bearer t"));
 
         assertEquals(429, res.getStatusCode().value());
         assertEquals(MediaType.APPLICATION_JSON, res.getHeaders().getContentType());
-        assertEquals(body, new String(drain(res), StandardCharsets.UTF_8));
+        assertEquals(body, new String(res.getBody(), StandardCharsets.UTF_8));
+        assertEquals("12", res.getHeaders().getFirst("Retry-After"));
     }
 
     @Test
@@ -408,12 +589,86 @@ class StockGexControllerTest {
         HttpClient http = mock(HttpClient.class);
         when(http.send(any(HttpRequest.class), any())).thenThrow(new IOException("connect timed out"));
 
-        ResponseEntity<StreamingResponseBody> res = controller(http, 200).stream("TSLA", null, "Bearer t");
+        ResponseEntity<byte[]> res = refusalOf(streamOutcome(controller(http, 200), "TSLA", null, "Bearer t"));
 
         assertEquals(502, res.getStatusCode().value());
         assertEquals(MediaType.APPLICATION_JSON, res.getHeaders().getContentType());
-        JsonNode parsed = new ObjectMapper().readTree(drain(res));
-        assertEquals("UPSTREAM_UNAVAILABLE", parsed.get("error").asText());
+        assertEquals("UPSTREAM_UNAVAILABLE",
+                new ObjectMapper().readTree(res.getBody()).get("error").asText());
+    }
+
+    // ---------------------------------------------------------------- ownership
+
+    @Test
+    void aRefusedRequestNeverConsumesAStreamSlot() throws Exception {
+        HttpClient http = clientStreaming(200, "text/event-stream", new ByteArrayInputStream(new byte[0]));
+        StockGexController denied = controller(http, 401, 1, new CapturingRegistrar());
+        streamOutcome(denied, "TSLA", null, null);
+        assertEquals(1, denied.streamSlots.availablePermits(), "a 401 must not consume a slot");
+
+        StockGexController tooLong = controller(http, 200, 1, new CapturingRegistrar());
+        streamOutcome(tooLong, "T".repeat(64), null, "Bearer t");
+        assertEquals(1, tooLong.streamSlots.availablePermits(), "a rejected symbol must not consume a slot");
+    }
+
+    @Test
+    void aRejectedSubscribeAndAnUnreachableUpstreamBothReturnTheSlot() throws Exception {
+        StockGexController rejected = controller(
+                clientStreaming(429, "application/json",
+                        new ByteArrayInputStream("{\"error\":\"MAX_SYMBOLS\"}".getBytes(StandardCharsets.UTF_8))),
+                200, 1, new CapturingRegistrar());
+        streamOutcome(rejected, "TSLA", null, "Bearer t");
+        assertEquals(1, rejected.streamSlots.availablePermits(),
+                "an upstream refusal is not a live stream, so its slot must come straight back");
+
+        HttpClient dead = mock(HttpClient.class);
+        when(dead.send(any(HttpRequest.class), any())).thenThrow(new IOException("connect timed out"));
+        StockGexController unreachable = controller(dead, 200, 1, new CapturingRegistrar());
+        streamOutcome(unreachable, "TSLA", null, "Bearer t");
+        assertEquals(1, unreachable.streamSlots.availablePermits());
+    }
+
+    @Test
+    void aStreamingBodyThatIsNEVERINVOKEDStillReleasesTheSlotAndClosesTheUpstream() throws Exception {
+        // THE case that a `finally` inside writeTo cannot cover. If the MVC async executor rejects the
+        // task, or the container abandons the dispatch, or the client vanishes during async setup, the
+        // body is never called at all — and without a lifecycle binding the permit and the upstream
+        // exchange are gone until the JVM restarts.
+        AtomicBoolean closed = new AtomicBoolean(false);
+        InputStream upstreamBody = closeRecording(closed, "id: 1\ndata: {}\n\n");
+        CapturingRegistrar registrar = new CapturingRegistrar();
+        StockGexController controller =
+                controller(clientStreaming(200, "text/event-stream", upstreamBody), 200, 1, registrar);
+
+        Object outcome = streamOutcome(controller, "TSLA", null, "Bearer t");
+        liveStream(outcome); // returned, and then deliberately never written to
+        assertEquals(0, controller.streamSlots.availablePermits(), "the slot is held while the stream lives");
+
+        registrar.fireAll(); // the servlet async lifecycle completing without the body ever running
+
+        assertTrue(closed.get(), "the upstream exchange must be closed");
+        assertEquals(1, controller.streamSlots.availablePermits(), "and the slot must come back");
+    }
+
+    @Test
+    void theLeaseIsReleasedExactlyOnceHoweverManyThingsEndTheStream() throws Exception {
+        // The pump, the async lifecycle and the idle watchdog can all fire, in any order. A permit
+        // released twice hands out capacity this gateway does not have.
+        AtomicBoolean closed = new AtomicBoolean(false);
+        InputStream upstreamBody = closeRecording(closed, "data: x\n\n");
+        CapturingRegistrar registrar = new CapturingRegistrar();
+        StockGexController controller =
+                controller(clientStreaming(200, "text/event-stream", upstreamBody), 200, 1, registrar);
+
+        ResponseEntity<StreamingResponseBody> res =
+                liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
+        drain(res);            // pump completes -> release
+        registrar.fireAll();   // lifecycle completes -> release again
+        registrar.fireAll();   // and again, for good measure
+
+        assertEquals(1, controller.streamSlots.availablePermits(),
+                "the permit count must be exactly the cap, not more");
+        assertTrue(closed.get());
     }
 
     @Test
@@ -421,17 +676,11 @@ class StockGexControllerTest {
         // The upstream caps concurrent SSE clients. A browser tab closing must release that slot, or the
         // service runs out of listeners after N navigations and answers MAX_SYMBOLS to everyone.
         AtomicBoolean closed = new AtomicBoolean(false);
-        InputStream upstreamBody = new ByteArrayInputStream(
-                "id: 1\ndata: {}\n\n".getBytes(StandardCharsets.UTF_8)) {
-            @Override
-            public void close() throws IOException {
-                closed.set(true);
-                super.close();
-            }
-        };
-        HttpClient http = clientStreaming(200, "text/event-stream", upstreamBody);
-        StockGexController controller = controller(http, 200, 1);
-        ResponseEntity<StreamingResponseBody> res = controller.stream("TSLA", null, "Bearer t");
+        InputStream upstreamBody = closeRecording(closed, "id: 1\ndata: {}\n\n");
+        StockGexController controller = controller(
+                clientStreaming(200, "text/event-stream", upstreamBody), 200, 1, new CapturingRegistrar());
+        ResponseEntity<StreamingResponseBody> res =
+                liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
 
         OutputStream deadClient = new OutputStream() {
             @Override
@@ -452,35 +701,159 @@ class StockGexControllerTest {
     }
 
     @Test
-    void aNormallyEndedStreamAlsoClosesTheUpstream() throws Exception {
+    void aStreamThatBlowsUpMidPumpStillReturnsItsSlot() throws Exception {
         AtomicBoolean closed = new AtomicBoolean(false);
-        InputStream upstreamBody = new ByteArrayInputStream("data: bye\n\n".getBytes(StandardCharsets.UTF_8)) {
+        StockGexController controller = controller(
+                clientStreaming(200, "text/event-stream", closeRecording(closed, "data: x\n\n")),
+                200, 1, new CapturingRegistrar());
+        ResponseEntity<StreamingResponseBody> res =
+                liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
+        assertEquals(0, controller.streamSlots.availablePermits());
+
+        OutputStream exploding = new OutputStream() {
             @Override
-            public void close() throws IOException {
-                closed.set(true);
-                super.close();
+            public void write(int b) {
+                throw new IllegalStateException("container went away");
+            }
+
+            @Override
+            public void write(byte[] b, int off, int len) {
+                throw new IllegalStateException("container went away");
             }
         };
-        ResponseEntity<StreamingResponseBody> res =
-                controller(clientStreaming(200, "text/event-stream", upstreamBody), 200)
-                        .stream("TSLA", null, "Bearer t");
-        drain(res);
+        assertThrows(RuntimeException.class, () -> res.getBody().writeTo(exploding));
+        assertEquals(1, controller.streamSlots.availablePermits());
         assertTrue(closed.get());
+    }
+
+    @Test
+    void aSilentUpstreamIsClosedByTheIdleWatchdogRatherThanHeldForever() throws Exception {
+        // Nothing else can see this. The request timeout stopped applying when headers arrived, and a
+        // heartbeat only proves liveness while the upstream is still sending one — silence produces no
+        // evidence of itself. Without the watchdog, one half-open peer holds an async thread, a permit
+        // and an upstream exchange until the JVM restarts.
+        CountDownLatch closed = new CountDownLatch(1);
+        InputStream silent = new InputStream() {
+            private final CountDownLatch stop = new CountDownLatch(1);
+
+            @Override
+            public int read() throws IOException {
+                try {
+                    stop.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                throw new IOException("closed");
+            }
+
+            @Override
+            public int read(byte[] b, int off, int len) throws IOException {
+                return read();
+            }
+
+            @Override
+            public void close() {
+                stop.countDown();
+                closed.countDown();
+            }
+        };
+
+        StockGexController controller = new StockGexController(
+                upstream(clientStreaming(200, "text/event-stream", silent)),
+                authReturning(200), new ObjectMapper(), 1, new CapturingRegistrar()) {
+        };
+        ResponseEntity<StreamingResponseBody> res =
+                liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
+
+        Thread pump = new Thread(() -> {
+            try {
+                res.getBody().writeTo(new ByteArrayOutputStream());
+            } catch (IOException ignored) {
+                // the watchdog's close surfaces here
+            }
+        });
+        pump.setDaemon(true);
+        pump.start();
+
+        // The production idle timeout is 60s; proving the MECHANISM without waiting a minute means
+        // releasing the lease the way the watchdog does and showing that it unblocks the pump.
+        assertEquals(0, controller.streamSlots.availablePermits());
+        StockGexController.StreamLease lease = new StockGexController.StreamLease(silent, controller.streamSlots);
+        lease.release();
+        assertTrue(closed.await(5, TimeUnit.SECONDS), "closing the stream is what unblocks a parked read");
+        pump.join(5000);
+        assertFalse(pump.isAlive(), "the pump must end when its upstream is closed under it");
+    }
+
+    @Test
+    void theIdleWatchdogOnlyFiresWhenNothingHasArrived() {
+        Semaphore slots = new Semaphore(1);
+        slots.tryAcquire();
+        StockGexController.StreamLease lease =
+                new StockGexController.StreamLease(new ByteArrayInputStream(new byte[0]), slots);
+
+        assertFalse(lease.isIdleFor(60_000L), "a stream that just started is not idle");
+        assertTrue(lease.isIdleFor(0L), "and one measured against a zero budget always is");
+        lease.markActivity();
+        assertFalse(lease.isIdleFor(60_000L), "a byte arriving resets the clock");
+        assertFalse(lease.isReleased());
+        lease.release();
+        assertTrue(lease.isReleased());
+        assertEquals(1, slots.availablePermits());
+    }
+
+    @Test
+    void streamsBeyondTheCapAreRefusedIMMEDIATELYWithACodeThePageKnows() throws Exception {
+        // The failure this prevents is NOT "one user gets a slow board": an async response that cannot
+        // get a thread does not fail, it queues, and with spring.mvc.async.request-timeout=-1 it queues
+        // forever, having answered nothing at all. And the refusal itself must not be a streaming body,
+        // or it would need the very executor whose exhaustion it reports.
+        HttpClient http = clientStreaming(200, "text/event-stream",
+                new ByteArrayInputStream("id: 1\ndata: {}\n\n".getBytes(StandardCharsets.UTF_8)));
+        StockGexController controller = controller(http, 200, 1, new CapturingRegistrar());
+
+        ResponseEntity<StreamingResponseBody> first =
+                liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
+        assertEquals(200, first.getStatusCode().value());
+
+        ResponseEntity<byte[]> refused = refusalOf(streamOutcome(controller, "AAPL", null, "Bearer t"));
+        assertEquals(503, refused.getStatusCode().value());
+        assertEquals("5", refused.getHeaders().getFirst("Retry-After"));
+        JsonNode body = new ObjectMapper().readTree(refused.getBody());
+        assertEquals("SSE_CLIENT_LIMIT", body.get("error").asText(),
+                "reuse the upstream's own vocabulary — the page already renders this one");
+
+        // Draining the first stream ends it, and the slot must come back for the next client.
+        drain(first);
+        assertEquals(1, controller.streamSlots.availablePermits());
     }
 
     // ---------------------------------------------------------------- timeout shape
 
     @Test
-    void theBoardHasARequestDeadlineAndTheStreamDeliberatelyHasNone() throws Exception {
+    void bothCallsBoundTheHANDSHAKEAndNeitherBoundsAHealthyStream() throws Exception {
+        // Verified against the JDK client: with BodyHandlers.ofInputStream the request timeout stops
+        // being enforced the moment send() returns with headers. So it bounds "accepted the socket, sent
+        // no headers" — which would otherwise pin a Tomcat request thread — without putting any lifetime
+        // limit on an hours-long stream. What bounds the BODY is the idle watchdog, not this.
         HttpClient boardHttp = clientReturning(200, "application/json", BOARD_JSON);
         controller(boardHttp, 200).board("TSLA", "Bearer t");
         assertTrue(capturedRequest(boardHttp).timeout().isPresent(),
                 "a request/response call must be bounded");
 
         HttpClient streamHttp = clientStreaming(200, "text/event-stream", new ByteArrayInputStream(new byte[0]));
-        controller(streamHttp, 200).stream("TSLA", null, "Bearer t");
-        assertTrue(capturedRequest(streamHttp).timeout().isEmpty(),
-                "a read deadline on an SSE request kills healthy streams on a timer — heartbeats are ~10s "
-                + "but a session lasts hours");
+        streamOutcome(controller(streamHttp, 200), "TSLA", null, "Bearer t");
+        assertTrue(capturedRequest(streamHttp).timeout().isPresent(),
+                "an unbounded handshake lets a silent upstream pin a request thread forever");
+    }
+
+    private static InputStream closeRecording(AtomicBoolean closed, String payload) {
+        return new ByteArrayInputStream(payload.getBytes(StandardCharsets.UTF_8)) {
+            @Override
+            public void close() throws IOException {
+                closed.set(true);
+                super.close();
+            }
+        };
     }
 }

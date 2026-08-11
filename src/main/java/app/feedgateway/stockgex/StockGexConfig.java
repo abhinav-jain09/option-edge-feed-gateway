@@ -16,7 +16,12 @@ import java.time.Duration;
 @Configuration
 public class StockGexConfig {
 
-    @Bean
+    /**
+     * {@code destroyMethod} is not cosmetic: the client owns a watchdog scheduler that bounds every
+     * body read and every idle stream, and a scheduler that outlives the context is a thread that
+     * outlives the application.
+     */
+    @Bean(destroyMethod = "close")
     public StockGexUpstream stockGexUpstream(GatewaySettings settings) {
         return new StockGexUpstream(settings.stockGexBaseUrl(),
                 Duration.ofMillis(settings.stockGexConnectTimeoutMs()),
