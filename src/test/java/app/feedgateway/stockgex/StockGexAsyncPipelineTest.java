@@ -100,6 +100,9 @@ class StockGexAsyncPipelineTest {
     StockGexController controller;
 
     private final ExecutorService clients = Executors.newCachedThreadPool();
+    /** Every response body this test opened, closed in @AfterEach rather than left to the GC. */
+    private final List<HttpResponse<InputStream>> openedBodies =
+            java.util.Collections.synchronizedList(new ArrayList<>());
     private final java.net.http.HttpClient http = java.net.http.HttpClient.newBuilder()
             .version(java.net.http.HttpClient.Version.HTTP_1_1)
             .connectTimeout(Duration.ofSeconds(5))
@@ -121,11 +124,18 @@ class StockGexAsyncPipelineTest {
     @AfterEach
     void releaseEverything() {
         upstream.releaseAll();
-    }
-
-    @AfterAll
-    static void stopClients() {
-        // the per-instance executor is shut down by the JVM; nothing to do beyond releasing holds
+        // JUnit builds a fresh test INSTANCE per method, so this cached pool is per method too, and
+        // its workers are non-daemon: without this they linger for a minute each, and the suite ends
+        // up holding threads and sockets while later timing assertions run.
+        clients.shutdownNow();
+        for (HttpResponse<InputStream> open : openedBodies) {
+            try {
+                open.body().close();
+            } catch (Exception ignored) {
+                // best effort; the point is not to leave sockets to the GC
+            }
+        }
+        openedBodies.clear();
     }
 
     @Test
@@ -225,7 +235,15 @@ class StockGexAsyncPipelineTest {
                     // is exactly the pressure this test wants.
                 }
             }
-            assertTrue(occupied >= 8, "the executor was not meaningfully occupied (" + occupied + ")");
+            // The named condition, asserted rather than assumed: the EFFECTIVE executor is at its
+            // maximum with no spare thread. Without this the test could pass with 52 threads free,
+            // in which case an accidentally-asynchronous refusal would also have been prompt and the
+            // test would have proved nothing.
+            java.util.concurrent.ThreadPoolExecutor pool =
+                    asyncConfig.executor().getThreadPoolExecutor();
+            assertTrue(waitFor(() -> pool.getActiveCount() >= pool.getMaximumPoolSize(), 20_000L),
+                    "the async executor never reached its maximum: active=" + pool.getActiveCount()
+                    + " of " + pool.getMaximumPoolSize() + " (occupied=" + occupied + ")");
             assertEquals(0, controller.streamSlots.availablePermits(), "the cap must be exhausted");
 
             long start = System.nanoTime();
@@ -271,30 +289,45 @@ class StockGexAsyncPipelineTest {
                     // expected for the overflow
                 }
             }
+            java.util.concurrent.ThreadPoolExecutor pool =
+                    asyncConfig.executor().getThreadPoolExecutor();
+            assertTrue(waitFor(() -> pool.getActiveCount() >= pool.getMaximumPoolSize(), 20_000L),
+                    "the async executor never reached its maximum, so no stream could be rejected");
             int before = controller.streamSlots.availablePermits();
+            int upstreamOpensBefore = upstream.opened();
 
-            // Fire a batch: with the pool saturated at least one of these should be admitted by the
-            // cap and then rejected by the executor.
-            for (int i = 0; i < 6; i++) {
+            // With the pool at its maximum, the cap admits these and the EXECUTOR refuses them, so
+            // the streaming body is never invoked and only the servlet async interceptor can clean up.
+            int rejected = 0;
+            for (int i = 0; i < 8; i++) {
                 try {
                     HttpResponse<String> r = http.send(
                             HttpRequest.newBuilder(URI.create(url("/api/stock-gex/stream?symbol=REJ" + i)))
                                     .timeout(Duration.ofSeconds(15))
                                     .header("Authorization", "Bearer t").GET().build(),
                             HttpResponse.BodyHandlers.ofString());
-                    assertTrue(r.statusCode() == 200 || r.statusCode() == 500 || r.statusCode() == 503,
-                            "unexpected status under executor rejection: " + r.statusCode());
+                    if (r.statusCode() == 500) {
+                        rejected++;
+                    }
                 } catch (IOException streamCutOff) {
-                    // a rejected async dispatch can also surface as a broken response
+                    rejected++;   // a rejected async dispatch can also surface as a broken response
                 }
             }
+            assertTrue(rejected > 0,
+                    "no request actually entered the executor-rejection path, so this test proved nothing");
+            assertTrue(upstream.opened() > upstreamOpensBefore,
+                    "a rejected request must have opened an upstream exchange — that is the thing "
+                    + "that has to be closed again");
             upstream.releaseAll();
 
-            // Whatever happened to each request, every permit must come back. That is the property:
-            // a rejection may be loud, but it may not be lossy.
+            // Whatever happened to each request, every permit must come back and every upstream
+            // exchange must be closed. A rejection may be loud; it may not be lossy.
             assertTrue(waitFor(() -> controller.streamSlots.availablePermits() >= before, 20_000L),
                     "permits leaked under executor rejection: " + controller.streamSlots.availablePermits()
                     + " < " + before);
+            assertTrue(waitFor(() -> upstream.closed() >= upstream.opened(), 20_000L),
+                    "upstream exchanges leaked: opened=" + upstream.opened()
+                    + " closed=" + upstream.closed());
         } finally {
             upstream.releaseAll();
         }
@@ -334,12 +367,14 @@ class StockGexAsyncPipelineTest {
     }
 
     private HttpResponse<InputStream> openStream(String symbol) throws Exception {
-        return http.send(
+        HttpResponse<InputStream> opened = http.send(
                 HttpRequest.newBuilder(URI.create(url("/api/stock-gex/stream?symbol=" + symbol)))
                         .timeout(Duration.ofSeconds(20))
                         .header("Authorization", "Bearer t")
                         .GET().build(),
                 HttpResponse.BodyHandlers.ofInputStream());
+        openedBodies.add(opened);
+        return opened;
     }
 
     private int openStreamStatus(String symbol) throws Exception {
@@ -369,9 +404,14 @@ class StockGexAsyncPipelineTest {
     static final class BlockingUpstream {
         private volatile CountDownLatch release = new CountDownLatch(1);
         private final AtomicInteger opened = new AtomicInteger();
+        private final AtomicInteger closed = new AtomicInteger();
 
         int opened() {
             return opened.get();
+        }
+
+        int closed() {
+            return closed.get();
         }
 
         /** A fresh hold for the next test; the context (and this bean) is shared between them. */
@@ -379,6 +419,7 @@ class StockGexAsyncPipelineTest {
             release.countDown();
             release = new CountDownLatch(1);
             opened.set(0);
+            closed.set(0);
         }
 
         void releaseAll() {
@@ -417,6 +458,11 @@ class StockGexAsyncPipelineTest {
                         b[off + n++] = first[index++];
                     }
                     return n;
+                }
+
+                @Override
+                public void close() {
+                    closed.incrementAndGet();
                 }
             };
         }

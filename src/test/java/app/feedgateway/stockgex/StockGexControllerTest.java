@@ -180,10 +180,25 @@ class StockGexControllerTest {
     }
 
     /** Run the stream handler and return whatever it answered — a stream, or a refusal. */
+    /**
+     * Drives the handler the way MVC does, including the raw header the resume id is now read from —
+     * binding a String would have let duplicate fields be joined into a token nobody issued.
+     */
     private Object streamOutcome(StockGexController controller, String symbol, String lastEventId,
                                  String authorization) {
+        return streamOutcomeWithIds(controller, symbol,
+                lastEventId == null ? List.of() : List.of(lastEventId), authorization);
+    }
+
+    private Object streamOutcomeWithIds(StockGexController controller, String symbol,
+                                        List<String> lastEventIds, String authorization) {
+        org.springframework.mock.web.MockHttpServletRequest request =
+                new org.springframework.mock.web.MockHttpServletRequest();
+        for (String id : lastEventIds) {
+            request.addHeader("Last-Event-ID", id);
+        }
         try {
-            return controller.stream(null, symbol, lastEventId, authorization);
+            return controller.stream(request, symbol, authorization);
         } catch (StockGexController.StockGexRefusal refusal) {
             return controller.refused(refusal);
         }
@@ -878,7 +893,7 @@ class StockGexControllerTest {
         Semaphore slots = new Semaphore(1);
         slots.tryAcquire();
         StockGexController.StreamLease lease =
-                new StockGexController.StreamLease(new ByteArrayInputStream(new byte[0]), slots);
+                new StockGexController.StreamLease(new ByteArrayInputStream(new byte[0]), slots, false);
 
         assertFalse(lease.isIdleFor(60_000L), "a stream that just started is not idle");
         assertTrue(lease.isIdleFor(0L), "and one measured against a zero budget always is");
@@ -1038,6 +1053,178 @@ class StockGexControllerTest {
         assertEquals(422, res.getStatusCode().value());
         assertArrayEquals(hostile, res.getBody(),
                 "a refusal body is as much a passthrough as a board body");
+    }
+
+    @Test
+    void aWildcardOnALIVESTREAMIsJudgedOnItsOWNTermsNotByTheHeaderBuilder() throws Exception {
+        // The trap: mediaType() is deliberately forgiving because its job is to produce a header
+        // Spring will accept, so it turns every wildcard into the fallback. Reusing it to DECIDE
+        // whether a 200 is a stream made `application/*` mean "no opinion" — and an
+        // application/*-labelled response was relabelled text/event-stream and served as live market
+        // data. application/* is not an absence; it is a statement that excludes event streams.
+        String[][] cases = {
+            {"application/*", "reject"},
+            {"application/json", "reject"},
+            {"text/html", "reject"},
+            {"not a media type at all", "reject"},
+            {"text/*", "accept"},
+            {"*/*", "accept"},
+            {"text/event-stream", "accept"},
+            {"text/event-stream;charset=utf-8", "accept"},
+        };
+        for (String[] c : cases) {
+            AtomicBoolean closed = new AtomicBoolean(false);
+            StockGexController controller = controller(
+                    clientStreaming(200, c[0], closeRecording(closed, "id: 1\ndata: {}\n\n")),
+                    200, 1, new CapturingRegistrar());
+            Object outcome = streamOutcome(controller, "TSLA", null, "Bearer t");
+
+            if ("accept".equals(c[1])) {
+                assertEquals(200, ((ResponseEntity<?>) outcome).getStatusCode().value(), c[0]);
+                assertTrue(((ResponseEntity<?>) outcome).getBody() instanceof StreamingResponseBody, c[0]);
+                liveResponses.add((ResponseEntity<StreamingResponseBody>) outcome);
+            } else {
+                ResponseEntity<byte[]> refused = refusalOf(outcome);
+                assertEquals(502, refused.getStatusCode().value(), c[0]);
+                assertEquals("UPSTREAM_PROTOCOL_ERROR",
+                        new ObjectMapper().readTree(refused.getBody()).get("error").asText(), c[0]);
+                assertTrue(closed.get(), "the body must be closed on rejection: " + c[0]);
+                assertEquals(1, controller.streamSlots.availablePermits(),
+                        "and the slot handed straight back: " + c[0]);
+            }
+        }
+    }
+
+    @Test
+    void aDuplicatedLastEventIdIsDroppedRatherThanJoinedIntoATokenNobodyIssued() throws Exception {
+        // MVC joins duplicate header fields with a comma, and "41,7" passes every character check
+        // while being an id the upstream never minted. The contract is exactly one opaque token, or
+        // nothing — and nothing costs one reset snapshot, which is always correct.
+        HttpClient http = clientStreaming(200, "text/event-stream", new ByteArrayInputStream(new byte[0]));
+        streamOutcomeWithIds(controller(http, 200), "TSLA", List.of("41", "7"), "Bearer t");
+
+        assertTrue(capturedRequest(http).headers().firstValue("Last-Event-ID").isEmpty(),
+                "two fields is not one token");
+
+        HttpClient single = clientStreaming(200, "text/event-stream", new ByteArrayInputStream(new byte[0]));
+        streamOutcomeWithIds(controller(single, 200), "TSLA", List.of("41"), "Bearer t");
+        assertEquals("41", capturedRequest(single).headers().firstValue("Last-Event-ID").orElse(""));
+    }
+
+    @Test
+    void theBoardBudgetIsAWHOLEREQUESTBudgetNotOnePerPhase() throws Exception {
+        // The request timeout covers the handshake; the body read then got a FRESH copy of the same
+        // budget, so a 5s setting could take almost 10s. GatewaySettings calls it a whole-request
+        // budget, so it has to be one.
+        long budgetMs = 600L;
+        // Behaves like a real socket in the one respect this test depends on: close() ENDS the read.
+        // The deadline is enforced by closing the stream from the watchdog thread, so a stub that
+        // ignored close would hang forever rather than fail — and a hanging test proves nothing.
+        InputStream slow = new InputStream() {
+            private final java.util.concurrent.atomic.AtomicBoolean closed =
+                    new java.util.concurrent.atomic.AtomicBoolean(false);
+
+            @Override
+            public int read() throws IOException {
+                if (closed.get()) {
+                    throw new IOException("closed under the reader");
+                }
+                try {
+                    Thread.sleep(25L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                if (closed.get()) {
+                    throw new IOException("closed under the reader");
+                }
+                return 'x';
+            }
+
+            @Override
+            public int read(byte[] b, int off, int len) throws IOException {
+                b[off] = (byte) read();
+                return 1;
+            }
+
+            @Override
+            public void close() {
+                closed.set(true);
+            }
+        };
+        StockGexUpstream upstream = new StockGexUpstream("http://stock-gex-service:8021",
+                Duration.ofMillis(budgetMs), clientStreaming(200, "application/json", slow));
+        upstreams.add(upstream);
+        StockGexController controller = new StockGexController(
+                upstream, authReturning(200), new ObjectMapper(), 4, new CapturingRegistrar());
+
+        long start = System.nanoTime();
+        ResponseEntity<byte[]> res = controller.board("TSLA", "Bearer t");
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
+
+        assertEquals(502, res.getStatusCode().value(), "a body that never ends must be cut off");
+        assertTrue(elapsedMs < budgetMs * 2,
+                "the whole request took " + elapsedMs + "ms against a " + budgetMs + "ms budget");
+    }
+
+    // ---------------------------------------------------------------- metrics
+
+    @Test
+    void everyTransitionIsCountedExactlyOnceAtTheCommitThatAuthorisesIt() throws Exception {
+        // A counter incremented in a caller, a retry, or an exception handler eventually disagrees
+        // with the state it claims to describe. Each of these is incremented at the one place the
+        // transition is decided, and the GAUGE is read from the semaphore rather than reconstructed.
+        long admittedBefore = StockGexController.STREAMS_ADMITTED.get();
+        long endedBefore = StockGexController.STREAMS_ENDED.get();
+        long refusedBefore = StockGexController.STREAMS_REFUSED_AT_CAP.get();
+        long boardsBefore = StockGexController.BOARDS_SERVED.get();
+
+        StockGexController controller = controller(
+                clientStreaming(200, "text/event-stream",
+                        new ByteArrayInputStream("id: 1\ndata: {}\n\n".getBytes(StandardCharsets.UTF_8))),
+                200, 1, new CapturingRegistrar());
+        ResponseEntity<StreamingResponseBody> live =
+                liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
+        assertEquals(admittedBefore + 1, StockGexController.STREAMS_ADMITTED.get());
+        assertEquals(endedBefore, StockGexController.STREAMS_ENDED.get(), "not ended yet");
+
+        // Over the cap while that one is live.
+        refusalOf(streamOutcome(controller, "AAPL", null, "Bearer t"));
+        assertEquals(refusedBefore + 1, StockGexController.STREAMS_REFUSED_AT_CAP.get());
+
+        // End it three different ways at once; it must still be counted once.
+        drain(live);
+        liveResponses.remove(live);
+        assertEquals(endedBefore + 1, StockGexController.STREAMS_ENDED.get(),
+                "a stream ended by pump AND lifecycle AND watchdog is still one ending");
+        assertEquals(1, controller.streamSlots.availablePermits());
+
+        controller(clientReturning(200, "application/json", BOARD_JSON), 200).board("TSLA", "Bearer t");
+        assertEquals(boardsBefore + 1, StockGexController.BOARDS_SERVED.get());
+    }
+
+    @Test
+    void theOperatorLineCarriesNoUnboundedOrPerSymbolLabel() throws Exception {
+        StockGexController controller = controller(
+                clientReturning(200, "application/json", BOARD_JSON), 200);
+        controller.board("TSLA", "Bearer t");
+
+        String line = controller.counters();
+
+        assertTrue(line.contains("streamSlotsFree="), line);
+        assertFalse(line.contains("TSLA"),
+                "a per-ticker label is an unbounded label set, and an arbitrary ticker must not be "
+                + "able to create per-ticker anything");
+        assertFalse(line.contains("Bearer"), "and a credential must never reach a log line");
+    }
+
+    @Test
+    void remoteTextOnALogLineIsBounded() {
+        String hostile = "x".repeat(5000) + "\r\ninjected: line";
+        String logged = StockGexController.shortForLog(hostile);
+
+        assertTrue(logged.length() < 200, "unbounded remote text must not be pasted into a log");
+        assertFalse(logged.contains("\n"), "and must not be able to forge a second log line");
+        assertEquals("", StockGexController.shortForLog(null));
     }
 
     // ---------------------------------------------------------------- timeout shape

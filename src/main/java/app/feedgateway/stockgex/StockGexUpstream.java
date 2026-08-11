@@ -44,8 +44,9 @@ import java.util.concurrent.TimeUnit;
  * that is a prefix of what it sent. A half-delivered body wearing the upstream's status is worse than an
  * honest error: the page would parse a truncated envelope and report whatever fell out of it.
  *
- * <p><b>Every wait is bounded, and the bounds are shaped by what they guard</b> (each verified against
- * the JDK client rather than assumed):
+ * <p><b>Every wait THIS CLASS PERFORMS is bounded, and the bounds are shaped by what they guard</b>
+ * (each verified against the JDK client rather than assumed; the write back to the browser is
+ * bounded by Tomcat's connector timeout, which is not this class's to enforce):
  * <ul>
  *   <li>CONNECT — {@code HttpClient.connectTimeout}. Bounds TCP establishment only.</li>
  *   <li>HANDSHAKE — {@code HttpRequest.timeout} on BOTH calls. With {@code BodyHandlers.ofInputStream}
@@ -64,13 +65,23 @@ public final class StockGexUpstream implements AutoCloseable {
     /** Cap on an upstream ERROR body we buffer. An error envelope is small; anything else is a fault. */
     static final int MAX_ERROR_BYTES = 64 * 1024;
     /**
-     * Cap on a BOARD body. A full board is a few hundred strikes of small JSON objects — ~100 KiB at the
-     * top end — so this is two orders of magnitude of headroom and still bounds per-request allocation.
-     * Matches the web tier's own STOCK_GEX_PROXY_MAX_BYTES default so the two caps cannot disagree.
+     * Cap on a BOARD body, sized against AGGREGATE exposure rather than against one request.
+     *
+     * <p>A full board is a few hundred strikes of small JSON objects — on the order of 100 KiB at the
+     * top end. The earlier 4 MiB cap gave forty times that headroom, but the number that matters is
+     * not per-request: this endpoint is served synchronously on Tomcat worker threads, and
+     * {@code ByteArrayOutputStream.toByteArray()} briefly doubles the buffer for its final copy. At
+     * Tomcat's default 200 threads, 4 MiB per request is ~1.6 GiB of transient allocation in the
+     * worst case, which is a heap event rather than a bounded read. 1 MiB keeps ten times the
+     * headroom over the largest realistic board while capping the aggregate at ~400 MiB, and
+     * anything larger is a producer fault that should be reported as one, not buffered.
      */
-    static final int MAX_BOARD_BYTES = 4 * 1024 * 1024;
+    static final int MAX_BOARD_BYTES = 1024 * 1024;
     /** Longest symbol we will put on the wire. Real tickers are <= 5-6 chars; this only stops abuse. */
     static final int MAX_SYMBOL_LENGTH = 32;
+
+    /** Watchdog threads. See the constructor: one is a shared-fate failure mode, not an economy. */
+    static final int WATCHDOG_THREADS = 4;
 
     /** Gateway-authored failure codes. Distinct on purpose — they mean different things to an operator. */
     static final String CODE_UNAVAILABLE = "UPSTREAM_UNAVAILABLE";
@@ -148,11 +159,22 @@ public final class StockGexUpstream implements AutoCloseable {
         this.boardTimeout = Objects.requireNonNull(boardTimeout, "boardTimeout");
         this.http = Objects.requireNonNull(http, "http");
         this.ownsTimers = timers == null;
-        this.timers = timers != null ? timers : Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "stock-gex-watchdog");
-            t.setDaemon(true);
-            return t;
-        });
+        // MORE THAN ONE THREAD, deliberately. Every watchdog task calls InputStream.close(), and
+        // close() is not contractually non-blocking — a single stuck close on one thread would
+        // disable every other body deadline and every other stream's idle check at once, which is
+        // precisely when those deadlines matter. A small pool bounds that blast radius.
+        this.timers = timers != null ? timers
+                : Executors.newScheduledThreadPool(WATCHDOG_THREADS, new java.util.concurrent.ThreadFactory() {
+                    private final java.util.concurrent.atomic.AtomicInteger n =
+                            new java.util.concurrent.atomic.AtomicInteger();
+
+                    @Override
+                    public Thread newThread(Runnable r) {
+                        Thread t = new Thread(r, "stock-gex-watchdog-" + n.incrementAndGet());
+                        t.setDaemon(true);
+                        return t;
+                    }
+                });
     }
 
     /** The shared watchdog scheduler; the controller arms its per-stream idle timers on it. */
@@ -174,6 +196,7 @@ public final class StockGexUpstream implements AutoCloseable {
      * asked for. What the length bound measures is exactly what goes on the wire.
      */
     public BoardResponse board(String symbol) {
+        long startedNanos = System.nanoTime();
         HttpResponse<InputStream> resp;
         try {
             // Request construction is INSIDE the mapped block: newBuilder/uri/header/build can all throw
@@ -200,8 +223,11 @@ public final class StockGexUpstream implements AutoCloseable {
         }
         requireIdentityEncoding(resp, "board");
         // send() has returned, so the JDK's request timeout no longer applies (verified). A body that
-        // arrives byte-by-byte, or never, would otherwise hold this request thread forever.
-        byte[] body = readBounded(resp.body(), MAX_BOARD_BYTES, boardTimeout, "board");
+        // arrives byte-by-byte, or never, would otherwise hold this request thread forever — and the
+        // deadline passed here is what REMAINS of the configured budget, not a fresh copy of it.
+        // GatewaySettings calls this a whole-request budget; starting the clock again after headers
+        // would have made a 5s setting mean up to 10s.
+        byte[] body = readBounded(resp.body(), MAX_BOARD_BYTES, remaining(startedNanos), "board");
         return new BoardResponse(resp.statusCode(), header(resp, "content-type"),
                 header(resp, "retry-after"), body);
     }
@@ -216,6 +242,7 @@ public final class StockGexUpstream implements AutoCloseable {
      * which the upstream answers with a full reset snapshot: correct, just more bytes.
      */
     public StreamResponse stream(String symbol, String lastEventId) {
+        long startedNanos = System.nanoTime();
         HttpResponse<InputStream> resp;
         try {
             HttpRequest.Builder b = HttpRequest.newBuilder(uri("/api/stock-gex/stream", symbol))
@@ -248,7 +275,7 @@ public final class StockGexUpstream implements AutoCloseable {
         if (status != 200) {
             // Not a stream: read the body under the error cap and close, so a rejected subscribe never
             // leaves a socket open. Overflow or a read fault is a protocol failure, not a body.
-            byte[] body = readBounded(resp.body(), MAX_ERROR_BYTES, boardTimeout, "stream error");
+            byte[] body = readBounded(resp.body(), MAX_ERROR_BYTES, remaining(startedNanos), "stream error");
             return new StreamResponse(status, contentType, retryAfter, null, body);
         }
         return new StreamResponse(status, contentType, retryAfter, resp.body(), null);
@@ -357,6 +384,13 @@ public final class StockGexUpstream implements AutoCloseable {
             }
         }
         return raw;
+    }
+
+    /** What is LEFT of the configured budget, floored so a body read always gets a moment to finish. */
+    private Duration remaining(long startedNanos) {
+        long spentMs = (System.nanoTime() - startedNanos) / 1_000_000L;
+        long leftMs = boardTimeout.toMillis() - spentMs;
+        return Duration.ofMillis(Math.max(250L, leftMs));
     }
 
     private static UnavailableException unavailable(String message, Throwable cause) {

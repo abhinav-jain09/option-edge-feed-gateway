@@ -79,7 +79,9 @@ public class StockGexController {
      * Max CONCURRENT live streams this gateway will carry. Each holds one MVC async thread and one
      * upstream HTTP exchange for the life of the session, so this — not the upstream's own limit — is
      * what bounds this JVM. Kept comfortably below {@link StockGexAsyncConfig#MAX_ASYNC_THREADS} so the
-     * other async endpoint on this gateway ({@code /api/seller-activity}) can always get a thread.
+     * other async endpoint on this gateway ({@code /api/seller-activity}, itself capped at 4) has
+     * ample headroom. This is a sizing argument about the two async endpoints that exist today, not
+     * a guarantee: a third one added without revisiting these numbers would invalidate it.
      */
     static final int MAX_CONCURRENT_STREAMS = 24;
 
@@ -100,6 +102,36 @@ public class StockGexController {
     private static final long UNREACHABLE_LOG_INTERVAL_MS = 30_000L;
 
     private static final String CLEANUP_KEY = StockGexController.class.getName() + ".streamCleanup";
+
+    /**
+     * Counters, each incremented ONCE at the transition that authorises it, never in a caller and
+     * never in a retry. The gauge is not a counter: free slots are read from the semaphore, which is
+     * the authoritative state, rather than reconstructed from increments and decrements that can
+     * disagree with it after a rollback.
+     *
+     * <p>No symbol, principal, or upstream text appears in any of these — a per-ticker counter is an
+     * unbounded label set, and the whole point of the cap is that an arbitrary ticker must not be
+     * able to create per-ticker resources.
+     */
+    static final AtomicLong STREAMS_ADMITTED = new AtomicLong();
+    static final AtomicLong STREAMS_REFUSED_AT_CAP = new AtomicLong();
+    static final AtomicLong STREAMS_ENDED = new AtomicLong();
+    static final AtomicLong UPSTREAM_REFUSALS = new AtomicLong();
+    static final AtomicLong UPSTREAM_UNREACHABLE = new AtomicLong();
+    static final AtomicLong UPSTREAM_PROTOCOL_FAULTS = new AtomicLong();
+    static final AtomicLong BOARDS_SERVED = new AtomicLong();
+
+    /** One line an operator can read: counters plus the gauge, derived from authoritative state. */
+    String counters() {
+        return "stock-gex gateway: boardsServed=" + BOARDS_SERVED.get()
+                + " streamsAdmitted=" + STREAMS_ADMITTED.get()
+                + " streamsEnded=" + STREAMS_ENDED.get()
+                + " streamsRefusedAtCap=" + STREAMS_REFUSED_AT_CAP.get()
+                + " streamSlotsFree=" + streamSlots.availablePermits() + "/" + capacity
+                + " upstreamRefusals=" + UPSTREAM_REFUSALS.get()
+                + " upstreamUnreachable=" + UPSTREAM_UNREACHABLE.get()
+                + " upstreamProtocolFaults=" + UPSTREAM_PROTOCOL_FAULTS.get();
+    }
 
     /**
      * How a stream's cleanup is bound to the servlet async lifecycle. A seam because the production
@@ -136,6 +168,7 @@ public class StockGexController {
     private final AtomicLong lastUnreachableLogMs = new AtomicLong(0L);
     private final long idleCheckMs;
     private final long idleTimeoutMs;
+    private final int capacity;
 
     @org.springframework.beans.factory.annotation.Autowired
     public StockGexController(StockGexUpstream upstream, LiquidityHistoryAuth auth, ObjectMapper mapper) {
@@ -157,6 +190,7 @@ public class StockGexController {
         this.auth = auth;
         this.mapper = mapper == null ? new ObjectMapper() : mapper;
         this.streamSlots = new Semaphore(maxConcurrentStreams);
+        this.capacity = maxConcurrentStreams;
         this.asyncCleanup = asyncCleanup;
         this.idleCheckMs = idleCheckMs;
         this.idleTimeoutMs = idleTimeoutMs;
@@ -197,6 +231,7 @@ public class StockGexController {
             // guess a retry interval the service already told us.
             out = out.header(HttpHeaders.RETRY_AFTER, response.retryAfter());
         }
+        BOARDS_SERVED.incrementAndGet();
         return out.body(response.body() == null ? new byte[0] : response.body());
     }
 
@@ -211,8 +246,11 @@ public class StockGexController {
     public ResponseEntity<StreamingResponseBody> stream(
             HttpServletRequest request,
             @RequestParam(value = "symbol", required = false) String symbol,
-            @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId,
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
+        // Read the header FIELDS rather than binding a String: MVC joins duplicate fields with a
+        // comma, and "41,7" is a token the upstream never issued but which passes every character
+        // check. The resume contract is "exactly one opaque token, or nothing at all".
+        String lastEventId = singleHeader(request, "Last-Event-ID");
         LiquidityHistoryAuth.Result authResult = auth.authenticate(authorization);
         if (authResult.status() != 200) {
             throw new StockGexRefusal(authResult.status(), null, new byte[0], null);
@@ -224,6 +262,7 @@ public class StockGexController {
         // strictly better than letting the request queue on an exhausted async pool, where it would
         // answer nothing at all.
         if (!streamSlots.tryAcquire()) {
+            STREAMS_REFUSED_AT_CAP.incrementAndGet();
             throw refusal(HttpStatus.SERVICE_UNAVAILABLE,
                     error("SSE_CLIENT_LIMIT",
                           "this gateway is already carrying its maximum number of live stock-gex streams"),
@@ -239,6 +278,7 @@ public class StockGexController {
                 throw refusal(HttpStatus.BAD_GATEWAY, unreachableError(unreachable), null);
             }
             if (!opened.live()) {
+                UPSTREAM_REFUSALS.incrementAndGet();
                 // Anything that is not a 200 — 4xx, 5xx, a redirect, even another 2xx — is an ordinary
                 // status+body response, carried through with the upstream's own status. A Location is
                 // deliberately NOT forwarded: it would name an internal host to the browser, and this
@@ -273,6 +313,7 @@ public class StockGexController {
                     // dead feed.
                     .header("X-Accel-Buffering", "no")
                     .body(pump);
+            STREAMS_ADMITTED.incrementAndGet();
             lease = null; // handed over; the finally below must not undo it
             return response;
         } catch (RuntimeException | Error failed) {
@@ -292,9 +333,10 @@ public class StockGexController {
     /**
      * The one place a gateway-authored (or passed-through non-stream) answer is written, and it is
      * written SYNCHRONOUSLY as a {@code byte[]}. Spring resolves handler exceptions on the request
-     * thread, before any async dispatch begins, so this path never touches the MVC async executor —
-     * which is exactly what makes "503, this gateway is out of stream slots" answerable while that
-     * executor is saturated.
+     * thread, before any async dispatch begins, so this path does not use the MVC async executor —
+     * which is what makes "503, this gateway is out of stream slots" answerable while that executor
+     * is saturated. Verified end to end in {@code StockGexAsyncPipelineTest}, with the executor
+     * asserted to be at its maximum before the refusal is requested.
      */
     @ExceptionHandler(StockGexRefusal.class)
     public ResponseEntity<byte[]> refused(StockGexRefusal refusal) {
@@ -324,7 +366,10 @@ public class StockGexController {
     }
 
     /**
-     * Everything a live stream owns, released exactly once no matter who gets there first.
+     * Everything a live stream owns, released AT MOST ONCE and on every path this process can
+     * observe — the pump ending, the servlet async lifecycle completing, and the idle watchdog
+     * firing. It cannot survive the process itself: a {@code kill -9} releases nothing, and the
+     * upstream's own listener cap is what reclaims the far side in that case.
      *
      * <p>Three independent things can end a stream — the pump finishing or failing, the servlet async
      * lifecycle completing, and the idle watchdog firing — and any of them can happen without the
@@ -335,6 +380,8 @@ public class StockGexController {
     static final class StreamLease {
         private final InputStream upstream;
         private final Semaphore slots;
+        /** Whether this lease's ending should be counted; false for leases a test builds by hand. */
+        private final boolean counted;
         private final AtomicBoolean released = new AtomicBoolean(false);
         /**
          * NANOTIME, not wall clock. This is the only mechanism bounding a silent upstream, and a
@@ -345,8 +392,13 @@ public class StockGexController {
         private volatile ScheduledFuture<?> watchdog;
 
         StreamLease(InputStream upstream, Semaphore slots) {
+            this(upstream, slots, true);
+        }
+
+        StreamLease(InputStream upstream, Semaphore slots, boolean counted) {
             this.upstream = upstream;
             this.slots = slots;
+            this.counted = counted;
         }
 
         InputStream stream() {
@@ -367,11 +419,18 @@ public class StockGexController {
 
         void armIdleWatchdog(java.util.concurrent.ScheduledExecutorService timers,
                              long checkEveryMs, long idleTimeoutMs) {
-            this.watchdog = timers.scheduleWithFixedDelay(() -> {
+            ScheduledFuture<?> armed = timers.scheduleWithFixedDelay(() -> {
                 if (isIdleFor(idleTimeoutMs)) {
                     release();
                 }
             }, checkEveryMs, checkEveryMs, TimeUnit.MILLISECONDS);
+            this.watchdog = armed;
+            // The task can fire — and the lease can be released by anything else — between scheduling
+            // and this assignment. release() would then have had nothing to cancel and the recurring
+            // task would run for the life of the JVM. A long GC pause is all it takes.
+            if (released.get()) {
+                armed.cancel(false);
+            }
         }
 
         /**
@@ -396,6 +455,9 @@ public class StockGexController {
                 // never be the reason the permit is not returned.
             } finally {
                 slots.release();
+                if (counted) {
+                    STREAMS_ENDED.incrementAndGet();
+                }
             }
         }
     }
@@ -438,16 +500,38 @@ public class StockGexController {
     // ------------------------------------------------------------------ helpers
 
     /**
-     * Is this really an event stream? A MISSING content type is accepted — the endpoint's contract
-     * says the 200 is a stream and some intermediaries strip it — but a type that is present and
-     * says something else is a contradiction, not an omission.
+     * Is this really an event stream?
+     *
+     * <p>Parsed INDEPENDENTLY of {@link #mediaType}, which is deliberately forgiving because its job
+     * is to produce a header Spring will accept — it turns every wildcard into the fallback. Reusing
+     * it here was a hole: {@code application/*} would become "no opinion" and therefore be accepted,
+     * relabelled {@code text/event-stream}, and returned as a live stream. {@code application/*} is
+     * not an absence of information; it is a statement that EXCLUDES {@code text/event-stream}.
+     *
+     * <p>The policy, in full:
+     * <ul>
+     *   <li>missing or blank — ACCEPT. The endpoint's contract says a 200 here is the stream, and
+     *       intermediaries do strip the header.</li>
+     *   <li>{@code &#42;/&#42;} — ACCEPT, as the wire equivalent of saying nothing.</li>
+     *   <li>{@code text/&#42;} — ACCEPT; compatible.</li>
+     *   <li>{@code application/&#42;} and any other incompatible type — REJECT.</li>
+     *   <li>present but unparseable — REJECT. A response we cannot describe is not one we should
+     *       hand to a browser as live market data.</li>
+     * </ul>
      */
     private static boolean isEventStream(String raw) {
         if (raw == null || raw.isBlank()) {
             return true;
         }
-        MediaType parsed = mediaType(raw, null);
-        return parsed == null || MediaType.TEXT_EVENT_STREAM.isCompatibleWith(parsed);
+        MediaType parsed;
+        try {
+            parsed = MediaType.parseMediaType(raw);
+        } catch (IllegalArgumentException malformed) {
+            return false;
+        }
+        // isCompatibleWith gives exactly the table above: */* and text/* are compatible with
+        // text/event-stream, application/* and every unrelated concrete type are not.
+        return MediaType.TEXT_EVENT_STREAM.isCompatibleWith(parsed);
     }
 
     private static void closeQuietly(InputStream in) {
@@ -459,6 +543,28 @@ public class StockGexController {
         } catch (IOException ignored) {
             // The exchange is being abandoned either way.
         }
+    }
+
+    /** Remote text on a log line is unbounded input; this bounds it. */
+    static String shortForLog(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String oneLine = raw.replaceAll("[\\r\\n]", " ");
+        return oneLine.length() <= 120 ? oneLine : oneLine.substring(0, 120) + "…";
+    }
+
+    /** The one value of a header, or null when it was absent OR sent more than once. */
+    private static String singleHeader(HttpServletRequest request, String name) {
+        if (request == null) {
+            return null;
+        }
+        java.util.Enumeration<String> values = request.getHeaders(name);
+        if (values == null || !values.hasMoreElements()) {
+            return null;
+        }
+        String only = values.nextElement();
+        return values.hasMoreElements() ? null : only;
     }
 
     /** Measures exactly what goes on the wire: the symbol is not trimmed anywhere on this path. */
@@ -484,6 +590,11 @@ public class StockGexController {
      * and a down upstream would otherwise write a line for every poll of every open tab.
      */
     private void logUnreachable(String endpoint, StockGexUpstream.UnavailableException cause) {
+        if (StockGexUpstream.CODE_PROTOCOL.equals(cause.code())) {
+            UPSTREAM_PROTOCOL_FAULTS.incrementAndGet();
+        } else {
+            UPSTREAM_UNREACHABLE.incrementAndGet();
+        }
         long now = System.currentTimeMillis();
         long previous = lastUnreachableLogMs.get();
         if (now - previous < UNREACHABLE_LOG_INTERVAL_MS
@@ -491,9 +602,12 @@ public class StockGexController {
             return;
         }
         Throwable root = cause.getCause() == null ? cause : cause.getCause();
-        // Message only, no stack trace: this is an expected operational state, not a defect.
+        // Message only, no stack trace: this is an expected operational state, not a defect. The
+        // root message can originate remotely, so it is truncated and flattened to one line — a log
+        // line is not a place to paste unbounded input from another service.
         System.out.println("stock-gex " + endpoint + " 502 " + cause.code() + ": "
-                + cause.getMessage() + " (" + root.getClass().getSimpleName() + ")");
+                + cause.getMessage() + " (" + root.getClass().getSimpleName() + ": "
+                + shortForLog(root.getMessage()) + ") " + counters());
     }
 
     /**
