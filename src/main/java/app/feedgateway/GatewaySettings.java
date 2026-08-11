@@ -1378,6 +1378,30 @@ public final class GatewaySettings {
         return value("GATEWAY_APPROVAL_ROLE", "");
     }
 
+    // ---- stock-gex-service proxy (/api/stock-gex/board, /api/stock-gex/stream) ----
+    // Same override shape as the pin-flow / system-status upstreams: a dotted key wins when present,
+    // otherwise the SCREAMING_SNAKE env the deploy wiring sets, otherwise the in-cluster default.
+
+    /** Base URL of the standalone stock-gex-service the board/stream endpoints proxy. */
+    public String stockGexBaseUrl() {
+        return firstNonBlank(value("stock-gex.base-url", ""),
+                             value("STOCK_GEX_BASE_URL", "http://stock-gex-service:8021"));
+    }
+
+    /** TCP connect budget for BOTH stock-gex calls; exceeded → 502 with a JSON error, never a stack trace. */
+    public long stockGexConnectTimeoutMs() {
+        return longValue("STOCK_GEX_CONNECT_TIMEOUT_MS", 2_000L, 200L);
+    }
+
+    /**
+     * Whole-request budget for the BOARD call only. Deliberately NOT applied to the stream: an SSE
+     * response is long-lived by construction (heartbeats arrive at ~10s and the session runs for hours),
+     * so any request-level deadline there would kill a perfectly healthy stream.
+     */
+    public long stockGexBoardTimeoutMs() {
+        return longValue("STOCK_GEX_BOARD_TIMEOUT_MS", 5_000L, 200L);
+    }
+
     public static String value(String key, String fallback) {
         String resolved = fallback;
         String env = System.getenv(key);
