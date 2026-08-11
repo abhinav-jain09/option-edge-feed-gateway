@@ -36,6 +36,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.MediaType;
@@ -123,16 +124,41 @@ class StockGexControllerTest {
         return http;
     }
 
-    private static StockGexUpstream upstream(HttpClient http) {
-        return new StockGexUpstream("http://stock-gex-service:8021/", Duration.ofSeconds(5), http);
+    /**
+     * Every {@link StockGexUpstream} built here owns a watchdog scheduler, and every live response
+     * holds a lease. Left behind they accumulate across the suite — daemon threads do not stop a JVM
+     * exiting, but they do interfere with the timing the watchdog tests measure.
+     */
+    private final List<StockGexUpstream> upstreams = new ArrayList<>();
+    private final List<ResponseEntity<StreamingResponseBody>> liveResponses = new ArrayList<>();
+
+    @AfterEach
+    void closeEverythingThisTestOpened() {
+        for (ResponseEntity<StreamingResponseBody> live : liveResponses) {
+            try {
+                live.getBody().writeTo(OutputStream.nullOutputStream());
+            } catch (Exception ignored) {
+                // the point is only to run the pump's finally
+            }
+        }
+        liveResponses.clear();
+        upstreams.forEach(StockGexUpstream::close);
+        upstreams.clear();
     }
 
-    private static StockGexController controller(HttpClient http, int authStatus) {
+    private StockGexUpstream upstream(HttpClient http) {
+        StockGexUpstream created =
+                new StockGexUpstream("http://stock-gex-service:8021/", Duration.ofSeconds(5), http);
+        upstreams.add(created);
+        return created;
+    }
+
+    private StockGexController controller(HttpClient http, int authStatus) {
         return controller(http, authStatus, StockGexController.MAX_CONCURRENT_STREAMS, new CapturingRegistrar());
     }
 
-    private static StockGexController controller(HttpClient http, int authStatus, int maxStreams,
-                                                 StockGexController.AsyncCleanupRegistrar registrar) {
+    private StockGexController controller(HttpClient http, int authStatus, int maxStreams,
+                                          StockGexController.AsyncCleanupRegistrar registrar) {
         return new StockGexController(upstream(http), authReturning(authStatus), new ObjectMapper(),
                 maxStreams, registrar);
     }
@@ -154,8 +180,8 @@ class StockGexControllerTest {
     }
 
     /** Run the stream handler and return whatever it answered — a stream, or a refusal. */
-    private static Object streamOutcome(StockGexController controller, String symbol, String lastEventId,
-                                        String authorization) {
+    private Object streamOutcome(StockGexController controller, String symbol, String lastEventId,
+                                 String authorization) {
         try {
             return controller.stream(null, symbol, lastEventId, authorization);
         } catch (StockGexController.StockGexRefusal refusal) {
@@ -174,10 +200,12 @@ class StockGexControllerTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static ResponseEntity<StreamingResponseBody> liveStream(Object outcome) {
+    private ResponseEntity<StreamingResponseBody> liveStream(Object outcome) {
         ResponseEntity<?> res = (ResponseEntity<?>) outcome;
         assertTrue(res.getBody() instanceof StreamingResponseBody, "expected a live stream");
-        return (ResponseEntity<StreamingResponseBody>) res;
+        ResponseEntity<StreamingResponseBody> live = (ResponseEntity<StreamingResponseBody>) res;
+        liveResponses.add(live);
+        return live;
     }
 
     // ---------------------------------------------------------------- board
@@ -727,11 +755,16 @@ class StockGexControllerTest {
     }
 
     @Test
-    void aSilentUpstreamIsClosedByTheIdleWatchdogRatherThanHeldForever() throws Exception {
-        // Nothing else can see this. The request timeout stopped applying when headers arrived, and a
-        // heartbeat only proves liveness while the upstream is still sending one — silence produces no
-        // evidence of itself. Without the watchdog, one half-open peer holds an async thread, a permit
-        // and an upstream exchange until the JVM restarts.
+    void aSilentUpstreamIsClosedByTheREALIdleWatchdogRatherThanHeldForever() throws Exception {
+        // Nothing else can see this failure. The request timeout stopped applying when headers
+        // arrived, and a heartbeat only proves liveness while the upstream is still sending one —
+        // silence produces no evidence of itself. Without the watchdog, one half-open peer holds an
+        // async thread, a permit and an upstream exchange until the JVM restarts.
+        //
+        // The PRODUCTION watchdog is exercised, on the controller's own lease, via the timing seam.
+        // An earlier version of this test built a second lease over the same semaphore, which
+        // released a permit it had never acquired and left the count wrong in the direction that
+        // hides a leak.
         CountDownLatch closed = new CountDownLatch(1);
         InputStream silent = new InputStream() {
             private final CountDownLatch stop = new CountDownLatch(1);
@@ -743,7 +776,7 @@ class StockGexControllerTest {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-                throw new IOException("closed");
+                throw new IOException("closed under the reader");
             }
 
             @Override
@@ -760,33 +793,88 @@ class StockGexControllerTest {
 
         StockGexController controller = new StockGexController(
                 upstream(clientStreaming(200, "text/event-stream", silent)),
-                authReturning(200), new ObjectMapper(), 1, new CapturingRegistrar()) {
-        };
+                authReturning(200), new ObjectMapper(), 1, new CapturingRegistrar(),
+                20L, 60L);   // check every 20ms, idle after 60ms
         ResponseEntity<StreamingResponseBody> res =
                 liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
+        assertEquals(0, controller.streamSlots.availablePermits());
 
+        CountDownLatch pumpFinished = new CountDownLatch(1);
         Thread pump = new Thread(() -> {
             try {
-                res.getBody().writeTo(new ByteArrayOutputStream());
+                res.getBody().writeTo(OutputStream.nullOutputStream());
             } catch (IOException ignored) {
                 // the watchdog's close surfaces here
+            } finally {
+                pumpFinished.countDown();
             }
         });
         pump.setDaemon(true);
         pump.start();
 
-        // The production idle timeout is 60s; proving the MECHANISM without waiting a minute means
-        // releasing the lease the way the watchdog does and showing that it unblocks the pump.
-        assertEquals(0, controller.streamSlots.availablePermits());
-        StockGexController.StreamLease lease = new StockGexController.StreamLease(silent, controller.streamSlots);
-        lease.release();
-        assertTrue(closed.await(5, TimeUnit.SECONDS), "closing the stream is what unblocks a parked read");
-        pump.join(5000);
-        assertFalse(pump.isAlive(), "the pump must end when its upstream is closed under it");
+        assertTrue(closed.await(5, TimeUnit.SECONDS),
+                "the watchdog must close a stream that has delivered nothing");
+        assertTrue(pumpFinished.await(5, TimeUnit.SECONDS),
+                "and closing it is what unblocks the pump parked on the read");
+        assertEquals(1, controller.streamSlots.availablePermits(),
+                "exactly one permit back — not two, however many things ended the stream");
+        liveResponses.remove(res);
     }
 
     @Test
-    void theIdleWatchdogOnlyFiresWhenNothingHasArrived() {
+    void aStreamThatKEEPSDELIVERINGIsNeverClosedByItsOwnWatchdog() throws Exception {
+        // The other half of the contract: the watchdog must not be a timer on healthy sessions.
+        AtomicBoolean stop = new AtomicBoolean(false);
+        InputStream chatty = new InputStream() {
+            @Override
+            public int read() {
+                return stop.get() ? -1 : ':';
+            }
+
+            @Override
+            public int read(byte[] b, int off, int len) {
+                if (stop.get()) {
+                    return -1;
+                }
+                b[off] = ':';
+                try {
+                    Thread.sleep(5L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return 1;
+            }
+        };
+        StockGexController controller = new StockGexController(
+                upstream(clientStreaming(200, "text/event-stream", chatty)),
+                authReturning(200), new ObjectMapper(), 1, new CapturingRegistrar(),
+                20L, 200L);
+        ResponseEntity<StreamingResponseBody> res =
+                liveStream(streamOutcome(controller, "TSLA", null, "Bearer t"));
+
+        Thread pump = new Thread(() -> {
+            try {
+                res.getBody().writeTo(OutputStream.nullOutputStream());
+            } catch (IOException ignored) {
+                // only reached if the watchdog wrongly fired
+            }
+        });
+        pump.setDaemon(true);
+        pump.start();
+
+        Thread.sleep(600L);   // three idle windows, with bytes arriving throughout
+        assertEquals(0, controller.streamSlots.availablePermits(),
+                "a stream that is delivering must still be alive after several idle windows");
+        stop.set(true);
+        pump.join(5000);
+        liveResponses.remove(res);
+    }
+
+    @Test
+    void theIdleClockIsMonotonicAndMovedOnlyByBytesArriving() {
+        // MONOTONIC on purpose: this is the only mechanism bounding a silent upstream, and a
+        // backward wall-clock step (NTP, a resumed VM) would postpone it by exactly the size of the
+        // jump — at the one moment it must not be postponed.
         Semaphore slots = new Semaphore(1);
         slots.tryAcquire();
         StockGexController.StreamLease lease =
@@ -798,8 +886,9 @@ class StockGexControllerTest {
         assertFalse(lease.isIdleFor(60_000L), "a byte arriving resets the clock");
         assertFalse(lease.isReleased());
         lease.release();
+        lease.release();
         assertTrue(lease.isReleased());
-        assertEquals(1, slots.availablePermits());
+        assertEquals(1, slots.availablePermits(), "released twice, returned once");
     }
 
     @Test
@@ -826,6 +915,129 @@ class StockGexControllerTest {
         // Draining the first stream ends it, and the slot must come back for the next client.
         drain(first);
         assertEquals(1, controller.streamSlots.availablePermits());
+    }
+
+    // ---------------------------------------------------------------- content-type / encoding
+
+    @Test
+    void aWildcardContentTypeFallsBackInsteadOfBecomingA500() throws Exception {
+        // "Parseable" is not "usable": */* and application/* both parse, and are then REJECTED by
+        // ResponseEntity.contentType() with an IllegalArgumentException — after the upstream body has
+        // already been read successfully. Unhandled, that is a 500 with a stack trace where a
+        // perfectly good 422 or 200 should have been.
+        for (String wildcard : new String[]{"*/*", "application/*", "*/*; charset=utf-8"}) {
+            ResponseEntity<byte[]> board = controller(
+                    clientReturning(200, contentType(wildcard), BOARD_JSON.getBytes(StandardCharsets.UTF_8)),
+                    200).board("TSLA", "Bearer t");
+            assertEquals(200, board.getStatusCode().value(), wildcard);
+            assertEquals(MediaType.APPLICATION_JSON, board.getHeaders().getContentType(), wildcard);
+            assertEquals(BOARD_JSON, bodyText(board), wildcard);
+        }
+    }
+
+    @Test
+    void aWildcardContentTypeOnAREFUSALDoesNotReplaceItWithA500() throws Exception {
+        // The nastiest version: throwing from inside the exception handler while HANDLING a refusal
+        // would swap the upstream's 429 for a 500 and take the whole error contract with it.
+        String body = "{\"error\":\"MAX_SYMBOLS\"}";
+        HttpClient http = clientStreaming(429, "*/*",
+                new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
+
+        ResponseEntity<byte[]> res = refusalOf(streamOutcome(controller(http, 200), "TSLA", null, "Bearer t"));
+
+        assertEquals(429, res.getStatusCode().value());
+        assertEquals(body, new String(res.getBody(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void a200ThatIsNotAnEventStreamIsA502NotAFakeLiveStream() throws Exception {
+        // A gateway answering `200 application/json`, or an HTML error page from an intermediary,
+        // would otherwise be handed to the browser as a live stream that can never carry an event —
+        // holding a slot and an async thread until the idle watchdog eventually noticed.
+        AtomicBoolean closed = new AtomicBoolean(false);
+        StockGexController controller = controller(
+                clientStreaming(200, "application/json", closeRecording(closed, "{\"not\":\"a stream\"}")),
+                200, 1, new CapturingRegistrar());
+
+        ResponseEntity<byte[]> res = refusalOf(streamOutcome(controller, "TSLA", null, "Bearer t"));
+
+        assertEquals(502, res.getStatusCode().value());
+        assertEquals("UPSTREAM_PROTOCOL_ERROR",
+                new ObjectMapper().readTree(res.getBody()).get("error").asText());
+        assertTrue(closed.get(), "and the body must be closed rather than left open");
+        assertEquals(1, controller.streamSlots.availablePermits(), "and the slot handed straight back");
+    }
+
+    @Test
+    void a200WithNoContentTypeAtAllIsStillTreatedAsTheStreamTheContractPromises() throws Exception {
+        // Absence is not contradiction: some intermediaries strip the header, and the endpoint's
+        // contract says a 200 here IS the stream.
+        ResponseEntity<StreamingResponseBody> res = liveStream(streamOutcome(
+                controller(clientStreaming(200, null,
+                        new ByteArrayInputStream("id: 1\ndata: {}\n\n".getBytes(StandardCharsets.UTF_8))), 200),
+                "TSLA", null, "Bearer t"));
+
+        assertEquals(200, res.getStatusCode().value());
+        assertEquals(MediaType.TEXT_EVENT_STREAM, res.getHeaders().getContentType());
+    }
+
+    @Test
+    void aCompressedBodyIsRefusedRatherThanForwardedAsUnreadableBytes() throws Exception {
+        // Accept-Encoding: identity is a REQUEST header — a wish. If something compresses anyway,
+        // forwarding those bytes while dropping Content-Encoding hands the browser a gzip stream
+        // labelled as JSON: not corrupt in any way that reports itself, simply unreadable.
+        HttpClient http = clientReturning(200,
+                headers(Map.of("content-type", List.of("application/json"),
+                               "content-encoding", List.of("gzip"))),
+                new byte[]{0x1f, (byte) 0x8b, 0x08, 0x00});
+
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+
+        assertEquals(502, res.getStatusCode().value());
+        assertEquals("UPSTREAM_PROTOCOL_ERROR",
+                new ObjectMapper().readTree(res.getBody()).get("error").asText());
+    }
+
+    @Test
+    void anIdentityEncodingHeaderIsFine() throws Exception {
+        ResponseEntity<byte[]> res = controller(clientReturning(200,
+                headers(Map.of("content-type", List.of("application/json"),
+                               "content-encoding", List.of("identity"))),
+                BOARD_JSON.getBytes(StandardCharsets.UTF_8)), 200).board("TSLA", "Bearer t");
+
+        assertEquals(200, res.getStatusCode().value());
+        assertEquals(BOARD_JSON, bodyText(res));
+    }
+
+    @Test
+    void aBoardRedirectAlsoLosesItsInternalLocation() throws Exception {
+        // Pinned for the board as well as the stream: an internal Location handed to a browser names
+        // a host that only exists inside the cluster.
+        HttpClient http = clientReturning(302,
+                headers(Map.of("content-type", List.of("text/html"),
+                               "location", List.of("http://stock-gex-service.internal:8021/elsewhere"))),
+                "moved".getBytes(StandardCharsets.UTF_8));
+
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+
+        assertEquals(302, res.getStatusCode().value());
+        assertEquals("moved", bodyText(res));
+        assertNull(res.getHeaders().getFirst("Location"));
+        assertFalse(res.getHeaders().toString().contains("internal"));
+    }
+
+    @Test
+    void aStreamREFUSALBodyAlsoSurvivesByteForByte() throws Exception {
+        // The board path is covered above; the refusal path goes through a different response
+        // builder and the exception handler, so it gets its own byte-hostile case.
+        byte[] hostile = {0x7B, (byte) 0xFF, (byte) 0xFE, 0x00, 0x41, (byte) 0xC3, 0x28, 0x7D};
+        HttpClient http = clientStreaming(422, "application/json", new ByteArrayInputStream(hostile));
+
+        ResponseEntity<byte[]> res = refusalOf(streamOutcome(controller(http, 200), "TSLA", null, "Bearer t"));
+
+        assertEquals(422, res.getStatusCode().value());
+        assertArrayEquals(hostile, res.getBody(),
+                "a refusal body is as much a passthrough as a board body");
     }
 
     // ---------------------------------------------------------------- timeout shape

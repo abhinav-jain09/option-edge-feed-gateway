@@ -182,8 +182,10 @@ public final class StockGexUpstream implements AutoCloseable {
             HttpRequest req = HttpRequest.newBuilder(uri("/api/stock-gex/board", symbol))
                     .timeout(boardTimeout)
                     .header("Accept", "application/json")
-                    // Ask for no transfer coding. A gzipped body forwarded under a Content-Encoding we
-                    // do not carry would arrive at the browser as garbage that still claims to be JSON.
+                    // Ask for no CONTENT coding. This is only a request, though — see
+                    // requireIdentityEncoding: what arrives still has to be checked, because a body
+                    // forwarded compressed without its Content-Encoding header is garbage that still
+                    // claims to be JSON.
                     .header("Accept-Encoding", "identity")
                     .GET()
                     .build();
@@ -196,6 +198,7 @@ public final class StockGexUpstream implements AutoCloseable {
         } catch (IllegalArgumentException | SecurityException misconfigured) {
             throw unavailable("stock-gex-service address is not usable", misconfigured);
         }
+        requireIdentityEncoding(resp, "board");
         // send() has returned, so the JDK's request timeout no longer applies (verified). A body that
         // arrives byte-by-byte, or never, would otherwise hold this request thread forever.
         byte[] body = readBounded(resp.body(), MAX_BOARD_BYTES, boardTimeout, "board");
@@ -238,6 +241,7 @@ public final class StockGexUpstream implements AutoCloseable {
         } catch (IllegalArgumentException | SecurityException misconfigured) {
             throw unavailable("stock-gex-service address is not usable", misconfigured);
         }
+        requireIdentityEncoding(resp, "stream");
         int status = resp.statusCode();
         String contentType = header(resp, "content-type");
         String retryAfter = header(resp, "retry-after");
@@ -248,6 +252,33 @@ public final class StockGexUpstream implements AutoCloseable {
             return new StreamResponse(status, contentType, retryAfter, null, body);
         }
         return new StreamResponse(status, contentType, retryAfter, resp.body(), null);
+    }
+
+    /**
+     * Refuse a body that arrived under a content coding this proxy does not decode.
+     *
+     * <p>{@code Accept-Encoding: identity} is a REQUEST header — a wish, not a guarantee. If an
+     * upstream or an intermediary compresses anyway, forwarding those bytes while dropping the
+     * {@code Content-Encoding} header hands the browser a gzip stream labelled as JSON: it is not
+     * corrupt in a way anything reports, it is simply unreadable. Since the whole contract here is
+     * byte-for-byte passthrough, the honest answer is to refuse rather than to half-decode.
+     */
+    private static void requireIdentityEncoding(HttpResponse<?> resp, String what) {
+        String encoding = header(resp, "content-encoding");
+        if (encoding == null || encoding.isBlank()
+                || "identity".equalsIgnoreCase(encoding.trim())) {
+            return;
+        }
+        try {
+            if (resp.body() instanceof InputStream stream) {
+                stream.close();
+            }
+        } catch (IOException ignored) {
+            // abandoning the exchange either way
+        }
+        throw new UnavailableException(CODE_PROTOCOL,
+                "stock-gex " + what + " arrived with content-encoding '" + encoding.trim()
+                + "', which this proxy does not decode", null);
     }
 
     /**

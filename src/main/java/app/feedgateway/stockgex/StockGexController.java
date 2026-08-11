@@ -134,6 +134,8 @@ public class StockGexController {
     /** Package-visible so a test can exhaust it. */
     final Semaphore streamSlots;
     private final AtomicLong lastUnreachableLogMs = new AtomicLong(0L);
+    private final long idleCheckMs;
+    private final long idleTimeoutMs;
 
     @org.springframework.beans.factory.annotation.Autowired
     public StockGexController(StockGexUpstream upstream, LiquidityHistoryAuth auth, ObjectMapper mapper) {
@@ -143,11 +145,21 @@ public class StockGexController {
     /** Test seam: explicit concurrency limit and cleanup binding. */
     StockGexController(StockGexUpstream upstream, LiquidityHistoryAuth auth, ObjectMapper mapper,
                        int maxConcurrentStreams, AsyncCleanupRegistrar asyncCleanup) {
+        this(upstream, auth, mapper, maxConcurrentStreams, asyncCleanup,
+                STREAM_IDLE_CHECK_MS, STREAM_IDLE_TIMEOUT_MS);
+    }
+
+    /** Test seam: a watchdog fast enough to observe, so the REAL one can be exercised. */
+    StockGexController(StockGexUpstream upstream, LiquidityHistoryAuth auth, ObjectMapper mapper,
+                       int maxConcurrentStreams, AsyncCleanupRegistrar asyncCleanup,
+                       long idleCheckMs, long idleTimeoutMs) {
         this.upstream = upstream;
         this.auth = auth;
         this.mapper = mapper == null ? new ObjectMapper() : mapper;
         this.streamSlots = new Semaphore(maxConcurrentStreams);
         this.asyncCleanup = asyncCleanup;
+        this.idleCheckMs = idleCheckMs;
+        this.idleTimeoutMs = idleTimeoutMs;
     }
 
     // ------------------------------------------------------------------ board
@@ -235,10 +247,20 @@ public class StockGexController {
                         opened.errorBody() == null ? new byte[0] : opened.errorBody(),
                         opened.retryAfter());
             }
+            if (!isEventStream(opened.contentType())) {
+                // A 200 is not enough. An upstream answering `200 application/json`, or an HTML error
+                // page from something in between, would otherwise be presented to the browser as a
+                // live event stream that can never carry an event — holding a slot and an async
+                // thread until the idle watchdog eventually noticed.
+                closeQuietly(opened.body());
+                throw refusal(HttpStatus.BAD_GATEWAY,
+                        error(StockGexUpstream.CODE_PROTOCOL,
+                              "stock-gex-service answered 200 but not with an event stream"), null);
+            }
             // The lease owns BOTH the upstream stream and the permit from here on, and releases them
             // exactly once however this request ends.
             lease = new StreamLease(opened.body(), streamSlots);
-            lease.armIdleWatchdog(upstream.timers(), STREAM_IDLE_CHECK_MS, STREAM_IDLE_TIMEOUT_MS);
+            lease.armIdleWatchdog(upstream.timers(), idleCheckMs, idleTimeoutMs);
             // Bind to the servlet async lifecycle BEFORE returning: if the executor rejects the body, or
             // the container discards the dispatch, writeTo never runs and this is the only thing left.
             asyncCleanup.onAsyncCompletion(request, lease::release);
@@ -314,7 +336,12 @@ public class StockGexController {
         private final InputStream upstream;
         private final Semaphore slots;
         private final AtomicBoolean released = new AtomicBoolean(false);
-        private final AtomicLong lastActivityMs = new AtomicLong(System.currentTimeMillis());
+        /**
+         * NANOTIME, not wall clock. This is the only mechanism bounding a silent upstream, and a
+         * backward clock adjustment (NTP step, a VM resuming) would postpone it by exactly the size
+         * of the jump — the one moment it must not be postponed.
+         */
+        private final AtomicLong lastActivityNanos = new AtomicLong(System.nanoTime());
         private volatile ScheduledFuture<?> watchdog;
 
         StreamLease(InputStream upstream, Semaphore slots) {
@@ -327,11 +354,11 @@ public class StockGexController {
         }
 
         void markActivity() {
-            lastActivityMs.set(System.currentTimeMillis());
+            lastActivityNanos.set(System.nanoTime());
         }
 
         boolean isIdleFor(long millis) {
-            return System.currentTimeMillis() - lastActivityMs.get() >= millis;
+            return System.nanoTime() - lastActivityNanos.get() >= TimeUnit.MILLISECONDS.toNanos(millis);
         }
 
         boolean isReleased() {
@@ -410,6 +437,30 @@ public class StockGexController {
 
     // ------------------------------------------------------------------ helpers
 
+    /**
+     * Is this really an event stream? A MISSING content type is accepted — the endpoint's contract
+     * says the 200 is a stream and some intermediaries strip it — but a type that is present and
+     * says something else is a contradiction, not an omission.
+     */
+    private static boolean isEventStream(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return true;
+        }
+        MediaType parsed = mediaType(raw, null);
+        return parsed == null || MediaType.TEXT_EVENT_STREAM.isCompatibleWith(parsed);
+    }
+
+    private static void closeQuietly(InputStream in) {
+        if (in == null) {
+            return;
+        }
+        try {
+            in.close();
+        } catch (IOException ignored) {
+            // The exchange is being abandoned either way.
+        }
+    }
+
     /** Measures exactly what goes on the wire: the symbol is not trimmed anywhere on this path. */
     private boolean tooLong(String symbol) {
         return symbol != null && symbol.length() > StockGexUpstream.MAX_SYMBOL_LENGTH;
@@ -481,14 +532,30 @@ public class StockGexController {
         return out.body(body.getBytes(StandardCharsets.UTF_8));
     }
 
-    /** Honour the upstream's content type when it is a usable one, else the caller's expectation. */
+    /**
+     * Honour the upstream's content type when it is a CONCRETE one, else the caller's expectation.
+     *
+     * <p>"Parseable" is not the same as "usable". A wildcard type ({@code &#42;/&#42;}) or a wildcard
+     * subtype ({@code application/&#42;}) both parse happily and are then rejected by
+     * {@link ResponseEntity.BodyBuilder#contentType} with an
+     * {@link IllegalArgumentException} — which, after the upstream response has already been read
+     * successfully, escapes as a 500 with a stack trace. Worse, it can throw from inside
+     * {@link #refused}, replacing an upstream 422 or 429 with a 500 while HANDLING it. A wildcard is
+     * not a description of a body anyway, so it is treated exactly like a missing one.
+     */
     private static MediaType mediaType(String raw, MediaType fallback) {
         if (raw == null || raw.isBlank()) {
             return fallback;
         }
         try {
-            return MediaType.parseMediaType(raw);
-        } catch (org.springframework.http.InvalidMediaTypeException malformed) {
+            MediaType parsed = MediaType.parseMediaType(raw);
+            if (parsed.isWildcardType() || parsed.isWildcardSubtype()) {
+                return fallback;
+            }
+            return parsed;
+        } catch (IllegalArgumentException malformed) {
+            // InvalidMediaTypeException extends IllegalArgumentException, so this covers both the
+            // unparseable case and anything else the parser rejects outright.
             return fallback;
         }
     }

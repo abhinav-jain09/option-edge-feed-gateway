@@ -1,6 +1,7 @@
 package app.feedgateway.selleractivity;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -15,7 +16,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -111,18 +111,61 @@ class SellerActivityStreamReleaseTest {
 
     /**
      * The socket-level backstop is the only thing that can end a write to a client that has stopped
-     * reading but not disconnected, now that no async clock will. It lives in a properties file, so it
-     * is pinned here rather than trusted to survive an edit.
+     * reading but not disconnected, now that no async clock will.
+     *
+     * <p>Asserted on the EFFECTIVE, BOUND value rather than on the text of a properties file: a
+     * commented-out line, a misspelled key, or a property that Boot no longer binds would all leave
+     * a source-text assertion green while the backstop was gone. {@code connection-timeout} is an
+     * I/O-operation budget on the connector (how long one blocking read or write may take), which is
+     * exactly the shape needed — not a general idle-connection deadline.
      */
     @Test
-    void theSocketTimeoutThatMakesAStuckWriteFailIsConfigured() throws Exception {
-        String properties = Files.readString(
-                Path.of("src/main/resources/application.properties"), StandardCharsets.UTF_8);
+    void theSocketTimeoutThatMakesAStuckWriteFailIsActuallyBOUND() {
+        org.springframework.boot.autoconfigure.web.ServerProperties bound =
+                new org.springframework.boot.autoconfigure.web.ServerProperties();
+        org.springframework.boot.context.properties.bind.Binder binder =
+                new org.springframework.boot.context.properties.bind.Binder(
+                        org.springframework.boot.context.properties.source.ConfigurationPropertySources.from(
+                                new org.springframework.core.env.MapPropertySource("under-test",
+                                        loadApplicationProperties())));
+        binder.bind("server", org.springframework.boot.context.properties.bind.Bindable.ofInstance(bound));
 
-        assertTrue(properties.contains("server.tomcat.connection-timeout="),
-                "without a socket timeout, a client that stops reading holds an async thread and an "
+        java.time.Duration connectionTimeout = bound.getTomcat().getConnectionTimeout();
+        assertNotNull(connectionTimeout,
+                "without a connector timeout, a client that stops reading holds an async thread and an "
                         + "aggregation permit for as long as it likes");
-        assertTrue(properties.contains("spring.mvc.async.request-timeout=-1"),
-                "and this is the setting that made that backstop load-bearing");
+        assertTrue(connectionTimeout.toMillis() > 0 && connectionTimeout.toMillis() <= 60_000L,
+                "the backstop must be a real, bounded budget; got " + connectionTimeout);
+    }
+
+    /** And the setting that made that backstop load-bearing, also asserted as a bound value. */
+    @Test
+    void theAsyncDeadlineIsActuallyRemoved() {
+        org.springframework.boot.autoconfigure.web.servlet.WebMvcProperties mvc =
+                new org.springframework.boot.autoconfigure.web.servlet.WebMvcProperties();
+        new org.springframework.boot.context.properties.bind.Binder(
+                org.springframework.boot.context.properties.source.ConfigurationPropertySources.from(
+                        new org.springframework.core.env.MapPropertySource("under-test",
+                                loadApplicationProperties())))
+                .bind("spring.mvc", org.springframework.boot.context.properties.bind.Bindable.ofInstance(mvc));
+
+        java.time.Duration requestTimeout = mvc.getAsync().getRequestTimeout();
+        assertNotNull(requestTimeout, "the property must be present at all");
+        assertTrue(requestTimeout.isNegative(),
+                "a non-negative async deadline tears down healthy SSE streams on a clock; got "
+                        + requestTimeout);
+    }
+
+    private static java.util.Map<String, Object> loadApplicationProperties() {
+        java.util.Properties properties = new java.util.Properties();
+        try (java.io.InputStream in =
+                     Files.newInputStream(Path.of("src/main/resources/application.properties"))) {
+            properties.load(in);
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+        java.util.Map<String, Object> map = new java.util.LinkedHashMap<>();
+        properties.forEach((k, v) -> map.put(String.valueOf(k), v));
+        return map;
     }
 }

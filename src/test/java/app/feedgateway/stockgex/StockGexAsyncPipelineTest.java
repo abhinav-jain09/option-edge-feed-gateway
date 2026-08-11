@@ -124,7 +124,8 @@ class StockGexAsyncPipelineTest {
     }
 
     @AfterAll
-    static void done() {
+    static void stopClients() {
+        // the per-instance executor is shut down by the JVM; nothing to do beyond releasing holds
     }
 
     @Test
@@ -192,6 +193,110 @@ class StockGexAsyncPipelineTest {
         upstream.releaseAll();
         for (HttpResponse<InputStream> r : live) {
             r.body().close();
+        }
+    }
+
+    @Test
+    void theRefusalIsStillSynchronousWhenTheAsyncEXECUTORItselfIsFull() throws Exception {
+        // The claim is not "refusals are fast when there is spare capacity" — it is that a refusal
+        // does not NEED the async executor at all. Proving that requires the executor to be full, so
+        // this exhausts the stream cap AND then fills the remaining pool before asking for one more.
+        List<HttpResponse<InputStream>> live = new ArrayList<>();
+        for (int i = 0; i < STREAM_CAP; i++) {
+            live.add(openStream("CAP" + i));
+        }
+        List<Future<HttpResponse<InputStream>>> occupiers = new ArrayList<>();
+        int fill = StockGexAsyncConfig.MAX_ASYNC_THREADS + 8;
+        for (int i = 0; i < fill; i++) {
+            occupiers.add(clients.submit(() -> http.send(
+                    HttpRequest.newBuilder(URI.create(url("/test/occupy")))
+                            .timeout(Duration.ofSeconds(20)).GET().build(),
+                    HttpResponse.BodyHandlers.ofInputStream())));
+        }
+        try {
+            int occupied = 0;
+            for (Future<HttpResponse<InputStream>> f : occupiers) {
+                try {
+                    if (f.get(30, TimeUnit.SECONDS).statusCode() == 200) {
+                        occupied++;
+                    }
+                } catch (Exception rejected) {
+                    // A rejected async task is the designed behaviour of the direct-handoff pool and
+                    // is exactly the pressure this test wants.
+                }
+            }
+            assertTrue(occupied >= 8, "the executor was not meaningfully occupied (" + occupied + ")");
+            assertEquals(0, controller.streamSlots.availablePermits(), "the cap must be exhausted");
+
+            long start = System.nanoTime();
+            HttpResponse<String> refused = http.send(
+                    HttpRequest.newBuilder(URI.create(url("/api/stock-gex/stream?symbol=UNDERLOAD")))
+                            .timeout(Duration.ofSeconds(15))
+                            .header("Authorization", "Bearer t").GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
+
+            assertEquals(503, refused.statusCode(),
+                    "a refusal must not become a 500 from a rejected async task: " + refused.body());
+            assertTrue(refused.body().contains("SSE_CLIENT_LIMIT"),
+                    "and it must still be the readable one: " + refused.body());
+            assertTrue(elapsedMs < 10_000L, "the refusal took " + elapsedMs + "ms — it was not immediate");
+        } finally {
+            upstream.releaseAll();
+            for (HttpResponse<InputStream> r : live) {
+                r.body().close();
+            }
+        }
+    }
+
+    @Test
+    void anADMITTEDStreamRejectedByTheExecutorStillGivesBackItsPermitAndCloses() throws Exception {
+        // The complement: the cap says yes, the POOL says no. The streaming body is then never
+        // invoked, so its finally never runs — and only the real servlet async interceptor can
+        // return the permit and close the upstream exchange. If it does not, the gateway loses a
+        // slot and an upstream SSE listener on every rejection.
+        List<Future<HttpResponse<InputStream>>> occupiers = new ArrayList<>();
+        int fill = StockGexAsyncConfig.MAX_ASYNC_THREADS + 24;
+        for (int i = 0; i < fill; i++) {
+            occupiers.add(clients.submit(() -> http.send(
+                    HttpRequest.newBuilder(URI.create(url("/test/occupy")))
+                            .timeout(Duration.ofSeconds(20)).GET().build(),
+                    HttpResponse.BodyHandlers.ofInputStream())));
+        }
+        try {
+            for (Future<HttpResponse<InputStream>> f : occupiers) {
+                try {
+                    f.get(30, TimeUnit.SECONDS);
+                } catch (Exception rejected) {
+                    // expected for the overflow
+                }
+            }
+            int before = controller.streamSlots.availablePermits();
+
+            // Fire a batch: with the pool saturated at least one of these should be admitted by the
+            // cap and then rejected by the executor.
+            for (int i = 0; i < 6; i++) {
+                try {
+                    HttpResponse<String> r = http.send(
+                            HttpRequest.newBuilder(URI.create(url("/api/stock-gex/stream?symbol=REJ" + i)))
+                                    .timeout(Duration.ofSeconds(15))
+                                    .header("Authorization", "Bearer t").GET().build(),
+                            HttpResponse.BodyHandlers.ofString());
+                    assertTrue(r.statusCode() == 200 || r.statusCode() == 500 || r.statusCode() == 503,
+                            "unexpected status under executor rejection: " + r.statusCode());
+                } catch (IOException streamCutOff) {
+                    // a rejected async dispatch can also surface as a broken response
+                }
+            }
+            upstream.releaseAll();
+
+            // Whatever happened to each request, every permit must come back. That is the property:
+            // a rejection may be loud, but it may not be lossy.
+            assertTrue(waitFor(() -> controller.streamSlots.availablePermits() >= before, 20_000L),
+                    "permits leaked under executor rejection: " + controller.streamSlots.availablePermits()
+                    + " < " + before);
+        } finally {
+            upstream.releaseAll();
         }
     }
 
@@ -372,6 +477,40 @@ class StockGexAsyncPipelineTest {
         @Bean
         NeighbourAsyncEndpoint neighbourAsyncEndpoint() {
             return new NeighbourAsyncEndpoint();
+        }
+
+        /** Fills the MVC async executor, so the synchronous-refusal claim is tested where it matters. */
+        @Bean
+        ExecutorFillingEndpoint executorFillingEndpoint(BlockingUpstream blocking) {
+            return new ExecutorFillingEndpoint(blocking);
+        }
+    }
+
+    /**
+     * A streaming endpoint whose only purpose is to OCCUPY async threads. Holding 12 streams in a
+     * 64-thread pool leaves 52 free, so an accidentally-asynchronous refusal would still be answered
+     * promptly and the test would pass for the wrong reason.
+     */
+    @RestController
+    static class ExecutorFillingEndpoint {
+        private final BlockingUpstream blocking;
+
+        ExecutorFillingEndpoint(BlockingUpstream blocking) {
+            this.blocking = blocking;
+        }
+
+        @GetMapping("/test/occupy")
+        ResponseEntity<StreamingResponseBody> occupy() {
+            return ResponseEntity.ok().contentType(MediaType.TEXT_EVENT_STREAM).body(out -> {
+                out.write(": held\n\n".getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                try (InputStream held = blocking.open()) {
+                    byte[] buffer = new byte[64];
+                    while (held.read(buffer) != -1) {
+                        // drains the first frame, then blocks on the shared latch
+                    }
+                }
+            });
         }
     }
 
