@@ -238,6 +238,72 @@ public class StockGexController {
         return out.body(response.body() == null ? new byte[0] : response.body());
     }
 
+    // ------------------------------------------------------------ closing board
+
+    /**
+     * {@code GET /api/stock-gex/close-board?symbol=TSLA} — the FROZEN board for a session that has
+     * already ended, so the picture stays readable after the close.
+     *
+     * <p>Same passthrough contract as the live board, and the same {@code no-store}: this response is
+     * cheap to re-fetch and a cached copy would outlive the day it describes, so a browser that came
+     * back tomorrow would be shown yesterday's frozen board as if it were the latest one. The payload
+     * names its own session, but nothing on the path reads that.
+     */
+    @GetMapping("/api/stock-gex/close-board")
+    public ResponseEntity<byte[]> closeBoard(
+            @RequestParam(value = "symbol", required = false) String symbol,
+            @RequestParam(value = "byExpiry", required = false) String byExpiry,
+            // Absent means "the newest published session"; the service owns that choice and this
+            // value reaches it untouched, exactly as symbol and byExpiry do.
+            @RequestParam(value = "session", required = false) String session,
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
+        LiquidityHistoryAuth.Result authResult = auth.authenticate(authorization);
+        if (authResult.status() != 200) {
+            return ResponseEntity.status(authResult.status()).build();
+        }
+        if (tooLong(symbol)) {
+            return json(HttpStatus.BAD_REQUEST, error("BAD_SYMBOL", "symbol is too long"), null);
+        }
+        return passthrough("close-board", () -> upstream.closeBoard(symbol, byExpiry, session));
+    }
+
+    /** {@code GET /api/stock-gex/close-sessions} — which frozen sessions the service can serve. */
+    @GetMapping("/api/stock-gex/close-sessions")
+    public ResponseEntity<byte[]> closeSessions(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
+        LiquidityHistoryAuth.Result authResult = auth.authenticate(authorization);
+        if (authResult.status() != 200) {
+            return ResponseEntity.status(authResult.status()).build();
+        }
+        return passthrough("close-sessions", upstream::closeSessions);
+    }
+
+    /**
+     * The verbatim-passthrough tail shared by the frozen endpoints: upstream status, content type and
+     * Retry-After carried through, an unreachable service becoming a gateway-authored 502.
+     *
+     * <p>The live board is NOT routed through this. It also counts {@code BOARDS_SERVED}, and folding
+     * that in would either mean counting frozen reads as boards served — quietly changing what an
+     * existing operational number means — or a flag argument that exists only to say "not really".
+     */
+    private ResponseEntity<byte[]> passthrough(
+            String what, java.util.function.Supplier<StockGexUpstream.BoardResponse> call) {
+        StockGexUpstream.BoardResponse response;
+        try {
+            response = call.get();
+        } catch (StockGexUpstream.UnavailableException unreachable) {
+            logUnreachable(what, unreachable);
+            return json(HttpStatus.BAD_GATEWAY, unreachableError(unreachable), null);
+        }
+        ResponseEntity.BodyBuilder out = ResponseEntity.status(response.status())
+                .contentType(mediaType(response.contentType(), MediaType.APPLICATION_JSON))
+                .header(HttpHeaders.CACHE_CONTROL, "no-store");
+        if (response.retryAfter() != null) {
+            out = out.header(HttpHeaders.RETRY_AFTER, response.retryAfter());
+        }
+        return out.body(response.body() == null ? new byte[0] : response.body());
+    }
+
     // ------------------------------------------------------------------ stream
 
     /**
