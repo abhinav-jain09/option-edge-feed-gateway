@@ -404,7 +404,14 @@ public class ContextTapeController {
                     // At most ONE full sweep per window, however many newcomers arrive at the cap:
                     // an O(n) pass per refused caller would be a CPU amplification path that sits
                     // in front of the bulkhead.
-                    if (nowMs >= nextSweepMs) {
+                    if (nowMs < nextSweepMs - windowMs) {
+                // wall-clock regression: the scheduled sweep deadline is now in
+                // OUR future by more than a window — re-arm it so eviction and
+                // future-start clamping are not suppressed for the regression
+                // interval (r9 F3)
+                nextSweepMs = nowMs;
+            }
+            if (nowMs >= nextSweepMs) {
                         counters.values().removeIf(s -> {
                             if (s[0] > nowMs) {
                                 // A window start in the future means the CLOCK regressed, not that

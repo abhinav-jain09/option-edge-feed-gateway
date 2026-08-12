@@ -484,6 +484,21 @@ public final class ContextTapeUpstream implements AutoCloseable {
      * a fresh client built after close() is shut down here, never published, never leaked.
      */
     private void recycleNow() {
+        // LOCKED PREFLIGHT before the factory is even invoked: a registry
+        // already at the cap (after pruning late terminations) means no new
+        // client may be created at all — the factory must not run (r9 F1).
+        // The identical check after the build remains as the race guard for a
+        // confirmation that fills the registry while the factory runs.
+        synchronized (lifecycleLock) {
+            unterminatedRetired.removeIf(HttpClient::isTerminated);
+            if (failStopped || unterminatedRetired.size() >= MAX_UNTERMINATED_RETIRED) {
+                failStopped = true;
+            }
+        }
+        if (failStopped) {
+            logCleanup("recycle refused pre-factory: unconfirmed retiree cap, FAIL-STOPPED");
+            return;
+        }
         HttpClient fresh;
         try {
             fresh = httpFactory.get();
@@ -496,7 +511,8 @@ public final class ContextTapeUpstream implements AutoCloseable {
             logCleanup("client factory failed, FAIL-STOPPING");
             return;
         }
-        HttpClient leaking;
+        HttpClient leaking = null;
+        boolean refused = false;
         synchronized (lifecycleLock) {
             if (closed) {
                 fresh.shutdownNow(); // close() won the race; the fresh client must not outlive it
@@ -509,21 +525,26 @@ public final class ContextTapeUpstream implements AutoCloseable {
             unterminatedRetired.removeIf(HttpClient::isTerminated);
             if (failStopped || unterminatedRetired.size() >= MAX_UNTERMINATED_RETIRED) {
                 failStopped = true;
-                fresh.shutdownNow();
-                logCleanup("recycle refused: unconfirmed retiree cap, FAIL-STOPPED");
-                return;
+                refused = true;            // side effects run OFF the lock (r9 F2)
+            } else {
+                leaking = http;
+                http = fresh;
+                generation.incrementAndGet();
+                abandonedOnGeneration = 0;
+                generationSaturated = false;
+                CLIENT_RECYCLES.incrementAndGet();
             }
-            leaking = http;
-            http = fresh;
-            generation.incrementAndGet();
-            abandonedOnGeneration = 0;
-            generationSaturated = false;
-            CLIENT_RECYCLES.incrementAndGet();
-            // INITIATES reclamation of everything abandoned on this generation. Best effort by JDK
-            // contract — which is why it is followed, below and off the lock, by a bounded
-            // termination confirmation rather than taken on faith.
-            leaking.shutdownNow();
         }
+        if (refused) {
+            fresh.shutdownNow();           // never under the lock every request needs
+            logCleanup("recycle refused: unconfirmed retiree cap, FAIL-STOPPED");
+            return;
+        }
+        // INITIATES reclamation of everything abandoned on the retired generation.
+        // Best effort by JDK contract — hence the bounded termination confirmation
+        // below. Both calls deliberately run OFF the lifecycle lock: a wedged
+        // shutdown or stdout backpressure must never stall session entry (r9 F2).
+        leaking.shutdownNow();
         logCleanup("recycled the leaking client");
         confirmRetirement(leaking);
     }
