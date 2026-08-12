@@ -66,12 +66,20 @@ import java.util.concurrent.atomic.AtomicLong;
  * caller's thread.</b> {@code InputStream.close()} is not contractually non-blocking, so closes run on a
  * FIXED-size closer pool behind a BOUNDED queue. When even that overflows (every closer thread stuck in
  * a pathological close AND the queue full), the disposal is counted and abandoned — and abandonment is
- * itself BOUNDED: after {@link #MAX_ABANDONED_BEFORE_RECYCLE} abandonments the upstream recycles its
- * owned {@link HttpClient} ({@code shutdownNow()} on the old one reclaims every abandoned exchange at
- * once, without any inline close) and continues on a fresh client; with an injected client it cannot do
- * that, so it FAIL-STOPS instead — refusing new sessions cleanly rather than leaking without limit.
- * Stuck reads are likewise bounded: they can strand at most {@link #READER_THREADS} reader threads,
- * after which new session calls are refused cleanly.
+ * itself BOUNDED: after {@link #MAX_ABANDONED_BEFORE_RECYCLE} abandonments the upstream retires its
+ * owned {@link HttpClient} and continues on a fresh one; with an injected client it cannot do that, so
+ * it FAIL-STOPS instead — refusing new sessions cleanly rather than leaking without limit.
+ *
+ * <p><b>JDK-contract limitation, stated plainly:</b> {@code HttpClient.shutdownNow()} is BEST EFFORT —
+ * the JDK does not guarantee that a shut-down client's operations terminate. No API can force a wedged
+ * exchange dead, so "reclaims everything" is not a promise this class can make. What it CAN and does
+ * guarantee: every retirement is followed by a bounded {@code awaitTermination}
+ * ({@link #RETIRED_TERMINATION_CONFIRM_MS}); a retiree that fails to confirm occupies one of
+ * {@link #MAX_UNTERMINATED_RETIRED} registry slots (freed if it terminates later); and when those
+ * slots are exhausted the upstream GLOBALLY FAIL-STOPS instead of retiring another possibly-live
+ * client. The hard bound is on the COUNT of potentially-unreclaimed clients, which is the strongest
+ * bound the JDK contract permits. Stuck reads are likewise bounded: they can strand at most
+ * {@link #READER_THREADS} reader threads, after which new session calls are refused cleanly.
  */
 public final class ContextTapeUpstream implements AutoCloseable {
 
@@ -108,10 +116,30 @@ public final class ContextTapeUpstream implements AutoCloseable {
     /**
      * How many abandoned disposals are tolerated on ONE client before the upstream stops creating
      * exchanges on it. An abandonment leaks one unread exchange until the client is shut down, so
-     * this is the hard bound on that leak: past it, an owned client is RECYCLED (shutdownNow on the
-     * old instance reclaims everything abandoned on it) and an injected one FAIL-STOPS.
+     * this is the bound on that leak per generation: past it, an owned client is RECYCLED (its
+     * shutdown initiated and then CONFIRMED — see {@link #confirmRetirement}) and an injected one
+     * FAIL-STOPS.
      */
     static final int MAX_ABANDONED_BEFORE_RECYCLE = 8;
+
+    /**
+     * How long a retirement waits for the retired client to CONFIRM termination. Runs on the
+     * lifecycle thread, never a request thread; also serialises recycles, which is desirable — a
+     * second recycle should not start while the first retiree is still unconfirmed.
+     */
+    static final long RETIRED_TERMINATION_CONFIRM_MS = 5_000L;
+
+    /**
+     * Hard cap on retired clients whose termination could NOT be confirmed. This is the honest leak
+     * bound this class can actually give: {@code HttpClient.shutdownNow()} is BEST EFFORT by JDK
+     * contract — it does not guarantee that operations terminate — so "recycle forever" could retire
+     * an unbounded procession of still-live clients. Instead, termination is awaited (bounded) and
+     * every retiree that fails to confirm occupies one of these slots (freed if it terminates
+     * later); when the slots are gone, the upstream GLOBALLY FAIL-STOPS rather than retire another
+     * possibly-live client. Worst-case unreclaimed residue is therefore K clients (+ the one
+     * current), never "one more per eight abandonments, forever".
+     */
+    static final int MAX_UNTERMINATED_RETIRED = 2;
 
     /** Gateway-authored failure codes. Distinct on purpose — they mean different things to an operator. */
     static final String CODE_UNAVAILABLE = "UPSTREAM_UNAVAILABLE";
@@ -176,7 +204,8 @@ public final class ContextTapeUpstream implements AutoCloseable {
      * the swap. While set, NO new exchange is created on the saturated client — sessions refuse —
      * so the per-generation abandonment total is bounded by the bound plus the requests already in
      * flight at the trip (themselves capped by the controller's 16-session bulkhead), every one of
-     * which is reclaimed when that generation's client is shut down.
+     * which the generation's client shutdown then reclaims (best-effort; see
+     * {@link #confirmRetirement}).
      */
     private volatile boolean generationSaturated;
     /**
@@ -198,6 +227,21 @@ public final class ContextTapeUpstream implements AutoCloseable {
      * is by definition saturated whenever a recycle is needed).
      */
     private final ExecutorService lifecycle;
+
+    /**
+     * Retired clients whose termination has NOT been confirmed — the residue the JDK's best-effort
+     * shutdown contract can leave behind. Guarded by {@link #lifecycleLock}; capped at
+     * {@link #MAX_UNTERMINATED_RETIRED}, past which the upstream fail-stops (see
+     * {@link #confirmRetirement}). Entries that terminate late are pruned when the next retiree
+     * arrives.
+     */
+    private final java.util.List<HttpClient> unterminatedRetired = new java.util.ArrayList<>();
+
+    /**
+     * Test seam for the cleanup-health log line: production writes to stdout, a test injects a
+     * collector so the LITERAL event can be asserted without racing a global stream swap.
+     */
+    java.util.function.Consumer<String> cleanupLog = System.out::println;
 
     /**
      * Test seam: runs between reader submission and the deadline wait, so a test can deterministically
@@ -315,6 +359,13 @@ public final class ContextTapeUpstream implements AutoCloseable {
         }
     }
 
+    /** For tests: retired clients whose termination is still unconfirmed. */
+    int unterminatedRetiredClients() {
+        synchronized (lifecycleLock) {
+            return unterminatedRetired.size();
+        }
+    }
+
     @Override
     public void close() {
         // The whole transition happens under the lifecycle lock, so it linearizes against a recycle:
@@ -329,8 +380,8 @@ public final class ContextTapeUpstream implements AutoCloseable {
             if (httpFactory != null) {
                 // shutdownNow, not close(): close() waits for in-flight exchanges, and a hung
                 // upstream during context shutdown would then hang the shutdown itself. Abandoning
-                // the exchanges is the point — and it is also what reclaims any disposals abandoned
-                // at overflow.
+                // the exchanges is the point — and (best-effort, per the JDK contract) it is also
+                // what reclaims any disposals abandoned at overflow.
                 http.shutdownNow();
             }
         }
@@ -381,13 +432,14 @@ public final class ContextTapeUpstream implements AutoCloseable {
     /**
      * Charge one abandoned disposal against the generation that created the stream, and act when the
      * CURRENT generation hits the bound: an OWNED client is recycled on the lifecycle thread — a
-     * fresh client takes over and {@code shutdownNow()} on the old one reclaims every exchange
-     * abandoned on it, at once, on no request thread — while an injected client cannot be replaced,
-     * so the upstream FAIL-STOPS and refuses new sessions instead.
+     * fresh client takes over, the old one's shutdown is initiated and then CONFIRMED under the
+     * unconfirmed-retiree cap ({@link #confirmRetirement}), all on no request thread — while an
+     * injected client cannot be replaced, so the upstream FAIL-STOPS and refuses new sessions
+     * instead.
      *
      * <p>Accounting is linearized under the lifecycle lock: the count is exact (no concurrent
      * overshoot), a straggler from a retired generation charges NOTHING (its client is already shut
-     * down — its abandonment is already reclaimed), and the saturation flag raised here is what stops
+     * down and its abandonment handed to that shutdown to reclaim), and the saturation flag raised here is what stops
      * new exchanges being created on the leaking client while the lifecycle thread swaps it.
      */
     private void noteAbandonedDisposal(long disposalGeneration) {
@@ -421,7 +473,7 @@ public final class ContextTapeUpstream implements AutoCloseable {
         try {
             lifecycle.execute(this::recycleNow);
         } catch (RejectedExecutionException shuttingDown) {
-            // close() already ran; its client shutdown reclaims everything, nothing left to do.
+            // close() already ran; its client shutdown takes over (best-effort), nothing left to do.
         }
     }
 
@@ -444,22 +496,62 @@ public final class ContextTapeUpstream implements AutoCloseable {
             logCleanup("client factory failed, FAIL-STOPPING");
             return;
         }
+        HttpClient leaking;
         synchronized (lifecycleLock) {
             if (closed) {
                 fresh.shutdownNow(); // close() won the race; the fresh client must not outlive it
                 return;
             }
-            HttpClient leaking = http;
+            leaking = http;
             http = fresh;
             generation.incrementAndGet();
             abandonedOnGeneration = 0;
             generationSaturated = false;
             CLIENT_RECYCLES.incrementAndGet();
-            // Non-blocking by contract: shutdownNow initiates immediate shutdown without awaiting
-            // termination — and it is what reclaims every exchange abandoned on this generation.
+            // INITIATES reclamation of everything abandoned on this generation. Best effort by JDK
+            // contract — which is why it is followed, below and off the lock, by a bounded
+            // termination confirmation rather than taken on faith.
             leaking.shutdownNow();
         }
         logCleanup("recycled the leaking client");
+        confirmRetirement(leaking);
+    }
+
+    /**
+     * The honest half of retirement: {@code shutdownNow()} only ASKS. This waits (bounded, on the
+     * lifecycle thread) for the retiree to confirm termination; a retiree that does not confirm
+     * occupies one of {@link #MAX_UNTERMINATED_RETIRED} registry slots — freed if it terminates
+     * later — and when the registry is full the upstream GLOBALLY FAIL-STOPS rather than retire yet
+     * another possibly-live client. That cap, not the shutdown call, is the leak bound this class
+     * actually guarantees; the JDK contract permits nothing stronger.
+     */
+    private void confirmRetirement(HttpClient retired) {
+        boolean terminated;
+        try {
+            terminated = retired.awaitTermination(Duration.ofMillis(RETIRED_TERMINATION_CONFIRM_MS));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt(); // close() is tearing us down; treat as unconfirmed
+            terminated = false;
+        }
+        if (terminated) {
+            logCleanup("retired client confirmed terminated");
+            return;
+        }
+        boolean stop = false;
+        synchronized (lifecycleLock) {
+            unterminatedRetired.removeIf(HttpClient::isTerminated); // late terminations free slots
+            unterminatedRetired.add(retired);
+            if (unterminatedRetired.size() >= MAX_UNTERMINATED_RETIRED && !closed) {
+                failStopped = true;
+                stop = true;
+            }
+        }
+        if (stop) {
+            logCleanup("unconfirmed retired clients hit the cap, FAIL-STOPPING");
+        } else {
+            logCleanup("retired client did not confirm termination within "
+                    + RETIRED_TERMINATION_CONFIRM_MS + "ms");
+        }
     }
 
     /**
@@ -469,10 +561,11 @@ public final class ContextTapeUpstream implements AutoCloseable {
      * bounded without throttling.
      */
     private void logCleanup(String what) {
-        System.out.println("context-tape upstream " + what
+        cleanupLog.accept("context-tape upstream " + what
                 + ": abandonedDisposals=" + DISPOSALS_ABANDONED.get()
                 + " clientRecycles=" + CLIENT_RECYCLES.get()
-                + " generation=" + generation.get());
+                + " generation=" + generation.get()
+                + " unterminatedRetired=" + unterminatedRetiredClients());
     }
 
     /** {@code GET <base>/api/context-tape/session} — one snapshot, one request/response. */
@@ -482,8 +575,9 @@ public final class ContextTapeUpstream implements AutoCloseable {
         // generation whose client actually produced the stream, and a recycle can land anywhere
         // between this capture and that construction. A caller that passed the gate before a flag
         // flipped can still complete its one send — that in-flight remainder is bounded by the
-        // controller's 16-session bulkhead and reclaimed by the generation's client shutdown, which
-        // is the documented bound.
+        // controller's 16-session bulkhead and handed to the generation's client shutdown to
+        // reclaim (best-effort, confirmed and capped — see confirmRetirement), which is the
+        // documented bound.
         HttpClient client;
         long bornGeneration;
         synchronized (lifecycleLock) {

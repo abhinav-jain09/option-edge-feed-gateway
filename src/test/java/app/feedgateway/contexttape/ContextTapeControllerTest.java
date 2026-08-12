@@ -913,6 +913,10 @@ class ContextTapeControllerTest {
             factoryThreads.add(Thread.currentThread().getName());
             HttpClient client = mock(HttpClient.class);
             try {
+                // Retirees CONFIRM termination by default, so recycling in these tests keeps its
+                // registry empty; the unconfirmable-retiree cap has its own dedicated test.
+                when(client.awaitTermination(any())).thenReturn(true);
+                when(client.isTerminated()).thenReturn(true);
                 when(client.send(any(HttpRequest.class), any())).thenAnswer(inv -> {
                     @SuppressWarnings({"unchecked", "rawtypes"})
                     HttpResponse resp = mock(HttpResponse.class);
@@ -960,21 +964,16 @@ class ContextTapeControllerTest {
                 up, authReturning(200), new ObjectMapper(), Integer.MAX_VALUE);
 
         long recyclesBefore = ContextTapeUpstream.CLIENT_RECYCLES.get();
-        java.io.ByteArrayOutputStream capturedOut = new java.io.ByteArrayOutputStream();
-        java.io.PrintStream realOut = System.out;
+        List<String> cleanupLog = java.util.Collections.synchronizedList(new ArrayList<>());
+        up.cleanupLog = cleanupLog::add; // injected logger: assert the LITERAL event, race-free
         try {
-            System.setOut(new java.io.PrintStream(capturedOut, true));
-            try {
-                for (int i = 0; i < SESSIONS_TO_TRIP; i++) {
-                    assertEquals(200, controller.session("Bearer t").getStatusCode().value(),
-                            "requests must keep succeeding while cleanup wedges, up to the bound");
-                }
-                assertTrue(waitFor(() ->
-                        ContextTapeUpstream.CLIENT_RECYCLES.get() == recyclesBefore + 1, 5_000L),
-                        "hitting the bound must recycle the client");
-            } finally {
-                System.setOut(realOut);
+            for (int i = 0; i < SESSIONS_TO_TRIP; i++) {
+                assertEquals(200, controller.session("Bearer t").getStatusCode().value(),
+                        "requests must keep succeeding while cleanup wedges, up to the bound");
             }
+            assertTrue(waitFor(() ->
+                    ContextTapeUpstream.CLIENT_RECYCLES.get() == recyclesBefore + 1, 5_000L),
+                    "hitting the bound must recycle the client");
 
             assertEquals(2, created.size(),
                     "the recycle must have pulled a FRESH client from the factory");
@@ -985,10 +984,16 @@ class ContextTapeControllerTest {
             assertTrue(waitFor(() -> created.get(1) == up.currentClient(), 5_000L),
                     "and the fresh client must be the one now carrying exchanges");
 
-            String logged = capturedOut.toString(StandardCharsets.UTF_8);
-            assertTrue(logged.contains("clientRecycles="),
-                    "the recycle must be LOGGED with its counters when it happens:\n" + logged);
-            assertTrue(logged.contains("abandonedDisposals="), logged);
+            // The RECYCLE EVENT itself must be logged — not merely counter labels that an earlier
+            // overflow line already carried. Awaited, because the log lands after the swap.
+            assertTrue(waitFor(() -> cleanupLog.stream()
+                            .anyMatch(line -> line.contains("recycled the leaking client")), 5_000L),
+                    "the recycle must be logged as its own event; got:\n"
+                    + String.join("\n", cleanupLog));
+            assertTrue(cleanupLog.stream().anyMatch(line ->
+                            line.contains("closer overflow") && line.contains("abandonedDisposals=")),
+                    "and the abandonment onset with its counters; got:\n"
+                    + String.join("\n", cleanupLog));
 
             // Unlike the injected-client case, an OWNED upstream keeps serving after the recycle.
             assertTrue(waitFor(() -> controller.session("Bearer t").getStatusCode().value() == 200,
@@ -1139,6 +1144,104 @@ class ContextTapeControllerTest {
                 "and a saturated principal stays saturated across the clock step — never a fresh budget");
         assertEquals(0L, limiter.tryAcquire("a", 1_000L + 60_000L),
                 "until its (clamped) window genuinely rolls");
+    }
+
+    @Test
+    void unconfirmableRetiredClientsAreCappedByAGlobalFailStop() throws Exception {
+        // The JDK contract half of the leak bound: shutdownNow() only ASKS, so a retiree may never
+        // terminate. Retirement therefore awaits confirmation, and retirees that cannot confirm are
+        // capped — at the cap the upstream FAIL-STOPS instead of retiring an unbounded procession of
+        // possibly-live clients. Here every retiree refuses to confirm.
+        java.util.concurrent.CountDownLatch releaseCloses = new java.util.concurrent.CountDownLatch(1);
+        List<HttpClient> created = java.util.Collections.synchronizedList(new ArrayList<>());
+        List<String> factoryThreads = java.util.Collections.synchronizedList(new ArrayList<>());
+        java.util.function.Supplier<HttpClient> inner =
+                wedgingFactory(created, factoryThreads, releaseCloses);
+        java.util.function.Supplier<HttpClient> unconfirmable = () -> {
+            HttpClient client = inner.get();
+            try {
+                when(client.awaitTermination(any())).thenReturn(false);
+                when(client.isTerminated()).thenReturn(false);
+            } catch (InterruptedException impossible) {
+                throw new IllegalStateException(impossible);
+            }
+            return client;
+        };
+        ContextTapeUpstream up = new ContextTapeUpstream("http://context-tape-service:8134",
+                Duration.ofSeconds(5), unconfirmable);
+        upstreams.add(up);
+        ContextTapeController controller = new ContextTapeController(
+                up, authReturning(200), new ObjectMapper(), Integer.MAX_VALUE);
+
+        long recyclesBefore = ContextTapeUpstream.CLIENT_RECYCLES.get();
+        try {
+            // Generation 0: trip the abandonment bound → recycle 1 → retiree 1 cannot confirm.
+            for (int i = 0; i < SESSIONS_TO_TRIP; i++) {
+                assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+            }
+            assertTrue(waitFor(() ->
+                    ContextTapeUpstream.CLIENT_RECYCLES.get() == recyclesBefore + 1, 5_000L));
+            assertTrue(waitFor(() -> up.unterminatedRetiredClients() == 1, 5_000L),
+                    "an unconfirmable retiree must occupy a registry slot");
+
+            // Generation 1: the closer is still wedged, so eight more sessions trip it again →
+            // recycle 2 → retiree 2 cannot confirm → the registry is full → GLOBAL fail-stop.
+            for (int i = 0; i < ContextTapeUpstream.MAX_ABANDONED_BEFORE_RECYCLE; i++) {
+                assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+            }
+            assertTrue(waitFor(() ->
+                    ContextTapeUpstream.CLIENT_RECYCLES.get() == recyclesBefore + 2, 5_000L));
+            assertTrue(waitFor(() -> up.unterminatedRetiredClients()
+                    >= ContextTapeUpstream.MAX_UNTERMINATED_RETIRED, 5_000L));
+
+            assertTrue(waitFor(() ->
+                    controller.session("Bearer t").getStatusCode().value() == 502, 5_000L),
+                    "at the unconfirmed-retiree cap the upstream must fail-stop, not recycle on");
+            Thread.sleep(100L);
+            assertEquals(502, controller.session("Bearer t").getStatusCode().value(),
+                    "and the fail-stop is terminal — no third client is ever created");
+            assertEquals(recyclesBefore + 2, ContextTapeUpstream.CLIENT_RECYCLES.get());
+            assertEquals(3, created.size(), "two retirees plus the live client, and NEVER more");
+        } finally {
+            releaseCloses.countDown();
+        }
+    }
+
+    @Test
+    void confirmedTerminationsFreeTheirSlotsSoRecyclingCanContinueIndefinitely() throws Exception {
+        // The healthy half: a retiree that CONFIRMS termination (as wedgingFactory's clients do)
+        // occupies no registry slot, so repeated recycles never approach the fail-stop cap.
+        java.util.concurrent.CountDownLatch releaseCloses = new java.util.concurrent.CountDownLatch(1);
+        List<HttpClient> created = java.util.Collections.synchronizedList(new ArrayList<>());
+        List<String> factoryThreads = java.util.Collections.synchronizedList(new ArrayList<>());
+        ContextTapeUpstream up = new ContextTapeUpstream("http://context-tape-service:8134",
+                Duration.ofSeconds(5), wedgingFactory(created, factoryThreads, releaseCloses));
+        upstreams.add(up);
+        ContextTapeController controller = new ContextTapeController(
+                up, authReturning(200), new ObjectMapper(), Integer.MAX_VALUE);
+
+        long recyclesBefore = ContextTapeUpstream.CLIENT_RECYCLES.get();
+        try {
+            for (int i = 0; i < SESSIONS_TO_TRIP; i++) {
+                assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+            }
+            for (int cycle = 1; cycle <= 3; cycle++) {
+                int expected = cycle;
+                assertTrue(waitFor(() -> ContextTapeUpstream.CLIENT_RECYCLES.get()
+                        == recyclesBefore + expected, 5_000L), "recycle #" + cycle);
+                assertEquals(0, up.unterminatedRetiredClients(),
+                        "a confirmed retiree must occupy no registry slot");
+                if (cycle < 3) {
+                    for (int i = 0; i < ContextTapeUpstream.MAX_ABANDONED_BEFORE_RECYCLE; i++) {
+                        assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+                    }
+                }
+            }
+            assertEquals(200, controller.session("Bearer t").getStatusCode().value(),
+                    "three confirmed recycles later, the upstream still serves");
+        } finally {
+            releaseCloses.countDown();
+        }
     }
 
     @Test
