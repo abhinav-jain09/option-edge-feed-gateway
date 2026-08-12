@@ -206,6 +206,9 @@ public class StockGexController {
     @GetMapping("/api/stock-gex/board")
     public ResponseEntity<byte[]> board(
             @RequestParam(value = "symbol", required = false) String symbol,
+            // Passed through untouched — the service decides what it means (only "true" widens the
+            // payload). See StockGexUpstream#board(String, String).
+            @RequestParam(value = "byExpiry", required = false) String byExpiry,
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
         LiquidityHistoryAuth.Result authResult = auth.authenticate(authorization);
         if (authResult.status() != 200) {
@@ -216,7 +219,7 @@ public class StockGexController {
         }
         StockGexUpstream.BoardResponse response;
         try {
-            response = upstream.board(symbol);
+            response = upstream.board(symbol, byExpiry);
         } catch (StockGexUpstream.UnavailableException unreachable) {
             logUnreachable("board", unreachable);
             return json(HttpStatus.BAD_GATEWAY, unreachableError(unreachable), null);

@@ -211,13 +211,25 @@ public final class StockGexUpstream implements AutoCloseable {
      * asked for. What the length bound measures is exactly what goes on the wire.
      */
     public BoardResponse board(String symbol) {
+        return board(symbol, null);
+    }
+
+    /**
+     * The board, optionally asking the service for its per-expiry breakdown.
+     *
+     * <p>{@code byExpiry} is forwarded EXACTLY as the caller sent it, for the same reason the symbol
+     * is: the service owns that contract — only the literal string {@code true} turns the wider
+     * payload on — and re-judging it here would make the gateway a second, silently disagreeing
+     * judge. A blank or absent value is simply not sent.
+     */
+    public BoardResponse board(String symbol, String byExpiry) {
         long startedNanos = System.nanoTime();
         HttpResponse<InputStream> resp;
         try {
             // Request construction is INSIDE the mapped block: newBuilder/uri/header/build can all throw
             // IllegalArgumentException for a bad address or header, and an escape here is a 500 with a
             // stack trace on the browser's side.
-            HttpRequest req = HttpRequest.newBuilder(uri("/api/stock-gex/board", symbol))
+            HttpRequest req = HttpRequest.newBuilder(uri("/api/stock-gex/board", symbol, byExpiry))
                     .timeout(boardTimeout)
                     .header("Accept", "application/json")
                     // Ask for no CONTENT coding. This is only a request, though — see
@@ -368,8 +380,17 @@ public final class StockGexUpstream implements AutoCloseable {
      * envelope, which is the state the page already knows how to render.
      */
     private URI uri(String path, String symbol) {
+        return uri(path, symbol, null);
+    }
+
+    private URI uri(String path, String symbol, String byExpiry) {
         String s = symbol == null ? "" : symbol;
         String raw = baseUrl + path + "?symbol=" + URLEncoder.encode(s, StandardCharsets.UTF_8);
+        if (byExpiry != null && !byExpiry.isBlank()) {
+            // Encoded, never interpreted: whatever the caller asked for reaches the one component
+            // that decides what it means.
+            raw += "&byExpiry=" + URLEncoder.encode(byExpiry, StandardCharsets.UTF_8);
+        }
         URI uri;
         try {
             uri = new URI(raw);

@@ -228,7 +228,7 @@ class StockGexControllerTest {
     @Test
     void boardServesTheUpstreamBodyVerbatim() throws Exception {
         HttpClient http = clientReturning(200, "application/json", BOARD_JSON);
-        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", null, "Bearer t");
 
         assertEquals(200, res.getStatusCode().value());
         assertEquals(BOARD_JSON, bodyText(res), "the board must not be reshaped in transit");
@@ -238,11 +238,44 @@ class StockGexControllerTest {
     }
 
     @Test
+    void byExpiryIsForwardedVerbatimAndOnlyWhenPresent() throws Exception {
+        // The service owns the contract: only the literal "true" widens the payload there. The
+        // gateway must therefore forward what it was given — not its own opinion of it — and must
+        // not invent the parameter when the caller did not send one.
+        HttpClient wide = clientReturning(200, "application/json", BOARD_JSON);
+        controller(wide, 200).board("TSLA", "true", "Bearer t");
+        assertEquals("http://stock-gex-service:8021/api/stock-gex/board?symbol=TSLA&byExpiry=true",
+                capturedRequest(wide).uri().toString());
+
+        HttpClient odd = clientReturning(200, "application/json", BOARD_JSON);
+        controller(odd, 200).board("TSLA", "yes please", "Bearer t");
+        assertEquals(
+                "http://stock-gex-service:8021/api/stock-gex/board?symbol=TSLA&byExpiry=yes+please",
+                capturedRequest(odd).uri().toString(),
+                "an odd value is encoded and passed on, never judged here");
+
+        HttpClient blank = clientReturning(200, "application/json", BOARD_JSON);
+        controller(blank, 200).board("TSLA", "   ", "Bearer t");
+        assertEquals("http://stock-gex-service:8021/api/stock-gex/board?symbol=TSLA",
+                capturedRequest(blank).uri().toString(), "a blank value is not sent at all");
+    }
+
+    @Test
+    void byExpiryDoesNotBypassAuthentication() throws Exception {
+        // The wider payload is still a board: the same 401 gate, and no upstream call at all.
+        HttpClient http = mock(HttpClient.class);
+        ResponseEntity<byte[]> res = controller(http, 401).board("TSLA", "true", null);
+        assertEquals(401, res.getStatusCode().value());
+        // asserting the status alone would still pass if a future change called upstream first
+        verifyNoInteractions(http);
+    }
+
+    @Test
     void aLiveBoardIsNeverCacheable() throws Exception {
         // A board is a measurement of a moving market. Any intermediary replaying one would be showing
         // a number that was true at a moment it does not name.
         ResponseEntity<byte[]> res =
-                controller(clientReturning(200, "application/json", BOARD_JSON), 200).board("TSLA", "Bearer t");
+                controller(clientReturning(200, "application/json", BOARD_JSON), 200).board("TSLA", null, "Bearer t");
         assertTrue(res.getHeaders().getCacheControl().contains("no-store"), res.getHeaders().toString());
     }
 
@@ -254,7 +287,7 @@ class StockGexControllerTest {
         byte[] hostile = {0x7B, (byte) 0xFF, (byte) 0xFE, 0x00, 0x41, (byte) 0xC3, 0x28, 0x7D};
         HttpClient http = clientReturning(200, contentType("application/octet-stream"), hostile);
 
-        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", null, "Bearer t");
 
         assertArrayEquals(hostile, res.getBody(),
                 "no charset may be applied to a body this proxy promised to carry unchanged");
@@ -265,7 +298,7 @@ class StockGexControllerTest {
         String body = "{\"error\":\"BAD_SYMBOL\",\"detail\":\"unknown root — try TSLA · 「日本」\"}";
         HttpClient http = clientReturning(400, "text/plain; charset=utf-8", body);
 
-        ResponseEntity<byte[]> res = controller(http, 200).board("ZZZZ", "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("ZZZZ", null, "Bearer t");
 
         assertEquals(400, res.getStatusCode().value());
         assertArrayEquals(body.getBytes(StandardCharsets.UTF_8), res.getBody());
@@ -291,7 +324,7 @@ class StockGexControllerTest {
         for (String[] c : cases) {
             int status = Integer.parseInt(c[0]);
             ResponseEntity<byte[]> res =
-                    controller(clientReturning(status, "application/json", c[1]), 200).board("ZZZZ", "Bearer t");
+                    controller(clientReturning(status, "application/json", c[1]), 200).board("ZZZZ", null, "Bearer t");
             assertEquals(status, res.getStatusCode().value(), "status must pass through: " + c[1]);
             assertEquals(c[1], bodyText(res), "body must pass through byte-for-byte");
         }
@@ -303,7 +336,7 @@ class StockGexControllerTest {
                 headers(Map.of("content-type", List.of("application/json"), "retry-after", List.of("30"))),
                 "{\"error\":\"MAX_SYMBOLS\"}".getBytes(StandardCharsets.UTF_8));
 
-        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", null, "Bearer t");
 
         assertEquals("30", res.getHeaders().getFirst("Retry-After"),
                 "the service already said how long to wait; the page should not have to invent it");
@@ -313,7 +346,7 @@ class StockGexControllerTest {
     void aMissingOrMalformedUpstreamContentTypeFallsBackRatherThanFailing() throws Exception {
         for (String bad : new String[]{null, "", "not/a/media/type", "///"}) {
             HttpClient http = clientReturning(200, contentType(bad), BOARD_JSON.getBytes(StandardCharsets.UTF_8));
-            ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+            ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", null, "Bearer t");
             assertEquals(200, res.getStatusCode().value(), "content-type: " + bad);
             assertEquals(MediaType.APPLICATION_JSON, res.getHeaders().getContentType(), "content-type: " + bad);
             assertEquals(BOARD_JSON, bodyText(res));
@@ -328,7 +361,7 @@ class StockGexControllerTest {
         java.util.Arrays.fill(huge, (byte) 'x');
         HttpClient http = clientReturning(200, contentType("application/json"), huge);
 
-        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", null, "Bearer t");
 
         assertEquals(502, res.getStatusCode().value());
         assertEquals("UPSTREAM_PROTOCOL_ERROR",
@@ -363,7 +396,7 @@ class StockGexControllerTest {
         when(resp.body()).thenReturn(broken);
         when(http.send(any(HttpRequest.class), any())).thenReturn(resp);
 
-        ResponseEntity<byte[]> res = controller(http, 200).board("ZZZZ", "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("ZZZZ", null, "Bearer t");
 
         // NOT 422-with-an-empty-body: that would be this gateway inventing an answer and signing it with
         // the upstream's status. The page would read "outside coverage" from a body we never received.
@@ -378,7 +411,7 @@ class StockGexControllerTest {
         when(http.send(any(HttpRequest.class), any()))
                 .thenThrow(new IOException("Connection refused to stock-gex-service/10.42.0.7:8021"));
 
-        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", null, "Bearer t");
 
         // 502, not 503: the upstream authors its OWN 503s (WIRE_CAPACITY, SHUTTING_DOWN) and the page
         // must be able to tell "gateway could not reach it" apart from those.
@@ -403,7 +436,7 @@ class StockGexControllerTest {
         StockGexController controller = new StockGexController(
                 misconfigured, authReturning(200), new ObjectMapper(), 4, new CapturingRegistrar());
 
-        ResponseEntity<byte[]> board = controller.board("TSLA", "Bearer t");
+        ResponseEntity<byte[]> board = controller.board("TSLA", null, "Bearer t");
         assertEquals(502, board.getStatusCode().value());
         assertEquals("UPSTREAM_UNAVAILABLE",
                 new ObjectMapper().readTree(board.getBody()).get("error").asText());
@@ -420,7 +453,7 @@ class StockGexControllerTest {
         when(http.send(any(HttpRequest.class), any()))
                 .thenThrow(new IllegalArgumentException("URI with undefined scheme"));
 
-        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", null, "Bearer t");
 
         assertEquals(502, res.getStatusCode().value());
         assertFalse(bodyText(res).contains("IllegalArgument"), "no exception class in the body");
@@ -434,14 +467,14 @@ class StockGexControllerTest {
         StockGexController controller =
                 new StockGexController(blank, authReturning(200), new ObjectMapper(), 4, new CapturingRegistrar());
 
-        assertEquals(502, controller.board("TSLA", "Bearer t").getStatusCode().value());
+        assertEquals(502, controller.board("TSLA", null, "Bearer t").getStatusCode().value());
     }
 
     @Test
     void authIsEnforcedBeforeTheUpstreamIsEvenCalled() throws Exception {
         for (int status : new int[]{401, 403}) {
             HttpClient http = mock(HttpClient.class);
-            assertEquals(status, controller(http, status).board("TSLA", null).getStatusCode().value());
+            assertEquals(status, controller(http, status).board("TSLA", null, null).getStatusCode().value());
             assertEquals(status,
                     refusalOf(streamOutcome(controller(http, status), "TSLA", null, null))
                             .getStatusCode().value());
@@ -452,7 +485,7 @@ class StockGexControllerTest {
     @Test
     void theSymbolIsUrlEncodedAndOTHERWISEUNTOUCHED() throws Exception {
         HttpClient http = clientReturning(400, "application/json", "{\"error\":\"BAD_SYMBOL\"}");
-        controller(http, 200).board(" tsla ", "Bearer t");
+        controller(http, 200).board(" tsla ", null, "Bearer t");
         // Not trimmed, not upper-cased. The upstream owns BAD_SYMBOL, and a gateway that quietly
         // rewrites the symbol makes the service judge something the user never typed.
         assertEquals("http://stock-gex-service:8021/api/stock-gex/board?symbol=+tsla+",
@@ -462,7 +495,7 @@ class StockGexControllerTest {
     @Test
     void theSymbolIsUrlEncodedRatherThanTrustedIntoTheQueryString() throws Exception {
         HttpClient http = clientReturning(400, "application/json", "{\"error\":\"BAD_SYMBOL\"}");
-        controller(http, 200).board("A B&x=1", "Bearer t");
+        controller(http, 200).board("A B&x=1", null, "Bearer t");
         assertEquals("http://stock-gex-service:8021/api/stock-gex/board?symbol=A+B%26x%3D1",
                 capturedRequest(http).uri().toString());
     }
@@ -470,7 +503,7 @@ class StockGexControllerTest {
     @Test
     void anAbsurdlyLongSymbolIsRefusedOnTheGatewaySideWithTheUpstreamsOwnCode() throws Exception {
         HttpClient http = mock(HttpClient.class);
-        ResponseEntity<byte[]> res = controller(http, 200).board("T".repeat(64), "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("T".repeat(64), null, "Bearer t");
         assertEquals(400, res.getStatusCode().value());
         // Reuse BAD_SYMBOL rather than invent a gateway-only code: the page already branches on it.
         assertTrue(bodyText(res).contains("BAD_SYMBOL"), bodyText(res));
@@ -480,7 +513,7 @@ class StockGexControllerTest {
     @Test
     void bothCallsRefuseTransferEncodingSoNothingArrivesCompressedAndUnlabelled() throws Exception {
         HttpClient board = clientReturning(200, "application/json", BOARD_JSON);
-        controller(board, 200).board("TSLA", "Bearer t");
+        controller(board, 200).board("TSLA", null, "Bearer t");
         assertEquals("identity", capturedRequest(board).headers().firstValue("Accept-Encoding").orElse(""));
 
         HttpClient stream = clientStreaming(200, "text/event-stream", new ByteArrayInputStream(new byte[0]));
@@ -946,7 +979,7 @@ class StockGexControllerTest {
         for (String wildcard : new String[]{"*/*", "application/*", "*/*; charset=utf-8"}) {
             ResponseEntity<byte[]> board = controller(
                     clientReturning(200, contentType(wildcard), BOARD_JSON.getBytes(StandardCharsets.UTF_8)),
-                    200).board("TSLA", "Bearer t");
+                    200).board("TSLA", null, "Bearer t");
             assertEquals(200, board.getStatusCode().value(), wildcard);
             assertEquals(MediaType.APPLICATION_JSON, board.getHeaders().getContentType(), wildcard);
             assertEquals(BOARD_JSON, bodyText(board), wildcard);
@@ -1009,7 +1042,7 @@ class StockGexControllerTest {
                                "content-encoding", List.of("gzip"))),
                 new byte[]{0x1f, (byte) 0x8b, 0x08, 0x00});
 
-        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", null, "Bearer t");
 
         assertEquals(502, res.getStatusCode().value());
         assertEquals("UPSTREAM_PROTOCOL_ERROR",
@@ -1021,7 +1054,7 @@ class StockGexControllerTest {
         ResponseEntity<byte[]> res = controller(clientReturning(200,
                 headers(Map.of("content-type", List.of("application/json"),
                                "content-encoding", List.of("identity"))),
-                BOARD_JSON.getBytes(StandardCharsets.UTF_8)), 200).board("TSLA", "Bearer t");
+                BOARD_JSON.getBytes(StandardCharsets.UTF_8)), 200).board("TSLA", null, "Bearer t");
 
         assertEquals(200, res.getStatusCode().value());
         assertEquals(BOARD_JSON, bodyText(res));
@@ -1036,7 +1069,7 @@ class StockGexControllerTest {
                                "location", List.of("http://stock-gex-service.internal:8021/elsewhere"))),
                 "moved".getBytes(StandardCharsets.UTF_8));
 
-        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", "Bearer t");
+        ResponseEntity<byte[]> res = controller(http, 200).board("TSLA", null, "Bearer t");
 
         assertEquals(302, res.getStatusCode().value());
         assertEquals("moved", bodyText(res));
@@ -1161,7 +1194,7 @@ class StockGexControllerTest {
                 upstream, authReturning(200), new ObjectMapper(), 4, new CapturingRegistrar());
 
         long start = System.nanoTime();
-        ResponseEntity<byte[]> res = controller.board("TSLA", "Bearer t");
+        ResponseEntity<byte[]> res = controller.board("TSLA", null, "Bearer t");
         long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
 
         assertEquals(502, res.getStatusCode().value(), "a body that never ends must be cut off");
@@ -1351,7 +1384,7 @@ class StockGexControllerTest {
                 "a stream ended by pump AND lifecycle AND watchdog is still one ending");
         assertEquals(1, controller.streamSlots.availablePermits());
 
-        controller(clientReturning(200, "application/json", BOARD_JSON), 200).board("TSLA", "Bearer t");
+        controller(clientReturning(200, "application/json", BOARD_JSON), 200).board("TSLA", null, "Bearer t");
         assertEquals(boardsBefore + 1, StockGexController.BOARDS_SERVED.get());
     }
 
@@ -1359,7 +1392,7 @@ class StockGexControllerTest {
     void theOperatorLineCarriesNoUnboundedOrPerSymbolLabel() throws Exception {
         StockGexController controller = controller(
                 clientReturning(200, "application/json", BOARD_JSON), 200);
-        controller.board("TSLA", "Bearer t");
+        controller.board("TSLA", null, "Bearer t");
 
         String line = controller.counters();
 
@@ -1389,7 +1422,7 @@ class StockGexControllerTest {
         // no headers" — which would otherwise pin a Tomcat request thread — without putting any lifetime
         // limit on an hours-long stream. What bounds the BODY is the idle watchdog, not this.
         HttpClient boardHttp = clientReturning(200, "application/json", BOARD_JSON);
-        controller(boardHttp, 200).board("TSLA", "Bearer t");
+        controller(boardHttp, 200).board("TSLA", null, "Bearer t");
         assertTrue(capturedRequest(boardHttp).timeout().isPresent(),
                 "a request/response call must be bounded");
 
