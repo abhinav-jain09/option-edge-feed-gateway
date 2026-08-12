@@ -223,13 +223,38 @@ public final class StockGexUpstream implements AutoCloseable {
      * judge. A blank or absent value is simply not sent.
      */
     public BoardResponse board(String symbol, String byExpiry) {
+        return get(uri("/api/stock-gex/board", symbol, "byExpiry", blankAsAbsent(byExpiry)),
+                   "board");
+    }
+
+    /**
+     * {@code GET <base>/api/stock-gex/close-board?symbol=…} — the FROZEN board for a session that has
+     * already ended.
+     *
+     * <p>Identical transport to {@link #board(String, String)} and deliberately so: it is the same
+     * shape of answer from the same service, and the only difference is which session it describes.
+     * {@code session} is forwarded exactly as sent, for the same reason {@code symbol} is.
+     */
+    public BoardResponse closeBoard(String symbol, String byExpiry, String session) {
+        // byExpiry collapses blank to absent (identical answer either way); `session` does NOT —
+        // it selects WHICH day is returned, and absent means "the newest published one".
+        return get(uri("/api/stock-gex/close-board", symbol,
+                       "byExpiry", blankAsAbsent(byExpiry), "session", session), "close-board");
+    }
+
+    /** {@code GET <base>/api/stock-gex/close-sessions} — which frozen sessions exist. */
+    public BoardResponse closeSessions() {
+        return get(plainUri("/api/stock-gex/close-sessions"), "close-sessions");
+    }
+
+    private BoardResponse get(URI target, String what) {
         long startedNanos = System.nanoTime();
         HttpResponse<InputStream> resp;
         try {
             // Request construction is INSIDE the mapped block: newBuilder/uri/header/build can all throw
             // IllegalArgumentException for a bad address or header, and an escape here is a 500 with a
             // stack trace on the browser's side.
-            HttpRequest req = HttpRequest.newBuilder(uri("/api/stock-gex/board", symbol, byExpiry))
+            HttpRequest req = HttpRequest.newBuilder(target)
                     .timeout(boardTimeout)
                     .header("Accept", "application/json")
                     // Ask for no CONTENT coding. This is only a request, though — see
@@ -248,13 +273,13 @@ public final class StockGexUpstream implements AutoCloseable {
         } catch (IllegalArgumentException | SecurityException misconfigured) {
             throw unavailable("stock-gex-service address is not usable", misconfigured);
         }
-        requireIdentityEncoding(resp, "board");
+        requireIdentityEncoding(resp, what);
         // send() has returned, so the JDK's request timeout no longer applies (verified). A body that
         // arrives byte-by-byte, or never, would otherwise hold this request thread forever — and the
         // deadline passed here is what REMAINS of the configured budget, not a fresh copy of it.
         // GatewaySettings calls this a whole-request budget; starting the clock again after headers
         // would have made a 5s setting mean up to 10s.
-        byte[] body = readBounded(resp.body(), MAX_BOARD_BYTES, remaining(startedNanos), "board");
+        byte[] body = readBounded(resp.body(), MAX_BOARD_BYTES, remaining(startedNanos), what);
         return new BoardResponse(resp.statusCode(), header(resp, "content-type"),
                 header(resp, "retry-after"), body);
     }
@@ -379,18 +404,51 @@ public final class StockGexUpstream implements AutoCloseable {
      * {@link UnavailableException} an unreachable service produces, i.e. a 502 with the ordinary JSON
      * envelope, which is the state the page already knows how to render.
      */
-    private URI uri(String path, String symbol) {
-        return uri(path, symbol, null);
+    /**
+     * {@code <base><path>?symbol=…} plus any name/value pair whose value is non-null.
+     *
+     * <p>{@code symbol} is ALWAYS sent, empty included: the upstream owns the {@code BAD_SYMBOL}
+     * contract, and omitting the parameter would ask it a different question than the caller asked.
+     *
+     * <p>PRESENCE, NOT EMPTINESS, is what decides whether an optional parameter goes on the wire.
+     * A caller that sent {@code session=} asked about a session; dropping it would silently ask
+     * for the NEWEST published one instead and answer with a trustworthy 200 describing a
+     * different day. Absent and blank are distinct questions, and only the upstream may answer
+     * either. A caller that wants blank treated as absent must say so by passing null — which is
+     * exactly what {@link #board(String, String)} does for {@code byExpiry}, where the two are
+     * genuinely the same question.
+     */
+    private URI uri(String path, String symbol, String... optionalPairs) {
+        StringBuilder raw = new StringBuilder(baseUrl).append(path).append("?symbol=")
+                .append(URLEncoder.encode(symbol == null ? "" : symbol, StandardCharsets.UTF_8));
+        for (int i = 0; i + 1 < optionalPairs.length; i += 2) {
+            String value = optionalPairs[i + 1];
+            if (value != null) {
+                raw.append('&').append(optionalPairs[i]).append('=')
+                        .append(URLEncoder.encode(value, StandardCharsets.UTF_8));
+            }
+        }
+        return absolute(raw.toString());
     }
 
-    private URI uri(String path, String symbol, String byExpiry) {
-        String s = symbol == null ? "" : symbol;
-        String raw = baseUrl + path + "?symbol=" + URLEncoder.encode(s, StandardCharsets.UTF_8);
-        if (byExpiry != null && !byExpiry.isBlank()) {
-            // Encoded, never interpreted: whatever the caller asked for reaches the one component
-            // that decides what it means.
-            raw += "&byExpiry=" + URLEncoder.encode(byExpiry, StandardCharsets.UTF_8);
-        }
+    /**
+     * Blank as absent, for a parameter where they ARE the same question.
+     *
+     * <p>{@code byExpiry} only ever widens the payload on the literal string {@code true}, so a
+     * blank value and no value produce the identical board. Collapsing them keeps the live board's
+     * URL exactly what it has always been. This must NOT be applied to a parameter that SELECTS
+     * something — see {@link #uri}.
+     */
+    private static String blankAsAbsent(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
+    /** {@code <base><path>} with no query at all — for an endpoint that takes no parameters. */
+    private URI plainUri(String path) {
+        return absolute(baseUrl + path);
+    }
+
+    private URI absolute(String raw) {
         URI uri;
         try {
             uri = new URI(raw);
