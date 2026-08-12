@@ -368,22 +368,28 @@ public final class ContextTapeUpstream implements AutoCloseable {
 
     @Override
     public void close() {
-        // The whole transition happens under the lifecycle lock, so it linearizes against a recycle:
-        // either the recycle published its fresh client first (and it is shut down right here), or
-        // close() wins and the recycle finds `closed` set and shuts the fresh client down itself.
-        // Nothing in this block waits: shutdownNow calls only interrupt and drain queues — the
-        // shutdown caller never runs a close, a factory, or anything blocking while holding the lock.
+        // STATE transitions under the lock (linearized against a recycle: either the recycle
+        // published its fresh client first — shut down below, off-lock — or close() wins and the
+        // recycle finds `closed` set and shuts its fresh client down itself). Every potentially
+        // blocking side effect runs OUTSIDE: HttpClient.shutdownNow is not contractually
+        // non-blocking, and this lock sits on every session's entry path (Gate-2 r10 F1).
+        HttpClient owned = null;
         synchronized (lifecycleLock) {
             closed = true;
-            readers.shutdownNow();
-            closer.shutdownNow();
             if (httpFactory != null) {
-                // shutdownNow, not close(): close() waits for in-flight exchanges, and a hung
-                // upstream during context shutdown would then hang the shutdown itself. Abandoning
-                // the exchanges is the point — and (best-effort, per the JDK contract) it is also
-                // what reclaims any disposals abandoned at overflow.
-                http.shutdownNow();
+                owned = http;
             }
+        }
+        // ThreadPoolExecutor.shutdownNow only drains + interrupts; the HttpClient is the one
+        // whose shutdown the JDK leaves unspecified — all of them run off-lock anyway.
+        readers.shutdownNow();
+        closer.shutdownNow();
+        if (owned != null) {
+            // shutdownNow, not close(): close() waits for in-flight exchanges, and a hung
+            // upstream during context shutdown would then hang the shutdown itself. Abandoning
+            // the exchanges is the point — and (best-effort, per the JDK contract) it is also
+            // what reclaims any disposals abandoned at overflow.
+            owned.shutdownNow();
         }
         if (lifecycle != null) {
             lifecycle.shutdownNow();
@@ -513,27 +519,32 @@ public final class ContextTapeUpstream implements AutoCloseable {
         }
         HttpClient leaking = null;
         boolean refused = false;
+        boolean closeWon = false;
         synchronized (lifecycleLock) {
             if (closed) {
-                fresh.shutdownNow(); // close() won the race; the fresh client must not outlive it
-                return;
-            }
-            // the cap gates the RECYCLE itself, not only the retirement that
-            // follows it: a full registry (after pruning late terminations)
-            // means no further clients may be created — fail-stop instead of
-            // retiring yet another possibly-live client (r8 F1)
-            unterminatedRetired.removeIf(HttpClient::isTerminated);
-            if (failStopped || unterminatedRetired.size() >= MAX_UNTERMINATED_RETIRED) {
-                failStopped = true;
-                refused = true;            // side effects run OFF the lock (r9 F2)
+                closeWon = true;     // close() won the race; shut the fresh client OFF-lock
             } else {
-                leaking = http;
-                http = fresh;
-                generation.incrementAndGet();
-                abandonedOnGeneration = 0;
-                generationSaturated = false;
-                CLIENT_RECYCLES.incrementAndGet();
+                // the cap gates the RECYCLE itself, not only the retirement that
+                // follows it: a full registry (after pruning late terminations)
+                // means no further clients may be created — fail-stop instead of
+                // retiring yet another possibly-live client (r8 F1)
+                unterminatedRetired.removeIf(HttpClient::isTerminated);
+                if (failStopped || unterminatedRetired.size() >= MAX_UNTERMINATED_RETIRED) {
+                    failStopped = true;
+                    refused = true;        // side effects run OFF the lock (r9 F2)
+                } else {
+                    leaking = http;
+                    http = fresh;
+                    generation.incrementAndGet();
+                    abandonedOnGeneration = 0;
+                    generationSaturated = false;
+                    CLIENT_RECYCLES.incrementAndGet();
+                }
             }
+        }
+        if (closeWon) {
+            fresh.shutdownNow();           // the fresh client must not outlive close()
+            return;
         }
         if (refused) {
             fresh.shutdownNow();           // never under the lock every request needs

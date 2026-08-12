@@ -982,7 +982,16 @@ class ContextTapeControllerTest {
             assertTrue(factoryThreads.get(1).startsWith("context-tape-lifecycle"),
                     "the recycle (factory included) must run on the lifecycle thread, not the "
                     + "request thread; ran on " + factoryThreads.get(1));
-            verify(created.get(0)).shutdownNow();
+            // the counter increments BEFORE the off-lock shutdownNow runs on the
+            // lifecycle thread — await the invocation, never verify immediately
+            assertTrue(waitFor(() -> {
+                try {
+                    verify(created.get(0)).shutdownNow();
+                    return true;
+                } catch (AssertionError notYet) {
+                    return false;
+                }
+            }, 5_000L), "the retired client's shutdown must be observed (off-lock, awaited)");
             assertTrue(waitFor(() -> created.get(1) == up.currentClient(), 5_000L),
                     "and the fresh client must be the one now carrying exchanges");
 
