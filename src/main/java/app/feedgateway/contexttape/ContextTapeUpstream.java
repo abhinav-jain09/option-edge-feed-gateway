@@ -502,6 +502,17 @@ public final class ContextTapeUpstream implements AutoCloseable {
                 fresh.shutdownNow(); // close() won the race; the fresh client must not outlive it
                 return;
             }
+            // the cap gates the RECYCLE itself, not only the retirement that
+            // follows it: a full registry (after pruning late terminations)
+            // means no further clients may be created — fail-stop instead of
+            // retiring yet another possibly-live client (r8 F1)
+            unterminatedRetired.removeIf(HttpClient::isTerminated);
+            if (failStopped || unterminatedRetired.size() >= MAX_UNTERMINATED_RETIRED) {
+                failStopped = true;
+                fresh.shutdownNow();
+                logCleanup("recycle refused: unconfirmed retiree cap, FAIL-STOPPED");
+                return;
+            }
             leaking = http;
             http = fresh;
             generation.incrementAndGet();
@@ -534,6 +545,12 @@ public final class ContextTapeUpstream implements AutoCloseable {
             terminated = false;
         }
         if (terminated) {
+            synchronized (lifecycleLock) {
+                // a PREVIOUS retiree may have terminated late — every
+                // retirement observation prunes, so the registry and its
+                // metric can never stay stale (r8 F2)
+                unterminatedRetired.removeIf(HttpClient::isTerminated);
+            }
             logCleanup("retired client confirmed terminated");
             return;
         }

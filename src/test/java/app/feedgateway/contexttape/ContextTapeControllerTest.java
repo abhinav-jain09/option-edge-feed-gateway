@@ -964,7 +964,9 @@ class ContextTapeControllerTest {
                 up, authReturning(200), new ObjectMapper(), Integer.MAX_VALUE);
 
         long recyclesBefore = ContextTapeUpstream.CLIENT_RECYCLES.get();
-        List<String> cleanupLog = java.util.Collections.synchronizedList(new ArrayList<>());
+        // CopyOnWriteArrayList: compound traversals (stream/join) below run while
+        // the lifecycle thread may still append — snapshot semantics, no CME
+        List<String> cleanupLog = new java.util.concurrent.CopyOnWriteArrayList<>();
         up.cleanupLog = cleanupLog::add; // injected logger: assert the LITERAL event, race-free
         try {
             for (int i = 0; i < SESSIONS_TO_TRIP; i++) {
