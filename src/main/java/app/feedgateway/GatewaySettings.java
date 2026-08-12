@@ -1402,6 +1402,30 @@ public final class GatewaySettings {
         return longValue("STOCK_GEX_BOARD_TIMEOUT_MS", 5_000L, 200L);
     }
 
+    // ---- context-tape-service proxy (/api/context-tape/session) ----
+    // Same override shape as the stock-gex / pin-flow / system-status upstreams: a dotted key wins when
+    // present, otherwise the SCREAMING_SNAKE env the deploy wiring sets, otherwise the in-cluster default.
+
+    /** Base URL of the standalone context-tape-service the session endpoint proxies. */
+    public String contextTapeBaseUrl() {
+        return firstNonBlank(value("context-tape.base-url", ""),
+                             value("CONTEXT_TAPE_BASE_URL", "http://context-tape-service:8134"));
+    }
+
+    /** TCP connect budget for the session call; exceeded → 502 with a JSON error, never a stack trace. */
+    public long contextTapeConnectTimeoutMs() {
+        return longValue("CONTEXT_TAPE_CONNECT_TIMEOUT_MS", 2_000L, 200L);
+    }
+
+    /**
+     * Whole-request budget for the session call — a plain JSON snapshot, no stream to spare. 10s, not
+     * the stock-gex 5s: a full-session snapshot is ~150 KB and on a cold path (service just readied,
+     * caches empty) the assembly plus transfer can legitimately outlast the smaller board budget.
+     */
+    public long contextTapeRequestTimeoutMs() {
+        return longValue("CONTEXT_TAPE_REQUEST_TIMEOUT_MS", 10_000L, 200L);
+    }
+
     public static String value(String key, String fallback) {
         String resolved = fallback;
         String env = System.getenv(key);
