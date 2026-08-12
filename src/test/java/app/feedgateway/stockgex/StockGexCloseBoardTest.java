@@ -117,10 +117,27 @@ class StockGexCloseBoardTest {
                         + "&session=last+friday",
                 capturedRequest(odd).uri().toString());
 
-        HttpClient blank = clientReturning(200, FROZEN_JSON);
-        controller(blank, 200).closeBoard("TSLA", "  ", "  ", "Bearer t");
+        HttpClient blankExpiry = clientReturning(200, FROZEN_JSON);
+        controller(blankExpiry, 200).closeBoard("TSLA", "  ", null, "Bearer t");
         assertEquals(BASE + "/api/stock-gex/close-board?symbol=TSLA",
-                capturedRequest(blank).uri().toString(), "blank values are not sent at all");
+                capturedRequest(blankExpiry).uri().toString(),
+                "byExpiry: blank and absent are the same question, so blank is not sent");
+    }
+
+    @Test
+    void aPresentButBlankSessionIsForwarded() throws Exception {
+        // PRESENCE, not emptiness. `session` SELECTS a day: dropping a blank one asks for the
+        // NEWEST published session instead and answers with a trustworthy 200 describing a
+        // different day. Only the service may decide what a blank session means.
+        HttpClient empty = clientReturning(400, "{\"error\":\"BAD_SESSION\"}");
+        controller(empty, 200).closeBoard("TSLA", null, "", "Bearer t");
+        assertEquals(BASE + "/api/stock-gex/close-board?symbol=TSLA&session=",
+                capturedRequest(empty).uri().toString());
+
+        HttpClient spaces = clientReturning(400, "{\"error\":\"BAD_SESSION\"}");
+        controller(spaces, 200).closeBoard("TSLA", null, "  ", "Bearer t");
+        assertEquals(BASE + "/api/stock-gex/close-board?symbol=TSLA&session=++",
+                capturedRequest(spaces).uri().toString());
     }
 
     @Test

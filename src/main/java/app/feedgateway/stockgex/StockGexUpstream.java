@@ -223,7 +223,8 @@ public final class StockGexUpstream implements AutoCloseable {
      * judge. A blank or absent value is simply not sent.
      */
     public BoardResponse board(String symbol, String byExpiry) {
-        return get(uri("/api/stock-gex/board", symbol, "byExpiry", byExpiry), "board");
+        return get(uri("/api/stock-gex/board", symbol, "byExpiry", blankAsAbsent(byExpiry)),
+                   "board");
     }
 
     /**
@@ -235,8 +236,10 @@ public final class StockGexUpstream implements AutoCloseable {
      * {@code session} is forwarded exactly as sent, for the same reason {@code symbol} is.
      */
     public BoardResponse closeBoard(String symbol, String byExpiry, String session) {
-        return get(uri("/api/stock-gex/close-board", symbol, "byExpiry", byExpiry,
-                       "session", session), "close-board");
+        // byExpiry collapses blank to absent (identical answer either way); `session` does NOT —
+        // it selects WHICH day is returned, and absent means "the newest published one".
+        return get(uri("/api/stock-gex/close-board", symbol,
+                       "byExpiry", blankAsAbsent(byExpiry), "session", session), "close-board");
     }
 
     /** {@code GET <base>/api/stock-gex/close-sessions} — which frozen sessions exist. */
@@ -402,24 +405,42 @@ public final class StockGexUpstream implements AutoCloseable {
      * envelope, which is the state the page already knows how to render.
      */
     /**
-     * {@code <base><path>?symbol=…} plus any name/value pairs whose value is present.
+     * {@code <base><path>?symbol=…} plus any name/value pair whose value is non-null.
      *
      * <p>{@code symbol} is ALWAYS sent, empty included: the upstream owns the {@code BAD_SYMBOL}
      * contract, and omitting the parameter would ask it a different question than the caller asked.
-     * Every optional value is encoded and never interpreted, so whatever was asked for reaches the
-     * one component that decides what it means — a blank or absent value is simply not sent.
+     *
+     * <p>PRESENCE, NOT EMPTINESS, is what decides whether an optional parameter goes on the wire.
+     * A caller that sent {@code session=} asked about a session; dropping it would silently ask
+     * for the NEWEST published one instead and answer with a trustworthy 200 describing a
+     * different day. Absent and blank are distinct questions, and only the upstream may answer
+     * either. A caller that wants blank treated as absent must say so by passing null — which is
+     * exactly what {@link #board(String, String)} does for {@code byExpiry}, where the two are
+     * genuinely the same question.
      */
     private URI uri(String path, String symbol, String... optionalPairs) {
         StringBuilder raw = new StringBuilder(baseUrl).append(path).append("?symbol=")
                 .append(URLEncoder.encode(symbol == null ? "" : symbol, StandardCharsets.UTF_8));
         for (int i = 0; i + 1 < optionalPairs.length; i += 2) {
             String value = optionalPairs[i + 1];
-            if (value != null && !value.isBlank()) {
+            if (value != null) {
                 raw.append('&').append(optionalPairs[i]).append('=')
                         .append(URLEncoder.encode(value, StandardCharsets.UTF_8));
             }
         }
         return absolute(raw.toString());
+    }
+
+    /**
+     * Blank as absent, for a parameter where they ARE the same question.
+     *
+     * <p>{@code byExpiry} only ever widens the payload on the literal string {@code true}, so a
+     * blank value and no value produce the identical board. Collapsing them keeps the live board's
+     * URL exactly what it has always been. This must NOT be applied to a parameter that SELECTS
+     * something — see {@link #uri}.
+     */
+    private static String blankAsAbsent(String value) {
+        return value == null || value.isBlank() ? null : value;
     }
 
     /** {@code <base><path>} with no query at all — for an endpoint that takes no parameters. */
