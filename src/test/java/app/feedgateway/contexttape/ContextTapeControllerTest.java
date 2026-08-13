@@ -948,6 +948,260 @@ class ContextTapeControllerTest {
                     + ContextTapeUpstream.MAX_ABANDONED_BEFORE_RECYCLE;
 
     @Test
+    void aReplacedBackendPoisonsThePoolAndTheGatewayRecyclesItselfBackToServing() throws Exception {
+        // PROD INCIDENT (2026-08-13): context-tape was redeployed; the gateway kept drawing dead
+        // keep-alive connections from the pool it had opened to the previous pod, so every session
+        // 502'd with UPSTREAM_UNAVAILABLE (ConnectException) — 606 served, then unreachable forever,
+        // clientRecycles=0 — until an operator restarted the gateway. A retry cannot fix this (the
+        // next connection comes from the same poisoned pool): the CLIENT has to be replaced. So a
+        // client that WAS working and then fails transport twice in a row is recycled, and the
+        // gateway serves again on its own.
+        List<HttpClient> created = java.util.Collections.synchronizedList(new ArrayList<>());
+        java.util.concurrent.atomic.AtomicBoolean peerReplaced =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.function.Supplier<HttpClient> factory = () -> {
+            HttpClient client = mock(HttpClient.class);
+            boolean isFresh = !created.isEmpty();     // client #2 = the post-recycle one
+            try {
+                when(client.send(any(HttpRequest.class), any())).thenAnswer(inv -> {
+                    // The ORIGINAL client's pooled connections point at the dead pod: once the peer
+                    // is replaced it can never connect again. The FRESH client dials the Service
+                    // anew and reaches the new pod.
+                    if (!isFresh && peerReplaced.get()) {
+                        throw new java.net.ConnectException("connection refused");
+                    }
+                    HttpResponse resp = mock(HttpResponse.class);
+                    when(resp.statusCode()).thenReturn(200);
+                    when(resp.headers()).thenReturn(contentType("application/json"));
+                    when(resp.body()).thenAnswer(b -> new ByteArrayInputStream(
+                            "{\"ok\":true}".getBytes(StandardCharsets.UTF_8)));
+                    return resp;
+                });
+                when(client.awaitTermination(any())).thenReturn(true);
+                when(client.isTerminated()).thenReturn(true);
+            } catch (Exception unreachable) {
+                throw new IllegalStateException(unreachable);
+            }
+            created.add(client);
+            return client;
+        };
+        ContextTapeUpstream up = new ContextTapeUpstream("http://context-tape-service:8134",
+                Duration.ofSeconds(5), factory);
+        upstreams.add(up);
+        ContextTapeController controller = new ContextTapeController(
+                up, authReturning(200), new ObjectMapper(), Integer.MAX_VALUE);
+        long transportRecyclesBefore = ContextTapeUpstream.TRANSPORT_RECYCLES.get();
+
+        // 1) the pool is healthy and proven
+        assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+
+        // 2) the backend is replaced under it — the pooled connections are now dead
+        peerReplaced.set(true);
+        assertEquals(502, controller.session("Bearer t").getStatusCode().value(),
+                "the first poisoned connection surfaces as the ordinary 502");
+        assertEquals(502, controller.session("Bearer t").getStatusCode().value(),
+                "the second confirms the pool, and must trigger the recycle");
+
+        // 3) the gateway replaces the client ITSELF — no operator restart
+        assertTrue(waitFor(() ->
+                ContextTapeUpstream.TRANSPORT_RECYCLES.get() == transportRecyclesBefore + 1, 5_000L),
+                "a client that worked and then failed transport twice must be recycled");
+        assertTrue(waitFor(() -> created.size() == 2, 5_000L),
+                "the recycle must pull a FRESH client from the factory");
+
+        // 4) and serves again, with no human in the loop
+        assertTrue(waitFor(() -> {
+            try {
+                return controller.session("Bearer t").getStatusCode().value() == 200;
+            } catch (Exception e) {
+                return false;
+            }
+        }, 5_000L), "after the self-recycle the gateway must serve the NEW backend again");
+    }
+
+    @Test
+    void aSuccessBetweenFailuresResetsTheRunAndTheCooldownBlocksASecondRecycle() throws Exception {
+        // Two bounds in one timeline, because they share the counter. (1) The trigger is CONSECUTIVE
+        // failures: an intervening success means the pool still works, so isolated blips never
+        // recycle. (2) After a recycle, the cooldown floor holds off another one — a genuinely down
+        // peer fails every request, and without the floor that would be a recycle storm burning the
+        // unconfirmed-retiree registry.
+        List<HttpClient> created = java.util.Collections.synchronizedList(new ArrayList<>());
+        java.util.concurrent.atomic.AtomicBoolean failing =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.function.Supplier<HttpClient> factory = () -> {
+            HttpClient client = mock(HttpClient.class);
+            try {
+                when(client.send(any(HttpRequest.class), any())).thenAnswer(inv -> {
+                    if (failing.get()) {
+                        throw new java.net.ConnectException("connection refused");
+                    }
+                    HttpResponse resp = mock(HttpResponse.class);
+                    when(resp.statusCode()).thenReturn(200);
+                    when(resp.headers()).thenReturn(contentType("application/json"));
+                    when(resp.body()).thenAnswer(b -> new ByteArrayInputStream(
+                            "{\"ok\":true}".getBytes(StandardCharsets.UTF_8)));
+                    return resp;
+                });
+                when(client.awaitTermination(any())).thenReturn(true);
+                when(client.isTerminated()).thenReturn(true);
+            } catch (Exception unreachable) {
+                throw new IllegalStateException(unreachable);
+            }
+            created.add(client);
+            return client;
+        };
+        ContextTapeUpstream up = new ContextTapeUpstream("http://context-tape-service:8134",
+                Duration.ofSeconds(5), factory);
+        upstreams.add(up);
+        ContextTapeController controller = new ContextTapeController(
+                up, authReturning(200), new ObjectMapper(), Integer.MAX_VALUE);
+        long before = ContextTapeUpstream.TRANSPORT_RECYCLES.get();
+
+        // (1) fail, succeed, fail — never two in a row, so nothing is recycled
+        assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+        failing.set(true);
+        assertEquals(502, controller.session("Bearer t").getStatusCode().value());
+        failing.set(false);
+        assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+        failing.set(true);
+        assertEquals(502, controller.session("Bearer t").getStatusCode().value());
+        Thread.sleep(50L);
+        assertEquals(before, ContextTapeUpstream.TRANSPORT_RECYCLES.get(),
+                "an isolated blip, cleared by a success, must not recycle the client");
+
+        // now two IN A ROW: that recycles exactly once
+        assertEquals(502, controller.session("Bearer t").getStatusCode().value());
+        assertTrue(waitFor(() ->
+                ContextTapeUpstream.TRANSPORT_RECYCLES.get() == before + 1, 5_000L),
+                "two consecutive transport failures must recycle");
+        assertTrue(waitFor(() -> created.size() == 2, 5_000L));
+
+        // (2) THE COOLDOWN, isolated. The fresh client must first SUCCEED — otherwise the
+        // prior-success gate alone would explain the absence of a second recycle and this would
+        // prove nothing. With that gate satisfied, two consecutive failures inside the 30s floor
+        // must STILL not recycle: only the cooldown can be holding it.
+        failing.set(false);
+        assertEquals(200, controller.session("Bearer t").getStatusCode().value(),
+                "client #2 must prove itself, so the prior-success gate is NOT what blocks below");
+        failing.set(true);
+        for (int i = 0; i < 4; i++) {
+            assertEquals(502, controller.session("Bearer t").getStatusCode().value());
+        }
+        Thread.sleep(100L);
+        assertEquals(before + 1, ContextTapeUpstream.TRANSPORT_RECYCLES.get(),
+                "the cooldown must stop a down peer from becoming a recycle storm");
+        assertEquals(2, created.size(), "no third client while the cooldown holds");
+    }
+
+    @Test
+    void concurrentTransportFailuresRecycleTheClientExactlyOnce() throws Exception {
+        // The single-in-flight gate: many request threads see the poisoned pool at once, and every
+        // one of them calls the failure hook. Only ONE swap may result — a second task would retire
+        // the fresh client that replaced it and consume a second unconfirmed-retiree slot.
+        List<HttpClient> created = java.util.Collections.synchronizedList(new ArrayList<>());
+        java.util.concurrent.atomic.AtomicBoolean peerReplaced =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.function.Supplier<HttpClient> factory = () -> {
+            HttpClient client = mock(HttpClient.class);
+            boolean isFresh = !created.isEmpty();
+            try {
+                when(client.send(any(HttpRequest.class), any())).thenAnswer(inv -> {
+                    if (!isFresh && peerReplaced.get()) {
+                        throw new java.net.ConnectException("connection refused");
+                    }
+                    HttpResponse resp = mock(HttpResponse.class);
+                    when(resp.statusCode()).thenReturn(200);
+                    when(resp.headers()).thenReturn(contentType("application/json"));
+                    when(resp.body()).thenAnswer(b -> new ByteArrayInputStream(
+                            "{\"ok\":true}".getBytes(StandardCharsets.UTF_8)));
+                    return resp;
+                });
+                when(client.awaitTermination(any())).thenReturn(true);
+                when(client.isTerminated()).thenReturn(true);
+            } catch (Exception unreachable) {
+                throw new IllegalStateException(unreachable);
+            }
+            created.add(client);
+            return client;
+        };
+        ContextTapeUpstream up = new ContextTapeUpstream("http://context-tape-service:8134",
+                Duration.ofSeconds(5), factory);
+        upstreams.add(up);
+        ContextTapeController controller = new ContextTapeController(
+                up, authReturning(200), new ObjectMapper(), Integer.MAX_VALUE);
+        long recyclesBefore = ContextTapeUpstream.CLIENT_RECYCLES.get();
+
+        assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+        peerReplaced.set(true);
+
+        int threads = 8;
+        java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(threads);
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(threads);
+        try {
+            for (int i = 0; i < threads; i++) {
+                pool.execute(() -> {
+                    try {
+                        go.await();
+                        controller.session("Bearer t");
+                    } catch (Exception ignored) {
+                        // a 502 is the expected outcome here; the assertion is on the recycle count
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+            go.countDown();
+            assertTrue(done.await(10, java.util.concurrent.TimeUnit.SECONDS),
+                    "all probing threads must finish");
+        } finally {
+            pool.shutdownNow();
+        }
+        assertTrue(waitFor(() -> created.size() == 2, 5_000L), "one fresh client must be built");
+        Thread.sleep(150L);   // let any duplicate swap land, if the gate were broken
+        assertEquals(2, created.size(), "a concurrent burst must not build a THIRD client");
+        assertEquals(recyclesBefore + 1, ContextTapeUpstream.CLIENT_RECYCLES.get(),
+                "exactly one swap, however many threads saw the poisoned pool");
+    }
+
+    @Test
+    void anUpstreamThatNeverConnectedIsNotRecycled() throws Exception {
+        // The other side of the gate: a client with NO proven success has no stale pool to throw
+        // away — the peer is simply down. Recycling on every failure there would churn clients (and
+        // burn the unconfirmed-retiree registry) for nothing, so it must not happen.
+        List<HttpClient> created = java.util.Collections.synchronizedList(new ArrayList<>());
+        java.util.function.Supplier<HttpClient> alwaysDown = () -> {
+            HttpClient client = mock(HttpClient.class);
+            try {
+                when(client.send(any(HttpRequest.class), any()))
+                        .thenThrow(new java.net.ConnectException("connection refused"));
+                when(client.awaitTermination(any())).thenReturn(true);
+                when(client.isTerminated()).thenReturn(true);
+            } catch (Exception unreachable) {
+                throw new IllegalStateException(unreachable);
+            }
+            created.add(client);
+            return client;
+        };
+        ContextTapeUpstream up = new ContextTapeUpstream("http://context-tape-service:8134",
+                Duration.ofSeconds(5), alwaysDown);
+        upstreams.add(up);
+        ContextTapeController controller = new ContextTapeController(
+                up, authReturning(200), new ObjectMapper(), Integer.MAX_VALUE);
+        long before = ContextTapeUpstream.TRANSPORT_RECYCLES.get();
+
+        for (int i = 0; i < 5; i++) {
+            assertEquals(502, controller.session("Bearer t").getStatusCode().value());
+        }
+        Thread.sleep(50L);   // give any (wrongly) dispatched recycle time to land
+        assertEquals(before, ContextTapeUpstream.TRANSPORT_RECYCLES.get(),
+                "a peer that was never reachable must not cause client churn");
+        assertEquals(1, created.size(), "no fresh client should have been built");
+    }
+
+    @Test
     void closerOverflowRecyclesTheOwnedClientOffTheRequestThreadAndLogsIt() throws Exception {
         // The OWNED-client half of the abandonment bound: when the counted abandonments hit the
         // bound, the LIFECYCLE thread — never the request thread — swaps in a fresh client from the

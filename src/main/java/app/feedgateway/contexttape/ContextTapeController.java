@@ -147,7 +147,10 @@ public class ContextTapeController {
                 + " upstreamUnreachable=" + UPSTREAM_UNREACHABLE.get()
                 + " upstreamProtocolFaults=" + UPSTREAM_PROTOCOL_FAULTS.get()
                 + " abandonedDisposals=" + ContextTapeUpstream.DISPOSALS_ABANDONED.get()
-                + " clientRecycles=" + ContextTapeUpstream.CLIENT_RECYCLES.get();
+                + " clientRecycles=" + ContextTapeUpstream.CLIENT_RECYCLES.get()
+                // moves when a BACKEND was replaced and the gateway healed its own poisoned pool —
+                // a different story from closes wedging, so it gets its own number
+                + " transportRecycles=" + ContextTapeUpstream.TRANSPORT_RECYCLES.get();
     }
 
     /**

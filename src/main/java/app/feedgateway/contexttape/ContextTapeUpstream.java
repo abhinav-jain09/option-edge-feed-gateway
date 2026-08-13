@@ -155,6 +155,29 @@ public final class ContextTapeUpstream implements AutoCloseable {
     /** Owned-client recycles performed to reclaim abandoned exchanges. Also on the operator line. */
     static final AtomicLong CLIENT_RECYCLES = new AtomicLong();
 
+    /**
+     * Consecutive transport failures on ONE client before its (pooled) connections are treated as
+     * poisoned and the client is recycled. Two, not one: a single ConnectException can be an
+     * ordinary blip, while two in a row on a client that was previously WORKING is the signature of
+     * a pool that outlived its peer.
+     */
+    static final int TRANSPORT_FAILURES_BEFORE_RECYCLE = 2;
+
+    /**
+     * Floor between transport-triggered recycles. A genuinely DOWN upstream fails every request; the
+     * cooldown is what stops that from becoming a recycle storm (and from consuming the
+     * {@link #MAX_UNTERMINATED_RETIRED} registry). Self-healing after a peer restart is still fast:
+     * the very first pair of failures recycles immediately, because the cooldown starts unset.
+     */
+    static final long TRANSPORT_RECYCLE_COOLDOWN_MS = 30_000L;
+
+    /**
+     * Recycles triggered by poisoned connections (not by abandonment). Own counter on the operator
+     * line: this one moving means a BACKEND was replaced and the gateway healed itself, which is a
+     * different story from closes wedging.
+     */
+    static final AtomicLong TRANSPORT_RECYCLES = new AtomicLong();
+
     /** A completed session call: the upstream's status, content type, Retry-After and body bytes, untouched. */
     public record SessionResponse(int status, String contentType, String retryAfter, byte[] body) {}
 
@@ -199,6 +222,33 @@ public final class ContextTapeUpstream implements AutoCloseable {
     private final AtomicLong generation = new AtomicLong();
     /** Abandoned disposals charged against the CURRENT generation. Guarded by {@link #lifecycleLock}. */
     private int abandonedOnGeneration;
+    /**
+     * CONSECUTIVE transport failures on the current generation (reset by any success and by the
+     * swap). Guarded by {@link #lifecycleLock}.
+     */
+    private int transportFailuresOnGeneration;
+    /**
+     * Whether the current generation's client ever completed a call. Only a client that WORKED and
+     * then started refusing has a pool worth throwing away — a client that never connected has no
+     * stale connections, and recycling it would just churn while the peer is down. Guarded by
+     * {@link #lifecycleLock}.
+     */
+    private boolean generationEverSucceeded;
+    /**
+     * The generation a recycle has been DISPATCHED for, or -1 when none is pending. ONE gate shared
+     * by both triggers (poisoned pool and closer abandonment): either may be the first to enqueue the
+     * swap for a generation, and the other must then NOT enqueue a second task for the same one — two
+     * tasks would swap twice, retiring a fresh client that never failed and burning two
+     * {@link #MAX_UNTERMINATED_RETIRED} slots (a global FAIL-STOP) out of a single incident.
+     * Guarded by {@link #lifecycleLock}.
+     */
+    private long recycleDispatchedForGeneration = -1L;
+    /**
+     * {@code System.nanoTime()} of the last transport-triggered recycle, and whether one has ever
+     * happened (nanoTime has no meaningful zero). Guarded by {@link #lifecycleLock}.
+     */
+    private long lastTransportRecycleNanos;
+    private boolean transportRecycledBefore;
     /**
      * Set (under the lock) the moment the current generation hits the abandonment bound; cleared by
      * the swap. While set, NO new exchange is created on the saturated client — sessions refuse —
@@ -448,6 +498,77 @@ public final class ContextTapeUpstream implements AutoCloseable {
      * down and its abandonment handed to that shutdown to reclaim), and the saturation flag raised here is what stops
      * new exchanges being created on the leaking client while the lifecycle thread swaps it.
      */
+    /**
+     * A call completed on {@code callGeneration}: its pool demonstrably works, so the consecutive
+     * transport-failure run resets and the generation is marked as having succeeded (the precondition
+     * for ever treating its connections as poisoned).
+     */
+    private void noteTransportSuccess(long callGeneration) {
+        synchronized (lifecycleLock) {
+            if (closed || callGeneration != generation.get()) {
+                return;
+            }
+            transportFailuresOnGeneration = 0;
+            generationEverSucceeded = true;
+        }
+    }
+
+    /**
+     * A transport-level failure (ConnectException and friends) on {@code callGeneration}. When a
+     * client that WAS working starts failing repeatedly, its pooled connections have outlived their
+     * peer — the exact state a backend redeploy leaves behind, and one no per-request retry can
+     * clear, because every retry draws another dead connection from the same pool. Recycling the
+     * client is the only way to force fresh ones, so that is what happens here — bounded by
+     * {@link #TRANSPORT_RECYCLE_COOLDOWN_MS} so a genuinely down peer cannot turn this into a
+     * recycle storm, and gated on a prior success so a never-connected client is left alone.
+     */
+    private void noteTransportFailure(long callGeneration) {
+        boolean dispatch = false;
+        synchronized (lifecycleLock) {
+            if (closed || failStopped || callGeneration != generation.get()) {
+                return;
+            }
+            transportFailuresOnGeneration++;
+            long now = System.nanoTime();
+            boolean cooledDown = !transportRecycledBefore
+                    || now - lastTransportRecycleNanos
+                        >= TimeUnit.MILLISECONDS.toNanos(TRANSPORT_RECYCLE_COOLDOWN_MS);
+            if (httpFactory != null
+                    && generationEverSucceeded
+                    && recycleDispatchedForGeneration != callGeneration   // abandonment may own it
+                    && !generationSaturated
+                    && transportFailuresOnGeneration >= TRANSPORT_FAILURES_BEFORE_RECYCLE
+                    && cooledDown) {
+                recycleDispatchedForGeneration = callGeneration;
+                transportRecycledBefore = true;
+                lastTransportRecycleNanos = now;
+                dispatch = true;
+            }
+        }
+        if (!dispatch) {
+            return;
+        }
+        logCleanup("upstream connections look poisoned (peer replaced?), recycling the client");
+        try {
+            lifecycle.execute(() -> recycleNow(callGeneration, true));
+        } catch (RejectedExecutionException shuttingDown) {
+            synchronized (lifecycleLock) {
+                if (recycleDispatchedForGeneration == callGeneration) {
+                    recycleDispatchedForGeneration = -1L;   // close() took over; never strand the gate
+                }
+            }
+        }
+    }
+
+    /** Release the recycle gate for {@code forGeneration} — but only if it still owns it. */
+    private void releaseRecycleGate(long forGeneration) {
+        synchronized (lifecycleLock) {
+            if (recycleDispatchedForGeneration == forGeneration) {
+                recycleDispatchedForGeneration = -1L;
+            }
+        }
+    }
+
     private void noteAbandonedDisposal(long disposalGeneration) {
         DISPOSALS_ABANDONED.incrementAndGet();
         boolean firstOnGeneration = false;
@@ -460,7 +581,14 @@ public final class ContextTapeUpstream implements AutoCloseable {
             firstOnGeneration = abandonedOnGeneration == 1;
             if (abandonedOnGeneration >= MAX_ABANDONED_BEFORE_RECYCLE && !generationSaturated) {
                 generationSaturated = true;
-                tripped = true;
+                // Saturation ALWAYS trips (no new exchanges on the leaking client), but the swap is
+                // only enqueued when nothing else already owns this generation's recycle — a
+                // poisoned-pool recycle already in flight will do the same swap, and a second task
+                // would retire the fresh client behind it.
+                tripped = recycleDispatchedForGeneration != disposalGeneration;
+                if (tripped && httpFactory != null) {
+                    recycleDispatchedForGeneration = disposalGeneration;
+                }
             }
         }
         if (firstOnGeneration) {
@@ -477,9 +605,14 @@ public final class ContextTapeUpstream implements AutoCloseable {
             return;
         }
         try {
-            lifecycle.execute(this::recycleNow);
+            lifecycle.execute(() -> recycleNow(disposalGeneration, false));
         } catch (RejectedExecutionException shuttingDown) {
             // close() already ran; its client shutdown takes over (best-effort), nothing left to do.
+            synchronized (lifecycleLock) {
+                if (recycleDispatchedForGeneration == disposalGeneration) {
+                    recycleDispatchedForGeneration = -1L;
+                }
+            }
         }
     }
 
@@ -489,19 +622,31 @@ public final class ContextTapeUpstream implements AutoCloseable {
      * is linearized against close(): whichever wins, exactly one owner shuts every client down —
      * a fresh client built after close() is shut down here, never published, never leaked.
      */
-    private void recycleNow() {
+    private void recycleNow(long expectedGeneration, boolean transportTriggered) {
         // LOCKED PREFLIGHT before the factory is even invoked: a registry
         // already at the cap (after pruning late terminations) means no new
         // client may be created at all — the factory must not run (r9 F1).
         // The identical check after the build remains as the race guard for a
         // confirmation that fills the registry while the factory runs.
+        boolean stale = false;
         synchronized (lifecycleLock) {
-            unterminatedRetired.removeIf(HttpClient::isTerminated);
-            if (failStopped || unterminatedRetired.size() >= MAX_UNTERMINATED_RETIRED) {
-                failStopped = true;
+            // STALE WORK: another task already swapped this generation away. The client in place now
+            // is fresh — it has not failed, has not saturated, and must not be retired by a task
+            // queued against its predecessor.
+            if (expectedGeneration != generation.get()) {
+                stale = true;
+            } else {
+                unterminatedRetired.removeIf(HttpClient::isTerminated);
+                if (failStopped || unterminatedRetired.size() >= MAX_UNTERMINATED_RETIRED) {
+                    failStopped = true;
+                }
             }
         }
+        if (stale) {
+            return;   // the gate belongs to the generation that replaced it; nothing to clear
+        }
         if (failStopped) {
+            releaseRecycleGate(expectedGeneration);   // no swap will happen; never strand the gate
             logCleanup("recycle refused pre-factory: unconfirmed retiree cap, FAIL-STOPPED");
             return;
         }
@@ -513,6 +658,9 @@ public final class ContextTapeUpstream implements AutoCloseable {
             // a clean per-request 502 — rather than an unmapped error on whatever thread this is.
             synchronized (lifecycleLock) {
                 failStopped = true;
+                if (recycleDispatchedForGeneration == expectedGeneration) {
+                    recycleDispatchedForGeneration = -1L;
+                }
             }
             logCleanup("client factory failed, FAIL-STOPPING");
             return;
@@ -520,8 +668,13 @@ public final class ContextTapeUpstream implements AutoCloseable {
         HttpClient leaking = null;
         boolean refused = false;
         boolean closeWon = false;
+        boolean swapped = false;
         synchronized (lifecycleLock) {
-            if (closed) {
+            if (expectedGeneration != generation.get()) {
+                // Someone swapped while the factory ran: this task is stale, and the client it would
+                // retire is the FRESH one. Shut the client we just built (off-lock) and leave.
+                closeWon = true;
+            } else if (closed) {
                 closeWon = true;     // close() won the race; shut the fresh client OFF-lock
             } else {
                 // the cap gates the RECYCLE itself, not only the retirement that
@@ -539,8 +692,23 @@ public final class ContextTapeUpstream implements AutoCloseable {
                     abandonedOnGeneration = 0;
                     generationSaturated = false;
                     CLIENT_RECYCLES.incrementAndGet();
+                    swapped = true;
                 }
             }
+            // The fresh generation starts with a clean pool and no proven success — and whatever the
+            // outcome above, this generation's recycle gate is released (a refusal/close must not
+            // strand it, or poisoned-pool healing would be disabled for the rest of the run).
+            transportFailuresOnGeneration = 0;
+            generationEverSucceeded = false;
+            if (recycleDispatchedForGeneration == expectedGeneration) {
+                recycleDispatchedForGeneration = -1L;
+            }
+        }
+        if (swapped && transportTriggered) {
+            // Counted ONLY on a completed swap: an operator reading transportRecycles must see
+            // "a backend was replaced and the gateway healed itself", never a mere intent that a
+            // refusal, a close race, a stale task or a broken factory then dropped.
+            TRANSPORT_RECYCLES.incrementAndGet();
         }
         if (closeWon) {
             fresh.shutdownNow();           // the fresh client must not outlive close()
@@ -672,6 +840,10 @@ public final class ContextTapeUpstream implements AutoCloseable {
             Thread.currentThread().interrupt();
             throw unavailable("interrupted while calling context-tape-service", e);
         } catch (IOException transport) {
+            // A dead POOLED connection surfaces here after a peer restart, and every retry would draw
+            // another one — so the client itself is the thing that has to go (bounded; see
+            // noteTransportFailure). The caller still gets the ordinary 502 for THIS request.
+            noteTransportFailure(bornGeneration);
             throw unavailable("context-tape-service is unreachable", transport);
         } catch (IllegalArgumentException | SecurityException misconfigured) {
             throw unavailable("context-tape-service address is not usable", misconfigured);
@@ -694,6 +866,9 @@ public final class ContextTapeUpstream implements AutoCloseable {
                         "context-tape session request budget was exhausted before the body was read", null);
             }
             byte[] body = readOnDeadline(resp.body(), MAX_SESSION_BYTES, deadlineNanos);
+            // The exchange completed end to end: this generation's pool works, so any failure run
+            // against it is cleared (and it becomes eligible for poisoned-pool recycling later).
+            noteTransportSuccess(bornGeneration);
             return new SessionResponse(resp.statusCode(), header(resp, "content-type"),
                     header(resp, "retry-after"), body);
         } finally {
