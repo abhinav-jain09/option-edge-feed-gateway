@@ -277,7 +277,7 @@ class FeedGatewayServiceTest {
                 .getDeclaredMethod("isLiveOnlyRebuiltEvent", String.class);
         classify.setAccessible(true);
 
-        for (String event : List.of("turn-alert", "spread-skew-event", "strike-cluster")) {
+        for (String event : List.of("turn-alert", "spread-skew-event", "strike-cluster", "drop-nowcast")) {
             assertTrue((boolean) classify.invoke(null, event),
                     event + " is broadcast/cached ONLY by the live consumer and must replay on discovery");
         }
@@ -558,6 +558,87 @@ class FeedGatewayServiceTest {
         assertTrue(isOptionalTopic(service, settings.spreadSkewEventsTopic()));
         // A mandatory feed must still be mandatory (guards against over-broadening the optional set).
         assertFalse(isOptionalTopic(service, settings.databentoStrikeFlowTopic()));
+    }
+
+    @Test
+    void appearingDropNowcastTopicSeeksTheDisplayWindowNotEndOrBeginning() throws Exception {
+        // When the optional drop-nowcast topic APPEARS mid-session (its producer finally creating
+        // it), END would lose the very first verdict (nothing rebuilds it) and BEGINNING would
+        // replay full retention (7 d) into every socket. The contract is bounded recovery: seek by
+        // timestamp over the 10-minute display window, END only as fallback (UI review r1 #3).
+        TopicPartition appeared = new TopicPartition("es.drop.nowcast", 0);
+        Object refresh = refreshGrown(List.of(appeared), List.of(appeared), List.of());
+        Map<String, Object> topicEvents = new java.util.LinkedHashMap<>();
+        topicEvents.put("es.drop.nowcast", topicBinding("DATABENTO", "drop-nowcast"));
+
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(consumer.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap()))
+                .thenReturn(Map.of(appeared,
+                        new org.apache.kafka.clients.consumer.OffsetAndTimestamp(42L, 1L)));
+        invokeSeekAddedLivePartitions(consumer, refresh, topicEvents);
+        org.mockito.Mockito.verify(consumer).seek(appeared, 42L);
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never())
+                .seekToEnd(org.mockito.ArgumentMatchers.anyCollection());
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never())
+                .seekToBeginning(org.mockito.ArgumentMatchers.anyCollection());
+
+        // No record within the window (offsetsForTimes returns no entry) -> END, never beginning.
+        KafkaConsumer<?, ?> emptyWindow = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(emptyWindow.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap()))
+                .thenReturn(Map.of());
+        invokeSeekAddedLivePartitions(emptyWindow, refresh, topicEvents);
+        org.mockito.Mockito.verify(emptyWindow).seekToEnd(List.of(appeared));
+        org.mockito.Mockito.verify(emptyWindow, org.mockito.Mockito.never())
+                .seek(org.mockito.ArgumentMatchers.any(TopicPartition.class),
+                        org.mockito.ArgumentMatchers.anyLong());
+
+        // offsetsForTimes failing (broker hiccup) -> best-effort END fallback, no propagation.
+        KafkaConsumer<?, ?> failing = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(failing.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap()))
+                .thenThrow(new org.apache.kafka.common.errors.TimeoutException("metadata hiccup"));
+        invokeSeekAddedLivePartitions(failing, refresh, topicEvents);
+        org.mockito.Mockito.verify(failing).seekToEnd(List.of(appeared));
+    }
+
+    private static Object refreshGrown(List<TopicPartition> merged, List<TopicPartition> added,
+            List<TopicPartition> previouslyAssigned) throws Exception {
+        Class<?> refreshClass = Class.forName("app.feedgateway.FeedGatewayService$Refresh");
+        Method grown = refreshClass.getDeclaredMethod("grown", List.class, List.class, List.class);
+        grown.setAccessible(true);
+        return grown.invoke(null, merged, added, previouslyAssigned);
+    }
+
+    private void invokeSeekAddedLivePartitions(KafkaConsumer<?, ?> consumer, Object refresh,
+            Map<String, Object> topicEvents) throws Exception {
+        Method seek = FeedGatewayService.class.getDeclaredMethod("seekAddedLivePartitions",
+                KafkaConsumer.class, Class.forName("app.feedgateway.FeedGatewayService$Refresh"),
+                Map.class);
+        seek.setAccessible(true);
+        seek.invoke(service(), consumer, refresh, topicEvents);
+    }
+
+    @Test
+    void dropNowcastParseGateBlocksMalformedValuesFromTheEnvelope() {
+        // enrichJson() passes unparseable text through VERBATIM and envelopeJson() concatenates it
+        // as JSON, so one malformed classifier value would poison every legacy client's frame
+        // ("Bad Data" on the whole feed). The gate must admit only a JSON object that is a NOWCAST
+        // with a non-empty drop_id (UI review r1 finding #4).
+        com.fasterxml.jackson.databind.ObjectMapper mapper =
+                new com.fasterxml.jackson.databind.ObjectMapper();
+        assertTrue(FeedGatewayService.isBroadcastableDropNowcast(mapper,
+                "{\"message_type\":\"NOWCAST\",\"drop_id\":\"ES-20260812-093500484-S31096-DN\"}"));
+        // truncated JSON (the exact poison-frame case)
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper,
+                "{\"message_type\":\"NOWCAST\",\"drop_id\":\"x"));
+        // valid JSON but not an object
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper, "[1,2,3]"));
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper, "\"NOWCAST\""));
+        // diagnostic / GAP_DISCOVERY records without a drop_id must not broadcast
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper,
+                "{\"message_type\":\"GAP_DISCOVERY\",\"drop_id\":\"d1\"}"));
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper,
+                "{\"message_type\":\"NOWCAST\"}"));
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper, null));
     }
 
     // ----- 0DTE binary direction / unusual-movement option-chain tint -----------------------------

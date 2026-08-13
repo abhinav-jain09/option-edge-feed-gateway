@@ -1105,6 +1105,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"coalescedUpdates\":" + coalescedUpdates.get() + ","
                 + "\"batchesSent\":" + batchesSent.get() + ","
                 + "\"forwardedEvents\":" + forwardedEvents.get() + ","
+                + "\"dropNowcastMalformed\":" + dropNowcastMalformed.get() + ","
                 + "\"inactiveDroppedEvents\":" + inactiveDroppedEvents.get() + ","
                 + "\"droppedNonRoutableEvents\":" + droppedNonRoutableEvents.get() + ","
                 + "\"staleDroppedEvents\":" + staleDroppedEvents.get() + ","
@@ -1270,6 +1271,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_gateway_forwarded_total Selected-source records forwarded to browsers.\n"
                 + "# TYPE options_edge_gateway_forwarded_total counter\n"
                 + "options_edge_gateway_forwarded_total " + forwardedEvents.get() + "\n"
+                + "# HELP options_edge_gateway_drop_nowcast_malformed_total Malformed drop-nowcast records dropped before broadcast.\n"
+                + "# TYPE options_edge_gateway_drop_nowcast_malformed_total counter\n"
+                + "options_edge_gateway_drop_nowcast_malformed_total " + dropNowcastMalformed.get() + "\n"
                 + "# HELP options_edge_gateway_inactive_dropped_total Inactive-source records consumed but not forwarded.\n"
                 + "# TYPE options_edge_gateway_inactive_dropped_total counter\n"
                 + "options_edge_gateway_inactive_dropped_total " + inactiveDroppedEvents.get() + "\n"
@@ -2325,15 +2329,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // A malformed value must never reach the envelope: enrichJson() would pass
                         // unparseable text through verbatim and poison every legacy client's frame,
                         // so parse-gate here — drop and count instead (review finding #4).
-                        try {
-                            com.fasterxml.jackson.databind.JsonNode parsed = mapper.readTree(json);
-                            if (parsed == null || !parsed.isObject()
-                                    || !"NOWCAST".equals(parsed.path("message_type").asText())
-                                    || parsed.path("drop_id").asText("").isEmpty()) {
-                                dropNowcastMalformed.incrementAndGet();
-                                continue;
-                            }
-                        } catch (Exception malformed) {
+                        if (!isBroadcastableDropNowcast(mapper, json)) {
                             dropNowcastMalformed.incrementAndGet();
                             continue;
                         }
@@ -2782,6 +2778,25 @@ public class FeedGatewayService implements ReplayRunner {
                 + " lag=" + maxLag
                 + " exceeded maxLagRecords=" + maxLagRecords
                 + "; sought selected partitions to latest.");
+    }
+
+    /**
+     * Parse gate for the drop-classifier verdict stream. A malformed value must never reach the
+     * envelope: enrichJson() passes unparseable text through verbatim, which would poison every
+     * legacy client's frame ("Bad Data" on the whole feed). Only a JSON object that is a NOWCAST
+     * with a non-empty drop_id may broadcast; everything else is dropped (and counted by the
+     * caller via dropNowcastMalformed).
+     */
+    static boolean isBroadcastableDropNowcast(com.fasterxml.jackson.databind.ObjectMapper mapper,
+            String json) {
+        try {
+            com.fasterxml.jackson.databind.JsonNode parsed = mapper.readTree(json);
+            return parsed != null && parsed.isObject()
+                    && "NOWCAST".equals(parsed.path("message_type").asText())
+                    && !parsed.path("drop_id").asText("").isEmpty();
+        } catch (Exception malformed) {
+            return false;
+        }
     }
 
     /**

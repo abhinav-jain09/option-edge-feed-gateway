@@ -115,6 +115,13 @@ public class SystemStatusController {
                 row.put("ageS", evidence.get("ageS"));
                 row.put("lastObservation", evidence.get("lastObservation"));
                 row.put("asOf", evidence.get("asOf"));
+                // The judging context, passed through verbatim including nulls. The page needs the
+                // threshold to say "268s of 300s" instead of a bare "268s", and the guard to show a
+                // stalled root AS the root rather than reddening everything behind it.
+                for (String k : new String[]{"thresholdS", "guard", "guardLeaseLeftS",
+                        "consecStale", "consecOk", "phase", "wouldHaveFired", "shadow"}) {
+                    row.put(k, evidence.get(k));
+                }
             }
             topicRows.add(row);
         }
