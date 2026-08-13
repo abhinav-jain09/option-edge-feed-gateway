@@ -1496,6 +1496,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.spreadSkewTopic(), new TopicBinding("DATABENTO", "spread-skew"));
         // spread-skew.events: discrete FIRE/EXIT/REVERSAL/RESTART transitions, broadcast STANDALONE (never cached).
         topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding("DATABENTO", "spread-skew-event"));
+        // drop-classifier SHADOW nowcast: discrete k=1 verdicts + refinements, broadcast STANDALONE
+        // (never cached) — the spread-skew-event sibling. Advisory-only (SHADOW).
+        topicEvents.put(settings.dropNowcastTopic(), new TopicBinding("DATABENTO", "drop-nowcast"));
         topicEvents.put(settings.optionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
         topicEvents.put(settings.optionPriceBehaviorByOptionTopic(), new TopicBinding("DATABENTO", "opb-by-option"));
         topicEvents.put(settings.optionPriceBehaviorSessionTopic(), new TopicBinding("DATABENTO", "opb-session"));
@@ -1617,6 +1620,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.spreadSkewTopic(), new TopicBinding("DATABENTO", "spread-skew"));
         // spread-skew.events: discrete FIRE/EXIT/REVERSAL/RESTART transitions, broadcast STANDALONE (never cached).
         topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding("DATABENTO", "spread-skew-event"));
+        // drop-classifier SHADOW nowcast: discrete k=1 verdicts + refinements, broadcast STANDALONE
+        // (never cached) — the spread-skew-event sibling. Advisory-only (SHADOW).
+        topicEvents.put(settings.dropNowcastTopic(), new TopicBinding("DATABENTO", "drop-nowcast"));
         topicEvents.put(settings.optionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
         topicEvents.put(settings.optionPriceBehaviorByOptionTopic(), new TopicBinding("DATABENTO", "opb-by-option"));
         topicEvents.put(settings.optionPriceBehaviorSessionTopic(), new TopicBinding("DATABENTO", "opb-session"));
@@ -2274,6 +2280,14 @@ public class FeedGatewayService implements ReplayRunner {
                             broadcast(binding.event(), hotRaw);
                             forwardedEvents.incrementAndGet();
                         }
+                        continue;
+                    }
+                    if ("drop-nowcast".equals(binding.event())) {
+                        // Drop-classifier verdict/refinement: one-shot advisory, broadcast STANDALONE
+                        // to every client (never selection-gated, never cached — the client keys by
+                        // drop_id and expires its own banner). SHADOW: display-only.
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
                         continue;
                     }
                     if ("spread-skew-event".equals(binding.event())) {

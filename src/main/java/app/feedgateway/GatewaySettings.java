@@ -648,6 +648,18 @@ public final class GatewaySettings {
         return value("KAFKA_SPREAD_SKEW_EVENTS_TOPIC", "options.spx.spread-skew.events");
     }
 
+    /**
+     * Drop-classifier SHADOW nowcast (LIQUIDITY_SWEEP vs REAL_DROP instant
+     * k=1 verdicts + refinements) from drop-classifier-service — plain JSON
+     * on the LOCAL prod broker (the service publishes here by design; the
+     * es4 broker wipes nightly). Broadcast as event {@code "drop-nowcast"}
+     * (own message.type) — STANDALONE and never cached, the spread-skew-event
+     * sibling. Advisory-only: SHADOW mode, never a trade signal.
+     */
+    public String dropNowcastTopic() {
+        return value("KAFKA_DROP_NOWCAST_TOPIC", "es.drop.nowcast");
+    }
+
     public String ibkrVolumeSandwichTopic() {
         return value("KAFKA_IBKR_VOLUME_SANDWICH_CURRENT_TOPIC",
                 value("KAFKA_VOLUME_SANDWICH_CURRENT_TOPIC", "options.ibkr.volume-sandwich.current"));
