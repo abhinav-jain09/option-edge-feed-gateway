@@ -69,8 +69,8 @@ public class SystemStatusStore {
             row.put("consecStale", nullableLong(rs, "consec_stale"));
             row.put("consecOk", nullableLong(rs, "consec_ok"));
             row.put("phase", rs.getString("phase"));
-            row.put("wouldHaveFired", rs.getBoolean("would_have_fired"));
-            row.put("shadow", rs.getBoolean("shadow"));
+            row.put("wouldHaveFired", nullableBoolean(rs, "would_have_fired"));
+            row.put("shadow", nullableBoolean(rs, "shadow"));
             out.add(row);
         });
         return out;
@@ -79,6 +79,12 @@ public class SystemStatusStore {
     /** SQL NULL stays null instead of collapsing to 0 — a zero here would read as a measurement. */
     private static Long nullableLong(java.sql.ResultSet rs, String column) throws SQLException {
         long v = rs.getLong(column);
+        return rs.wasNull() ? null : v;
+    }
+
+    /** SQL NULL stays null instead of collapsing to false — "unknown" must never read as "did not fire". */
+    private static Boolean nullableBoolean(java.sql.ResultSet rs, String column) throws SQLException {
+        boolean v = rs.getBoolean(column);
         return rs.wasNull() ? null : v;
     }
 
