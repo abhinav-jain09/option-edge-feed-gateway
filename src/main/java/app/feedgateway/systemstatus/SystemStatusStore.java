@@ -40,22 +40,46 @@ public class SystemStatusStore {
         return dataSource != null;
     }
 
-    /** One row per topic the watcher observed, newest observation per (env, subject). */
+    /**
+     * One row per topic the watcher observed, newest observation per (env, subject).
+     *
+     * <p>{@code thresholdS} and {@code guard} come from migration 003 and are what make the page's
+     * per-topic view judgeable rather than merely descriptive: an age means nothing without its OWN
+     * threshold (120s and 1200s topics are not comparable on raw age), and {@code guard} is what lets
+     * a stalled ROOT be shown as the root instead of colouring in everything downstream of it.
+     * Every one of these is nullable and is passed through as null — never defaulted — because a
+     * missing threshold must render as "unknown", not as a threshold of zero.
+     */
     public List<Map<String, Object>> topics(String env) throws SQLException {
-        String sql = "SELECT topic, state, age_s, last_observation, as_of"
+        String sql = "SELECT topic, state, age_s, last_observation, as_of,"
+                + " threshold_s, guard, guard_lease_left_s, consec_stale, consec_ok,"
+                + " phase, would_have_fired, shadow"
                 + " FROM oe_watch.v_topic_state WHERE env = ? ORDER BY topic";
         List<Map<String, Object>> out = new ArrayList<>();
         query(sql, env, rs -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("topic", rs.getString("topic"));
             row.put("state", rs.getString("state"));
-            Object age = rs.getObject("age_s");
-            row.put("ageS", age == null ? null : rs.getLong("age_s"));
+            row.put("ageS", nullableLong(rs, "age_s"));
             row.put("lastObservation", rs.getString("last_observation"));
             row.put("asOf", ts(rs, "as_of"));
+            row.put("thresholdS", nullableLong(rs, "threshold_s"));
+            row.put("guard", rs.getString("guard"));
+            row.put("guardLeaseLeftS", nullableLong(rs, "guard_lease_left_s"));
+            row.put("consecStale", nullableLong(rs, "consec_stale"));
+            row.put("consecOk", nullableLong(rs, "consec_ok"));
+            row.put("phase", rs.getString("phase"));
+            row.put("wouldHaveFired", rs.getBoolean("would_have_fired"));
+            row.put("shadow", rs.getBoolean("shadow"));
             out.add(row);
         });
         return out;
+    }
+
+    /** SQL NULL stays null instead of collapsing to 0 — a zero here would read as a measurement. */
+    private static Long nullableLong(java.sql.ResultSet rs, String column) throws SQLException {
+        long v = rs.getLong(column);
+        return rs.wasNull() ? null : v;
     }
 
     /** Open incidents (per the transition_seq-ordered projection), most recent first. */

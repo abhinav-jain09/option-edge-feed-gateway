@@ -429,6 +429,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong batchesSent = new AtomicLong();
     private final AtomicLong consumerRestarts = new AtomicLong();
     private final AtomicLong forwardedEvents = new AtomicLong();
+    /** drop-nowcast values dropped at the parse gate (review finding #4). */
+    private final AtomicLong dropNowcastMalformed = new AtomicLong();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -1103,6 +1105,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"coalescedUpdates\":" + coalescedUpdates.get() + ","
                 + "\"batchesSent\":" + batchesSent.get() + ","
                 + "\"forwardedEvents\":" + forwardedEvents.get() + ","
+                + "\"dropNowcastMalformed\":" + dropNowcastMalformed.get() + ","
                 + "\"inactiveDroppedEvents\":" + inactiveDroppedEvents.get() + ","
                 + "\"droppedNonRoutableEvents\":" + droppedNonRoutableEvents.get() + ","
                 + "\"staleDroppedEvents\":" + staleDroppedEvents.get() + ","
@@ -1268,6 +1271,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_gateway_forwarded_total Selected-source records forwarded to browsers.\n"
                 + "# TYPE options_edge_gateway_forwarded_total counter\n"
                 + "options_edge_gateway_forwarded_total " + forwardedEvents.get() + "\n"
+                + "# HELP options_edge_gateway_drop_nowcast_malformed_total Malformed drop-nowcast records dropped before broadcast.\n"
+                + "# TYPE options_edge_gateway_drop_nowcast_malformed_total counter\n"
+                + "options_edge_gateway_drop_nowcast_malformed_total " + dropNowcastMalformed.get() + "\n"
                 + "# HELP options_edge_gateway_inactive_dropped_total Inactive-source records consumed but not forwarded.\n"
                 + "# TYPE options_edge_gateway_inactive_dropped_total counter\n"
                 + "options_edge_gateway_inactive_dropped_total " + inactiveDroppedEvents.get() + "\n"
@@ -1496,6 +1502,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.spreadSkewTopic(), new TopicBinding("DATABENTO", "spread-skew"));
         // spread-skew.events: discrete FIRE/EXIT/REVERSAL/RESTART transitions, broadcast STANDALONE (never cached).
         topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding("DATABENTO", "spread-skew-event"));
+        // drop-classifier SHADOW nowcast: discrete k=1 verdicts + refinements, broadcast STANDALONE
+        // (never cached) — the spread-skew-event sibling. Advisory-only (SHADOW).
+        topicEvents.put(settings.dropNowcastTopic(), new TopicBinding("DATABENTO", "drop-nowcast"));
         topicEvents.put(settings.optionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
         topicEvents.put(settings.optionPriceBehaviorByOptionTopic(), new TopicBinding("DATABENTO", "opb-by-option"));
         topicEvents.put(settings.optionPriceBehaviorSessionTopic(), new TopicBinding("DATABENTO", "opb-session"));
@@ -1617,6 +1626,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.spreadSkewTopic(), new TopicBinding("DATABENTO", "spread-skew"));
         // spread-skew.events: discrete FIRE/EXIT/REVERSAL/RESTART transitions, broadcast STANDALONE (never cached).
         topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding("DATABENTO", "spread-skew-event"));
+        // drop-classifier SHADOW nowcast: discrete k=1 verdicts + refinements, broadcast STANDALONE
+        // (never cached) — the spread-skew-event sibling. Advisory-only (SHADOW).
+        topicEvents.put(settings.dropNowcastTopic(), new TopicBinding("DATABENTO", "drop-nowcast"));
         topicEvents.put(settings.optionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
         topicEvents.put(settings.optionPriceBehaviorByOptionTopic(), new TopicBinding("DATABENTO", "opb-by-option"));
         topicEvents.put(settings.optionPriceBehaviorSessionTopic(), new TopicBinding("DATABENTO", "opb-session"));
@@ -2109,12 +2121,20 @@ public class FeedGatewayService implements ReplayRunner {
                                          Map<String, TopicBinding> topicEvents) {
         Set<TopicPartition> onGrownTopics = Set.copyOf(refresh.addedOnGrownTopics());
         List<TopicPartition> recoverFromBeginning = new ArrayList<>();
+        List<TopicPartition> recoverDisplayWindow = new ArrayList<>();
         List<TopicPartition> toEnd = new ArrayList<>();
         for (TopicPartition partition : refresh.added()) {
             TopicBinding binding = topicEvents.get(partition.topic());
             boolean liveOnly = binding != null && isLiveOnlyRebuiltEvent(binding.event());
             if (liveOnly && onGrownTopics.contains(partition)) {
                 recoverFromBeginning.add(partition);
+            } else if (binding != null && "drop-nowcast".equals(binding.event())) {
+                // A drop-nowcast topic that just APPEARED (the optional producer creating it
+                // mid-session) may already hold verdicts; END would lose the very first one and
+                // nothing rebuilds it. Beginning would replay full retention (7 d). Bounded
+                // recovery instead: seek by timestamp over the client's 10-minute display
+                // window (review finding #3).
+                recoverDisplayWindow.add(partition);
             } else {
                 toEnd.add(partition);
             }
@@ -2125,6 +2145,29 @@ public class FeedGatewayService implements ReplayRunner {
         if (!recoverFromBeginning.isEmpty()) {
             consumer.seekToBeginning(recoverFromBeginning);
         }
+        if (!recoverDisplayWindow.isEmpty()) {
+            long fromMs = System.currentTimeMillis() - 10 * 60_000L;
+            Map<TopicPartition, Long> query = new HashMap<>();
+            for (TopicPartition p : recoverDisplayWindow) {
+                query.put(p, fromMs);
+            }
+            try {
+                Map<TopicPartition, org.apache.kafka.clients.consumer.OffsetAndTimestamp> offsets =
+                        consumer.offsetsForTimes(query);
+                for (TopicPartition p : recoverDisplayWindow) {
+                    org.apache.kafka.clients.consumer.OffsetAndTimestamp ot =
+                            offsets == null ? null : offsets.get(p);
+                    if (ot != null) {
+                        consumer.seek(p, ot.offset());
+                    } else {
+                        consumer.seekToEnd(List.of(p));
+                    }
+                }
+            } catch (Exception e) {
+                // bounded-recovery best effort: END is the safe fallback
+                consumer.seekToEnd(recoverDisplayWindow);
+            }
+        }
     }
 
     /**
@@ -2134,7 +2177,9 @@ public class FeedGatewayService implements ReplayRunner {
      * has no case for it, so the cache consumer reads those records and drops them.
      *
      * <ul>
-     *   <li>{@code turn-alert}, {@code spread-skew-event} — discrete one-shot transitions, never cached.</li>
+     *   <li>{@code turn-alert}, {@code spread-skew-event}, {@code drop-nowcast} — discrete one-shot
+     *       transitions, never cached ({@code drop-nowcast} additionally gets a bounded 10-minute
+     *       timestamp-seek when its OPTIONAL topic first appears — see seekAddedLivePartitions).</li>
      *   <li>{@code strike-cluster} — dashboard + recent-signals trail, cached into {@code strikeClusters}
      *       by the live branch only and replayed to connecting clients from there.</li>
      * </ul>
@@ -2148,6 +2193,7 @@ public class FeedGatewayService implements ReplayRunner {
     private static boolean isLiveOnlyRebuiltEvent(String event) {
         return "turn-alert".equals(event)
                 || "spread-skew-event".equals(event)
+                || "drop-nowcast".equals(event)
                 || "strike-cluster".equals(event);
     }
 
@@ -2274,6 +2320,21 @@ public class FeedGatewayService implements ReplayRunner {
                             broadcast(binding.event(), hotRaw);
                             forwardedEvents.incrementAndGet();
                         }
+                        continue;
+                    }
+                    if ("drop-nowcast".equals(binding.event())) {
+                        // Drop-classifier verdict/refinement: one-shot advisory, broadcast STANDALONE
+                        // to every client (never selection-gated, never cached — the client keys by
+                        // drop_id and expires its own banner). SHADOW: display-only.
+                        // A malformed value must never reach the envelope: enrichJson() would pass
+                        // unparseable text through verbatim and poison every legacy client's frame,
+                        // so parse-gate here — drop and count instead (review finding #4).
+                        if (!isBroadcastableDropNowcast(mapper, json)) {
+                            dropNowcastMalformed.incrementAndGet();
+                            continue;
+                        }
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
                         continue;
                     }
                     if ("spread-skew-event".equals(binding.event())) {
@@ -2720,6 +2781,25 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
+     * Parse gate for the drop-classifier verdict stream. A malformed value must never reach the
+     * envelope: enrichJson() passes unparseable text through verbatim, which would poison every
+     * legacy client's frame ("Bad Data" on the whole feed). Only a JSON object that is a NOWCAST
+     * with a non-empty drop_id may broadcast; everything else is dropped (and counted by the
+     * caller via dropNowcastMalformed).
+     */
+    static boolean isBroadcastableDropNowcast(com.fasterxml.jackson.databind.ObjectMapper mapper,
+            String json) {
+        try {
+            com.fasterxml.jackson.databind.JsonNode parsed = mapper.readTree(json);
+            return parsed != null && parsed.isObject()
+                    && "NOWCAST".equals(parsed.path("message_type").asText())
+                    && !parsed.path("drop_id").asText("").isEmpty();
+        } catch (Exception malformed) {
+            return false;
+        }
+    }
+
+    /**
      * Topics whose producers may legitimately be absent (graceful-absence contract). Every other
      * topic in a consumer set is mandatory and keeps the strict metadata requirement.
      */
@@ -2729,7 +2809,8 @@ public class FeedGatewayService implements ReplayRunner {
         // services restart each day, are simply absent until that service first produces) — treat them
         // as optional so their absence can't starve strike-flow / mission-pace / the other JSON feeds.
         return topic != null
-                && (topic.equals(settings.strikeLiquidityTopic())
+                && (topic.equals(settings.dropNowcastTopic())
+                    || topic.equals(settings.strikeLiquidityTopic())
                     || topic.equals(settings.dealerLedgerProfileTopic())
                     || topic.equals(settings.dealerLedgerStateTopic())
                     || topic.equals(settings.strikeIntelByStrikeTopic())
@@ -8262,6 +8343,10 @@ public class FeedGatewayService implements ReplayRunner {
             // standalone broadcast reaches sockets in per-session (auth) mode too
             // (GatewayRecordMapper deliberately has no route for it).
             "ibkr-preopen-status",
+            // Drop-classifier SHADOW nowcast: a GLOBAL advisory (identical for every user,
+            // display-only). Allowlisted so the standalone broadcast reaches per-session
+            // (auth) sockets too — without this, authenticated prod silently drops it.
+            "drop-nowcast",
             // Agent A short-premium recommendation is a GLOBAL advisory overlay (the UI filters by
             // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
             // in per-session (auth) mode too, not only legacy mode — otherwise it is silently

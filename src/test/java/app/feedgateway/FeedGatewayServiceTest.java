@@ -277,7 +277,7 @@ class FeedGatewayServiceTest {
                 .getDeclaredMethod("isLiveOnlyRebuiltEvent", String.class);
         classify.setAccessible(true);
 
-        for (String event : List.of("turn-alert", "spread-skew-event", "strike-cluster")) {
+        for (String event : List.of("turn-alert", "spread-skew-event", "strike-cluster", "drop-nowcast")) {
             assertTrue((boolean) classify.invoke(null, event),
                     event + " is broadcast/cached ONLY by the live consumer and must replay on discovery");
         }
@@ -547,6 +547,10 @@ class FeedGatewayServiceTest {
         // rollout — it MUST be optional (like strike-intel) so its absence cannot starve the shared
         // JSON consumer (strike-flow / mission-pace / etc.).
         assertTrue(isOptionalTopic(service, settings.strikeInvasionTopic()));
+        // drop-classifier's nowcast topic is created by ITS service on first start and can be
+        // absent when the gateway boots — it MUST be optional so its absence cannot starve the
+        // shared JSON consumers (UI review r1 finding #2).
+        assertTrue(isOptionalTopic(service, settings.dropNowcastTopic()));
         // Both spread-skew topics come from the same brand-new spread-skew-service, which may not be
         // deployed during a staged rollout — BOTH must be optional (like strike-invasion) so their
         // absence cannot starve the shared JSON consumer.
@@ -554,6 +558,172 @@ class FeedGatewayServiceTest {
         assertTrue(isOptionalTopic(service, settings.spreadSkewEventsTopic()));
         // A mandatory feed must still be mandatory (guards against over-broadening the optional set).
         assertFalse(isOptionalTopic(service, settings.databentoStrikeFlowTopic()));
+    }
+
+    @Test
+    void appearingDropNowcastTopicSeeksTheDisplayWindowNotEndOrBeginning() throws Exception {
+        // When the optional drop-nowcast topic APPEARS mid-session (its producer finally creating
+        // it), END would lose the very first verdict (nothing rebuilds it) and BEGINNING would
+        // replay full retention (7 d) into every socket. The contract is bounded recovery: seek by
+        // timestamp over the 10-minute display window, END only as fallback (UI review r1 #3).
+        TopicPartition appeared = new TopicPartition("es.drop.nowcast", 0);
+        Object refresh = refreshGrown(List.of(appeared), List.of(appeared), List.of());
+        Map<String, Object> topicEvents = new java.util.LinkedHashMap<>();
+        topicEvents.put("es.drop.nowcast", topicBinding("DATABENTO", "drop-nowcast"));
+
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(consumer.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap()))
+                .thenReturn(Map.of(appeared,
+                        new org.apache.kafka.clients.consumer.OffsetAndTimestamp(42L, 1L)));
+        invokeSeekAddedLivePartitions(consumer, refresh, topicEvents);
+        org.mockito.Mockito.verify(consumer).seek(appeared, 42L);
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never())
+                .seekToEnd(org.mockito.ArgumentMatchers.anyCollection());
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never())
+                .seekToBeginning(org.mockito.ArgumentMatchers.anyCollection());
+
+        // No record within the window (offsetsForTimes returns no entry) -> END, never beginning.
+        KafkaConsumer<?, ?> emptyWindow = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(emptyWindow.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap()))
+                .thenReturn(Map.of());
+        invokeSeekAddedLivePartitions(emptyWindow, refresh, topicEvents);
+        org.mockito.Mockito.verify(emptyWindow).seekToEnd(List.of(appeared));
+        org.mockito.Mockito.verify(emptyWindow, org.mockito.Mockito.never())
+                .seek(org.mockito.ArgumentMatchers.any(TopicPartition.class),
+                        org.mockito.ArgumentMatchers.anyLong());
+
+        // offsetsForTimes failing (broker hiccup) -> best-effort END fallback, no propagation.
+        KafkaConsumer<?, ?> failing = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(failing.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap()))
+                .thenThrow(new org.apache.kafka.common.errors.TimeoutException("metadata hiccup"));
+        invokeSeekAddedLivePartitions(failing, refresh, topicEvents);
+        org.mockito.Mockito.verify(failing).seekToEnd(List.of(appeared));
+    }
+
+    private static Object refreshGrown(List<TopicPartition> merged, List<TopicPartition> added,
+            List<TopicPartition> previouslyAssigned) throws Exception {
+        Class<?> refreshClass = Class.forName("app.feedgateway.FeedGatewayService$Refresh");
+        Method grown = refreshClass.getDeclaredMethod("grown", List.class, List.class, List.class);
+        grown.setAccessible(true);
+        return grown.invoke(null, merged, added, previouslyAssigned);
+    }
+
+    private void invokeSeekAddedLivePartitions(KafkaConsumer<?, ?> consumer, Object refresh,
+            Map<String, Object> topicEvents) throws Exception {
+        Method seek = FeedGatewayService.class.getDeclaredMethod("seekAddedLivePartitions",
+                KafkaConsumer.class, Class.forName("app.feedgateway.FeedGatewayService$Refresh"),
+                Map.class);
+        seek.setAccessible(true);
+        seek.invoke(service(), consumer, refresh, topicEvents);
+    }
+
+    @Test
+    void dropNowcastLifecycleAbsentAtBootstrapThenDiscoveredAssignsAndSeeksTheDisplayWindow()
+            throws Exception {
+        // END-TO-END lifecycle through the REAL discovery path (UI review r2 finding 4): the
+        // optional topic is absent when the consumer bootstraps (its producer not yet deployed),
+        // the periodic PartitionRefresh later finds it, assigns it, and the seek policy recovers
+        // the 10-minute display window — no gateway restart, no lost first verdict, no full-
+        // retention replay. Each stage drives the production method, not a hand-built Refresh.
+        FeedGatewayService service = service();
+        setRunning(service, true);
+        TopicPartition mandatory = new TopicPartition("databento.display", 0);
+        TopicPartition dropped = new TopicPartition("es.drop.nowcast", 0);
+        Set<String> topics = new java.util.LinkedHashSet<>(
+                List.of("databento.display", "es.drop.nowcast"));
+
+        // Stage 1 — bootstrap with the optional topic ABSENT: partitionsFor must complete with
+        // only the mandatory topic instead of blocking/failing on the absent optional one.
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(consumer.partitionsFor(
+                        org.mockito.ArgumentMatchers.eq("databento.display"),
+                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
+                .thenReturn(List.of(new org.apache.kafka.common.PartitionInfo(
+                        "databento.display", 0, null, null, null)));
+        org.mockito.Mockito.when(consumer.partitionsFor(
+                        org.mockito.ArgumentMatchers.eq("es.drop.nowcast"),
+                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
+                .thenReturn(null);
+        Method partitionsFor = FeedGatewayService.class.getDeclaredMethod("partitionsFor",
+                String.class, KafkaConsumer.class, Set.class, long.class);
+        partitionsFor.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        List<TopicPartition> bootstrap = (List<TopicPartition>) partitionsFor.invoke(
+                service, "json", consumer, topics, 2_000L);
+        assertEquals(List.of(mandatory), bootstrap,
+                "an absent optional topic must not block bootstrap or appear in the assignment");
+
+        // Stage 2 — the producer deploys and creates the topic; the next refresh interval must
+        // DISCOVER it, assign the union, and classify it as added-on-NEW-topic.
+        org.mockito.Mockito.when(consumer.partitionsFor(
+                        org.mockito.ArgumentMatchers.eq("es.drop.nowcast"),
+                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
+                .thenReturn(List.of(new org.apache.kafka.common.PartitionInfo(
+                        "es.drop.nowcast", 0, null, null, null)));
+        Class<?> refreshClass = Class.forName("app.feedgateway.FeedGatewayService$PartitionRefresh");
+        java.lang.reflect.Constructor<?> refreshCtor = refreshClass.getDeclaredConstructor(
+                FeedGatewayService.class, String.class, Set.class);
+        refreshCtor.setAccessible(true);
+        Object partitionRefresh = refreshCtor.newInstance(service, "json", topics);
+        java.lang.reflect.Field nextRefreshMs = refreshClass.getDeclaredField("nextRefreshMs");
+        nextRefreshMs.setAccessible(true);
+        nextRefreshMs.setLong(partitionRefresh, 0L); // interval elapsed — refresh now
+        Method apply = refreshClass.getDeclaredMethod("apply", KafkaConsumer.class, List.class);
+        apply.setAccessible(true);
+        Object refresh = apply.invoke(partitionRefresh, consumer, bootstrap);
+        org.mockito.Mockito.verify(consumer).assign(List.of(mandatory, dropped));
+        Class<?> refreshRecord = Class.forName("app.feedgateway.FeedGatewayService$Refresh");
+        assertEquals(List.of(dropped),
+                refreshRecord.getDeclaredMethod("addedOnNewTopics").invoke(refresh),
+                "the appearing topic must be classified as NEW, not grown");
+
+        // Stage 3 — the REAL refresh result feeds the seek policy: bounded display-window
+        // recovery, never END (loses the first verdict) and never BEGINNING (replays 7 d).
+        org.mockito.Mockito.when(consumer.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap()))
+                .thenReturn(Map.of(dropped,
+                        new org.apache.kafka.clients.consumer.OffsetAndTimestamp(7L, 1L)));
+        Map<String, Object> topicEvents = new java.util.LinkedHashMap<>();
+        topicEvents.put("databento.display", topicBinding("DATABENTO", "snapshot"));
+        topicEvents.put("es.drop.nowcast", topicBinding("DATABENTO", "drop-nowcast"));
+        Method seek = FeedGatewayService.class.getDeclaredMethod("seekAddedLivePartitions",
+                KafkaConsumer.class, refreshRecord, Map.class);
+        seek.setAccessible(true);
+        seek.invoke(service, consumer, refresh, topicEvents);
+        org.mockito.Mockito.verify(consumer).seek(dropped, 7L);
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never())
+                .seekToEnd(org.mockito.ArgumentMatchers.anyCollection());
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never())
+                .seekToBeginning(org.mockito.ArgumentMatchers.anyCollection());
+    }
+
+    private static void setRunning(FeedGatewayService service, boolean value) throws Exception {
+        java.lang.reflect.Field running = FeedGatewayService.class.getDeclaredField("running");
+        running.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicBoolean) running.get(service)).set(value);
+    }
+
+    @Test
+    void dropNowcastParseGateBlocksMalformedValuesFromTheEnvelope() {
+        // enrichJson() passes unparseable text through VERBATIM and envelopeJson() concatenates it
+        // as JSON, so one malformed classifier value would poison every legacy client's frame
+        // ("Bad Data" on the whole feed). The gate must admit only a JSON object that is a NOWCAST
+        // with a non-empty drop_id (UI review r1 finding #4).
+        com.fasterxml.jackson.databind.ObjectMapper mapper =
+                new com.fasterxml.jackson.databind.ObjectMapper();
+        assertTrue(FeedGatewayService.isBroadcastableDropNowcast(mapper,
+                "{\"message_type\":\"NOWCAST\",\"drop_id\":\"ES-20260812-093500484-S31096-DN\"}"));
+        // truncated JSON (the exact poison-frame case)
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper,
+                "{\"message_type\":\"NOWCAST\",\"drop_id\":\"x"));
+        // valid JSON but not an object
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper, "[1,2,3]"));
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper, "\"NOWCAST\""));
+        // diagnostic / GAP_DISCOVERY records without a drop_id must not broadcast
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper,
+                "{\"message_type\":\"GAP_DISCOVERY\",\"drop_id\":\"d1\"}"));
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper,
+                "{\"message_type\":\"NOWCAST\"}"));
+        assertFalse(FeedGatewayService.isBroadcastableDropNowcast(mapper, null));
     }
 
     // ----- 0DTE binary direction / unusual-movement option-chain tint -----------------------------
