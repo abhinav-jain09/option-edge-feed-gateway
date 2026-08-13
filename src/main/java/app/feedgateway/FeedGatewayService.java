@@ -429,6 +429,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong batchesSent = new AtomicLong();
     private final AtomicLong consumerRestarts = new AtomicLong();
     private final AtomicLong forwardedEvents = new AtomicLong();
+    /** drop-nowcast values dropped at the parse gate (review finding #4). */
+    private final AtomicLong dropNowcastMalformed = new AtomicLong();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -2115,12 +2117,20 @@ public class FeedGatewayService implements ReplayRunner {
                                          Map<String, TopicBinding> topicEvents) {
         Set<TopicPartition> onGrownTopics = Set.copyOf(refresh.addedOnGrownTopics());
         List<TopicPartition> recoverFromBeginning = new ArrayList<>();
+        List<TopicPartition> recoverDisplayWindow = new ArrayList<>();
         List<TopicPartition> toEnd = new ArrayList<>();
         for (TopicPartition partition : refresh.added()) {
             TopicBinding binding = topicEvents.get(partition.topic());
             boolean liveOnly = binding != null && isLiveOnlyRebuiltEvent(binding.event());
             if (liveOnly && onGrownTopics.contains(partition)) {
                 recoverFromBeginning.add(partition);
+            } else if (binding != null && "drop-nowcast".equals(binding.event())) {
+                // A drop-nowcast topic that just APPEARED (the optional producer creating it
+                // mid-session) may already hold verdicts; END would lose the very first one and
+                // nothing rebuilds it. Beginning would replay full retention (7 d). Bounded
+                // recovery instead: seek by timestamp over the client's 10-minute display
+                // window (review finding #3).
+                recoverDisplayWindow.add(partition);
             } else {
                 toEnd.add(partition);
             }
@@ -2131,6 +2141,29 @@ public class FeedGatewayService implements ReplayRunner {
         if (!recoverFromBeginning.isEmpty()) {
             consumer.seekToBeginning(recoverFromBeginning);
         }
+        if (!recoverDisplayWindow.isEmpty()) {
+            long fromMs = System.currentTimeMillis() - 10 * 60_000L;
+            Map<TopicPartition, Long> query = new HashMap<>();
+            for (TopicPartition p : recoverDisplayWindow) {
+                query.put(p, fromMs);
+            }
+            try {
+                Map<TopicPartition, org.apache.kafka.clients.consumer.OffsetAndTimestamp> offsets =
+                        consumer.offsetsForTimes(query);
+                for (TopicPartition p : recoverDisplayWindow) {
+                    org.apache.kafka.clients.consumer.OffsetAndTimestamp ot =
+                            offsets == null ? null : offsets.get(p);
+                    if (ot != null) {
+                        consumer.seek(p, ot.offset());
+                    } else {
+                        consumer.seekToEnd(List.of(p));
+                    }
+                }
+            } catch (Exception e) {
+                // bounded-recovery best effort: END is the safe fallback
+                consumer.seekToEnd(recoverDisplayWindow);
+            }
+        }
     }
 
     /**
@@ -2140,7 +2173,9 @@ public class FeedGatewayService implements ReplayRunner {
      * has no case for it, so the cache consumer reads those records and drops them.
      *
      * <ul>
-     *   <li>{@code turn-alert}, {@code spread-skew-event} — discrete one-shot transitions, never cached.</li>
+     *   <li>{@code turn-alert}, {@code spread-skew-event}, {@code drop-nowcast} — discrete one-shot
+     *       transitions, never cached ({@code drop-nowcast} additionally gets a bounded 10-minute
+     *       timestamp-seek when its OPTIONAL topic first appears — see seekAddedLivePartitions).</li>
      *   <li>{@code strike-cluster} — dashboard + recent-signals trail, cached into {@code strikeClusters}
      *       by the live branch only and replayed to connecting clients from there.</li>
      * </ul>
@@ -2154,6 +2189,7 @@ public class FeedGatewayService implements ReplayRunner {
     private static boolean isLiveOnlyRebuiltEvent(String event) {
         return "turn-alert".equals(event)
                 || "spread-skew-event".equals(event)
+                || "drop-nowcast".equals(event)
                 || "strike-cluster".equals(event);
     }
 
@@ -2286,6 +2322,21 @@ public class FeedGatewayService implements ReplayRunner {
                         // Drop-classifier verdict/refinement: one-shot advisory, broadcast STANDALONE
                         // to every client (never selection-gated, never cached — the client keys by
                         // drop_id and expires its own banner). SHADOW: display-only.
+                        // A malformed value must never reach the envelope: enrichJson() would pass
+                        // unparseable text through verbatim and poison every legacy client's frame,
+                        // so parse-gate here — drop and count instead (review finding #4).
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode parsed = mapper.readTree(json);
+                            if (parsed == null || !parsed.isObject()
+                                    || !"NOWCAST".equals(parsed.path("message_type").asText())
+                                    || parsed.path("drop_id").asText("").isEmpty()) {
+                                dropNowcastMalformed.incrementAndGet();
+                                continue;
+                            }
+                        } catch (Exception malformed) {
+                            dropNowcastMalformed.incrementAndGet();
+                            continue;
+                        }
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
                         continue;
@@ -2743,7 +2794,8 @@ public class FeedGatewayService implements ReplayRunner {
         // services restart each day, are simply absent until that service first produces) — treat them
         // as optional so their absence can't starve strike-flow / mission-pace / the other JSON feeds.
         return topic != null
-                && (topic.equals(settings.strikeLiquidityTopic())
+                && (topic.equals(settings.dropNowcastTopic())
+                    || topic.equals(settings.strikeLiquidityTopic())
                     || topic.equals(settings.dealerLedgerProfileTopic())
                     || topic.equals(settings.dealerLedgerStateTopic())
                     || topic.equals(settings.strikeIntelByStrikeTopic())
@@ -8276,6 +8328,10 @@ public class FeedGatewayService implements ReplayRunner {
             // standalone broadcast reaches sockets in per-session (auth) mode too
             // (GatewayRecordMapper deliberately has no route for it).
             "ibkr-preopen-status",
+            // Drop-classifier SHADOW nowcast: a GLOBAL advisory (identical for every user,
+            // display-only). Allowlisted so the standalone broadcast reaches per-session
+            // (auth) sockets too — without this, authenticated prod silently drops it.
+            "drop-nowcast",
             // Agent A short-premium recommendation is a GLOBAL advisory overlay (the UI filters by
             // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
             // in per-session (auth) mode too, not only legacy mode — otherwise it is silently

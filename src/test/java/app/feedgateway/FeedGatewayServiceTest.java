@@ -547,6 +547,10 @@ class FeedGatewayServiceTest {
         // rollout — it MUST be optional (like strike-intel) so its absence cannot starve the shared
         // JSON consumer (strike-flow / mission-pace / etc.).
         assertTrue(isOptionalTopic(service, settings.strikeInvasionTopic()));
+        // drop-classifier's nowcast topic is created by ITS service on first start and can be
+        // absent when the gateway boots — it MUST be optional so its absence cannot starve the
+        // shared JSON consumers (UI review r1 finding #2).
+        assertTrue(isOptionalTopic(service, settings.dropNowcastTopic()));
         // Both spread-skew topics come from the same brand-new spread-skew-service, which may not be
         // deployed during a staged rollout — BOTH must be optional (like strike-invasion) so their
         // absence cannot starve the shared JSON consumer.
