@@ -618,6 +618,91 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void dropNowcastLifecycleAbsentAtBootstrapThenDiscoveredAssignsAndSeeksTheDisplayWindow()
+            throws Exception {
+        // END-TO-END lifecycle through the REAL discovery path (UI review r2 finding 4): the
+        // optional topic is absent when the consumer bootstraps (its producer not yet deployed),
+        // the periodic PartitionRefresh later finds it, assigns it, and the seek policy recovers
+        // the 10-minute display window — no gateway restart, no lost first verdict, no full-
+        // retention replay. Each stage drives the production method, not a hand-built Refresh.
+        FeedGatewayService service = service();
+        setRunning(service, true);
+        TopicPartition mandatory = new TopicPartition("databento.display", 0);
+        TopicPartition dropped = new TopicPartition("es.drop.nowcast", 0);
+        Set<String> topics = new java.util.LinkedHashSet<>(
+                List.of("databento.display", "es.drop.nowcast"));
+
+        // Stage 1 — bootstrap with the optional topic ABSENT: partitionsFor must complete with
+        // only the mandatory topic instead of blocking/failing on the absent optional one.
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(consumer.partitionsFor(
+                        org.mockito.ArgumentMatchers.eq("databento.display"),
+                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
+                .thenReturn(List.of(new org.apache.kafka.common.PartitionInfo(
+                        "databento.display", 0, null, null, null)));
+        org.mockito.Mockito.when(consumer.partitionsFor(
+                        org.mockito.ArgumentMatchers.eq("es.drop.nowcast"),
+                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
+                .thenReturn(null);
+        Method partitionsFor = FeedGatewayService.class.getDeclaredMethod("partitionsFor",
+                String.class, KafkaConsumer.class, Set.class, long.class);
+        partitionsFor.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        List<TopicPartition> bootstrap = (List<TopicPartition>) partitionsFor.invoke(
+                service, "json", consumer, topics, 2_000L);
+        assertEquals(List.of(mandatory), bootstrap,
+                "an absent optional topic must not block bootstrap or appear in the assignment");
+
+        // Stage 2 — the producer deploys and creates the topic; the next refresh interval must
+        // DISCOVER it, assign the union, and classify it as added-on-NEW-topic.
+        org.mockito.Mockito.when(consumer.partitionsFor(
+                        org.mockito.ArgumentMatchers.eq("es.drop.nowcast"),
+                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
+                .thenReturn(List.of(new org.apache.kafka.common.PartitionInfo(
+                        "es.drop.nowcast", 0, null, null, null)));
+        Class<?> refreshClass = Class.forName("app.feedgateway.FeedGatewayService$PartitionRefresh");
+        java.lang.reflect.Constructor<?> refreshCtor = refreshClass.getDeclaredConstructor(
+                FeedGatewayService.class, String.class, Set.class);
+        refreshCtor.setAccessible(true);
+        Object partitionRefresh = refreshCtor.newInstance(service, "json", topics);
+        java.lang.reflect.Field nextRefreshMs = refreshClass.getDeclaredField("nextRefreshMs");
+        nextRefreshMs.setAccessible(true);
+        nextRefreshMs.setLong(partitionRefresh, 0L); // interval elapsed — refresh now
+        Method apply = refreshClass.getDeclaredMethod("apply", KafkaConsumer.class, List.class);
+        apply.setAccessible(true);
+        Object refresh = apply.invoke(partitionRefresh, consumer, bootstrap);
+        org.mockito.Mockito.verify(consumer).assign(List.of(mandatory, dropped));
+        Class<?> refreshRecord = Class.forName("app.feedgateway.FeedGatewayService$Refresh");
+        assertEquals(List.of(dropped),
+                refreshRecord.getDeclaredMethod("addedOnNewTopics").invoke(refresh),
+                "the appearing topic must be classified as NEW, not grown");
+
+        // Stage 3 — the REAL refresh result feeds the seek policy: bounded display-window
+        // recovery, never END (loses the first verdict) and never BEGINNING (replays 7 d).
+        org.mockito.Mockito.when(consumer.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap()))
+                .thenReturn(Map.of(dropped,
+                        new org.apache.kafka.clients.consumer.OffsetAndTimestamp(7L, 1L)));
+        Map<String, Object> topicEvents = new java.util.LinkedHashMap<>();
+        topicEvents.put("databento.display", topicBinding("DATABENTO", "snapshot"));
+        topicEvents.put("es.drop.nowcast", topicBinding("DATABENTO", "drop-nowcast"));
+        Method seek = FeedGatewayService.class.getDeclaredMethod("seekAddedLivePartitions",
+                KafkaConsumer.class, refreshRecord, Map.class);
+        seek.setAccessible(true);
+        seek.invoke(service, consumer, refresh, topicEvents);
+        org.mockito.Mockito.verify(consumer).seek(dropped, 7L);
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never())
+                .seekToEnd(org.mockito.ArgumentMatchers.anyCollection());
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never())
+                .seekToBeginning(org.mockito.ArgumentMatchers.anyCollection());
+    }
+
+    private static void setRunning(FeedGatewayService service, boolean value) throws Exception {
+        java.lang.reflect.Field running = FeedGatewayService.class.getDeclaredField("running");
+        running.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicBoolean) running.get(service)).set(value);
+    }
+
+    @Test
     void dropNowcastParseGateBlocksMalformedValuesFromTheEnvelope() {
         // enrichJson() passes unparseable text through VERBATIM and envelopeJson() concatenates it
         // as JSON, so one malformed classifier value would poison every legacy client's frame
