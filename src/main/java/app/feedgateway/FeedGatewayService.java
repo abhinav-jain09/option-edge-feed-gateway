@@ -237,6 +237,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     private final Map<String, String> gammaMigration = new ConcurrentHashMap<>();
+    /** Peak rotation windows and the raw move log, per chain. Same shape as gammaMigration. */
+    private final Map<String, String> gammaRotation = new ConcurrentHashMap<>();
     // ES-on-SPX aligned whole-book per symbol|expiry (JSON, roll-forward: latest emitEventTimeMs wins).
     private final Map<String, String> esGex = new ConcurrentHashMap<>();
     // ES strike-intelligence projected onto SPX strikes, keyed by NATIVE ES identity (symbol|expiry|esStrike,
@@ -1424,6 +1426,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
+        topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
@@ -1553,6 +1556,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
+        topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
@@ -3533,6 +3537,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.unifiedSrTopic(),
                     settings.databentoGexMagnetTopic(),
                     settings.gammaMigrationTopic(),
+                    settings.gammaRotationTopic(),
                     settings.databentoMaxPainTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic(),
@@ -4611,6 +4616,14 @@ public class FeedGatewayService implements ReplayRunner {
                 gammaMigration.put(key, json);
                 return key;
             }
+            case "gamma-rotation" -> {
+                // Same contract as gamma-migration: one compacted record per chain is the whole
+                // current answer, so last-value-wins with no tombstones.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gammaRotation.put(key, json);
+                return key;
+            }
             case "es-gex" -> {
                 // ES-on-SPX aligned WHOLE-BOOK per symbol|expiry (roll-forward: latest emitEventTimeMs wins;
                 // the align service is the single writer and stamps a monotonically-advancing emitEventTimeMs).
@@ -5088,6 +5101,15 @@ public class FeedGatewayService implements ReplayRunner {
                         .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gamma-migration", entry.getValue()))
+                        .forEach(cachedEvents::add);
+                case "gamma-rotation" -> gammaRotation.entrySet().stream()
+                        .filter(entry -> isCacheFresh("gamma-rotation:" + entry.getKey(), nowMs))
+                        .filter(entry -> passesSelectionBarrier("gamma-rotation:" + entry.getKey(),
+                                selection, false, false))
+                        .filter(entry -> "DATABENTO".equals(selection.source()))
+                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(entry -> new CachedEvent("gamma-rotation", entry.getValue()))
                         .forEach(cachedEvents::add);
                 case "gex-magnet" -> gexMagnet.entrySet().stream()
                         // DATABENTO-only Avro per-chain magnet value (last-value-wins). Replay while the
@@ -5837,6 +5859,8 @@ public class FeedGatewayService implements ReplayRunner {
             gexMagnet.remove(versionKey.substring("gex-magnet:".length()));
         } else if (versionKey.startsWith("gamma-migration:")) {
             gammaMigration.remove(versionKey.substring("gamma-migration:".length()));
+        } else if (versionKey.startsWith("gamma-rotation:")) {
+            gammaRotation.remove(versionKey.substring("gamma-rotation:".length()));
         } else if (versionKey.startsWith("hot-strike:")) {
             hotStrikes.remove(versionKey.substring("hot-strike:".length()));
         } else if (versionKey.startsWith("es-gex:")) {
@@ -5950,11 +5974,25 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     public String cachedGammaMigration(String symbol, String expiry) {
+        return cachedByChain(gammaMigration, symbol, expiry);
+    }
+
+    /** The peak-rotation windows and raw move log for one chain, or null when none is cached. */
+    public String cachedGammaRotation(String symbol, String expiry) {
+        return cachedByChain(gammaRotation, symbol, expiry);
+    }
+
+    /**
+     * ONE key derivation for both. They are written by the same producer under the same key, so
+     * two hand-rolled copies could only ever drift apart — and a mismatch here is invisible: the
+     * endpoint answers present:false for a chain that is publishing once a second.
+     */
+    private String cachedByChain(Map<String, String> cache, String symbol, String expiry) {
         if (symbol == null || expiry == null) {
             return null;
         }
         String key = "DATABENTO|" + symbol.trim().toUpperCase(Locale.ROOT) + "|" + normalizeExpiry(expiry);
-        return gammaMigration.get(key);
+        return cache.get(key);
     }
 
     /**
@@ -7354,6 +7392,7 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "gex-magnet", gexMagnet);
         replayCacheMap(session, "gamma-migration", gammaMigration);
+        replayCacheMap(session, "gamma-rotation", gammaRotation);
         replayCacheMap(session, "es-gex", esGex);
         replayCacheMap(session, "es-strike-intel", esStrikeIntel);
         replayCacheMap(session, "gex-strike-lifecycle", gexStrikeLifecycle);
@@ -7679,6 +7718,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.unifiedSrTopic(), "strike-sr");
                 avroTopics.put(settings.databentoGexMagnetTopic(), "gex-magnet");
                 avroTopics.put(settings.gammaMigrationTopic(), "gamma-migration");
+                avroTopics.put(settings.gammaRotationTopic(), "gamma-rotation");
                 avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
