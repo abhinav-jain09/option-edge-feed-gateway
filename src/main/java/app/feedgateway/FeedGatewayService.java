@@ -7418,9 +7418,17 @@ public class FeedGatewayService implements ReplayRunner {
             String key = tf + "|" + bar.get("barStartMs").asLong();
             String sd = text(root, "sessionDate");
             synchronized (cvdBars) {
-                if (!sd.isEmpty() && !sd.equals(cvdBarsSessionDate)) {
-                    cvdBars.clear();
-                    cvdBarsSessionDate = sd;
+                if (!sd.isEmpty()) {
+                    String current = cvdBarsSessionDate;
+                    // MONOTONIC rollover (merge-gate finding 4): sessionDate is yyyymmdd, so string
+                    // order IS date order. A NEWER date rolls the view forward; an OLDER date is a
+                    // late/replayed record from a dead session and must never resurrect it.
+                    if (current == null || sd.compareTo(current) > 0) {
+                        cvdBars.clear();
+                        cvdBarsSessionDate = sd;
+                    } else if (sd.compareTo(current) < 0) {
+                        return;                                // stale-session record: dropped
+                    }
                 }
                 cvdBars.put(key, json);
             }
@@ -7442,20 +7450,36 @@ public class FeedGatewayService implements ReplayRunner {
         return sb.append("}}").toString();
     }
 
-    /** Ascending-by-barStartMs page of the keyed CVD bar view for the REST backfill (R46/R37a). */
-    public java.util.List<String> cvdBarsSnapshot(String timeframe, long toMsInclusive, long afterMsExclusive, int limit) {
-        java.util.List<String> out = new java.util.ArrayList<>();
+    /** One ATOMIC backfill page: session check, rows, cursor and session stamp under one lock. */
+    public record CvdBarsPage(String sessionDate, boolean sessionMismatch,
+                              java.util.List<String> bars, Long nextCursor) { }
+
+    /**
+     * R46 (merge-gate finding 3): the mismatch check, the rows, the response session and the
+     * cursor are ONE synchronized snapshot — a rollover can happen before or after this call,
+     * never inside it, so a page can never mix sessions or mislabel itself.
+     */
+    public CvdBarsPage cvdBarsPage(String timeframe, long toMsInclusive, long afterMsExclusive,
+                                   int limit, String expectedSessionDate) {
         synchronized (cvdBars) {
+            String current = cvdBarsSessionDate;
+            if (expectedSessionDate != null && !expectedSessionDate.isEmpty()
+                    && current != null && !expectedSessionDate.equals(current)) {
+                return new CvdBarsPage(current, true, java.util.List.of(), null);
+            }
+            java.util.List<String> out = new java.util.ArrayList<>();
+            long lastStart = -1;
             for (java.util.Map.Entry<String, String> e : cvdBars.entrySet()) {
                 int sep = e.getKey().lastIndexOf('|');
                 if (!e.getKey().substring(0, sep).equals(timeframe)) continue;
                 long start = Long.parseLong(e.getKey().substring(sep + 1));
                 if (start <= afterMsExclusive || start > toMsInclusive) continue;
                 out.add(e.getValue());
+                lastStart = start;
                 if (out.size() >= limit) break;
             }
+            return new CvdBarsPage(current, false, out, out.size() >= limit ? lastStart : null);
         }
-        return out;
     }
 
     public String cvdBarsSessionDate() { return cvdBarsSessionDate; }

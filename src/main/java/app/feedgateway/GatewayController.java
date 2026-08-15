@@ -53,32 +53,20 @@ public class GatewayController {
                           @org.springframework.web.bind.annotation.RequestParam(value = "afterMs", defaultValue = "-1") long afterMs,
                           @org.springframework.web.bind.annotation.RequestParam(value = "limit", defaultValue = "500") int limit,
                           @org.springframework.web.bind.annotation.RequestParam(value = "sessionDate", defaultValue = "") String sessionDate) {
-        // R46 rollover fence: a page mid-handshake pins the session its hello named. If the view
-        // has rolled since, every already-fetched page belongs to a dead session — the client must
-        // discard and restart, so the mismatch is EXPLICIT rather than silently merged.
-        String current = service.cvdBarsSessionDate();
-        if (!sessionDate.isEmpty() && current != null && !sessionDate.equals(current)) {
-            return "{\"sessionMismatch\":true,\"sessionDate\":\"" + current + "\"}";
-        }
         int capped = Math.max(1, Math.min(limit, 1000));
-        java.util.List<String> bars = service.cvdBarsSnapshot(tf, toMs, afterMs, capped);
+        // R46: session check, rows, cursor and session stamp are ONE atomic snapshot (finding 3).
+        FeedGatewayService.CvdBarsPage page = service.cvdBarsPage(tf, toMs, afterMs, capped, sessionDate);
         StringBuilder sb = new StringBuilder("{\"sessionDate\":");
-        String sd = service.cvdBarsSessionDate();
-        sb.append(sd == null ? "null" : "\"" + sd + "\"").append(",\"bars\":[");
-        for (int i = 0; i < bars.size(); i++) {
+        sb.append(page.sessionDate() == null ? "null" : "\"" + page.sessionDate() + "\"");
+        if (page.sessionMismatch()) {
+            return sb.append(",\"sessionMismatch\":true,\"bars\":[],\"nextCursor\":null}").toString();
+        }
+        sb.append(",\"bars\":[");
+        for (int i = 0; i < page.bars().size(); i++) {
             if (i > 0) sb.append(',');
-            sb.append(bars.get(i));
+            sb.append(page.bars().get(i));
         }
-        // nextCursor = the last returned bar's start when the page filled; null otherwise.
-        sb.append("],\"nextCursor\":");
-        if (bars.size() == capped) {
-            com.fasterxml.jackson.databind.ObjectMapper m = new com.fasterxml.jackson.databind.ObjectMapper();
-            try {
-                sb.append(m.readTree(bars.get(bars.size() - 1)).path("bar").path("barStartMs").asLong());
-            } catch (Exception e) { sb.append("null"); }
-        } else {
-            sb.append("null");
-        }
+        sb.append("],\"nextCursor\":").append(page.nextCursor() == null ? "null" : page.nextCursor());
         sb.append('}');
         return sb.toString();
     }
