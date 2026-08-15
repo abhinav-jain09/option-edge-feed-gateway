@@ -41,6 +41,40 @@ public class GatewayController {
         return service.healthJson();
     }
 
+    /**
+     * R46 backfill (ES-CVD-DESIGN.md): the current session's CVD bar-close records for one
+     * timeframe, ascending by barStartMs, paginated by afterMs (exclusive cursor) up to toMs
+     * (inclusive bound = the hello frame's high-water mark). Auth: same JWT gate as every /api
+     * route. Response: {"sessionDate":..., "bars":[<record>...], "nextCursor": <long or null>}.
+     */
+    @GetMapping(value = "/api/cvd/bars", produces = MediaType.APPLICATION_JSON_VALUE)
+    public String cvdBars(@org.springframework.web.bind.annotation.RequestParam("tf") String tf,
+                          @org.springframework.web.bind.annotation.RequestParam("toMs") long toMs,
+                          @org.springframework.web.bind.annotation.RequestParam(value = "afterMs", defaultValue = "-1") long afterMs,
+                          @org.springframework.web.bind.annotation.RequestParam(value = "limit", defaultValue = "500") int limit) {
+        int capped = Math.max(1, Math.min(limit, 1000));
+        java.util.List<String> bars = service.cvdBarsSnapshot(tf, toMs, afterMs, capped);
+        StringBuilder sb = new StringBuilder("{\"sessionDate\":");
+        String sd = service.cvdBarsSessionDate();
+        sb.append(sd == null ? "null" : "\"" + sd + "\"").append(",\"bars\":[");
+        for (int i = 0; i < bars.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(bars.get(i));
+        }
+        // nextCursor = the last returned bar's start when the page filled; null otherwise.
+        sb.append("],\"nextCursor\":");
+        if (bars.size() == capped) {
+            com.fasterxml.jackson.databind.ObjectMapper m = new com.fasterxml.jackson.databind.ObjectMapper();
+            try {
+                sb.append(m.readTree(bars.get(bars.size() - 1)).path("bar").path("barStartMs").asLong());
+            } catch (Exception e) { sb.append("null"); }
+        } else {
+            sb.append("null");
+        }
+        sb.append('}');
+        return sb.toString();
+    }
+
     @GetMapping(value = "/metrics", produces = MediaType.TEXT_PLAIN_VALUE)
     public String metrics() {
         // Liquidity-history §7 metrics are appended to the same text endpoint the rest of the

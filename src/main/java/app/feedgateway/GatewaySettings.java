@@ -259,6 +259,21 @@ public final class GatewaySettings {
         return boolValue("GATEWAY_ES_AGGRESSOR_FLOW_ENABLED", false);
     }
 
+    /** Latest ES CVD live snapshot (JSON, keyed by ES.v.0; 1 Hz, compacted). */
+    public String esCvdTopic() {
+        return value("KAFKA_ES_CVD_TOPIC", "futures.cvd");
+    }
+
+    /** ES CVD bar-close records (JSON, keyed symbol|timeframe|barStartMs; at-least-once upserts). */
+    public String esCvdBarsTopic() {
+        return value("KAFKA_ES_CVD_BARS_TOPIC", "futures.cvd.bars");
+    }
+
+    /** Opt-in for the same reason as the aggressor: the ES-only topics do not exist on every cluster. */
+    public boolean esCvdEnabled() {
+        return boolValue("GATEWAY_ES_CVD_ENABLED", false);
+    }
+
     public String databentoDirectionalPressureTopic() {
         return value("KAFKA_DATABENTO_DIRECTIONAL_PRESSURE_TOPIC", "options.databento.directional-pressure");
     }
