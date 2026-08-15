@@ -692,6 +692,11 @@ public class FeedGatewayService implements ReplayRunner {
         clients.add(session);
         clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
+        if (settings.esCvdEnabled()) {
+            // R46 hello: the per-timeframe high-water marks of the bar view, so the page can bound
+            // its REST backfill to exactly what this gateway holds and buffer WS bars past it.
+            send(session, "cvd-hello", cvdHelloJson());
+        }
         // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
         // each socket gets only the cached state matching its own AppSession selection (no cross-
         // contract leak), then live routed data (FR-11).
@@ -1553,6 +1558,12 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.esAggressorFlowEnabled()) {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
+        if (settings.esCvdEnabled()) {
+            // ES CVD live snapshot (1 Hz, compacted, keyed ES.v.0) and bar-close upserts
+            // (keyed symbol|timeframe|barStartMs) — R37/R37a in ES-CVD-DESIGN.md.
+            topicEvents.put(settings.esCvdTopic(), new TopicBinding("DATABENTO", "es-cvd"));
+            topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding("DATABENTO", "es-cvd-bar"));
+        }
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
@@ -2357,6 +2368,22 @@ public class FeedGatewayService implements ReplayRunner {
                         // selection-gated and never cached (a transition is a one-shot alert; the 5s
                         // spread-skew snapshot carries the current state for late joiners) — the
                         // turn-alert sibling.
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("es-cvd".equals(binding.event())) {
+                        // Same standalone-delivery reasoning as es-aggressor-flow below: one compacted
+                        // ES.v.0 snapshot per second, no option-expiry identity, never selection-gated.
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("es-cvd-bar".equals(binding.event())) {
+                        // Keyed view first (the REST backfill's source of truth), then the live
+                        // broadcast — clients apply the same last-per-key upsert rule, so at-least-once
+                        // delivery is invisible in every materialized state (ES-CVD-DESIGN.md R31).
+                        upsertCvdBar(json);
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
                         continue;
@@ -7370,6 +7397,103 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (JsonProcessingException ignored) {
             return false;
         }
+    }
+
+    /** Keyed view of the current session's CVD bar-close records — tf|barStartMs -> record JSON. */
+    private final java.util.TreeMap<String, String> cvdBars = new java.util.TreeMap<>();
+    private volatile String cvdBarsSessionDate;
+
+    /**
+     * At-least-once keyed upsert (ES-CVD-DESIGN.md R31): last record per tf|barStartMs wins, so a
+     * restart's re-emission overwrites rather than duplicates. Session rollover clears the view —
+     * the backfill contract is CURRENT-session bars only. A foreign-shaped record is dropped from
+     * the view but still broadcast; clients apply the same keyed-upsert rule downstream.
+     */
+    void upsertCvdBar(String json) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String tf = text(root, "timeframe");
+            JsonNode bar = root.path("bar");
+            if (tf.isEmpty() || !bar.hasNonNull("barStartMs")) return;
+            String key = tf + "|" + bar.get("barStartMs").asLong();
+            String sd = text(root, "sessionDate");
+            synchronized (cvdBars) {
+                if (!sd.isEmpty()) {
+                    String current = cvdBarsSessionDate;
+                    // MONOTONIC rollover (merge-gate finding 4): sessionDate is yyyymmdd, so string
+                    // order IS date order. A NEWER date rolls the view forward; an OLDER date is a
+                    // late/replayed record from a dead session and must never resurrect it.
+                    if (current == null || sd.compareTo(current) > 0) {
+                        cvdBars.clear();
+                        cvdBarsSessionDate = sd;
+                    } else if (sd.compareTo(current) < 0) {
+                        return;                                // stale-session record: dropped
+                    }
+                }
+                cvdBars.put(key, json);
+            }
+        } catch (JsonProcessingException ignored) {
+        }
+    }
+
+    /** R46 hello payload: {"sessionDate":...,"hwm":{"30s":<lastBarStartMs>,...}}. */
+    String cvdHelloJson() {
+        StringBuilder sb = new StringBuilder("{\"sessionDate\":");
+        String sd = cvdBarsSessionDate;
+        sb.append(sd == null ? "null" : "\"" + sd + "\"").append(",\"hwm\":{");
+        boolean first = true;
+        for (java.util.Map.Entry<String, Long> e : cvdBarsHighWaterMarks().entrySet()) {
+            if (!first) sb.append(',');
+            sb.append('\"').append(e.getKey()).append("\":").append(e.getValue());
+            first = false;
+        }
+        return sb.append("}}").toString();
+    }
+
+    /** One ATOMIC backfill page: session check, rows, cursor and session stamp under one lock. */
+    public record CvdBarsPage(String sessionDate, boolean sessionMismatch,
+                              java.util.List<String> bars, Long nextCursor) { }
+
+    /**
+     * R46 (merge-gate finding 3): the mismatch check, the rows, the response session and the
+     * cursor are ONE synchronized snapshot — a rollover can happen before or after this call,
+     * never inside it, so a page can never mix sessions or mislabel itself.
+     */
+    public CvdBarsPage cvdBarsPage(String timeframe, long toMsInclusive, long afterMsExclusive,
+                                   int limit, String expectedSessionDate) {
+        synchronized (cvdBars) {
+            String current = cvdBarsSessionDate;
+            if (expectedSessionDate != null && !expectedSessionDate.isEmpty()
+                    && current != null && !expectedSessionDate.equals(current)) {
+                return new CvdBarsPage(current, true, java.util.List.of(), null);
+            }
+            java.util.List<String> out = new java.util.ArrayList<>();
+            long lastStart = -1;
+            for (java.util.Map.Entry<String, String> e : cvdBars.entrySet()) {
+                int sep = e.getKey().lastIndexOf('|');
+                if (!e.getKey().substring(0, sep).equals(timeframe)) continue;
+                long start = Long.parseLong(e.getKey().substring(sep + 1));
+                if (start <= afterMsExclusive || start > toMsInclusive) continue;
+                out.add(e.getValue());
+                lastStart = start;
+                if (out.size() >= limit) break;
+            }
+            return new CvdBarsPage(current, false, out, out.size() >= limit ? lastStart : null);
+        }
+    }
+
+    public String cvdBarsSessionDate() { return cvdBarsSessionDate; }
+
+    /** Per-timeframe high-water marks of the keyed CVD bar view, for the R46 handshake. */
+    public java.util.Map<String, Long> cvdBarsHighWaterMarks() {
+        java.util.Map<String, Long> hwm = new java.util.LinkedHashMap<>();
+        synchronized (cvdBars) {
+            for (String key : cvdBars.keySet()) {
+                int sep = key.lastIndexOf('|');
+                hwm.merge(key.substring(0, sep), Long.parseLong(key.substring(sep + 1)), Math::max);
+            }
+        }
+        return hwm;
     }
 
     private static String text(JsonNode root, String field) {
