@@ -237,7 +237,17 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     private final Map<String, String> gammaMigration = new ConcurrentHashMap<>();
-    /** Peak rotation windows and the raw move log, per chain. Same shape as gammaMigration. */
+    /**
+     * Peak rotation windows and the raw move log, per chain. Same shape as gammaMigration.
+     *
+     * <p>REST-ONLY, deliberately: it is consumed by {@code GET /api/gamma-rotation} and nothing
+     * else. It is therefore consumed into this cache and evicted with it, but is NOT plumbed
+     * through the websocket paths — no EventType, no pending map, no per-session replay, no batch
+     * field. Half-wiring it there is worse than not wiring it: entries would be collected into a
+     * snapshot that has no field to carry them and silently dropped, and every one of those sites
+     * would then have to be kept in step for a delivery path with no subscriber. If a websocket
+     * consumer ever wants this, wire it in ONE change across all of those sites (Codex).
+     */
     private final Map<String, String> gammaRotation = new ConcurrentHashMap<>();
     // ES-on-SPX aligned whole-book per symbol|expiry (JSON, roll-forward: latest emitEventTimeMs wins).
     private final Map<String, String> esGex = new ConcurrentHashMap<>();
@@ -5102,15 +5112,7 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gamma-migration", entry.getValue()))
                         .forEach(cachedEvents::add);
-                case "gamma-rotation" -> gammaRotation.entrySet().stream()
-                        .filter(entry -> isCacheFresh("gamma-rotation:" + entry.getKey(), nowMs))
-                        .filter(entry -> passesSelectionBarrier("gamma-rotation:" + entry.getKey(),
-                                selection, false, false))
-                        .filter(entry -> "DATABENTO".equals(selection.source()))
-                        .filter(entry -> matchesCachedSelection(entry.getValue(), selection))
-                        .sorted(Map.Entry.comparingByKey())
-                        .map(entry -> new CachedEvent("gamma-rotation", entry.getValue()))
-                        .forEach(cachedEvents::add);
+
                 case "gex-magnet" -> gexMagnet.entrySet().stream()
                         // DATABENTO-only Avro per-chain magnet value (last-value-wins). Replay while the
                         // cache entry is alive, enforcing source/symbol/expiry isolation below.
@@ -5411,6 +5413,18 @@ public class FeedGatewayService implements ReplayRunner {
             // otherwise a stalled/dead producer's last ARMED/DEFENDED would render as an active permission.
             // Drives join freshness (joinDealerLedger), purge eviction, and cached-replay uniformly.
             return CachePolicy.expiring(settings.dealerLedgerTtlMs());
+        }
+        if ("gamma-rotation".equals(event)) {
+            // NEVER the generic 15-minute TTL. This topic publishes only when the peak MOVES, so a
+            // quiet stretch is the normal state of a healthy chain — and eviction after 15 quiet
+            // minutes threw away the whole session's move log, after which the endpoint answered
+            // present:false and the card said "the peak has not moved yet today". That is the
+            // precise false claim the card was built to avoid (Codex).
+            //
+            // The record is a SESSION-LONG accumulation, not a heartbeat: its age says nothing
+            // about whether it is still true, and the producer replaces it at the ET rollover.
+            // Seek-back matches, so a restart rebuilds a log whose last move was hours ago.
+            return CachePolicy.noEviction(settings.optionChainOffHoursSeekBackMs());
         }
         if (MARKET_AWARE_CHAIN_EVENTS.contains(event)) {
             if (isRegularTradingHours(nowMs)) {
@@ -7392,7 +7406,6 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "strike-sr", strikeSr);
         replayCacheMap(session, "gex-magnet", gexMagnet);
         replayCacheMap(session, "gamma-migration", gammaMigration);
-        replayCacheMap(session, "gamma-rotation", gammaRotation);
         replayCacheMap(session, "es-gex", esGex);
         replayCacheMap(session, "es-strike-intel", esStrikeIntel);
         replayCacheMap(session, "gex-strike-lifecycle", gexStrikeLifecycle);
