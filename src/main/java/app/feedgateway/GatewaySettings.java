@@ -722,6 +722,19 @@ public final class GatewaySettings {
         return value("KAFKA_GAMMA_MIGRATION_TOPIC", "options.spx.gamma-migration.current");
     }
 
+    /**
+     * Peak ROTATION (Avro, per-chain last-value-wins). Broadcast as event "gamma-rotation".
+     *
+     * <p>A separate topic from {@link #gammaMigrationTopic()} because the snapshot record has no
+     * room left: the windows were built onto it first and measured 8199 bytes against a hard 8192
+     * ceiling. Where the migration record says where the peak is NOW — an instantaneous reading
+     * that is true for one second and gone — this says where it has BEEN going, consolidated over
+     * 1m / 5m / 15m / 30m / 4h / session, plus the raw log of individual moves behind it.
+     */
+    public String gammaRotationTopic() {
+        return value("KAFKA_GAMMA_ROTATION_TOPIC", "options.spx.gamma-migration.rotation");
+    }
+
     /** GEX magnet strike (Avro, per-chain last-value-wins). Broadcast as event "gex-magnet". */
     public String databentoGexMagnetTopic() {
         return value("KAFKA_DATABENTO_GEX_MAGNET_TOPIC", "options.databento.gex.magnet");
