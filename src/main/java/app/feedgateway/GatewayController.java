@@ -51,7 +51,15 @@ public class GatewayController {
     public String cvdBars(@org.springframework.web.bind.annotation.RequestParam("tf") String tf,
                           @org.springframework.web.bind.annotation.RequestParam("toMs") long toMs,
                           @org.springframework.web.bind.annotation.RequestParam(value = "afterMs", defaultValue = "-1") long afterMs,
-                          @org.springframework.web.bind.annotation.RequestParam(value = "limit", defaultValue = "500") int limit) {
+                          @org.springframework.web.bind.annotation.RequestParam(value = "limit", defaultValue = "500") int limit,
+                          @org.springframework.web.bind.annotation.RequestParam(value = "sessionDate", defaultValue = "") String sessionDate) {
+        // R46 rollover fence: a page mid-handshake pins the session its hello named. If the view
+        // has rolled since, every already-fetched page belongs to a dead session — the client must
+        // discard and restart, so the mismatch is EXPLICIT rather than silently merged.
+        String current = service.cvdBarsSessionDate();
+        if (!sessionDate.isEmpty() && current != null && !sessionDate.equals(current)) {
+            return "{\"sessionMismatch\":true,\"sessionDate\":\"" + current + "\"}";
+        }
         int capped = Math.max(1, Math.min(limit, 1000));
         java.util.List<String> bars = service.cvdBarsSnapshot(tf, toMs, afterMs, capped);
         StringBuilder sb = new StringBuilder("{\"sessionDate\":");
