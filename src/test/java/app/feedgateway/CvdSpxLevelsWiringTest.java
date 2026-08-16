@@ -2,6 +2,7 @@ package app.feedgateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -23,9 +24,30 @@ class CvdSpxLevelsWiringTest {
         return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
     }
 
+    /** An OK record: causal provenance inline, neither matrix flag. */
+    private static String ok(String sessionDate, long positionMs, long prints) {
+        return "{\"schemaVersion\":\"1.0.0\",\"symbol\":\"ES.v.0\",\"state\":\"OK\",\"sessionDate\":\""
+                + sessionDate + "\",\"alignedAtMs\":1786900000000,\"foldPositionMs\":" + positionMs
+                + ",\"foldPrints\":" + prints + ",\"buyLevels\":[],\"sellLevels\":[]}";
+    }
+
+    /** An UNAVAILABLE record with an explicit matrix combination. */
+    private static String unavailable(String reason, String provenance, boolean retained, boolean reset) {
+        return "{\"schemaVersion\":\"1.0.0\",\"symbol\":\"ES.v.0\",\"state\":\"UNAVAILABLE\",\"reason\":\""
+                + reason + "\",\"alignedAtMs\":1786900000000,\"sourceProvenance\":" + provenance
+                + ",\"provenanceRetained\":" + retained + ",\"baselineReset\":" + reset + "}";
+    }
+
+    private static String prov(String sessionDate, long positionMs, long prints) {
+        return "{\"sessionDate\":\"" + sessionDate + "\",\"foldPositionMs\":" + positionMs
+                + ",\"foldPrints\":" + prints + "}";
+    }
+
     private static String levels(String state) {
-        return "{\"schemaVersion\":\"1.0.0\",\"symbol\":\"SPX\",\"state\":\"" + state
-                + "\",\"sessionDate\":\"20260817\",\"alignedAtMs\":1786900000000}";
+        return "OK".equals(state) ? ok("20260817", 1000, 5)
+                : "{\"schemaVersion\":\"1.0.0\",\"symbol\":\"ES.v.0\",\"state\":\"" + state
+                        + "\",\"reason\":\"source_stale\",\"alignedAtMs\":1786900000000,"
+                        + "\"sourceProvenance\":null,\"provenanceRetained\":false,\"baselineReset\":false}";
     }
 
     @Test void isOptInAndUsesTheAlignedOutputTopic() {
@@ -44,23 +66,90 @@ class CvdSpxLevelsWiringTest {
 
     @Test void boundaryAcceptsOnlyMajorOneOkOrUnavailable() {
         var s = service();
-        assertTrue(s.acceptCvdSpxLevels(levels("OK")));
-        assertTrue(s.acceptCvdSpxLevels(levels("UNAVAILABLE")));
-        assertTrue(s.acceptCvdSpxLevels(levels("OK").replace("1.0.0", "1.7.3")),
+        assertNotNull(s.validateCvdSpxLevels(levels("OK")));
+        assertNotNull(s.validateCvdSpxLevels(levels("UNAVAILABLE")));
+        assertNotNull(s.validateCvdSpxLevels(levels("OK").replace("1.0.0", "1.7.3")),
                 "minor/patch revisions of major 1 must pass");
-        assertFalse(s.acceptCvdSpxLevels(levels("OVERFLOW")), "producer-side state never reaches clients");
-        assertFalse(s.acceptCvdSpxLevels(levels("OK").replace("1.0.0", "2.0.0")), "future schema epoch");
-        assertFalse(s.acceptCvdSpxLevels(levels("OK").replace("1.0.0", "10.0")), "malformed version");
-        assertFalse(s.acceptCvdSpxLevels("[1,2,3]"), "non-object");
-        assertFalse(s.acceptCvdSpxLevels("not json"));
-        assertFalse(s.acceptCvdSpxLevels("{\"schemaVersion\":\"1.0.0\"}"), "missing state");
+        assertNull(s.validateCvdSpxLevels(levels("OK").replace("\"OK\"", "\"OVERFLOW\"")),
+                "producer-side state never reaches clients");
+        assertNull(s.validateCvdSpxLevels(levels("OK").replace("1.0.0", "2.0.0")), "future schema epoch");
+        assertNull(s.validateCvdSpxLevels(levels("OK").replace("1.0.0", "10.0")), "malformed version");
+        assertNull(s.validateCvdSpxLevels("[1,2,3]"), "non-object");
+        assertNull(s.validateCvdSpxLevels("not json"));
+        assertNull(s.validateCvdSpxLevels("{\"schemaVersion\":\"1.0.0\"}"), "missing state");
+        assertNull(s.validateCvdSpxLevels(ok("2026081", 1, 1)), "sessionDate must be 8 digits");
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1).replace("\"foldPrints\":1", "\"foldPrints\":\"1\"")),
+                "provenance components are integral, not strings");
+    }
+
+    @Test void unavailableMustMatchTheProvenanceCombinationMatrix() {
+        var s = service();
+        // The four legal combinations.
+        assertNotNull(s.validateCvdSpxLevels(unavailable("source_absent", "null", false, true)),
+                "tombstone-derived absence");
+        assertNotNull(s.validateCvdSpxLevels(unavailable("source_absent", "null", false, false)),
+                "pre-first-source startup absence");
+        assertNotNull(s.validateCvdSpxLevels(
+                        unavailable("source_malformed", prov("20260817", 10, 2), true, false)),
+                "provenance-unrecoverable malformed carries the RETAINED provenance, labeled");
+        assertNotNull(s.validateCvdSpxLevels(
+                        unavailable("source_stale", prov("20260817", 10, 2), false, false)),
+                "causally validated");
+        // Everything else is malformed — most importantly, a reset that claims provenance, which
+        // must never be able to erase the gateway's baseline.
+        assertNull(s.validateCvdSpxLevels(unavailable("source_absent", prov("20260817", 10, 2), false, true)));
+        assertNull(s.validateCvdSpxLevels(unavailable("source_absent", "null", true, true)));
+        assertNull(s.validateCvdSpxLevels(unavailable("source_absent", "null", true, false)));
+        assertNull(s.validateCvdSpxLevels(unavailable("source_stale", prov("20260817", 10, 2), true, true)));
+        assertNull(s.validateCvdSpxLevels(
+                unavailable("source_stale", prov("20260817", 10, 2), false, false)
+                        .replace(",\"provenanceRetained\":false", "")), "both flags are mandatory");
+        assertNull(s.validateCvdSpxLevels(
+                unavailable("source_stale", prov("20260817", 10, 2), false, false)
+                        .replace(",\"sourceProvenance\":" + prov("20260817", 10, 2), "")),
+                "an absent key is not the same statement as an explicit null");
+        assertNull(s.validateCvdSpxLevels(unavailable("source_stale", "{\"sessionDate\":\"20260817\"}", false, false)),
+                "a partial provenance object is malformed, not provenance-less");
+        // An OK record may never claim either flag.
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1).replace("\"state\":\"OK\"",
+                "\"state\":\"OK\",\"baselineReset\":true")));
+    }
+
+    @Test void retentionRefusesRegressionsInTheCalendarAwareTotalOrder() {
+        var s = service();
+        assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 1000, 5))));
+        assertEquals(0L, s.cvdSpxLevelsRegressionsForTest());
+
+        assertFalse(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 900, 4))), "lower position");
+        assertFalse(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260814", 9999, 99))), "older session");
+        assertFalse(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 1100, 4))),
+                "crossed: position up, prints down — impossible from one monotone fold");
+        assertFalse(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 900, 6))), "crossed the other way");
+        assertEquals(4L, s.cvdSpxLevelsRegressionsForTest());
+        assertTrue(s.cvdSpxLevelsLatestForTest().get().contains("\"foldPositionMs\":1000"),
+                "the retained record is untouched by every refusal");
+
+        assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 1000, 5))), "equal is idempotent");
+        assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 1200, 6))), "advance");
+        assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260818", 1, 1))), "newer session wins");
+    }
+
+    @Test void onlyTheTombstoneCombinationResetsTheBaseline() {
+        var s = service();
+        assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 1000, 5))));
+        // A startup-absence record must NOT regress a live baseline to "nothing known".
+        assertFalse(s.retainCvdSpxLevels(s.validateCvdSpxLevels(unavailable("source_absent", "null", false, false))));
+        assertEquals(1L, s.cvdSpxLevelsRegressionsForTest());
+        // The tombstone-derived absence DOES reset it, and a lower-provenance record is then accepted.
+        assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(unavailable("source_absent", "null", false, true))));
+        assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 1, 1))),
+                "after an operator wipe the baseline starts over");
     }
 
     @Test void boundaryRefusesOversizeRecords() {
         var s = service();
         String pad = "x".repeat(FeedGatewayService.CVD_SPX_LEVELS_MAX_BYTES);
-        assertFalse(s.acceptCvdSpxLevels(
-                levels("OK").replace("\"SPX\"", "\"" + pad + "\"")));
+        assertNull(s.validateCvdSpxLevels(levels("OK").replace("\"ES.v.0\"", "\"" + pad + "\"")));
     }
 
     @Test void tombstoneWithdrawsTheConnectReplayAndCounts() {
@@ -71,6 +160,9 @@ class CvdSpxLevelsWiringTest {
         s.evictCvdSpxLevelsTombstone("es-cvd-spx-levels", tombstone);
         assertNull(s.cvdSpxLevelsLatestForTest().get(), "a withdrawn record must never replay");
         assertEquals(1L, s.cvdSpxLevelsDropsForTest());
+        // The baseline goes with it: the next record must not be judged against an erased history.
+        assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260101", 1, 1))));
+        assertEquals(0L, s.cvdSpxLevelsRegressionsForTest());
     }
 
     @Test void otherEventsTombstonesAreIgnored() {
@@ -90,6 +182,7 @@ class CvdSpxLevelsWiringTest {
         String metrics = service().metrics();
         assertTrue(metrics.contains("\ngateway_cvd_spx_levels_enabled 0"), "flag off by default");
         assertTrue(metrics.contains("\ngateway_cvd_spx_levels_drops_total 0"));
+        assertTrue(metrics.contains("\ngateway_cvd_spx_levels_position_regressions_total 0"));
     }
 
     // ---- wiring-shape pins on the source (the es-cvd defect class: right branch, wrong loop) ----
@@ -117,20 +210,41 @@ class CvdSpxLevelsWiringTest {
         int generic = source.indexOf("String cacheKey = updateCache(binding, record, json);", direct);
         assertTrue(direct >= 0 && generic > direct);
         String branch = source.substring(direct, generic);
-        assertTrue(branch.contains("acceptCvdSpxLevels(json)"), "boundary gate before broadcast");
+        assertTrue(branch.contains("validateCvdSpxLevels(json)") && branch.contains("retainCvdSpxLevels(accepted)"),
+                "schema gate AND regression gate both precede the broadcast");
         assertTrue(branch.contains("broadcast(binding.event(), json);"));
         assertTrue(FeedGatewayServiceSourcePins.isRawPassThrough(source),
                 "producer-authored attestation must reach the browser byte-untouched");
     }
 
-    @Test void addClientReplaysTheRetainedRecordBehindTheFlag() throws Exception {
+    @Test void connectReplayRidesInsideTheHelloContract() throws Exception {
+        // CL-R8/G19: the levels record replays INSIDE cvd-hello, so "hello carried no levels
+        // record" (levels: null) is distinguishable from "replay still pending" — that is what
+        // lets the page choose `no_data` instead of staying blank forever.
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         int addClient = source.indexOf("public void addClient(WebSocketSession session)");
         int replayEnd = source.indexOf("if (perSessionRouting())", addClient);
         String head = source.substring(addClient, replayEnd);
-        assertTrue(head.contains("esCvdSpxLevelsEnabled()")
-                        && head.contains("send(session, \"es-cvd-spx-levels\", levels)"),
-                "connect replay happens for BOTH routing modes, before the mode branch");
+        assertTrue(head.contains("esCvdSpxLevelsEnabled()") && head.contains("send(session, \"cvd-hello\""),
+                "the hello is sent when EITHER CVD flag is on, for both routing modes");
+        assertFalse(head.contains("send(session, \"es-cvd-spx-levels\""),
+                "a separate connect frame would reintroduce the ambiguity G19 forbids");
+    }
+
+    @Test void helloCarriesTheLevelsFieldOnlyWhenEnabled() {
+        var off = service();
+        assertFalse(off.cvdHelloJson().contains("levels"), "field absent while the flag is off");
+
+        System.setProperty("GATEWAY_ES_CVD_SPX_LEVELS_ENABLED", "true");
+        try {
+            var on = service();
+            assertTrue(on.cvdHelloJson().contains("\"levels\":null"),
+                    "an explicit null IS the completion signal: hello arrived, no record retained");
+            on.retainCvdSpxLevels(on.validateCvdSpxLevels(ok("20260817", 1000, 5)));
+            assertTrue(on.cvdHelloJson().contains("\"foldPositionMs\":1000"), "retained record rides verbatim");
+        } finally {
+            System.clearProperty("GATEWAY_ES_CVD_SPX_LEVELS_ENABLED");
+        }
     }
 
     /** Tiny helper so the pin reads as one assertion. */

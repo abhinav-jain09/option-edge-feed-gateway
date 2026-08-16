@@ -448,6 +448,10 @@ public class FeedGatewayService implements ReplayRunner {
             new java.util.concurrent.atomic.AtomicReference<>();
     /** U16: es-cvd-spx-levels records rejected at the boundary (invalid, oversize, tombstone). */
     private final AtomicLong cvdSpxLevelsDrops = new AtomicLong();
+    /** U16: records refused because their provenance REGRESSED against what is retained (CL-R7 V1). */
+    private final AtomicLong cvdSpxLevelsRegressions = new AtomicLong();
+    /** U16 retention baseline: the provenance of the retained record; guarded by the retain lock. */
+    private CvdSpxLevelsProvenance cvdSpxLevelsProvenance;
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -697,20 +701,13 @@ public class FeedGatewayService implements ReplayRunner {
         clients.add(session);
         clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
-        if (settings.esCvdEnabled()) {
+        if (settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled()) {
             // R46 hello: the per-timeframe high-water marks of the bar view, so the page can bound
             // its REST backfill to exactly what this gateway holds and buffer WS bars past it.
+            // U16 (CL-R8/G19): the latest ACCEPTED levels record rides INSIDE this same hello, so
+            // "hello carried no levels record" (levels: null) is distinguishable from "replay still
+            // pending" — the page needs that distinction to choose `no_data` over staying blank.
             send(session, "cvd-hello", cvdHelloJson());
-        }
-        if (settings.esCvdSpxLevelsEnabled()) {
-            // U16 connect replay: the latest ACCEPTED levels record, verbatim. Absent retention
-            // (gateway cold start, withdrawal, aligner down) sends nothing — the page's own
-            // staleness predicate keeps the overlay hidden until a live record lands (CL-R7
-            // fail-closed; worst-case gap is one ALIGN_HEARTBEAT).
-            String levels = cvdSpxLevelsLatest.get();
-            if (levels != null) {
-                send(session, "es-cvd-spx-levels", levels);
-            }
         }
         // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
         // each socket gets only the cached state matching its own AppSession selection (no cross-
@@ -1193,6 +1190,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP gateway_cvd_spx_levels_drops_total es-cvd-spx-levels records dropped at the gateway boundary (invalid, oversize, tombstone).\n"
                 + "# TYPE gateway_cvd_spx_levels_drops_total counter\n"
                 + "gateway_cvd_spx_levels_drops_total " + cvdSpxLevelsDrops.get() + "\n"
+                + "# HELP gateway_cvd_spx_levels_position_regressions_total es-cvd-spx-levels records refused because their fold provenance regressed.\n"
+                + "# TYPE gateway_cvd_spx_levels_position_regressions_total counter\n"
+                + "gateway_cvd_spx_levels_position_regressions_total " + cvdSpxLevelsRegressions.get() + "\n"
                 + "# HELP options_edge_feed_gateway_snapshots Cached option snapshot count.\n"
                 + "# TYPE options_edge_feed_gateway_snapshots gauge\n"
                 + "options_edge_feed_gateway_snapshots " + snapshots.size() + "\n"
@@ -2414,12 +2414,12 @@ public class FeedGatewayService implements ReplayRunner {
                         // VERBATIM (raw pass-through — never enriched). Boundary checks only; the
                         // aligner already validated the full schema. Anything rejected here is
                         // counted and dropped — never broadcast, never retained.
-                        if (acceptCvdSpxLevels(json)) {
-                            cvdSpxLevelsLatest.set(json);
+                        CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(json);
+                        if (accepted == null) {
+                            cvdSpxLevelsDrops.incrementAndGet();
+                        } else if (retainCvdSpxLevels(accepted)) {
                             broadcast(binding.event(), json);
                             forwardedEvents.incrementAndGet();
-                        } else {
-                            cvdSpxLevelsDrops.incrementAndGet();
                         }
                         continue;
                     }
@@ -7492,41 +7492,169 @@ public class FeedGatewayService implements ReplayRunner {
     static final int CVD_SPX_LEVELS_MAX_BYTES = 65536;
 
     /**
-     * U16 (CL-R7) boundary acceptance for one es-cvd-spx-levels record: bounded size, JSON object,
-     * schema major version 1, state OK|UNAVAILABLE. The aligner enforced the FULL schema before its
-     * transactional publish; this gate only refuses what could break clients or is from a future
-     * schema epoch. Anything refused is dropped and counted — never broadcast, never retained.
+     * U16 (CL-R7/CL-R8): the provenance a levels record carries through the hop —
+     * {@code (sessionDate, foldPositionMs, foldPrints)} of the SOURCE fold that caused it, plus the
+     * two combination-matrix flags. Ordering is CALENDAR-AWARE and TOTAL: sessionDate first
+     * (the aligner emits it zero-padded, so lexical order IS date order), then foldPositionMs, then
+     * foldPrints. A CROSSED pair — one component higher, the other lower within the same session —
+     * cannot come from any single monotone fold, so it is inconsistent provenance and rejected like
+     * a regression rather than ordered.
      */
-    boolean acceptCvdSpxLevels(String json) {
-        if (json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > CVD_SPX_LEVELS_MAX_BYTES) {
-            return false;
+    record CvdSpxLevelsProvenance(String sessionDate, long foldPositionMs, long foldPrints) {
+        boolean crossed(CvdSpxLevelsProvenance other) {
+            if (!sessionDate.equals(other.sessionDate)) return false;
+            return (foldPositionMs > other.foldPositionMs && foldPrints < other.foldPrints)
+                    || (foldPositionMs < other.foldPositionMs && foldPrints > other.foldPrints);
         }
-        try {
-            com.fasterxml.jackson.databind.JsonNode n = mapper.readTree(json);
-            if (n == null || !n.isObject()) {
-                return false;
-            }
-            if (!n.path("schemaVersion").asText("").matches("1\\.\\d+\\.\\d+")) {
-                return false;
-            }
-            String state = n.path("state").asText("");
-            return "OK".equals(state) || "UNAVAILABLE".equals(state);
-        } catch (Exception e) {
-            return false;
+
+        /** −1 / 0 / +1 against another provenance in the SAME total order the aligner uses. */
+        int compareTo(CvdSpxLevelsProvenance other) {
+            int c = sessionDate.compareTo(other.sessionDate);
+            if (c != 0) return c < 0 ? -1 : 1;
+            if (foldPositionMs != other.foldPositionMs) return foldPositionMs < other.foldPositionMs ? -1 : 1;
+            if (foldPrints != other.foldPrints) return foldPrints < other.foldPrints ? -1 : 1;
+            return 0;
         }
     }
 
     /**
-     * U16 withdrawal handling: a TOMBSTONE on the levels topic (reset tooling) clears the connect
-     * replay — a withdrawn record must never be served to a late joiner — and counts as a drop so
-     * the operation is visible. Non-tombstone unparseable values just count.
+     * Parsed acceptance verdict for one levels record: the bytes to forward, the SOURCE provenance
+     * it carries (null when none has ever existed), and the two matrix flags.
      */
-    void evictCvdSpxLevelsTombstone(String event, org.apache.kafka.clients.consumer.ConsumerRecord<String, ?> record) {
+    record CvdSpxLevelsAccepted(String json, CvdSpxLevelsProvenance provenance,
+                                boolean provenanceRetained, boolean baselineReset) { }
+
+    /**
+     * U16 (CL-R7/CL-R8) schema validation for ONE levels record. Refuses: oversized (pre-parse),
+     * unparseable, non-object, schema major != 1 (minors ignored), state outside {OK, UNAVAILABLE},
+     * and every combination outside the design's provenance MATRIX:
+     *
+     * <ul>
+     *   <li>tombstone-derived absence — {null provenance, baselineReset true, retained false}</li>
+     *   <li>pre-first-source startup absence — {null, false, false} (never resets)</li>
+     *   <li>provenance-unrecoverable malformed — {non-null, false, retained true}</li>
+     *   <li>causally-validated source-derived — {non-null, false, false}</li>
+     * </ul>
+     *
+     * Anything else is MALFORMED and dropped — never forwarded, and never treated as a baseline
+     * erase: an invalid reset combination must not be able to wipe the gateway's retention.
+     */
+    CvdSpxLevelsAccepted validateCvdSpxLevels(String json) {
+        if (json == null
+                || json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > CVD_SPX_LEVELS_MAX_BYTES) {
+            return null;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode n = mapper.readTree(json);
+            if (n == null || !n.isObject()) return null;
+            if (!n.path("schemaVersion").asText("").matches("1\\.\\d+\\.\\d+")) return null;
+            String state = n.path("state").asText("");
+
+            if ("OK".equals(state)) {
+                // An OK record is always causally derived: inline provenance, neither flag set.
+                if (n.path("provenanceRetained").asBoolean(false) || n.path("baselineReset").asBoolean(false)) {
+                    return null;
+                }
+                CvdSpxLevelsProvenance p = provenanceOfOk(n);
+                return p == null ? null : new CvdSpxLevelsAccepted(json, p, false, false);
+            }
+            if (!"UNAVAILABLE".equals(state)) return null;
+
+            // Both flags are MANDATORY booleans on UNAVAILABLE, and sourceProvenance must be
+            // present as either an explicit null or a fully-formed object — an absent key is not
+            // the same statement as "no provenance has ever existed".
+            if (!n.path("provenanceRetained").isBoolean() || !n.path("baselineReset").isBoolean()) return null;
+            if (!n.has("sourceProvenance")) return null;
+            boolean retained = n.path("provenanceRetained").asBoolean();
+            boolean reset = n.path("baselineReset").asBoolean();
+            com.fasterxml.jackson.databind.JsonNode sp = n.get("sourceProvenance");
+            CvdSpxLevelsProvenance p = null;
+            if (!sp.isNull()) {
+                p = provenanceOfUnavailable(sp);
+                if (p == null) return null;                      // malformed provenance object
+            }
+            boolean hasProvenance = p != null;
+            boolean matrixOk =
+                    (!hasProvenance && reset && !retained)       // tombstone-derived absence
+                    || (!hasProvenance && !reset && !retained)   // pre-first-source startup absence
+                    || (hasProvenance && !reset && retained)     // provenance-unrecoverable malformed
+                    || (hasProvenance && !reset && !retained);   // causally validated
+            if (!matrixOk) return null;
+            return new CvdSpxLevelsAccepted(json, p, retained, reset);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** OK records carry the source's provenance inline (sessionDate + foldPositionMs + foldPrints). */
+    private static CvdSpxLevelsProvenance provenanceOfOk(com.fasterxml.jackson.databind.JsonNode n) {
+        String sd = n.path("sessionDate").asText("");
+        if (!sd.matches("\\d{8}")
+                || !n.path("foldPositionMs").isIntegralNumber()
+                || !n.path("foldPrints").isIntegralNumber()) {
+            return null;
+        }
+        return new CvdSpxLevelsProvenance(sd, n.path("foldPositionMs").asLong(), n.path("foldPrints").asLong());
+    }
+
+    /** UNAVAILABLE records carry it under sourceProvenance when any validated record has existed. */
+    private static CvdSpxLevelsProvenance provenanceOfUnavailable(com.fasterxml.jackson.databind.JsonNode sp) {
+        if (!sp.isObject()) return null;
+        String sd = sp.path("sessionDate").asText("");
+        if (!sd.matches("\\d{8}")
+                || !sp.path("foldPositionMs").isIntegralNumber()
+                || !sp.path("foldPrints").isIntegralNumber()) {
+            return null;
+        }
+        return new CvdSpxLevelsProvenance(sd, sp.path("foldPositionMs").asLong(), sp.path("foldPrints").asLong());
+    }
+
+    /**
+     * U16 retention (CL-R7 V1, hop-to-hop freshness): accept the record iff it does not REGRESS
+     * against what is retained, applying the SAME calendar-aware total order the aligner applies.
+     * ONLY the exact tombstone combination resets the baseline; a provenance-less startup-absence
+     * record is accepted only when nothing is retained (never a regression to "nothing known").
+     * Rejections increment gateway_cvd_spx_levels_position_regressions_total and forward nothing,
+     * so a lagging incarnation can never displace a newer attestation on the browser.
+     */
+    synchronized boolean retainCvdSpxLevels(CvdSpxLevelsAccepted accepted) {
+        if (accepted.baselineReset()) {
+            cvdSpxLevelsProvenance = null;                       // operator wipe flows through
+            cvdSpxLevelsLatest.set(accepted.json());
+            return true;
+        }
+        CvdSpxLevelsProvenance incoming = accepted.provenance();
+        if (incoming == null) {
+            if (cvdSpxLevelsProvenance != null) {
+                cvdSpxLevelsRegressions.incrementAndGet();
+                return false;
+            }
+            cvdSpxLevelsLatest.set(accepted.json());
+            return true;
+        }
+        CvdSpxLevelsProvenance held = cvdSpxLevelsProvenance;
+        if (held != null && (incoming.crossed(held) || incoming.compareTo(held) < 0)) {
+            cvdSpxLevelsRegressions.incrementAndGet();
+            return false;
+        }
+        cvdSpxLevelsProvenance = incoming;
+        cvdSpxLevelsLatest.set(accepted.json());
+        return true;
+    }
+
+    /**
+     * U16 withdrawal handling: a TOMBSTONE on the levels topic (reset tooling) clears the connect
+     * replay AND the retention baseline — a withdrawn record must never be served to a late joiner,
+     * and the next record must not be judged against an erased history. Counted so the operation is
+     * visible. Non-tombstone unparseable values just count.
+     */
+    synchronized void evictCvdSpxLevelsTombstone(String event, org.apache.kafka.clients.consumer.ConsumerRecord<String, ?> record) {
         if (!"es-cvd-spx-levels".equals(event)) {
             return;
         }
         if (record.value() == null) {
             cvdSpxLevelsLatest.set(null);
+            cvdSpxLevelsProvenance = null;
         }
         cvdSpxLevelsDrops.incrementAndGet();
     }
@@ -7537,6 +7665,10 @@ public class FeedGatewayService implements ReplayRunner {
 
     long cvdSpxLevelsDropsForTest() {
         return cvdSpxLevelsDrops.get();
+    }
+
+    long cvdSpxLevelsRegressionsForTest() {
+        return cvdSpxLevelsRegressions.get();
     }
 
     /** R46 hello payload: {"sessionDate":...,"hwm":{"30s":<lastBarStartMs>,...}}. */
@@ -7550,7 +7682,13 @@ public class FeedGatewayService implements ReplayRunner {
             sb.append('\"').append(e.getKey()).append("\":").append(e.getValue());
             first = false;
         }
-        return sb.append("}}").toString();
+        sb.append('}');
+        if (settings.esCvdSpxLevelsEnabled()) {
+            // Verbatim record or an explicit null — the FIELD's presence is the completion signal.
+            String levels = cvdSpxLevelsLatest.get();
+            sb.append(",\"levels\":").append(levels == null ? "null" : levels);
+        }
+        return sb.append('}').toString();
     }
 
     /** One ATOMIC backfill page: session check, rows, cursor and session stamp under one lock. */
