@@ -443,6 +443,11 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong forwardedEvents = new AtomicLong();
     /** drop-nowcast values dropped at the parse gate (review finding #4). */
     private final AtomicLong dropNowcastMalformed = new AtomicLong();
+    /** U16: latest ACCEPTED es-cvd-spx-levels record (verbatim), replayed on connect; null = none. */
+    private final java.util.concurrent.atomic.AtomicReference<String> cvdSpxLevelsLatest =
+            new java.util.concurrent.atomic.AtomicReference<>();
+    /** U16: es-cvd-spx-levels records rejected at the boundary (invalid, oversize, tombstone). */
+    private final AtomicLong cvdSpxLevelsDrops = new AtomicLong();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -696,6 +701,16 @@ public class FeedGatewayService implements ReplayRunner {
             // R46 hello: the per-timeframe high-water marks of the bar view, so the page can bound
             // its REST backfill to exactly what this gateway holds and buffer WS bars past it.
             send(session, "cvd-hello", cvdHelloJson());
+        }
+        if (settings.esCvdSpxLevelsEnabled()) {
+            // U16 connect replay: the latest ACCEPTED levels record, verbatim. Absent retention
+            // (gateway cold start, withdrawal, aligner down) sends nothing — the page's own
+            // staleness predicate keeps the overlay hidden until a live record lands (CL-R7
+            // fail-closed; worst-case gap is one ALIGN_HEARTBEAT).
+            String levels = cvdSpxLevelsLatest.get();
+            if (levels != null) {
+                send(session, "es-cvd-spx-levels", levels);
+            }
         }
         // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
         // each socket gets only the cached state matching its own AppSession selection (no cross-
@@ -1172,6 +1187,12 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_gateway_ws_dropped_on_close_total Queued messages discarded when a slow client was dropped.\n"
                 + "# TYPE options_edge_gateway_ws_dropped_on_close_total counter\n"
                 + "options_edge_gateway_ws_dropped_on_close_total " + wsDroppedOnClose.get() + "\n"
+                + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
+                + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
+                + "gateway_cvd_spx_levels_enabled " + boolMetric(settings.esCvdSpxLevelsEnabled()) + "\n"
+                + "# HELP gateway_cvd_spx_levels_drops_total es-cvd-spx-levels records dropped at the gateway boundary (invalid, oversize, tombstone).\n"
+                + "# TYPE gateway_cvd_spx_levels_drops_total counter\n"
+                + "gateway_cvd_spx_levels_drops_total " + cvdSpxLevelsDrops.get() + "\n"
                 + "# HELP options_edge_feed_gateway_snapshots Cached option snapshot count.\n"
                 + "# TYPE options_edge_feed_gateway_snapshots gauge\n"
                 + "options_edge_feed_gateway_snapshots " + snapshots.size() + "\n"
@@ -1683,6 +1704,21 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
         if (settings.esAggressorFlowEnabled()) {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
+        }
+        if (settings.esCvdEnabled()) {
+            // DEFECT FIX (found during U16): #136 bound these to the CACHE consumer only, but the
+            // es-cvd/es-cvd-bar delivery branches live in THIS consumer's loop — live snapshots,
+            // bar upserts and therefore the REST backfill view never populated. Same both-consumers
+            // shape as es-aggressor-flow above.
+            topicEvents.put(settings.esCvdTopic(), new TopicBinding("DATABENTO", "es-cvd"));
+            topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding("DATABENTO", "es-cvd-bar"));
+        }
+        if (settings.esCvdSpxLevelsEnabled()) {
+            // U16: SPX-translated CVD structure levels (compacted single-partition heartbeat,
+            // >=1 record per ALIGN_HEARTBEAT while the aligner runs) — LIVE consumer only. The
+            // cache consumer is deliberately NOT subscribed: updateCache has no case for it, and
+            // this event keeps its own latest-record retention for the connect replay.
+            topicEvents.put(settings.esCvdSpxLevelsTopic(), new TopicBinding("DATABENTO", "es-cvd-spx-levels"));
         }
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
@@ -2300,6 +2336,7 @@ public class FeedGatewayService implements ReplayRunner {
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
                         evictEsStrikeIntelTombstone(binding, record);
+                        evictCvdSpxLevelsTombstone(binding == null ? null : binding.event(), record);
                         continue;
                     }
                     if (!isTrustedIndexPrice(binding, json) || !isValidSpxPrice(binding, json)) {
@@ -2370,6 +2407,20 @@ public class FeedGatewayService implements ReplayRunner {
                         // turn-alert sibling.
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("es-cvd-spx-levels".equals(binding.event())) {
+                        // U16 (CL-R7): producer-authored transactional attestation, delivered
+                        // VERBATIM (raw pass-through — never enriched). Boundary checks only; the
+                        // aligner already validated the full schema. Anything rejected here is
+                        // counted and dropped — never broadcast, never retained.
+                        if (acceptCvdSpxLevels(json)) {
+                            cvdSpxLevelsLatest.set(json);
+                            broadcast(binding.event(), json);
+                            forwardedEvents.incrementAndGet();
+                        } else {
+                            cvdSpxLevelsDrops.incrementAndGet();
+                        }
                         continue;
                     }
                     if ("es-cvd".equals(binding.event())) {
@@ -6868,7 +6919,8 @@ public class FeedGatewayService implements ReplayRunner {
      * {@code marketDataSource}/{@code source}/{@code sessionDate} over the producer's own fields.
      */
     private static boolean isRawPassThroughEvent(String event) {
-        return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event);
+        return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
+                || "es-cvd-spx-levels".equals(event);
     }
 
     /**
@@ -7434,6 +7486,57 @@ public class FeedGatewayService implements ReplayRunner {
             }
         } catch (JsonProcessingException ignored) {
         }
+    }
+
+    /** U16 boundary cap: one levels record may never exceed the design's 64 KiB record bound. */
+    static final int CVD_SPX_LEVELS_MAX_BYTES = 65536;
+
+    /**
+     * U16 (CL-R7) boundary acceptance for one es-cvd-spx-levels record: bounded size, JSON object,
+     * schema major version 1, state OK|UNAVAILABLE. The aligner enforced the FULL schema before its
+     * transactional publish; this gate only refuses what could break clients or is from a future
+     * schema epoch. Anything refused is dropped and counted — never broadcast, never retained.
+     */
+    boolean acceptCvdSpxLevels(String json) {
+        if (json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > CVD_SPX_LEVELS_MAX_BYTES) {
+            return false;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode n = mapper.readTree(json);
+            if (n == null || !n.isObject()) {
+                return false;
+            }
+            if (!n.path("schemaVersion").asText("").matches("1\\.\\d+\\.\\d+")) {
+                return false;
+            }
+            String state = n.path("state").asText("");
+            return "OK".equals(state) || "UNAVAILABLE".equals(state);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * U16 withdrawal handling: a TOMBSTONE on the levels topic (reset tooling) clears the connect
+     * replay — a withdrawn record must never be served to a late joiner — and counts as a drop so
+     * the operation is visible. Non-tombstone unparseable values just count.
+     */
+    void evictCvdSpxLevelsTombstone(String event, org.apache.kafka.clients.consumer.ConsumerRecord<String, ?> record) {
+        if (!"es-cvd-spx-levels".equals(event)) {
+            return;
+        }
+        if (record.value() == null) {
+            cvdSpxLevelsLatest.set(null);
+        }
+        cvdSpxLevelsDrops.incrementAndGet();
+    }
+
+    java.util.concurrent.atomic.AtomicReference<String> cvdSpxLevelsLatestForTest() {
+        return cvdSpxLevelsLatest;
+    }
+
+    long cvdSpxLevelsDropsForTest() {
+        return cvdSpxLevelsDrops.get();
     }
 
     /** R46 hello payload: {"sessionDate":...,"hwm":{"30s":<lastBarStartMs>,...}}. */
@@ -8569,7 +8672,15 @@ public class FeedGatewayService implements ReplayRunner {
             "close-direction",
             // Continuous ES futures buyer/seller pressure is an ES-global advisory card. The payload is
             // symbol-filtered by the browser and deliberately has no option-chain expiry identity.
-            "es-aggressor-flow");
+            "es-aggressor-flow",
+            // DEFECT FIX (found during U16): the ES CVD stream is the same ES-global advisory class,
+            // but was never allowlisted — in per-session (auth) mode broadcast() dropped every
+            // es-cvd/es-cvd-bar frame as non-routable.
+            "es-cvd",
+            "es-cvd-bar",
+            // U16: SPX-translated CVD structure levels — ES-global advisory overlay on the tape page,
+            // fail-closed client-side (ES-CVD-SPX-LEVELS-DESIGN.md CL-R7).
+            "es-cvd-spx-levels");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);
