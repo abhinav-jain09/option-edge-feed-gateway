@@ -600,6 +600,14 @@ public class FeedGatewayService implements ReplayRunner {
             thread.setDaemon(true);
             return thread;
         });
+        // U16 (CL-R8/G19): HYDRATE the retained levels record before any client can connect. The
+        // only subscriber is the live consumer, which starts at seekToEnd — so without this the
+        // gateway would answer every hello with levels:null until the next heartbeat, and if the
+        // aligner is down after having committed a record, forever. The topic is compacted and
+        // single-partition, so this is a bounded read of one key's latest committed value.
+        if (settings.esCvdSpxLevelsEnabled()) {
+            executor.submit(this::hydrateCvdSpxLevels);
+        }
         executor.submit(this::runSelectionConsumer);
         executor.submit(this::runAvroLiveConsumer);
         executor.submit(this::runJsonStateLiveConsumer);
@@ -2414,7 +2422,8 @@ public class FeedGatewayService implements ReplayRunner {
                         // VERBATIM (raw pass-through — never enriched). Boundary checks only; the
                         // aligner already validated the full schema. Anything rejected here is
                         // counted and dropped — never broadcast, never retained.
-                        CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(json);
+                        CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(
+                                record.key() == null ? null : String.valueOf(record.key()), json);
                         if (accepted == null) {
                             cvdSpxLevelsDrops.incrementAndGet();
                         } else if (retainCvdSpxLevels(accepted)) {
@@ -7540,29 +7549,94 @@ public class FeedGatewayService implements ReplayRunner {
      * erase: an invalid reset combination must not be able to wipe the gateway's retention.
      */
     CvdSpxLevelsAccepted validateCvdSpxLevels(String json) {
-        if (json == null
-                || json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > CVD_SPX_LEVELS_MAX_BYTES) {
+        return validateCvdSpxLevels(CVD_SPX_LEVELS_KEY, json);
+    }
+
+    /** The topic's contractual key; the payload's symbol must agree with it (CL-R7). */
+    static final String CVD_SPX_LEVELS_KEY = "ES.v.0";
+
+    /**
+     * U16 (§2 / CL-R7 / CL-R8): the FULL gateway schema gate for one aligned levels record. The
+     * record reaches the browser byte-for-byte, so anything this misses is something a page has to
+     * survive — the aligner validating its own output is not a substitute for the boundary between
+     * a producer and every client.
+     *
+     * <p>Refused: a foreign Kafka key or a payload {@code symbol} disagreeing with it; oversize
+     * (pre-parse); unparseable or non-object; schema major != 1; a state outside {OK, UNAVAILABLE};
+     * any field the state forbids; a missing or unknown UNAVAILABLE reason; every provenance
+     * combination outside the matrix; and, on OK records, the whole structure contract — required
+     * envelope fields, array bounds, per-level shape with the side-sign rule and duplicate-price
+     * rejection, flip and balance shape, basis fields with a known state, and the cross-field
+     * bounds (level touches and the flip crossing lie at or before the record's own flow time).
+     * Every integral field must be JS-exact and non-truncating; a {@code BigIntegerNode} is
+     * integral and {@code asLong()} would wrap it.
+     */
+    CvdSpxLevelsAccepted validateCvdSpxLevels(String key, String json) {
+        if (json == null || !CVD_SPX_LEVELS_KEY.equals(key)) return null;
+        if (json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > CVD_SPX_LEVELS_MAX_BYTES) {
             return null;
         }
         try {
             com.fasterxml.jackson.databind.JsonNode n = mapper.readTree(json);
             if (n == null || !n.isObject()) return null;
             if (!n.path("schemaVersion").asText("").matches("1\\.\\d+\\.\\d+")) return null;
+            if (!CVD_SPX_LEVELS_KEY.equals(n.path("symbol").asText(""))) return null;
+            Long alignedAtMs = levelsInt(n, "alignedAtMs");
+            if (alignedAtMs == null || alignedAtMs <= 0) return null;
             String state = n.path("state").asText("");
 
             if ("OK".equals(state)) {
-                // An OK record is always causally derived: inline provenance, neither flag set.
                 if (n.path("provenanceRetained").asBoolean(false) || n.path("baselineReset").asBoolean(false)) {
                     return null;
                 }
-                CvdSpxLevelsProvenance p = provenanceOfOk(n);
-                return p == null ? null : new CvdSpxLevelsAccepted(json, p, false, false);
+                if (n.has("reason") || n.has("sourceProvenance")) return null;   // UNAVAILABLE-only
+                if (!n.path("sessionComplete").isBoolean()) return null;
+                String sessionDate = n.path("sessionDate").asText("");
+                if (!sessionDate.matches("\\d{8}") || !isCalendarDate(sessionDate)) return null;
+                Long flow = levelsInt(n, "flowEventTimeMs");
+                Long sourcePublished = levelsInt(n, "sourcePublishedAtMs");
+                Long basisCents = levelsInt(n, "basisCents");
+                Long basisMeasured = levelsInt(n, "basisMeasuredAtMs");
+                Long pos = levelsInt(n, "foldPositionMs");
+                Long prints = levelsInt(n, "foldPrints");
+                if (flow == null || flow < 0 || sourcePublished == null || sourcePublished <= 0
+                        || basisCents == null || basisMeasured == null || basisMeasured <= 0
+                        || pos == null || pos < 0 || prints == null || prints < 0) {
+                    return null;
+                }
+                if (!CVD_SPX_LEVELS_BASIS_STATES.contains(n.path("basisState").asText(""))) return null;
+                if (!validLevelsArray(n.get("buyLevels"), true, flow)
+                        || !validLevelsArray(n.get("sellLevels"), false, flow)) {
+                    return null;
+                }
+                com.fasterxml.jackson.databind.JsonNode flip = n.get("flip");
+                if (flip == null) return null;                            // present, possibly null
+                if (!flip.isNull()) {
+                    if (!flip.isObject()) return null;
+                    Long fp = levelsInt(flip, "priceCents");
+                    Long at = levelsInt(flip, "atMs");
+                    Long cross = levelsInt(flip, "cvdAtCross");
+                    String dir = flip.path("direction").asText("");
+                    if (fp == null || fp <= 0 || at == null || at <= 0 || at > flow || cross == null
+                            || (!"UP".equals(dir) && !"DOWN".equals(dir))) {
+                        return null;
+                    }
+                }
+                com.fasterxml.jackson.databind.JsonNode balance = n.get("balancePriceCents");
+                if (balance == null) return null;                         // present, possibly null
+                if (!balance.isNull()) {
+                    Long b = levelsInt(n, "balancePriceCents");
+                    if (b == null || b <= 0) return null;
+                }
+                return new CvdSpxLevelsAccepted(json,
+                        new CvdSpxLevelsProvenance(sessionDate, pos, prints), false, false);
             }
             if (!"UNAVAILABLE".equals(state)) return null;
 
-            // Both flags are MANDATORY booleans on UNAVAILABLE, and sourceProvenance must be
-            // present as either an explicit null or a fully-formed object — an absent key is not
-            // the same statement as "no provenance has ever existed".
+            if (!CVD_SPX_LEVELS_REASONS.contains(n.path("reason").asText(""))) return null;
+            for (String okOnly : CVD_SPX_LEVELS_OK_ONLY_FIELDS) {
+                if (n.has(okOnly)) return null;                           // OK-only field on UNAVAILABLE
+            }
             if (!n.path("provenanceRetained").isBoolean() || !n.path("baselineReset").isBoolean()) return null;
             if (!n.has("sourceProvenance")) return null;
             boolean retained = n.path("provenanceRetained").asBoolean();
@@ -7571,7 +7645,7 @@ public class FeedGatewayService implements ReplayRunner {
             CvdSpxLevelsProvenance p = null;
             if (!sp.isNull()) {
                 p = provenanceOfUnavailable(sp);
-                if (p == null) return null;                      // malformed provenance object
+                if (p == null) return null;
             }
             boolean hasProvenance = p != null;
             boolean matrixOk =
@@ -7586,27 +7660,128 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
-    /** OK records carry the source's provenance inline (sessionDate + foldPositionMs + foldPrints). */
-    private static CvdSpxLevelsProvenance provenanceOfOk(com.fasterxml.jackson.databind.JsonNode n) {
-        String sd = n.path("sessionDate").asText("");
-        if (!sd.matches("\\d{8}")
-                || !n.path("foldPositionMs").isIntegralNumber()
-                || !n.path("foldPrints").isIntegralNumber()) {
-            return null;
+    /**
+     * U16 startup hydration: read the compacted levels partition's latest COMMITTED record and
+     * apply it through the ordinary validate+retain path, so a restarted gateway serves the
+     * governing record in its very first hello instead of a null. Bounded and best-effort by
+     * design — a failure leaves the replay empty, which the page renders as no_data (fail-closed),
+     * and the next live record hydrates it anyway.
+     */
+    void hydrateCvdSpxLevels() {
+        String topic = settings.esCvdSpxLevelsTopic();
+        Properties props = stringObjectConsumerProperties("cvd-spx-levels-hydrate");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none");
+        try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(props)) {
+            var infos = consumer.partitionsFor(topic, Duration.ofSeconds(10));
+            if (infos == null || infos.isEmpty()) return;               // topic not created yet
+            if (infos.size() != 1) {
+                System.err.println("cvd-spx-levels hydration skipped: " + topic + " has "
+                        + infos.size() + " partitions, expected 1");
+                return;
+            }
+            TopicPartition tp = new TopicPartition(topic, infos.get(0).partition());
+            consumer.assign(List.of(tp));
+            long begin = consumer.beginningOffsets(List.of(tp), Duration.ofSeconds(10)).get(tp);
+            long end = consumer.endOffsets(List.of(tp), Duration.ofSeconds(10)).get(tp);
+            if (end <= begin) return;                                   // empty log
+            consumer.seek(tp, begin);
+            long deadline = System.currentTimeMillis() + 30_000L;
+            String latestKey = null, latestValue = null;
+            while (consumer.position(tp, Duration.ofSeconds(10)) < end) {
+                if (System.currentTimeMillis() > deadline) {
+                    System.err.println("cvd-spx-levels hydration timed out; the first hello may carry no levels");
+                    return;
+                }
+                for (ConsumerRecord<String, Object> rec : consumer.poll(Duration.ofMillis(500))) {
+                    if (rec.offset() >= end) continue;
+                    latestKey = rec.key();
+                    latestValue = rec.value() == null ? null : String.valueOf(rec.value());
+                }
+            }
+            if (latestValue == null) return;                            // never published, or a tombstone
+            CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(latestKey, latestValue);
+            if (accepted == null) {
+                cvdSpxLevelsDrops.incrementAndGet();                    // malformed retained: stay empty
+                return;
+            }
+            retainCvdSpxLevels(accepted);
+        } catch (RuntimeException e) {
+            System.err.println("cvd-spx-levels hydration failed; the first hello may carry no levels: " + e);
         }
-        return new CvdSpxLevelsProvenance(sd, n.path("foldPositionMs").asLong(), n.path("foldPrints").asLong());
     }
 
+    /** OK basis states the aligner may emit (its OK_BASIS_STATES, mirrored at the boundary). */
+    private static final Set<String> CVD_SPX_LEVELS_BASIS_STATES =
+            Set.of("ANCHORED", "MEASURED", "PROJECTED");
+
+    /** The aligner's reason precedence chain — an unknown reason is a schema violation. */
+    private static final Set<String> CVD_SPX_LEVELS_REASONS = Set.of(
+            "source_absent", "source_malformed", "source_wrong_session", "source_future_dated",
+            "source_overflow", "source_not_observable", "source_stale", "basis_unusable",
+            "translation_error");
+
+    /** Structure fields an UNAVAILABLE record must not carry (it has no structure to report). */
+    private static final List<String> CVD_SPX_LEVELS_OK_ONLY_FIELDS = List.of(
+            "buyLevels", "sellLevels", "flip", "balancePriceCents", "basisCents", "basisState",
+            "basisMeasuredAtMs", "sourcePublishedAtMs", "flowEventTimeMs", "sessionComplete");
+
+    /**
+     * One integral field, read WITHOUT truncation and bounded to JS-exact. A BigIntegerNode is
+     * integral and {@code asLong()} silently wraps it, which would let an oversized value pass a
+     * positive check and then corrupt ordering — so convertibility is required, then the bound.
+     */
+    private static Long levelsInt(com.fasterxml.jackson.databind.JsonNode parent, String field) {
+        com.fasterxml.jackson.databind.JsonNode v = parent.get(field);
+        if (v == null || !v.isIntegralNumber() || !v.canConvertToLong()) return null;
+        long x = v.asLong();
+        return (x > CVD_SPX_LEVELS_MAX_SAFE || x < -CVD_SPX_LEVELS_MAX_SAFE) ? null : x;
+    }
+
+    /** JavaScript's exact-integer bound: the browser is the consumer of every one of these. */
+    static final long CVD_SPX_LEVELS_MAX_SAFE = (1L << 53) - 1;
+
+    /** A real calendar date, not merely eight digits — 99999999 must not order as a session. */
+    private static boolean isCalendarDate(String yyyymmdd) {
+        try {
+            java.time.LocalDate.parse(yyyymmdd, java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
+            return true;
+        } catch (java.time.format.DateTimeParseException e) {
+            return false;
+        }
+    }
+
+    /** One side's levels: bounded array, per-level shape, side-sign rule, no duplicate prices. */
+    private static boolean validLevelsArray(com.fasterxml.jackson.databind.JsonNode arr,
+                                            boolean buy, long flowEventTimeMs) {
+        if (arr == null || !arr.isArray() || arr.size() > 10) return false;
+        Set<Long> prices = new java.util.HashSet<>();
+        for (com.fasterxml.jackson.databind.JsonNode l : arr) {
+            if (!l.isObject()) return false;
+            Long price = levelsInt(l, "priceCents");
+            Long delta = levelsInt(l, "deltaSum");
+            Long count = levelsInt(l, "tradeCount");
+            Long touch = levelsInt(l, "lastTouchMs");
+            if (price == null || price <= 0 || !prices.add(price)) return false;
+            if (delta == null || (buy ? delta <= 0 : delta >= 0)) return false;   // side sign
+            if (count == null || count <= 0 || touch == null || touch <= 0) return false;
+            if (touch > flowEventTimeMs) return false;      // bounded by the record's own flow time
+        }
+        return true;
+    }
+
+    /** OK records carry the source's provenance inline (sessionDate + foldPositionMs + foldPrints). */
     /** UNAVAILABLE records carry it under sourceProvenance when any validated record has existed. */
     private static CvdSpxLevelsProvenance provenanceOfUnavailable(com.fasterxml.jackson.databind.JsonNode sp) {
         if (!sp.isObject()) return null;
         String sd = sp.path("sessionDate").asText("");
-        if (!sd.matches("\\d{8}")
-                || !sp.path("foldPositionMs").isIntegralNumber()
-                || !sp.path("foldPrints").isIntegralNumber()) {
+        Long pos = levelsInt(sp, "foldPositionMs");
+        Long prints = levelsInt(sp, "foldPrints");
+        if (!sd.matches("\\d{8}") || !isCalendarDate(sd)
+                || pos == null || pos < 0 || prints == null || prints < 0) {
             return null;
         }
-        return new CvdSpxLevelsProvenance(sd, sp.path("foldPositionMs").asLong(), sp.path("foldPrints").asLong());
+        return new CvdSpxLevelsProvenance(sd, pos, prints);
     }
 
     /**

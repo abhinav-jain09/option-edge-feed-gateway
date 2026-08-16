@@ -24,11 +24,27 @@ class CvdSpxLevelsWiringTest {
         return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
     }
 
-    /** An OK record: causal provenance inline, neither matrix flag. */
+    private static final long FLOW = 1786899999000L;
+
+    /** A full OK record: causal provenance inline, neither matrix flag, complete structure. */
     private static String ok(String sessionDate, long positionMs, long prints) {
+        return ok(sessionDate, positionMs, prints, "[]", "[]", "null", "null");
+    }
+
+    private static String ok(String sessionDate, long positionMs, long prints,
+                             String buyLevels, String sellLevels, String flip, String balance) {
         return "{\"schemaVersion\":\"1.0.0\",\"symbol\":\"ES.v.0\",\"state\":\"OK\",\"sessionDate\":\""
-                + sessionDate + "\",\"alignedAtMs\":1786900000000,\"foldPositionMs\":" + positionMs
-                + ",\"foldPrints\":" + prints + ",\"buyLevels\":[],\"sellLevels\":[]}";
+                + sessionDate + "\",\"sessionComplete\":false,\"alignedAtMs\":1786900000000,"
+                + "\"basisCents\":2575,\"basisState\":\"MEASURED\",\"basisMeasuredAtMs\":" + FLOW + ","
+                + "\"sourcePublishedAtMs\":" + FLOW + ",\"flowEventTimeMs\":" + FLOW + ","
+                + "\"foldPositionMs\":" + positionMs + ",\"foldPrints\":" + prints
+                + ",\"buyLevels\":" + buyLevels + ",\"sellLevels\":" + sellLevels
+                + ",\"flip\":" + flip + ",\"balancePriceCents\":" + balance + "}";
+    }
+
+    private static String level(long priceCents, long deltaSum) {
+        return "{\"priceCents\":" + priceCents + ",\"deltaSum\":" + deltaSum
+                + ",\"tradeCount\":7,\"lastTouchMs\":" + (FLOW - 1000) + "}";
     }
 
     /** An UNAVAILABLE record with an explicit matrix combination. */
@@ -45,9 +61,8 @@ class CvdSpxLevelsWiringTest {
 
     private static String levels(String state) {
         return "OK".equals(state) ? ok("20260817", 1000, 5)
-                : "{\"schemaVersion\":\"1.0.0\",\"symbol\":\"ES.v.0\",\"state\":\"" + state
-                        + "\",\"reason\":\"source_stale\",\"alignedAtMs\":1786900000000,"
-                        + "\"sourceProvenance\":null,\"provenanceRetained\":false,\"baselineReset\":false}";
+                : unavailable("source_stale", "null", false, false).replace("\"UNAVAILABLE\"",
+                        "\"" + state + "\"");
     }
 
     @Test void isOptInAndUsesTheAlignedOutputTopic() {
@@ -149,7 +164,84 @@ class CvdSpxLevelsWiringTest {
     @Test void boundaryRefusesOversizeRecords() {
         var s = service();
         String pad = "x".repeat(FeedGatewayService.CVD_SPX_LEVELS_MAX_BYTES);
-        assertNull(s.validateCvdSpxLevels(levels("OK").replace("\"ES.v.0\"", "\"" + pad + "\"")));
+        assertNull(s.validateCvdSpxLevels(levels("OK").replace("\"MEASURED\"", "\"" + pad + "\"")),
+                "the size cap is PRE-parse: an oversize record is refused whatever it says");
+    }
+
+    @Test void theContractualKeyIsRequiredAndTheSymbolMustAgree() {
+        var s = service();
+        assertNotNull(s.validateCvdSpxLevels("ES.v.0", levels("OK")));
+        assertNull(s.validateCvdSpxLevels("NQ.v.0", levels("OK")), "a foreign key never governs");
+        assertNull(s.validateCvdSpxLevels(null, levels("OK")), "nor a null key");
+        assertNull(s.validateCvdSpxLevels("ES.v.0", levels("OK").replace("\"symbol\":\"ES.v.0\"", "\"symbol\":\"NQ.v.0\"")),
+                "key and payload symbol must AGREE, not merely each be present");
+    }
+
+    @Test void theFullOkStructureContractIsEnforced() {
+        var s = service();
+        String full = ok("20260817", 1000, 5,
+                "[" + level(637525, 900) + "]", "[" + level(638000, -900) + "]",
+                "{\"priceCents\":637600,\"atMs\":" + (FLOW - 500) + ",\"direction\":\"UP\",\"cvdAtCross\":42}",
+                "637750");
+        assertNotNull(s.validateCvdSpxLevels(full), "a complete record passes");
+
+        // envelope fields the browser needs
+        assertNull(s.validateCvdSpxLevels(full.replace(",\"alignedAtMs\":1786900000000", "")));
+        assertNull(s.validateCvdSpxLevels(full.replace(",\"sessionComplete\":false", "")));
+        assertNull(s.validateCvdSpxLevels(full.replace("\"basisState\":\"MEASURED\"", "\"basisState\":\"QUARANTINED\"")),
+                "an OK record cannot carry an unusable basis state");
+        assertNull(s.validateCvdSpxLevels(full.replace(",\"basisCents\":2575", "")));
+        assertNull(s.validateCvdSpxLevels(full.replace("\"sessionDate\":\"20260817\"", "\"sessionDate\":\"99999999\"")),
+                "eight digits is not a date");
+
+        // structure invariants
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1, "[" + level(637525, -900) + "]", "[]", "null", "null")),
+                "a buy level with negative delta breaks the side-sign rule");
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1,
+                        "[" + level(637525, 900) + "," + level(637525, 300) + "]", "[]", "null", "null")),
+                "duplicate prices within a side");
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1,
+                        "[{\"priceCents\":637525,\"deltaSum\":900,\"tradeCount\":7,\"lastTouchMs\":" + (FLOW + 1) + "}]",
+                        "[]", "null", "null")),
+                "a touch after the record's own flow time");
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1, "[]", "[]",
+                        "{\"priceCents\":637600,\"atMs\":" + (FLOW + 1) + ",\"direction\":\"UP\",\"cvdAtCross\":1}",
+                        "null")),
+                "a flip crossing after the flow time");
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1, "[]", "[]",
+                        "{\"priceCents\":637600,\"atMs\":" + (FLOW - 1) + ",\"direction\":\"SIDEWAYS\",\"cvdAtCross\":1}",
+                        "null")),
+                "an unknown flip direction");
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1, "[]", "[]", "null", "0")),
+                "a non-positive balance price");
+        assertNull(s.validateCvdSpxLevels(full.replace(",\"flip\":", ",\"flipX\":")), "flip must be present");
+    }
+
+    @Test void oversizedIntegersAreRefusedNotTruncated() {
+        var s = service();
+        String huge = new java.math.BigInteger("2").pow(70).toString();
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1000, 5).replace("\"foldPositionMs\":1000",
+                "\"foldPositionMs\":" + huge)), "asLong() would have wrapped this into a plausible position");
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1000, 5).replace("\"foldPrints\":5",
+                "\"foldPrints\":" + ((1L << 53))), "past JS-exact"));
+        assertNotNull(s.validateCvdSpxLevels(ok("20260817", 1000, (1L << 53) - 1)), "the boundary is legal");
+        assertNull(s.validateCvdSpxLevels(ok("20260817", -1, 5)), "a negative fold position");
+        assertNull(s.validateCvdSpxLevels(
+                unavailable("source_stale", prov("20260817", -5, 2), false, false)),
+                "nor inside sourceProvenance");
+        assertNull(s.validateCvdSpxLevels(
+                unavailable("source_stale", prov("99999999", 5, 2), false, false)),
+                "nor an impossible date");
+    }
+
+    @Test void unavailableRecordsCarryAReasonAndNoStructure() {
+        var s = service();
+        assertNull(s.validateCvdSpxLevels(unavailable("source_stale", "null", false, false)
+                        .replace("\"reason\":\"source_stale\"", "\"reason\":\"whatever\"")),
+                "an unknown reason is a schema violation");
+        assertNull(s.validateCvdSpxLevels(unavailable("source_stale", "null", false, false)
+                        .replace(",\"sourceProvenance\"", ",\"buyLevels\":[],\"sourceProvenance\"")),
+                "an UNAVAILABLE record has no structure to report");
     }
 
     @Test void tombstoneWithdrawsTheConnectReplayAndCounts() {
@@ -210,8 +302,9 @@ class CvdSpxLevelsWiringTest {
         int generic = source.indexOf("String cacheKey = updateCache(binding, record, json);", direct);
         assertTrue(direct >= 0 && generic > direct);
         String branch = source.substring(direct, generic);
-        assertTrue(branch.contains("validateCvdSpxLevels(json)") && branch.contains("retainCvdSpxLevels(accepted)"),
-                "schema gate AND regression gate both precede the broadcast");
+        assertTrue(branch.contains("validateCvdSpxLevels(") && branch.contains("record.key()")
+                        && branch.contains("retainCvdSpxLevels(accepted)"),
+                "the schema gate (fed the KAFKA KEY) and the regression gate both precede the broadcast");
         assertTrue(branch.contains("broadcast(binding.event(), json);"));
         assertTrue(FeedGatewayServiceSourcePins.isRawPassThrough(source),
                 "producer-authored attestation must reach the browser byte-untouched");
@@ -254,5 +347,25 @@ class CvdSpxLevelsWiringTest {
             int end = source.indexOf('}', m);
             return m >= 0 && source.substring(m, end).contains("\"es-cvd-spx-levels\"");
         }
+    }
+
+    @Test void startupHydrationIsWiredBehindTheFlag() throws Exception {
+        // Without it the only subscriber is the live consumer, which starts at seekToEnd: a
+        // restarted gateway would answer every hello with levels:null until the next heartbeat —
+        // and if the aligner is down after committing, forever.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int start = source.indexOf("public void start()");
+        int end = source.indexOf("runSelectionConsumer);", start);
+        String head = source.substring(start, end);
+        assertTrue(head.contains("esCvdSpxLevelsEnabled()") && head.contains("hydrateCvdSpxLevels"),
+                "hydration runs at startup, behind the flag, before clients can connect");
+
+        int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
+        int hydrateEnd = source.indexOf("OK basis states", hydrate);
+        String body = source.substring(hydrate, hydrateEnd);
+        assertTrue(body.contains("infos.size() != 1"), "the single-partition contract is re-asserted");
+        assertTrue(body.contains("validateCvdSpxLevels(latestKey, latestValue)"),
+                "the hydrated record goes through the SAME gate as a live one, key included");
+        assertTrue(body.contains("retainCvdSpxLevels(accepted)"), "and through the same retention");
     }
 }
