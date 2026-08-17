@@ -452,6 +452,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong cvdSpxLevelsRegressions = new AtomicLong();
     /** U16 retention baseline: the provenance of the retained record; guarded by the retain lock. */
     private CvdSpxLevelsProvenance cvdSpxLevelsProvenance;
+    /** U16: the end offset hydration read to, handed to the live consumer once; -1 = none. */
+    private final AtomicLong cvdSpxLevelsHandoffOffset = new AtomicLong(-1L);
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -2300,6 +2302,7 @@ public class FeedGatewayService implements ReplayRunner {
                 seekToCacheWindow(consumer, partitions, topicEvents);
             } else {
                 consumer.seekToEnd(partitions);
+                seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
             }
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
             while (running.get()) {
@@ -7676,8 +7679,15 @@ public class FeedGatewayService implements ReplayRunner {
         Properties props = stringObjectConsumerProperties("cvd-spx-levels-hydrate");
         props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none");
-        try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(props)) {
-            var infos = consumer.partitionsFor(topic, Duration.ofSeconds(10));
+        // ONE absolute deadline, taken BEFORE the first Kafka call and spent down by every blocking
+        // operation including the close. Per-call 10s timeouts do not bound a startup step: three
+        // metadata calls plus a position() plus a bounded close can each pay their own timeout, and
+        // "15 seconds" would quietly become a minute on a sick broker.
+        final long deadlineNanos = System.nanoTime()
+                + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(CVD_SPX_LEVELS_HYDRATE_DEADLINE_MS);
+        KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(props);
+        try {
+            var infos = consumer.partitionsFor(topic, hydrateRemaining(deadlineNanos));
             if (infos == null || infos.isEmpty()) return;               // topic not created yet
             if (infos.size() != 1) {
                 System.err.println("cvd-spx-levels hydration skipped: " + topic + " has "
@@ -7686,18 +7696,21 @@ public class FeedGatewayService implements ReplayRunner {
             }
             TopicPartition tp = new TopicPartition(topic, infos.get(0).partition());
             consumer.assign(List.of(tp));
-            long begin = consumer.beginningOffsets(List.of(tp), Duration.ofSeconds(10)).get(tp);
-            long end = consumer.endOffsets(List.of(tp), Duration.ofSeconds(10)).get(tp);
+            long begin = consumer.beginningOffsets(List.of(tp), hydrateRemaining(deadlineNanos)).get(tp);
+            long end = consumer.endOffsets(List.of(tp), hydrateRemaining(deadlineNanos)).get(tp);
+            // The end offset is the HANDOFF POINT: the live consumer starts this partition here
+            // instead of at its own later seekToEnd, so a record committed between the two can no
+            // longer fall into a gap that leaves the hydrated record replaying indefinitely.
+            cvdSpxLevelsHandoffOffset.set(end);
             if (end <= begin) return;                                   // empty log
             consumer.seek(tp, begin);
-            long deadline = System.currentTimeMillis() + CVD_SPX_LEVELS_HYDRATE_DEADLINE_MS;
             String latestKey = null, latestValue = null;
-            while (consumer.position(tp, Duration.ofSeconds(10)) < end) {
-                if (System.currentTimeMillis() > deadline) {
+            while (consumer.position(tp, hydrateRemaining(deadlineNanos)) < end) {
+                if (System.nanoTime() >= deadlineNanos) {
                     System.err.println("cvd-spx-levels hydration timed out; the first hello may carry no levels");
                     return;
                 }
-                for (ConsumerRecord<String, Object> rec : consumer.poll(Duration.ofMillis(500))) {
+                for (ConsumerRecord<String, Object> rec : consumer.poll(hydrateRemaining(deadlineNanos))) {
                     if (rec.offset() >= end) continue;
                     latestKey = rec.key();
                     latestValue = rec.value() == null ? null : String.valueOf(rec.value());
@@ -7712,7 +7725,37 @@ public class FeedGatewayService implements ReplayRunner {
             retainCvdSpxLevels(accepted);
         } catch (RuntimeException e) {
             System.err.println("cvd-spx-levels hydration failed; the first hello may carry no levels: " + e);
+        } finally {
+            try {
+                consumer.close(hydrateRemaining(deadlineNanos));        // the close is inside the budget too
+            } catch (RuntimeException ignored) { }
         }
+    }
+
+    /**
+     * U16 handoff: hydration read to end offset E and closed its consumer; the live consumer would
+     * otherwise seekToEnd to a LATER E', silently skipping everything committed in between — and
+     * if the aligner then stopped, the gateway would replay the older hydrated record forever.
+     * Starting this one partition at E instead makes the two reads continuous. Consumed once, so a
+     * reconnect after a live tombstone cannot rewind to a pre-tombstone position.
+     */
+    private void seekCvdSpxLevelsToHandoff(KafkaConsumer<String, Object> consumer,
+                                           List<TopicPartition> partitions) {
+        long handoff = cvdSpxLevelsHandoffOffset.getAndSet(-1L);
+        if (handoff < 0) return;
+        String topic = settings.esCvdSpxLevelsTopic();
+        for (TopicPartition tp : partitions) {
+            if (tp.topic().equals(topic)) {
+                consumer.seek(tp, handoff);
+                return;
+            }
+        }
+    }
+
+    /** What is left of the hydration budget; never negative, so a blown budget stops immediately. */
+    private static Duration hydrateRemaining(long deadlineNanos) {
+        long remaining = deadlineNanos - System.nanoTime();
+        return remaining <= 0 ? Duration.ZERO : Duration.ofNanos(remaining);
     }
 
     /**
@@ -7850,7 +7893,9 @@ public class FeedGatewayService implements ReplayRunner {
         if (!"es-cvd-spx-levels".equals(event)) {
             return;
         }
-        if (record.value() == null) {
+        // A withdrawal is as governing as a value, so it passes the SAME key gate: a foreign-key
+        // tombstone is malformed input, counted and ignored, never an erase of the baseline.
+        if (record.value() == null && CVD_SPX_LEVELS_KEY.equals(record.key())) {
             cvdSpxLevelsLatest.set(null);
             cvdSpxLevelsProvenance = null;
         }

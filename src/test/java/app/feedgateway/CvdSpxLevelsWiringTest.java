@@ -248,7 +248,7 @@ class CvdSpxLevelsWiringTest {
         var s = service();
         s.cvdSpxLevelsLatestForTest().set(levels("OK"));
         ConsumerRecord<String, String> tombstone =
-                new ConsumerRecord<>("options.es-cvd-spx-levels", 0, 5L, "SPX", null);
+                new ConsumerRecord<>("options.es-cvd-spx-levels", 0, 5L, "ES.v.0", null);
         s.evictCvdSpxLevelsTombstone("es-cvd-spx-levels", tombstone);
         assertNull(s.cvdSpxLevelsLatestForTest().get(), "a withdrawn record must never replay");
         assertEquals(1L, s.cvdSpxLevelsDropsForTest());
@@ -425,5 +425,53 @@ class CvdSpxLevelsWiringTest {
                 "hydration is CALLED on the startup path, before any consumer is submitted");
         assertFalse(head.contains("submit(this::hydrateCvdSpxLevels)"),
                 "not submitted asynchronously");
+    }
+
+    @Test void aForeignKeyTombstoneNeverErasesTheBaseline() {
+        // A withdrawal is as governing as a value, so it passes the same key gate. Letting any
+        // null-valued record on the topic clear retention would hand a foreign producer an erase.
+        var s = service();
+        s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 1000, 5)));
+        ConsumerRecord<String, String> foreign =
+                new ConsumerRecord<>("options.es-cvd-spx-levels", 0, 6L, "SPX", null);
+        s.evictCvdSpxLevelsTombstone("es-cvd-spx-levels", foreign);
+        assertNotNull(s.cvdSpxLevelsLatestForTest().get(), "the governing record survives");
+        assertEquals(1L, s.cvdSpxLevelsDropsForTest(), "and the foreign record is counted");
+        // the retention baseline survives too: a lower record is still a regression
+        assertFalse(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 900, 4))));
+
+        ConsumerRecord<String, String> real =
+                new ConsumerRecord<>("options.es-cvd-spx-levels", 0, 7L, "ES.v.0", null);
+        s.evictCvdSpxLevelsTombstone("es-cvd-spx-levels", real);
+        assertNull(s.cvdSpxLevelsLatestForTest().get(), "the contractual tombstone does withdraw");
+    }
+
+    @Test void hydrationHandsItsEndOffsetToTheLiveConsumer() throws Exception {
+        // Hydration reads to E and closes; the live consumer would otherwise seekToEnd to a later
+        // E', skipping everything committed in between — and with the aligner then stopped, the
+        // gateway would replay the older hydrated record indefinitely.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        assertTrue(source.contains("cvdSpxLevelsHandoffOffset.set(end)"),
+                "hydration records the offset it read to");
+        int live = source.indexOf("private void runLiveConsumerOnce(");
+        int seek = source.indexOf("seekCvdSpxLevelsToHandoff(consumer, partitions)", live);
+        int poll = source.indexOf("consumer.poll(", live);
+        assertTrue(seek > live && seek < poll, "and the live consumer starts there, before its first poll");
+        assertTrue(source.contains("cvdSpxLevelsHandoffOffset.getAndSet(-1L)"),
+                "consumed ONCE, so a reconnect cannot rewind past a live tombstone");
+    }
+
+    @Test void theHydrationBudgetIsOneAbsoluteDeadline() throws Exception {
+        // Per-call 10s timeouts do not bound a startup step: three metadata calls, a position()
+        // and a bounded close can each pay their own, and "15 seconds" becomes a minute.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
+        int end = source.indexOf("private void seekCvdSpxLevelsToHandoff", hydrate);
+        String body = source.substring(hydrate, end);
+        assertFalse(body.contains("Duration.ofSeconds(10)"), "no per-call constant timeouts remain");
+        assertTrue(body.indexOf("deadlineNanos = System.nanoTime()") < body.indexOf("partitionsFor("),
+                "the deadline is taken BEFORE the first Kafka call");
+        assertTrue(body.contains("consumer.close(hydrateRemaining(deadlineNanos))"),
+                "and the close spends from the same budget");
     }
 }
