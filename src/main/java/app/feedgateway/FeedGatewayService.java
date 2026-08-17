@@ -7716,7 +7716,13 @@ public class FeedGatewayService implements ReplayRunner {
                     latestValue = rec.value() == null ? null : String.valueOf(rec.value());
                 }
             }
-            if (latestValue == null) return;                            // never published, or a tombstone
+            if (latestValue == null) {
+                // A retained TOMBSTONE is a withdrawal, and CL-R8 counts every one of them. Being
+                // silent here made the counter depend on whether the gateway happened to restart
+                // after the wipe — the same operator action, two different histories.
+                cvdSpxLevelsDrops.incrementAndGet();
+                return;
+            }
             CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(latestKey, latestValue);
             if (accepted == null) {
                 cvdSpxLevelsDrops.incrementAndGet();                    // malformed retained: stay empty
@@ -7741,15 +7747,23 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private void seekCvdSpxLevelsToHandoff(KafkaConsumer<String, Object> consumer,
                                            List<TopicPartition> partitions) {
-        long handoff = cvdSpxLevelsHandoffOffset.getAndSet(-1L);
-        if (handoff < 0) return;
+        // OWNERSHIP FIRST, consumption second. Both live consumers run this helper, and consuming
+        // the offset before finding the partition let whichever ran first (avro-live, which never
+        // holds this topic) destroy the handoff — leaving state-live at its own later seekToEnd
+        // and reopening the very gap this exists to close. getAndSet then runs only in the
+        // consumer that actually owns the partition, so exactly one seek can happen.
         String topic = settings.esCvdSpxLevelsTopic();
+        TopicPartition owned = null;
         for (TopicPartition tp : partitions) {
             if (tp.topic().equals(topic)) {
-                consumer.seek(tp, handoff);
-                return;
+                owned = tp;
+                break;
             }
         }
+        if (owned == null) return;
+        long handoff = cvdSpxLevelsHandoffOffset.getAndSet(-1L);
+        if (handoff < 0) return;
+        consumer.seek(owned, handoff);
     }
 
     /** What is left of the hydration budget; never negative, so a blown budget stops immediately. */

@@ -474,4 +474,31 @@ class CvdSpxLevelsWiringTest {
         assertTrue(body.contains("consumer.close(hydrateRemaining(deadlineNanos))"),
                 "and the close spends from the same budget");
     }
+
+    @Test void onlyTheOwningConsumerConsumesTheHandoffOffset() throws Exception {
+        // Both live consumers run the helper. Consuming the offset before finding the partition
+        // let avro-live — which never holds this topic — destroy it, leaving state-live at its own
+        // later seekToEnd and reopening the loss gap.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int helper = source.indexOf("private void seekCvdSpxLevelsToHandoff");
+        int end = source.indexOf("hydrateRemaining(long deadlineNanos)", helper);
+        String body = source.substring(helper, end);
+        assertTrue(body.indexOf("owned == null") < body.indexOf("getAndSet(-1L)"),
+                "ownership is established BEFORE the offset is consumed");
+        assertTrue(body.indexOf("getAndSet(-1L)") < body.indexOf("consumer.seek(owned"),
+                "and the consuming consumer is the one that seeks");
+    }
+
+    @Test void aRetainedTombstoneIsCountedAtStartupToo() throws Exception {
+        // Otherwise the counter depends on whether the gateway happened to restart after an
+        // operator wipe: the same action, two different histories.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
+        int end = source.indexOf("private void seekCvdSpxLevelsToHandoff", hydrate);
+        String body = source.substring(hydrate, end);
+        int nullCheck = body.indexOf("if (latestValue == null)");
+        int count = body.indexOf("cvdSpxLevelsDrops.incrementAndGet()", nullCheck);
+        assertTrue(nullCheck >= 0 && count > nullCheck && count - nullCheck < 400,
+                "the retained-tombstone branch counts the drop before returning");
+    }
 }
