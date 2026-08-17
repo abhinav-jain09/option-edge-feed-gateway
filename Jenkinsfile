@@ -173,24 +173,27 @@ pipeline {
           PROD_IMAGE="$PUSH_REGISTRY/options-edge-feed-gateway:prod"  # self-documenting prod moving tag
           BUILDER_NAME="options-edge-feed-gateway-${BUILD_NUMBER:-local}"
           BUILDKITD_CONFIG="$(mktemp)"
-          # Write a buildkit insecure-registry entry for the EFFECTIVE registry iff it
-          # (normalized: scheme stripped, trailing slash stripped, lowercased) matches
+          # Write a buildkit insecure-registry entry for the registry we actually PUSH to
+          # (normalized: scheme stripped, trailing slash stripped, lowercased) iff it matches
           # any entry in $INSECURE_REGISTRIES (derived from oeProfile in Resolve profile,
-          # normalized the same way). Without this, prod pushes via docker buildx fail
-          # with 'http: server gave HTTP response to HTTPS client'.
+          # normalized the same way). Without this, pushes via docker buildx fail with
+          # 'http: server gave HTTP response to HTTPS client'.
+          # This MUST test and emit PUSH_REGISTRY, not IMAGE_REGISTRY: when the builder is
+          # not the registry host they differ, and a stanza written for the pull-side name
+          # leaves the push endpoint unconfigured, failing before anything is uploaded.
           normalize() {
             printf '%s' "$1" | tr 'A-Z' 'a-z' \
               | sed -e 's#^http://##' -e 's#^https://##' \
               | sed -e 's#/*$##'
           }
-          effective_norm=$(normalize "$IMAGE_REGISTRY")
+          effective_norm=$(normalize "$PUSH_REGISTRY")
           registry_insecure=false
           for r in $INSECURE_REGISTRIES; do
             if [ "$effective_norm" = "$(normalize "$r")" ]; then registry_insecure=true; break; fi
           done
           if [ "$registry_insecure" = "true" ]; then
             cat > "$BUILDKITD_CONFIG" <<EOF
-[registry."$IMAGE_REGISTRY"]
+[registry."$PUSH_REGISTRY"]
   http = true
   insecure = true
 EOF
