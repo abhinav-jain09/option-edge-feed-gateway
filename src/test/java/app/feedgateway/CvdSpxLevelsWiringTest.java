@@ -288,8 +288,19 @@ class CvdSpxLevelsWiringTest {
         assertTrue(builder.contains("esCvdSpxLevelsEnabled()")
                         && builder.contains("\"es-cvd-spx-levels\""),
                 "the delivery branch lives in the LIVE loop, so the LIVE consumer must subscribe");
-        assertTrue(builder.contains("settings.esCvdTopic()") && builder.contains("settings.esCvdBarsTopic()"),
-                "defect fix: es-cvd/es-cvd-bar must be live-bound too, not only cache-bound");
+        // The es-cvd/es-cvd-bar wiring was centralised into addEsCvdTopics() so the bootstrap and
+        // live topic sets cannot drift. Pin the invariant that still matters — the LIVE builder
+        // wires those topics, and the shared helper binds both — instead of grepping for literal
+        // put() calls in this method body, which a refactor legitimately moves.
+        assertTrue(builder.contains("addEsCvdTopics("),
+                "defect fix: the LIVE consumer must wire es-cvd/es-cvd-bar (via addEsCvdTopics)");
+        int helper = source.indexOf("private void addEsCvdTopics(");
+        assertTrue(helper >= 0, "addEsCvdTopics helper must exist");
+        int helperEnd = source.indexOf("\n    }", helper);
+        assertTrue(helperEnd > helper, "addEsCvdTopics body must be locatable");
+        String helperBody = source.substring(helper, helperEnd);
+        assertTrue(helperBody.contains("settings.esCvdTopic()") && helperBody.contains("settings.esCvdBarsTopic()"),
+                "addEsCvdTopics must bind BOTH es-cvd and es-cvd-bar");
         int cacheBuilder = source.indexOf("private void runJsonStateCacheConsumer()");
         int cacheRun = source.indexOf("runAssignedCacheConsumer(\"state\"", cacheBuilder);
         assertFalse(source.substring(cacheBuilder, cacheRun).contains("es-cvd-spx-levels"),
