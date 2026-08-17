@@ -361,11 +361,69 @@ class CvdSpxLevelsWiringTest {
                 "hydration runs at startup, behind the flag, before clients can connect");
 
         int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
-        int hydrateEnd = source.indexOf("OK basis states", hydrate);
+        int hydrateEnd = source.indexOf("CVD_SPX_LEVELS_BASIS_STATES", hydrate);
+        assertTrue(hydrate >= 0 && hydrateEnd > hydrate);
         String body = source.substring(hydrate, hydrateEnd);
         assertTrue(body.contains("infos.size() != 1"), "the single-partition contract is re-asserted");
         assertTrue(body.contains("validateCvdSpxLevels(latestKey, latestValue)"),
                 "the hydrated record goes through the SAME gate as a live one, key included");
         assertTrue(body.contains("retainCvdSpxLevels(accepted)"), "and through the same retention");
+    }
+
+    @Test void theStateFieldMatrixIsEnforcedInBothDirections() {
+        var s = service();
+        // UNAVAILABLE-only fields on an OK record — malformed WHATEVER their value, because the
+        // record reaches the browser verbatim and would read as a state it is not in.
+        for (String field : new String[] { "reason", "sourceProvenance", "provenanceRetained", "baselineReset" }) {
+            String value = "provenanceRetained".equals(field) || "baselineReset".equals(field) ? "false"
+                    : ("reason".equals(field) ? "\"source_stale\"" : "null");
+            assertNull(s.validateCvdSpxLevels(ok("20260817", 1000, 5)
+                            .replace("\"state\":\"OK\"", "\"state\":\"OK\",\"" + field + "\":" + value)),
+                    field + " belongs to UNAVAILABLE only");
+        }
+        // OK-only fields on an UNAVAILABLE record, provenance included.
+        for (String injected : new String[] { "\"sessionDate\":\"20260817\"", "\"foldPositionMs\":10",
+                "\"foldPrints\":2", "\"flowEventTimeMs\":1", "\"basisState\":\"MEASURED\"" }) {
+            assertNull(s.validateCvdSpxLevels(unavailable("source_stale", "null", false, false)
+                            .replace("\"state\":\"UNAVAILABLE\"", "\"state\":\"UNAVAILABLE\"," + injected)),
+                    injected + " is OK-only");
+        }
+    }
+
+    @Test void everyTranslatedPriceObeysItsDeclaredRange() {
+        var s = service();
+        long max = FeedGatewayService.CVD_SPX_LEVELS_MAX_PRICE_CENTS;
+        assertNotNull(s.validateCvdSpxLevels(ok("20260817", 1, 1, "[]", "[]", "null", String.valueOf(max))),
+                "the top of the range is legal");
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1, "[]", "[]", "null", String.valueOf(max + 1))),
+                "a balance above 10,000,000 cents is not an SPX price");
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1,
+                        "[" + level(max + 1, 900) + "]", "[]", "null", "null")));
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1, 1, "[]", "[]",
+                        "{\"priceCents\":" + (max + 1) + ",\"atMs\":" + (FLOW - 1)
+                                + ",\"direction\":\"UP\",\"cvdAtCross\":1}", "null")));
+    }
+
+    @Test void theBasisStateSetMatchesItsNamedAuthority() {
+        // SOURCE OF TRUTH: CvdSpxLevelsAligner.OK_BASIS_STATES in options-edge-processing, itself
+        // parity-tested against BasisSnapshot.isValid. This repo cannot import it, so the set is
+        // pinned here against the same authority: a drift on either side fails a test instead of
+        // silently changing what the boundary accepts.
+        assertEquals(java.util.Set.of("ANCHORED", "MEASURED", "PROJECTED"),
+                FeedGatewayService.CVD_SPX_LEVELS_BASIS_STATES);
+    }
+
+    @Test void hydrationIsAStartupBarrierNotABackgroundTask() throws Exception {
+        // Submitting it to the executor returned from start() immediately: a client connecting in
+        // the next second still got levels:null, and a live tombstone could clear retention only
+        // for the late hydration to resurrect the withdrawn record.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int start = source.indexOf("public void start()");
+        int end = source.indexOf("runSelectionConsumer);", start);
+        String head = source.substring(start, end);
+        assertTrue(head.contains("hydrateCvdSpxLevels();"),
+                "hydration is CALLED on the startup path, before any consumer is submitted");
+        assertFalse(head.contains("submit(this::hydrateCvdSpxLevels)"),
+                "not submitted asynchronously");
     }
 }

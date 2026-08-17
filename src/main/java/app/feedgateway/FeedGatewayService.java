@@ -600,13 +600,14 @@ public class FeedGatewayService implements ReplayRunner {
             thread.setDaemon(true);
             return thread;
         });
-        // U16 (CL-R8/G19): HYDRATE the retained levels record before any client can connect. The
-        // only subscriber is the live consumer, which starts at seekToEnd — so without this the
-        // gateway would answer every hello with levels:null until the next heartbeat, and if the
-        // aligner is down after having committed a record, forever. The topic is compacted and
-        // single-partition, so this is a bounded read of one key's latest committed value.
+        // U16 (CL-R8/G19): HYDRATE the retained levels record BEFORE anything else starts — this
+        // is a barrier, not a background task. Submitting it to the executor would return from
+        // start() immediately, so a client connecting in the next second still got levels:null,
+        // and worse, a live tombstone could clear retention only for the late hydration to
+        // resurrect the withdrawn record. Running it here means the live consumer begins with the
+        // baseline already in place, and every ordering after that is the live one's.
         if (settings.esCvdSpxLevelsEnabled()) {
-            executor.submit(this::hydrateCvdSpxLevels);
+            hydrateCvdSpxLevels();
         }
         executor.submit(this::runSelectionConsumer);
         executor.submit(this::runAvroLiveConsumer);
@@ -7586,10 +7587,9 @@ public class FeedGatewayService implements ReplayRunner {
             String state = n.path("state").asText("");
 
             if ("OK".equals(state)) {
-                if (n.path("provenanceRetained").asBoolean(false) || n.path("baselineReset").asBoolean(false)) {
-                    return null;
+                for (String unavailableOnly : CVD_SPX_LEVELS_UNAVAILABLE_ONLY_FIELDS) {
+                    if (n.has(unavailableOnly)) return null;      // present at all, whatever its value
                 }
-                if (n.has("reason") || n.has("sourceProvenance")) return null;   // UNAVAILABLE-only
                 if (!n.path("sessionComplete").isBoolean()) return null;
                 String sessionDate = n.path("sessionDate").asText("");
                 if (!sessionDate.matches("\\d{8}") || !isCalendarDate(sessionDate)) return null;
@@ -7617,7 +7617,8 @@ public class FeedGatewayService implements ReplayRunner {
                     Long at = levelsInt(flip, "atMs");
                     Long cross = levelsInt(flip, "cvdAtCross");
                     String dir = flip.path("direction").asText("");
-                    if (fp == null || fp <= 0 || at == null || at <= 0 || at > flow || cross == null
+                    if (fp == null || fp <= 0 || fp > CVD_SPX_LEVELS_MAX_PRICE_CENTS
+                            || at == null || at <= 0 || at > flow || cross == null
                             || (!"UP".equals(dir) && !"DOWN".equals(dir))) {
                         return null;
                     }
@@ -7626,7 +7627,7 @@ public class FeedGatewayService implements ReplayRunner {
                 if (balance == null) return null;                         // present, possibly null
                 if (!balance.isNull()) {
                     Long b = levelsInt(n, "balancePriceCents");
-                    if (b == null || b <= 0) return null;
+                    if (b == null || b <= 0 || b > CVD_SPX_LEVELS_MAX_PRICE_CENTS) return null;
                 }
                 return new CvdSpxLevelsAccepted(json,
                         new CvdSpxLevelsProvenance(sessionDate, pos, prints), false, false);
@@ -7667,6 +7668,9 @@ public class FeedGatewayService implements ReplayRunner {
      * design — a failure leaves the replay empty, which the page renders as no_data (fail-closed),
      * and the next live record hydrates it anyway.
      */
+    /** Bounded: this runs on the startup path, so it must never hold the service down. */
+    static final long CVD_SPX_LEVELS_HYDRATE_DEADLINE_MS = 15_000L;
+
     void hydrateCvdSpxLevels() {
         String topic = settings.esCvdSpxLevelsTopic();
         Properties props = stringObjectConsumerProperties("cvd-spx-levels-hydrate");
@@ -7686,7 +7690,7 @@ public class FeedGatewayService implements ReplayRunner {
             long end = consumer.endOffsets(List.of(tp), Duration.ofSeconds(10)).get(tp);
             if (end <= begin) return;                                   // empty log
             consumer.seek(tp, begin);
-            long deadline = System.currentTimeMillis() + 30_000L;
+            long deadline = System.currentTimeMillis() + CVD_SPX_LEVELS_HYDRATE_DEADLINE_MS;
             String latestKey = null, latestValue = null;
             while (consumer.position(tp, Duration.ofSeconds(10)) < end) {
                 if (System.currentTimeMillis() > deadline) {
@@ -7711,8 +7715,14 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
-    /** OK basis states the aligner may emit (its OK_BASIS_STATES, mirrored at the boundary). */
-    private static final Set<String> CVD_SPX_LEVELS_BASIS_STATES =
+    /**
+     * The basis states an OK record may carry. SOURCE OF TRUTH: the aligner's
+     * {@code CvdSpxLevelsAligner.OK_BASIS_STATES} in options-edge-processing, which is itself
+     * parity-tested against {@code BasisSnapshot.isValid}. This repo cannot import that constant,
+     * so the set is pinned by a test here that names the same authority — a drift on either side
+     * fails a test rather than silently accepting (or rejecting) a state at the boundary.
+     */
+    static final Set<String> CVD_SPX_LEVELS_BASIS_STATES =
             Set.of("ANCHORED", "MEASURED", "PROJECTED");
 
     /** The aligner's reason precedence chain — an unknown reason is a schema violation. */
@@ -7721,10 +7731,19 @@ public class FeedGatewayService implements ReplayRunner {
             "source_overflow", "source_not_observable", "source_stale", "basis_unusable",
             "translation_error");
 
-    /** Structure fields an UNAVAILABLE record must not carry (it has no structure to report). */
+    /**
+     * The state-field matrix, both directions. A record carrying a field its state does not define
+     * is malformed WHATEVER the field's value: the record reaches the browser verbatim, so an
+     * UNAVAILABLE frame with a sessionDate and fold provenance in it reads as structure the
+     * aligner never attested.
+     */
     private static final List<String> CVD_SPX_LEVELS_OK_ONLY_FIELDS = List.of(
             "buyLevels", "sellLevels", "flip", "balancePriceCents", "basisCents", "basisState",
-            "basisMeasuredAtMs", "sourcePublishedAtMs", "flowEventTimeMs", "sessionComplete");
+            "basisMeasuredAtMs", "sourcePublishedAtMs", "flowEventTimeMs", "sessionComplete",
+            "sessionDate", "foldPositionMs", "foldPrints");
+
+    private static final List<String> CVD_SPX_LEVELS_UNAVAILABLE_ONLY_FIELDS = List.of(
+            "reason", "sourceProvenance", "provenanceRetained", "baselineReset");
 
     /**
      * One integral field, read WITHOUT truncation and bounded to JS-exact. A BigIntegerNode is
@@ -7740,6 +7759,9 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** JavaScript's exact-integer bound: the browser is the consumer of every one of these. */
     static final long CVD_SPX_LEVELS_MAX_SAFE = (1L << 53) - 1;
+
+    /** §2: every translated SPX price is in (0, 10_000_000] cents — balance included. */
+    static final long CVD_SPX_LEVELS_MAX_PRICE_CENTS = 10_000_000L;
 
     /** A real calendar date, not merely eight digits — 99999999 must not order as a session. */
     private static boolean isCalendarDate(String yyyymmdd) {
@@ -7762,7 +7784,8 @@ public class FeedGatewayService implements ReplayRunner {
             Long delta = levelsInt(l, "deltaSum");
             Long count = levelsInt(l, "tradeCount");
             Long touch = levelsInt(l, "lastTouchMs");
-            if (price == null || price <= 0 || !prices.add(price)) return false;
+            if (price == null || price <= 0 || price > CVD_SPX_LEVELS_MAX_PRICE_CENTS
+                    || !prices.add(price)) return false;
             if (delta == null || (buy ? delta <= 0 : delta >= 0)) return false;   // side sign
             if (count == null || count <= 0 || touch == null || touch <= 0) return false;
             if (touch > flowEventTimeMs) return false;      // bounded by the record's own flow time
