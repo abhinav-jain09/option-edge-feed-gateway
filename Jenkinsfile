@@ -47,8 +47,9 @@ pipeline {
           // builders sat idle, which defeats the offload.
           env.BUILD_AGENT_LABEL = oeBuildAgent(p)
           env.BUILD_PLATFORM = params.BUILD_PLATFORM?.trim() ? params.BUILD_PLATFORM : p.platform
-          // Build the set of plain-http registries from EVERY profile (not a hardcoded
-          // list of env names — so adding a new profile auto-extends this), normalize
+          // Build the set of plain-http registries from the deployable profiles listed in
+          // knownEnvs below (dev + production; `experiment` is deliberately out of scope for
+          // this job, whose ENVIRONMENT choices are dev/production), normalize
           // for robust matching (strip scheme + trailing slash + lowercase), and add
           // dev-registry loopback aliases. The Image stage writes a buildkit insecure-
           // registry config for the EFFECTIVE IMAGE_REGISTRY iff its normalized form is
