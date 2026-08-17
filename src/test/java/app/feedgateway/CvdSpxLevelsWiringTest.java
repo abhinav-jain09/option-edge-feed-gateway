@@ -557,4 +557,46 @@ class CvdSpxLevelsWiringTest {
                 "construction happens inside the guarded lifecycle");
         assertTrue(body.contains("if (consumer != null)"), "and the close tolerates a failed construction");
     }
+
+    @Test void aConsumerRetryResumesInsteadOfReplayingHistory() throws Exception {
+        // The generic retry path seeks every partition back into its cache window — 15 minutes —
+        // which on a COMPACTED state topic means re-reading records this consumer already
+        // processed. A historical tombstone would erase the baseline again, a historical
+        // baselineReset would be re-applied as a fresh operator wipe, and older post-reset records
+        // would be accepted and broadcast on the way back to now.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int live = source.indexOf("private void runLiveConsumerOnce(");
+        int retry = source.indexOf("seekToCacheWindow(consumer, partitions, topicEvents);", live);
+        int resume = source.indexOf("resumeCvdSpxLevels(consumer, partitions);", live);
+        int poll = source.indexOf("consumer.poll(", live);
+        assertTrue(retry > 0 && resume > retry && resume < poll,
+                "the levels partition is re-seeked AFTER the generic window seek, before any poll");
+
+        int helper = source.indexOf("private void resumeCvdSpxLevels");
+        int helperEnd = source.indexOf("hydrateRemaining(long deadlineNanos)", helper);
+        String body = source.substring(helper, helperEnd);
+        assertTrue(body.contains("cvdSpxLevelsNextOffset.get()") && body.contains("consumer.seek(owned, next)"),
+                "it resumes from the tracked offset");
+        assertTrue(body.contains("seekToEnd(List.of(owned))"),
+                "and when nothing is known it starts at the END, never in the past");
+        assertTrue(source.contains("cvdSpxLevelsNextOffset.set(record.offset() + 1)"),
+                "progress is tracked for every levels record, values and tombstones alike");
+    }
+
+    @Test void aHistoricalResetCannotUndoNewerRetainedState() {
+        // The behavioral half: what retry continuity protects. Replaying an old reset and the
+        // older records that followed it must not be able to regress what is retained now.
+        var s = service();
+        assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 5000, 40))));
+        String retained = s.cvdSpxLevelsLatestForTest().get();
+
+        // A record from BEFORE that state — the shape a replay would deliver — is refused.
+        assertFalse(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 1000, 5))));
+        assertEquals(retained, s.cvdSpxLevelsLatestForTest().get(), "retention did not regress");
+        assertEquals(1L, s.cvdSpxLevelsRegressionsForTest());
+
+        // Only a GOVERNING (newer) record moves it, reset or not.
+        assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 6000, 50))));
+        assertTrue(s.cvdSpxLevelsLatestForTest().get().contains("\"foldPositionMs\":6000"));
+    }
 }

@@ -454,6 +454,9 @@ public class FeedGatewayService implements ReplayRunner {
     private CvdSpxLevelsProvenance cvdSpxLevelsProvenance;
     /** U16: the end offset hydration read to, handed to the live consumer once; -1 = none. */
     private final AtomicLong cvdSpxLevelsHandoffOffset = new AtomicLong(-1L);
+    /** U16: the next offset to read on this partition, so a consumer RETRY resumes instead of
+     *  replaying history (a historical tombstone or reset must never be re-applied as new). */
+    private final AtomicLong cvdSpxLevelsNextOffset = new AtomicLong(-1L);
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -2300,6 +2303,7 @@ public class FeedGatewayService implements ReplayRunner {
             consumer.assign(partitions);
             if (retry) {
                 seekToCacheWindow(consumer, partitions, topicEvents);
+                resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
             } else {
                 consumer.seekToEnd(partitions);
                 seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
@@ -2349,6 +2353,7 @@ public class FeedGatewayService implements ReplayRunner {
                         evictStrikeSrTombstone(binding, record);
                         evictEsStrikeIntelTombstone(binding, record);
                         evictCvdSpxLevelsTombstone(binding == null ? null : binding.event(), record);
+                        noteCvdSpxLevelsProgress(binding, record);
                         continue;
                     }
                     if (!isTrustedIndexPrice(binding, json) || !isValidSpxPrice(binding, json)) {
@@ -2434,6 +2439,7 @@ public class FeedGatewayService implements ReplayRunner {
                             broadcast(binding.event(), json);
                             forwardedEvents.incrementAndGet();
                         }
+                        noteCvdSpxLevelsProgress(binding, record);
                         continue;
                     }
                     if ("es-cvd".equals(binding.event())) {
@@ -7789,6 +7795,42 @@ public class FeedGatewayService implements ReplayRunner {
         long handoff = cvdSpxLevelsHandoffOffset.getAndSet(-1L);
         if (handoff < 0) return;
         consumer.seek(owned, handoff);
+    }
+
+    /** Remember where this partition got to, so a retry resumes rather than replays. */
+    private void noteCvdSpxLevelsProgress(TopicBinding binding, ConsumerRecord<String, ?> record) {
+        if (binding != null && "es-cvd-spx-levels".equals(binding.event())) {
+            cvdSpxLevelsNextOffset.set(record.offset() + 1);
+        }
+    }
+
+    /**
+     * U16 retry continuity. The generic retry path seeks every partition back into its cache
+     * window — up to 15 minutes — which on a COMPACTED state topic means re-reading history that
+     * has not been cleaned yet. A historical tombstone would then erase the baseline again, a
+     * historical {@code baselineReset} would be re-applied as a fresh operator wipe, and older
+     * post-reset records would be accepted and broadcast on the way back to now, with a concurrent
+     * hello seeing levels:null in the middle of it. None of that is new information: this consumer
+     * already processed those records. So the levels partition resumes from where it left off, and
+     * when nothing is known it starts at the END rather than in the past — a missed record is a
+     * bounded staleness the page already handles, while a replayed erase is a false one.
+     */
+    private void resumeCvdSpxLevels(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        String topic = settings.esCvdSpxLevelsTopic();
+        TopicPartition owned = null;
+        for (TopicPartition tp : partitions) {
+            if (tp.topic().equals(topic)) {
+                owned = tp;
+                break;
+            }
+        }
+        if (owned == null) return;
+        long next = cvdSpxLevelsNextOffset.get();
+        if (next >= 0) {
+            consumer.seek(owned, next);
+        } else {
+            consumer.seekToEnd(List.of(owned));
+        }
     }
 
     /** What is left of the hydration budget; never negative, so a blown budget stops immediately. */
