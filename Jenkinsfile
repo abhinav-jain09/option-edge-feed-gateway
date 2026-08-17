@@ -191,6 +191,11 @@ pipeline {
           PROD_IMAGE="$PUSH_REGISTRY/options-edge-feed-gateway:prod"  # self-documenting prod moving tag
           BUILDER_NAME="options-edge-feed-gateway-${BUILD_NUMBER:-local}"
           BUILDKITD_CONFIG="$(mktemp)"
+          # Register the file-only cleanup IMMEDIATELY: several fallible commands run before the
+          # builder exists, and under `set -e` a failure there would otherwise leak the temp
+          # config. Redefined below once the builder is actually created.
+          cleanup() { rm -f "$BUILDKITD_CONFIG"; }
+          trap cleanup EXIT
           # Write a buildkit insecure-registry entry for the registry we actually PUSH to
           # (normalized: scheme stripped, trailing slash stripped, lowercased) iff it matches
           # any entry in $INSECURE_REGISTRIES (derived from oeProfile in Resolve profile,
@@ -220,16 +225,16 @@ EOF
           fi
           # Same reasoning as the preflight: the production remote-build path never touches the
           # local daemon, so do not create/destroy a local buildx builder for it.
-          cleanup() { rm -f "$BUILDKITD_CONFIG"; }
           if [ "$needs_local_docker" = "true" ]; then
             docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
             docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" --use >/dev/null
+            # Builder now exists — widen cleanup to remove it too. The EXIT trap already points
+            # at `cleanup`, so redefining the function is enough.
             cleanup() {
               docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
               rm -f "$BUILDKITD_CONFIG"
             }
           fi
-          trap cleanup EXIT
           TAG_ARGS="-t $IMAGE"
           if [ -n "$DEV_TAG" ] && [ "$DEV_TAG" != "$TAG" ]; then
             TAG_ARGS="$TAG_ARGS -t $DEV_IMAGE"
