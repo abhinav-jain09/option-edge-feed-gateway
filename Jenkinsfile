@@ -157,7 +157,14 @@ pipeline {
           # Preflight: this stage may run on a builder whose Docker is not always up (the .74
           # agents use Docker Desktop, which needs a GUI session and does not survive reboot).
           # Fail here with something actionable rather than obscurely mid-buildx.
-          if ! docker info >/dev/null 2>&1; then
+          # ONLY for builds that actually use the local daemon: production ships the source to
+          # REMOTE_BUILD_HOST and builds there, so it must not depend on Docker being up on the
+          # agent (Codex: that would fail prod for a reason that has nothing to do with prod).
+          needs_local_docker=true
+          if [ "${ENVIRONMENT:-dev}" = "production" ] && [ "$PUSH_IMAGE" = "true" ]; then
+            needs_local_docker=false
+          fi
+          if [ "$needs_local_docker" = "true" ] && ! docker info >/dev/null 2>&1; then
             echo "Docker daemon is not reachable on this build agent ($(hostname))." >&2
             echo "If this is the .74 builder, start Docker Desktop on it and re-run." >&2
             exit 1
@@ -211,12 +218,17 @@ EOF
           else
             : > "$BUILDKITD_CONFIG"
           fi
-          docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-          docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" --use >/dev/null
-          cleanup() {
+          # Same reasoning as the preflight: the production remote-build path never touches the
+          # local daemon, so do not create/destroy a local buildx builder for it.
+          cleanup() { rm -f "$BUILDKITD_CONFIG"; }
+          if [ "$needs_local_docker" = "true" ]; then
             docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-            rm -f "$BUILDKITD_CONFIG"
-          }
+            docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" --use >/dev/null
+            cleanup() {
+              docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
+              rm -f "$BUILDKITD_CONFIG"
+            }
+          fi
           trap cleanup EXIT
           TAG_ARGS="-t $IMAGE"
           if [ -n "$DEV_TAG" ] && [ "$DEV_TAG" != "$TAG" ]; then
