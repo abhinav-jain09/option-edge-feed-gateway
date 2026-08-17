@@ -42,7 +42,10 @@ pipeline {
           // An explicit IMAGE_REGISTRY override applies to both, preserving back-compat
           // for callers like bring-up-all that pass one registry for everything.
           env.PUSH_REGISTRY = params.IMAGE_REGISTRY?.trim() ? params.IMAGE_REGISTRY : p.registryFromBuildAgent
-          env.BUILD_AGENT_LABEL = p.buildAgentLabel
+          // Strict preference with fallback, resolved at runtime. NOT a `a || b` label
+          // expression: that is an unordered union and would let .102 win while the .74
+          // builders sat idle, which defeats the offload.
+          env.BUILD_AGENT_LABEL = oeBuildAgent(p)
           env.BUILD_PLATFORM = params.BUILD_PLATFORM?.trim() ? params.BUILD_PLATFORM : p.platform
           // Build the set of plain-http registries from EVERY profile (not a hardcoded
           // list of env names — so adding a new profile auto-extends this), normalize
