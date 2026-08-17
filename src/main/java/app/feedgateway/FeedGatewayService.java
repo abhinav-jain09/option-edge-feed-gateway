@@ -443,6 +443,20 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong forwardedEvents = new AtomicLong();
     /** drop-nowcast values dropped at the parse gate (review finding #4). */
     private final AtomicLong dropNowcastMalformed = new AtomicLong();
+    /** U16: latest ACCEPTED es-cvd-spx-levels record (verbatim), replayed on connect; null = none. */
+    private final java.util.concurrent.atomic.AtomicReference<String> cvdSpxLevelsLatest =
+            new java.util.concurrent.atomic.AtomicReference<>();
+    /** U16: es-cvd-spx-levels records rejected at the boundary (invalid, oversize, tombstone). */
+    private final AtomicLong cvdSpxLevelsDrops = new AtomicLong();
+    /** U16: records refused because their provenance REGRESSED against what is retained (CL-R7 V1). */
+    private final AtomicLong cvdSpxLevelsRegressions = new AtomicLong();
+    /** U16 retention baseline: the provenance of the retained record; guarded by the retain lock. */
+    private CvdSpxLevelsProvenance cvdSpxLevelsProvenance;
+    /** U16: the end offset hydration read to, handed to the live consumer once; -1 = none. */
+    private final AtomicLong cvdSpxLevelsHandoffOffset = new AtomicLong(-1L);
+    /** U16: the next offset to read on this partition, so a consumer RETRY resumes instead of
+     *  replaying history (a historical tombstone or reset must never be re-applied as new). */
+    private final AtomicLong cvdSpxLevelsNextOffset = new AtomicLong(-1L);
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -591,6 +605,15 @@ public class FeedGatewayService implements ReplayRunner {
             thread.setDaemon(true);
             return thread;
         });
+        // U16 (CL-R8/G19): HYDRATE the retained levels record BEFORE anything else starts — this
+        // is a barrier, not a background task. Submitting it to the executor would return from
+        // start() immediately, so a client connecting in the next second still got levels:null,
+        // and worse, a live tombstone could clear retention only for the late hydration to
+        // resurrect the withdrawn record. Running it here means the live consumer begins with the
+        // baseline already in place, and every ordering after that is the live one's.
+        if (settings.esCvdSpxLevelsEnabled()) {
+            hydrateCvdSpxLevels();
+        }
         executor.submit(this::runSelectionConsumer);
         executor.submit(this::runAvroLiveConsumer);
         executor.submit(this::runJsonStateLiveConsumer);
@@ -692,9 +715,12 @@ public class FeedGatewayService implements ReplayRunner {
         clients.add(session);
         clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
-        if (settings.esCvdEnabled()) {
+        if (settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled()) {
             // R46 hello: the per-timeframe high-water marks of the bar view, so the page can bound
             // its REST backfill to exactly what this gateway holds and buffer WS bars past it.
+            // U16 (CL-R8/G19): the latest ACCEPTED levels record rides INSIDE this same hello, so
+            // "hello carried no levels record" (levels: null) is distinguishable from "replay still
+            // pending" — the page needs that distinction to choose `no_data` over staying blank.
             send(session, "cvd-hello", cvdHelloJson());
         }
         // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
@@ -1172,6 +1198,15 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_gateway_ws_dropped_on_close_total Queued messages discarded when a slow client was dropped.\n"
                 + "# TYPE options_edge_gateway_ws_dropped_on_close_total counter\n"
                 + "options_edge_gateway_ws_dropped_on_close_total " + wsDroppedOnClose.get() + "\n"
+                + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
+                + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
+                + "gateway_cvd_spx_levels_enabled " + boolMetric(settings.esCvdSpxLevelsEnabled()) + "\n"
+                + "# HELP gateway_cvd_spx_levels_drops_total es-cvd-spx-levels records dropped at the gateway boundary (invalid, oversize, tombstone).\n"
+                + "# TYPE gateway_cvd_spx_levels_drops_total counter\n"
+                + "gateway_cvd_spx_levels_drops_total " + cvdSpxLevelsDrops.get() + "\n"
+                + "# HELP gateway_cvd_spx_levels_position_regressions_total es-cvd-spx-levels records refused because their fold provenance regressed.\n"
+                + "# TYPE gateway_cvd_spx_levels_position_regressions_total counter\n"
+                + "gateway_cvd_spx_levels_position_regressions_total " + cvdSpxLevelsRegressions.get() + "\n"
                 + "# HELP options_edge_feed_gateway_snapshots Cached option snapshot count.\n"
                 + "# TYPE options_edge_feed_gateway_snapshots gauge\n"
                 + "options_edge_feed_gateway_snapshots " + snapshots.size() + "\n"
@@ -1683,6 +1718,21 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
         if (settings.esAggressorFlowEnabled()) {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
+        }
+        if (settings.esCvdEnabled()) {
+            // DEFECT FIX (found during U16): #136 bound these to the CACHE consumer only, but the
+            // es-cvd/es-cvd-bar delivery branches live in THIS consumer's loop — live snapshots,
+            // bar upserts and therefore the REST backfill view never populated. Same both-consumers
+            // shape as es-aggressor-flow above.
+            topicEvents.put(settings.esCvdTopic(), new TopicBinding("DATABENTO", "es-cvd"));
+            topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding("DATABENTO", "es-cvd-bar"));
+        }
+        if (settings.esCvdSpxLevelsEnabled()) {
+            // U16: SPX-translated CVD structure levels (compacted single-partition heartbeat,
+            // >=1 record per ALIGN_HEARTBEAT while the aligner runs) — LIVE consumer only. The
+            // cache consumer is deliberately NOT subscribed: updateCache has no case for it, and
+            // this event keeps its own latest-record retention for the connect replay.
+            topicEvents.put(settings.esCvdSpxLevelsTopic(), new TopicBinding("DATABENTO", "es-cvd-spx-levels"));
         }
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
@@ -2253,8 +2303,10 @@ public class FeedGatewayService implements ReplayRunner {
             consumer.assign(partitions);
             if (retry) {
                 seekToCacheWindow(consumer, partitions, topicEvents);
+                resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
             } else {
                 consumer.seekToEnd(partitions);
+                seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
             }
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
             while (running.get()) {
@@ -2300,6 +2352,8 @@ public class FeedGatewayService implements ReplayRunner {
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
                         evictEsStrikeIntelTombstone(binding, record);
+                        evictCvdSpxLevelsTombstone(binding == null ? null : binding.event(), record);
+                        noteCvdSpxLevelsProgress(binding, record);
                         continue;
                     }
                     if (!isTrustedIndexPrice(binding, json) || !isValidSpxPrice(binding, json)) {
@@ -2370,6 +2424,22 @@ public class FeedGatewayService implements ReplayRunner {
                         // turn-alert sibling.
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("es-cvd-spx-levels".equals(binding.event())) {
+                        // U16 (CL-R7): producer-authored transactional attestation, delivered
+                        // VERBATIM (raw pass-through — never enriched). Boundary checks only; the
+                        // aligner already validated the full schema. Anything rejected here is
+                        // counted and dropped — never broadcast, never retained.
+                        CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(
+                                record.key() == null ? null : String.valueOf(record.key()), json);
+                        if (accepted == null) {
+                            cvdSpxLevelsDrops.incrementAndGet();
+                        } else if (retainCvdSpxLevels(accepted)) {
+                            broadcast(binding.event(), json);
+                            forwardedEvents.incrementAndGet();
+                        }
+                        noteCvdSpxLevelsProgress(binding, record);
                         continue;
                     }
                     if ("es-cvd".equals(binding.event())) {
@@ -6868,7 +6938,8 @@ public class FeedGatewayService implements ReplayRunner {
      * {@code marketDataSource}/{@code source}/{@code sessionDate} over the producer's own fields.
      */
     private static boolean isRawPassThroughEvent(String event) {
-        return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event);
+        return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
+                || "es-cvd-spx-levels".equals(event);
     }
 
     /**
@@ -7436,6 +7507,532 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** U16 boundary cap: one levels record may never exceed the design's 64 KiB record bound. */
+    static final int CVD_SPX_LEVELS_MAX_BYTES = 65536;
+
+    /**
+     * U16 (CL-R7/CL-R8): the provenance a levels record carries through the hop —
+     * {@code (sessionDate, foldPositionMs, foldPrints)} of the SOURCE fold that caused it, plus the
+     * two combination-matrix flags. Ordering is CALENDAR-AWARE and TOTAL: sessionDate first
+     * (the aligner emits it zero-padded, so lexical order IS date order), then foldPositionMs, then
+     * foldPrints. A CROSSED pair — one component higher, the other lower within the same session —
+     * cannot come from any single monotone fold, so it is inconsistent provenance and rejected like
+     * a regression rather than ordered.
+     */
+    record CvdSpxLevelsProvenance(String sessionDate, long foldPositionMs, long foldPrints) {
+        boolean crossed(CvdSpxLevelsProvenance other) {
+            if (!sessionDate.equals(other.sessionDate)) return false;
+            return (foldPositionMs > other.foldPositionMs && foldPrints < other.foldPrints)
+                    || (foldPositionMs < other.foldPositionMs && foldPrints > other.foldPrints);
+        }
+
+        /** −1 / 0 / +1 against another provenance in the SAME total order the aligner uses. */
+        int compareTo(CvdSpxLevelsProvenance other) {
+            int c = sessionDate.compareTo(other.sessionDate);
+            if (c != 0) return c < 0 ? -1 : 1;
+            if (foldPositionMs != other.foldPositionMs) return foldPositionMs < other.foldPositionMs ? -1 : 1;
+            if (foldPrints != other.foldPrints) return foldPrints < other.foldPrints ? -1 : 1;
+            return 0;
+        }
+    }
+
+    /**
+     * Parsed acceptance verdict for one levels record: the bytes to forward, the SOURCE provenance
+     * it carries (null when none has ever existed), and the two matrix flags.
+     */
+    record CvdSpxLevelsAccepted(String json, CvdSpxLevelsProvenance provenance,
+                                boolean provenanceRetained, boolean baselineReset) { }
+
+    /**
+     * U16 (CL-R7/CL-R8) schema validation for ONE levels record. Refuses: oversized (pre-parse),
+     * unparseable, non-object, schema major != 1 (minors ignored), state outside {OK, UNAVAILABLE},
+     * and every combination outside the design's provenance MATRIX:
+     *
+     * <ul>
+     *   <li>tombstone-derived absence — {null provenance, baselineReset true, retained false}</li>
+     *   <li>pre-first-source startup absence — {null, false, false} (never resets)</li>
+     *   <li>provenance-unrecoverable malformed — {non-null, false, retained true}</li>
+     *   <li>causally-validated source-derived — {non-null, false, false}</li>
+     * </ul>
+     *
+     * Anything else is MALFORMED and dropped — never forwarded, and never treated as a baseline
+     * erase: an invalid reset combination must not be able to wipe the gateway's retention.
+     */
+    CvdSpxLevelsAccepted validateCvdSpxLevels(String json) {
+        return validateCvdSpxLevels(CVD_SPX_LEVELS_KEY, json);
+    }
+
+    /** The topic's contractual key; the payload's symbol must agree with it (CL-R7). */
+    static final String CVD_SPX_LEVELS_KEY = "ES.v.0";
+
+    /**
+     * U16 (§2 / CL-R7 / CL-R8): the FULL gateway schema gate for one aligned levels record. The
+     * record reaches the browser byte-for-byte, so anything this misses is something a page has to
+     * survive — the aligner validating its own output is not a substitute for the boundary between
+     * a producer and every client.
+     *
+     * <p>Refused: a foreign Kafka key or a payload {@code symbol} disagreeing with it; oversize
+     * (pre-parse); unparseable or non-object; schema major != 1; a state outside {OK, UNAVAILABLE};
+     * any field the state forbids; a missing or unknown UNAVAILABLE reason; every provenance
+     * combination outside the matrix; and, on OK records, the whole structure contract — required
+     * envelope fields, array bounds, per-level shape with the side-sign rule and duplicate-price
+     * rejection, flip and balance shape, basis fields with a known state, and the cross-field
+     * bounds (level touches and the flip crossing lie at or before the record's own flow time).
+     * Every integral field must be JS-exact and non-truncating; a {@code BigIntegerNode} is
+     * integral and {@code asLong()} would wrap it.
+     */
+    CvdSpxLevelsAccepted validateCvdSpxLevels(String key, String json) {
+        if (json == null || !CVD_SPX_LEVELS_KEY.equals(key)) return null;
+        if (json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > CVD_SPX_LEVELS_MAX_BYTES) {
+            return null;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode n = mapper.readTree(json);
+            if (n == null || !n.isObject()) return null;
+            if (!n.path("schemaVersion").asText("").matches("1\\.\\d+\\.\\d+")) return null;
+            if (!CVD_SPX_LEVELS_KEY.equals(n.path("symbol").asText(""))) return null;
+            Long alignedAtMs = levelsInt(n, "alignedAtMs");
+            if (alignedAtMs == null || alignedAtMs <= 0) return null;
+            String state = n.path("state").asText("");
+
+            if ("OK".equals(state)) {
+                for (String unavailableOnly : CVD_SPX_LEVELS_UNAVAILABLE_ONLY_FIELDS) {
+                    if (n.has(unavailableOnly)) return null;      // present at all, whatever its value
+                }
+                if (!n.path("sessionComplete").isBoolean()) return null;
+                // TEXTUAL by contract: asText() coerces the integer 20260817 into "20260817", so a
+                // strict-type violation would pass a check that looks like it enforces the type.
+                if (!n.path("sessionDate").isTextual()) return null;
+                String sessionDate = n.path("sessionDate").asText("");
+                if (!sessionDate.matches("\\d{8}") || !isCalendarDate(sessionDate)) return null;
+                Long flow = levelsInt(n, "flowEventTimeMs");
+                Long sourcePublished = levelsInt(n, "sourcePublishedAtMs");
+                Long basisCents = levelsInt(n, "basisCents");
+                Long basisMeasured = levelsInt(n, "basisMeasuredAtMs");
+                Long pos = levelsInt(n, "foldPositionMs");
+                Long prints = levelsInt(n, "foldPrints");
+                if (flow == null || flow < 0 || sourcePublished == null || sourcePublished <= 0
+                        || basisCents == null || basisMeasured == null || basisMeasured <= 0
+                        || pos == null || pos < 0 || prints == null || prints < 0) {
+                    return null;
+                }
+                if (!CVD_SPX_LEVELS_BASIS_STATES.contains(n.path("basisState").asText(""))) return null;
+                if (!validLevelsArray(n.get("buyLevels"), true, flow)
+                        || !validLevelsArray(n.get("sellLevels"), false, flow)) {
+                    return null;
+                }
+                com.fasterxml.jackson.databind.JsonNode flip = n.get("flip");
+                if (flip == null) return null;                            // present, possibly null
+                if (!flip.isNull()) {
+                    if (!flip.isObject()) return null;
+                    Long fp = levelsInt(flip, "priceCents");
+                    Long at = levelsInt(flip, "atMs");
+                    Long cross = levelsInt(flip, "cvdAtCross");
+                    String dir = flip.path("direction").asText("");
+                    if (fp == null || fp <= 0 || fp > CVD_SPX_LEVELS_MAX_PRICE_CENTS
+                            || at == null || at <= 0 || at > flow || cross == null
+                            || (!"UP".equals(dir) && !"DOWN".equals(dir))) {
+                        return null;
+                    }
+                }
+                com.fasterxml.jackson.databind.JsonNode balance = n.get("balancePriceCents");
+                if (balance == null) return null;                         // present, possibly null
+                if (!balance.isNull()) {
+                    Long b = levelsInt(n, "balancePriceCents");
+                    if (b == null || b <= 0 || b > CVD_SPX_LEVELS_MAX_PRICE_CENTS) return null;
+                }
+                return new CvdSpxLevelsAccepted(json,
+                        new CvdSpxLevelsProvenance(sessionDate, pos, prints), false, false);
+            }
+            if (!"UNAVAILABLE".equals(state)) return null;
+
+            if (!CVD_SPX_LEVELS_REASONS.contains(n.path("reason").asText(""))) return null;
+            for (String okOnly : CVD_SPX_LEVELS_OK_ONLY_FIELDS) {
+                if (n.has(okOnly)) return null;                           // OK-only field on UNAVAILABLE
+            }
+            if (!n.path("provenanceRetained").isBoolean() || !n.path("baselineReset").isBoolean()) return null;
+            if (!n.has("sourceProvenance")) return null;
+            boolean retained = n.path("provenanceRetained").asBoolean();
+            boolean reset = n.path("baselineReset").asBoolean();
+            com.fasterxml.jackson.databind.JsonNode sp = n.get("sourceProvenance");
+            CvdSpxLevelsProvenance p = null;
+            if (!sp.isNull()) {
+                p = provenanceOfUnavailable(sp);
+                if (p == null) return null;
+            }
+            boolean hasProvenance = p != null;
+            boolean matrixOk =
+                    (!hasProvenance && reset && !retained)       // tombstone-derived absence
+                    || (!hasProvenance && !reset && !retained)   // pre-first-source startup absence
+                    || (hasProvenance && !reset && retained)     // provenance-unrecoverable malformed
+                    || (hasProvenance && !reset && !retained);   // causally validated
+            if (!matrixOk) return null;
+            return new CvdSpxLevelsAccepted(json, p, retained, reset);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * U16 startup hydration: read the compacted levels partition's latest COMMITTED record and
+     * apply it through the ordinary validate+retain path, so a restarted gateway serves the
+     * governing record in its very first hello instead of a null. Bounded and best-effort by
+     * design — a failure leaves the replay empty, which the page renders as no_data (fail-closed),
+     * and the next live record hydrates it anyway.
+     */
+    /** Bounded: this runs on the startup path, so it must never hold the service down. */
+    static final long CVD_SPX_LEVELS_HYDRATE_DEADLINE_MS = 15_000L;
+
+    void hydrateCvdSpxLevels() {
+        String topic = settings.esCvdSpxLevelsTopic();
+        Properties props = stringObjectConsumerProperties("cvd-spx-levels-hydrate");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none");
+        // ONE absolute deadline, taken BEFORE the first Kafka call and spent down by every blocking
+        // operation including the close. Per-call 10s timeouts do not bound a startup step: three
+        // metadata calls plus a position() plus a bounded close can each pay their own timeout, and
+        // "15 seconds" would quietly become a minute on a sick broker.
+        final long deadlineNanos = System.nanoTime()
+                + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(CVD_SPX_LEVELS_HYDRATE_DEADLINE_MS);
+        // The CONSTRUCTOR is inside the guard: a config, security or client-initialization failure
+        // here would otherwise escape a best-effort startup step and abort @PostConstruct — the
+        // opposite of the fail-closed levels:null this promises.
+        KafkaConsumer<String, Object> consumer = null;
+        try {
+            consumer = new KafkaConsumer<>(props);
+            var infos = consumer.partitionsFor(topic, hydrateRemaining(deadlineNanos));
+            if (infos == null || infos.isEmpty()) return;               // topic not created yet
+            if (infos.size() != 1) {
+                System.err.println("cvd-spx-levels hydration skipped: " + topic + " has "
+                        + infos.size() + " partitions, expected 1");
+                return;
+            }
+            TopicPartition tp = new TopicPartition(topic, infos.get(0).partition());
+            consumer.assign(List.of(tp));
+            long begin = consumer.beginningOffsets(List.of(tp), hydrateRemaining(deadlineNanos)).get(tp);
+            long end = consumer.endOffsets(List.of(tp), hydrateRemaining(deadlineNanos)).get(tp);
+            // The end offset is the HANDOFF POINT: the live consumer starts this partition here
+            // instead of at its own later seekToEnd, so a record committed between the two can no
+            // longer fall into a gap that leaves the hydrated record replaying indefinitely.
+            cvdSpxLevelsHandoffOffset.set(end);
+            if (end <= begin) return;                                   // empty log
+            consumer.seek(tp, begin);
+            // A read_committed scan can legitimately return NOTHING between begin and end — the
+            // range may hold only aborted batches or transaction control records. That is not a
+            // withdrawal, so it must not be counted as one; the two states are tracked apart.
+            boolean sawRecord = false;
+            String latestValue = null;
+            while (consumer.position(tp, hydrateRemaining(deadlineNanos)) < end) {
+                if (System.nanoTime() >= deadlineNanos) {
+                    System.err.println("cvd-spx-levels hydration timed out; the first hello may carry no levels");
+                    return;
+                }
+                for (ConsumerRecord<String, Object> rec : consumer.poll(hydrateRemaining(deadlineNanos))) {
+                    if (rec.offset() >= end) continue;
+                    // PER KEY, because compaction is per key: a later foreign-key record can sit
+                    // after the governing ES.v.0 one, and taking "the last record in the
+                    // partition" would drop the real state, leave the replay empty, and hand the
+                    // live consumer an offset past it — invisible until the next heartbeat, or
+                    // forever with the aligner stopped. Live ingestion already refuses a foreign
+                    // key without displacing retained state; hydration now matches it, counting
+                    // the foreign record exactly as the live path would.
+                    if (!CVD_SPX_LEVELS_KEY.equals(rec.key())) {
+                        cvdSpxLevelsDrops.incrementAndGet();
+                        continue;
+                    }
+                    sawRecord = true;
+                    latestValue = rec.value() == null ? null : String.valueOf(rec.value());
+                }
+            }
+            if (!sawRecord) return;                                     // nothing committed to hydrate from
+            if (latestValue == null) {
+                // A retained TOMBSTONE is a withdrawal, and CL-R8 counts every one of them. Being
+                // silent here made the counter depend on whether the gateway happened to restart
+                // after the wipe — the same operator action, two different histories.
+                cvdSpxLevelsDrops.incrementAndGet();
+                return;
+            }
+            CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(CVD_SPX_LEVELS_KEY, latestValue);
+            if (accepted == null) {
+                cvdSpxLevelsDrops.incrementAndGet();                    // malformed retained: stay empty
+                return;
+            }
+            retainCvdSpxLevels(accepted);
+        } catch (RuntimeException e) {
+            System.err.println("cvd-spx-levels hydration failed; the first hello may carry no levels: " + e);
+        } finally {
+            if (consumer != null) {
+                try {
+                    consumer.close(hydrateRemaining(deadlineNanos));    // the close is inside the budget too
+                } catch (RuntimeException ignored) { }
+            }
+        }
+    }
+
+    /**
+     * U16 handoff: hydration read to end offset E and closed its consumer; the live consumer would
+     * otherwise seekToEnd to a LATER E', silently skipping everything committed in between — and
+     * if the aligner then stopped, the gateway would replay the older hydrated record forever.
+     * Starting this one partition at E instead makes the two reads continuous. Consumed once, so a
+     * reconnect after a live tombstone cannot rewind to a pre-tombstone position.
+     */
+    /**
+     * Where a levels cursor may actually be honoured. Returns the offset to seek to, or
+     * {@link #CVD_SPX_LEVELS_SEEK_END} when the cursor cannot be trusted: no cursor at all, or one
+     * outside the partition's CURRENT range. The log moves underneath a process-local cursor —
+     * compaction and retention advance the start, a recreation or truncation can leave the whole
+     * log behind it — and this partition shares the state-live consumer, so an out-of-range seek
+     * would take every other JSON state stream down with it (repeated OffsetOutOfRange below the
+     * beginning, a stranded position above the end).
+     *
+     * <p>Pure on purpose: the decision is the part worth testing, and it is testable without a
+     * broker.
+     */
+    static long resolveCvdSpxLevelsSeek(long cursor, long beginningOffset, long endOffset) {
+        if (cursor < 0) return CVD_SPX_LEVELS_SEEK_END;
+        if (cursor < beginningOffset || cursor > endOffset) return CVD_SPX_LEVELS_SEEK_END;
+        return cursor;
+    }
+
+    /** Sentinel: "do not trust the cursor, start at the end". */
+    static final long CVD_SPX_LEVELS_SEEK_END = -1L;
+
+    /** Apply the decision, reading the live range; any failure takes the safe end-seek. */
+    private void seekCvdSpxLevelsWithin(KafkaConsumer<String, Object> consumer, TopicPartition owned,
+                                        long cursor, AtomicLong cursorHolder) {
+        List<TopicPartition> one = List.of(owned);
+        long target;
+        try {
+            long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
+            long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
+            target = resolveCvdSpxLevelsSeek(cursor, beginning, end);
+        } catch (RuntimeException e) {
+            target = CVD_SPX_LEVELS_SEEK_END;                  // range unknown: the safe fallback
+        }
+        if (target == CVD_SPX_LEVELS_SEEK_END) {
+            if (cursorHolder != null) cursorHolder.set(-1L);    // stale: never retried forever
+            consumer.seekToEnd(one);
+            return;
+        }
+        consumer.seek(owned, target);
+    }
+
+    private void seekCvdSpxLevelsToHandoff(KafkaConsumer<String, Object> consumer,
+                                           List<TopicPartition> partitions) {
+        // OWNERSHIP FIRST, consumption second. Both live consumers run this helper, and consuming
+        // the offset before finding the partition let whichever ran first (avro-live, which never
+        // holds this topic) destroy the handoff — leaving state-live at its own later seekToEnd
+        // and reopening the very gap this exists to close. getAndSet then runs only in the
+        // consumer that actually owns the partition, so exactly one seek can happen.
+        String topic = settings.esCvdSpxLevelsTopic();
+        TopicPartition owned = null;
+        for (TopicPartition tp : partitions) {
+            if (tp.topic().equals(topic)) {
+                owned = tp;
+                break;
+            }
+        }
+        if (owned == null) return;
+        long handoff = cvdSpxLevelsHandoffOffset.getAndSet(-1L);
+        if (handoff < 0) return;
+        // Same lifecycle exposure as the retry cursor: between hydration and this seek, retention,
+        // compaction, truncation or a recreation can make the handoff offset invalid.
+        seekCvdSpxLevelsWithin(consumer, owned, handoff, null);
+    }
+
+    /** Remember where this partition got to, so a retry resumes rather than replays. */
+    private void noteCvdSpxLevelsProgress(TopicBinding binding, ConsumerRecord<String, ?> record) {
+        if (binding != null && "es-cvd-spx-levels".equals(binding.event())) {
+            cvdSpxLevelsNextOffset.set(record.offset() + 1);
+        }
+    }
+
+    /**
+     * U16 retry continuity. The generic retry path seeks every partition back into its cache
+     * window — up to 15 minutes — which on a COMPACTED state topic means re-reading history that
+     * has not been cleaned yet. A historical tombstone would then erase the baseline again, a
+     * historical {@code baselineReset} would be re-applied as a fresh operator wipe, and older
+     * post-reset records would be accepted and broadcast on the way back to now, with a concurrent
+     * hello seeing levels:null in the middle of it. None of that is new information: this consumer
+     * already processed those records. So the levels partition resumes from where it left off, and
+     * when nothing is known it starts at the END rather than in the past — a missed record is a
+     * bounded staleness the page already handles, while a replayed erase is a false one.
+     */
+    private void resumeCvdSpxLevels(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        String topic = settings.esCvdSpxLevelsTopic();
+        TopicPartition owned = null;
+        for (TopicPartition tp : partitions) {
+            if (tp.topic().equals(topic)) {
+                owned = tp;
+                break;
+            }
+        }
+        if (owned == null) return;
+        seekCvdSpxLevelsWithin(consumer, owned, cvdSpxLevelsNextOffset.get(), cvdSpxLevelsNextOffset);
+    }
+
+    /** What is left of the hydration budget; never negative, so a blown budget stops immediately. */
+    private static Duration hydrateRemaining(long deadlineNanos) {
+        long remaining = deadlineNanos - System.nanoTime();
+        return remaining <= 0 ? Duration.ZERO : Duration.ofNanos(remaining);
+    }
+
+    /**
+     * The basis states an OK record may carry. SOURCE OF TRUTH: the aligner's
+     * {@code CvdSpxLevelsAligner.OK_BASIS_STATES} in options-edge-processing, which is itself
+     * parity-tested against {@code BasisSnapshot.isValid}. This repo cannot import that constant,
+     * so the set is pinned by a test here that names the same authority — a drift on either side
+     * fails a test rather than silently accepting (or rejecting) a state at the boundary.
+     */
+    static final Set<String> CVD_SPX_LEVELS_BASIS_STATES =
+            Set.of("ANCHORED", "MEASURED", "PROJECTED");
+
+    /** The aligner's reason precedence chain — an unknown reason is a schema violation. */
+    private static final Set<String> CVD_SPX_LEVELS_REASONS = Set.of(
+            "source_absent", "source_malformed", "source_wrong_session", "source_future_dated",
+            "source_overflow", "source_not_observable", "source_stale", "basis_unusable",
+            "translation_error");
+
+    /**
+     * The state-field matrix, both directions. A record carrying a field its state does not define
+     * is malformed WHATEVER the field's value: the record reaches the browser verbatim, so an
+     * UNAVAILABLE frame with a sessionDate and fold provenance in it reads as structure the
+     * aligner never attested.
+     */
+    private static final List<String> CVD_SPX_LEVELS_OK_ONLY_FIELDS = List.of(
+            "buyLevels", "sellLevels", "flip", "balancePriceCents", "basisCents", "basisState",
+            "basisMeasuredAtMs", "sourcePublishedAtMs", "flowEventTimeMs", "sessionComplete",
+            "sessionDate", "foldPositionMs", "foldPrints");
+
+    private static final List<String> CVD_SPX_LEVELS_UNAVAILABLE_ONLY_FIELDS = List.of(
+            "reason", "sourceProvenance", "provenanceRetained", "baselineReset");
+
+    /**
+     * One integral field, read WITHOUT truncation and bounded to JS-exact. A BigIntegerNode is
+     * integral and {@code asLong()} silently wraps it, which would let an oversized value pass a
+     * positive check and then corrupt ordering — so convertibility is required, then the bound.
+     */
+    private static Long levelsInt(com.fasterxml.jackson.databind.JsonNode parent, String field) {
+        com.fasterxml.jackson.databind.JsonNode v = parent.get(field);
+        if (v == null || !v.isIntegralNumber() || !v.canConvertToLong()) return null;
+        long x = v.asLong();
+        return (x > CVD_SPX_LEVELS_MAX_SAFE || x < -CVD_SPX_LEVELS_MAX_SAFE) ? null : x;
+    }
+
+    /** JavaScript's exact-integer bound: the browser is the consumer of every one of these. */
+    static final long CVD_SPX_LEVELS_MAX_SAFE = (1L << 53) - 1;
+
+    /** §2: every translated SPX price is in (0, 10_000_000] cents — balance included. */
+    static final long CVD_SPX_LEVELS_MAX_PRICE_CENTS = 10_000_000L;
+
+    /** A real calendar date, not merely eight digits — 99999999 must not order as a session. */
+    private static boolean isCalendarDate(String yyyymmdd) {
+        try {
+            java.time.LocalDate.parse(yyyymmdd, java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
+            return true;
+        } catch (java.time.format.DateTimeParseException e) {
+            return false;
+        }
+    }
+
+    /** One side's levels: bounded array, per-level shape, side-sign rule, no duplicate prices. */
+    private static boolean validLevelsArray(com.fasterxml.jackson.databind.JsonNode arr,
+                                            boolean buy, long flowEventTimeMs) {
+        if (arr == null || !arr.isArray() || arr.size() > 10) return false;
+        Set<Long> prices = new java.util.HashSet<>();
+        for (com.fasterxml.jackson.databind.JsonNode l : arr) {
+            if (!l.isObject()) return false;
+            Long price = levelsInt(l, "priceCents");
+            Long delta = levelsInt(l, "deltaSum");
+            Long count = levelsInt(l, "tradeCount");
+            Long touch = levelsInt(l, "lastTouchMs");
+            if (price == null || price <= 0 || price > CVD_SPX_LEVELS_MAX_PRICE_CENTS
+                    || !prices.add(price)) return false;
+            if (delta == null || (buy ? delta <= 0 : delta >= 0)) return false;   // side sign
+            if (count == null || count <= 0 || touch == null || touch <= 0) return false;
+            if (touch > flowEventTimeMs) return false;      // bounded by the record's own flow time
+        }
+        return true;
+    }
+
+    /** OK records carry the source's provenance inline (sessionDate + foldPositionMs + foldPrints). */
+    /** UNAVAILABLE records carry it under sourceProvenance when any validated record has existed. */
+    private static CvdSpxLevelsProvenance provenanceOfUnavailable(com.fasterxml.jackson.databind.JsonNode sp) {
+        if (!sp.isObject() || !sp.path("sessionDate").isTextual()) return null;   // textual by contract
+        String sd = sp.path("sessionDate").asText("");
+        Long pos = levelsInt(sp, "foldPositionMs");
+        Long prints = levelsInt(sp, "foldPrints");
+        if (!sd.matches("\\d{8}") || !isCalendarDate(sd)
+                || pos == null || pos < 0 || prints == null || prints < 0) {
+            return null;
+        }
+        return new CvdSpxLevelsProvenance(sd, pos, prints);
+    }
+
+    /**
+     * U16 retention (CL-R7 V1, hop-to-hop freshness): accept the record iff it does not REGRESS
+     * against what is retained, applying the SAME calendar-aware total order the aligner applies.
+     * ONLY the exact tombstone combination resets the baseline; a provenance-less startup-absence
+     * record is accepted only when nothing is retained (never a regression to "nothing known").
+     * Rejections increment gateway_cvd_spx_levels_position_regressions_total and forward nothing,
+     * so a lagging incarnation can never displace a newer attestation on the browser.
+     */
+    synchronized boolean retainCvdSpxLevels(CvdSpxLevelsAccepted accepted) {
+        if (accepted.baselineReset()) {
+            cvdSpxLevelsProvenance = null;                       // operator wipe flows through
+            cvdSpxLevelsLatest.set(accepted.json());
+            return true;
+        }
+        CvdSpxLevelsProvenance incoming = accepted.provenance();
+        if (incoming == null) {
+            if (cvdSpxLevelsProvenance != null) {
+                cvdSpxLevelsRegressions.incrementAndGet();
+                return false;
+            }
+            cvdSpxLevelsLatest.set(accepted.json());
+            return true;
+        }
+        CvdSpxLevelsProvenance held = cvdSpxLevelsProvenance;
+        if (held != null && (incoming.crossed(held) || incoming.compareTo(held) < 0)) {
+            cvdSpxLevelsRegressions.incrementAndGet();
+            return false;
+        }
+        cvdSpxLevelsProvenance = incoming;
+        cvdSpxLevelsLatest.set(accepted.json());
+        return true;
+    }
+
+    /**
+     * U16 withdrawal handling: a TOMBSTONE on the levels topic (reset tooling) clears the connect
+     * replay AND the retention baseline — a withdrawn record must never be served to a late joiner,
+     * and the next record must not be judged against an erased history. Counted so the operation is
+     * visible. Non-tombstone unparseable values just count.
+     */
+    synchronized void evictCvdSpxLevelsTombstone(String event, org.apache.kafka.clients.consumer.ConsumerRecord<String, ?> record) {
+        if (!"es-cvd-spx-levels".equals(event)) {
+            return;
+        }
+        // A withdrawal is as governing as a value, so it passes the SAME key gate: a foreign-key
+        // tombstone is malformed input, counted and ignored, never an erase of the baseline.
+        if (record.value() == null && CVD_SPX_LEVELS_KEY.equals(record.key())) {
+            cvdSpxLevelsLatest.set(null);
+            cvdSpxLevelsProvenance = null;
+        }
+        cvdSpxLevelsDrops.incrementAndGet();
+    }
+
+    java.util.concurrent.atomic.AtomicReference<String> cvdSpxLevelsLatestForTest() {
+        return cvdSpxLevelsLatest;
+    }
+
+    long cvdSpxLevelsDropsForTest() {
+        return cvdSpxLevelsDrops.get();
+    }
+
+    long cvdSpxLevelsRegressionsForTest() {
+        return cvdSpxLevelsRegressions.get();
+    }
+
     /** R46 hello payload: {"sessionDate":...,"hwm":{"30s":<lastBarStartMs>,...}}. */
     String cvdHelloJson() {
         StringBuilder sb = new StringBuilder("{\"sessionDate\":");
@@ -7447,7 +8044,13 @@ public class FeedGatewayService implements ReplayRunner {
             sb.append('\"').append(e.getKey()).append("\":").append(e.getValue());
             first = false;
         }
-        return sb.append("}}").toString();
+        sb.append('}');
+        if (settings.esCvdSpxLevelsEnabled()) {
+            // Verbatim record or an explicit null — the FIELD's presence is the completion signal.
+            String levels = cvdSpxLevelsLatest.get();
+            sb.append(",\"levels\":").append(levels == null ? "null" : levels);
+        }
+        return sb.append('}').toString();
     }
 
     /** One ATOMIC backfill page: session check, rows, cursor and session stamp under one lock. */
@@ -8569,7 +9172,15 @@ public class FeedGatewayService implements ReplayRunner {
             "close-direction",
             // Continuous ES futures buyer/seller pressure is an ES-global advisory card. The payload is
             // symbol-filtered by the browser and deliberately has no option-chain expiry identity.
-            "es-aggressor-flow");
+            "es-aggressor-flow",
+            // DEFECT FIX (found during U16): the ES CVD stream is the same ES-global advisory class,
+            // but was never allowlisted — in per-session (auth) mode broadcast() dropped every
+            // es-cvd/es-cvd-bar frame as non-routable.
+            "es-cvd",
+            "es-cvd-bar",
+            // U16: SPX-translated CVD structure levels — ES-global advisory overlay on the tape page,
+            // fail-closed client-side (ES-CVD-SPX-LEVELS-DESIGN.md CL-R7).
+            "es-cvd-spx-levels");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);

@@ -274,6 +274,19 @@ public final class GatewaySettings {
         return boolValue("GATEWAY_ES_CVD_ENABLED", false);
     }
 
+    /**
+     * U16: SPX-translated CVD structure levels from es-spx-align (JSON, compacted, single
+     * partition, transactional producer — read_committed everywhere). OFF by default: the flag is
+     * the LAST rollout step (ES-CVD-SPX-LEVELS-DESIGN.md CL-R11) and also the paging-alert gate.
+     */
+    public String esCvdSpxLevelsTopic() {
+        return value("KAFKA_ES_CVD_SPX_LEVELS_TOPIC", "options.es-cvd-spx-levels");
+    }
+
+    public boolean esCvdSpxLevelsEnabled() {
+        return boolValue("GATEWAY_ES_CVD_SPX_LEVELS_ENABLED", false);
+    }
+
     public String databentoDirectionalPressureTopic() {
         return value("KAFKA_DATABENTO_DIRECTIONAL_PRESSURE_TOPIC", "options.databento.directional-pressure");
     }
