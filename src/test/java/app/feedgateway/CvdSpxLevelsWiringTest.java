@@ -501,4 +501,29 @@ class CvdSpxLevelsWiringTest {
         assertTrue(nullCheck >= 0 && count > nullCheck && count - nullCheck < 400,
                 "the retained-tombstone branch counts the drop before returning");
     }
+
+    @Test void sessionDateMustBeTextualNotMerelyDigitLike() {
+        // asText() coerces the INTEGER 20260817 into "20260817", so a regex-on-asText check looks
+        // like type enforcement while accepting a strict-type violation.
+        var s = service();
+        assertNull(s.validateCvdSpxLevels(ok("20260817", 1000, 5)
+                        .replace("\"sessionDate\":\"20260817\"", "\"sessionDate\":20260817")),
+                "a numeric top-level sessionDate is malformed");
+        assertNull(s.validateCvdSpxLevels(unavailable("source_stale", prov("20260817", 10, 2), false, false)
+                        .replace("\"sessionDate\":\"20260817\"", "\"sessionDate\":20260817")),
+                "and so is a numeric one inside sourceProvenance");
+    }
+
+    @Test void anEmptyCommittedScanIsNotAWithdrawal() throws Exception {
+        // begin < end says the log has offsets, not that read_committed will return a user record:
+        // the range can hold only aborted batches or control records. Counting that as a tombstone
+        // would invent withdrawals that never happened.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
+        int end = source.indexOf("private void seekCvdSpxLevelsToHandoff", hydrate);
+        String body = source.substring(hydrate, end);
+        assertTrue(body.contains("boolean sawRecord = false"), "the two states are tracked apart");
+        assertTrue(body.indexOf("if (!sawRecord) return;") < body.indexOf("if (latestValue == null)"),
+                "an empty scan returns BEFORE the tombstone branch can count a drop");
+    }
 }

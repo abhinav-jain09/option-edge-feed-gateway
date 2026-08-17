@@ -7594,6 +7594,9 @@ public class FeedGatewayService implements ReplayRunner {
                     if (n.has(unavailableOnly)) return null;      // present at all, whatever its value
                 }
                 if (!n.path("sessionComplete").isBoolean()) return null;
+                // TEXTUAL by contract: asText() coerces the integer 20260817 into "20260817", so a
+                // strict-type violation would pass a check that looks like it enforces the type.
+                if (!n.path("sessionDate").isTextual()) return null;
                 String sessionDate = n.path("sessionDate").asText("");
                 if (!sessionDate.matches("\\d{8}") || !isCalendarDate(sessionDate)) return null;
                 Long flow = levelsInt(n, "flowEventTimeMs");
@@ -7704,6 +7707,10 @@ public class FeedGatewayService implements ReplayRunner {
             cvdSpxLevelsHandoffOffset.set(end);
             if (end <= begin) return;                                   // empty log
             consumer.seek(tp, begin);
+            // A read_committed scan can legitimately return NOTHING between begin and end — the
+            // range may hold only aborted batches or transaction control records. That is not a
+            // withdrawal, so it must not be counted as one; the two states are tracked apart.
+            boolean sawRecord = false;
             String latestKey = null, latestValue = null;
             while (consumer.position(tp, hydrateRemaining(deadlineNanos)) < end) {
                 if (System.nanoTime() >= deadlineNanos) {
@@ -7712,10 +7719,12 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 for (ConsumerRecord<String, Object> rec : consumer.poll(hydrateRemaining(deadlineNanos))) {
                     if (rec.offset() >= end) continue;
+                    sawRecord = true;
                     latestKey = rec.key();
                     latestValue = rec.value() == null ? null : String.valueOf(rec.value());
                 }
             }
+            if (!sawRecord) return;                                     // nothing committed to hydrate from
             if (latestValue == null) {
                 // A retained TOMBSTONE is a withdrawal, and CL-R8 counts every one of them. Being
                 // silent here made the counter depend on whether the gateway happened to restart
@@ -7853,7 +7862,7 @@ public class FeedGatewayService implements ReplayRunner {
     /** OK records carry the source's provenance inline (sessionDate + foldPositionMs + foldPrints). */
     /** UNAVAILABLE records carry it under sourceProvenance when any validated record has existed. */
     private static CvdSpxLevelsProvenance provenanceOfUnavailable(com.fasterxml.jackson.databind.JsonNode sp) {
-        if (!sp.isObject()) return null;
+        if (!sp.isObject() || !sp.path("sessionDate").isTextual()) return null;   // textual by contract
         String sd = sp.path("sessionDate").asText("");
         Long pos = levelsInt(sp, "foldPositionMs");
         Long prints = levelsInt(sp, "foldPrints");
