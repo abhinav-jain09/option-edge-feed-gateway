@@ -2,9 +2,11 @@
 
 pipeline {
   // agent none: the build agent is chosen per-environment from oeProfile(ENVIRONMENT).
-  // buildAgentLabel, which cannot be read before the pipeline starts. Dev builds are
-  // offloaded to the .74 arm64 builders so image builds do not load the dev Mac (.102)
-  // during market hours; production keeps building via REMOTE_BUILD_HOST as before.
+  // buildAgentLabel, which cannot be read before the pipeline starts. BOTH dev and production
+  // now compile on the .74 arm64 builders so the dev Mac (.102) does no build work during
+  // market hours — it runs the controller, the dev cluster, the registry and the broker.
+  // Production still builds its amd64 IMAGE natively on REMOTE_BUILD_HOST (.252); only the
+  // Maven compile/test/package moves, and the jar is architecture-independent.
   // The Deploy stage needs no cluster access — it triggers `service-deploy`, which is
   // itself pinned to an agent on .102 that holds the kubeconfigs.
   agent none
@@ -30,7 +32,12 @@ pipeline {
     stage('Resolve profile') {
       // Runs anywhere: pure Groovy, no workspace needed. Publishes the agent label the
       // Build stage then pins itself to.
+      // skipDefaultCheckout: a declarative `agent` normally triggers an implicit `checkout scm`,
+      // so this stage was doing a full git fetch on whatever node it landed on — including the
+      // dev Mac, which must not do build I/O during market hours. It only calls oeProfile(), so
+      // it needs no working copy at all.
       agent any
+      options { skipDefaultCheckout() }
       steps {
         script {
           def p = oeProfile(params.ENVIRONMENT)
