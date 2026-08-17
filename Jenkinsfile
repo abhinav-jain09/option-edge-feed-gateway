@@ -2,9 +2,11 @@
 
 pipeline {
   // agent none: the build agent is chosen per-environment from oeProfile(ENVIRONMENT).
-  // buildAgentLabel, which cannot be read before the pipeline starts. Dev builds are
-  // offloaded to the .74 arm64 builders so image builds do not load the dev Mac (.102)
-  // during market hours; production keeps building via REMOTE_BUILD_HOST as before.
+  // buildAgentLabel, which cannot be read before the pipeline starts. BOTH dev and production
+  // now compile on the .74 arm64 builders so the dev Mac (.102) does no build work during
+  // market hours — it runs the controller, the dev cluster, the registry and the broker.
+  // Production still builds its amd64 IMAGE natively on REMOTE_BUILD_HOST (.252); only the
+  // Maven compile/test/package moves, and the jar is architecture-independent.
   // The Deploy stage needs no cluster access — it triggers `service-deploy`, which is
   // itself pinned to an agent on .102 that holds the kubeconfigs.
   agent none
@@ -30,7 +32,12 @@ pipeline {
     stage('Resolve profile') {
       // Runs anywhere: pure Groovy, no workspace needed. Publishes the agent label the
       // Build stage then pins itself to.
+      // skipDefaultCheckout: a declarative `agent` normally triggers an implicit `checkout scm`,
+      // so this stage was doing a full git fetch on whatever node it landed on — including the
+      // dev Mac, which must not do build I/O during market hours. It only calls oeProfile(), so
+      // it needs no working copy at all.
       agent any
+      options { skipDefaultCheckout() }
       steps {
         script {
           def p = oeProfile(params.ENVIRONMENT)
@@ -150,7 +157,14 @@ pipeline {
           # Preflight: this stage may run on a builder whose Docker is not always up (the .74
           # agents use Docker Desktop, which needs a GUI session and does not survive reboot).
           # Fail here with something actionable rather than obscurely mid-buildx.
-          if ! docker info >/dev/null 2>&1; then
+          # ONLY for builds that actually use the local daemon: production ships the source to
+          # REMOTE_BUILD_HOST and builds there, so it must not depend on Docker being up on the
+          # agent (Codex: that would fail prod for a reason that has nothing to do with prod).
+          needs_local_docker=true
+          if [ "${ENVIRONMENT:-dev}" = "production" ] && [ "$PUSH_IMAGE" = "true" ]; then
+            needs_local_docker=false
+          fi
+          if [ "$needs_local_docker" = "true" ] && ! docker info >/dev/null 2>&1; then
             echo "Docker daemon is not reachable on this build agent ($(hostname))." >&2
             echo "If this is the .74 builder, start Docker Desktop on it and re-run." >&2
             exit 1
@@ -177,6 +191,11 @@ pipeline {
           PROD_IMAGE="$PUSH_REGISTRY/options-edge-feed-gateway:prod"  # self-documenting prod moving tag
           BUILDER_NAME="options-edge-feed-gateway-${BUILD_NUMBER:-local}"
           BUILDKITD_CONFIG="$(mktemp)"
+          # Register the file-only cleanup IMMEDIATELY: several fallible commands run before the
+          # builder exists, and under `set -e` a failure there would otherwise leak the temp
+          # config. Redefined below once the builder is actually created.
+          cleanup() { rm -f "$BUILDKITD_CONFIG"; }
+          trap cleanup EXIT
           # Write a buildkit insecure-registry entry for the registry we actually PUSH to
           # (normalized: scheme stripped, trailing slash stripped, lowercased) iff it matches
           # any entry in $INSECURE_REGISTRIES (derived from oeProfile in Resolve profile,
@@ -204,13 +223,18 @@ EOF
           else
             : > "$BUILDKITD_CONFIG"
           fi
-          docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-          docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" --use >/dev/null
-          cleanup() {
+          # Same reasoning as the preflight: the production remote-build path never touches the
+          # local daemon, so do not create/destroy a local buildx builder for it.
+          if [ "$needs_local_docker" = "true" ]; then
             docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-            rm -f "$BUILDKITD_CONFIG"
-          }
-          trap cleanup EXIT
+            docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" --use >/dev/null
+            # Builder now exists — widen cleanup to remove it too. The EXIT trap already points
+            # at `cleanup`, so redefining the function is enough.
+            cleanup() {
+              docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
+              rm -f "$BUILDKITD_CONFIG"
+            }
+          fi
           TAG_ARGS="-t $IMAGE"
           if [ -n "$DEV_TAG" ] && [ "$DEV_TAG" != "$TAG" ]; then
             TAG_ARGS="$TAG_ARGS -t $DEV_IMAGE"
