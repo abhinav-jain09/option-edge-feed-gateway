@@ -7688,8 +7688,12 @@ public class FeedGatewayService implements ReplayRunner {
         // "15 seconds" would quietly become a minute on a sick broker.
         final long deadlineNanos = System.nanoTime()
                 + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(CVD_SPX_LEVELS_HYDRATE_DEADLINE_MS);
-        KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(props);
+        // The CONSTRUCTOR is inside the guard: a config, security or client-initialization failure
+        // here would otherwise escape a best-effort startup step and abort @PostConstruct — the
+        // opposite of the fail-closed levels:null this promises.
+        KafkaConsumer<String, Object> consumer = null;
         try {
+            consumer = new KafkaConsumer<>(props);
             var infos = consumer.partitionsFor(topic, hydrateRemaining(deadlineNanos));
             if (infos == null || infos.isEmpty()) return;               // topic not created yet
             if (infos.size() != 1) {
@@ -7711,7 +7715,7 @@ public class FeedGatewayService implements ReplayRunner {
             // range may hold only aborted batches or transaction control records. That is not a
             // withdrawal, so it must not be counted as one; the two states are tracked apart.
             boolean sawRecord = false;
-            String latestKey = null, latestValue = null;
+            String latestValue = null;
             while (consumer.position(tp, hydrateRemaining(deadlineNanos)) < end) {
                 if (System.nanoTime() >= deadlineNanos) {
                     System.err.println("cvd-spx-levels hydration timed out; the first hello may carry no levels");
@@ -7719,8 +7723,18 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 for (ConsumerRecord<String, Object> rec : consumer.poll(hydrateRemaining(deadlineNanos))) {
                     if (rec.offset() >= end) continue;
+                    // PER KEY, because compaction is per key: a later foreign-key record can sit
+                    // after the governing ES.v.0 one, and taking "the last record in the
+                    // partition" would drop the real state, leave the replay empty, and hand the
+                    // live consumer an offset past it — invisible until the next heartbeat, or
+                    // forever with the aligner stopped. Live ingestion already refuses a foreign
+                    // key without displacing retained state; hydration now matches it, counting
+                    // the foreign record exactly as the live path would.
+                    if (!CVD_SPX_LEVELS_KEY.equals(rec.key())) {
+                        cvdSpxLevelsDrops.incrementAndGet();
+                        continue;
+                    }
                     sawRecord = true;
-                    latestKey = rec.key();
                     latestValue = rec.value() == null ? null : String.valueOf(rec.value());
                 }
             }
@@ -7732,7 +7746,7 @@ public class FeedGatewayService implements ReplayRunner {
                 cvdSpxLevelsDrops.incrementAndGet();
                 return;
             }
-            CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(latestKey, latestValue);
+            CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(CVD_SPX_LEVELS_KEY, latestValue);
             if (accepted == null) {
                 cvdSpxLevelsDrops.incrementAndGet();                    // malformed retained: stay empty
                 return;
@@ -7741,9 +7755,11 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (RuntimeException e) {
             System.err.println("cvd-spx-levels hydration failed; the first hello may carry no levels: " + e);
         } finally {
-            try {
-                consumer.close(hydrateRemaining(deadlineNanos));        // the close is inside the budget too
-            } catch (RuntimeException ignored) { }
+            if (consumer != null) {
+                try {
+                    consumer.close(hydrateRemaining(deadlineNanos));    // the close is inside the budget too
+                } catch (RuntimeException ignored) { }
+            }
         }
     }
 

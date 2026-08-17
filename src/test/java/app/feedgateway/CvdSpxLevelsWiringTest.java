@@ -365,8 +365,8 @@ class CvdSpxLevelsWiringTest {
         assertTrue(hydrate >= 0 && hydrateEnd > hydrate);
         String body = source.substring(hydrate, hydrateEnd);
         assertTrue(body.contains("infos.size() != 1"), "the single-partition contract is re-asserted");
-        assertTrue(body.contains("validateCvdSpxLevels(latestKey, latestValue)"),
-                "the hydrated record goes through the SAME gate as a live one, key included");
+        assertTrue(body.contains("validateCvdSpxLevels(CVD_SPX_LEVELS_KEY, latestValue)"),
+                "the hydrated record goes through the SAME gate as a live one");
         assertTrue(body.contains("retainCvdSpxLevels(accepted)"), "and through the same retention");
     }
 
@@ -525,5 +525,36 @@ class CvdSpxLevelsWiringTest {
         assertTrue(body.contains("boolean sawRecord = false"), "the two states are tracked apart");
         assertTrue(body.indexOf("if (!sawRecord) return;") < body.indexOf("if (latestValue == null)"),
                 "an empty scan returns BEFORE the tombstone branch can count a drop");
+    }
+
+    @Test void hydrationTracksTheContractualKeyNotTheLastRecord() throws Exception {
+        // Compaction is PER KEY, so a later foreign-key record can sit after the governing ES.v.0
+        // one. Taking "the last record in the partition" would drop the real state, leave the
+        // replay empty, and hand the live consumer an offset past it — invisible until the next
+        // heartbeat, or forever with the aligner stopped.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
+        int end = source.indexOf("private void seekCvdSpxLevelsToHandoff", hydrate);
+        String body = source.substring(hydrate, end);
+        assertTrue(body.contains("!CVD_SPX_LEVELS_KEY.equals(rec.key())"),
+                "foreign-key records are filtered out of the scan");
+        int filter = body.indexOf("!CVD_SPX_LEVELS_KEY.equals(rec.key())");
+        assertTrue(body.indexOf("cvdSpxLevelsDrops.incrementAndGet()", filter) > filter,
+                "and counted exactly as the live path counts them");
+        assertTrue(body.indexOf("sawRecord = true", filter) > filter,
+                "only a contractual-key record counts as something to hydrate from");
+    }
+
+    @Test void theHydrationConsumerIsConstructedInsideTheGuard() throws Exception {
+        // A config/security/client-init failure in the constructor would otherwise escape a
+        // best-effort startup step and abort @PostConstruct — the opposite of the fail-closed
+        // levels:null this promises.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
+        int end = source.indexOf("private void seekCvdSpxLevelsToHandoff", hydrate);
+        String body = source.substring(hydrate, end);
+        assertTrue(body.indexOf("try {") < body.indexOf("new KafkaConsumer<>(props)"),
+                "construction happens inside the guarded lifecycle");
+        assertTrue(body.contains("if (consumer != null)"), "and the close tolerates a failed construction");
     }
 }
