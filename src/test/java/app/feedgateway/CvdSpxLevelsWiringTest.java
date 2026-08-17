@@ -579,6 +579,12 @@ class CvdSpxLevelsWiringTest {
                 "it resumes from the tracked offset");
         assertTrue(body.contains("seekToEnd(List.of(owned))"),
                 "and when nothing is known it starts at the END, never in the past");
+        assertTrue(body.contains("next < beginning || next > end"),
+                "the process-local cursor is validated against the CURRENT log range");
+        assertTrue(body.contains("cvdSpxLevelsNextOffset.set(-1L)"),
+                "and a stale cursor is discarded rather than retried forever");
+        assertTrue(body.contains("catch (RuntimeException e)"),
+                "an unreadable range falls back to the same safe end-seek");
         assertTrue(source.contains("cvdSpxLevelsNextOffset.set(record.offset() + 1)"),
                 "progress is tracked for every levels record, values and tombstones alike");
     }

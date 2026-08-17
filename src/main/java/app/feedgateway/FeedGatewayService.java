@@ -7826,10 +7826,29 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (owned == null) return;
         long next = cvdSpxLevelsNextOffset.get();
-        if (next >= 0) {
-            consumer.seek(owned, next);
-        } else {
+        if (next < 0) {
             consumer.seekToEnd(List.of(owned));
+            return;
+        }
+        // The tracked cursor is PROCESS-LOCAL, and the log underneath it moves: compaction and
+        // retention advance the log start, and a topic recreation or truncation can leave the
+        // whole log behind it. Seeking outside the live range would fail repeatedly with
+        // OffsetOutOfRange (below) or strand the consumer past the end (above) — and because this
+        // partition shares the state-live consumer, that would wedge every other JSON state
+        // stream with it. So the cursor is only honoured while it is inside the current range.
+        try {
+            List<TopicPartition> one = List.of(owned);
+            long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
+            long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
+            if (next < beginning || next > end) {
+                cvdSpxLevelsNextOffset.set(-1L);            // stale cursor: do not keep re-trying it
+                consumer.seekToEnd(one);
+                return;
+            }
+            consumer.seek(owned, next);
+        } catch (RuntimeException e) {
+            cvdSpxLevelsNextOffset.set(-1L);
+            consumer.seekToEnd(List.of(owned));            // range unknown: the safe fallback
         }
     }
 
