@@ -7776,6 +7776,47 @@ public class FeedGatewayService implements ReplayRunner {
      * Starting this one partition at E instead makes the two reads continuous. Consumed once, so a
      * reconnect after a live tombstone cannot rewind to a pre-tombstone position.
      */
+    /**
+     * Where a levels cursor may actually be honoured. Returns the offset to seek to, or
+     * {@link #CVD_SPX_LEVELS_SEEK_END} when the cursor cannot be trusted: no cursor at all, or one
+     * outside the partition's CURRENT range. The log moves underneath a process-local cursor —
+     * compaction and retention advance the start, a recreation or truncation can leave the whole
+     * log behind it — and this partition shares the state-live consumer, so an out-of-range seek
+     * would take every other JSON state stream down with it (repeated OffsetOutOfRange below the
+     * beginning, a stranded position above the end).
+     *
+     * <p>Pure on purpose: the decision is the part worth testing, and it is testable without a
+     * broker.
+     */
+    static long resolveCvdSpxLevelsSeek(long cursor, long beginningOffset, long endOffset) {
+        if (cursor < 0) return CVD_SPX_LEVELS_SEEK_END;
+        if (cursor < beginningOffset || cursor > endOffset) return CVD_SPX_LEVELS_SEEK_END;
+        return cursor;
+    }
+
+    /** Sentinel: "do not trust the cursor, start at the end". */
+    static final long CVD_SPX_LEVELS_SEEK_END = -1L;
+
+    /** Apply the decision, reading the live range; any failure takes the safe end-seek. */
+    private void seekCvdSpxLevelsWithin(KafkaConsumer<String, Object> consumer, TopicPartition owned,
+                                        long cursor, AtomicLong cursorHolder) {
+        List<TopicPartition> one = List.of(owned);
+        long target;
+        try {
+            long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
+            long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
+            target = resolveCvdSpxLevelsSeek(cursor, beginning, end);
+        } catch (RuntimeException e) {
+            target = CVD_SPX_LEVELS_SEEK_END;                  // range unknown: the safe fallback
+        }
+        if (target == CVD_SPX_LEVELS_SEEK_END) {
+            if (cursorHolder != null) cursorHolder.set(-1L);    // stale: never retried forever
+            consumer.seekToEnd(one);
+            return;
+        }
+        consumer.seek(owned, target);
+    }
+
     private void seekCvdSpxLevelsToHandoff(KafkaConsumer<String, Object> consumer,
                                            List<TopicPartition> partitions) {
         // OWNERSHIP FIRST, consumption second. Both live consumers run this helper, and consuming
@@ -7794,7 +7835,9 @@ public class FeedGatewayService implements ReplayRunner {
         if (owned == null) return;
         long handoff = cvdSpxLevelsHandoffOffset.getAndSet(-1L);
         if (handoff < 0) return;
-        consumer.seek(owned, handoff);
+        // Same lifecycle exposure as the retry cursor: between hydration and this seek, retention,
+        // compaction, truncation or a recreation can make the handoff offset invalid.
+        seekCvdSpxLevelsWithin(consumer, owned, handoff, null);
     }
 
     /** Remember where this partition got to, so a retry resumes rather than replays. */
@@ -7825,31 +7868,7 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
         if (owned == null) return;
-        long next = cvdSpxLevelsNextOffset.get();
-        if (next < 0) {
-            consumer.seekToEnd(List.of(owned));
-            return;
-        }
-        // The tracked cursor is PROCESS-LOCAL, and the log underneath it moves: compaction and
-        // retention advance the log start, and a topic recreation or truncation can leave the
-        // whole log behind it. Seeking outside the live range would fail repeatedly with
-        // OffsetOutOfRange (below) or strand the consumer past the end (above) — and because this
-        // partition shares the state-live consumer, that would wedge every other JSON state
-        // stream with it. So the cursor is only honoured while it is inside the current range.
-        try {
-            List<TopicPartition> one = List.of(owned);
-            long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
-            long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
-            if (next < beginning || next > end) {
-                cvdSpxLevelsNextOffset.set(-1L);            // stale cursor: do not keep re-trying it
-                consumer.seekToEnd(one);
-                return;
-            }
-            consumer.seek(owned, next);
-        } catch (RuntimeException e) {
-            cvdSpxLevelsNextOffset.set(-1L);
-            consumer.seekToEnd(List.of(owned));            // range unknown: the safe fallback
-        }
+        seekCvdSpxLevelsWithin(consumer, owned, cvdSpxLevelsNextOffset.get(), cvdSpxLevelsNextOffset);
     }
 
     /** What is left of the hydration budget; never negative, so a blown budget stops immediately. */

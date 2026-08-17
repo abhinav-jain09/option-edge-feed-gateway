@@ -361,7 +361,7 @@ class CvdSpxLevelsWiringTest {
                 "hydration runs at startup, behind the flag, before clients can connect");
 
         int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
-        int hydrateEnd = source.indexOf("CVD_SPX_LEVELS_BASIS_STATES", hydrate);
+        int hydrateEnd = source.indexOf("static long resolveCvdSpxLevelsSeek", hydrate);
         assertTrue(hydrate >= 0 && hydrateEnd > hydrate);
         String body = source.substring(hydrate, hydrateEnd);
         assertTrue(body.contains("infos.size() != 1"), "the single-partition contract is re-asserted");
@@ -466,7 +466,7 @@ class CvdSpxLevelsWiringTest {
         // and a bounded close can each pay their own, and "15 seconds" becomes a minute.
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
-        int end = source.indexOf("private void seekCvdSpxLevelsToHandoff", hydrate);
+        int end = source.indexOf("static long resolveCvdSpxLevelsSeek", hydrate);
         String body = source.substring(hydrate, end);
         assertFalse(body.contains("Duration.ofSeconds(10)"), "no per-call constant timeouts remain");
         assertTrue(body.indexOf("deadlineNanos = System.nanoTime()") < body.indexOf("partitionsFor("),
@@ -485,8 +485,8 @@ class CvdSpxLevelsWiringTest {
         String body = source.substring(helper, end);
         assertTrue(body.indexOf("owned == null") < body.indexOf("getAndSet(-1L)"),
                 "ownership is established BEFORE the offset is consumed");
-        assertTrue(body.indexOf("getAndSet(-1L)") < body.indexOf("consumer.seek(owned"),
-                "and the consuming consumer is the one that seeks");
+        assertTrue(body.indexOf("getAndSet(-1L)") < body.indexOf("seekCvdSpxLevelsWithin(consumer, owned"),
+                "and the consuming consumer is the one that seeks (through the range check)");
     }
 
     @Test void aRetainedTombstoneIsCountedAtStartupToo() throws Exception {
@@ -494,7 +494,7 @@ class CvdSpxLevelsWiringTest {
         // operator wipe: the same action, two different histories.
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
-        int end = source.indexOf("private void seekCvdSpxLevelsToHandoff", hydrate);
+        int end = source.indexOf("static long resolveCvdSpxLevelsSeek", hydrate);
         String body = source.substring(hydrate, end);
         int nullCheck = body.indexOf("if (latestValue == null)");
         int count = body.indexOf("cvdSpxLevelsDrops.incrementAndGet()", nullCheck);
@@ -520,7 +520,7 @@ class CvdSpxLevelsWiringTest {
         // would invent withdrawals that never happened.
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
-        int end = source.indexOf("private void seekCvdSpxLevelsToHandoff", hydrate);
+        int end = source.indexOf("static long resolveCvdSpxLevelsSeek", hydrate);
         String body = source.substring(hydrate, end);
         assertTrue(body.contains("boolean sawRecord = false"), "the two states are tracked apart");
         assertTrue(body.indexOf("if (!sawRecord) return;") < body.indexOf("if (latestValue == null)"),
@@ -534,7 +534,7 @@ class CvdSpxLevelsWiringTest {
         // heartbeat, or forever with the aligner stopped.
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
-        int end = source.indexOf("private void seekCvdSpxLevelsToHandoff", hydrate);
+        int end = source.indexOf("static long resolveCvdSpxLevelsSeek", hydrate);
         String body = source.substring(hydrate, end);
         assertTrue(body.contains("!CVD_SPX_LEVELS_KEY.equals(rec.key())"),
                 "foreign-key records are filtered out of the scan");
@@ -551,7 +551,7 @@ class CvdSpxLevelsWiringTest {
         // levels:null this promises.
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         int hydrate = source.indexOf("void hydrateCvdSpxLevels()");
-        int end = source.indexOf("private void seekCvdSpxLevelsToHandoff", hydrate);
+        int end = source.indexOf("static long resolveCvdSpxLevelsSeek", hydrate);
         String body = source.substring(hydrate, end);
         assertTrue(body.indexOf("try {") < body.indexOf("new KafkaConsumer<>(props)"),
                 "construction happens inside the guarded lifecycle");
@@ -573,18 +573,11 @@ class CvdSpxLevelsWiringTest {
                 "the levels partition is re-seeked AFTER the generic window seek, before any poll");
 
         int helper = source.indexOf("private void resumeCvdSpxLevels");
-        int helperEnd = source.indexOf("hydrateRemaining(long deadlineNanos)", helper);
+        int helperEnd = source.indexOf("private static Duration hydrateRemaining", helper);
         String body = source.substring(helper, helperEnd);
-        assertTrue(body.contains("cvdSpxLevelsNextOffset.get()") && body.contains("consumer.seek(owned, next)"),
-                "it resumes from the tracked offset");
-        assertTrue(body.contains("seekToEnd(List.of(owned))"),
-                "and when nothing is known it starts at the END, never in the past");
-        assertTrue(body.contains("next < beginning || next > end"),
-                "the process-local cursor is validated against the CURRENT log range");
-        assertTrue(body.contains("cvdSpxLevelsNextOffset.set(-1L)"),
-                "and a stale cursor is discarded rather than retried forever");
-        assertTrue(body.contains("catch (RuntimeException e)"),
-                "an unreadable range falls back to the same safe end-seek");
+        assertTrue(body.contains("cvdSpxLevelsNextOffset.get()"), "it resumes from the tracked offset");
+        assertTrue(body.contains("seekCvdSpxLevelsWithin(consumer, owned, cvdSpxLevelsNextOffset.get()"),
+                "the cursor is applied through the range-validating helper, not seeked blindly");
         assertTrue(source.contains("cvdSpxLevelsNextOffset.set(record.offset() + 1)"),
                 "progress is tracked for every levels record, values and tombstones alike");
     }
@@ -604,5 +597,36 @@ class CvdSpxLevelsWiringTest {
         // Only a GOVERNING (newer) record moves it, reset or not.
         assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 6000, 50))));
         assertTrue(s.cvdSpxLevelsLatestForTest().get().contains("\"foldPositionMs\":6000"));
+    }
+
+    @Test void aCursorIsHonouredOnlyInsideTheLiveLogRange() {
+        // Executable, not a source pin: this is the decision both seek paths make. A cursor below
+        // the beginning (compaction/retention moved the log start) would fail repeatedly with
+        // OffsetOutOfRange; one above the end (truncation or a recreated topic) would strand the
+        // consumer past the data. Because this partition shares the state-live consumer, either
+        // takes every other JSON state stream down with it.
+        long END = FeedGatewayService.CVD_SPX_LEVELS_SEEK_END;
+
+        assertEquals(500L, FeedGatewayService.resolveCvdSpxLevelsSeek(500L, 100L, 900L), "inside the range");
+        assertEquals(100L, FeedGatewayService.resolveCvdSpxLevelsSeek(100L, 100L, 900L), "at the beginning");
+        assertEquals(900L, FeedGatewayService.resolveCvdSpxLevelsSeek(900L, 100L, 900L),
+                "at the end — the next record to read is exactly there");
+
+        assertEquals(END, FeedGatewayService.resolveCvdSpxLevelsSeek(99L, 100L, 900L),
+                "one below the beginning: compaction moved the log start");
+        assertEquals(END, FeedGatewayService.resolveCvdSpxLevelsSeek(901L, 100L, 900L),
+                "one past the end: truncation or a recreated topic");
+        assertEquals(END, FeedGatewayService.resolveCvdSpxLevelsSeek(-1L, 100L, 900L), "no cursor at all");
+        assertEquals(END, FeedGatewayService.resolveCvdSpxLevelsSeek(5L, 0L, 0L), "an empty log");
+    }
+
+    @Test void bothSeekPathsGoThroughTheSameValidation() throws Exception {
+        // The handoff has the same lifecycle exposure as the retry cursor: retention, compaction,
+        // truncation or a recreation between hydration and the live consumer's first seek.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int handoff = source.indexOf("private void seekCvdSpxLevelsToHandoff");
+        int handoffEnd = source.indexOf("private void noteCvdSpxLevelsProgress", handoff);
+        assertTrue(source.substring(handoff, handoffEnd).contains("seekCvdSpxLevelsWithin(consumer, owned, handoff"),
+                "the startup handoff is range-validated too, not seeked blindly");
     }
 }
