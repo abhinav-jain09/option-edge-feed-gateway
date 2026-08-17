@@ -1593,12 +1593,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.esAggressorFlowEnabled()) {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
-        if (settings.esCvdEnabled()) {
-            // ES CVD live snapshot (1 Hz, compacted, keyed ES.v.0) and bar-close upserts
-            // (keyed symbol|timeframe|barStartMs) — R37/R37a in ES-CVD-DESIGN.md.
-            topicEvents.put(settings.esCvdTopic(), new TopicBinding("DATABENTO", "es-cvd"));
-            topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding("DATABENTO", "es-cvd-bar"));
-        }
+        addEsCvdTopics(topicEvents);
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
@@ -1719,14 +1714,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.esAggressorFlowEnabled()) {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
-        if (settings.esCvdEnabled()) {
-            // DEFECT FIX (found during U16): #136 bound these to the CACHE consumer only, but the
-            // es-cvd/es-cvd-bar delivery branches live in THIS consumer's loop — live snapshots,
-            // bar upserts and therefore the REST backfill view never populated. Same both-consumers
-            // shape as es-aggressor-flow above.
-            topicEvents.put(settings.esCvdTopic(), new TopicBinding("DATABENTO", "es-cvd"));
-            topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding("DATABENTO", "es-cvd-bar"));
-        }
+        addEsCvdTopics(topicEvents);
         if (settings.esCvdSpxLevelsEnabled()) {
             // U16: SPX-translated CVD structure levels (compacted single-partition heartbeat,
             // >=1 record per ALIGN_HEARTBEAT while the aligner runs) — LIVE consumer only. The
@@ -1736,6 +1724,13 @@ public class FeedGatewayService implements ReplayRunner {
         }
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
+    }
+
+    private void addEsCvdTopics(Map<String, TopicBinding> topicEvents) {
+        if (!settings.esCvdEnabled()) return;
+        // One wiring path is shared by bootstrap and live consumers so their topic sets cannot drift.
+        topicEvents.put(settings.esCvdTopic(), new TopicBinding("DATABENTO", "es-cvd"));
+        topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding("DATABENTO", "es-cvd-bar"));
     }
 
     private void runAlertConsumer() {

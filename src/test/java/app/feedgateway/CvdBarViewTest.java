@@ -2,10 +2,27 @@ package app.feedgateway;
 
 import static org.junit.jupiter.api.Assertions.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 
 /** The keyed CVD bar view: upsert semantics, session rollover, pagination, high-water marks (R37a/R46). */
 class CvdBarViewTest {
+
+    @Test void bootstrapAndLiveConsumersShareOneCvdTopicWiringPath() throws Exception {
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        assertEquals(2, occurrences(source, "addEsCvdTopics(topicEvents);"));
+        assertEquals(1, occurrences(source,
+                "topicEvents.put(settings.esCvdTopic(), new TopicBinding(\"DATABENTO\", \"es-cvd\"));"));
+        assertEquals(1, occurrences(source,
+                "topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding(\"DATABENTO\", \"es-cvd-bar\"));"));
+    }
+
+    private static int occurrences(String text, String needle) {
+        int count = 0;
+        for (int at = 0; (at = text.indexOf(needle, at)) >= 0; at += needle.length()) count++;
+        return count;
+    }
 
     private static FeedGatewayService service() {
         return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
