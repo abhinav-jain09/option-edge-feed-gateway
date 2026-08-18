@@ -17,13 +17,22 @@ import java.util.List;
  * and it returns the envelope, or {@code null} when there is nothing to publish yet. The caller owns
  * caching/coalescing/broadcast — see {@code FeedGatewayService}.
  *
- * <p><b>Anchor strike.</b> The UI shows one pill on one strike. The anchor is resolved from
- * {@code state.defendedLevel} — which IS a strike value (the state machine compares it directly to
- * strikes) — and falls back to {@code profile.pinCandidateStrike} (also a strike). When an actionable
- * state has NEITHER anchor (a pure call-side ARMED whose session-high anchor is not in the contract),
- * the envelope carries the book with an EMPTY {@code strikes[]}: the UI renders no pill but the data
- * stays live. This is a deliberate refusal to fabricate an anchor; a dedicated backend anchor field
- * would let the call-side pill attach to a strike.
+ * <p><b>Anchor strike.</b> The UI shows one pill on one strike, and the anchor is read from the side
+ * the backend itself decided: a CALL permission anchors to {@code state.armedAnchorStrike} (the armed
+ * cluster's anchor — the same strike the fire record carries as {@code anchorLevel} and the same one
+ * frozen into the triggerId), a PUT permission to {@code state.defendedLevel} (the defense level).
+ * There is no cross-side fallback: the two anchors mean different things and neither substitutes for
+ * the other.
+ *
+ * <p>{@code profile.pinCandidateStrike} is deliberately NOT an anchor. It is the pin magnet — the
+ * max long-gamma strike near spot inside the final PIN_WINDOW_MS — so using it would pin a sell
+ * permission to an unrelated strike during the one window where it happens to be non-null. It was
+ * the CALL anchor until 2026-08-18 and it was measured null in 260/260 live records, which is why
+ * the first CALL fires in ~30 days rendered no pill at all.
+ *
+ * <p>When an actionable state has no side-correct anchor, the envelope carries the book with an
+ * EMPTY {@code strikes[]}: the UI renders no pill but the data stays live. That refusal is
+ * unchanged — this reads a real anchor, it does not relax the guard.
  *
  * <p><b>Action side.</b> CALL/PUT is NOT composed here as copy — it is read from which SELL zone in
  * {@code state.actions[]} is most permissive (CALL_SELL_ZONE ⇒ CALL, PUT_SELL_ZONE ⇒ PUT), i.e. the
@@ -95,6 +104,7 @@ public final class DealerLedgerJoiner {
         putNumber(book, "flipLevel", p.get("nearestFlip"));
         putNumber(book, "pinCandidate", p.get("pinCandidateStrike"));
         putNumber(book, "defendedLevel", s.get("defendedLevel"));
+        putNumber(book, "armedAnchorStrike", s.get("armedAnchorStrike"));
         // Quality: profile is authoritative for greeks/inventory; state owns spot quality (and MISSING).
         putText(book, "inventoryConfidence", firstNode(p.get("inventoryConfidence"), s.get("inventoryConfidence")));
         putText(book, "greeksQuality", firstNode(p.get("greeksQuality"), s.get("greeksQuality")));
@@ -125,19 +135,15 @@ public final class DealerLedgerJoiner {
         if (!ACTIONABLE_STATES.contains(state)) {
             return null;
         }
-        // Resolve the action SIDE first, then anchor by side. defendedLevel is the DEFENSE/support anchor
-        // (put-side); it must NEVER anchor a CALL-side sell permission. A CALL-side entry anchors ONLY to
-        // pinCandidateStrike (the backend exposes no dedicated call-side/cluster anchor yet); if that is
-        // absent, we render NO pill rather than fabricate the wrong strike. PUT/DEFENDED and the
-        // (defense-oriented) ARMING candidate phase use defendedLevel first, then pinCandidateStrike.
+        // Resolve the action SIDE first, then take THAT side's anchor and no other. armedAnchorStrike is
+        // the CALL-side anchor (the armed cluster the fire is about); defendedLevel is the PUT-side
+        // defense level. Neither may stand in for the other: anchoring a call-sell permission to a put
+        // support, or a defense to a candidate-flow cluster, names a strike the signal was never about.
         String[] sideAndPermission = dominantSell(s.get("actions"));
         String side = sideAndPermission[0]; // CALL | PUT | null
-        double anchor;
-        if ("CALL".equals(side)) {
-            anchor = numberOrNaN(p.get("pinCandidateStrike"));
-        } else {
-            anchor = firstFinite(s.get("defendedLevel"), p.get("pinCandidateStrike"));
-        }
+        double anchor = "CALL".equals(side)
+                ? numberOrNaN(s.get("armedAnchorStrike"))
+                : numberOrNaN(s.get("defendedLevel"));
         if (!Double.isFinite(anchor)) {
             return null; // no valid side-correct strike to pin the pill to — emit book only
         }
@@ -250,11 +256,6 @@ public final class DealerLedgerJoiner {
 
     private static long longOr(JsonNode node, long fallback) {
         return (node != null && node.isNumber()) ? node.asLong() : fallback;
-    }
-
-    private static double firstFinite(JsonNode a, JsonNode b) {
-        double first = numberOrNaN(a);
-        return Double.isFinite(first) ? first : numberOrNaN(b);
     }
 
     private static double numberOrNaN(JsonNode node) {

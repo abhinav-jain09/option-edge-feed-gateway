@@ -84,40 +84,97 @@ class DealerLedgerJoinerTest {
     }
 
     @Test
-    void callArmedDoesNotUseDefendedLevelAsAnchor() throws Exception {
-        // CALL-side ARMED must anchor to pinCandidateStrike (5350), NEVER the put-side defendedLevel (5340),
-        // even though defendedLevel is present (defense-candidate lifecycle). This is a wrong-strike guard.
-        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"pinCandidateStrike\":5350}";
+    void callArmedAnchorsToTheArmedClusterNotThePutSideDefendedLevel() throws Exception {
+        // CALL-side ARMED anchors to armedAnchorStrike (5350), NEVER the put-side defendedLevel (5340),
+        // even though defendedLevel is present (defense-candidate lifecycle). Wrong-strike guard.
+        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\"}";
         String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"ARMED\",\"defendedLevel\":5340,"
+                + "\"armedAnchorStrike\":5350,"
                 + "\"actions\":[{\"zone\":\"CALL_SELL_ZONE\",\"state\":\"ACTIVE\"},{\"zone\":\"PUT_SELL_ZONE\",\"state\":\"WAITING\"}]}";
         ObjectNode env = join(profile, state, false);
         JsonNode e = env.get("strikes").get(0);
-        assertEquals(5350.0, e.get("strike").asDouble()); // pinCandidateStrike, NOT defendedLevel 5340
+        assertEquals(5350.0, e.get("strike").asDouble()); // armedAnchorStrike, NOT defendedLevel 5340
         assertEquals("CALL", e.get("action").asText());
         assertEquals("ACTIVE", e.get("permission").asText());
+        assertEquals(5350.0, env.get("book").get("armedAnchorStrike").asDouble(),
+                "the anchor is also inspectable in the book");
     }
 
     @Test
     void defendedLevelPresentButDominantActionCALLDoesNotAnchorToDefendedLevel() throws Exception {
         // Explicit: defendedLevel set + CALL dominant ⇒ the entry strike is NOT defendedLevel.
-        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"pinCandidateStrike\":5400}";
+        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\"}";
         String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"ARMED\",\"defendedLevel\":5310,"
+                + "\"armedAnchorStrike\":5400,"
                 + "\"actions\":[{\"zone\":\"CALL_SELL_ZONE\",\"state\":\"ACTIVE\"}]}";
         ObjectNode env = join(profile, state, false);
         assertEquals(5400.0, env.get("strikes").get(0).get("strike").asDouble());
         assertNotEquals(5310.0, env.get("strikes").get(0).get("strike").asDouble());
     }
 
+    /**
+     * THE LIVE DEFECT, reproduced. Both first-ever fires (dev 12:14 ET, prod 13:51 ET, 2026-08-18)
+     * looked exactly like this: ARMED, CALL side, no armed anchor in the payload — and the UI showed
+     * nothing. The refusal itself is correct and must survive; what was missing was the anchor, which
+     * the state topic now carries.
+     */
     @Test
     void callArmedWithNoCallAnchorDoesNotRenderWrongStrikePill() throws Exception {
-        // CALL-side ARMED with NO pinCandidateStrike must NOT fall back to defendedLevel: no pill at all
-        // (refuse to fabricate the wrong strike), book only.
         String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"netDealerGamma\":-1e7}";
         String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"ARMED\",\"defendedLevel\":5310,"
                 + "\"actions\":[{\"zone\":\"CALL_SELL_ZONE\",\"state\":\"ACTIVE\"}]}";
         ObjectNode env = join(profile, state, false);
         assertEquals(0, env.get("strikes").size());
         assertEquals(5310.0, env.get("book").get("defendedLevel").asDouble()); // still shown in the book, just not as the pill anchor
+    }
+
+    /**
+     * pinCandidateStrike is the PIN MAGNET (max long gamma near spot, only inside the final
+     * PIN_WINDOW_MS) — not a sell-permission anchor. It must not pin a pill on EITHER side, however
+     * convenient its presence is. This is the regression guard for the old behaviour.
+     */
+    @Test
+    void pinCandidateStrikeNeverAnchorsAPillOnEitherSide() throws Exception {
+        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"pinCandidateStrike\":5555}";
+        String callState = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"ARMED\","
+                + "\"actions\":[{\"zone\":\"CALL_SELL_ZONE\",\"state\":\"ACTIVE\"}]}";
+        ObjectNode callEnv = join(profile, callState, false);
+        assertEquals(0, callEnv.get("strikes").size(),
+                "a CALL permission with no armed anchor renders nothing — never the pin magnet");
+        assertEquals(5555.0, callEnv.get("book").get("pinCandidate").asDouble(),
+                "it stays visible in the book as what it is: a pin candidate");
+
+        String putState = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"DEFENDED\","
+                + "\"actions\":[{\"zone\":\"PUT_SELL_ZONE\",\"state\":\"ACTIVE\"}]}";
+        assertEquals(0, join(profile, putState, false).get("strikes").size(),
+                "and a PUT defense with no defendedLevel renders nothing either");
+    }
+
+    /**
+     * The cluster anchor is CALL-side by the backend's own rule; it must not become a PUT defense
+     * level merely because it is present in the payload.
+     */
+    @Test
+    void putSideNeverAnchorsToTheCallSideClusterAnchor() throws Exception {
+        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\"}";
+        String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"DEFENDED\","
+                + "\"armedAnchorStrike\":5400,"
+                + "\"actions\":[{\"zone\":\"PUT_SELL_ZONE\",\"state\":\"ACTIVE\"}]}";
+        ObjectNode env = join(profile, state, false);
+        assertEquals(0, env.get("strikes").size(),
+                "a PUT permission with no defendedLevel renders no pill, cluster anchor or not");
+    }
+
+    /** ARMING is actionable too: the pill exists before the fire, on the tracking cluster anchor. */
+    @Test
+    void armingCallSideAnchorsToTheTrackingClusterAnchor() throws Exception {
+        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\"}";
+        String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"ARMING\","
+                + "\"armedAnchorStrike\":5325,"
+                + "\"actions\":[{\"zone\":\"CALL_SELL_ZONE\",\"state\":\"STAGED\"}]}";
+        JsonNode e = join(profile, state, false).get("strikes").get(0);
+        assertEquals(5325.0, e.get("strike").asDouble());
+        assertEquals("ARMING", e.get("state").asText());
     }
 
     @Test
@@ -132,12 +189,15 @@ class DealerLedgerJoinerTest {
     }
 
     @Test
-    void anchorFallsBackToPinCandidateWhenNoDefendedLevel() throws Exception {
-        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"pinCandidateStrike\":5350}";
+    void callArmedWithNoDefendedLevelStillAnchorsToItsOwnCluster() throws Exception {
+        // The ordinary CALL case: no defense has ever formed, so defendedLevel is absent and the
+        // cluster anchor is the only strike in play — which is exactly the shape of both live fires.
+        String profile = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\"}";
         String state = "{\"symbol\":\"SPXW\",\"expiry\":\"20260704\",\"state\":\"ARMED\","
+                + "\"armedAnchorStrike\":7700,"
                 + "\"actions\":[{\"zone\":\"CALL_SELL_ZONE\",\"state\":\"ACTIVE\"}]}";
         ObjectNode env = join(profile, state, false);
-        assertEquals(5350.0, env.get("strikes").get(0).get("strike").asDouble());
+        assertEquals(7700.0, env.get("strikes").get(0).get("strike").asDouble());
     }
 
     @Test
