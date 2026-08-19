@@ -26,7 +26,7 @@ import java.util.Map;
  *
  * <p>Pure: constructing one has no side effects. Reporting is the caller's job.
  */
-record SystemStatusFailure(String code, String sqlState, String detail) {
+record SystemStatusFailure(String code, String sqlState, String detail, boolean ledgerUnreachable) {
 
     /** Depth cap: a cause/next chain is walked, never followed forever. */
     private static final int MAX_CHAIN = 8;
@@ -64,12 +64,13 @@ record SystemStatusFailure(String code, String sqlState, String detail) {
      */
     static SystemStatusFailure of(Throwable failure, List<String> extraSecrets) {
         if (failure == null) {
-            return new SystemStatusFailure("INTERNAL_ERROR", null, "no exception supplied");
+            return new SystemStatusFailure("INTERNAL_ERROR", null, "no exception supplied", false);
         }
         List<Throwable> chain = chain(failure);
         SQLException sql = firstSqlException(chain);
         String sqlState = sql == null ? null : sql.getSQLState();
-        return new SystemStatusFailure(classify(sql, sqlState), sqlState, detailOf(chain, extraSecrets));
+        return new SystemStatusFailure(classify(sql, sqlState), sqlState, detailOf(chain, extraSecrets),
+                unreachable(chain, sqlState));
     }
 
     /**
@@ -191,6 +192,26 @@ record SystemStatusFailure(String code, String sqlState, String detail) {
 
     private static String cap(String s, int max) {
         return s.length() <= max ? s : s.substring(0, max) + "…";
+    }
+
+    /**
+     * Whether this failure proves the LEDGER ITSELF is unreachable, rather than one query being
+     * unhappy. A statement timeout or a missing column says nothing about the next section; a pool
+     * that could not hand out a connection, or a connection-class SQLState, says every remaining read
+     * will fail the same way. Decided HERE, from the exception type, rather than by sniffing the
+     * rendered detail string downstream.
+     */
+    private static boolean unreachable(List<Throwable> chain, String sqlState) {
+        if (sqlState != null && (sqlState.startsWith("08") || "53300".equals(sqlState))) {
+            return true;
+        }
+        for (Throwable t : chain) {
+            if (t instanceof java.sql.SQLTransientConnectionException
+                    || t instanceof java.sql.SQLNonTransientConnectionException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** What the browser is allowed to see. Never {@link #detail()}. */

@@ -164,4 +164,33 @@ class SystemStatusFailureTest {
         assertFalse(detail.contains("S3cretValue"),
                 "not even the surviving PREFIX of the secret may remain: " + detail);
     }
+
+    /**
+     * The distinction the short-circuit depends on: a pool that cannot hand out a connection, or a
+     * connection-class SQLState, means every remaining section will fail the same way. A statement
+     * timeout or a missing column means nothing of the sort — those sections must still be read.
+     */
+    @Test
+    void onlyConnectionClassFailuresMarkTheLedgerUnreachable() {
+        assertTrue(SystemStatusFailure.of(new java.sql.SQLTransientConnectionException(
+                "oe-watch-status - Connection is not available, request timed out after 2027ms"),
+                List.of()).ledgerUnreachable());
+        assertTrue(SystemStatusFailure.of(new java.sql.SQLNonTransientConnectionException("gone"),
+                List.of()).ledgerUnreachable());
+        assertTrue(SystemStatusFailure.of(new SQLException("refused", "08001"), List.of())
+                .ledgerUnreachable());
+        assertTrue(SystemStatusFailure.of(new SQLException("too many", "53300"), List.of())
+                .ledgerUnreachable());
+        // Wrapped, because that is how a pool failure usually arrives.
+        assertTrue(SystemStatusFailure.of(new RuntimeException("wrapper",
+                new java.sql.SQLTransientConnectionException("timed out")), List.of())
+                .ledgerUnreachable());
+
+        assertFalse(SystemStatusFailure.of(new SQLException("cancelled", "57014"), List.of())
+                .ledgerUnreachable(), "a statement timeout says nothing about the next section");
+        assertFalse(SystemStatusFailure.of(new SQLException("no such column", "42703"), List.of())
+                .ledgerUnreachable(), "a dropped column says nothing about the next section");
+        assertFalse(SystemStatusFailure.of(new IllegalStateException("bug"), List.of())
+                .ledgerUnreachable());
+    }
 }

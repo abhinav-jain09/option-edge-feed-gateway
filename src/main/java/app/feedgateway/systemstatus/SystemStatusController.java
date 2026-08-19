@@ -447,7 +447,7 @@ public class SystemStatusController implements org.springframework.beans.factory
 
     private static SystemStatusFailure saturated() {
         return new SystemStatusFailure("SATURATED", null,
-                "a ledger read is already in flight and no usable snapshot exists yet");
+                "a ledger read is already in flight and no usable snapshot exists yet", false);
     }
 
     private LedgerSnapshot readAllSections(String env) {
@@ -470,7 +470,6 @@ public class SystemStatusController implements org.springframework.beans.factory
                 failures, budget -> store.restarts(env, budget), Map.of());
         Map<String, Object> lastRun = section("lastRun", slow, deadlineNanos, statuses, failures,
                 budget -> store.lastRun(env, budget), LedgerSnapshot.nullLastRun());
-
         if (!statuses.get("lastRun").equals(OK) || lastRun.isEmpty()) {
             // No rows is not a failure — it is a ledger with no run yet. Either way both keys exist.
             Map<String, Object> normalised = LedgerSnapshot.nullLastRun();
@@ -502,7 +501,7 @@ public class SystemStatusController implements org.springframework.beans.factory
         int budget = remainingSeconds(deadlineNanos, sectionSeconds);
         if (budget <= 0) {
             return failed(name, statuses, failures, new SystemStatusFailure("DEADLINE_EXCEEDED", null,
-                    "request budget spent before this section was read"), fallback);
+                    "request budget spent before this section was read", false), fallback);
         }
         Future<T> task;
         try {
@@ -523,7 +522,7 @@ public class SystemStatusController implements org.springframework.beans.factory
             // reads, so without this the "budget" was only ever advisory.
             task.cancel(true);
             return failed(name, statuses, failures, new SystemStatusFailure("DEADLINE_EXCEEDED", null,
-                    "section exceeded its " + budget + "s share of the request budget"), fallback);
+                    "section exceeded its " + budget + "s share of the request budget", false), fallback);
         } catch (InterruptedException e) {
             task.cancel(true);
             Thread.currentThread().interrupt();
@@ -576,7 +575,7 @@ public class SystemStatusController implements org.springframework.beans.factory
     }
 
     private static SystemStatusFailure shuttingDown() {
-        return new SystemStatusFailure("SHUTTING_DOWN", null, "the gateway is shutting down");
+        return new SystemStatusFailure("SHUTTING_DOWN", null, "the gateway is shutting down", false);
     }
 
     private List<String> secrets() {
@@ -584,16 +583,12 @@ public class SystemStatusController implements org.springframework.beans.factory
     }
 
     /**
-     * The failure of an earlier section that proves the LEDGER ITSELF is unreachable, if any. A
-     * statement timeout or a missing column says nothing about the next section; a pool that cannot
-     * hand out a connection, or a connection-class SQLState, says every remaining read will fail the
-     * same way.
+     * The failure of an earlier section that proves the LEDGER ITSELF is unreachable, if any.
+     * Classified in {@link SystemStatusFailure}, not sniffed out of the rendered detail string.
      */
     private static SystemStatusFailure unreachableLedger(Map<String, SystemStatusFailure> failures) {
         for (SystemStatusFailure failure : failures.values()) {
-            if ("CONNECTION_FAILURE".equals(failure.code())
-                    || (failure.detail() != null
-                        && failure.detail().contains("SQLTransientConnectionException"))) {
+            if (failure.ledgerUnreachable()) {
                 return failure;
             }
         }
