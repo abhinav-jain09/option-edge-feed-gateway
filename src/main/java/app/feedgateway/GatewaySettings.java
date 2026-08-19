@@ -527,11 +527,64 @@ public final class GatewaySettings {
     }
 
     public int systemStatusCacheMs() {
-        return intValue("OE_SYSTEM_STATUS_CACHE_MS", 30_000, 1_000);
+        return clamped("OE_SYSTEM_STATUS_CACHE_MS", 30_000, 1_000, 300_000);
     }
 
+    /**
+     * How old a cached ledger snapshot may get before it stops counting as evidence at all. Past this
+     * the page must not show green states or an empty incident list from it: a stuck refresh would
+     * otherwise leave yesterday's "all healthy" on screen forever, which is the same lie as a blank
+     * page, only more convincing.
+     */
+    public int systemStatusMaxStaleMs() {
+        return clamped("OE_SYSTEM_STATUS_MAX_STALE_MS", 300_000, 1_000, 3_600_000);
+    }
+
+    /** Ceiling shared by both ledger budgets: past this the gateway is no longer a live process. */
+    public static final int SYSTEM_STATUS_MAX_TIMEOUT_S = 60;
+
+    /**
+     * Per-statement budget for the FAST ledger sections (topics, incidents, restarts). These answer in
+     * single-digit milliseconds against the current views, so 3s is a genuine safety net here.
+     */
     public int systemStatusQueryTimeoutSeconds() {
-        return intValue("OE_SYSTEM_STATUS_QUERY_TIMEOUT_S", 3, 1);
+        return clamped("OE_SYSTEM_STATUS_QUERY_TIMEOUT_S", 3, 1, SYSTEM_STATUS_MAX_TIMEOUT_S);
+    }
+
+    /**
+     * Per-statement budget for the SLOW last-run section only. {@code oe_watch.v_runs} answers in
+     * ~250ms warm but takes seconds on a cold Postgres cache, and 2026-08-19 proved what happens when
+     * that budget is a failure switch rather than a safety net: the whole page went blank. Only this
+     * one section gets the wide allowance — giving it to all four would let a single request occupy a
+     * two-connection pool for a minute. Bounded above by {@link #SYSTEM_STATUS_MAX_TIMEOUT_S} so an
+     * operator cannot accidentally configure an unbounded wait into a live market-data process.
+     */
+    public int systemStatusSlowQueryTimeoutSeconds() {
+        return clamped("OE_SYSTEM_STATUS_SLOW_QUERY_TIMEOUT_S", 15, 1, SYSTEM_STATUS_MAX_TIMEOUT_S);
+    }
+
+    /**
+     * Whole-request budget across ALL ledger sections. Per-section timeouts alone do not bound a
+     * request: four sequential reads can each spend their own allowance. The deadline is what makes the
+     * endpoint's worst case a number rather than a sum.
+     */
+    public int systemStatusRequestBudgetSeconds() {
+        return clamped("OE_SYSTEM_STATUS_REQUEST_BUDGET_S", 25, 1, SYSTEM_STATUS_MAX_TIMEOUT_S * 2);
+    }
+
+    /**
+     * How long a COLD-START request waits for the one in-flight ledger read — i.e. only when no
+     * snapshot exists at all, since any existing snapshot answers immediately. Kept well under the
+     * database budget on purpose: a waiting request thread is a thread not serving market data.
+     * Callers clamp it to the request budget, so it can never outlast the read it is waiting for.
+     */
+    public int systemStatusColdStartWaitMs() {
+        return clamped("OE_SYSTEM_STATUS_COLD_START_WAIT_MS", 2_000, 100, 10_000);
+    }
+
+    /** Bounded on BOTH sides — {@link #intValue} only enforces a floor, so a huge value silently won. */
+    private int clamped(String key, int fallback, int min, int max) {
+        return Math.min(max, intValue(key, fallback, min));
     }
 
     public int systemStatusAdminTimeoutMs() {

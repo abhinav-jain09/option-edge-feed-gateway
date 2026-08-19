@@ -28,6 +28,12 @@ import java.util.Map;
  */
 public class SystemStatusStore {
 
+    /**
+     * The single-argument reads are {@code final} on purpose. Production always calls the budgeted
+     * overload, so a subclass (a test double) that overrode the convenience form would be silently
+     * bypassed and its assertions would pass against code that never ran. Making that a compile error
+     * is cheaper than discovering it as a vacuous green test.
+     */
     private final HikariDataSource dataSource;
     private final int queryTimeoutSeconds;
 
@@ -50,13 +56,23 @@ public class SystemStatusStore {
      * Every one of these is nullable and is passed through as null — never defaulted — because a
      * missing threshold must render as "unknown", not as a threshold of zero.
      */
-    public List<Map<String, Object>> topics(String env) throws SQLException {
+    public final List<Map<String, Object>> topics(String env) throws SQLException {
+        return topics(env, queryTimeoutSeconds);
+    }
+
+    /**
+     * @param timeoutSeconds per-statement budget for THIS read. Sections are budgeted individually
+     *     because they are not equally expensive: the topic/incident/restart views answer in
+     *     milliseconds, only the last-run view is slow, and giving all four the slow view's allowance
+     *     would turn one request into a multi-minute occupant of a two-connection pool.
+     */
+    public List<Map<String, Object>> topics(String env, int timeoutSeconds) throws SQLException {
         String sql = "SELECT topic, state, age_s, last_observation, as_of,"
                 + " threshold_s, guard, guard_lease_left_s, consec_stale, consec_ok,"
                 + " phase, would_have_fired, shadow"
                 + " FROM oe_watch.v_topic_state WHERE env = ? ORDER BY topic";
         List<Map<String, Object>> out = new ArrayList<>();
-        query(sql, env, rs -> {
+        query(sql, env, timeoutSeconds, rs -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("topic", rs.getString("topic"));
             row.put("state", rs.getString("state"));
@@ -89,11 +105,16 @@ public class SystemStatusStore {
     }
 
     /** Open incidents (per the transition_seq-ordered projection), most recent first. */
-    public List<Map<String, Object>> openIncidents(String env) throws SQLException {
+    public final List<Map<String, Object>> openIncidents(String env) throws SQLException {
+        return openIncidents(env, queryTimeoutSeconds);
+    }
+
+    /** @param timeoutSeconds per-statement budget for THIS read (see {@link #topics(String, int)}). */
+    public List<Map<String, Object>> openIncidents(String env, int timeoutSeconds) throws SQLException {
         String sql = "SELECT topic, current_transition, transition_seq, as_of"
                 + " FROM oe_watch.v_incidents WHERE env = ? AND open_now ORDER BY as_of DESC";
         List<Map<String, Object>> out = new ArrayList<>();
-        query(sql, env, rs -> {
+        query(sql, env, timeoutSeconds, rs -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("topic", rs.getString("topic"));
             row.put("transition", rs.getString("current_transition"));
@@ -108,12 +129,17 @@ public class SystemStatusStore {
      * §3.6 per-service restart counts for the current session/expiry. One row per service EVERY cycle,
      * so 0 / NO_PODS / PARTIAL / UNKNOWN are all representable and a missing cell is impossible.
      */
-    public Map<String, Map<String, Object>> restarts(String env) throws SQLException {
+    public final Map<String, Map<String, Object>> restarts(String env) throws SQLException {
+        return restarts(env, queryTimeoutSeconds);
+    }
+
+    /** @param timeoutSeconds per-statement budget for THIS read (see {@link #topics(String, int)}). */
+    public Map<String, Map<String, Object>> restarts(String env, int timeoutSeconds) throws SQLException {
         String sql = "SELECT service, session_key, restarts_this_session, status,"
                 + " unattributed_prior, last_restart_at, as_of"
                 + " FROM oe_watch.v_restarts_latest WHERE env = ? ORDER BY service";
         Map<String, Map<String, Object>> out = new LinkedHashMap<>();
-        query(sql, env, rs -> {
+        query(sql, env, timeoutSeconds, rs -> {
             Map<String, Object> row = new LinkedHashMap<>();
             String service = rs.getString("service");
             row.put("sessionKey", rs.getString("session_key"));
@@ -130,12 +156,17 @@ public class SystemStatusStore {
     }
 
     /** Last watcher run per env: proves the evidence is current, and surfaces BLIND outcomes. */
-    public Map<String, Object> lastRun(String env) throws SQLException {
+    public final Map<String, Object> lastRun(String env) throws SQLException {
+        return lastRun(env, queryTimeoutSeconds);
+    }
+
+    /** @param timeoutSeconds per-statement budget for THIS read (see {@link #topics(String, int)}). */
+    public Map<String, Object> lastRun(String env, int timeoutSeconds) throws SQLException {
         String sql = "SELECT started_at, finished_at, outcome FROM oe_watch.v_runs"
                 + " WHERE env = ? AND watcher = 'freshness' AND started_at IS NOT NULL"
                 + " ORDER BY started_at DESC LIMIT 1";
         Map<String, Object> out = new LinkedHashMap<>();
-        query(sql, env, rs -> {
+        query(sql, env, timeoutSeconds, rs -> {
             out.put("startedAt", ts(rs, "started_at"));
             out.put("finishedAt", ts(rs, "finished_at"));
             out.put("outcome", rs.getString("outcome"));
@@ -148,13 +179,13 @@ public class SystemStatusStore {
         void accept(ResultSet rs) throws SQLException;
     }
 
-    private void query(String sql, String env, RowHandler handler) throws SQLException {
+    private void query(String sql, String env, int timeoutSeconds, RowHandler handler) throws SQLException {
         if (dataSource == null) {
             throw new SQLException("oe_watch datasource not configured");
         }
         try (Connection c = dataSource.getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
-            ps.setQueryTimeout(queryTimeoutSeconds);
+            ps.setQueryTimeout(Math.max(1, timeoutSeconds));
             ps.setString(1, env);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
