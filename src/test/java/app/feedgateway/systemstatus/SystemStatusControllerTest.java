@@ -1184,4 +1184,63 @@ class SystemStatusControllerTest {
         assertEquals("SHUTTING_DOWN", ledger.path("degraded").path("lastRun").path("code").asText(),
                 "and it must SAY why the later sections are missing: " + ledger);
     }
+
+    /**
+     * Observed on dev, 2026-08-19: with the ledger Postgres down, the endpoint took 24 SECONDS to say
+     * so — 2s discovering the pool could not hand out a connection, then 3s + 3s + 15s of each
+     * remaining section rediscovering the same thing. Once a connection-level failure has been
+     * established the ledger is DOWN; the remaining sections must report it, not re-prove it.
+     */
+    @Test
+    void aDeadLedgerIsReportedOnceNotRediscoveredBySection() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger attempts = new java.util.concurrent.atomic.AtomicInteger();
+        SystemStatusStore store = new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            public List<Map<String, Object>> topics(String env, int t) throws SQLException {
+                attempts.incrementAndGet();
+                throw new java.sql.SQLTransientConnectionException(
+                        "oe-watch-status - Connection is not available, request timed out after 2027ms");
+            }
+
+            @Override
+            public List<Map<String, Object>> openIncidents(String env, int t) {
+                attempts.incrementAndGet();
+                return List.of();
+            }
+
+            @Override
+            public Map<String, Map<String, Object>> restarts(String env, int t) {
+                attempts.incrementAndGet();
+                return Map.of();
+            }
+
+            @Override
+            public Map<String, Object> lastRun(String env, int t) {
+                attempts.incrementAndGet();
+                return new LinkedHashMap<>();
+            }
+        };
+        SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+        long startedAt = System.nanoTime();
+        JsonNode ledger = mapper.readTree(c.systemStatus().getBody()).path("ledger");
+        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+
+        assertEquals(1, attempts.get(),
+                "the ledger was proved unreachable once; the other three sections must not retry it");
+        assertTrue(elapsedMs < 1_000, "a dead ledger must be reported promptly; took " + elapsedMs + "ms");
+        for (String section : List.of("topicsStatus", "openIncidentsStatus", "restartsStatus",
+                "lastRunStatus")) {
+            assertEquals("UNKNOWN", ledger.path(section).asText(), section);
+        }
+        // Every section still SAYS why — reporting once must not mean the other three go unexplained.
+        for (String section : List.of("topics", "openIncidents", "restarts", "lastRun")) {
+            assertEquals("QUERY_FAILED", ledger.path("degraded").path(section).path("code").asText(),
+                    section + " must carry the reason that was actually established");
+        }
+    }
 }

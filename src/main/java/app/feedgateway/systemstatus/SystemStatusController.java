@@ -470,6 +470,7 @@ public class SystemStatusController implements org.springframework.beans.factory
                 failures, budget -> store.restarts(env, budget), Map.of());
         Map<String, Object> lastRun = section("lastRun", slow, deadlineNanos, statuses, failures,
                 budget -> store.lastRun(env, budget), LedgerSnapshot.nullLastRun());
+
         if (!statuses.get("lastRun").equals(OK) || lastRun.isEmpty()) {
             // No rows is not a failure — it is a ledger with no run yet. Either way both keys exist.
             Map<String, Object> normalised = LedgerSnapshot.nullLastRun();
@@ -488,6 +489,16 @@ public class SystemStatusController implements org.springframework.beans.factory
     private <T> T section(String name, int sectionSeconds, long deadlineNanos,
                           Map<String, String> statuses, Map<String, SystemStatusFailure> failures,
                           SectionReader<T> reader, T fallback) {
+        SystemStatusFailure unreachable = unreachableLedger(failures);
+        if (unreachable != null) {
+            // A previous section could not get a connection at all. The ledger is DOWN, and that is
+            // already known — spending this section's whole budget rediscovering it is what turned a
+            // dead ledger into a 24-second page (observed on dev 2026-08-19: 2s + 3s + 3s + 15s).
+            // Every section still reports, with the reason that was actually established.
+            statuses.put(name, UNKNOWN);
+            failures.put(name, unreachable);
+            return fallback;
+        }
         int budget = remainingSeconds(deadlineNanos, sectionSeconds);
         if (budget <= 0) {
             return failed(name, statuses, failures, new SystemStatusFailure("DEADLINE_EXCEEDED", null,
@@ -570,6 +581,23 @@ public class SystemStatusController implements org.springframework.beans.factory
 
     private List<String> secrets() {
         return List.of(settings.systemStatusDbPassword());
+    }
+
+    /**
+     * The failure of an earlier section that proves the LEDGER ITSELF is unreachable, if any. A
+     * statement timeout or a missing column says nothing about the next section; a pool that cannot
+     * hand out a connection, or a connection-class SQLState, says every remaining read will fail the
+     * same way.
+     */
+    private static SystemStatusFailure unreachableLedger(Map<String, SystemStatusFailure> failures) {
+        for (SystemStatusFailure failure : failures.values()) {
+            if ("CONNECTION_FAILURE".equals(failure.code())
+                    || (failure.detail() != null
+                        && failure.detail().contains("SQLTransientConnectionException"))) {
+                return failure;
+            }
+        }
+        return null;
     }
 
     /** Seconds left of the request budget, never more than this section's own allowance. */
