@@ -530,8 +530,15 @@ public final class GatewaySettings {
         return intValue("OE_SYSTEM_STATUS_CACHE_MS", 30_000, 1_000);
     }
 
+    /**
+     * Per-statement budget for the ledger reads. 3s was too tight to be a safety net and behaved as a
+     * failure switch instead: the {@code oe_watch} views aggregate a ledger that grows ~70k rows/day, so
+     * on a cold Postgres cache a read that answers in ~250ms warm takes seconds, and the page went blank
+     * for a reason no log recorded. 15s still bounds a runaway query well inside the page's 2-minute
+     * refresh, and a section that does breach it now degrades on its own (see SystemStatusController).
+     */
     public int systemStatusQueryTimeoutSeconds() {
-        return intValue("OE_SYSTEM_STATUS_QUERY_TIMEOUT_S", 3, 1);
+        return intValue("OE_SYSTEM_STATUS_QUERY_TIMEOUT_S", 15, 1);
     }
 
     public int systemStatusAdminTimeoutMs() {

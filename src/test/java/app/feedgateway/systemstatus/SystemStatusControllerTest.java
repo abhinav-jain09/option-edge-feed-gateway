@@ -208,4 +208,143 @@ class SystemStatusControllerTest {
         assertEquals("NOT_CONFIGURED", out.path("services").get(0).path("lagStatus").asText());
         assertNull(out.path("services").get(0).path("lagRecordsSum").numberValue());
     }
+
+    /**
+     * The prod failure of 2026-08-19: the topic read answered fine, the LAST-RUN read hit its statement
+     * timeout, and the whole page went grey — every topic NO_EVIDENCE, every service UNKNOWN — because a
+     * single catch wrapped all four reads and the topic rows were only published after the last one
+     * returned. Evidence that WAS read must survive a later section failing.
+     */
+    @Test
+    void lastRunFailureDegradesOnlyTheBannerAndKeepsTopicEvidence() throws Exception {
+        System.setProperty("OE_SYSTEM_STATUS_TOPICS", "options.databento.gex.magnet");
+        try {
+            Map<String, Object> observed = new LinkedHashMap<>();
+            observed.put("topic", "options.databento.gex.magnet");
+            observed.put("state", "HEALTHY");
+            observed.put("ageS", 4L);
+            SystemStatusStore store = new SystemStatusStore(null, 3) {
+                @Override
+                public boolean configured() {
+                    return true;
+                }
+
+                @Override
+                public List<Map<String, Object>> topics(String env) {
+                    return List.of(observed);
+                }
+
+                @Override
+                public List<Map<String, Object>> openIncidents(String env) {
+                    return List.of();
+                }
+
+                @Override
+                public Map<String, Map<String, Object>> restarts(String env) {
+                    return Map.of("databento-gex-service",
+                            new LinkedHashMap<>(Map.of("restartsStatus", "OK",
+                                    "restartsThisSession", 0)));
+                }
+
+                @Override
+                public Map<String, Object> lastRun(String env) throws SQLException {
+                    throw new SQLException("ERROR: canceling statement due to user request", "57014");
+                }
+            };
+            JsonNode out = call(store, noLag());
+
+            JsonNode ledger = out.path("ledger");
+            assertTrue(ledger.path("available").asBoolean(),
+                    "topic evidence was read successfully — the ledger is not unavailable");
+            assertTrue(ledger.path("reason").isMissingNode(), "there is no whole-ledger failure to report");
+            assertTrue(ledger.path("lastRunOutcome").isMissingNode(),
+                    "an unread last run must be ABSENT, never a stale or invented outcome");
+
+            JsonNode degraded = ledger.path("degraded");
+            assertTrue(degraded.has("lastRun"), "the failing section must be named");
+            assertEquals(1, degraded.size(), "only the section that actually failed is degraded");
+
+            JsonNode topic = out.path("topics").get(0);
+            assertEquals("OK", topic.path("evidence").asText(),
+                    "evidence already read must not be discarded by a later section failing");
+            assertEquals("HEALTHY", topic.path("state").asText());
+            assertEquals("OK", out.path("services").get(0).path("restartsStatus").asText());
+        } finally {
+            System.clearProperty("OE_SYSTEM_STATUS_TOPICS");
+        }
+    }
+
+    /**
+     * "PSQLException" alone cannot tell a statement timeout from a bad password from a dropped column,
+     * and this envelope is the only place the failure is ever seen — the endpoint swallows it otherwise.
+     */
+    @Test
+    void ledgerFailureCarriesTheDriverMessageAndSqlStateNotJustTheClassName() throws Exception {
+        SystemStatusStore store = new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            public List<Map<String, Object>> topics(String env) throws SQLException {
+                throw new SQLException("ERROR: canceling statement due to user request", "57014");
+            }
+        };
+        String error = call(store, noLag()).path("ledger").path("error").asText();
+        assertTrue(error.contains("SQLException"), "the class still identifies the failure family");
+        assertTrue(error.contains("57014"), "the SQLState is what names it a TIMEOUT: " + error);
+        assertTrue(error.contains("canceling statement"), "the driver's own message must survive: " + error);
+    }
+
+    /**
+     * A restart sample that could not be read is UNKNOWN even when the topic read succeeded — the two
+     * are separate evidence and a readable ledger does not make an unread restart count a NO_EVIDENCE 0.
+     */
+    @Test
+    void unreadableRestartsAreUnknownEvenWhenTopicsRead() throws Exception {
+        System.setProperty("OE_SYSTEM_STATUS_TOPICS", "options.databento.gex.magnet");
+        System.setProperty("OE_SYSTEM_STATUS_LAG_REGISTRY",
+                "databento-gex-service:databento-gex-service:options.databento.raw");
+        try {
+            SystemStatusStore store = new SystemStatusStore(null, 3) {
+                @Override
+                public boolean configured() {
+                    return true;
+                }
+
+                @Override
+                public List<Map<String, Object>> topics(String env) {
+                    return List.of();
+                }
+
+                @Override
+                public List<Map<String, Object>> openIncidents(String env) {
+                    return List.of();
+                }
+
+                @Override
+                public Map<String, Map<String, Object>> restarts(String env) throws SQLException {
+                    throw new SQLException("ERROR: canceling statement due to user request", "57014");
+                }
+
+                @Override
+                public Map<String, Object> lastRun(String env) {
+                    return new LinkedHashMap<>(Map.of("startedAt", "2026-08-19T17:00:00Z",
+                            "outcome", "OK"));
+                }
+            };
+            JsonNode out = call(store, noLag());
+            assertTrue(out.path("ledger").path("available").asBoolean());
+            assertTrue(out.path("ledger").path("degraded").has("restarts"));
+            for (JsonNode row : out.path("services")) {
+                assertEquals("UNKNOWN", row.path("restartsStatus").asText(),
+                        "an unread restart sample must not read as a measured 0");
+                assertTrue(row.path("restartsThisSession").isNull());
+            }
+        } finally {
+            System.clearProperty("OE_SYSTEM_STATUS_TOPICS");
+            System.clearProperty("OE_SYSTEM_STATUS_LAG_REGISTRY");
+        }
+    }
 }

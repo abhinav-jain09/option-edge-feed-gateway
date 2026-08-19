@@ -2,11 +2,14 @@ package app.feedgateway.systemstatus;
 
 import app.feedgateway.GatewaySettings;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -33,6 +36,8 @@ import java.util.Map;
 @RestController
 public class SystemStatusController {
 
+    private static final Logger LOG = LoggerFactory.getLogger(SystemStatusController.class);
+
     private final GatewaySettings settings;
     private final SystemStatusStore store;
     private final ConsumerLagReader lag;
@@ -58,26 +63,57 @@ public class SystemStatusController {
         List<Map<String, Object>> topics = new ArrayList<>();
         Map<String, Map<String, Object>> restarts = Map.of();
         List<Map<String, Object>> incidents = List.of();
+        boolean topicsOk = false;
+        boolean restartsOk = false;
         if (!store.configured()) {
             ledger.put("available", false);
             ledger.put("reason", "NOT_CONFIGURED");
             ledger.put("transport", transport());
         } else {
+            // Each ledger section is read INDEPENDENTLY. One slow view (a statement timeout on the
+            // last-run lookup, say) must not blank the topic evidence that was already read
+            // successfully — that is the same "one failing never blanks the other" rule this endpoint
+            // already applies between the ledger and the broker, applied inside the ledger too.
+            Map<String, Object> failures = new LinkedHashMap<>();
+            Map<String, Object> lastRun = Map.of();
             try {
-                List<Map<String, Object>> observed = store.topics(env);
+                topics = store.topics(env);
+                topicsOk = true;
+            } catch (Exception e) {
+                failures.put("topics", describe("topics", e));
+            }
+            try {
                 incidents = store.openIncidents(env);
+            } catch (Exception e) {
+                failures.put("openIncidents", describe("openIncidents", e));
+            }
+            try {
                 restarts = store.restarts(env);
-                Map<String, Object> lastRun = store.lastRun(env);
-                ledger.put("available", true);
+                restartsOk = true;
+            } catch (Exception e) {
+                failures.put("restarts", describe("restarts", e));
+            }
+            try {
+                lastRun = store.lastRun(env);
+            } catch (Exception e) {
+                failures.put("lastRun", describe("lastRun", e));
+            }
+            // available tracks the TOPIC evidence specifically: that is what the topic rows below are
+            // joined onto. A failed last-run lookup degrades the freshness banner, not the whole page.
+            ledger.put("available", topicsOk);
+            if (!topicsOk) {
+                ledger.put("reason", "QUERY_FAILED");
+                ledger.put("error", failures.get("topics"));
+            }
+            if (!failures.containsKey("lastRun")) {
                 ledger.put("lastRunAt", lastRun.get("startedAt"));
                 ledger.put("lastRunOutcome", lastRun.get("outcome"));
-                ledger.put("transport", transport());
-                topics = observed;
-            } catch (Exception e) {
-                ledger.put("available", false);
-                ledger.put("reason", "QUERY_FAILED");
-                ledger.put("error", e.getClass().getSimpleName());
-                ledger.put("transport", transport());
+            }
+            ledger.put("transport", transport());
+            if (!failures.isEmpty()) {
+                // Named per section so the page can say WHICH evidence is missing instead of going grey
+                // as a whole, and so the operator sees the driver's own message rather than a class name.
+                ledger.put("degraded", failures);
             }
         }
         out.put("ledger", ledger);
@@ -147,8 +183,7 @@ public class SystemStatusController {
             }).putAll(e.getValue());
         }
         for (Map<String, Object> row : byService.values()) {
-            row.putIfAbsent("restartsStatus", Boolean.TRUE.equals(ledger.get("available"))
-                    ? "NO_EVIDENCE" : "UNKNOWN");
+            row.putIfAbsent("restartsStatus", restartsOk ? "NO_EVIDENCE" : "UNKNOWN");
             row.putIfAbsent("restartsThisSession", null);
             serviceRows.add(row);
         }
@@ -159,6 +194,26 @@ public class SystemStatusController {
             out.put("lagError", lag.error());
         }
         return ResponseEntity.ok(mapper.writeValueAsString(out));
+    }
+
+    /**
+     * The driver's own message, not just the exception class: "PSQLException" alone cannot distinguish a
+     * statement timeout from a bad password from a dropped column, and this endpoint is the only place
+     * the failure is ever seen. Logged at WARN too, because a page nobody is looking at is not evidence.
+     */
+    private static String describe(String section, Exception e) {
+        String sqlState = (e instanceof SQLException sql) ? sql.getSQLState() : null;
+        String message = e.getMessage() == null ? "" : e.getMessage().replace('\n', ' ').trim();
+        StringBuilder sb = new StringBuilder(e.getClass().getSimpleName());
+        if (sqlState != null && !sqlState.isBlank()) {
+            sb.append(" [SQLState ").append(sqlState).append(']');
+        }
+        if (!message.isEmpty()) {
+            sb.append(": ").append(message);
+        }
+        String described = sb.toString();
+        LOG.warn("system-status ledger section {} failed: {}", section, described, e);
+        return described;
     }
 
     /**
