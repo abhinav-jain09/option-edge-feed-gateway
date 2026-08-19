@@ -31,7 +31,7 @@ class SystemStatusControllerTest {
             }
 
             @Override
-            public List<Map<String, Object>> topics(String env) throws SQLException {
+            public List<Map<String, Object>> topics(String env, int timeoutSeconds) throws SQLException {
                 throw new SQLException("connection refused");
             }
         };
@@ -46,22 +46,22 @@ class SystemStatusControllerTest {
             }
 
             @Override
-            public List<Map<String, Object>> topics(String env) {
+            public List<Map<String, Object>> topics(String env, int timeoutSeconds) {
                 return topics;
             }
 
             @Override
-            public List<Map<String, Object>> openIncidents(String env) {
+            public List<Map<String, Object>> openIncidents(String env, int timeoutSeconds) {
                 return List.of();
             }
 
             @Override
-            public Map<String, Map<String, Object>> restarts(String env) {
+            public Map<String, Map<String, Object>> restarts(String env, int timeoutSeconds) {
                 return restarts;
             }
 
             @Override
-            public Map<String, Object> lastRun(String env) {
+            public Map<String, Object> lastRun(String env, int timeoutSeconds) {
                 return new LinkedHashMap<>(Map.of("startedAt", "2026-07-27T13:40:00Z",
                         "outcome", "OK"));
             }
@@ -230,39 +230,49 @@ class SystemStatusControllerTest {
                 }
 
                 @Override
-                public List<Map<String, Object>> topics(String env) {
+                public List<Map<String, Object>> topics(String env, int timeoutSeconds) {
                     return List.of(observed);
                 }
 
                 @Override
-                public List<Map<String, Object>> openIncidents(String env) {
+                public List<Map<String, Object>> openIncidents(String env, int timeoutSeconds) {
                     return List.of();
                 }
 
                 @Override
-                public Map<String, Map<String, Object>> restarts(String env) {
+                public Map<String, Map<String, Object>> restarts(String env, int timeoutSeconds) {
                     return Map.of("databento-gex-service",
                             new LinkedHashMap<>(Map.of("restartsStatus", "OK",
                                     "restartsThisSession", 0)));
                 }
 
                 @Override
-                public Map<String, Object> lastRun(String env) throws SQLException {
+                public Map<String, Object> lastRun(String env, int timeoutSeconds) throws SQLException {
                     throw new SQLException("ERROR: canceling statement due to user request", "57014");
                 }
             };
             JsonNode out = call(store, noLag());
 
             JsonNode ledger = out.path("ledger");
-            assertTrue(ledger.path("available").asBoolean(),
-                    "topic evidence was read successfully — the ledger is not unavailable");
-            assertTrue(ledger.path("reason").isMissingNode(), "there is no whole-ledger failure to report");
-            assertTrue(ledger.path("lastRunOutcome").isMissingNode(),
-                    "an unread last run must be ABSENT, never a stale or invented outcome");
+            // v1 `available` still means ALL FOUR reads completed, so a page built against v1 stays
+            // conservative. The finer truth rides alongside it.
+            assertFalse(ledger.path("available").asBoolean(),
+                    "one section failed, so the v1 all-or-nothing flag must not claim availability");
+            assertTrue(ledger.path("topicsAvailable").asBoolean(),
+                    "topic evidence was read successfully and must be advertised as such");
+            assertEquals("PARTIAL", ledger.path("reason").asText());
+            assertEquals("OK", ledger.path("topicsStatus").asText());
+            assertEquals("OK", ledger.path("restartsStatus").asText());
+            assertEquals("UNKNOWN", ledger.path("lastRunStatus").asText());
+            assertTrue(ledger.has("lastRunAt"), "the key must exist so the page tests a value, not undefined");
+            assertTrue(ledger.path("lastRunAt").isNull(), "an unread last run is null, never invented");
+            assertTrue(ledger.path("lastRunOutcome").isNull(),
+                    "an unread last run must never carry a stale or invented outcome");
 
             JsonNode degraded = ledger.path("degraded");
             assertTrue(degraded.has("lastRun"), "the failing section must be named");
             assertEquals(1, degraded.size(), "only the section that actually failed is degraded");
+            assertEquals("STATEMENT_TIMEOUT", degraded.path("lastRun").path("code").asText());
 
             JsonNode topic = out.path("topics").get(0);
             assertEquals("OK", topic.path("evidence").asText(),
@@ -275,11 +285,14 @@ class SystemStatusControllerTest {
     }
 
     /**
-     * "PSQLException" alone cannot tell a statement timeout from a bad password from a dropped column,
-     * and this envelope is the only place the failure is ever seen — the endpoint swallows it otherwise.
+     * The browser gets a CODE, never the driver's sentence. "PSQLException" alone could not tell a
+     * statement timeout from a bad password from a dropped column — that was the diagnostic hole — but
+     * a PostgreSQL message carries schema names, SQL fragments, {@code Where:} context and whatever a
+     * server function chose to raise, and a JDBC failure can echo connection properties. So the page
+     * gets a closed vocabulary and the SQLState; the sentence goes to the log.
      */
     @Test
-    void ledgerFailureCarriesTheDriverMessageAndSqlStateNotJustTheClassName() throws Exception {
+    void browserSeesASafeCodeAndSqlStateNeverTheDriverSentence() throws Exception {
         SystemStatusStore store = new SystemStatusStore(null, 3) {
             @Override
             public boolean configured() {
@@ -287,14 +300,25 @@ class SystemStatusControllerTest {
             }
 
             @Override
-            public List<Map<String, Object>> topics(String env) throws SQLException {
-                throw new SQLException("ERROR: canceling statement due to user request", "57014");
+            public List<Map<String, Object>> topics(String env, int timeoutSeconds) throws SQLException {
+                throw new SQLException("ERROR: canceling statement due to user request\n  Where: "
+                        + "oe_watch.v_topic_state, password=hunter2 jdbc:postgresql://oe:s3cret@host/db",
+                        "57014");
             }
         };
-        String error = call(store, noLag()).path("ledger").path("error").asText();
-        assertTrue(error.contains("SQLException"), "the class still identifies the failure family");
-        assertTrue(error.contains("57014"), "the SQLState is what names it a TIMEOUT: " + error);
-        assertTrue(error.contains("canceling statement"), "the driver's own message must survive: " + error);
+        JsonNode ledger = call(store, noLag()).path("ledger");
+        assertEquals("QUERY_FAILED", ledger.path("reason").asText());
+        assertEquals("STATEMENT_TIMEOUT", ledger.path("error").asText(),
+                "the v1 error field keeps its string shape but carries a SAFE classified code");
+        JsonNode topicsFailure = ledger.path("degraded").path("topics");
+        assertEquals("STATEMENT_TIMEOUT", topicsFailure.path("code").asText());
+        assertEquals("57014", topicsFailure.path("sqlState").asText());
+        String whole = call(store, noLag()).toString();
+        assertFalse(whole.contains("canceling statement"),
+                "the driver's sentence must not reach the browser: " + whole);
+        assertFalse(whole.contains("hunter2") || whole.contains("s3cret"),
+                "no credential may reach the browser: " + whole);
+        assertFalse(whole.contains("Where:"), "no server context may reach the browser: " + whole);
     }
 
     /**
@@ -314,37 +338,270 @@ class SystemStatusControllerTest {
                 }
 
                 @Override
-                public List<Map<String, Object>> topics(String env) {
+                public List<Map<String, Object>> topics(String env, int timeoutSeconds) {
                     return List.of();
                 }
 
                 @Override
-                public List<Map<String, Object>> openIncidents(String env) {
+                public List<Map<String, Object>> openIncidents(String env, int timeoutSeconds) {
                     return List.of();
                 }
 
                 @Override
-                public Map<String, Map<String, Object>> restarts(String env) throws SQLException {
+                public Map<String, Map<String, Object>> restarts(String env, int timeoutSeconds) throws SQLException {
                     throw new SQLException("ERROR: canceling statement due to user request", "57014");
                 }
 
                 @Override
-                public Map<String, Object> lastRun(String env) {
+                public Map<String, Object> lastRun(String env, int timeoutSeconds) {
                     return new LinkedHashMap<>(Map.of("startedAt", "2026-08-19T17:00:00Z",
                             "outcome", "OK"));
                 }
             };
             JsonNode out = call(store, noLag());
-            assertTrue(out.path("ledger").path("available").asBoolean());
+            assertTrue(out.path("ledger").path("topicsAvailable").asBoolean());
+            assertFalse(out.path("ledger").path("available").asBoolean());
+            assertEquals("UNKNOWN", out.path("ledger").path("restartsStatus").asText());
             assertTrue(out.path("ledger").path("degraded").has("restarts"));
-            for (JsonNode row : out.path("services")) {
-                assertEquals("UNKNOWN", row.path("restartsStatus").asText(),
-                        "an unread restart sample must not read as a measured 0");
-                assertTrue(row.path("restartsThisSession").isNull());
-            }
+            // The universe comes from the REGISTRY, so the row exists even though neither evidence
+            // source produced it. Asserted by exact size + name: a zero-iteration loop over an empty
+            // services array is how this test passed vacuously before.
+            assertEquals(1, out.path("services").size(),
+                    "the registered service must still appear: " + out.path("services"));
+            JsonNode row = out.path("services").get(0);
+            assertEquals("databento-gex-service", row.path("service").asText());
+            assertEquals("UNKNOWN", row.path("restartsStatus").asText(),
+                    "an unread restart sample must not read as a measured 0");
+            assertTrue(row.path("restartsThisSession").isNull());
+            assertEquals("NOT_CONFIGURED", row.path("lagStatus").asText());
         } finally {
             System.clearProperty("OE_SYSTEM_STATUS_TOPICS");
             System.clearProperty("OE_SYSTEM_STATUS_LAG_REGISTRY");
         }
+    }
+
+    /** A store whose sections each behave as the test asks; unspecified sections succeed emptily. */
+    private static SystemStatusStore storeWhere(SectionBehaviour topics, SectionBehaviour incidents,
+                                                SectionBehaviour restarts, SectionBehaviour lastRun) {
+        return new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            @SuppressWarnings("unchecked")
+            public List<Map<String, Object>> topics(String env, int t) throws SQLException {
+                return (List<Map<String, Object>>) topics.apply(List.of());
+            }
+
+            @Override
+            @SuppressWarnings("unchecked")
+            public List<Map<String, Object>> openIncidents(String env, int t) throws SQLException {
+                return (List<Map<String, Object>>) incidents.apply(List.of());
+            }
+
+            @Override
+            @SuppressWarnings("unchecked")
+            public Map<String, Map<String, Object>> restarts(String env, int t) throws SQLException {
+                return (Map<String, Map<String, Object>>) restarts.apply(Map.of());
+            }
+
+            @Override
+            @SuppressWarnings("unchecked")
+            public Map<String, Object> lastRun(String env, int t) throws SQLException {
+                return (Map<String, Object>) lastRun.apply(new LinkedHashMap<String, Object>());
+            }
+        };
+    }
+
+    private interface SectionBehaviour {
+        Object apply(Object emptyValue) throws SQLException;
+    }
+
+    private static final SectionBehaviour SUCCEEDS = empty -> empty;
+    private static final SectionBehaviour TIMES_OUT = empty -> {
+        throw new SQLException("ERROR: canceling statement due to user request", "57014");
+    };
+
+    /**
+     * An empty incident list is what a HEALTHY system looks like, so "could not read the incidents" must
+     * never arrive as one. Without an explicit status the page renders "no open incidents" over an
+     * unread section — absence as health, the exact failure mode this endpoint exists to prevent.
+     */
+    @Test
+    void unreadableIncidentsAreNotAnEmptyIncidentList() throws Exception {
+        JsonNode out = call(storeWhere(SUCCEEDS, TIMES_OUT, SUCCEEDS, SUCCEEDS), noLag());
+        JsonNode ledger = out.path("ledger");
+        assertEquals("UNKNOWN", ledger.path("openIncidentsStatus").asText(),
+                "an unread incident section must say so; the empty array alone cannot be trusted");
+        assertEquals("OK", ledger.path("topicsStatus").asText());
+        assertTrue(ledger.path("degraded").has("openIncidents"));
+        assertEquals(0, out.path("openIncidents").size());
+    }
+
+    /** The mirror case of the prod incident: topics unreadable while the restart sample came back. */
+    @Test
+    void topicsFailureLeavesRestartEvidenceIntact() throws Exception {
+        System.setProperty("OE_SYSTEM_STATUS_TOPICS", "options.databento.gex.magnet");
+        try {
+            SystemStatusStore store = storeWhere(TIMES_OUT, SUCCEEDS,
+                    empty -> Map.of("databento-gex-service",
+                            new LinkedHashMap<>(Map.of("restartsStatus", "OK", "restartsThisSession", 2))),
+                    SUCCEEDS);
+            JsonNode out = call(store, noLag());
+            assertFalse(out.path("ledger").path("topicsAvailable").asBoolean());
+            assertEquals("QUERY_FAILED", out.path("ledger").path("reason").asText());
+            assertEquals("LEDGER_UNAVAILABLE", out.path("topics").get(0).path("reason").asText());
+            JsonNode row = out.path("services").get(0);
+            assertEquals("OK", row.path("restartsStatus").asText(),
+                    "a restart sample that WAS read must survive the topic read failing");
+            assertEquals(2, row.path("restartsThisSession").asInt());
+        } finally {
+            System.clearProperty("OE_SYSTEM_STATUS_TOPICS");
+        }
+    }
+
+    /**
+     * A ledger with no run yet is not a failure. Both keys must still be PRESENT and null — a missing
+     * key renders as "undefined" in a browser and Date.parse(undefined) is Invalid Date, whereas an
+     * explicit null is a value the page can test.
+     */
+    @Test
+    void noLastRunRowIsNullNotMissingAndNotAFailure() throws Exception {
+        JsonNode ledger = call(storeWhere(SUCCEEDS, SUCCEEDS, SUCCEEDS, SUCCEEDS), noLag()).path("ledger");
+        assertEquals("OK", ledger.path("lastRunStatus").asText(), "no rows is not a query failure");
+        assertTrue(ledger.path("available").asBoolean(), "all four reads completed");
+        assertTrue(ledger.has("lastRunAt") && ledger.path("lastRunAt").isNull());
+        assertTrue(ledger.has("lastRunOutcome") && ledger.path("lastRunOutcome").isNull());
+        assertFalse(ledger.has("degraded"));
+    }
+
+    /** A run that started but has not finished carries a null outcome, not an invented one. */
+    @Test
+    void inFlightRunReportsANullOutcome() throws Exception {
+        SystemStatusStore store = storeWhere(SUCCEEDS, SUCCEEDS, SUCCEEDS, empty -> {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("startedAt", "2026-08-19T17:00:00Z");
+            row.put("outcome", null);
+            return row;
+        });
+        JsonNode ledger = call(store, noLag()).path("ledger");
+        assertEquals("OK", ledger.path("lastRunStatus").asText());
+        assertEquals("2026-08-19T17:00:00Z", ledger.path("lastRunAt").asText());
+        assertTrue(ledger.path("lastRunOutcome").isNull());
+    }
+
+    /** A store that hands back null is a gateway bug, not a query failure — and must not escape. */
+    @Test
+    void aNullSectionResultIsAnInternalErrorNotAQueryFailure() throws Exception {
+        JsonNode ledger = call(storeWhere(empty -> null, SUCCEEDS, SUCCEEDS, SUCCEEDS), noLag())
+                .path("ledger");
+        assertEquals("UNKNOWN", ledger.path("topicsStatus").asText());
+        assertEquals("INTERNAL_ERROR", ledger.path("degraded").path("topics").path("code").asText(),
+                "a programming fault must not be reported as a Postgres query failure");
+    }
+
+    /**
+     * The bulkhead. The ledger pool is two connections and this endpoint shares the gateway's request
+     * threads, so a slow ledger must not turn N concurrent status requests into N threads queueing on
+     * Postgres. Exactly one read runs; the rest are served without touching the database.
+     */
+    @Test
+    void concurrentRequestsDoNotStackUpOnTheLedger() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.CountDownLatch inside = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        SystemStatusStore store = new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            public List<Map<String, Object>> topics(String env, int t) {
+                reads.incrementAndGet();
+                inside.countDown();
+                try {
+                    release.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return List.of();
+            }
+
+            @Override
+            public List<Map<String, Object>> openIncidents(String env, int t) {
+                return List.of();
+            }
+
+            @Override
+            public Map<String, Map<String, Object>> restarts(String env, int t) {
+                return Map.of();
+            }
+
+            @Override
+            public Map<String, Object> lastRun(String env, int t) {
+                return new LinkedHashMap<>();
+            }
+        };
+        SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+        Thread slow = new Thread(() -> {
+            try {
+                c.systemStatus();
+            } catch (Exception ignored) {
+                // the assertion below is on the READ COUNT, not on this thread's payload
+            }
+        });
+        slow.start();
+        assertTrue(inside.await(5, java.util.concurrent.TimeUnit.SECONDS), "first read never started");
+
+        JsonNode out = mapper.readTree(c.systemStatus().getBody());
+        assertEquals(1, reads.get(), "a second request must not start a second ledger read");
+        assertEquals("UNKNOWN", out.path("ledger").path("topicsStatus").asText(),
+                "with no snapshot yet, a blocked reader answers UNKNOWN — never a fabricated empty read");
+        assertEquals("SATURATED", out.path("ledger").path("degraded").path("topics").path("code").asText());
+
+        release.countDown();
+        slow.join(5_000);
+    }
+
+    /** A fresh snapshot is reused: the page refreshes every 2 minutes, the pool has two connections. */
+    @Test
+    void aFreshSnapshotIsServedWithoutRereadingTheLedger() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+        SystemStatusStore store = new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            public List<Map<String, Object>> topics(String env, int t) {
+                reads.incrementAndGet();
+                return List.of();
+            }
+
+            @Override
+            public List<Map<String, Object>> openIncidents(String env, int t) {
+                return List.of();
+            }
+
+            @Override
+            public Map<String, Map<String, Object>> restarts(String env, int t) {
+                return Map.of();
+            }
+
+            @Override
+            public Map<String, Object> lastRun(String env, int t) {
+                return new LinkedHashMap<>();
+            }
+        };
+        SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+        c.systemStatus();
+        JsonNode second = mapper.readTree(c.systemStatus().getBody());
+        assertEquals(1, reads.get(), "the second request inside the cache window must not re-read");
+        assertTrue(second.path("ledger").path("snapshotAgeMs").asLong() >= 0,
+                "the page is told how old the evidence is, so a cached read is never passed off as live");
     }
 }

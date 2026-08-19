@@ -530,15 +530,41 @@ public final class GatewaySettings {
         return intValue("OE_SYSTEM_STATUS_CACHE_MS", 30_000, 1_000);
     }
 
+    /** Ceiling shared by both ledger budgets: past this the gateway is no longer a live process. */
+    public static final int SYSTEM_STATUS_MAX_TIMEOUT_S = 60;
+
     /**
-     * Per-statement budget for the ledger reads. 3s was too tight to be a safety net and behaved as a
-     * failure switch instead: the {@code oe_watch} views aggregate a ledger that grows ~70k rows/day, so
-     * on a cold Postgres cache a read that answers in ~250ms warm takes seconds, and the page went blank
-     * for a reason no log recorded. 15s still bounds a runaway query well inside the page's 2-minute
-     * refresh, and a section that does breach it now degrades on its own (see SystemStatusController).
+     * Per-statement budget for the FAST ledger sections (topics, incidents, restarts). These answer in
+     * single-digit milliseconds against the current views, so 3s is a genuine safety net here.
      */
     public int systemStatusQueryTimeoutSeconds() {
-        return intValue("OE_SYSTEM_STATUS_QUERY_TIMEOUT_S", 15, 1);
+        return clamped("OE_SYSTEM_STATUS_QUERY_TIMEOUT_S", 3, 1, SYSTEM_STATUS_MAX_TIMEOUT_S);
+    }
+
+    /**
+     * Per-statement budget for the SLOW last-run section only. {@code oe_watch.v_runs} answers in
+     * ~250ms warm but takes seconds on a cold Postgres cache, and 2026-08-19 proved what happens when
+     * that budget is a failure switch rather than a safety net: the whole page went blank. Only this
+     * one section gets the wide allowance — giving it to all four would let a single request occupy a
+     * two-connection pool for a minute. Bounded above by {@link #SYSTEM_STATUS_MAX_TIMEOUT_S} so an
+     * operator cannot accidentally configure an unbounded wait into a live market-data process.
+     */
+    public int systemStatusSlowQueryTimeoutSeconds() {
+        return clamped("OE_SYSTEM_STATUS_SLOW_QUERY_TIMEOUT_S", 15, 1, SYSTEM_STATUS_MAX_TIMEOUT_S);
+    }
+
+    /**
+     * Whole-request budget across ALL ledger sections. Per-section timeouts alone do not bound a
+     * request: four sequential reads can each spend their own allowance. The deadline is what makes the
+     * endpoint's worst case a number rather than a sum.
+     */
+    public int systemStatusRequestBudgetSeconds() {
+        return clamped("OE_SYSTEM_STATUS_REQUEST_BUDGET_S", 25, 1, SYSTEM_STATUS_MAX_TIMEOUT_S * 2);
+    }
+
+    /** Bounded on BOTH sides — {@link #intValue} only enforces a floor, so a huge value silently won. */
+    private int clamped(String key, int fallback, int min, int max) {
+        return Math.min(max, intValue(key, fallback, min));
     }
 
     public int systemStatusAdminTimeoutMs() {
