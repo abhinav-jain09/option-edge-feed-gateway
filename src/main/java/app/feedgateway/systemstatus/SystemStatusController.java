@@ -45,7 +45,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * that hides the rest of the picture.
  */
 @RestController
-public class SystemStatusController {
+public class SystemStatusController implements org.springframework.beans.factory.DisposableBean {
 
     private static final Logger LOG = LoggerFactory.getLogger(SystemStatusController.class);
 
@@ -59,6 +59,12 @@ public class SystemStatusController {
     private static final List<String> SECTIONS = List.of("topics", "openIncidents", "restarts", "lastRun");
     /** Frames kept from a stack: enough to locate the call site, bounded so a log stays a log. */
     private static final int MAX_STACK_FRAMES = 6;
+    /**
+     * How long a COLD-START request waits for the one in-flight read. Deliberately far below the
+     * database request budget: a request thread waiting is a request thread not serving market data,
+     * and once any snapshot exists the wait is skipped entirely.
+     */
+    private static final long COLD_START_WAIT_MS = 2_000L;
     /** One full stack trace per section per this interval; the rest are one-liners (an outage repeats). */
     private static final long STACK_TRACE_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(5);
 
@@ -67,7 +73,10 @@ public class SystemStatusController {
      * as the live market-data REST surface, so N concurrent status requests must not become N threads
      * queueing on the database. Exactly one reader at a time; everyone else is served the last snapshot.
      */
-    private final AtomicReference<CompletableFuture<LedgerSnapshot>> inFlight = new AtomicReference<>();
+    /** The in-flight refresh AND the env it is for: a flight for another env can never help us. */
+    private record Flight(String env, CompletableFuture<LedgerSnapshot> result) { }
+
+    private final AtomicReference<Flight> inFlight = new AtomicReference<>();
     private volatile LedgerSnapshot snapshot;
     private final AtomicReference<Long> lastStackNanos = new AtomicReference<>();
 
@@ -107,7 +116,10 @@ public class SystemStatusController {
         out.put("generatedAt", Instant.now().toString());
 
         LedgerSnapshot snap = readLedger(env);
-        boolean stale = snap.ageMs() > settings.systemStatusMaxStaleMs();
+        // Sampled ONCE. Deciding staleness from one reading of the clock and publishing the age from
+        // another lets a threshold crossing between them emit OK next to an age past the limit.
+        long snapshotAgeMs = snap.ageMs();
+        boolean stale = snapshotAgeMs > settings.systemStatusMaxStaleMs();
         Map<String, Object> ledger = new LinkedHashMap<>();
         List<Map<String, Object>> topics = snap.topics();
         Map<String, Map<String, Object>> restarts = snap.restarts();
@@ -148,7 +160,7 @@ public class SystemStatusController {
         ledger.put("lastRunAt", snap.lastRun().get("startedAt"));
         ledger.put("lastRunOutcome", snap.lastRun().get("outcome"));
         ledger.put("transport", transport());
-        ledger.put("snapshotAgeMs", snap.ageMs());
+        ledger.put("snapshotAgeMs", snapshotAgeMs);
         ledger.put("maxStaleMs", settings.systemStatusMaxStaleMs());
         if (!snap.failures().isEmpty() || stale) {
             // Named per section so the page can say WHICH evidence is missing instead of going grey
@@ -196,6 +208,15 @@ public class SystemStatusController {
                 // Gated on the TOPIC read specifically: whether the last-run banner could be read
                 // says nothing about whether this topic has ever been observed.
                 row.put("reason", topicsOk ? "NEVER_OBSERVED" : "LEDGER_UNAVAILABLE");
+            } else if (stale) {
+                // Retained so the operator can see what it WAS, but never as evidence: a green chip
+                // beside an "EVIDENCE STALE" banner is the page contradicting itself, and the green
+                // is what a person actually reads.
+                row.put("evidence", STALE);
+                row.put("state", evidence.get("state"));
+                row.put("ageS", evidence.get("ageS"));
+                row.put("asOf", evidence.get("asOf"));
+                row.put("reason", "SNAPSHOT_STALE");
             } else {
                 row.put("evidence", "OK");
                 row.put("state", evidence.get("state"));
@@ -346,11 +367,16 @@ public class SystemStatusController {
             return LedgerSnapshot.empty(env, UNKNOWN, null);
         }
         LedgerSnapshot cached = usable(snapshot, env);
-        if (cached != null && cached.ageMs() < settings.systemStatusCacheMs()) {
+        // Reuse is bounded by BOTH windows. Honouring only the cache window meant that configuring a
+        // max-stale shorter than the cache window suppressed the refresh for the whole cache window
+        // while serving evidence already past its own staleness limit.
+        long reuseMs = Math.min(settings.systemStatusCacheMs(), settings.systemStatusMaxStaleMs());
+        if (cached != null && cached.ageMs() < reuseMs) {
             return cached;
         }
         CompletableFuture<LedgerSnapshot> mine = new CompletableFuture<>();
-        if (inFlight.compareAndSet(null, mine)) {
+        Flight flight = new Flight(env, mine);
+        if (inFlight.compareAndSet(null, flight)) {
             try {
                 LedgerSnapshot fresh = readAllSections(env);
                 snapshot = fresh;
@@ -360,18 +386,28 @@ public class SystemStatusController {
                 mine.completeExceptionally(e);
                 throw e;
             } finally {
-                inFlight.compareAndSet(mine, null);
+                inFlight.compareAndSet(flight, null);
             }
         }
-        CompletableFuture<LedgerSnapshot> running = inFlight.get();
+        // Contended. An older snapshot for THIS env is a better answer than a blocked request thread:
+        // it is real evidence, it carries its own age, and past the max-stale line the envelope
+        // downgrades it to STALE anyway. Only a genuine cold start waits, and then briefly — this
+        // endpoint shares the gateway's request threads with the live market-data surface.
+        if (cached != null) {
+            return cached;
+        }
+        Flight running = inFlight.get();
         if (running == null) {
-            // It finished between our miss and our CAS; the snapshot it published is the answer.
             LedgerSnapshot published = usable(snapshot, env);
             return published != null ? published : LedgerSnapshot.empty(env, UNKNOWN, saturated());
         }
+        if (!running.env().equals(env)) {
+            // A flight for another environment can never become our evidence; waiting on it would pin
+            // this thread for the whole budget to learn nothing.
+            return LedgerSnapshot.empty(env, UNKNOWN, saturated());
+        }
         try {
-            LedgerSnapshot shared = running.get(settings.systemStatusRequestBudgetSeconds(),
-                    TimeUnit.SECONDS);
+            LedgerSnapshot shared = running.result().get(COLD_START_WAIT_MS, TimeUnit.MILLISECONDS);
             LedgerSnapshot forThisEnv = usable(shared, env);
             if (forThisEnv != null) {
                 return forThisEnv;
@@ -379,9 +415,9 @@ public class SystemStatusController {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (TimeoutException | java.util.concurrent.ExecutionException e) {
-            // Fall through: the in-flight read is not going to help this request.
+            // The in-flight read is not going to help this request in time.
         }
-        return cached != null ? cached : LedgerSnapshot.empty(env, UNKNOWN, saturated());
+        return LedgerSnapshot.empty(env, UNKNOWN, saturated());
     }
 
     /** A snapshot is only usable as this request's evidence if it was taken for the SAME env. */
@@ -527,6 +563,16 @@ public class SystemStatusController {
         }
         LOG.warn("system-status ledger failure origin: {}",
                 SystemStatusFailure.redact(frames.toString(), secrets()));
+    }
+
+    /**
+     * Daemon threads keep the JVM from being held open; they do not stop work during a Spring context
+     * shutdown or reload, which is exactly when the datasource underneath them is being closed.
+     */
+    @Override
+    public void destroy() throws InterruptedException {
+        sections.shutdownNow();
+        sections.awaitTermination(2, TimeUnit.SECONDS);
     }
 
     /**

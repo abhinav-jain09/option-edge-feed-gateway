@@ -703,66 +703,148 @@ class SystemStatusControllerTest {
     }
 
     /**
-     * A snapshot past the max-stale line stops being evidence. A refresh that is stuck must not leave
-     * yesterday's green states and empty incident list on screen forever — that is the same lie as a
-     * blank page, only more convincing.
+     * A snapshot past the max-stale line stops being evidence. Proved on ONE controller: prime a real
+     * successful read, let it age past the limit, then force the aged snapshot to be SERVED by holding
+     * the refresh gate from another thread. Accepting "STALE or UNKNOWN" would have passed on the
+     * trivially-produced UNKNOWN and proved nothing about staleness at all.
      */
     @Test
-    void aSnapshotPastMaxStaleIsNoLongerPresentedAsHealth() throws Exception {
+    void anAgedSnapshotIsServedAsStaleAndNeverAsEvidence() throws Exception {
         System.setProperty("OE_SYSTEM_STATUS_TOPICS", "options.databento.raw");
         System.setProperty("OE_SYSTEM_STATUS_CACHE_MS", "1000");
         System.setProperty("OE_SYSTEM_STATUS_MAX_STALE_MS", "1000");
+        java.util.concurrent.CountDownLatch secondReadStarted = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
         try {
             Map<String, Object> observed = new LinkedHashMap<>();
             observed.put("topic", "options.databento.raw");
             observed.put("state", "HEALTHY");
-            SystemStatusController c = new SystemStatusController(new GatewaySettings(),
-                    storeWhere(empty -> List.of(observed), SUCCEEDS, SUCCEEDS, SUCCEEDS), noLag(), mapper);
-            assertEquals("OK", mapper.readTree(c.systemStatus().getBody())
-                    .path("ledger").path("topicsStatus").asText());
+            java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+            SystemStatusStore store = new SystemStatusStore(null, 3) {
+                @Override
+                public boolean configured() {
+                    return true;
+                }
 
-            Thread.sleep(1_100);   // now past BOTH the cache window and the max-stale line
-            // The gate is free, so this request refreshes — hold it by taking the gate from another
-            // thread is unnecessary: what is under test is that an OLD snapshot cannot be served green.
-            JsonNode stale = mapper.readTree(new SystemStatusController(new GatewaySettings(),
-                    staleStoreServing(observed), noLag(), mapper).systemStatus().getBody());
-            assertTrue(List.of("STALE", "UNKNOWN").contains(stale.path("ledger").path("topicsStatus").asText()),
-                    "a snapshot older than max-stale must not report OK: " + stale.path("ledger"));
+                @Override
+                public List<Map<String, Object>> topics(String env, int t) {
+                    if (reads.incrementAndGet() > 1) {
+                        secondReadStarted.countDown();
+                        try {
+                            release.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    return List.of(observed);
+                }
+
+                @Override
+                public List<Map<String, Object>> openIncidents(String env, int t) {
+                    return List.of();
+                }
+
+                @Override
+                public Map<String, Map<String, Object>> restarts(String env, int t) {
+                    return Map.of();
+                }
+
+                @Override
+                public Map<String, Object> lastRun(String env, int t) {
+                    return new LinkedHashMap<>();
+                }
+            };
+            SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+
+            JsonNode fresh = mapper.readTree(c.systemStatus().getBody());
+            assertEquals("OK", fresh.path("ledger").path("topicsStatus").asText());
+            assertEquals("OK", fresh.path("topics").get(0).path("evidence").asText());
+
+            Thread.sleep(1_100);                       // now past both the reuse window and max-stale
+            Thread holder = new Thread(() -> {             // takes the refresh gate and blocks in it
+                try {
+                    c.systemStatus();
+                } catch (Exception ignored) {
+                    // this thread's payload is not what is asserted
+                }
+            });
+            holder.start();
+            assertTrue(secondReadStarted.await(5, java.util.concurrent.TimeUnit.SECONDS));
+
+            JsonNode aged = mapper.readTree(c.systemStatus().getBody());
+            JsonNode ledger = aged.path("ledger");
+            assertEquals("SNAPSHOT_STALE", ledger.path("reason").asText(),
+                    "the aged snapshot must be served AS stale, not silently reused: " + ledger);
+            assertEquals("STALE", ledger.path("topicsStatus").asText());
+            assertFalse(ledger.path("available").asBoolean());
+            assertFalse(ledger.path("topicsAvailable").asBoolean());
+            assertTrue(ledger.path("snapshotAgeMs").asLong() > ledger.path("maxStaleMs").asLong(),
+                    "the published age must itself be past the limit it was judged against");
+            // The consequence that matters: the retained row is visible but is NOT evidence.
+            JsonNode topic = aged.path("topics").get(0);
+            assertEquals("STALE", topic.path("evidence").asText(),
+                    "a retained row must never still claim evidence=OK: " + topic);
+            assertEquals("HEALTHY", topic.path("state").asText(), "what it WAS is still shown");
+            assertEquals("SNAPSHOT_STALE", topic.path("reason").asText());
+
+            release.countDown();
+            holder.join(5_000);
         } finally {
+            release.countDown();
             System.clearProperty("OE_SYSTEM_STATUS_TOPICS");
             System.clearProperty("OE_SYSTEM_STATUS_CACHE_MS");
             System.clearProperty("OE_SYSTEM_STATUS_MAX_STALE_MS");
         }
     }
 
-    /** A store whose read blocks long enough that the only answer available is an aged snapshot. */
-    private static SystemStatusStore staleStoreServing(Map<String, Object> observed) {
-        return new SystemStatusStore(null, 3) {
-            @Override
-            public boolean configured() {
-                return true;
-            }
+    /**
+     * Reuse is bounded by BOTH windows. Honouring only the cache window let a short max-stale be
+     * defeated by a long cache one: the endpoint would keep serving evidence already past its own
+     * staleness limit, without ever attempting a refresh.
+     */
+    @Test
+    void aShortMaxStaleIsNotDefeatedByALongCacheWindow() throws Exception {
+        System.setProperty("OE_SYSTEM_STATUS_CACHE_MS", "300000");
+        System.setProperty("OE_SYSTEM_STATUS_MAX_STALE_MS", "1000");
+        try {
+            java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+            SystemStatusStore store = new SystemStatusStore(null, 3) {
+                @Override
+                public boolean configured() {
+                    return true;
+                }
 
-            @Override
-            public List<Map<String, Object>> topics(String env, int t) throws SQLException {
-                throw new SQLException("ERROR: canceling statement due to user request", "57014");
-            }
+                @Override
+                public List<Map<String, Object>> topics(String env, int t) {
+                    reads.incrementAndGet();
+                    return List.of();
+                }
 
-            @Override
-            public List<Map<String, Object>> openIncidents(String env, int t) {
-                return List.of();
-            }
+                @Override
+                public List<Map<String, Object>> openIncidents(String env, int t) {
+                    return List.of();
+                }
 
-            @Override
-            public Map<String, Map<String, Object>> restarts(String env, int t) {
-                return Map.of();
-            }
+                @Override
+                public Map<String, Map<String, Object>> restarts(String env, int t) {
+                    return Map.of();
+                }
 
-            @Override
-            public Map<String, Object> lastRun(String env, int t) {
-                return new LinkedHashMap<>();
-            }
-        };
+                @Override
+                public Map<String, Object> lastRun(String env, int t) {
+                    return new LinkedHashMap<>();
+                }
+            };
+            SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+            c.systemStatus();
+            Thread.sleep(1_100);
+            c.systemStatus();
+            assertEquals(2, reads.get(),
+                    "past max-stale the endpoint must attempt a refresh even inside the cache window");
+        } finally {
+            System.clearProperty("OE_SYSTEM_STATUS_CACHE_MS");
+            System.clearProperty("OE_SYSTEM_STATUS_MAX_STALE_MS");
+        }
     }
 
     /**
@@ -812,5 +894,118 @@ class SystemStatusControllerTest {
         } finally {
             System.clearProperty("OE_ENV");
         }
+    }
+
+    /**
+     * A contended request must not block on a flight it can never use. Waiting on another
+     * environment's refresh pins a shared REST request thread for the whole budget to learn nothing.
+     */
+    @Test
+    void aRequestNeverWaitsOnAnotherEnvironmentsInFlightRead() throws Exception {
+        System.setProperty("OE_SYSTEM_STATUS_REQUEST_BUDGET_S", "30");
+        System.setProperty("OE_ENV", "prod");
+        java.util.concurrent.CountDownLatch inside = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        try {
+            SystemStatusStore store = new SystemStatusStore(null, 3) {
+                @Override
+                public boolean configured() {
+                    return true;
+                }
+
+                @Override
+                public List<Map<String, Object>> topics(String env, int t) {
+                    inside.countDown();
+                    try {
+                        release.await(20, java.util.concurrent.TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return List.of();
+                }
+
+                @Override
+                public List<Map<String, Object>> openIncidents(String env, int t) {
+                    return List.of();
+                }
+
+                @Override
+                public Map<String, Map<String, Object>> restarts(String env, int t) {
+                    return Map.of();
+                }
+
+                @Override
+                public Map<String, Object> lastRun(String env, int t) {
+                    return new LinkedHashMap<>();
+                }
+            };
+            SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+            Thread prodReader = new Thread(() -> {
+                try {
+                    c.systemStatus();
+                } catch (Exception ignored) {
+                    // not the subject of this assertion
+                }
+            });
+            prodReader.start();
+            assertTrue(inside.await(5, java.util.concurrent.TimeUnit.SECONDS), "prod read never started");
+
+            System.setProperty("OE_ENV", "es4");
+            long startedAt = System.nanoTime();
+            JsonNode es4 = mapper.readTree(c.systemStatus().getBody());
+            long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+
+            assertTrue(elapsedMs < 2_000,
+                    "es4 waited " + elapsedMs + "ms on a prod flight it could never use");
+            assertEquals("es4", es4.path("env").asText());
+            assertEquals("UNKNOWN", es4.path("ledger").path("topicsStatus").asText());
+            release.countDown();
+            prodReader.join(5_000);
+        } finally {
+            release.countDown();
+            System.clearProperty("OE_SYSTEM_STATUS_REQUEST_BUDGET_S");
+            System.clearProperty("OE_ENV");
+        }
+    }
+
+    /** The executor is shut down with the Spring context, not left running over a closed datasource. */
+    @Test
+    void destroyStopsTheSectionExecutor() throws Exception {
+        java.util.concurrent.CountDownLatch inside = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean interrupted = new java.util.concurrent.atomic.AtomicBoolean();
+        SystemStatusStore store = new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            public List<Map<String, Object>> topics(String env, int t) {
+                inside.countDown();
+                try {
+                    Thread.sleep(20_000);
+                } catch (InterruptedException e) {
+                    interrupted.set(true);
+                    Thread.currentThread().interrupt();
+                }
+                return List.of();
+            }
+        };
+        SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+        Thread reader = new Thread(() -> {
+            try {
+                c.systemStatus();
+            } catch (Exception ignored) {
+                // not the subject of this assertion
+            }
+        });
+        reader.start();
+        assertTrue(inside.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        c.destroy();
+        for (int i = 0; i < 100 && !interrupted.get(); i++) {
+            Thread.sleep(20);
+        }
+        assertTrue(interrupted.get(), "context shutdown must stop in-flight section work");
+        reader.join(5_000);
     }
 }
