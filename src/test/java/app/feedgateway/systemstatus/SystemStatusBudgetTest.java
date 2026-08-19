@@ -133,8 +133,10 @@ class SystemStatusBudgetTest {
                     .readValue(c.systemStatus().getBody(), Map.class);
             long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
 
-            assertTrue(elapsedMs < 10_000,
-                    "a 30s section must not hold the request for 30s; took " + elapsedMs + "ms");
+            // Bounded NEAR the configured second. "< 10s" would have passed with the budget doing
+            // nothing at all beyond stopping the 30s sleep, which is not the claim being made.
+            assertTrue(elapsedMs < 3_000,
+                    "a 1s budget must end the request in about a second; took " + elapsedMs + "ms");
             Map<?, ?> ledger = (Map<?, ?>) body.get("ledger");
             assertEquals("UNKNOWN", ledger.get("topicsStatus"));
             assertEquals("UNKNOWN", ledger.get("lastRunStatus"));

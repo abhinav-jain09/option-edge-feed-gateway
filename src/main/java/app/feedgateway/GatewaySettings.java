@@ -572,6 +572,16 @@ public final class GatewaySettings {
         return clamped("OE_SYSTEM_STATUS_REQUEST_BUDGET_S", 25, 1, SYSTEM_STATUS_MAX_TIMEOUT_S * 2);
     }
 
+    /**
+     * How long a COLD-START request waits for the one in-flight ledger read — i.e. only when no
+     * snapshot exists at all, since any existing snapshot answers immediately. Kept well under the
+     * database budget on purpose: a waiting request thread is a thread not serving market data.
+     * Callers clamp it to the request budget, so it can never outlast the read it is waiting for.
+     */
+    public int systemStatusColdStartWaitMs() {
+        return clamped("OE_SYSTEM_STATUS_COLD_START_WAIT_MS", 2_000, 100, 10_000);
+    }
+
     /** Bounded on BOTH sides — {@link #intValue} only enforces a floor, so a huge value silently won. */
     private int clamped(String key, int fallback, int min, int max) {
         return Math.min(max, intValue(key, fallback, min));

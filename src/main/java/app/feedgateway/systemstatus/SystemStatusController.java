@@ -59,12 +59,8 @@ public class SystemStatusController implements org.springframework.beans.factory
     private static final List<String> SECTIONS = List.of("topics", "openIncidents", "restarts", "lastRun");
     /** Frames kept from a stack: enough to locate the call site, bounded so a log stays a log. */
     private static final int MAX_STACK_FRAMES = 6;
-    /**
-     * How long a COLD-START request waits for the one in-flight read. Deliberately far below the
-     * database request budget: a request thread waiting is a request thread not serving market data,
-     * and once any snapshot exists the wait is skipped entirely.
-     */
-    private static final long COLD_START_WAIT_MS = 2_000L;
+    /** Longest a shutdown will wait for in-flight section work before giving up on it. */
+    private static final long SHUTDOWN_WAIT_SECONDS = GatewaySettings.SYSTEM_STATUS_MAX_TIMEOUT_S + 2L;
     /** One full stack trace per section per this interval; the rest are one-liners (an outage repeats). */
     private static final long STACK_TRACE_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(5);
 
@@ -77,6 +73,8 @@ public class SystemStatusController implements org.springframework.beans.factory
     private record Flight(String env, CompletableFuture<LedgerSnapshot> result) { }
 
     private final AtomicReference<Flight> inFlight = new AtomicReference<>();
+    /** Set once shutdown begins: no new ledger read may start against a datasource being closed. */
+    private volatile boolean closing;
     private volatile LedgerSnapshot snapshot;
     private final AtomicReference<Long> lastStackNanos = new AtomicReference<>();
 
@@ -366,6 +364,12 @@ public class SystemStatusController implements org.springframework.beans.factory
         if (!store.configured()) {
             return LedgerSnapshot.empty(env, UNKNOWN, null);
         }
+        if (closing) {
+            // A read started now would race the datasource being torn down underneath it.
+            LedgerSnapshot last = usable(snapshot, env);
+            return last != null ? last : LedgerSnapshot.empty(env, UNKNOWN,
+                    new SystemStatusFailure("SHUTTING_DOWN", null, "the gateway is shutting down"));
+        }
         LedgerSnapshot cached = usable(snapshot, env);
         // Reuse is bounded by BOTH windows. Honouring only the cache window meant that configuring a
         // max-stale shorter than the cache window suppressed the refresh for the whole cache window
@@ -407,7 +411,11 @@ public class SystemStatusController implements org.springframework.beans.factory
             return LedgerSnapshot.empty(env, UNKNOWN, saturated());
         }
         try {
-            LedgerSnapshot shared = running.result().get(COLD_START_WAIT_MS, TimeUnit.MILLISECONDS);
+            // Clamped to the request budget: a wait that outlasts the read it is waiting for is just
+            // a stalled request thread. Configurable, because 2s is a judgement about THIS deployment.
+            long waitMs = Math.min(settings.systemStatusColdStartWaitMs(),
+                    TimeUnit.SECONDS.toMillis(settings.systemStatusRequestBudgetSeconds()));
+            LedgerSnapshot shared = running.result().get(waitMs, TimeUnit.MILLISECONDS);
             LedgerSnapshot forThisEnv = usable(shared, env);
             if (forThisEnv != null) {
                 return forThisEnv;
@@ -571,8 +579,16 @@ public class SystemStatusController implements org.springframework.beans.factory
      */
     @Override
     public void destroy() throws InterruptedException {
+        closing = true;
         sections.shutdownNow();
-        sections.awaitTermination(2, TimeUnit.SECONDS);
+        // A JDBC read blocked on a socket does not answer an interrupt; it ends when its own socket
+        // timeout fires. Waiting the full I/O bound is what makes "the executor is stopped" true
+        // rather than merely requested, and the result is CHECKED — a silent false here is how a task
+        // survives into datasource teardown.
+        if (!sections.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)) {
+            LOG.warn("system-status section executor did not terminate within {}s; "
+                    + "a ledger read is still blocked on I/O", SHUTDOWN_WAIT_SECONDS);
+        }
     }
 
     /**

@@ -633,10 +633,16 @@ class SystemStatusControllerTest {
             assertTrue(inside.await(5, java.util.concurrent.TimeUnit.SECONDS), "first read never started");
             System.setProperty("OE_SYSTEM_STATUS_REQUEST_BUDGET_S", "1");
 
+            long startedAt = System.nanoTime();
             JsonNode out = mapper.readTree(c.systemStatus().getBody());
+            long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
             assertEquals("UNKNOWN", out.path("ledger").path("topicsStatus").asText());
             assertEquals("SATURATED", out.path("ledger").path("degraded").path("topics").path("code").asText(),
                     "with nothing cached and no shared result in time, the honest answer is UNKNOWN");
+            // The cold-start wait is clamped to the request budget. Unclamped it was a fixed 2s, so a
+            // 1s budget bought a 2s wait — the follower outlasting the very budget it was given.
+            assertTrue(elapsedMs < 1_800,
+                    "a 1s budget must not buy a 2s cold-start wait; took " + elapsedMs + "ms");
             release.countDown();
             slow.join(5_000);
         } finally {
@@ -1007,5 +1013,94 @@ class SystemStatusControllerTest {
         }
         assertTrue(interrupted.get(), "context shutdown must stop in-flight section work");
         reader.join(5_000);
+    }
+
+    /**
+     * A JDBC read blocked on a socket does not answer an interrupt — it ends when its own socket
+     * timeout fires. destroy() must not RETURN while such a task is still running, or the datasource
+     * is closed underneath it. Modelled with a task that deliberately swallows the first interrupt.
+     */
+    @Test
+    void destroyWaitsForAnInterruptDeafSection() throws Exception {
+        java.util.concurrent.CountDownLatch inside = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean stillRunning =
+                new java.util.concurrent.atomic.AtomicBoolean(true);
+        SystemStatusStore store = new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            public List<Map<String, Object>> topics(String env, int t) {
+                inside.countDown();
+                long until = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(600);
+                while (System.nanoTime() < until) {
+                    try {
+                        Thread.sleep(50);   // swallowed: the first interrupt does NOT end this work
+                    } catch (InterruptedException ignored) {
+                        // deliberately deaf, exactly like a socket read
+                    }
+                }
+                stillRunning.set(false);
+                return List.of();
+            }
+        };
+        SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+        Thread reader = new Thread(() -> {
+            try {
+                c.systemStatus();
+            } catch (Exception ignored) {
+                // not the subject of this assertion
+            }
+        });
+        reader.start();
+        assertTrue(inside.await(5, java.util.concurrent.TimeUnit.SECONDS));
+
+        c.destroy();
+        assertFalse(stillRunning.get(),
+                "destroy() returned while a section was still running over the datasource it is about "
+                        + "to close");
+        reader.join(5_000);
+    }
+
+    /** Once shutdown begins, no NEW read may start against a datasource being torn down. */
+    @Test
+    void noNewLedgerReadStartsWhileClosing() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+        SystemStatusStore store = new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            public List<Map<String, Object>> topics(String env, int t) {
+                reads.incrementAndGet();
+                return List.of();
+            }
+
+            @Override
+            public List<Map<String, Object>> openIncidents(String env, int t) {
+                return List.of();
+            }
+
+            @Override
+            public Map<String, Map<String, Object>> restarts(String env, int t) {
+                return Map.of();
+            }
+
+            @Override
+            public Map<String, Object> lastRun(String env, int t) {
+                return new LinkedHashMap<>();
+            }
+        };
+        SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+        c.destroy();
+        JsonNode out = mapper.readTree(c.systemStatus().getBody());
+        assertEquals(0, reads.get(), "a read started during shutdown races the datasource teardown");
+        assertEquals("UNKNOWN", out.path("ledger").path("topicsStatus").asText());
+        assertEquals("SHUTTING_DOWN",
+                out.path("ledger").path("degraded").path("topics").path("code").asText());
     }
 }
