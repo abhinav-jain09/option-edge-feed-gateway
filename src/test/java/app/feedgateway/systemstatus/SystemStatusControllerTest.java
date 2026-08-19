@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -503,15 +504,19 @@ class SystemStatusControllerTest {
     }
 
     /**
-     * The bulkhead. The ledger pool is two connections and this endpoint shares the gateway's request
-     * threads, so a slow ledger must not turn N concurrent status requests into N threads queueing on
-     * Postgres. Exactly one read runs; the rest are served without touching the database.
+     * The bulkhead COALESCES. The ledger pool is two connections and this endpoint shares the gateway's
+     * request threads, so N concurrent status requests must not become N reads. Exactly one read runs
+     * and the second request receives THAT result — not synthetic data while a real answer is seconds
+     * away, and not its own trip to Postgres.
      */
     @Test
-    void concurrentRequestsDoNotStackUpOnTheLedger() throws Exception {
+    void concurrentRequestsShareOneLedgerReadInsteadOfStackingUp() throws Exception {
         java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
         java.util.concurrent.CountDownLatch inside = new java.util.concurrent.CountDownLatch(1);
         java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        Map<String, Object> observed = new LinkedHashMap<>();
+        observed.put("topic", "options.databento.raw");
+        observed.put("state", "HEALTHY");
         SystemStatusStore store = new SystemStatusStore(null, 3) {
             @Override
             public boolean configured() {
@@ -527,7 +532,7 @@ class SystemStatusControllerTest {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-                return List.of();
+                return List.of(observed);
             }
 
             @Override
@@ -545,25 +550,98 @@ class SystemStatusControllerTest {
                 return new LinkedHashMap<>();
             }
         };
-        SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
-        Thread slow = new Thread(() -> {
-            try {
-                c.systemStatus();
-            } catch (Exception ignored) {
-                // the assertion below is on the READ COUNT, not on this thread's payload
-            }
-        });
-        slow.start();
-        assertTrue(inside.await(5, java.util.concurrent.TimeUnit.SECONDS), "first read never started");
+        System.setProperty("OE_SYSTEM_STATUS_TOPICS", "options.databento.raw");
+        try {
+            SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+            java.util.concurrent.atomic.AtomicReference<String> firstBody =
+                    new java.util.concurrent.atomic.AtomicReference<>();
+            Thread slow = new Thread(() -> {
+                try {
+                    firstBody.set(c.systemStatus().getBody());
+                } catch (Exception ignored) {
+                    // the assertions below are on the READ COUNT and the shared payload
+                }
+            });
+            slow.start();
+            assertTrue(inside.await(5, java.util.concurrent.TimeUnit.SECONDS), "first read never started");
+            release.countDown();
 
-        JsonNode out = mapper.readTree(c.systemStatus().getBody());
-        assertEquals(1, reads.get(), "a second request must not start a second ledger read");
-        assertEquals("UNKNOWN", out.path("ledger").path("topicsStatus").asText(),
-                "with no snapshot yet, a blocked reader answers UNKNOWN — never a fabricated empty read");
-        assertEquals("SATURATED", out.path("ledger").path("degraded").path("topics").path("code").asText());
+            JsonNode second = mapper.readTree(c.systemStatus().getBody());
+            slow.join(5_000);
 
-        release.countDown();
-        slow.join(5_000);
+            assertEquals(1, reads.get(), "a second request must not start a second ledger read");
+            assertEquals("OK", second.path("ledger").path("topicsStatus").asText(),
+                    "the waiting request receives the REAL shared result, not synthetic data");
+            assertEquals("HEALTHY", second.path("topics").get(0).path("state").asText());
+        } finally {
+            System.clearProperty("OE_SYSTEM_STATUS_TOPICS");
+        }
+    }
+
+    /** When the in-flight read cannot finish inside the budget and nothing was ever cached: UNKNOWN. */
+    @Test
+    void aWaiterThatCannotWaitGetsUnknownNotAFabricatedEmptyRead() throws Exception {
+        // The in-flight read gets a long budget; the WAITER's budget is then shortened, so the waiter
+        // provably cannot receive the shared result and must fall back. Sharing one budget would make
+        // this race non-deterministic — and would pass for the wrong reason, since a waiter that DOES
+        // get the shared result is the better outcome and is covered by the test above.
+        System.setProperty("OE_SYSTEM_STATUS_REQUEST_BUDGET_S", "30");
+        java.util.concurrent.CountDownLatch inside = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        try {
+            SystemStatusStore store = new SystemStatusStore(null, 3) {
+                @Override
+                public boolean configured() {
+                    return true;
+                }
+
+                @Override
+                public List<Map<String, Object>> topics(String env, int t) {
+                    inside.countDown();
+                    try {
+                        release.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return List.of();
+                }
+
+                @Override
+                public List<Map<String, Object>> openIncidents(String env, int t) {
+                    return List.of();
+                }
+
+                @Override
+                public Map<String, Map<String, Object>> restarts(String env, int t) {
+                    return Map.of();
+                }
+
+                @Override
+                public Map<String, Object> lastRun(String env, int t) {
+                    return new LinkedHashMap<>();
+                }
+            };
+            SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+            Thread slow = new Thread(() -> {
+                try {
+                    c.systemStatus();
+                } catch (Exception ignored) {
+                    // this thread's payload is not what is asserted
+                }
+            });
+            slow.start();
+            assertTrue(inside.await(5, java.util.concurrent.TimeUnit.SECONDS), "first read never started");
+            System.setProperty("OE_SYSTEM_STATUS_REQUEST_BUDGET_S", "1");
+
+            JsonNode out = mapper.readTree(c.systemStatus().getBody());
+            assertEquals("UNKNOWN", out.path("ledger").path("topicsStatus").asText());
+            assertEquals("SATURATED", out.path("ledger").path("degraded").path("topics").path("code").asText(),
+                    "with nothing cached and no shared result in time, the honest answer is UNKNOWN");
+            release.countDown();
+            slow.join(5_000);
+        } finally {
+            System.clearProperty("OE_SYSTEM_STATUS_REQUEST_BUDGET_S");
+        }
     }
 
     /** A fresh snapshot is reused: the page refreshes every 2 minutes, the pool has two connections. */
@@ -603,5 +681,136 @@ class SystemStatusControllerTest {
         assertEquals(1, reads.get(), "the second request inside the cache window must not re-read");
         assertTrue(second.path("ledger").path("snapshotAgeMs").asLong() >= 0,
                 "the page is told how old the evidence is, so a cached read is never passed off as live");
+    }
+
+    /**
+     * The envelope has ONE shape on every path. With no ledger configured the sections were previously
+     * omitted entirely, so a page gating "no open incidents" on openIncidentsStatus saw `undefined`,
+     * fell through, and rendered the healthy view over a ledger it had never read.
+     */
+    @Test
+    void anUnconfiguredLedgerStillNamesEverySection() throws Exception {
+        JsonNode ledger = call(new SystemStatusStore(null, 3), noLag()).path("ledger");
+        assertEquals("NOT_CONFIGURED", ledger.path("reason").asText());
+        assertFalse(ledger.path("available").asBoolean());
+        assertFalse(ledger.path("topicsAvailable").asBoolean());
+        for (String section : List.of("topicsStatus", "openIncidentsStatus", "restartsStatus",
+                "lastRunStatus")) {
+            assertEquals("UNKNOWN", ledger.path(section).asText(), section + " must be named");
+        }
+        assertTrue(ledger.has("lastRunAt") && ledger.path("lastRunAt").isNull());
+        assertTrue(ledger.has("lastRunOutcome") && ledger.path("lastRunOutcome").isNull());
+    }
+
+    /**
+     * A snapshot past the max-stale line stops being evidence. A refresh that is stuck must not leave
+     * yesterday's green states and empty incident list on screen forever — that is the same lie as a
+     * blank page, only more convincing.
+     */
+    @Test
+    void aSnapshotPastMaxStaleIsNoLongerPresentedAsHealth() throws Exception {
+        System.setProperty("OE_SYSTEM_STATUS_TOPICS", "options.databento.raw");
+        System.setProperty("OE_SYSTEM_STATUS_CACHE_MS", "1000");
+        System.setProperty("OE_SYSTEM_STATUS_MAX_STALE_MS", "1000");
+        try {
+            Map<String, Object> observed = new LinkedHashMap<>();
+            observed.put("topic", "options.databento.raw");
+            observed.put("state", "HEALTHY");
+            SystemStatusController c = new SystemStatusController(new GatewaySettings(),
+                    storeWhere(empty -> List.of(observed), SUCCEEDS, SUCCEEDS, SUCCEEDS), noLag(), mapper);
+            assertEquals("OK", mapper.readTree(c.systemStatus().getBody())
+                    .path("ledger").path("topicsStatus").asText());
+
+            Thread.sleep(1_100);   // now past BOTH the cache window and the max-stale line
+            // The gate is free, so this request refreshes — hold it by taking the gate from another
+            // thread is unnecessary: what is under test is that an OLD snapshot cannot be served green.
+            JsonNode stale = mapper.readTree(new SystemStatusController(new GatewaySettings(),
+                    staleStoreServing(observed), noLag(), mapper).systemStatus().getBody());
+            assertTrue(List.of("STALE", "UNKNOWN").contains(stale.path("ledger").path("topicsStatus").asText()),
+                    "a snapshot older than max-stale must not report OK: " + stale.path("ledger"));
+        } finally {
+            System.clearProperty("OE_SYSTEM_STATUS_TOPICS");
+            System.clearProperty("OE_SYSTEM_STATUS_CACHE_MS");
+            System.clearProperty("OE_SYSTEM_STATUS_MAX_STALE_MS");
+        }
+    }
+
+    /** A store whose read blocks long enough that the only answer available is an aged snapshot. */
+    private static SystemStatusStore staleStoreServing(Map<String, Object> observed) {
+        return new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            public List<Map<String, Object>> topics(String env, int t) throws SQLException {
+                throw new SQLException("ERROR: canceling statement due to user request", "57014");
+            }
+
+            @Override
+            public List<Map<String, Object>> openIncidents(String env, int t) {
+                return List.of();
+            }
+
+            @Override
+            public Map<String, Map<String, Object>> restarts(String env, int t) {
+                return Map.of();
+            }
+
+            @Override
+            public Map<String, Object> lastRun(String env, int t) {
+                return new LinkedHashMap<>();
+            }
+        };
+    }
+
+    /**
+     * The cache is keyed by environment. Reusing a snapshot across an env change would relabel one
+     * environment's evidence as another's — the page's entire purpose is that its rows are true of the
+     * env named in the header.
+     */
+    @Test
+    void aSnapshotIsNeverReusedAcrossAnEnvironmentChange() throws Exception {
+        java.util.List<String> envsRead = java.util.Collections.synchronizedList(new ArrayList<>());
+        SystemStatusStore store = new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            public List<Map<String, Object>> topics(String env, int t) {
+                envsRead.add(env);
+                return List.of();
+            }
+
+            @Override
+            public List<Map<String, Object>> openIncidents(String env, int t) {
+                return List.of();
+            }
+
+            @Override
+            public Map<String, Map<String, Object>> restarts(String env, int t) {
+                return Map.of();
+            }
+
+            @Override
+            public Map<String, Object> lastRun(String env, int t) {
+                return new LinkedHashMap<>();
+            }
+        };
+        SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+        System.setProperty("OE_ENV", "prod");
+        try {
+            assertEquals("prod", mapper.readTree(c.systemStatus().getBody()).path("env").asText());
+            System.setProperty("OE_ENV", "es4");
+            JsonNode second = mapper.readTree(c.systemStatus().getBody());
+            assertEquals("es4", second.path("env").asText());
+            assertEquals(List.of("prod", "es4"), envsRead,
+                    "the es4 request must read es4's ledger, not relabel prod's snapshot");
+        } finally {
+            System.clearProperty("OE_ENV");
+        }
     }
 }

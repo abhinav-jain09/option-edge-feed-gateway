@@ -17,8 +17,15 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.Semaphore;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * {@code GET /api/system-status} — the System Status page's single source (design §3.5/§3.6.6).
@@ -46,6 +53,12 @@ public class SystemStatusController {
     private static final String OK = "OK";
     /** Section could not be read. NEVER an empty list, NEVER a missing key — see the honesty contract. */
     private static final String UNKNOWN = "UNKNOWN";
+    /** Section was read, but so long ago the value is no longer evidence of anything. */
+    private static final String STALE = "STALE";
+    /** Sections, in read order. Named once so the envelope is identical on every path. */
+    private static final List<String> SECTIONS = List.of("topics", "openIncidents", "restarts", "lastRun");
+    /** Frames kept from a stack: enough to locate the call site, bounded so a log stays a log. */
+    private static final int MAX_STACK_FRAMES = 6;
     /** One full stack trace per section per this interval; the rest are one-liners (an outage repeats). */
     private static final long STACK_TRACE_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(5);
 
@@ -54,9 +67,23 @@ public class SystemStatusController {
      * as the live market-data REST surface, so N concurrent status requests must not become N threads
      * queueing on the database. Exactly one reader at a time; everyone else is served the last snapshot.
      */
-    private final Semaphore gate = new Semaphore(1);
+    private final AtomicReference<CompletableFuture<LedgerSnapshot>> inFlight = new AtomicReference<>();
     private volatile LedgerSnapshot snapshot;
-    private final Map<String, Long> lastStackTraceNanos = new java.util.concurrent.ConcurrentHashMap<>();
+    private final AtomicReference<Long> lastStackNanos = new AtomicReference<>();
+
+    /**
+     * Sections run here, NOT on the request thread, so the request-wide deadline is a real bound and
+     * not merely the number handed to {@code setQueryTimeout}: connection acquisition, TLS and socket
+     * reads all happen outside that statement timeout. An abandoned task keeps its pooled connection
+     * only until its own statement timeout fires, so the leak is bounded. Daemon threads: this pool
+     * must never hold the JVM open.
+     */
+    private final ExecutorService sections = new ThreadPoolExecutor(0, 4, 30L, TimeUnit.SECONDS,
+            new SynchronousQueue<>(), r -> {
+                Thread t = new Thread(r, "system-status-section");
+                t.setDaemon(true);
+                return t;
+            });
 
     private final GatewaySettings settings;
     private final SystemStatusStore store;
@@ -80,50 +107,64 @@ public class SystemStatusController {
         out.put("generatedAt", Instant.now().toString());
 
         LedgerSnapshot snap = readLedger(env);
+        boolean stale = snap.ageMs() > settings.systemStatusMaxStaleMs();
         Map<String, Object> ledger = new LinkedHashMap<>();
         List<Map<String, Object>> topics = snap.topics();
         Map<String, Map<String, Object>> restarts = snap.restarts();
         List<Map<String, Object>> incidents = snap.incidents();
-        boolean topicsOk = OK.equals(snap.status("topics"));
-        boolean restartsOk = OK.equals(snap.status("restarts"));
+        // Past the max-stale line a cached snapshot stops being evidence. Its statuses go STALE and
+        // nothing downstream may present it as health — a stuck refresh leaving yesterday's green
+        // states on screen is the same lie as a blank page, only more convincing.
+        boolean topicsOk = !stale && OK.equals(snap.status("topics"));
+        boolean restartsOk = !stale && OK.equals(snap.status("restarts"));
 
+        // ONE envelope shape on every path, configured or not. When the ledger is unconfigured the
+        // sections are still named and still say UNKNOWN: a page that gates "no open incidents" on
+        // openIncidentsStatus must not fall through to `undefined` and render the healthy view.
+        ledger.put("available", !stale && store.configured() && snap.allOk());
+        ledger.put("topicsAvailable", topicsOk);
         if (!store.configured()) {
-            ledger.put("available", false);
             ledger.put("reason", "NOT_CONFIGURED");
-            ledger.put("transport", transport());
-        } else {
-            // `available` keeps its v1 meaning — ALL FOUR reads completed — because a page built against
-            // v1 uses it to decide whether anything below can be trusted. Narrowing it here would have
-            // made an old page render a partially-read ledger as fully current. The finer-grained truth
-            // is published ALONGSIDE it, so a page that understands the statuses can be precise and one
-            // that does not stays conservative.
-            boolean allOk = snap.allOk();
-            ledger.put("available", allOk);
-            ledger.put("topicsAvailable", topicsOk);
-            if (!allOk) {
-                ledger.put("reason", topicsOk ? "PARTIAL" : "QUERY_FAILED");
-                // v1 shape (a string) with a SAFE value: a closed-vocabulary code, never server text.
-                SystemStatusFailure primary = snap.primaryFailure();
-                ledger.put("error", primary == null ? UNKNOWN : primary.code());
+        } else if (stale) {
+            ledger.put("reason", "SNAPSHOT_STALE");
+            ledger.put("error", "SNAPSHOT_STALE");
+        } else if (!snap.allOk()) {
+            // `available` keeps its v1 meaning — ALL FOUR reads completed — because a page built
+            // against v1 uses it to decide whether anything below can be trusted. Narrowing it would
+            // have made an old page render a partially-read ledger as fully current.
+            ledger.put("reason", topicsOk ? "PARTIAL" : "QUERY_FAILED");
+            SystemStatusFailure primary = snap.primaryFailure();
+            // v1 shape (a string) with a SAFE value: a closed-vocabulary code, never server text.
+            ledger.put("error", primary == null ? UNKNOWN : primary.code());
+        }
+        for (String name : SECTIONS) {
+            String status = !store.configured() ? UNKNOWN
+                    : stale && OK.equals(snap.status(name)) ? STALE
+                    : snap.status(name);
+            ledger.put(name + "Status", status);
+        }
+        // Always PRESENT, nullable when unread: a missing key renders as "undefined" in a browser and
+        // Date.parse(undefined) is Invalid Date, while an explicit null is a value the page can test.
+        ledger.put("lastRunAt", snap.lastRun().get("startedAt"));
+        ledger.put("lastRunOutcome", snap.lastRun().get("outcome"));
+        ledger.put("transport", transport());
+        ledger.put("snapshotAgeMs", snap.ageMs());
+        ledger.put("maxStaleMs", settings.systemStatusMaxStaleMs());
+        if (!snap.failures().isEmpty() || stale) {
+            // Named per section so the page can say WHICH evidence is missing instead of going grey
+            // as a whole. Codes only — the driver's message stays in the log (it can carry schema,
+            // SQL fragments, hostnames, and in the worst case a credential echoed by a property).
+            Map<String, Object> degraded = new LinkedHashMap<>();
+            snap.failures().forEach((section, failure) -> degraded.put(section, failure.browserView()));
+            if (stale) {
+                Map<String, Object> staleView = new LinkedHashMap<>();
+                staleView.put("code", "SNAPSHOT_STALE");
+                staleView.put("sqlState", null);
+                for (String name : SECTIONS) {
+                    degraded.putIfAbsent(name, staleView);
+                }
             }
-            ledger.put("topicsStatus", snap.status("topics"));
-            ledger.put("openIncidentsStatus", snap.status("openIncidents"));
-            ledger.put("restartsStatus", snap.status("restarts"));
-            ledger.put("lastRunStatus", snap.status("lastRun"));
-            // Always PRESENT, nullable when unread: a missing key renders as "undefined" in a browser and
-            // `new Date(undefined)` is Invalid Date, while an explicit null is a value the page can test.
-            ledger.put("lastRunAt", snap.lastRun().get("startedAt"));
-            ledger.put("lastRunOutcome", snap.lastRun().get("outcome"));
-            ledger.put("transport", transport());
-            ledger.put("snapshotAgeMs", snap.ageMs());
-            if (!snap.failures().isEmpty()) {
-                // Named per section so the page can say WHICH evidence is missing instead of going grey
-                // as a whole. Codes only — the driver's message stays in the log (it can carry schema,
-                // SQL fragments, hostnames, and in the worst case a credential echoed by a property).
-                Map<String, Object> degraded = new LinkedHashMap<>();
-                snap.failures().forEach((section, failure) -> degraded.put(section, failure.browserView()));
-                ledger.put("degraded", degraded);
-            }
+            ledger.put("degraded", degraded);
         }
         out.put("ledger", ledger);
 
@@ -235,7 +276,8 @@ public class SystemStatusController {
      * Every ledger section as of ONE read, with a status per section. Immutable and shared between
      * concurrent requests, so nothing in here may be mutated after construction.
      */
-    private record LedgerSnapshot(long takenAtNanos,
+    private record LedgerSnapshot(String env,
+                                  long takenAtNanos,
                                   List<Map<String, Object>> topics,
                                   List<Map<String, Object>> incidents,
                                   Map<String, Map<String, Object>> restarts,
@@ -243,16 +285,16 @@ public class SystemStatusController {
                                   Map<String, String> statuses,
                                   Map<String, SystemStatusFailure> failures) {
 
-        static LedgerSnapshot empty(String status, SystemStatusFailure failure) {
+        static LedgerSnapshot empty(String env, String status, SystemStatusFailure failure) {
             Map<String, String> statuses = new LinkedHashMap<>();
             Map<String, SystemStatusFailure> failures = new LinkedHashMap<>();
-            for (String section : List.of("topics", "openIncidents", "restarts", "lastRun")) {
+            for (String section : SECTIONS) {
                 statuses.put(section, status);
                 if (failure != null) {
                     failures.put(section, failure);
                 }
             }
-            return new LedgerSnapshot(System.nanoTime(), List.of(), List.of(), Map.of(),
+            return new LedgerSnapshot(env, System.nanoTime(), List.of(), List.of(), Map.of(),
                     nullLastRun(), statuses, failures);
         }
 
@@ -289,36 +331,75 @@ public class SystemStatusController {
     }
 
     /**
-     * Serve the ledger under a cache + single-flight gate. Three outcomes, all honest:
-     * a fresh-enough snapshot is reused (the page refreshes every 2 minutes; re-reading per request
-     * bought nothing and cost the pool), a free gate reads a new one, and a busy gate serves the last
-     * snapshot rather than queueing another thread on a two-connection pool. With no snapshot at all
-     * and a busy gate the answer is UNKNOWN — never an empty ledger dressed as a read one.
+     * Serve the ledger under a cache + COALESCING single flight. A refresh is computed at most once at
+     * a time; concurrent callers WAIT for that same result rather than each opening their own read
+     * against a two-connection pool, and rather than being fobbed off with synthetic data while a
+     * perfectly good answer is seconds away. Only a caller that cannot wait within the request budget
+     * falls back — to the previous snapshot if there is one, and otherwise to UNKNOWN/SATURATED, which
+     * is the honest answer for "nobody has read this yet".
+     *
+     * <p>The cache is keyed by {@code env}: a snapshot taken for one environment must never be
+     * relabelled as another's evidence.
      */
     private LedgerSnapshot readLedger(String env) {
         if (!store.configured()) {
-            return LedgerSnapshot.empty(UNKNOWN, null);
+            return LedgerSnapshot.empty(env, UNKNOWN, null);
         }
-        LedgerSnapshot cached = snapshot;
+        LedgerSnapshot cached = usable(snapshot, env);
         if (cached != null && cached.ageMs() < settings.systemStatusCacheMs()) {
             return cached;
         }
-        if (!gate.tryAcquire()) {
-            return cached != null ? cached
-                    : LedgerSnapshot.empty(UNKNOWN, new SystemStatusFailure("SATURATED", null,
-                            "another status read holds the single-flight gate and no snapshot exists yet"));
+        CompletableFuture<LedgerSnapshot> mine = new CompletableFuture<>();
+        if (inFlight.compareAndSet(null, mine)) {
+            try {
+                LedgerSnapshot fresh = readAllSections(env);
+                snapshot = fresh;
+                mine.complete(fresh);
+                return fresh;
+            } catch (RuntimeException | Error e) {
+                mine.completeExceptionally(e);
+                throw e;
+            } finally {
+                inFlight.compareAndSet(mine, null);
+            }
+        }
+        CompletableFuture<LedgerSnapshot> running = inFlight.get();
+        if (running == null) {
+            // It finished between our miss and our CAS; the snapshot it published is the answer.
+            LedgerSnapshot published = usable(snapshot, env);
+            return published != null ? published : LedgerSnapshot.empty(env, UNKNOWN, saturated());
         }
         try {
-            LedgerSnapshot fresh = readAllSections(env);
-            snapshot = fresh;
-            return fresh;
-        } finally {
-            gate.release();
+            LedgerSnapshot shared = running.get(settings.systemStatusRequestBudgetSeconds(),
+                    TimeUnit.SECONDS);
+            LedgerSnapshot forThisEnv = usable(shared, env);
+            if (forThisEnv != null) {
+                return forThisEnv;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (TimeoutException | java.util.concurrent.ExecutionException e) {
+            // Fall through: the in-flight read is not going to help this request.
         }
+        return cached != null ? cached : LedgerSnapshot.empty(env, UNKNOWN, saturated());
+    }
+
+    /** A snapshot is only usable as this request's evidence if it was taken for the SAME env. */
+    private static LedgerSnapshot usable(LedgerSnapshot candidate, String env) {
+        return candidate != null && candidate.env().equals(env) ? candidate : null;
+    }
+
+    private static SystemStatusFailure saturated() {
+        return new SystemStatusFailure("SATURATED", null,
+                "a ledger read is already in flight and no usable snapshot exists yet");
     }
 
     private LedgerSnapshot readAllSections(String env) {
-        long deadlineNanos = System.nanoTime()
+        // Stamped BEFORE the reads, not after: the age we publish must be the age of the OLDEST
+        // section in the snapshot, so a slow last-run read cannot make the topic states look fresher
+        // than they are.
+        long startedAtNanos = System.nanoTime();
+        long deadlineNanos = startedAtNanos
                 + TimeUnit.SECONDS.toNanos(settings.systemStatusRequestBudgetSeconds());
         int fast = settings.systemStatusQueryTimeoutSeconds();
         int slow = settings.systemStatusSlowQueryTimeoutSeconds();
@@ -339,7 +420,7 @@ public class SystemStatusController {
             normalised.putAll(lastRun);
             lastRun = normalised;
         }
-        return new LedgerSnapshot(System.nanoTime(), topics, incidents, restarts, lastRun,
+        return new LedgerSnapshot(env, startedAtNanos, topics, incidents, restarts, lastRun,
                 statuses, failures);
     }
 
@@ -353,32 +434,56 @@ public class SystemStatusController {
                           SectionReader<T> reader, T fallback) {
         int budget = remainingSeconds(deadlineNanos, sectionSeconds);
         if (budget <= 0) {
-            statuses.put(name, UNKNOWN);
-            failures.put(name, new SystemStatusFailure("DEADLINE_EXCEEDED", null,
-                    "request budget spent before this section was read"));
-            return fallback;
+            return failed(name, statuses, failures, new SystemStatusFailure("DEADLINE_EXCEEDED", null,
+                    "request budget spent before this section was read"), fallback);
+        }
+        Future<T> task;
+        try {
+            task = sections.submit(() -> reader.read(budget));
+        } catch (RejectedExecutionException e) {
+            return failed(name, statuses, failures, saturated(), fallback);
         }
         try {
-            T value = reader.read(budget);
+            T value = task.get(budget, TimeUnit.SECONDS);
             if (value == null) {
                 throw new IllegalStateException("section returned null");
             }
             statuses.put(name, OK);
             return value;
-        } catch (SQLException e) {
-            record(name, e, failures);
+        } catch (TimeoutException e) {
+            // The HARD bound. setQueryTimeout does not cover connection acquisition, TLS or socket
+            // reads, so without this the "budget" was only ever advisory.
+            task.cancel(true);
+            return failed(name, statuses, failures, new SystemStatusFailure("DEADLINE_EXCEEDED", null,
+                    "section exceeded its " + budget + "s share of the request budget"), fallback);
+        } catch (InterruptedException e) {
+            task.cancel(true);
+            Thread.currentThread().interrupt();
+            return failed(name, statuses, failures,
+                    SystemStatusFailure.of(e, secrets()), fallback);
+        } catch (java.util.concurrent.ExecutionException e) {
+            // The cause is the real failure: SQLException stays QUERY_FAILED, anything else is a
+            // gateway bug and must not be reported as a Postgres problem.
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            reportStack(cause);
+            return failed(name, statuses, failures, SystemStatusFailure.of(cause, secrets()), fallback);
         } catch (RuntimeException e) {
-            // A programming fault is NOT a ledger query failure; classifying it as one would send an
-            // operator to Postgres to debug the gateway.
-            record(name, e, failures);
-        } catch (Exception e) {
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            record(name, e, failures);
+            reportStack(e);
+            return failed(name, statuses, failures, SystemStatusFailure.of(e, secrets()), fallback);
         }
+    }
+
+    private <T> T failed(String name, Map<String, String> statuses,
+                         Map<String, SystemStatusFailure> failures, SystemStatusFailure failure,
+                         T fallback) {
         statuses.put(name, UNKNOWN);
+        failures.put(name, failure);
+        report(name, failure);
         return fallback;
+    }
+
+    private List<String> secrets() {
+        return List.of(settings.systemStatusDbPassword());
     }
 
     /** Seconds left of the request budget, never more than this section's own allowance. */
@@ -392,22 +497,36 @@ public class SystemStatusController {
     }
 
     /**
-     * Classify, then report. The classification is pure ({@link SystemStatusFailure}); this is the only
-     * place that logs, and it logs the SANITIZED single-line detail — the raw throwable is attached at
-     * most once per section per {@link #STACK_TRACE_INTERVAL_NANOS}, because during an outage this runs
-     * on every request and four full stack traces per request is how a log stops being readable.
+     * Report a classified failure. The raw {@link Throwable} is NEVER handed to the logger: SLF4J would
+     * print its original message and every cause verbatim, which is exactly the unredacted, unbounded,
+     * multi-line text the sanitizer exists to prevent — password, URL userinfo and server detail
+     * included. What goes out is the sanitized bounded detail plus, at most once per
+     * {@link #STACK_TRACE_INTERVAL_NANOS} ACROSS ALL SECTIONS, a short frame list: enough to locate the
+     * call site, and never four full traces per request during an outage.
      */
-    private void record(String name, Throwable e, Map<String, SystemStatusFailure> failures) {
-        SystemStatusFailure failure = SystemStatusFailure.of(e, List.of(settings.systemStatusDbPassword()));
-        failures.put(name, failure);
+    private void report(String name, SystemStatusFailure failure) {
+        LOG.warn("system-status ledger section {} failed: {} {}", name, failure.code(), failure.detail());
+    }
+
+    /** Frame list only — class, method and line. No messages, so nothing to redact can ride along. */
+    private void reportStack(Throwable e) {
         long now = System.nanoTime();
-        Long previous = lastStackTraceNanos.get(name);
-        if (previous == null || now - previous > STACK_TRACE_INTERVAL_NANOS) {
-            lastStackTraceNanos.put(name, now);
-            LOG.warn("system-status ledger section {} failed: {} {}", name, failure.code(), failure.detail(), e);
-        } else {
-            LOG.warn("system-status ledger section {} failed: {} {}", name, failure.code(), failure.detail());
+        Long previous = lastStackNanos.get();
+        if (previous != null && now - previous <= STACK_TRACE_INTERVAL_NANOS) {
+            return;
         }
+        if (!lastStackNanos.compareAndSet(previous, now)) {
+            return;
+        }
+        StringBuilder frames = new StringBuilder();
+        StackTraceElement[] stack = e.getStackTrace();
+        for (int i = 0; i < Math.min(MAX_STACK_FRAMES, stack.length); i++) {
+            frames.append(i == 0 ? "" : " <- ").append(stack[i].getClassName())
+                    .append('.').append(stack[i].getMethodName())
+                    .append(':').append(stack[i].getLineNumber());
+        }
+        LOG.warn("system-status ledger failure origin: {}",
+                SystemStatusFailure.redact(frames.toString(), secrets()));
     }
 
     /**

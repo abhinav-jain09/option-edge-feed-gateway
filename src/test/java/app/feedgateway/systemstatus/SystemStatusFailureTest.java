@@ -113,4 +113,55 @@ class SystemStatusFailureTest {
     void aNullFailureStillClassifies() {
         assertEquals("INTERNAL_ERROR", SystemStatusFailure.of(null, List.of()).code());
     }
+
+    /** A RuntimeException wrapping SQLState 42501 is still a PRIVILEGE problem in Postgres. */
+    @Test
+    void aWrappedSqlFailureIsClassifiedFromTheSqlExceptionNotTheWrapper() {
+        SystemStatusFailure f = SystemStatusFailure.of(
+                new RuntimeException("pool wrapper", new SQLException("denied", "42501")), List.of());
+        assertEquals("INSUFFICIENT_PRIVILEGE", f.code(),
+                "classifying the wrapper as INTERNAL_ERROR sends the operator to debug the gateway");
+        assertEquals("42501", f.sqlState());
+    }
+
+    /** A SQLException with a nonsense state is still a query failure, not an internal error. */
+    @Test
+    void anUnknownSqlStateIsStillAQueryFailure() {
+        assertEquals("QUERY_FAILED",
+                SystemStatusFailure.of(new SQLException("odd", "ZZZZZ"), List.of()).code());
+        assertEquals("QUERY_FAILED",
+                SystemStatusFailure.of(new SQLException("blank state", ""), List.of()).code());
+    }
+
+    /** Quoted and JSON assignment forms — the bare pattern stops at the opening quote. */
+    @Test
+    void quotedAndJsonSecretFormsAreRedacted() {
+        String detail = SystemStatusFailure.of(new SQLException(
+                "{\"password\":\"hunter2\", \"token\": \"abc123\"} sslpassword='pk-9' ok", "28P01"),
+                List.of()).detail();
+        assertFalse(detail.contains("hunter2"), detail);
+        assertFalse(detail.contains("abc123"), detail);
+        assertFalse(detail.contains("pk-9"), detail);
+    }
+
+    /** A short configured password is still a password; it must not be exempt from redaction. */
+    @Test
+    void shortConfiguredSecretsAreRedactedToo() {
+        String detail = SystemStatusFailure.of(new SQLException("value was Ab1 here", "28P01"),
+                List.of("Ab1")).detail();
+        assertFalse(detail.contains("Ab1"), detail);
+    }
+
+    /**
+     * Redaction happens BEFORE truncation. Capping first slices a long secret in half and leaves the
+     * prefix behind — which is still a secret, and still enough to be dangerous.
+     */
+    @Test
+    void aLongSecretIsRedactedBeforeTheMessageIsTruncated() {
+        String secret = "S3cretValue" + "9".repeat(400);
+        String detail = SystemStatusFailure.of(
+                new SQLException("prefix " + secret + " suffix", "28P01"), List.of(secret)).detail();
+        assertFalse(detail.contains("S3cretValue"),
+                "not even the surviving PREFIX of the secret may remain: " + detail);
+    }
 }

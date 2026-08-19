@@ -39,8 +39,13 @@ record SystemStatusFailure(String code, String sqlState, String detail) {
      * {@code password=...} / {@code sslpassword=...} / {@code token=...} / {@code apikey=...} in a
      * property list or query string, and the {@code user:pass@host} userinfo of a URL.
      */
+    private static final String SECRET_KEYS = "password|passwd|pwd|sslpassword|token|secret|apikey|api_key";
+    /** Bare form: {@code password=hunter2}, {@code token: abc123}. */
     private static final java.util.regex.Pattern SECRET_ASSIGNMENT = java.util.regex.Pattern.compile(
-            "(?i)\\b(password|passwd|pwd|sslpassword|token|secret|apikey|api_key)\\b\\s*[=:]\\s*[^\\s,;&)\\]}\"']+");
+            "(?i)\\b(" + SECRET_KEYS + ")\\b\\s*[=:]\\s*[^\\s,;&)\\]}\"']+");
+    /** Quoted/JSON form: {@code "password":"hunter2"}, {@code token='abc'} — the bare pattern stops at the quote. */
+    private static final java.util.regex.Pattern SECRET_ASSIGNMENT_QUOTED = java.util.regex.Pattern.compile(
+            "(?i)([\"']?)\\b(" + SECRET_KEYS + ")\\b\\1\\s*[=:]\\s*([\"'])(?:\\\\.|(?!\\3).)*\\3");
     private static final java.util.regex.Pattern URL_USERINFO = java.util.regex.Pattern.compile(
             "(?i)([a-z][a-z0-9+.-]*://)[^/@\\s]*@");
     /**
@@ -61,9 +66,10 @@ record SystemStatusFailure(String code, String sqlState, String detail) {
         if (failure == null) {
             return new SystemStatusFailure("INTERNAL_ERROR", null, "no exception supplied");
         }
-        String sqlState = firstSqlState(failure);
-        String code = classify(failure, sqlState);
-        return new SystemStatusFailure(code, sqlState, detailOf(failure, extraSecrets));
+        List<Throwable> chain = chain(failure);
+        SQLException sql = firstSqlException(chain);
+        String sqlState = sql == null ? null : sql.getSQLState();
+        return new SystemStatusFailure(classify(sql, sqlState), sqlState, detailOf(chain, extraSecrets));
     }
 
     /**
@@ -71,8 +77,11 @@ record SystemStatusFailure(String code, String sqlState, String detail) {
      * WITHOUT the server message: a timeout means the query is too slow, a privilege error means the
      * reader role lost a grant, an undefined column means the view drifted from the code.
      */
-    private static String classify(Throwable failure, String sqlState) {
-        if (!(failure instanceof SQLException)) {
+    private static String classify(SQLException failure, String sqlState) {
+        // Classified from the SQLException found ANYWHERE in the chain, not from the outermost
+        // throwable: a RuntimeException wrapping SQLState 42501 is still a privilege problem in
+        // Postgres, and reporting it as INTERNAL_ERROR sends the operator to debug the gateway.
+        if (failure == null) {
             return "INTERNAL_ERROR";
         }
         if (sqlState == null || sqlState.isBlank()) {
@@ -91,22 +100,29 @@ record SystemStatusFailure(String code, String sqlState, String detail) {
         };
     }
 
-    /** The first non-blank SQLState anywhere in the chain — the outer wrapper often has none. */
-    private static String firstSqlState(Throwable failure) {
-        for (Throwable t : chain(failure)) {
+    /**
+     * The first SQLException anywhere in the chain, preferring one that actually carries a SQLState —
+     * the outer wrapper often has none, and pgjdbc puts the real one on the next-exception.
+     */
+    private static SQLException firstSqlException(List<Throwable> chain) {
+        SQLException withoutState = null;
+        for (Throwable t : chain) {
             if (t instanceof SQLException sql) {
                 String state = sql.getSQLState();
                 if (state != null && !state.isBlank()) {
-                    return state;
+                    return sql;
+                }
+                if (withoutState == null) {
+                    withoutState = sql;
                 }
             }
         }
-        return null;
+        return withoutState;
     }
 
-    private static String detailOf(Throwable failure, List<String> extraSecrets) {
+    private static String detailOf(List<Throwable> chain, List<String> extraSecrets) {
         StringBuilder sb = new StringBuilder();
-        for (Throwable t : chain(failure)) {
+        for (Throwable t : chain) {
             if (sb.length() > 0) {
                 sb.append(" <- ");
             }
@@ -116,7 +132,9 @@ record SystemStatusFailure(String code, String sqlState, String detail) {
             }
             String message = t.getMessage();
             if (message != null && !message.isBlank()) {
-                sb.append(": ").append(cap(message, MAX_LINK_CHARS));
+                // REDACT BEFORE TRUNCATING. Capping first can slice a long secret in half and leave
+                // the prefix behind, which is still a secret.
+                sb.append(": ").append(cap(redact(message, extraSecrets), MAX_LINK_CHARS));
             }
             if (sb.length() >= MAX_DETAIL_CHARS) {
                 break;
@@ -154,12 +172,16 @@ record SystemStatusFailure(String code, String sqlState, String detail) {
         return CONTROL_CHARS.matcher(s).replaceAll(" ").trim();
     }
 
-    private static String redact(String s, List<String> extraSecrets) {
-        String out = SECRET_ASSIGNMENT.matcher(s).replaceAll("$1=***");
+    /** Package-private so the reporting path can sanitise anything else it is about to log. */
+    static String redact(String s, List<String> extraSecrets) {
+        String out = SECRET_ASSIGNMENT_QUOTED.matcher(s).replaceAll("$2=***");
+        out = SECRET_ASSIGNMENT.matcher(out).replaceAll("$1=***");
         out = URL_USERINFO.matcher(out).replaceAll("$1***@");
         if (extraSecrets != null) {
             for (String secret : extraSecrets) {
-                if (secret != null && secret.length() >= 4 && out.contains(secret)) {
+                // EVERY non-blank configured secret, not only long ones. A short password is still a
+                // password; over-redacting a common substring is the cheaper mistake.
+                if (secret != null && !secret.isBlank() && out.contains(secret)) {
                     out = out.replace(secret, "***");
                 }
             }

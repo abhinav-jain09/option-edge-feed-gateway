@@ -527,7 +527,17 @@ public final class GatewaySettings {
     }
 
     public int systemStatusCacheMs() {
-        return intValue("OE_SYSTEM_STATUS_CACHE_MS", 30_000, 1_000);
+        return clamped("OE_SYSTEM_STATUS_CACHE_MS", 30_000, 1_000, 300_000);
+    }
+
+    /**
+     * How old a cached ledger snapshot may get before it stops counting as evidence at all. Past this
+     * the page must not show green states or an empty incident list from it: a stuck refresh would
+     * otherwise leave yesterday's "all healthy" on screen forever, which is the same lie as a blank
+     * page, only more convincing.
+     */
+    public int systemStatusMaxStaleMs() {
+        return clamped("OE_SYSTEM_STATUS_MAX_STALE_MS", 300_000, 1_000, 3_600_000);
     }
 
     /** Ceiling shared by both ledger budgets: past this the gateway is no longer a live process. */
