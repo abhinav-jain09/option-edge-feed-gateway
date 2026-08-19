@@ -447,7 +447,7 @@ public class SystemStatusController implements org.springframework.beans.factory
 
     private static SystemStatusFailure saturated() {
         return new SystemStatusFailure("SATURATED", null,
-                "a ledger read is already in flight and no usable snapshot exists yet");
+                "a ledger read is already in flight and no usable snapshot exists yet", false);
     }
 
     private LedgerSnapshot readAllSections(String env) {
@@ -488,10 +488,20 @@ public class SystemStatusController implements org.springframework.beans.factory
     private <T> T section(String name, int sectionSeconds, long deadlineNanos,
                           Map<String, String> statuses, Map<String, SystemStatusFailure> failures,
                           SectionReader<T> reader, T fallback) {
+        SystemStatusFailure unreachable = unreachableLedger(failures);
+        if (unreachable != null) {
+            // A previous section could not get a connection at all. The ledger is DOWN, and that is
+            // already known — spending this section's whole budget rediscovering it is what turned a
+            // dead ledger into a 24-second page (observed on dev 2026-08-19: 2s + 3s + 3s + 15s).
+            // Every section still reports, with the reason that was actually established.
+            statuses.put(name, UNKNOWN);
+            failures.put(name, unreachable);
+            return fallback;
+        }
         int budget = remainingSeconds(deadlineNanos, sectionSeconds);
         if (budget <= 0) {
             return failed(name, statuses, failures, new SystemStatusFailure("DEADLINE_EXCEEDED", null,
-                    "request budget spent before this section was read"), fallback);
+                    "request budget spent before this section was read", false), fallback);
         }
         Future<T> task;
         try {
@@ -512,7 +522,7 @@ public class SystemStatusController implements org.springframework.beans.factory
             // reads, so without this the "budget" was only ever advisory.
             task.cancel(true);
             return failed(name, statuses, failures, new SystemStatusFailure("DEADLINE_EXCEEDED", null,
-                    "section exceeded its " + budget + "s share of the request budget"), fallback);
+                    "section exceeded its " + budget + "s share of the request budget", false), fallback);
         } catch (InterruptedException e) {
             task.cancel(true);
             Thread.currentThread().interrupt();
@@ -565,11 +575,24 @@ public class SystemStatusController implements org.springframework.beans.factory
     }
 
     private static SystemStatusFailure shuttingDown() {
-        return new SystemStatusFailure("SHUTTING_DOWN", null, "the gateway is shutting down");
+        return new SystemStatusFailure("SHUTTING_DOWN", null, "the gateway is shutting down", false);
     }
 
     private List<String> secrets() {
         return List.of(settings.systemStatusDbPassword());
+    }
+
+    /**
+     * The failure of an earlier section that proves the LEDGER ITSELF is unreachable, if any.
+     * Classified in {@link SystemStatusFailure}, not sniffed out of the rendered detail string.
+     */
+    private static SystemStatusFailure unreachableLedger(Map<String, SystemStatusFailure> failures) {
+        for (SystemStatusFailure failure : failures.values()) {
+            if (failure.ledgerUnreachable()) {
+                return failure;
+            }
+        }
+        return null;
     }
 
     /** Seconds left of the request budget, never more than this section's own allowance. */
