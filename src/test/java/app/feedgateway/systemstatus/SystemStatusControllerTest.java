@@ -13,6 +13,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -1102,5 +1103,85 @@ class SystemStatusControllerTest {
         assertEquals("UNKNOWN", out.path("ledger").path("topicsStatus").asText());
         assertEquals("SHUTTING_DOWN",
                 out.path("ledger").path("degraded").path("topics").path("code").asText());
+    }
+
+    /**
+     * The INTERLEAVING, not just the after-the-fact case: a request already inside the endpoint, past
+     * its admission check, must not go on submitting further sections once shutdown begins. Testing
+     * only a request issued after destroy() returned cannot reach this window at all.
+     */
+    @Test
+    void aRequestAlreadyInFlightStopsSubmittingSectionsOnceShutdownBegins() throws Exception {
+        java.util.concurrent.CountDownLatch firstSectionRunning = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch shutdownStarted = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean laterSectionEnteredTheStore =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        SystemStatusStore store = new SystemStatusStore(null, 3) {
+            @Override
+            public boolean configured() {
+                return true;
+            }
+
+            @Override
+            public List<Map<String, Object>> topics(String env, int t) {
+                firstSectionRunning.countDown();
+                try {
+                    shutdownStarted.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return List.of();
+            }
+
+            @Override
+            public List<Map<String, Object>> openIncidents(String env, int t) {
+                laterSectionEnteredTheStore.set(true);
+                return List.of();
+            }
+
+            @Override
+            public Map<String, Map<String, Object>> restarts(String env, int t) {
+                laterSectionEnteredTheStore.set(true);
+                return Map.of();
+            }
+
+            @Override
+            public Map<String, Object> lastRun(String env, int t) {
+                laterSectionEnteredTheStore.set(true);
+                return new LinkedHashMap<>();
+            }
+        };
+        SystemStatusController c = new SystemStatusController(new GatewaySettings(), store, noLag(), mapper);
+        java.util.concurrent.atomic.AtomicReference<String> body =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        Thread request = new Thread(() -> {
+            try {
+                body.set(c.systemStatus().getBody());
+            } catch (Exception ignored) {
+                // the assertion is on what the store was asked to do, not on this payload
+            }
+        });
+        request.start();
+        assertTrue(firstSectionRunning.await(5, java.util.concurrent.TimeUnit.SECONDS));
+
+        Thread closer = new Thread(() -> {
+            try {
+                c.destroy();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        closer.start();
+        Thread.sleep(100);          // let destroy() take the lock and set closing
+        shutdownStarted.countDown();  // now release the section that is mid-flight
+
+        request.join(15_000);
+        closer.join(15_000);
+        assertFalse(laterSectionEnteredTheStore.get(),
+                "a section submitted after shutdown began must not reach the datasource being closed");
+        assertNotNull(body.get(), "the request must still answer, degraded, rather than hang or throw");
+        JsonNode ledger = mapper.readTree(body.get()).path("ledger");
+        assertEquals("SHUTTING_DOWN", ledger.path("degraded").path("lastRun").path("code").asText(),
+                "and it must SAY why the later sections are missing: " + ledger);
     }
 }

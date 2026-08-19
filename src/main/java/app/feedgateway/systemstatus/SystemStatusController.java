@@ -59,8 +59,15 @@ public class SystemStatusController implements org.springframework.beans.factory
     private static final List<String> SECTIONS = List.of("topics", "openIncidents", "restarts", "lastRun");
     /** Frames kept from a stack: enough to locate the call site, bounded so a log stays a log. */
     private static final int MAX_STACK_FRAMES = 6;
-    /** Longest a shutdown will wait for in-flight section work before giving up on it. */
-    private static final long SHUTDOWN_WAIT_SECONDS = GatewaySettings.SYSTEM_STATUS_MAX_TIMEOUT_S + 2L;
+    /**
+     * Longest a shutdown will wait for in-flight section work. Deliberately SHORTER than the socket
+     * backstop: Jenkinsfile.deploy gives the old process 15 seconds before {@code kill -9}, so a
+     * 62-second wait here would not make shutdown cleaner — it would guarantee the hard kill lands
+     * mid-shutdown, or that old and new listeners overlap. Ten seconds fits inside that window; a
+     * task still running after it is logged and left to the datasource close, which aborts its
+     * connection.
+     */
+    private static final long SHUTDOWN_WAIT_SECONDS = 10L;
     /** One full stack trace per section per this interval; the rest are one-liners (an outage repeats). */
     private static final long STACK_TRACE_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(5);
 
@@ -73,8 +80,14 @@ public class SystemStatusController implements org.springframework.beans.factory
     private record Flight(String env, CompletableFuture<LedgerSnapshot> result) { }
 
     private final AtomicReference<Flight> inFlight = new AtomicReference<>();
-    /** Set once shutdown begins: no new ledger read may start against a datasource being closed. */
-    private volatile boolean closing;
+    /**
+     * Set once shutdown begins: no new ledger read may start against a datasource being closed.
+     * Guarded by {@link #lifecycle} at the two points that matter — the admission check and the task
+     * submission — because a plain volatile read leaves a window where a request sees {@code false},
+     * shutdown flips it, and the request submits anyway.
+     */
+    private boolean closing;
+    private final Object lifecycle = new Object();
     private volatile LedgerSnapshot snapshot;
     private final AtomicReference<Long> lastStackNanos = new AtomicReference<>();
 
@@ -364,11 +377,10 @@ public class SystemStatusController implements org.springframework.beans.factory
         if (!store.configured()) {
             return LedgerSnapshot.empty(env, UNKNOWN, null);
         }
-        if (closing) {
+        if (isClosing()) {
             // A read started now would race the datasource being torn down underneath it.
             LedgerSnapshot last = usable(snapshot, env);
-            return last != null ? last : LedgerSnapshot.empty(env, UNKNOWN,
-                    new SystemStatusFailure("SHUTTING_DOWN", null, "the gateway is shutting down"));
+            return last != null ? last : LedgerSnapshot.empty(env, UNKNOWN, shuttingDown());
         }
         LedgerSnapshot cached = usable(snapshot, env);
         // Reuse is bounded by BOTH windows. Honouring only the cache window meant that configuring a
@@ -483,9 +495,10 @@ public class SystemStatusController implements org.springframework.beans.factory
         }
         Future<T> task;
         try {
-            task = sections.submit(() -> reader.read(budget));
+            task = submitSection(reader, budget);
         } catch (RejectedExecutionException e) {
-            return failed(name, statuses, failures, saturated(), fallback);
+            return failed(name, statuses, failures,
+                    isClosing() ? shuttingDown() : saturated(), fallback);
         }
         try {
             T value = task.get(budget, TimeUnit.SECONDS);
@@ -524,6 +537,35 @@ public class SystemStatusController implements org.springframework.beans.factory
         failures.put(name, failure);
         report(name, failure);
         return fallback;
+    }
+
+    /**
+     * Admission and submission under ONE lock, and the task re-checks after it starts. Without this,
+     * a section could be submitted in the window between a request reading {@code closing == false}
+     * and shutdown setting it — starting a database read against a datasource being closed.
+     */
+    private <T> Future<T> submitSection(SectionReader<T> reader, int budget) {
+        synchronized (lifecycle) {
+            if (closing) {
+                throw new RejectedExecutionException("system-status is shutting down");
+            }
+            return sections.submit(() -> {
+                if (isClosing()) {
+                    throw new RejectedExecutionException("system-status is shutting down");
+                }
+                return reader.read(budget);
+            });
+        }
+    }
+
+    private boolean isClosing() {
+        synchronized (lifecycle) {
+            return closing;
+        }
+    }
+
+    private static SystemStatusFailure shuttingDown() {
+        return new SystemStatusFailure("SHUTTING_DOWN", null, "the gateway is shutting down");
     }
 
     private List<String> secrets() {
@@ -579,7 +621,9 @@ public class SystemStatusController implements org.springframework.beans.factory
      */
     @Override
     public void destroy() throws InterruptedException {
-        closing = true;
+        synchronized (lifecycle) {
+            closing = true;
+        }
         sections.shutdownNow();
         // A JDBC read blocked on a socket does not answer an interrupt; it ends when its own socket
         // timeout fires. Waiting the full I/O bound is what makes "the executor is stopped" true
