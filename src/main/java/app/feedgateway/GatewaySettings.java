@@ -799,6 +799,13 @@ public final class GatewaySettings {
      * dwell and drift, the mass balance either side of spot, the strike heating up, and any wall
      * that has crossed zero.
      */
+    /** Corridor-gauge live state (shadow mode): per-(symbol|expiry) JSON, compacted last-value.
+     *  Broadcast STANDALONE as event "corridor-gauge" — the UI renders it with an UNVALIDATED
+     *  badge until the CORRIDOR-GAUGE-GATE1 acceptance gate passes. */
+    public String corridorGaugeTopic() {
+        return value("KAFKA_CORRIDOR_GAUGE_TOPIC", "corridor-gauge-state");
+    }
+
     public String gammaMigrationTopic() {
         return value("KAFKA_GAMMA_MIGRATION_TOPIC", "options.spx.gamma-migration.current");
     }
