@@ -6656,6 +6656,12 @@ public class FeedGatewayService implements ReplayRunner {
             if (!isCacheFresh("corridor-gauge:" + entry.getKey(), nowMs)) {
                 continue;
             }
+            // the cache key ENCODES the source (SOURCE|symbol|expiry); the payload itself is
+            // source-less, so the key is the only authoritative source check here (r3 #1)
+            if (selection == null
+                    || !entry.getKey().startsWith(selection.source() + "|")) {
+                continue;
+            }
             if (!matchesCachedSelection(json, selection)) {
                 continue;
             }
