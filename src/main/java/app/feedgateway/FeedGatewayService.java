@@ -4818,7 +4818,12 @@ public class FeedGatewayService implements ReplayRunner {
                 return key;
             }
             case "corridor-gauge" -> {
-                // Per-chain (symbol|expiry) last-value-wins upsert; the producer never tombstones.
+                // Per-chain last-value-wins upsert; the producer never tombstones. The cache key
+                // is SOURCE|symbol|expiry (UI-review r2 #2): replayCacheMap derives the routing
+                // source from the prefix before the first '|', and the record key alone would
+                // hand it "SPX" as a source.
+                key = binding.source() + "|" + key;
+                versionKey = event + ":" + key;
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 corridorGauges.put(key, json);
@@ -6638,13 +6643,20 @@ public class FeedGatewayService implements ReplayRunner {
     /** Legacy-mode cached replay of the standalone corridor-gauge state on connect. Fresh
      *  entries only; the strip otherwise waits at most one 60s heartbeat for a live frame. */
     private void replayCorridorGaugeCached(WebSocketSession session) {
+        // Purge first (dealer-ledger precedent), then per-entry freshness AND active-selection
+        // isolation (UI-review r2 #2): a legacy client must not receive another chain's frame.
         long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        ActiveSelection selection = activeSelection.get();
         for (Map.Entry<String, String> entry : corridorGauges.entrySet()) {
             String json = entry.getValue();
             if (json == null || json.isBlank()) {
                 continue;
             }
             if (!isCacheFresh("corridor-gauge:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            if (!matchesCachedSelection(json, selection)) {
                 continue;
             }
             send(session, "corridor-gauge", json);
@@ -8281,11 +8293,11 @@ public class FeedGatewayService implements ReplayRunner {
         // The joined dealer-ledger envelope, standalone per session. dealerLedgers holds only envelopes
         // built from fresh halves (joinDealerLedger) and evicted on role expiry (removeCacheEntry).
         replayCacheMap(session, "dealer-ledger", dealerLedgers);
-        // corridor-gauge is standalone like dealer-ledger, but replays through its OWN
-        // freshness-checked helper in BOTH connection modes (UI-review r1 P3): the generic
-        // map replay does not re-check per-entry freshness, and an expired corridor frame
-        // must never be replayed as live to a connecting client.
-        replayCorridorGaugeCached(session);
+        // corridor-gauge per-session replay goes through the GENERIC path on purpose
+        // (UI-review r2 #2): replayCacheMap applies BOTH the per-entry freshness gate (the
+        // event is registered in requiresFreshPerSessionReplay) and the routing engine's
+        // shouldDeliverToSocket — the bespoke helper would bypass selection isolation here.
+        replayCacheMap(session, "corridor-gauge", corridorGauges);
         replayCacheMap(session, "opb-by-option", opbByOptions);
         replayCacheMap(session, "opb-session", opbSessions);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
@@ -8353,6 +8365,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     private boolean requiresFreshPerSessionReplay(String event) {
         return "option-truth".equals(event)
+                || "corridor-gauge".equals(event)
                 || "strike-sr".equals(event)
                 || "gex-magnet".equals(event)
                 || "gamma-migration".equals(event)

@@ -100,6 +100,7 @@ public final class GatewayRecordMapper {
             case "gex-oi-status" -> EventType.GEX_OI_STATUS;
             case "strike-sr" -> EventType.STRIKE_SR;
             case "gamma-migration" -> EventType.GAMMA_MIGRATION;
+            case "corridor-gauge" -> EventType.CORRIDOR_GAUGE;
             case "max-pain" -> EventType.MAX_PAIN;
             case "es-gex" -> EventType.ES_GEX;
             case "es-strike-intel" -> EventType.ES_STRIKE_INTEL;
