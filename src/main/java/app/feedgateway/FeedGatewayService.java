@@ -8281,8 +8281,11 @@ public class FeedGatewayService implements ReplayRunner {
         // The joined dealer-ledger envelope, standalone per session. dealerLedgers holds only envelopes
         // built from fresh halves (joinDealerLedger) and evicted on role expiry (removeCacheEntry).
         replayCacheMap(session, "dealer-ledger", dealerLedgers);
-        // corridor-gauge is standalone like dealer-ledger; one fresh envelope per chain
-        replayCacheMap(session, "corridor-gauge", corridorGauges);
+        // corridor-gauge is standalone like dealer-ledger, but replays through its OWN
+        // freshness-checked helper in BOTH connection modes (UI-review r1 P3): the generic
+        // map replay does not re-check per-entry freshness, and an expired corridor frame
+        // must never be replayed as live to a connecting client.
+        replayCorridorGaugeCached(session);
         replayCacheMap(session, "opb-by-option", opbByOptions);
         replayCacheMap(session, "opb-session", opbSessions);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
