@@ -141,6 +141,7 @@ public class FeedGatewayService implements ReplayRunner {
             "liquidity-heatmap",
             "option-price-behavior",
             "dealer-ledger",
+            "corridor-gauge",
             "zero-dte-intelligence",
             "greek-move-auth",
             "spot-vol-regime",
@@ -237,6 +238,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     private final Map<String, String> gammaMigration = new ConcurrentHashMap<>();
+    /** Corridor-gauge live state per symbol|expiry (JSON, last-value-wins). Standalone event. */
+    private final Map<String, String> corridorGauges = new ConcurrentHashMap<>();
     /**
      * Peak rotation windows and the raw move log, per chain. Same shape as gammaMigration.
      *
@@ -732,6 +735,8 @@ public class FeedGatewayService implements ReplayRunner {
             // routed — replayCacheMap can't deliver it (no GatewayRecordMapper case), so replay it
             // the same standalone way legacy mode does, so an auth-mode reload restores the overlay.
             replayShortPremiumCached(session);
+            // corridor-gauge standalone replay: a reload mid-session restores the strip instantly
+            replayCorridorGaugeCached(session);
             replayZeroDteIntelligenceCached(session);
             // Indicators are the same GLOBAL advisory class (symbol-filtered
             // client-side) — the production auth mode owes the connect replay too
@@ -1264,6 +1269,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_gex_magnet Cached per-(symbol,expiry) gex-magnet count.\n"
                 + "# TYPE options_edge_feed_gateway_gex_magnet gauge\n"
                 + "options_edge_feed_gateway_gex_magnet " + gexMagnet.size() + "\n"
+                + "# HELP options_edge_feed_gateway_corridor_gauges Cached corridor-gauge chain count.\n"
+                + "# TYPE options_edge_feed_gateway_corridor_gauges gauge\n"
+                + "options_edge_feed_gateway_corridor_gauges " + corridorGauges.size() + "\n"
                 + (settings.esGexEnabled()
                         ? "# HELP options_edge_feed_gateway_es_gex Cached per-(symbol,expiry) ES-on-SPX aligned book count.\n"
                           + "# TYPE options_edge_feed_gateway_es_gex gauge\n"
@@ -1545,6 +1553,8 @@ public class FeedGatewayService implements ReplayRunner {
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
         topicEvents.put(settings.dealerLedgerStateTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
+        // corridor-gauge live state: JSON per symbol|expiry, standalone delivery like dealer-ledger
+        topicEvents.put(settings.corridorGaugeTopic(), new TopicBinding("DATABENTO", "corridor-gauge"));
         // Liquidity-heatmap frames are JSON (StrikeLiquidityHeatmapFrame) — this string consumer,
         // never the Avro one (the Avro-read-as-JSON bug class).
         topicEvents.put(settings.strikeLiquidityTopic(), new TopicBinding("DATABENTO", "liquidity-heatmap"));
@@ -1672,6 +1682,8 @@ public class FeedGatewayService implements ReplayRunner {
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
         topicEvents.put(settings.dealerLedgerStateTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
+        // corridor-gauge live state: JSON per symbol|expiry, standalone delivery like dealer-ledger
+        topicEvents.put(settings.corridorGaugeTopic(), new TopicBinding("DATABENTO", "corridor-gauge"));
         // Keep the cache + live JSON consumer topic sets symmetric (same rule as gex-history).
         topicEvents.put(settings.strikeLiquidityTopic(), new TopicBinding("DATABENTO", "liquidity-heatmap"));
         topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding("DATABENTO", "mission-pace"));
@@ -2700,6 +2712,10 @@ public class FeedGatewayService implements ReplayRunner {
                             // Delivered STANDALONE (its own message.type), never inside a ui-batch — the UI
                             // has a dedicated dealer-ledger handler and reads no dealerLedgers batch array.
                             broadcast(binding.event(), forwardJson);
+                        } else if ("corridor-gauge".equals(binding.event())) {
+                            // Likewise STANDALONE: the strike-board strip has its own handler; keeping it
+                            // out of ui-batch leaves the established batch schema untouched (shadow mode).
+                            broadcast(binding.event(), forwardJson);
                         } else if ("option-truth".equals(binding.event())) {
                             // Compact per-strike signal has its own event in legacy mode. Keeping it out of
                             // ui-batch avoids changing the established batch schema and lets the outbound
@@ -2928,6 +2944,7 @@ public class FeedGatewayService implements ReplayRunner {
                     || topic.equals(settings.spreadSkewTopic())
                     || topic.equals(settings.spreadSkewEventsTopic())
                     || topic.equals(settings.shortPremiumRecommendationTopic())
+                    || topic.equals(settings.corridorGaugeTopic())
                     // ES open-direction forecast/outcome producer is a brand-new service that may not be
                     // deployed (and the topics are absent after the daily Kafka wipe until it first
                     // produces) — optional, so their absence can never starve the shared JSON consumer.
@@ -3709,6 +3726,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.strikeIntelByStrikeTopic(),
                     settings.optionTruthByStrikeTopic(),
                     settings.strikeInvasionTopic(),
+                    settings.corridorGaugeTopic(),
                     settings.strikeLiquidityTopic(),
                     settings.databentoPaceMissionTopic(),
                     settings.missionControlTopic(),
@@ -3873,6 +3891,13 @@ public class FeedGatewayService implements ReplayRunner {
             // gateway has captured source-switch offset barriers, so applying that offset barrier can suppress
             // valid fresh levels indefinitely. Keep the same source/symbol/expiry and max-stale gates used by
             // mission-* while bypassing only the offset barrier.
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
+                    && matchesActiveSelection(json, selection);
+        }
+        if ("corridor-gauge".equals(binding.event())) {
+            // Same class as gamma-migration: low-frequency derived per-chain state; the offset
+            // barrier would suppress fresh values indefinitely after a source switch.
             return binding.source().equals(selection.source())
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesActiveSelection(json, selection);
@@ -4790,6 +4815,18 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gexMagnet.put(key, json);
+                return key;
+            }
+            case "corridor-gauge" -> {
+                // Per-chain last-value-wins upsert; the producer never tombstones. The cache key
+                // is SOURCE|symbol|expiry (UI-review r2 #2): replayCacheMap derives the routing
+                // source from the prefix before the first '|', and the record key alone would
+                // hand it "SPX" as a source.
+                key = binding.source() + "|" + key;
+                versionKey = event + ":" + key;
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                corridorGauges.put(key, json);
                 return key;
             }
             case "gamma-migration" -> {
@@ -6044,6 +6081,8 @@ public class FeedGatewayService implements ReplayRunner {
             gexStrikeLifecycle.remove(versionKey.substring("gex-strike-lifecycle:".length()));
         } else if (versionKey.startsWith("gex-magnet:")) {
             gexMagnet.remove(versionKey.substring("gex-magnet:".length()));
+        } else if (versionKey.startsWith("corridor-gauge:")) {
+            corridorGauges.remove(versionKey.substring("corridor-gauge:".length()));
         } else if (versionKey.startsWith("gamma-migration:")) {
             gammaMigration.remove(versionKey.substring("gamma-migration:".length()));
         } else if (versionKey.startsWith("gamma-rotation:")) {
@@ -6598,6 +6637,35 @@ public class FeedGatewayService implements ReplayRunner {
             if (json != null && !json.isBlank() && matchesCachedSelection(json, selection)) {
                 send(session, "dealer-ledger", json);
             }
+        }
+    }
+
+    /** Legacy-mode cached replay of the standalone corridor-gauge state on connect. Fresh
+     *  entries only; the strip otherwise waits at most one 60s heartbeat for a live frame. */
+    private void replayCorridorGaugeCached(WebSocketSession session) {
+        // Purge first (dealer-ledger precedent), then per-entry freshness AND active-selection
+        // isolation (UI-review r2 #2): a legacy client must not receive another chain's frame.
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        ActiveSelection selection = activeSelection.get();
+        for (Map.Entry<String, String> entry : corridorGauges.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("corridor-gauge:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            // the cache key ENCODES the source (SOURCE|symbol|expiry); the payload itself is
+            // source-less, so the key is the only authoritative source check here (r3 #1)
+            if (selection == null
+                    || !entry.getKey().startsWith(selection.source() + "|")) {
+                continue;
+            }
+            if (!matchesCachedSelection(json, selection)) {
+                continue;
+            }
+            send(session, "corridor-gauge", json);
         }
     }
 
@@ -8231,6 +8299,11 @@ public class FeedGatewayService implements ReplayRunner {
         // The joined dealer-ledger envelope, standalone per session. dealerLedgers holds only envelopes
         // built from fresh halves (joinDealerLedger) and evicted on role expiry (removeCacheEntry).
         replayCacheMap(session, "dealer-ledger", dealerLedgers);
+        // corridor-gauge per-session replay goes through the GENERIC path on purpose
+        // (UI-review r2 #2): replayCacheMap applies BOTH the per-entry freshness gate (the
+        // event is registered in requiresFreshPerSessionReplay) and the routing engine's
+        // shouldDeliverToSocket — the bespoke helper would bypass selection isolation here.
+        replayCacheMap(session, "corridor-gauge", corridorGauges);
         replayCacheMap(session, "opb-by-option", opbByOptions);
         replayCacheMap(session, "opb-session", opbSessions);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
@@ -8298,6 +8371,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     private boolean requiresFreshPerSessionReplay(String event) {
         return "option-truth".equals(event)
+                || "corridor-gauge".equals(event)
                 || "strike-sr".equals(event)
                 || "gex-magnet".equals(event)
                 || "gamma-migration".equals(event)
@@ -8540,6 +8614,7 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.strikeIntelByStrikeTopic(), "strike-intel");
                 stringTopics.put(settings.strikeInvasionTopic(), "strike-invasion");
+                stringTopics.put(settings.corridorGaugeTopic(), "corridor-gauge");
                 stringTopics.put(settings.strikeLiquidityTopic(), "liquidity-heatmap");
                 stringTopics.put(settings.databentoPaceMissionTopic(), "mission-pace");
                 stringTopics.put(settings.missionControlTopic(), "mission-control");
