@@ -1281,8 +1281,8 @@ class FeedGatewayServiceTest {
     @Test
     void strikeInvasionCalibrationFenceSurvivesTheGatewayUntouched() throws Exception {
         // The gateway is the last hop before the UI, so if it dropped or rewrote `verdictCalibrated`
-        // the badge would render a fence-less grade-A verdict for a model that failed every
-        // pre-registered calibration criterion (STRIKE-INVASION-CALIBRATION-GATE1.md).
+        // the badge would render a fence-less grade-A verdict for a model that passed no pre-registered criterion (3 failed, 2 were not evaluable)
+        // (strike-invasion-service/calibration/GATE1.md).
         //
         // It is NOT a byte-for-byte relay -- enrichJson stamps the selection expiry, and updateCache
         // prepends the source to the key. What this pins is narrower and is the property that
