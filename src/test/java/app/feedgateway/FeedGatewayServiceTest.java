@@ -1293,7 +1293,7 @@ class FeedGatewayServiceTest {
         String json = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"strike\":6005,"
                 + "\"direction\":\"UP\",\"verdict\":\"SHORT_CALL_CANDIDATE\",\"grade\":\"A\","
                 + "\"verdictCalibrated\":false,"
-                + "\"calibrationRef\":\"STRIKE-INVASION-CALIBRATION-GATE1:2026-08-23:FAILED_5_OF_5\","
+                + "\"calibrationRef\":\"STRIKE-INVASION-CALIBRATION-GATE1:2026-08-23:NO_PASS_3_FAIL_2_NOT_EVALUABLE\","
                 + "\"eventTimeMs\":" + System.currentTimeMillis() + "}";
 
         String enriched = enrichJson(service, json, topicBinding("DATABENTO", "strike-invasion"));
@@ -1304,7 +1304,7 @@ class FeedGatewayServiceTest {
                 "it must still be a BOOLEAN -- a consumer that requires a real boolean would read a "
                 + "re-typed value as uncalibrated, but the gateway must not be what re-types it");
         assertFalse(node.get("verdictCalibrated").asBoolean(true), "and it must still be false");
-        assertEquals("STRIKE-INVASION-CALIBRATION-GATE1:2026-08-23:FAILED_5_OF_5",
+        assertEquals("STRIKE-INVASION-CALIBRATION-GATE1:2026-08-23:NO_PASS_3_FAIL_2_NOT_EVALUABLE",
                 node.get("calibrationRef").asText());
         assertEquals("SHORT_CALL_CANDIDATE", node.get("verdict").asText());
         assertEquals("A", node.get("grade").asText());
