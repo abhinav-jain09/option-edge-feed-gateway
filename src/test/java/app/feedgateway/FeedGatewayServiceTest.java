@@ -1,6 +1,7 @@
 package app.feedgateway;
 
 import app.feedgateway.mtsession.gateway.ReplayParams;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -1275,6 +1276,57 @@ class FeedGatewayServiceTest {
                 down);
         assertEquals("DATABENTO|SPX|6005|DOWN", downKey,
                 "a DOWN record must key separately from the same strike's UP record");
+    }
+
+    @Test
+    void strikeInvasionCalibrationFenceSurvivesTheGatewayUntouched() throws Exception {
+        // The gateway is the last hop before the UI, so if it dropped or rewrote `verdictCalibrated`
+        // the badge would render a fence-less grade-A verdict for a model that passed no pre-registered criterion (3 failed, 2 were not evaluable)
+        // (strike-invasion-service/calibration/GATE1.md).
+        //
+        // It is NOT a byte-for-byte relay -- enrichJson stamps the selection expiry, and updateCache
+        // prepends the source to the key. What this pins is narrower and is the property that
+        // matters: the gateway ADDS routing metadata and otherwise carries the contract's fields
+        // through unread. It has no projection of its own that could infer calibration.
+        FeedGatewayService service = service();
+        setActiveSelection(service, "DATABENTO", "SPX", currentTradingDateExpiry());
+        String json = "{\"marketDataSource\":\"DATABENTO\",\"symbol\":\"SPX\",\"strike\":6005,"
+                + "\"direction\":\"UP\",\"verdict\":\"SHORT_CALL_CANDIDATE\",\"grade\":\"A\","
+                + "\"verdictCalibrated\":false,"
+                + "\"calibrationRef\":\"STRIKE-INVASION-CALIBRATION-GATE1:2026-08-23:NO_PASS_3_FAIL_2_NOT_EVALUABLE\","
+                + "\"eventTimeMs\":" + System.currentTimeMillis() + "}";
+
+        String enriched = enrichJson(service, json, topicBinding("DATABENTO", "strike-invasion"));
+        JsonNode node = new ObjectMapper().readTree(enriched);
+
+        assertTrue(node.has("verdictCalibrated"), "the fence must not be dropped in transit");
+        assertTrue(node.get("verdictCalibrated").isBoolean(),
+                "it must still be a BOOLEAN -- a consumer that requires a real boolean would read a "
+                + "re-typed value as uncalibrated, but the gateway must not be what re-types it");
+        assertFalse(node.get("verdictCalibrated").asBoolean(true), "and it must still be false");
+        assertEquals("STRIKE-INVASION-CALIBRATION-GATE1:2026-08-23:NO_PASS_3_FAIL_2_NOT_EVALUABLE",
+                node.get("calibrationRef").asText());
+        assertEquals("SHORT_CALL_CANDIDATE", node.get("verdict").asText());
+        assertEquals("A", node.get("grade").asText());
+    }
+
+    @Test
+    void theGatewayNeverInterpretsTheCalibrationFence() throws Exception {
+        // A source-level guard with a purpose: the fence is only trustworthy if EVERY consumer
+        // treats a missing or malformed flag as uncalibrated. The cheapest way for the gateway to
+        // hold that property is to have no opinion about the field at all. If someone later adds a
+        // gateway-side projection or filter over it, this fails and they must add the strict
+        // coercion rules the other consumers carry.
+        Path source = Path.of("src/main/java/app/feedgateway/FeedGatewayService.java");
+        String code = Files.readString(source);
+
+        assertFalse(code.contains("verdictCalibrated"),
+                "the gateway must relay the fence, not interpret it");
+        assertFalse(code.contains("calibrationRef"),
+                "likewise the calibration reference");
+        // And it must still be storing the payload it received rather than a rebuilt one.
+        assertTrue(code.contains("strikeInvasions.put(key, json)"),
+                "strike-invasion must be cached as the received JSON, not a re-serialized projection");
     }
 
     @Test
