@@ -82,7 +82,57 @@ class SellerActivityAggregatorTest {
         List<SellerActivityAggregator.StrikeSeries> series = List.of(
                 new SellerActivityAggregator.StrikeSeries(7515, List.of(new long[]{1, 20}, new long[]{2, 1})),
                 new SellerActivityAggregator.StrikeSeries(7520, List.of(new long[]{1, 2}, new long[]{2, 7})));
-        assertEquals(7520.0, SellerActivityAggregator.leader(series));
+        assertEquals(7520.0, SellerActivityAggregator.leader(series, false));
+    }
+
+    @Test
+    void sessionLeaderCarriesTheLastCumulativeValueForwardInsteadOfScoringItZero() {
+        // Session points are cumulative and sparse: 7515 holds a running total of 100 but last printed
+        // at t=2, while 7520 printed 2 most recently at t=3. The leader is the strike HOLDING the most,
+        // not the one that printed last -- the exact-bucket rule would score 7515 at zero and invert it.
+        List<SellerActivityAggregator.StrikeSeries> sparse = List.of(
+                new SellerActivityAggregator.StrikeSeries(7515, List.of(new long[]{1, 40}, new long[]{2, 100})),
+                new SellerActivityAggregator.StrikeSeries(7520, List.of(new long[]{3, 2})));
+        assertEquals(7515.0, SellerActivityAggregator.leader(sparse, true));
+        // Bucketed samples keep the opposite rule on the same data: absent from the latest bucket == 0.
+        assertEquals(7520.0, SellerActivityAggregator.leader(sparse, false));
+        // Unordered points and duplicate timestamps resolve to the later element, as the web does.
+        List<SellerActivityAggregator.StrikeSeries> messy = List.of(
+                new SellerActivityAggregator.StrikeSeries(7515, List.of(new long[]{2, 9}, new long[]{1, 4}, new long[]{2, 11})),
+                new SellerActivityAggregator.StrikeSeries(7520, List.of(new long[]{2, 10})));
+        assertEquals(7515.0, SellerActivityAggregator.leader(messy, true));
+    }
+
+    @Test
+    void sessionEnvelopeNamesTheHoldingLeaderNotTheMostRecentPrinter() {
+        // Same shape end to end: a Session (1440) envelope built from a real snapshot must name the
+        // strike holding the largest cumulative total even though it did not print at the latest minute.
+        ObjectNode snapshot = mapper.createObjectNode();
+        snapshot.put("timestampMs", 1_800_000L);
+        ArrayNode strikes = snapshot.putArray("strikes");
+
+        ObjectNode holder = strikes.addObject();
+        holder.put("strike", 7515);
+        ObjectNode holderActivity = holder.putObject("sellerActivity");
+        holderActivity.put("bucketMinutes", 1);
+        ArrayNode holderPoints = holderActivity.putArray("points");
+        point(holderPoints, 0L, 40, 20, 20);
+        point(holderPoints, 60_000L, 60, 30, 30);   // cumulative 100 by t=1min, then silent
+
+        ObjectNode recent = strikes.addObject();
+        recent.put("strike", 7520);
+        ObjectNode recentActivity = recent.putObject("sellerActivity");
+        recentActivity.put("bucketMinutes", 1);
+        ArrayNode recentPoints = recentActivity.putArray("points");
+        // 30 minutes later: a DIFFERENT 30m bucket, so the bucketed and Session answers can differ.
+        point(recentPoints, 1_800_000L, 2, 1, 1);   // printed most recently, total of 2
+
+        ObjectNode env = aggregator.aggregate(snapshot.toString(), "SPX", "2026-08-26",
+                SellerActivityAggregator.SESSION_MINUTES, "combined");
+        assertEquals(7515.0, env.path("leaderStrike").asDouble());
+
+        ObjectNode bucketed = aggregator.aggregate(snapshot.toString(), "SPX", "2026-08-26", 30, "combined");
+        assertEquals(7520.0, bucketed.path("leaderStrike").asDouble());
     }
 
     @Test
@@ -160,8 +210,10 @@ class SellerActivityAggregatorTest {
         List<SellerActivityAggregator.StrikeSeries> tie = List.of(
                 new SellerActivityAggregator.StrikeSeries(7515, List.of(new long[]{5, 7})),
                 new SellerActivityAggregator.StrikeSeries(7520, List.of(new long[]{5, 7})));
-        assertEquals(7515.0, SellerActivityAggregator.leader(tie));
-        assertNull(SellerActivityAggregator.leader(List.of()));
+        assertEquals(7515.0, SellerActivityAggregator.leader(tie, false));
+        assertEquals(7515.0, SellerActivityAggregator.leader(tie, true));
+        assertNull(SellerActivityAggregator.leader(List.of(), false));
+        assertNull(SellerActivityAggregator.leader(List.of(), true));
     }
 
     @Test

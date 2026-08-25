@@ -98,7 +98,7 @@ public final class SellerActivityAggregator {
                 }
             }
             series.sort(Comparator.comparingDouble(StrikeSeries::strike));
-            leaderStrike = leader(series);
+            leaderStrike = leader(series, sampleMinutes == SESSION_MINUTES);
         }
 
         ArrayNode seriesOut = out.putArray("series");
@@ -184,10 +184,18 @@ public final class SellerActivityAggregator {
     }
 
     /**
-     * Port of sellerActivityLeader: the strike with the largest count in the LATEST visible bucket
-     * (not the historical total); ties resolve to the lower strike. {@code null} when there is no data.
+     * Port of sellerActivityLeader: the strike with the largest count at the LATEST visible timestamp;
+     * ties resolve to the lower strike. {@code null} when there is no data.
+     *
+     * <p>What "at the latest timestamp" means depends on the sample. Bucketed samples are independent
+     * counts, so a strike absent from the latest bucket scores 0 — it genuinely traded nothing there.
+     * Session ({@code cumulative}) points are running totals emitted only when a strike prints, so an
+     * absent timestamp means UNCHANGED: a strike holding a cumulative 100 whose last print was at 09:40
+     * still leads a strike that printed 2 a minute ago. Scoring it 0 would hand the lead to whoever
+     * printed most recently, however small their session total. Mirrors {@code sellerValueAt} in
+     * option-chain.js, which the web panel uses for exactly this reason.
      */
-    static Double leader(List<StrikeSeries> series) {
+    static Double leader(List<StrikeSeries> series, boolean cumulative) {
         long latest = Long.MIN_VALUE;
         for (StrikeSeries s : series) {
             for (long[] p : s.points()) {
@@ -201,8 +209,16 @@ public final class SellerActivityAggregator {
         long bestValue = Long.MIN_VALUE;
         for (StrikeSeries s : series) {
             long value = 0L;
+            long valueAt = Long.MIN_VALUE;
             for (long[] p : s.points()) {
-                if (p[0] == latest) {
+                if (cumulative) {
+                    // Last value at or before `latest`. Points arrive ascending, but this tolerates any
+                    // order and resolves duplicate timestamps to the later element, as the web does.
+                    if (p[0] <= latest && p[0] >= valueAt) {
+                        value = p[1];
+                        valueAt = p[0];
+                    }
+                } else if (p[0] == latest) {
                     value = p[1];
                     break;
                 }
