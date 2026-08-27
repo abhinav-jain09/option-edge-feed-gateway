@@ -3,6 +3,7 @@ package app.feedgateway;
 import com.optionsedge.contracts.greekmoveauth.GreekMoveAuthTopics;
 import com.optionsedge.contracts.spotvolregime.SpotVolRegimeTopics;
 import com.optionsedge.contracts.strikeintelligence.StrikeIntelligenceTopics;
+import com.optionsedge.contracts.volpremium.VolPremiumTopics;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
@@ -1225,6 +1226,26 @@ public final class GatewaySettings {
      */
     public long spotVolRegimeTtlMs() {
         return longValue("GATEWAY_SPOT_VOL_REGIME_TTL_MS", 300_000L, 0L);
+    }
+
+    /**
+     * Compacted IV-vs-realised topic of the standalone vol-premium service (JSON
+     * {@code IvRvReading} &mdash; see {@link VolPremiumTopics#IVRV}). One record per
+     * {@code SYMBOL|sessionDate}, published every frame. Resolved through the platform topic-prefix
+     * helper at deploy time, matching the spot-vol-regime sibling above.
+     */
+    public String volPremiumIvrvTopic() {
+        return value("KAFKA_VOL_PREMIUM_IVRV_TOPIC", VolPremiumTopics.IVRV);
+    }
+
+    /**
+     * Freshness TTL for the vol-premium IV/RV cache. Same SHORT freshness class as
+     * {@link #spotVolRegimeTtlMs()}: a volatility reading minutes old (dead producer, overnight
+     * leftover) is misleading and must read as absent &mdash; the chart simply has no current point
+     * &mdash; never replay as live. Default 5 min.
+     */
+    public long volPremiumIvrvTtlMs() {
+        return longValue("GATEWAY_VOL_PREMIUM_IVRV_TTL_MS", 300_000L, 0L);
     }
 
     /**
