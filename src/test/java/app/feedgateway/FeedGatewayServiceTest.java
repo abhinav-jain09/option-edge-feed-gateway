@@ -2784,6 +2784,42 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    // A READER must never create a topic — every consumer this gateway builds says so.
+    void consumersNeverAutoCreateTopics() throws Exception {
+        // Subscribing to an absent topic makes the consumer ask the broker for its metadata, and
+        // with auto-creation enabled the broker MAKES it, at cluster defaults — here 32 partitions
+        // and no compaction.
+        //
+        // On 2026-08-28 that happened for real: this gateway recreated
+        // options.spx.vol-premium.ivrv at 32 partitions within two seconds of it being deleted,
+        // and its producer — which refuses to start on any partition count but one, because the
+        // frame ordinal is meaningless across partitions — crash-looped behind it. A reader had
+        // blocked a writer by creating the writer's own topic wrongly, and every clean-slate would
+        // have reproduced it.
+        //
+        // Asserted on the SHARED builder every consumer derives from, and structurally on the
+        // three that wrap it, so a future consumer cannot quietly opt out by taking a different
+        // route.
+        FeedGatewayService service = service();
+        java.lang.reflect.Method base = FeedGatewayService.class
+                .getDeclaredMethod("baseConsumerProperties", String.class);
+        base.setAccessible(true);
+        java.util.Properties props = (java.util.Properties) base.invoke(service, "test");
+        assertEquals("false", props.getProperty("allow.auto.create.topics"),
+                "a gateway reads topics; it owns none of them");
+
+        for (String builder : new String[] {"avroConsumerProperties", "stringConsumerProperties",
+                "stringObjectConsumerProperties"}) {
+            java.lang.reflect.Method m =
+                    FeedGatewayService.class.getDeclaredMethod(builder, String.class);
+            m.setAccessible(true);
+            java.util.Properties p = (java.util.Properties) m.invoke(service, "test");
+            assertEquals("false", p.getProperty("allow.auto.create.topics"),
+                    builder + " must inherit the no-auto-create rule");
+        }
+    }
+
+    @Test
     // Cache removal must not take an event EMIT LOCK: that is a lock-order inversion.
     void removeCacheEntryDoesNotInvertTheEmitLockOrder() throws Exception {
         // Both ingest paths take an emit lock and then call updateCache, which takes the instance
