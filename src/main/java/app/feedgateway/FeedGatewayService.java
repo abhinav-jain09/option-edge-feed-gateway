@@ -10379,6 +10379,21 @@ public class FeedGatewayService implements ReplayRunner {
         // captureOffsetBarriers + BARRIER_CONSUMER_ISOLATION.
         properties.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, RECORD_CONSUMER_ISOLATION);
         properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        // A READER NEVER CREATES A TOPIC. Subscribing to an absent topic makes the consumer ask the
+        // broker for its metadata, and with auto-creation enabled the broker MAKES it — at cluster
+        // defaults, which here is 32 partitions and no compaction.
+        //
+        // That is not a tidiness point. options.spx.vol-premium.ivrv is a single ordered series
+        // whose consumers read a per-session frame ordinal to decide whether two readings were
+        // observed back to back, and its producer refuses to start on any partition count but one.
+        // On 2026-08-28 this gateway auto-created that topic at 32 partitions within two seconds of
+        // it being deleted, and the producer then crash-looped: a service correctly refusing to
+        // publish an unorderable series, blocked by a reader that had no business creating anything.
+        // Every clean-slate would have reproduced it.
+        //
+        // The owner of a topic is whoever declares it — the deploy repo's topics.env, or the
+        // producer's own ensureTopics. This process is neither, for any topic it reads.
+        properties.put(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, "false");
         properties.put(ConsumerConfig.CLIENT_ID_CONFIG, settings.groupIdBase() + "-" + name);
         properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, Integer.toString(settings.maxPollRecords()));
         properties.put(ConsumerConfig.FETCH_MAX_BYTES_CONFIG, Integer.toString(settings.fetchMaxBytes()));
