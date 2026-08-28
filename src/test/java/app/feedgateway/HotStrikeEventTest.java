@@ -112,8 +112,12 @@ class HotStrikeEventTest {
         assertTrue(source.contains("isCacheFresh(\"hot-strike:\" + hotEntry.getKey(), hotNowMs)"),
                 "hot-strike replay must be gated by the session freshness window");
         // auth-mode delivery: broadcast() drops events outside the global allowlist
-        assertTrue(source.split("GLOBAL_BROADCAST_EVENTS = Set.of\\(")[1]
-                        .substring(0, 2000).contains("\"hot-strike\","),
+        // Scan the WHOLE Set.of(...) block, not a fixed 2000-char prefix of it: the prefix window
+        // silently became a moving target every time an entry (or its comment) was added above
+        // hot-strike, so this assertion failed for a reason that had nothing to do with hot-strike.
+        String allowlistBlock = source.split("GLOBAL_BROADCAST_EVENTS = Set\\.of\\(")[1];
+        allowlistBlock = allowlistBlock.substring(0, allowlistBlock.indexOf(");"));
+        assertTrue(allowlistBlock.contains("\"hot-strike\","),
                 "hot-strike must be allowlisted for per-session (auth) broadcast");
         // delivered in BOTH connect modes: per-session AND legacy
         assertEquals(2, source.split("replayHotStrikeCached\\(session\\);", -1).length - 1,

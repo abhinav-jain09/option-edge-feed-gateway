@@ -104,6 +104,14 @@ pipeline {
           rm -rf .deps/options-edge-contracts
           git clone git@github.com:abhinav-jain09/options-edge-contracts.git .deps/options-edge-contracts
           git -C .deps/options-edge-contracts checkout "${CONTRACTS_BRANCH:-main}"
+          # RECORD THE REVISION, because the branch is mutable and the contract is EXECUTABLE here.
+          # The gateway validates vol-premium readings by deserialising them through
+          # IvRvReading's own constructor, so what this clone resolved to decides which payloads
+          # the gateway admits at runtime. Without the SHA, two images built from the same gateway
+          # commit can behave differently at that boundary with nothing in their provenance to say
+          # why. Mirrors what options-edge-processing already records.
+          git -C .deps/options-edge-contracts rev-parse HEAD > .contracts-sha
+          echo "contracts revision: $(cat .contracts-sha)"
           mvn -B -f .deps/options-edge-contracts/pom.xml install
         '''
       }
@@ -235,6 +243,10 @@ EOF
               rm -f "$BUILDKITD_CONFIG"
             }
           fi
+          CONTRACTS_SHA="$(cat .contracts-sha 2>/dev/null || echo unknown)"
+          # A LABEL, so the revision travels with the image rather than only with the build log —
+          # see the note in the contracts install stage.
+          BUILD_LABELS="--label options-edge.contracts-revision=$CONTRACTS_SHA"
           TAG_ARGS="-t $IMAGE"
           if [ -n "$DEV_TAG" ] && [ "$DEV_TAG" != "$TAG" ]; then
             TAG_ARGS="$TAG_ARGS -t $DEV_IMAGE"
@@ -261,11 +273,11 @@ EOF
               ./ "$remote:$remote_dir/"
             push_cmd=""
             for ref in $push_refs; do push_cmd="$push_cmd && docker push '$ref'"; done
-            ssh "$remote" "cd '$remote_dir' && docker build --no-cache $TAG_ARGS . $push_cmd && rm -rf '$remote_dir'"
+            ssh "$remote" "cd '$remote_dir' && docker build --no-cache $BUILD_LABELS $TAG_ARGS . $push_cmd && rm -rf '$remote_dir'"
           elif [ "$PUSH_IMAGE" = "true" ]; then
-            docker buildx build --platform "$BUILD_PLATFORM" --no-cache $TAG_ARGS --push .
+            docker buildx build --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS --push .
           else
-            docker buildx build --platform "$BUILD_PLATFORM" --no-cache $TAG_ARGS --load .
+            docker buildx build --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS --load .
           fi
         '''
       }

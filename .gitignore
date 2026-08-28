@@ -5,3 +5,9 @@ target/
 .idea/
 *.iml
 .claude/worktrees/
+
+# local git worktrees (esgex/lifecycle) live inside the checkout; never commit them as gitlinks
+.gwt-*
+
+# Build provenance written by the contracts install stage — never committed.
+.contracts-sha
