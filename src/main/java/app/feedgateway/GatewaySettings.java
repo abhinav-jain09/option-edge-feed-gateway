@@ -318,6 +318,15 @@ public final class GatewaySettings {
     }
 
     /**
+     * Per-strike premium binned by where the underlying was standing when it printed, compacted and
+     * split from the chain-wide snapshot for the same reason Seller Activity is: a per-strike x per-bin
+     * matrix cannot ride inside a record that is republished on every dashboard tick.
+     */
+    public String databentoSpotBandTopic() {
+        return value("KAFKA_DATABENTO_SPOT_BAND_TOPIC", "options.databento.spot-band-flow");
+    }
+
+    /**
      * Per-strike delta-flow topic (JSON {@code DeltaFlowStrikeSnapshot}, one record per
      * {@code symbol|date|expiry|strike}) from delta-flow-service. Broadcast as event
      * {@code "delta-flow"}. NB: unlike the {@code options.databento.*} topics, the delta-flow

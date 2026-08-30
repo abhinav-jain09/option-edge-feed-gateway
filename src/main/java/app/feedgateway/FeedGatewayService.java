@@ -129,7 +129,7 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "spot-band", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "gex-oi-status",
             "strike-sr",
             "gex-magnet",
@@ -1572,6 +1572,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
+        topicEvents.put(settings.databentoSpotBandTopic(), new TopicBinding("DATABENTO", "spot-band"));
         if (settings.esGexEnabled()) {
             topicEvents.put(settings.esGexSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-gex"));
         }
@@ -1707,6 +1708,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
+        topicEvents.put(settings.databentoSpotBandTopic(), new TopicBinding("DATABENTO", "spot-band"));
         if (settings.esGexEnabled()) {
             topicEvents.put(settings.esGexSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-gex"));
         }
