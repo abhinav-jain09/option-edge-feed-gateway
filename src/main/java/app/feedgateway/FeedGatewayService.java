@@ -3018,60 +3018,23 @@ public class FeedGatewayService implements ReplayRunner {
      * topic in a consumer set is mandatory and keeps the strict metadata requirement.
      */
     private boolean isOptionalTopic(String topic) {
-        // OPTIONAL: absence must never block/crash-loop the SHARED consumer. The dealer-ledger topics
-        // are produced by a separate service that may not be deployed (and, since Kafka is wiped and
-        // services restart each day, are simply absent until that service first produces) — treat them
-        // as optional so their absence can't starve strike-flow / mission-pace / the other JSON feeds.
-        return topic != null
-                && (topic.equals(settings.dropNowcastTopic())
-                    || topic.equals(settings.strikeLiquidityTopic())
-                    || topic.equals(settings.dealerLedgerProfileTopic())
-                    || topic.equals(settings.dealerLedgerStateTopic())
-                    || topic.equals(settings.strikeIntelByStrikeTopic())
-                    || topic.equals(settings.optionTruthByStrikeTopic())
-                    || topic.equals(settings.strikeInvasionTopic())
-                    // Both spread-skew topics come from the same brand-new spread-skew-service, which may
-                    // not be deployed during a staged rollout — BOTH must be optional (like strike-invasion)
-                    // so their absence cannot starve the shared JSON consumer.
-                    || topic.equals(settings.spreadSkewTopic())
-                    || topic.equals(settings.spreadSkewEventsTopic())
-                    || topic.equals(settings.shortPremiumRecommendationTopic())
-                    || topic.equals(settings.corridorGaugeTopic())
-                    // ES open-direction forecast/outcome producer is a brand-new service that may not be
-                    // deployed (and the topics are absent after the daily Kafka wipe until it first
-                    // produces) — optional, so their absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.esOpenDirectionForecastTopic())
-                    || topic.equals(settings.esOpenDirectionOutcomeTopic())
-                    // The live STATUS heartbeat comes from the same may-not-be-deployed producer, and is
-                    // additionally absent whenever no overnight session is active — optional like its siblings.
-                    || topic.equals(settings.esOpenDirectionStatusTopic())
-                    // Greek-move-authenticity is a brand-new standalone service that may not be deployed (and
-                    // the topic is absent after the daily Kafka wipe until it first produces) — optional, so
-                    // its absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.greekMoveAuthCurrentTopic())
-                    // Spot-vol-regime is a brand-new standalone service that may not be deployed (and the
-                    // topic is absent after the daily Kafka wipe until it first produces) — optional, so
-                    // its absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.spotVolRegimeTopic())
-                    // Vol-premium is a brand-new standalone service that may not be deployed (and the
-                    // topic is absent after the daily Kafka wipe until it first produces) — optional, so
-                    // its absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.volPremiumIvrvTopic())
-                    // BOTH indicator CURRENT topics are optional (r2 finding 3):
-                    // the local one until the service first produces, and the
-                    // es4-MIRRORED one whenever the mirror is not yet installed —
-                    // an absent mirror means ES goes stale (§7.3), never a dead
-                    // shared consumer.
-                    || settings.indicatorsSnapshotTopics().contains(topic)
-                    // The tape-zones board is OPTIONAL for the same two reasons: on dev/prod it does
-                    // not exist until the MM1 mirror is installed (§6.2, still pending), and on es4
-                    // not until the service first produces. An absent board must mean "the card says
-                    // no data", never a dead shared JSON consumer.
-                    || topic.equals(settings.tapeZonesBoardTopic())
-                    // Close-direction is a brand-new standalone service that may not be deployed (and the
-                    // topic is absent until it first produces) — optional like its advisory siblings.
-                    || topic.equals(settings.closeDirectionSignalTopic())
-                    || topic.equals(settings.vixOptionInteligenceTopic()));
+        // EVERY topic is optional: absence must never block or crash-loop a shared consumer.
+        //
+        // This used to be a hand-maintained whitelist (20 entries deep by 2026-08), and the list itself
+        // was the outage generator: dev wipes every topic nightly, so ANY topic whose producer had not
+        // yet run was absent at bootstrap — and any topic someone forgot to whitelist made partitionsFor
+        // throw TopicMetadataTimeoutException for the WHOLE consumer set, restarting it every 30s and
+        // blacking out every feed it carried (the UI's recurring "GEX WAITING / 0 records" mornings:
+        // .pace.rank on 08-28, gex.oi-status + option-truth + spread-skew the same day, spot-band-flow
+        // on 08-31 — each a new service's topic missing from the list). Every entry's own comment told
+        // the same story: "brand-new service that may not be deployed... absent after the daily wipe".
+        // That is not an exception; it is the steady state. So the default is flipped: an absent topic
+        // is skipped with a logged transition (see partitionsFor) and picked up by PartitionRefresh once
+        // its producer creates it — no gateway restart, no whitelist to forget. A topic that is truly
+        // load-bearing does not need strict metadata at bootstrap to be correct: its consumers simply
+        // have nothing to read until the producer runs, which is the same observable state, minus the
+        // collateral blackout of every OTHER feed on the shared consumer.
+        return topic != null;
     }
 
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {

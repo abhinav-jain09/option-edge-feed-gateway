@@ -557,8 +557,15 @@ class FeedGatewayServiceTest {
         // absence cannot starve the shared JSON consumer.
         assertTrue(isOptionalTopic(service, settings.spreadSkewTopic()));
         assertTrue(isOptionalTopic(service, settings.spreadSkewEventsTopic()));
-        // A mandatory feed must still be mandatory (guards against over-broadening the optional set).
-        assertFalse(isOptionalTopic(service, settings.databentoStrikeFlowTopic()));
+        // The default is now graceful-absence for EVERY topic (2026-08-31): the hand-maintained
+        // whitelist was itself the recurring outage — each newly bound topic someone forgot to list
+        // (.pace.rank, gex.oi-status, spot-band-flow...) made partitionsFor throw for the WHOLE
+        // consumer set after the nightly wipe, blacking out every feed it carried. Formerly-mandatory
+        // topics are optional too: their absence means their own feature has no data (same observable
+        // state), never a dead shared consumer.
+        assertTrue(isOptionalTopic(service, settings.databentoStrikeFlowTopic()));
+        // null stays non-optional: a null topic name is a wiring bug, not an absent producer.
+        assertFalse(isOptionalTopic(service, null));
     }
 
     @Test
