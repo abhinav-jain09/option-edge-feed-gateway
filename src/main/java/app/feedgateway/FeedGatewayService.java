@@ -186,7 +186,8 @@ public class FeedGatewayService implements ReplayRunner {
     // map, not seller-activity's disk store) because a band matrix is a short sparse list, not a
     // session history — but it follows seller-activity's OTHER rule: never broadcast one record at
     // a time. ~200 strikes republished on change would fill the chain's outbound queue; it rides
-    // the ui-batch instead, exactly as strikeFlows does.
+    // the ui-batch instead, exactly as strikeFlows does. That holds on EVERY route: the live
+    // consumer skips it (see the spot-band continue) and replayCachedToSocket does not replay it.
     private final Map<String, String> spotBands = new ConcurrentHashMap<>();
     private final SellerActivityDiskStore sellerActivityStore = new SellerActivityDiskStore();
     // Per-strike delta-flow snapshots, keyed by source|symbol|expiry|strike (last-value-wins per
@@ -8578,7 +8579,11 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "pace-rank", paceRanks);
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
-        replayCacheMap(session, "spot-band", spotBands);
+        // spot-band is deliberately NOT replayed here. replayCacheMap sends ONE socket message per
+        // cache entry, and there is no client handler for a "spot-band" message — the page reads bands
+        // only from the ui-batch's spotBands array. Replaying ~200 per-strike entries therefore sent a
+        // burst the browser discarded, and contradicted this field's own contract. The batch is the
+        // delivery path on both routes: sourceSwitchReplayEvents() for a switch, pendingSpotBands live.
         replayCacheMap(session, "delta-flow", deltaFlows);
         replayCacheMap(session, "strike-intel", strikeIntels);
         replayCacheMap(session, "option-truth", optionTruths);
