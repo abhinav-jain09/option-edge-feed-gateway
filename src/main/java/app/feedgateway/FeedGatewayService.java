@@ -186,8 +186,17 @@ public class FeedGatewayService implements ReplayRunner {
     // map, not seller-activity's disk store) because a band matrix is a short sparse list, not a
     // session history — but it follows seller-activity's OTHER rule: never broadcast one record at
     // a time. ~200 strikes republished on change would fill the chain's outbound queue; it rides
-    // the ui-batch instead, exactly as strikeFlows does.
+    // the ui-batch instead, exactly as strikeFlows does. That holds on EVERY route: the live
+    // consumer skips it (see the spot-band continue) and replayCachedToSocket does not replay it.
     private final Map<String, String> spotBands = new ConcurrentHashMap<>();
+    // socketId -> the readiness key whose completed band board this socket has already been sent by a
+    // SWITCH-time replay. Readiness and the connect bracket both race to serve the same board; rather
+    // than reason about which iterator ordering wins, both go through it and the loser is a no-op.
+    // Connect and return-to-live replays are NOT deduplicated here — a reset owes a fresh board. That is
+    // also why a STALE claim cannot cost a socket its board: if an id were ever reused, the new
+    // connection still gets the full board from the connect replay, which never consults this ledger.
+    // Bounded by the live socket set on every switch (see replaySpotBandBatchAfterSourceSwitch).
+    private final Map<String, String> spotBandSwitchDelivered = new ConcurrentHashMap<>();
     private final SellerActivityDiskStore sellerActivityStore = new SellerActivityDiskStore();
     // Per-strike delta-flow snapshots, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (DeltaFlowStrikeSnapshot) — lives on the JSON-state consumer.
@@ -774,7 +783,16 @@ public class FeedGatewayService implements ReplayRunner {
         // each socket gets only the cached state matching its own AppSession selection (no cross-
         // contract leak), then live routed data (FR-11).
         if (perSessionRouting()) {
+            // A socket that connects BETWEEN a source switch and its readiness can be served a cache that
+            // is still filling, and the readiness replay iterates `clients` weakly — if its iterator was
+            // snapshotted before this session was registered, no later attempt repairs it, because
+            // readiness is one-shot per selection key. Bracket the replay with the key: if readiness
+            // committed while we were replaying, take the completed band board ourselves.
+            String keyBeforeReplay = readySelectionKey.get();
             replayCachedToSocket(session);
+            if (!java.util.Objects.equals(keyBeforeReplay, readySelectionKey.get())) {
+                replaySpotBandBatchOncePerReadiness(session);
+            }
             // short-premium is a GLOBAL advisory (symbol-filtered client-side), not per-session
             // routed — replayCacheMap can't deliver it (no GatewayRecordMapper case), so replay it
             // the same standalone way legacy mode does, so an auth-mode reload restores the overlay.
@@ -795,7 +813,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gamma-migration", "gex-strike-lifecycle"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
+            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "spot-band", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
             replayOptionTruthCachedLegacy(session);
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
@@ -850,6 +868,7 @@ public class FeedGatewayService implements ReplayRunner {
     public void removeClient(WebSocketSession session) {
         String id = session.getId();
         OutboundChannel channel = outbound.remove(id);
+        spotBandSwitchDelivered.remove(id);
         WebSocketSession stored = clientsById.remove(id);
         if (stored != null) {
             clients.remove(stored);
@@ -3636,6 +3655,11 @@ public class FeedGatewayService implements ReplayRunner {
             broadcast("source-switching", activeSelectionJson(next, "source-switching"));
             broadcast("status", statusJson());
             boolean replayed = broadcastCachedState(sourceSwitchReplayEvents());
+            // NB: the band batch is deliberately NOT replayed here. When this selection is already
+            // serviceable, markSelectionReady(next) runs immediately below and replays it — doing it
+            // here too sent every socket the same batch twice for one switch. Readiness is also the
+            // correct moment: before it, the new selection's cache is knowably incomplete, so a replay
+            // here would push exactly the partial board the readiness gate exists to withhold.
             // WITHHOLD readiness while the newly selected source has partitions still replaying a mid-run
             // rebuild. Announcing source-ready here would certify a cache that is knowably missing every
             // strike on those partitions — the original incident's symptom, reached by a different route.
@@ -4077,6 +4101,7 @@ public class FeedGatewayService implements ReplayRunner {
             // would stay blank until a manual refresh or the next market open.
             broadcast("source-ready", activeSelectionJson(selection, "source-ready"));
             broadcastCachedState(sourceSwitchReplayEvents());
+            replaySpotBandBatchAfterSourceSwitch();
         }
     }
 
@@ -8578,7 +8603,14 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "pace-rank", paceRanks);
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
-        replayCacheMap(session, "spot-band", spotBands);
+        // Bands go out as ONE batch, not through replayCacheMap: that sends a socket message per cache
+        // entry and the web client has no handler for a "spot-band" message, so ~200 per-strike messages
+        // were simply discarded by the browser. It belongs HERE rather than in addClient because this is
+        // the common per-socket replay path, which has exactly two triggers: connect (addClient) and
+        // return-to-live (resumeLive -> replayLiveCacheToAppSession). A SOURCE SWITCH does NOT come
+        // through here — that is handled separately in applySelection/markSelectionReady, because in
+        // per-session mode broadcastCachedState drops the switch batch outright.
+        replaySpotBandBatchToSocket(session);
         replayCacheMap(session, "delta-flow", deltaFlows);
         replayCacheMap(session, "strike-intel", strikeIntels);
         replayCacheMap(session, "option-truth", optionTruths);
@@ -8657,8 +8689,20 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {
+        for (String json : deliverableCacheEntries(session, event, cache)) {
+            send(session, event, json);
+        }
+    }
+
+    /**
+     * The entries of {@code cache} this socket is allowed to see, in cache order. Shared by the
+     * per-entry replay above and the batch replay below so the freshness and per-session routing
+     * filters can never drift apart between the two delivery shapes.
+     */
+    private List<String> deliverableCacheEntries(WebSocketSession session, String event, Map<String, String> cache) {
+        List<String> deliverable = new ArrayList<>();
         if (routingEngine == null) {
-            return;
+            return deliverable;
         }
         String socketId = session.getId();
         long nowMs = System.currentTimeMillis();
@@ -8682,12 +8726,75 @@ public class FeedGatewayService implements ReplayRunner {
                         : (root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "");
                 Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
                 if (rec.isPresent() && routingEngine.shouldDeliverToSocket(rec.get(), socketId)) {
-                    send(session, event, json);
+                    deliverable.add(json);
                 }
             } catch (JsonProcessingException ignored) {
                 // skip malformed cached entry
             }
         }
+        return deliverable;
+    }
+
+    /**
+     * Bands as ONE ui-batch, never one socket message per strike.
+     *
+     * <p>This exists because the per-session route has no other way to deliver them: enqueuePending and
+     * broadcastCachedState both drop when perSessionRouting() is true, so the coalesced batch and the
+     * source-switch batch are dead on an authenticated gateway. The earlier version replayed bands
+     * through replayCacheMap, which does deliver — as ~200 individual "spot-band" messages that the web
+     * client has no handler for, so an authenticated browser received nothing at all. Same per-socket
+     * routing filter as the per-entry path; one envelope out.
+     */
+    /**
+     * Bands after a source switch, for per-session sockets only.
+     *
+     * <p>broadcastCachedState DROPS when perSessionRouting() is true, so the switch batch never leaves
+     * the gateway in authenticated mode. Every other cached surface still recovers, because live routed
+     * records refill it at the consume sites — bands cannot, since the live consumer skips them by
+     * design (one message per strike would flood the chain socket). Suppressing the live path is what
+     * makes this replay owed. Per-socket filtered by the same routing check, one batch each.
+     *
+     * <p>Called from markSelectionReady ONLY — never also from applySelection, which would double-send
+     * on the common path where a switch is serviceable at once and marks itself ready inline.
+     */
+    private void replaySpotBandBatchAfterSourceSwitch() {
+        if (!perSessionRouting()) {
+            return;
+        }
+        // Self-healing prune. removeClient clears a socket's claim, but onSlowDisconnect, closeSockets
+        // (logout / session expiry) and closeExpiredAuthSessions drop sockets by other routes whose close
+        // callback can be delayed or suppressed, so the ledger must not depend on any of them running.
+        // Retaining only live sockets bounds it by the connected set on every switch.
+        spotBandSwitchDelivered.keySet().retainAll(clientsById.keySet());
+        for (WebSocketSession client : clients) {
+            replaySpotBandBatchOncePerReadiness(client);
+        }
+    }
+
+    /**
+     * The switch-time band board, at most once per socket per readiness key. Both the readiness replay
+     * and the connect bracket call this; whichever arrives first claims the key and the other no-ops, so
+     * exactly-once holds under EITHER iterator ordering instead of depending on the interleaving.
+     */
+    private void replaySpotBandBatchOncePerReadiness(WebSocketSession session) {
+        String key = readySelectionKey.get();
+        String previous = spotBandSwitchDelivered.put(session.getId(), key);
+        if (java.util.Objects.equals(previous, key)) {
+            return;
+        }
+        replaySpotBandBatchToSocket(session);
+    }
+
+    private void replaySpotBandBatchToSocket(WebSocketSession session) {
+        List<String> deliverable = deliverableCacheEntries(session, "spot-band", spotBands);
+        if (deliverable.isEmpty()) {
+            return;
+        }
+        List<CachedEvent> asBatch = new ArrayList<>(deliverable.size());
+        for (String json : deliverable) {
+            asBatch.add(new CachedEvent("spot-band", json));
+        }
+        sendEnvelope(session, uiBatchEnvelopeJson(asBatch));
     }
 
     private boolean requiresFreshPerSessionReplay(String event) {
