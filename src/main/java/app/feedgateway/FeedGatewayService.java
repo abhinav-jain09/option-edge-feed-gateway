@@ -3637,7 +3637,11 @@ public class FeedGatewayService implements ReplayRunner {
             broadcast("source-switching", activeSelectionJson(next, "source-switching"));
             broadcast("status", statusJson());
             boolean replayed = broadcastCachedState(sourceSwitchReplayEvents());
-            replaySpotBandBatchAfterSourceSwitch();
+            // NB: the band batch is deliberately NOT replayed here. When this selection is already
+            // serviceable, markSelectionReady(next) runs immediately below and replays it — doing it
+            // here too sent every socket the same batch twice for one switch. Readiness is also the
+            // correct moment: before it, the new selection's cache is knowably incomplete, so a replay
+            // here would push exactly the partial board the readiness gate exists to withhold.
             // WITHHOLD readiness while the newly selected source has partitions still replaying a mid-run
             // rebuild. Announcing source-ready here would certify a cache that is knowably missing every
             // strike on those partitions — the original incident's symptom, reached by a different route.
@@ -8731,6 +8735,9 @@ public class FeedGatewayService implements ReplayRunner {
      * records refill it at the consume sites — bands cannot, since the live consumer skips them by
      * design (one message per strike would flood the chain socket). Suppressing the live path is what
      * makes this replay owed. Per-socket filtered by the same routing check, one batch each.
+     *
+     * <p>Called from markSelectionReady ONLY — never also from applySelection, which would double-send
+     * on the common path where a switch is serviceable at once and marks itself ready inline.
      */
     private void replaySpotBandBatchAfterSourceSwitch() {
         if (!perSessionRouting()) {

@@ -189,12 +189,20 @@ class SpotBandForwardingTest {
      * sites must therefore replay the band batch, or the column empties on every roll and stays empty.
      */
     @Test
-    void bothSourceSwitchCallSitesReplayTheBandBatch() throws Exception {
+    void theSourceSwitchReplaysTheBandBatchExactlyOnce() throws Exception {
         String source = Files.readString(Path.of(SERVICE));
-        assertEquals(2, occurrences(source, "replaySpotBandBatchAfterSourceSwitch();"),
-                "both broadcastCachedState(sourceSwitchReplayEvents()) call sites owe the band batch");
-        assertEquals(2, occurrences(source, "broadcastCachedState(sourceSwitchReplayEvents());"),
-                "a new switch call site would need the band replay too — this pins the count");
+
+        assertEquals(1, occurrences(source, "replaySpotBandBatchAfterSourceSwitch();"),
+                "applySelection calls markSelectionReady inline when the switch is serviceable at once, "
+                        + "so a second call site sends every socket the same batch twice");
+
+        // and the one call site is the READINESS one: before readiness the new selection's cache is
+        // knowably incomplete, which is the whole point of the gate.
+        int ready = source.indexOf("broadcast(\"source-ready\", activeSelectionJson(selection, \"source-ready\"));");
+        assertTrue(ready > 0, "expected the readiness announcement");
+        assertTrue(source.substring(ready, ready + 400).contains("replaySpotBandBatchAfterSourceSwitch();"),
+                "the band replay belongs on the readiness convergence path");
+
         int at = source.indexOf("private void replaySpotBandBatchAfterSourceSwitch() {");
         assertTrue(at > 0, "expected the switch-time helper");
         assertTrue(source.substring(at, at + 400).contains("if (!perSessionRouting()) {"),
