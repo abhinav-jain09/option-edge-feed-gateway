@@ -209,6 +209,25 @@ class SpotBandForwardingTest {
                 "legacy mode already gets the switch batch from broadcastCachedState — do not double-send");
     }
 
+    /**
+     * Readiness is ONE-SHOT per selection key and its replay iterates `clients` weakly. A socket that
+     * connects between a switch and its readiness can therefore be served a still-filling cache and
+     * then be missed by the readiness replay, with nothing left to repair it. The connect path brackets
+     * its replay with the readiness key and re-takes the band board if it moved underneath.
+     */
+    @Test
+    void aSocketJoiningDuringReadinessStillGetsTheCompleteBoard() throws Exception {
+        String source = Files.readString(Path.of(SERVICE));
+        int at = source.indexOf("String keyBeforeReplay = readySelectionKey.get();");
+        assertTrue(at > 0, "connect must capture the readiness key before replaying");
+        String window = source.substring(at, at + 500);
+        assertTrue(window.contains("replayCachedToSocket(session);"), "…around the replay itself");
+        assertTrue(window.contains("!java.util.Objects.equals(keyBeforeReplay, readySelectionKey.get())"),
+                "…and compare it afterwards");
+        assertTrue(window.contains("replaySpotBandBatchToSocket(session);"),
+                "…re-taking the band board when readiness landed mid-replay");
+    }
+
     /** The legacy (unauthenticated) connect bootstrap listed every cached surface except this one, so a
      *  fresh page showed empty bands until the next coalesced flush happened to carry one. */
     @Test

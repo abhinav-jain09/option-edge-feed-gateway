@@ -775,7 +775,16 @@ public class FeedGatewayService implements ReplayRunner {
         // each socket gets only the cached state matching its own AppSession selection (no cross-
         // contract leak), then live routed data (FR-11).
         if (perSessionRouting()) {
+            // A socket that connects BETWEEN a source switch and its readiness can be served a cache that
+            // is still filling, and the readiness replay iterates `clients` weakly — if its iterator was
+            // snapshotted before this session was registered, no later attempt repairs it, because
+            // readiness is one-shot per selection key. Bracket the replay with the key: if readiness
+            // committed while we were replaying, take the completed band board ourselves.
+            String keyBeforeReplay = readySelectionKey.get();
             replayCachedToSocket(session);
+            if (!java.util.Objects.equals(keyBeforeReplay, readySelectionKey.get())) {
+                replaySpotBandBatchToSocket(session);
+            }
             // short-premium is a GLOBAL advisory (symbol-filtered client-side), not per-session
             // routed — replayCacheMap can't deliver it (no GatewayRecordMapper case), so replay it
             // the same standalone way legacy mode does, so an auth-mode reload restores the overlay.
