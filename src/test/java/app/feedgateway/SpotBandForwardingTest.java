@@ -154,6 +154,37 @@ class SpotBandForwardingTest {
                 "registered once = works in only one of bootstrap or live");
     }
 
+    /**
+     * Every delivery route must actually reach a browser. enqueuePending and broadcastCachedState both
+     * DROP when perSessionRouting() is true, so on an authenticated gateway the coalesced batch and the
+     * source-switch batch are dead — and bands have no per-message client handler, so the per-entry
+     * replay reached nobody either. That combination delivered nothing at all on any route. The
+     * per-session connect must therefore send bands as their own ui-batch.
+     */
+    @Test
+    void theAuthenticatedRouteStillHasABandDeliveryPath() throws Exception {
+        String source = Files.readString(Path.of(SERVICE));
+
+        int at = source.indexOf("if (perSessionRouting()) {\n            replayCachedToSocket(session);");
+        assertTrue(at > 0, "expected the per-session connect branch");
+        assertTrue(source.substring(at, at + 600).contains("replaySpotBandBatchToSocket(session);"),
+                "per-session connect must deliver bands, or an authenticated browser gets none");
+
+        assertTrue(source.contains("sendEnvelope(session, uiBatchEnvelopeJson(asBatch));"),
+                "and it must be ONE batch, not one message per strike");
+        assertTrue(source.contains("deliverableCacheEntries(session, \"spot-band\", spotBands)"),
+                "the batch must use the same per-socket routing filter as the per-entry path");
+    }
+
+    /** The legacy (unauthenticated) connect bootstrap listed every cached surface except this one, so a
+     *  fresh page showed empty bands until the next coalesced flush happened to carry one. */
+    @Test
+    void theLegacyConnectBootstrapIncludesBands() throws Exception {
+        String source = Files.readString(Path.of(SERVICE));
+        assertTrue(source.contains("\"strike-flow\", \"spot-band\", \"delta-flow\", \"strike-intel\""),
+                "sendCachedState on connect must list spot-band");
+    }
+
     /** Absent from the source-switch replay list, the column empties on a switch and never refills. */
     @Test
     void itSurvivesASourceSwitch() throws Exception {
