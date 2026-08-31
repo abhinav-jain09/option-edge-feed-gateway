@@ -952,6 +952,89 @@ public class FeedGatewayService implements ReplayRunner {
     }
     private final AtomicReference<String> readySelectionKey = new AtomicReference<>("");
 
+    /**
+     * PER-TOPIC live-forward gate over one cache family (avro / state / hpsf).
+     *
+     * <p>The family-wide {@code AtomicBoolean} made catch-up ATOMIC across every topic the family's
+     * cache consumer replays: one large or slow topic held {@code avroCaughtUp}/{@code stateCaughtUp}
+     * false and the live consumers cache-gated EVERY record — the whole option chain went dark while
+     * an auxiliary topic hydrated (the 2026-08 restart blackouts: ~1.05M of ~1.25M polled records
+     * dropped by the cache gate, ready pods serving nothing). The same class of atomic coupling was
+     * already removed once for topic ABSENCE (the metadata whitelist, PR#152); this removes it for
+     * topic CATCH-UP.
+     *
+     * <p>The owning cache consumer publishes each barriered topic's state here as it replays:
+     * {@code true} once every barrier partition of that topic is reached, {@code false} while any is
+     * pending. {@link #readyFor} answers per RECORD topic, so a live record forwards as soon as ITS
+     * OWN cache lane is complete — an auxiliary topic still replaying can only dark its own feature.
+     * A topic with NO barrier this attempt (its source is not selected, so {@link #catchUpEndOffsets}
+     * excluded it) has no entry and falls back to the FAMILY flag — exactly the pre-existing
+     * behaviour for such topics, so nothing forwards earlier or later than before for them.
+     *
+     * <p>Fail-closed: when a cache-consumer attempt dies, {@code clearTopicStates()} runs with
+     * {@link #markCacheRecovering} — every topic falls back to the family flag, which is false, so
+     * the whole family is closed until the replacement attempt re-measures its barriers. The
+     * family flag itself keeps its meaning (ALL selected barriers reached) and still drives the
+     * one-shot cached replay in {@link #markCacheCaughtUp}, {@code addClient} replay, health and
+     * metrics — only the LIVE-FORWARD decision is per-topic.
+     */
+    static final class CacheGate {
+        final AtomicBoolean family;
+        private final ConcurrentHashMap<String, Boolean> topicReady = new ConcurrentHashMap<>();
+
+        CacheGate(AtomicBoolean family) {
+            this.family = family;
+        }
+
+        boolean readyFor(String topic) {
+            Boolean topicState = topicReady.get(topic);
+            return topicState != null ? topicState : family.get();
+        }
+
+        /**
+         * Replace the tracked barrier states with {@code states} (topic → all-barriers-reached).
+         * Topics absent from {@code states} lose their entry and fall back to the family flag —
+         * this is how a source switch retires barriers that no longer apply.
+         */
+        void applyBarrierStates(Map<String, Boolean> states) {
+            topicReady.putAll(states);
+            topicReady.keySet().retainAll(states.keySet());
+        }
+
+        /** Attempt death: forget every per-topic state so the family flag (false) gates everything. */
+        void clearTopicStates() {
+            topicReady.clear();
+        }
+
+        /** Barriered topics whose replay is still pending, sorted — for health/diagnostics. */
+        List<String> pendingTopics() {
+            return topicReady.entrySet().stream()
+                    .filter(e -> !e.getValue())
+                    .map(Map.Entry::getKey)
+                    .sorted()
+                    .toList();
+        }
+    }
+
+    private final CacheGate avroGate = new CacheGate(avroCaughtUp);
+    private final CacheGate stateGate = new CacheGate(stateCaughtUp);
+    private final CacheGate hpsfGate = new CacheGate(hpsfCaughtUp);
+
+    /**
+     * Group per-partition catch-up barriers by TOPIC: a topic's state is {@code true} only when every
+     * one of its barrier partitions has reached its barrier offset. Pure function of the barrier map
+     * and a position lookup so the semantics are testable without a KafkaConsumer.
+     */
+    static Map<String, Boolean> topicBarrierStates(Map<TopicPartition, Long> barriers,
+                                                   java.util.function.ToLongFunction<TopicPartition> position) {
+        Map<String, Boolean> states = new LinkedHashMap<>();
+        for (Map.Entry<TopicPartition, Long> entry : barriers.entrySet()) {
+            boolean reached = position.applyAsLong(entry.getKey()) >= entry.getValue();
+            states.merge(entry.getKey().topic(), reached, Boolean::logicalAnd);
+        }
+        return states;
+    }
+
     // ---- Rollover-diagnostics instrumentation (additive; no behavior changes) ----
     // These counters + fields exist ONLY to answer "which flag flipped wrong?" the next time the gateway
     // silently wedges across a midnight-ET rollover (see 2026-07-01 9.5h outage). They are additive:
@@ -964,7 +1047,7 @@ public class FeedGatewayService implements ReplayRunner {
     // from a non-selected source can never mask a real wedge in the selected source's pipeline.
     private final AtomicLong liveRecordsEligibleForActiveSelection = new AtomicLong();
     private final AtomicLong droppedByStaleness = new AtomicLong();         // records dropped by selection-barrier / stale gate
-    private final AtomicLong droppedByCacheGate = new AtomicLong();         // records dropped because cacheCaughtUpFlag was false
+    private final AtomicLong droppedByCacheGate = new AtomicLong();         // records dropped because their topic's cache lane was not caught up
     private final AtomicLong retainedCvdRecordsDropped = new AtomicLong();
     private final AtomicLong earlyAuctionUndecodableSkipped = new AtomicLong();
     private final AtomicLong droppedByOtherReasons = new AtomicLong();      // caught-up + non-forwardable (source/symbol/expiry mismatch, etc.)
@@ -2480,6 +2563,13 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"avroCaughtUp\":" + avroCaughtUp.get() + ","
                 + "\"stateCaughtUp\":" + stateCaughtUp.get() + ","
                 + "\"hpsfCaughtUp\":" + hpsfCaughtUp.get() + ","
+                // Per-topic gate visibility: the barriered topics whose cache lane is still replaying.
+                // Live forwarding is per-topic, so a name here means ONLY that feature is dark — not
+                // the board. Empty lists + false family flags = the family has no measured barriers
+                // yet (attempt bootstrapping/dead) and everything falls back to the family flag.
+                + "\"avroPendingTopics\":" + jsonStringArray(avroGate.pendingTopics()) + ","
+                + "\"statePendingTopics\":" + jsonStringArray(stateGate.pendingTopics()) + ","
+                + "\"hpsfPendingTopics\":" + jsonStringArray(hpsfGate.pendingTopics()) + ","
                 + "\"instanceId\":\"" + escapeJson(settings.instanceId()) + "\","
                 + "\"clients\":" + clients.size() + ","
                 + "\"outboundQueued\":" + totalOutboundQueued() + ","
@@ -2625,6 +2715,15 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_hpsf_caught_up Whether HPSF view cache consumers have caught up.\n"
                 + "# TYPE options_edge_feed_gateway_hpsf_caught_up gauge\n"
                 + "options_edge_feed_gateway_hpsf_caught_up " + boolMetric(hpsfCaughtUp.get()) + "\n"
+                + "# HELP options_edge_feed_gateway_avro_topics_pending Barriered Avro topics whose cache lane is still replaying (live forwarding is per-topic).\n"
+                + "# TYPE options_edge_feed_gateway_avro_topics_pending gauge\n"
+                + "options_edge_feed_gateway_avro_topics_pending " + avroGate.pendingTopics().size() + "\n"
+                + "# HELP options_edge_feed_gateway_state_topics_pending Barriered JSON-state topics whose cache lane is still replaying (live forwarding is per-topic).\n"
+                + "# TYPE options_edge_feed_gateway_state_topics_pending gauge\n"
+                + "options_edge_feed_gateway_state_topics_pending " + stateGate.pendingTopics().size() + "\n"
+                + "# HELP options_edge_feed_gateway_hpsf_topics_pending Barriered HPSF topics whose cache lane is still replaying (live forwarding is per-topic).\n"
+                + "# TYPE options_edge_feed_gateway_hpsf_topics_pending gauge\n"
+                + "options_edge_feed_gateway_hpsf_topics_pending " + hpsfGate.pendingTopics().size() + "\n"
                 + "# HELP options_edge_feed_gateway_clients Connected WebSocket client count.\n"
                 + "# TYPE options_edge_feed_gateway_clients gauge\n"
                 + "options_edge_feed_gateway_clients " + clients.size() + "\n"
@@ -3001,7 +3100,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_forward_stalled_dropped_by_staleness_total Records dropped by the selection/staleness barrier (bucketed slice of inactiveDroppedEvents).\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_dropped_by_staleness_total counter\n"
                 + "options_edge_feed_gateway_forward_stalled_dropped_by_staleness_total " + droppedByStaleness.get() + "\n"
-                + "# HELP options_edge_feed_gateway_forward_stalled_dropped_by_cache_gate_total Records dropped because cacheCaughtUpFlag was FALSE.\n"
+                + "# HELP options_edge_feed_gateway_forward_stalled_dropped_by_cache_gate_total Records dropped because their topic's cache lane was not caught up.\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_dropped_by_cache_gate_total counter\n"
                 + "options_edge_feed_gateway_forward_stalled_dropped_by_cache_gate_total " + droppedByCacheGate.get() + "\n"
                 + "# HELP options_edge_feed_gateway_forward_stalled_dropped_by_other_reasons_total Records dropped by source/symbol/expiry mismatch or other non-staleness reasons.\n"
@@ -3161,7 +3260,7 @@ public class FeedGatewayService implements ReplayRunner {
         // Spot-vol-regime CURRENT (AVRO since its 2026-10-19 cutover; browsers still get the identical JSON, see
         // SpotVolRegimeJson): the same optional/standalone GLOBAL advisory class as before, only the wire changed.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
-        runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
+        runAssignedCacheConsumer("avro", topicEvents, true, avroGate);
     }
 
     private void runJsonStateCacheConsumer() {
@@ -3307,7 +3406,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.gammaEffortEnabled()) {
             topicEvents.put(settings.gammaEffortTopic(), new TopicBinding("DATABENTO", "gamma-effort"));
         }
-        runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
+        runAssignedCacheConsumer("state", topicEvents, false, stateGate);
     }
 
     private void runAvroLiveConsumer() {
@@ -3434,7 +3533,7 @@ public class FeedGatewayService implements ReplayRunner {
         addEsAuctionTopics(topicEvents);
         // Spot-vol-regime CURRENT: AVRO (see the cache twin); symmetric topic sets.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
-        runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
+        runLiveConsumer("avro-live", topicEvents, true, avroGate);
     }
 
     /**
@@ -3609,7 +3708,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.gammaEffortEnabled()) {
             topicEvents.put(settings.gammaEffortTopic(), new TopicBinding("DATABENTO", "gamma-effort"));
         }
-        runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
+        runLiveConsumer("state-live", topicEvents, false, stateGate);
     }
 
     private void addEsCvdTopics(Map<String, TopicBinding> topicEvents) {
@@ -3658,7 +3757,10 @@ public class FeedGatewayService implements ReplayRunner {
         runRetryingConsumer(
                 "hpsf-cache",
                 retry -> runHpsfCacheConsumerOnce(),
-                () -> markCacheRecovering(hpsfCaughtUp)
+                () -> {
+                    hpsfGate.clearTopicStates();
+                    markCacheRecovering(hpsfGate.family);
+                }
         );
     }
 
@@ -3674,6 +3776,7 @@ public class FeedGatewayService implements ReplayRunner {
             Map<TopicPartition, Long> bootstrapEndOffsets =
                     new LinkedHashMap<>(consumer.endOffsets(partitions));
             boolean live = caughtUp(consumer, bootstrapEndOffsets);
+            hpsfGate.applyBarrierStates(topicBarrierStates(bootstrapEndOffsets, consumer::position));
             PartitionRefresh partitionRefresh = new PartitionRefresh("hpsf-cache", hpsfTopics());
             if (live) {
                 markCacheCaughtUp("hpsf", hpsfEvents(), hpsfCaughtUp);
@@ -3695,6 +3798,7 @@ public class FeedGatewayService implements ReplayRunner {
                     updateHpsfCache(record);
                 }
                 purgeExpiredCache(System.currentTimeMillis());
+                hpsfGate.applyBarrierStates(topicBarrierStates(bootstrapEndOffsets, consumer::position));
                 if (!live && caughtUp(consumer, bootstrapEndOffsets)) {
                     live = true;
                     markCacheCaughtUp("hpsf", hpsfEvents(), hpsfCaughtUp);
@@ -3735,7 +3839,7 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 for (ConsumerRecord<String, String> record : records) {
                     HpsfCacheUpdate update = updateHpsfCache(record);
-                    if (update != null && hpsfCaughtUp.get()) {
+                    if (update != null && hpsfGate.readyFor(record.topic())) {
                         // P0 (HPSF bypass): in tenant mode route per-session by the record's chain key
                         // so HPSF signals/audit reach only entitled sessions; the all-client batch path
                         // is unreachable. Legacy single-tenant mode keeps the coalesced batch.
@@ -3749,7 +3853,8 @@ public class FeedGatewayService implements ReplayRunner {
                         inactiveDroppedEvents.incrementAndGet();
                         // Rollover-diagnostics fine-grained bucketing (Codex round-2 P2b): mirror the
                         // generic live-loop bucketing so HPSF drops also show up in the per-bucket telemetry.
-                        // The only reason a non-null update drops here is the HPSF cache-gate being FALSE.
+                        // The only reason a non-null update drops here is this topic's cache lane (or the
+                        // family fallback) not being caught up yet.
                         droppedByCacheGate.incrementAndGet();
                     } else {
                         // update == null: parse failure or non-matching binding — not a staleness/gate drop,
@@ -3848,13 +3953,18 @@ public class FeedGatewayService implements ReplayRunner {
         return new TopicBinding("DATABENTO","es-footprint-bar").equals(bindings.get(settings.esFootprintBarsTopic()));
     }
 
-    private void runAssignedCacheConsumer(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
+    private void runAssignedCacheConsumer(String name, Map<String, TopicBinding> topicEvents, boolean avro, CacheGate gate) {
         runRetryingConsumer(
                 name,
-                retry -> runAssignedCacheConsumerOnce(name, topicEvents, avro, caughtUpFlag),
+                retry -> runAssignedCacheConsumerOnce(name, topicEvents, avro, gate),
                 () -> {
                     if (ownsOrderFootprintHistory(topicEvents)) orderChartFootprintReplay.invalidate();
-                    markCacheRecovering(caughtUpFlag, topicEvents.values().stream().map(TopicBinding::event).distinct().toList());
+                    // Attempt death: the per-topic states were measured by the dead attempt's consumer
+                    // and are meaningless for its replacement. Drop them FIRST so every topic falls
+                    // back to the family flag, then mark the family recovering: fully fail-closed
+                    // until the replacement attempt re-measures its barriers.
+                    gate.clearTopicStates();
+                    markCacheRecovering(gate.family, topicEvents.values().stream().map(TopicBinding::event).distinct().toList());
                 }
         );
     }
@@ -3887,7 +3997,7 @@ public class FeedGatewayService implements ReplayRunner {
                 owner.equals(entry.getValue().owner()) && !freshEndOffsets.containsKey(entry.getKey()));
     }
 
-    private void runAssignedCacheConsumerOnce(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
+    private void runAssignedCacheConsumerOnce(String name, Map<String, TopicBinding> topicEvents, boolean avro, CacheGate gate) {
         // Entries in the service-scoped bootstrap registry are owned by ONE consumer attempt. When this
         // attempt exits -- crash, Kafka error, shutdown -- its entries MUST go with it: the replacement
         // attempt re-bootstraps every partition through the full catch-up gate, so the incremental entries
@@ -3939,10 +4049,13 @@ public class FeedGatewayService implements ReplayRunner {
                     new LinkedHashMap<>(catchUpEndOffsets(bootstrapEndOffsets, topicEvents));
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
             boolean live = caughtUp(consumer, catchUpEndOffsets);
+            // Seed the PER-TOPIC gate from the same barriers: topics whose lane is already complete
+            // start forwarding immediately, topics still replaying stay closed, independently.
+            gate.applyBarrierStates(topicBarrierStates(catchUpEndOffsets, consumer::position));
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             footprintStrikeReplayProgress(consumer, strikeReplay);   // an empty strike partition is complete at once
             if (live) {
-                markCacheCaughtUp(name, events, caughtUpFlag);
+                markCacheCaughtUp(name, events, gate.family);
                 tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
             }
             PollMaintenance canonicalMaintenance = new PollMaintenance(settings.pollMs());
@@ -3985,7 +4098,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // partitions — the exact user-visible symptom of the incident being fixed. Gated on
                         // addedSelected so growth on a non-selected source cannot flap readiness for nothing.
                         live = false;
-                        markCacheRecovering(caughtUpFlag, events);
+                        markCacheRecovering(gate.family, events);
                     }
                     // Lag-skip protection covers EVERY added partition, source-filtered or not: the
                     // selection can change while a partition is still replaying, and it would then be
@@ -4075,7 +4188,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // The emit lock covers mutation+enqueue as one unit.
                         synchronized (indicatorsEmitLock) {
                             String indicatorKey = updateCache(binding, record, json);
-                            if (indicatorKey != null && caughtUpFlag.get()
+                            if (indicatorKey != null && gate.readyFor(record.topic())
                                     && shouldBroadcastIndicators(binding.event() + ":" + indicatorKey, record.offset())) {
                                 broadcast(binding.event(), json);
                                 forwardedEvents.incrementAndGet();
@@ -4088,7 +4201,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // topic, so whichever consumer wins updateCache for an offset must be the
                         // one that broadcasts it — otherwise the live consumer's duplicate is
                         // correctly rejected by the offset gate and clients starve.
-                        tapeZonesBroadcast(binding, record, json, caughtUpFlag);
+                        tapeZonesBroadcast(binding, record, json, gate);
                         continue;
                     }
                     if (binding != null && footprintViews != null && isFootprintEvent(binding.event())) {
@@ -4157,9 +4270,14 @@ public class FeedGatewayService implements ReplayRunner {
                             catchUpEndOffsets(boundedEndOffsets(consumer, partitions), topicEvents));
                     live = caughtUp(consumer, catchUpEndOffsets);
                     if (!live) {
-                        markCacheRecovering(caughtUpFlag, events);
+                        markCacheRecovering(gate.family, events);
                     }
                 }
+                // PER-TOPIC convergence, every poll and AFTER the polled records were applied to the
+                // cache (poll() advances position() past records it merely returned — see the order
+                // note above). Newly-added and switch-recomputed barriers are reflected here too:
+                // a topic whose new barrier is unmet flips back to pending, alone.
+                gate.applyBarrierStates(topicBarrierStates(catchUpEndOffsets, consumer::position));
                 if (!live && caughtUp(consumer, catchUpEndOffsets)) {
                     live = true;
                 }
@@ -4169,7 +4287,7 @@ public class FeedGatewayService implements ReplayRunner {
                     // once the last barrier retires, and markCacheCaughtUp's false->true CAS may never fire
                     // again. Both calls are idempotent and markSelectionReady re-validates under readyLock,
                     // so this is safe and cheap.
-                    markCacheCaughtUp(name, events, caughtUpFlag);
+                    markCacheCaughtUp(name, events, gate.family);
                     tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
                     ActiveSelection liveSelection = activeSelection.get();
                     if (liveSelection != null
@@ -4371,10 +4489,10 @@ public class FeedGatewayService implements ReplayRunner {
         return settings.cacheTtlMs();
     }
 
-    private void runLiveConsumer(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean cacheCaughtUpFlag) {
+    private void runLiveConsumer(String name, Map<String, TopicBinding> topicEvents, boolean avro, CacheGate gate) {
         runRetryingConsumer(
                 name,
-                retry -> runLiveConsumerOnce(name, topicEvents, avro, cacheCaughtUpFlag, retry),
+                retry -> runLiveConsumerOnce(name, topicEvents, avro, gate, retry),
                 null
         );
     }
@@ -4383,7 +4501,7 @@ public class FeedGatewayService implements ReplayRunner {
             String name,
             Map<String, TopicBinding> topicEvents,
             boolean avro,
-            AtomicBoolean cacheCaughtUpFlag,
+            CacheGate gate,
             boolean retry
     ) {
         try (KafkaConsumer<String, Object> consumer = newLiveConsumer(name, avro)) {
@@ -4450,7 +4568,7 @@ public class FeedGatewayService implements ReplayRunner {
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
                     if (binding != null && "direction-push".equals(binding.event())) {
-                        onDirectionPushRecord(record, cacheCaughtUpFlag.get());
+                        onDirectionPushRecord(record, gate.readyFor(record.topic()));
                         continue;
                     }
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
@@ -4488,7 +4606,7 @@ public class FeedGatewayService implements ReplayRunner {
                                 && "DATABENTO".equals(binding.source())
                                 // Shared LIVE topic only — see the cache path for why.
                                 && settings.databentoGexTopic().equals(record.topic())
-                                && interceptSharedGexRecord(record, rawJson, cacheCaughtUpFlag.get(),
+                                && interceptSharedGexRecord(record, rawJson, gate.readyFor(record.topic()),
                                         System.currentTimeMillis())) {
                             continue;
                         }
@@ -4701,7 +4819,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // CAS gate makes whichever consumer wins the broadcaster.
                         synchronized (indicatorsEmitLock) {
                             String indicatorsKey = updateCache(binding, record, json);
-                            if (indicatorsKey != null && cacheCaughtUpFlag.get()
+                            if (indicatorsKey != null && gate.readyFor(record.topic())
                                     && shouldBroadcastIndicators(binding.event() + ":" + indicatorsKey,
                                             record.offset())) {
                                 broadcast(binding.event(), json);
@@ -4753,7 +4871,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // duplicate rejection (cacheKey == null for the second consumer) never
                         // suppresses a live delivery. The wrap carries (recordKey, offset) so the
                         // client renders last-writer-wins even when a replay interleaves.
-                        if (cacheCaughtUpFlag.get() && shouldBroadcastIbkrPreOpen(record.offset())) {
+                        if (gate.readyFor(record.topic()) && shouldBroadcastIbkrPreOpen(record.offset())) {
                             broadcast(binding.event(),
                                     wrapIbkrPreOpenStatus(String.valueOf(record.key()),
                                             record.offset(), record.timestamp(), json));
@@ -4779,14 +4897,14 @@ public class FeedGatewayService implements ReplayRunner {
                         // decision is ONE unit under the emit lock: whichever consumer wins
                         // updateCache for an offset is the one that broadcasts it, and the loser's
                         // null correctly suppresses only its own duplicate.
-                        tapeZonesBroadcast(binding, record, json, cacheCaughtUpFlag);
+                        tapeZonesBroadcast(binding, record, json, gate);
                         continue;
                     }
                     if ("zero-dte-intelligence".equals(binding.event())) {
                         // Chain-level control signal: always its own websocket event, never a ui-batch row
                         // and never selection-routed. Every client receives it and filters symbol/session;
                         // updateCache's payload-time TTL ensures replay/backfill cannot look live.
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -4797,7 +4915,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // ui-batch row and never selection-routed. cacheKey == null covers malformed
                         // payloads AND interims after the session's verdict (dead by precedence) —
                         // neither is ever live-broadcast (design CD-R30).
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -4809,7 +4927,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // by symbol client-side. Freshness fail-closed: updateCache's SHORT greekMoveAuthTtlMs
                         // window returns null (cacheKey == null) for a stale/backfilled verdict, so a stale
                         // authenticity read is never live-broadcast — the UI track just stays hidden.
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -4819,7 +4937,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // Gamma-leadership CURRENT: same GLOBAL advisory class as the siblings below —
                         // own websocket event, never a ui-batch row, never selection-routed. Freshness
                         // fail-closed via the SHORT gammaLeadershipTtlMs window.
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -4828,7 +4946,7 @@ public class FeedGatewayService implements ReplayRunner {
                     if ("direction-alert".equals(binding.event()) || "direction-scorecard".equals(binding.event())
                             || "direction-progress".equals(binding.event())) {
                         // A4 alert/scorecard: the same GLOBAL advisory class; freshness fail-closed on their own windows
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -4837,7 +4955,7 @@ public class FeedGatewayService implements ReplayRunner {
                     if ("direction".equals(binding.event())) {
                         // Candle Direction CURRENT decision: same GLOBAL advisory class — own websocket event,
                         // never a ui-batch row, never selection-routed; freshness fail-closed on directionTtlMs.
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -4848,7 +4966,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // greek-move-auth above — own websocket event, never a ui-batch row, never
                         // selection-routed. Freshness fail-closed via the SHORT spotVolRegimeTtlMs window
                         // (stale snapshot => cacheKey == null => never live-broadcast).
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -4862,7 +4980,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // window: a stale or malformed verdict yields cacheKey == null and is never
                         // live-broadcast, so the chip reads UNAVAILABLE rather than showing a verdict
                         // whose inputs are hours old.
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -4971,7 +5089,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // The live STATUS heartbeat shares this branch with its OWN short window: a status
                         // older than esOpenDirectionStatusTtlMs (5 min) makes updateCache return null
                         // (cacheKey == null), so a stale heartbeat is never live-broadcast here either.
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -4988,7 +5106,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // Low frequency by construction: the measurement is one record per folded
                         // bar and the profile only when the fold or the refusal count moves, so a
                         // global broadcast costs a page that is not looking at it almost nothing.
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
@@ -4999,11 +5117,11 @@ public class FeedGatewayService implements ReplayRunner {
                         // pre-open and until a client selects a market, which would suppress the overlay exactly
                         // when Agent A acts late in the session. The UI filters by symbol client-side, and a
                         // recommendation is low-frequency + keyed to today's expiry, so a global broadcast is safe.
-                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                        if (cacheKey != null && gate.readyFor(record.topic())) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
-                    } else if (cacheKey != null && cacheCaughtUpFlag.get()
+                    } else if (cacheKey != null && gate.readyFor(record.topic())
                             && shouldForward(binding, forwardJson, record, (decided = activeSelection.get()))) {
                         if ("dealer-ledger".equals(binding.event())) {
                             // Delivered STANDALONE (its own message.type), never inside a ui-batch — the UI
@@ -5035,7 +5153,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // increment). Splits inactiveDroppedEvents into WHY it dropped so a stall shows
                         // up as e.g. "droppedByCacheGate climbing" vs "droppedByOtherReasons climbing".
                         recordDropBucket(binding, forwardJson,
-                                cacheCaughtUpFlag.get(),
+                                gate.readyFor(record.topic()),
                                 decided != null ? decided : activeSelection.get());
                         // Cache-arrival convergence: a snapshot for the ACTIVE selection was cached but not
                         // live-forwarded (e.g. it arrived already older than maxStaleMs on a closed market
@@ -5043,7 +5161,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // fires its one-shot cached re-push and open dashboards repopulate. matchesActiveSelection
                         // guards against off-selection data; markSelectionReady re-validates atomically.
                         ActiveSelection current = activeSelection.get();
-                        if (cacheCaughtUpFlag.get() && "snapshot".equals(binding.event())
+                        if (gate.readyFor(record.topic()) && "snapshot".equals(binding.event())
                                 && current != null && matchesActiveSelection(json, current)) {
                             markSelectionReady(current);
                         }
@@ -5835,7 +5953,7 @@ public class FeedGatewayService implements ReplayRunner {
     void runCacheConsumerAttemptForTest(String name, Map<String, TopicBinding> topicEvents, AtomicBoolean caughtUpFlag,
                                         KafkaConsumer<String, Object> client) {
         cacheConsumerForTest = () -> client;
-        try { runAssignedCacheConsumerOnce(name, topicEvents, false, caughtUpFlag); } finally { cacheConsumerForTest = null; }
+        try { runAssignedCacheConsumerOnce(name, topicEvents, false, new CacheGate(caughtUpFlag)); } finally { cacheConsumerForTest = null; }
     }
 
     /** Test seam: the client a LIVE-consumer attempt uses; null in production, which builds a real KafkaConsumer. */
@@ -5850,7 +5968,7 @@ public class FeedGatewayService implements ReplayRunner {
     void runLiveConsumerAttemptForTest(String name, Map<String, TopicBinding> topicEvents, AtomicBoolean cacheCaughtUpFlag,
                                        KafkaConsumer<String, Object> client, boolean retry) {
         liveConsumerForTest = () -> client;
-        try { runLiveConsumerOnce(name, topicEvents, false, cacheCaughtUpFlag, retry); } finally { liveConsumerForTest = null; }
+        try { runLiveConsumerOnce(name, topicEvents, false, new CacheGate(cacheCaughtUpFlag), retry); } finally { liveConsumerForTest = null; }
     }
 
     /** Test seam: the named consumer's next poll runs its partition refresh. */
@@ -7652,7 +7770,7 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(candidates.event() + ":" + candidates.key(), cacheTimestamp(record));
                 cachePositions.put(candidates.event() + ":" + candidates.key(), recordPosition(record));
                 putHpsfView(candidates);
-                if (hpsfCaughtUp.get()) {
+                if (hpsfGate.readyFor(record.topic())) {
                     // Same P0 gate as the live consumer: route per-session in tenant mode, batch in legacy.
                     if (perSessionRouting()) {
                         routeHpsfPerSession(candidates);
@@ -11732,13 +11850,13 @@ public class FeedGatewayService implements ReplayRunner {
      * a replayed older board can never be enqueued after a newer live one.
      */
     private void tapeZonesBroadcast(TopicBinding binding, ConsumerRecord<String, ?> record, String json,
-                                    AtomicBoolean caughtUpFlag) {
+                                    CacheGate gate) {
         synchronized (tapeZonesEmitLock) {
             String cacheKey = updateCache(binding, record, json);
             if (cacheKey == null) {
                 return;   // refused by identity / ordering / TTL — never forwarded
             }
-            if (!caughtUpFlag.get() || !shouldBroadcastTapeZones(record.offset())) {
+            if (!gate.readyFor(record.topic()) || !shouldBroadcastTapeZones(record.offset())) {
                 return;
             }
             // Re-read the position the cache just committed rather than re-deriving it from the
@@ -17715,6 +17833,17 @@ public class FeedGatewayService implements ReplayRunner {
     /** Test seam: how many auction partitions currently hold a frozen handoff. */
     int esAuctionHandoffCountForTest() { return esAuctionHandoffOffset.size(); }
 
+    private static String jsonStringArray(List<String> values) {
+        StringBuilder array = new StringBuilder("[");
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) {
+                array.append(',');
+            }
+            array.append('"').append(escapeJson(values.get(i))).append('"');
+        }
+        return array.append(']').toString();
+    }
+
     private static String escapeJson(String value) {
         StringBuilder escaped = new StringBuilder();
         for (int i = 0; i < value.length(); i++) {
@@ -17835,6 +17964,9 @@ public class FeedGatewayService implements ReplayRunner {
                     + " avroCaughtUp=" + avroCaughtUp.get()
                     + " stateCaughtUp=" + stateCaughtUp.get()
                     + " hpsfCaughtUp=" + hpsfCaughtUp.get()
+                    + " avroPendingTopics=" + avroGate.pendingTopics()
+                    + " statePendingTopics=" + stateGate.pendingTopics()
+                    + " hpsfPendingTopics=" + hpsfGate.pendingTopics()
                     + " readySelectionKey=" + quote(readySelectionKey.get())
                     + " autoRolledExpiry=" + quote(autoRolledExpiry)
                     + " lastRolloverAtMs=" + lastRoll
@@ -17879,6 +18011,9 @@ public class FeedGatewayService implements ReplayRunner {
                         + " avroCaughtUp=" + avroCaughtUp.get()
                         + " stateCaughtUp=" + stateCaughtUp.get()
                         + " hpsfCaughtUp=" + hpsfCaughtUp.get()
+                        + " avroPendingTopics=" + avroGate.pendingTopics()
+                        + " statePendingTopics=" + stateGate.pendingTopics()
+                        + " hpsfPendingTopics=" + hpsfGate.pendingTopics()
                         + " readySelectionKey=" + quote(readySelectionKey.get())
                         + " autoRolledExpiry=" + quote(autoRolledExpiry)
                         + " hoursSinceLastRollover=" + hoursSinceRoll
