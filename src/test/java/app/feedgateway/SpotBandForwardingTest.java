@@ -224,8 +224,39 @@ class SpotBandForwardingTest {
         assertTrue(window.contains("replayCachedToSocket(session);"), "…around the replay itself");
         assertTrue(window.contains("!java.util.Objects.equals(keyBeforeReplay, readySelectionKey.get())"),
                 "…and compare it afterwards");
-        assertTrue(window.contains("replaySpotBandBatchToSocket(session);"),
+        assertTrue(window.contains("replaySpotBandBatchOncePerReadiness(session);"),
                 "…re-taking the band board when readiness landed mid-replay");
+    }
+
+    /**
+     * Readiness and the connect bracket race to serve the same completed board, and either iterator
+     * ordering can win. Exactly-once must therefore be a property of the code, not of the interleaving:
+     * both go through a per-socket ledger keyed by the readiness key, and the loser no-ops.
+     */
+    @Test
+    void theSwitchBoardIsSentAtMostOncePerSocketPerReadiness() throws Exception {
+        String source = Files.readString(Path.of(SERVICE));
+
+        int at = source.indexOf("private void replaySpotBandBatchOncePerReadiness(WebSocketSession session) {");
+        assertTrue(at > 0, "expected the deduplicating variant");
+        String body = source.substring(at, at + 600);
+        assertTrue(body.contains("spotBandSwitchDelivered.put(session.getId(), key)"),
+                "claim the key atomically — two racing threads must not both send");
+        assertTrue(body.contains("java.util.Objects.equals(previous, key)"), "…and the loser returns");
+
+        // Both racing call sites must use the deduplicating variant, never the raw one. Counted by their
+        // exact argument so the method DECLARATION is not mistaken for a third call site.
+        assertEquals(1, occurrences(source, "replaySpotBandBatchOncePerReadiness(client);"),
+                "the readiness replay must dedupe");
+        assertEquals(1, occurrences(source, "replaySpotBandBatchOncePerReadiness(session);"),
+                "the connect bracket must dedupe");
+        // The raw (undeduplicated) variant has exactly two callers, neither of them a racing site:
+        // replayCachedToSocket, whose connect/return-to-live replay always owes a fresh board, and the
+        // deduplicating wrapper itself once it has claimed the key.
+        assertEquals(2, occurrences(source, "replaySpotBandBatchToSocket(session);\n"),
+                "a third raw call site would bypass the exactly-once ledger");
+        assertTrue(source.contains("spotBandSwitchDelivered.remove(id);"),
+                "a per-socket ledger that is never cleaned leaks an entry per disconnect");
     }
 
     /** The legacy (unauthenticated) connect bootstrap listed every cached surface except this one, so a

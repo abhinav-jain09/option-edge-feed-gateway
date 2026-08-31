@@ -189,6 +189,11 @@ public class FeedGatewayService implements ReplayRunner {
     // the ui-batch instead, exactly as strikeFlows does. That holds on EVERY route: the live
     // consumer skips it (see the spot-band continue) and replayCachedToSocket does not replay it.
     private final Map<String, String> spotBands = new ConcurrentHashMap<>();
+    // socketId -> the readiness key whose completed band board this socket has already been sent by a
+    // SWITCH-time replay. Readiness and the connect bracket both race to serve the same board; rather
+    // than reason about which iterator ordering wins, both go through it and the loser is a no-op.
+    // Connect and return-to-live replays are NOT deduplicated here — a reset owes a fresh board.
+    private final Map<String, String> spotBandSwitchDelivered = new ConcurrentHashMap<>();
     private final SellerActivityDiskStore sellerActivityStore = new SellerActivityDiskStore();
     // Per-strike delta-flow snapshots, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (DeltaFlowStrikeSnapshot) — lives on the JSON-state consumer.
@@ -783,7 +788,7 @@ public class FeedGatewayService implements ReplayRunner {
             String keyBeforeReplay = readySelectionKey.get();
             replayCachedToSocket(session);
             if (!java.util.Objects.equals(keyBeforeReplay, readySelectionKey.get())) {
-                replaySpotBandBatchToSocket(session);
+                replaySpotBandBatchOncePerReadiness(session);
             }
             // short-premium is a GLOBAL advisory (symbol-filtered client-side), not per-session
             // routed — replayCacheMap can't deliver it (no GatewayRecordMapper case), so replay it
@@ -860,6 +865,7 @@ public class FeedGatewayService implements ReplayRunner {
     public void removeClient(WebSocketSession session) {
         String id = session.getId();
         OutboundChannel channel = outbound.remove(id);
+        spotBandSwitchDelivered.remove(id);
         WebSocketSession stored = clientsById.remove(id);
         if (stored != null) {
             clients.remove(stored);
@@ -8753,8 +8759,22 @@ public class FeedGatewayService implements ReplayRunner {
             return;
         }
         for (WebSocketSession client : clients) {
-            replaySpotBandBatchToSocket(client);
+            replaySpotBandBatchOncePerReadiness(client);
         }
+    }
+
+    /**
+     * The switch-time band board, at most once per socket per readiness key. Both the readiness replay
+     * and the connect bracket call this; whichever arrives first claims the key and the other no-ops, so
+     * exactly-once holds under EITHER iterator ordering instead of depending on the interleaving.
+     */
+    private void replaySpotBandBatchOncePerReadiness(WebSocketSession session) {
+        String key = readySelectionKey.get();
+        String previous = spotBandSwitchDelivered.put(session.getId(), key);
+        if (java.util.Objects.equals(previous, key)) {
+            return;
+        }
+        replaySpotBandBatchToSocket(session);
     }
 
     private void replaySpotBandBatchToSocket(WebSocketSession session) {
