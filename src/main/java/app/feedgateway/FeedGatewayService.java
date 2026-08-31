@@ -3637,6 +3637,7 @@ public class FeedGatewayService implements ReplayRunner {
             broadcast("source-switching", activeSelectionJson(next, "source-switching"));
             broadcast("status", statusJson());
             boolean replayed = broadcastCachedState(sourceSwitchReplayEvents());
+            replaySpotBandBatchAfterSourceSwitch();
             // WITHHOLD readiness while the newly selected source has partitions still replaying a mid-run
             // rebuild. Announcing source-ready here would certify a cache that is knowably missing every
             // strike on those partitions — the original incident's symptom, reached by a different route.
@@ -4078,6 +4079,7 @@ public class FeedGatewayService implements ReplayRunner {
             // would stay blank until a manual refresh or the next market open.
             broadcast("source-ready", activeSelectionJson(selection, "source-ready"));
             broadcastCachedState(sourceSwitchReplayEvents());
+            replaySpotBandBatchAfterSourceSwitch();
         }
     }
 
@@ -8582,9 +8584,10 @@ public class FeedGatewayService implements ReplayRunner {
         // Bands go out as ONE batch, not through replayCacheMap: that sends a socket message per cache
         // entry and the web client has no handler for a "spot-band" message, so ~200 per-strike messages
         // were simply discarded by the browser. It belongs HERE rather than in addClient because this is
-        // the common per-socket replay path — connect, source switch, and return-to-live from a
-        // historical replay (replayLiveCacheToAppSession) all arrive through it, and in authenticated
-        // mode broadcastCachedState drops the source-switch batch, so this is their only route.
+        // the common per-socket replay path, which has exactly two triggers: connect (addClient) and
+        // return-to-live (resumeLive -> replayLiveCacheToAppSession). A SOURCE SWITCH does NOT come
+        // through here — that is handled separately in applySelection/markSelectionReady, because in
+        // per-session mode broadcastCachedState drops the switch batch outright.
         replaySpotBandBatchToSocket(session);
         replayCacheMap(session, "delta-flow", deltaFlows);
         replayCacheMap(session, "strike-intel", strikeIntels);
@@ -8720,6 +8723,24 @@ public class FeedGatewayService implements ReplayRunner {
      * client has no handler for, so an authenticated browser received nothing at all. Same per-socket
      * routing filter as the per-entry path; one envelope out.
      */
+    /**
+     * Bands after a source switch, for per-session sockets only.
+     *
+     * <p>broadcastCachedState DROPS when perSessionRouting() is true, so the switch batch never leaves
+     * the gateway in authenticated mode. Every other cached surface still recovers, because live routed
+     * records refill it at the consume sites — bands cannot, since the live consumer skips them by
+     * design (one message per strike would flood the chain socket). Suppressing the live path is what
+     * makes this replay owed. Per-socket filtered by the same routing check, one batch each.
+     */
+    private void replaySpotBandBatchAfterSourceSwitch() {
+        if (!perSessionRouting()) {
+            return;
+        }
+        for (WebSocketSession client : clients) {
+            replaySpotBandBatchToSocket(client);
+        }
+    }
+
     private void replaySpotBandBatchToSocket(WebSocketSession session) {
         List<String> deliverable = deliverableCacheEntries(session, "spot-band", spotBands);
         if (deliverable.isEmpty()) {

@@ -182,6 +182,25 @@ class SpotBandForwardingTest {
                 "the batch must use the same per-socket routing filter as the per-entry path");
     }
 
+    /**
+     * A source switch is NOT one of replayCachedToSocket's triggers — it has exactly two, addClient and
+     * resumeLive. In per-session mode broadcastCachedState drops the switch batch, and bands cannot
+     * refill from live data either because the live consumer skips them by design. Both switch call
+     * sites must therefore replay the band batch, or the column empties on every roll and stays empty.
+     */
+    @Test
+    void bothSourceSwitchCallSitesReplayTheBandBatch() throws Exception {
+        String source = Files.readString(Path.of(SERVICE));
+        assertEquals(2, occurrences(source, "replaySpotBandBatchAfterSourceSwitch();"),
+                "both broadcastCachedState(sourceSwitchReplayEvents()) call sites owe the band batch");
+        assertEquals(2, occurrences(source, "broadcastCachedState(sourceSwitchReplayEvents());"),
+                "a new switch call site would need the band replay too — this pins the count");
+        int at = source.indexOf("private void replaySpotBandBatchAfterSourceSwitch() {");
+        assertTrue(at > 0, "expected the switch-time helper");
+        assertTrue(source.substring(at, at + 400).contains("if (!perSessionRouting()) {"),
+                "legacy mode already gets the switch batch from broadcastCachedState — do not double-send");
+    }
+
     /** The legacy (unauthenticated) connect bootstrap listed every cached surface except this one, so a
      *  fresh page showed empty bands until the next coalesced flush happened to carry one. */
     @Test
