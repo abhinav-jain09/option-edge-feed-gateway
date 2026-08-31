@@ -51,4 +51,59 @@ class SpotBandForwardingTest {
         for (int at = 0; (at = text.indexOf(needle, at)) >= 0; at += needle.length()) count++;
         return count;
     }
+
+    /**
+     * Registration is not delivery. The first cut of this feature registered the topic in both
+     * consumers and allow-listed the event — both asserted, both true — and the records still reached
+     * nobody, because the gateway delivers per-strike records through the ui-batch and a new event
+     * needs a cache map, a cache key, a store branch and a batch field before any of that happens.
+     * The page showed an empty column for hours behind two green tests.
+     */
+    @Test
+    void theRecordIsCACHEDandRIDESTHEBATCH_notMerelyRegistered() throws Exception {
+        String source = Files.readString(Path.of(SERVICE));
+        assertTrue(source.contains("private final Map<String, String> spotBands = new ConcurrentHashMap<>()"),
+                "consumed with nowhere to put it is the same as not consumed");
+        assertTrue(source.contains("case \"spot-band\" -> {"), "updateCache must have a store branch");
+        assertTrue(source.contains("spotBands.put(key, json);"));
+        assertTrue(source.contains("key = strikeFlowCacheKey(json, key);"),
+                "a per-strike event needs a per-strike cache key or every strike overwrites the last");
+        assertTrue(source.contains("case \"spot-band\" -> spotBandJsons.add(cachedEvent.json());"),
+                "collected into the batch");
+        assertTrue(source.contains("\"spotBands\\\":\" + jsonArray(spotBandJsons)"),
+                "and emitted as a batch field the page can read");
+    }
+
+    /** The live coalescing path is a SECOND batch route; a field on one and not the other delivers
+     *  only on replay, or only live, and looks intermittently broken. */
+    @Test
+    void theCoalescedLivePathCarriesItToo() throws Exception {
+        String source = Files.readString(Path.of(SERVICE));
+        assertTrue(source.contains("private final Map<String, String> pendingSpotBands = new LinkedHashMap<>()"));
+        assertTrue(source.contains("case \"spot-band\" -> pendingSpotBands;"));
+        assertTrue(source.contains("new ArrayList<>(pendingSpotBands.values()),"));
+        assertTrue(source.contains("pendingSpotBands.clear();"), "a batch that never clears repeats itself");
+    }
+
+    /** One record per strike, republished on change — broadcasting each would fill the chain's
+     *  outbound queue, which is exactly why seller-activity does not either. */
+    @Test
+    void individualRecordsAreNOTbroadcastOverTheSocket() throws Exception {
+        String source = Files.readString(Path.of(SERVICE));
+        int at = source.indexOf("if (\"spot-band\".equals(binding.event())) {");
+        assertTrue(at > 0, "there must be an explicit skip, not an accident of ordering");
+        String after = source.substring(at, at + 500);
+        assertTrue(after.contains("continue;"), "the skip must actually skip");
+    }
+
+    /** Replay after a source switch must include it, or switching source silently empties the column. */
+    @Test
+    void itSurvivesASourceSwitchAndIsEvictedWithItsVersionKey() throws Exception {
+        String source = Files.readString(Path.of(SERVICE));
+        assertTrue(source.contains("\"strike-flow\", \"spot-band\", \"seller-activity\""),
+                "absent from the source-switch replay list, the column empties on a switch");
+        assertTrue(source.contains("replayCacheMap(session, \"spot-band\", spotBands);"));
+        assertTrue(source.contains("spotBands.remove(versionKey.substring(\"spot-band:\".length()));"),
+                "a cache with no eviction outlives the session it describes");
+    }
 }
