@@ -257,6 +257,14 @@ class SpotBandForwardingTest {
                 "a third raw call site would bypass the exactly-once ledger");
         assertTrue(source.contains("spotBandSwitchDelivered.remove(id);"),
                 "a per-socket ledger that is never cleaned leaks an entry per disconnect");
+        // removeClient is not the only teardown route — onSlowDisconnect, closeSockets (logout / session
+        // expiry) and closeExpiredAuthSessions drop sockets by paths whose close callback can be delayed
+        // or suppressed. The ledger must not depend on any of them, so it is pruned to the live set.
+        int sw = source.indexOf("private void replaySpotBandBatchAfterSourceSwitch() {");
+        assertTrue(sw > 0, "expected the switch-time helper");
+        assertTrue(source.substring(sw, sw + 900)
+                        .contains("spotBandSwitchDelivered.keySet().retainAll(clientsById.keySet());"),
+                "prune to the connected set, or an unclosed socket leaks a claim forever");
     }
 
     /** The legacy (unauthenticated) connect bootstrap listed every cached surface except this one, so a

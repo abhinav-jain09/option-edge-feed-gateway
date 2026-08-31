@@ -192,7 +192,10 @@ public class FeedGatewayService implements ReplayRunner {
     // socketId -> the readiness key whose completed band board this socket has already been sent by a
     // SWITCH-time replay. Readiness and the connect bracket both race to serve the same board; rather
     // than reason about which iterator ordering wins, both go through it and the loser is a no-op.
-    // Connect and return-to-live replays are NOT deduplicated here — a reset owes a fresh board.
+    // Connect and return-to-live replays are NOT deduplicated here — a reset owes a fresh board. That is
+    // also why a STALE claim cannot cost a socket its board: if an id were ever reused, the new
+    // connection still gets the full board from the connect replay, which never consults this ledger.
+    // Bounded by the live socket set on every switch (see replaySpotBandBatchAfterSourceSwitch).
     private final Map<String, String> spotBandSwitchDelivered = new ConcurrentHashMap<>();
     private final SellerActivityDiskStore sellerActivityStore = new SellerActivityDiskStore();
     // Per-strike delta-flow snapshots, keyed by source|symbol|expiry|strike (last-value-wins per
@@ -8758,6 +8761,11 @@ public class FeedGatewayService implements ReplayRunner {
         if (!perSessionRouting()) {
             return;
         }
+        // Self-healing prune. removeClient clears a socket's claim, but onSlowDisconnect, closeSockets
+        // (logout / session expiry) and closeExpiredAuthSessions drop sockets by other routes whose close
+        // callback can be delayed or suppressed, so the ledger must not depend on any of them running.
+        // Retaining only live sockets bounds it by the connected set on every switch.
+        spotBandSwitchDelivered.keySet().retainAll(clientsById.keySet());
         for (WebSocketSession client : clients) {
             replaySpotBandBatchOncePerReadiness(client);
         }
