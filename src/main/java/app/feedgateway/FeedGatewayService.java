@@ -4485,7 +4485,11 @@ public class FeedGatewayService implements ReplayRunner {
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
         } else if ("spot-band".equals(event)) {
-            key = strikeFlowCacheKey(json, key);
+            // PER-STRIKE, so the per-strike keyer — the same one seller-activity uses. strikeFlowCacheKey
+            // is symbol|expiry because a strike-flow record is CHAIN-WIDE (one record carrying strikes[]);
+            // a band record is one strike. Keying these board-level collapsed all ~200 into a single
+            // entry and the cache held exactly 1, which the spot_bands metric showed immediately.
+            key = deltaFlowCacheKey(json, key);
         } else if ("seller-activity".equals(event)) {
             key = deltaFlowCacheKey(json, key);
         } else if ("delta-flow".equals(event)) {
