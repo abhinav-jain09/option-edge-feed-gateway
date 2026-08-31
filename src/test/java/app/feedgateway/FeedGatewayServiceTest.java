@@ -410,28 +410,6 @@ class FeedGatewayServiceTest {
                 "once the replacement reaches its own barrier the source may become ready");
     }
 
-    @Test
-    void probeOrderPutsKnownTopicsFirstAndRotatesTheUnknowns() {
-        // Known topics answer from the client metadata cache in microseconds and are the ones that detect
-        // growth; unknown (absent optional) topics each BLOCK for their full timeout. If the unknowns ran
-        // first, ~8 undeployed producers would eat the whole refresh budget and growth detection would be
-        // permanently dead — the 4→32 incident restored by its own fix. Rotation guarantees no unknown
-        // topic is permanently starved by the ones ahead of it either.
-        FeedGatewayService service = service();
-        Set<String> topics = new java.util.LinkedHashSet<>(
-                List.of("z-absent-1", "known-a", "m-absent-2", "known-b", "a-absent-3"));
-        Set<String> known = Set.of("known-a", "known-b");
-
-        List<String> first = service.probeOrder(topics, known);
-        assertEquals(List.of("known-a", "known-b"), first.subList(0, 2),
-                "assigned topics are probed before any potentially blocking unknown topic");
-        assertEquals(Set.of("z-absent-1", "m-absent-2", "a-absent-3"), Set.copyOf(first.subList(2, 5)),
-                "every unknown topic is still probed");
-
-        List<String> second = service.probeOrder(topics, known);
-        assertFalse(first.get(2).equals(second.get(2)),
-                "the head unknown rotates between passes, so no absent topic is permanently starved");
-    }
 
     @Test
     void sourceReadinessIsWithheldWhileThatSourceIsStillBootstrapping() {
@@ -536,29 +514,57 @@ class FeedGatewayServiceTest {
     }
 
     @Test
-    void dealerLedgerTopicsAreOptionalSoTheirAbsenceCannotStarveTheSharedConsumer() throws Exception {
-        // Kafka is wiped + services restart daily, and the dealer-ledger producer may not be deployed,
-        // so both DL topics are absent at gateway startup. They MUST be optional or partitionsFor would
-        // block the shared JSON consumer waiting for them, starving strike-flow / mission-pace / etc.
+    void absentTopicsAreSkippedButResolvingNothingThrows() throws Exception {
+        // Graceful-absence contract (2026-08-31, replaces the optional-topic whitelist):
+        // a PARTIAL resolution returns the resolved subset; a resolution of NOTHING is a failure
+        // (an empty assignment would make poll() throw an unnamed IllegalStateException and would
+        // let caughtUp({}) certify an empty cache as ready), and it names the unresolved topics.
         FeedGatewayService service = service();
-        GatewaySettings settings = new GatewaySettings();
-        assertTrue(isOptionalTopic(service, settings.dealerLedgerProfileTopic()));
-        assertTrue(isOptionalTopic(service, settings.dealerLedgerStateTopic()));
-        // strike-invasion is a brand-new topic whose producer may not be deployed during a staged
-        // rollout — it MUST be optional (like strike-intel) so its absence cannot starve the shared
-        // JSON consumer (strike-flow / mission-pace / etc.).
-        assertTrue(isOptionalTopic(service, settings.strikeInvasionTopic()));
-        // drop-classifier's nowcast topic is created by ITS service on first start and can be
-        // absent when the gateway boots — it MUST be optional so its absence cannot starve the
-        // shared JSON consumers (UI review r1 finding #2).
-        assertTrue(isOptionalTopic(service, settings.dropNowcastTopic()));
-        // Both spread-skew topics come from the same brand-new spread-skew-service, which may not be
-        // deployed during a staged rollout — BOTH must be optional (like strike-invasion) so their
-        // absence cannot starve the shared JSON consumer.
-        assertTrue(isOptionalTopic(service, settings.spreadSkewTopic()));
-        assertTrue(isOptionalTopic(service, settings.spreadSkewEventsTopic()));
-        // A mandatory feed must still be mandatory (guards against over-broadening the optional set).
-        assertFalse(isOptionalTopic(service, settings.databentoStrikeFlowTopic()));
+        setRunning(service, true);
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        java.util.Map<String, java.util.List<org.apache.kafka.common.PartitionInfo>> cluster =
+                java.util.Map.of("present", java.util.List.of(
+                        new org.apache.kafka.common.PartitionInfo("present", 0, null, null, null)));
+        org.mockito.Mockito.when(consumer.listTopics(org.mockito.Mockito.any(java.time.Duration.class)))
+                .thenReturn(cluster);
+        java.util.List<org.apache.kafka.common.TopicPartition> partial = partitionsFor(
+                service, consumer, java.util.Set.of("present", "absent"), 400L, java.util.Set.of(), false);
+        assertEquals(java.util.List.of(new org.apache.kafka.common.TopicPartition("present", 0)), partial);
+        IllegalStateException nothing = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> partitionsFor(
+                service, consumer, java.util.Set.of("absent", "also-absent"), 300L, java.util.Set.of(), false));
+        assertTrue(nothing.getMessage().contains("absent"), nothing.getMessage());
+    }
+
+    @Test
+    void vanishedAssignedTopicAndStrictAbsenceStillFailThePass() throws Exception {
+        // An ALREADY-ASSIGNED topic vanishing from metadata is a metadata outage, not a producer that
+        // has not started: the pass must fail so PartitionRefresh's refreshFailing/stale alarms stay
+        // honest. strictAbsence restores all-or-nothing for replay and the switch offset barrier.
+        FeedGatewayService service = service();
+        setRunning(service, true);
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        java.util.Map<String, java.util.List<org.apache.kafka.common.PartitionInfo>> cluster =
+                java.util.Map.of("present", java.util.List.of(
+                        new org.apache.kafka.common.PartitionInfo("present", 0, null, null, null)));
+        org.mockito.Mockito.when(consumer.listTopics(org.mockito.Mockito.any(java.time.Duration.class)))
+                .thenReturn(cluster);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> partitionsFor(
+                service, consumer, java.util.Set.of("present", "vanished"), 300L,
+                java.util.Set.of("vanished"), false));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> partitionsFor(
+                service, consumer, java.util.Set.of("present", "absent"), 300L,
+                java.util.Set.of(), true));
+        // The same strict call succeeds verbatim once every topic resolves.
+        java.util.Map<String, java.util.List<org.apache.kafka.common.PartitionInfo>> full =
+                java.util.Map.of(
+                        "present", java.util.List.of(
+                                new org.apache.kafka.common.PartitionInfo("present", 0, null, null, null)),
+                        "absent", java.util.List.of(
+                                new org.apache.kafka.common.PartitionInfo("absent", 0, null, null, null)));
+        org.mockito.Mockito.when(consumer.listTopics(org.mockito.Mockito.any(java.time.Duration.class)))
+                .thenReturn(full);
+        assertEquals(2, partitionsFor(service, consumer,
+                java.util.Set.of("present", "absent"), 300L, java.util.Set.of(), true).size());
     }
 
     @Test
@@ -636,15 +642,11 @@ class FeedGatewayServiceTest {
         // Stage 1 — bootstrap with the optional topic ABSENT: partitionsFor must complete with
         // only the mandatory topic instead of blocking/failing on the absent optional one.
         KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
-        org.mockito.Mockito.when(consumer.partitionsFor(
-                        org.mockito.ArgumentMatchers.eq("databento.display"),
+        org.mockito.Mockito.when(consumer.listTopics(
                         org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
-                .thenReturn(List.of(new org.apache.kafka.common.PartitionInfo(
-                        "databento.display", 0, null, null, null)));
-        org.mockito.Mockito.when(consumer.partitionsFor(
-                        org.mockito.ArgumentMatchers.eq("es.drop.nowcast"),
-                        org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
-                .thenReturn(null);
+                .thenReturn(java.util.Map.of("databento.display",
+                        List.of(new org.apache.kafka.common.PartitionInfo(
+                                "databento.display", 0, null, null, null))));
         Method partitionsFor = FeedGatewayService.class.getDeclaredMethod("partitionsFor",
                 String.class, KafkaConsumer.class, Set.class, long.class);
         partitionsFor.setAccessible(true);
@@ -656,11 +658,15 @@ class FeedGatewayServiceTest {
 
         // Stage 2 — the producer deploys and creates the topic; the next refresh interval must
         // DISCOVER it, assign the union, and classify it as added-on-NEW-topic.
-        org.mockito.Mockito.when(consumer.partitionsFor(
-                        org.mockito.ArgumentMatchers.eq("es.drop.nowcast"),
+        org.mockito.Mockito.when(consumer.listTopics(
                         org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
-                .thenReturn(List.of(new org.apache.kafka.common.PartitionInfo(
-                        "es.drop.nowcast", 0, null, null, null)));
+                .thenReturn(java.util.Map.of(
+                        "databento.display",
+                        List.of(new org.apache.kafka.common.PartitionInfo(
+                                "databento.display", 0, null, null, null)),
+                        "es.drop.nowcast",
+                        List.of(new org.apache.kafka.common.PartitionInfo(
+                                "es.drop.nowcast", 0, null, null, null))));
         Class<?> refreshClass = Class.forName("app.feedgateway.FeedGatewayService$PartitionRefresh");
         java.lang.reflect.Constructor<?> refreshCtor = refreshClass.getDeclaredConstructor(
                 FeedGatewayService.class, String.class, Set.class);
@@ -736,8 +742,6 @@ class FeedGatewayServiceTest {
         assertEquals(
                 "options.spx.vix-option-inteligence-service.current",
                 settings.vixOptionInteligenceTopic());
-        assertTrue(isOptionalTopic(service, settings.vixOptionInteligenceTopic()),
-                "a staged producer rollout must not starve the shared JSON consumer");
         assertEquals(15_000L, settings.zeroDteIntelligenceTtlMs());
         long now = System.currentTimeMillis();
         assertFalse(isExpired(service, "zero-dte-intelligence", now - 14_999L, now));
@@ -1516,8 +1520,6 @@ class FeedGatewayServiceTest {
         // their absence can never block/crash-loop the shared JSON consumer.
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
-        assertTrue(isOptionalTopic(service, settings.esOpenDirectionForecastTopic()));
-        assertTrue(isOptionalTopic(service, settings.esOpenDirectionOutcomeTopic()));
     }
 
     @Test
@@ -1632,8 +1634,6 @@ class FeedGatewayServiceTest {
     void closeDirectionTopicIsOptionalAndPrefixAware() throws Exception {
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
-        assertTrue(isOptionalTopic(service, settings.closeDirectionSignalTopic()),
-                "close-direction topic absence must never starve the shared JSON consumer");
         // TOPIC_PREFIX (es4) applies through the *_TOPIC helper — no code change per env.
         System.setProperty("TOPIC_PREFIX", "es.");
         try {
@@ -1781,8 +1781,6 @@ class FeedGatewayServiceTest {
         // the 12h forecast/outcome window that would replay a stale overnight status as live.
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
-        assertTrue(isOptionalTopic(service, settings.esOpenDirectionStatusTopic()),
-                "status producer may be absent (not deployed / no active session) — must be optional");
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("es-open-direction-status"),
                 "status must fan out in per-session (auth) mode like its siblings");
         assertEquals(300_000L, settings.esOpenDirectionStatusTtlMs(), "default TTL must be 5 minutes");
@@ -1864,8 +1862,6 @@ class FeedGatewayServiceTest {
         GatewaySettings settings = new GatewaySettings();
         assertEquals("options.spx.greek-move-auth.current", settings.greekMoveAuthCurrentTopic(),
                 "default topic must be the contract constant GreekMoveAuthTopics.GREEK_MOVE_AUTH_CURRENT");
-        assertTrue(isOptionalTopic(service, settings.greekMoveAuthCurrentTopic()),
-                "a brand-new standalone producer may be absent — the topic must be optional");
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("greek-move-auth"),
                 "the verdict must fan out in per-session (auth) mode like the open-direction siblings");
         assertEquals(300_000L, settings.greekMoveAuthTtlMs(), "default TTL must be 5 minutes");
@@ -1986,8 +1982,6 @@ class FeedGatewayServiceTest {
         GatewaySettings settings = new GatewaySettings();
         assertEquals("options.indicators.snapshot.current", settings.indicatorsSnapshotTopic(),
                 "default topic must be the contract constant IndicatorTopics.INDICATORS_SNAPSHOT_CURRENT");
-        assertTrue(isOptionalTopic(service, settings.indicatorsSnapshotTopic()),
-                "a brand-new standalone producer may be absent — the topic must be optional");
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("indicators"),
                 "indicator snapshots fan out in per-session (auth) mode like advisory siblings");
         assertEquals(300_000L, settings.indicatorsTtlMs(), "default TTL must be 5 minutes");
@@ -2195,8 +2189,6 @@ class FeedGatewayServiceTest {
                         assertEquals("es.tape-zones.board",
                                 new GatewaySettings().tapeZonesBoardTopic(),
                                 "an unprefixed override IS prefixed on es4")));
-        assertTrue(isOptionalTopic(service, settings.tapeZonesBoardTopic()),
-                "the board is absent until the service produces / the MM1 mirror is installed");
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("tapeZones"),
                 "the board fans out in per-session (auth) mode like its advisory siblings");
         assertEquals(300_000L, settings.tapeZonesTtlMs(), "default eviction window must be 5 minutes");
@@ -2455,9 +2447,6 @@ class FeedGatewayServiceTest {
         GatewaySettings settings = new GatewaySettings();
         assertEquals("options.spx.vol-premium.ivrv", settings.volPremiumIvrvTopic(),
                 "default topic must be the contract constant VolPremiumTopics.IVRV");
-        assertTrue(isOptionalTopic(service, settings.volPremiumIvrvTopic()),
-                "a brand-new standalone producer may be absent, and the topic does not exist after "
-                        + "the daily Kafka wipe until it first produces — it must be optional");
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("vol-premium-ivrv"),
                 "the reading must fan out in per-session (auth) mode like its advisory siblings");
         assertEquals(300_000L, settings.volPremiumIvrvTtlMs(), "default TTL must be 5 minutes");
@@ -3192,8 +3181,6 @@ class FeedGatewayServiceTest {
         GatewaySettings settings = new GatewaySettings();
         assertEquals("options.spx.spot-vol-regime.current", settings.spotVolRegimeTopic(),
                 "default topic must be the contract constant SpotVolRegimeTopics.SPOT_VOL_REGIME_CURRENT");
-        assertTrue(isOptionalTopic(service, settings.spotVolRegimeTopic()),
-                "a brand-new standalone producer may be absent — the topic must be optional");
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("spot-vol-regime"),
                 "the regime must fan out in per-session (auth) mode like its advisory siblings");
         assertEquals(300_000L, settings.spotVolRegimeTtlMs(), "default TTL must be 5 minutes");
@@ -4998,10 +4985,23 @@ class FeedGatewayServiceTest {
         );
     }
 
-    private static boolean isOptionalTopic(FeedGatewayService service, String topic) throws Exception {
-        Method method = FeedGatewayService.class.getDeclaredMethod("isOptionalTopic", String.class);
+    @SuppressWarnings("unchecked")
+    private static java.util.List<org.apache.kafka.common.TopicPartition> partitionsFor(
+            FeedGatewayService service, KafkaConsumer<?, ?> consumer, java.util.Set<String> topics,
+            long budgetMs, java.util.Set<String> alreadyKnownTopics, boolean strictAbsence) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("partitionsFor",
+                String.class, KafkaConsumer.class, java.util.Set.class, long.class,
+                java.util.Set.class, boolean.class);
         method.setAccessible(true);
-        return (boolean) method.invoke(service, topic);
+        try {
+            return (java.util.List<org.apache.kafka.common.TopicPartition>) method.invoke(
+                    service, "test", consumer, topics, budgetMs, alreadyKnownTopics, strictAbsence);
+        } catch (java.lang.reflect.InvocationTargetException wrapped) {
+            if (wrapped.getCause() instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw wrapped;
+        }
     }
 
     private static boolean isExpired(FeedGatewayService service, String event, long eventTime, long now) throws Exception {

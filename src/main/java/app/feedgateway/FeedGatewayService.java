@@ -507,11 +507,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong sourceStaleEvents = new AtomicLong();
     private final AtomicLong lastSourceStaleBroadcastMs = new AtomicLong();
     private final AtomicLong lastLagCheckMs = new AtomicLong();
-    /** Optional topics currently absent from metadata — shared across consumer threads, so log-once. */
-    private final Set<String> absentOptionalTopics = ConcurrentHashMap.newKeySet();
-    /** Rotates which absent optional topic gets probed first, so none is permanently starved. */
-    private final java.util.concurrent.atomic.AtomicInteger unknownProbeRotation =
-            new java.util.concurrent.atomic.AtomicInteger();
+    /** Topics currently absent from metadata — shared across consumer threads, so log-once per name|topic. */
+    private final Set<String> absentTopics = ConcurrentHashMap.newKeySet();
     /**
      * Partitions discovered mid-run that are still replaying their cache rebuild, published at SERVICE
      * scope because two independent threads need them: the owning cache consumer (to keep them out of the
@@ -3013,67 +3010,6 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
-    /**
-     * Topics whose producers may legitimately be absent (graceful-absence contract). Every other
-     * topic in a consumer set is mandatory and keeps the strict metadata requirement.
-     */
-    private boolean isOptionalTopic(String topic) {
-        // OPTIONAL: absence must never block/crash-loop the SHARED consumer. The dealer-ledger topics
-        // are produced by a separate service that may not be deployed (and, since Kafka is wiped and
-        // services restart each day, are simply absent until that service first produces) — treat them
-        // as optional so their absence can't starve strike-flow / mission-pace / the other JSON feeds.
-        return topic != null
-                && (topic.equals(settings.dropNowcastTopic())
-                    || topic.equals(settings.strikeLiquidityTopic())
-                    || topic.equals(settings.dealerLedgerProfileTopic())
-                    || topic.equals(settings.dealerLedgerStateTopic())
-                    || topic.equals(settings.strikeIntelByStrikeTopic())
-                    || topic.equals(settings.optionTruthByStrikeTopic())
-                    || topic.equals(settings.strikeInvasionTopic())
-                    // Both spread-skew topics come from the same brand-new spread-skew-service, which may
-                    // not be deployed during a staged rollout — BOTH must be optional (like strike-invasion)
-                    // so their absence cannot starve the shared JSON consumer.
-                    || topic.equals(settings.spreadSkewTopic())
-                    || topic.equals(settings.spreadSkewEventsTopic())
-                    || topic.equals(settings.shortPremiumRecommendationTopic())
-                    || topic.equals(settings.corridorGaugeTopic())
-                    // ES open-direction forecast/outcome producer is a brand-new service that may not be
-                    // deployed (and the topics are absent after the daily Kafka wipe until it first
-                    // produces) — optional, so their absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.esOpenDirectionForecastTopic())
-                    || topic.equals(settings.esOpenDirectionOutcomeTopic())
-                    // The live STATUS heartbeat comes from the same may-not-be-deployed producer, and is
-                    // additionally absent whenever no overnight session is active — optional like its siblings.
-                    || topic.equals(settings.esOpenDirectionStatusTopic())
-                    // Greek-move-authenticity is a brand-new standalone service that may not be deployed (and
-                    // the topic is absent after the daily Kafka wipe until it first produces) — optional, so
-                    // its absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.greekMoveAuthCurrentTopic())
-                    // Spot-vol-regime is a brand-new standalone service that may not be deployed (and the
-                    // topic is absent after the daily Kafka wipe until it first produces) — optional, so
-                    // its absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.spotVolRegimeTopic())
-                    // Vol-premium is a brand-new standalone service that may not be deployed (and the
-                    // topic is absent after the daily Kafka wipe until it first produces) — optional, so
-                    // its absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.volPremiumIvrvTopic())
-                    // BOTH indicator CURRENT topics are optional (r2 finding 3):
-                    // the local one until the service first produces, and the
-                    // es4-MIRRORED one whenever the mirror is not yet installed —
-                    // an absent mirror means ES goes stale (§7.3), never a dead
-                    // shared consumer.
-                    || settings.indicatorsSnapshotTopics().contains(topic)
-                    // The tape-zones board is OPTIONAL for the same two reasons: on dev/prod it does
-                    // not exist until the MM1 mirror is installed (§6.2, still pending), and on es4
-                    // not until the service first produces. An absent board must mean "the card says
-                    // no data", never a dead shared JSON consumer.
-                    || topic.equals(settings.tapeZonesBoardTopic())
-                    // Close-direction is a brand-new standalone service that may not be deployed (and the
-                    // topic is absent until it first produces) — optional like its advisory siblings.
-                    || topic.equals(settings.closeDirectionSignalTopic())
-                    || topic.equals(settings.vixOptionInteligenceTopic()));
-    }
-
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {
         if (caughtUpFlag.getAndSet(false)) {
             broadcast("status", statusJson());
@@ -3084,126 +3020,114 @@ public class FeedGatewayService implements ReplayRunner {
         return partitionsFor(name, consumer, topics, settings.metadataTimeoutMs());
     }
 
-    /**
-     * Resolve every topic's partitions, or fail with {@link TopicMetadataTimeoutException}.
-     *
-     * <p>{@code budgetMs} is a TOTAL deadline for the whole call, enforced before EVERY per-topic metadata
-     * request — not merely once per pass. Each request against a topic the client does not know blocks for
-     * its own timeout, so an unbounded per-topic timeout made the real cost {@code 1s x absent-topics}:
-     * with ~8 optional topics undeployed (the normal state after the daily Kafka wipe) a single pass could
-     * stall ~8s. At bootstrap that is harmless; from {@link PartitionRefresh} it runs ON THE POLL THREAD
-     * every refresh interval, so it stalls consumption, and the resulting backlog can trip
-     * {@link #maybeSeekSelectedSourceToLatest} into seeking the selected partitions to END — turning a
-     * metadata hiccup into real skipped data.
-     *
-     * <p>Running out of budget mid-pass yields an INCOMPLETE view, which must never be mistaken for a
-     * complete one: {@code complete} is cleared so the call throws rather than returning a short list that
-     * a caller could read as "these topics no longer have those partitions".
-     */
+    /** Graceful-absence overload — see the full overload for the contract. */
     private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics,
                                                long budgetMs) {
-        return partitionsFor(name, consumer, topics, budgetMs, Set.of());
+        return partitionsFor(name, consumer, topics, budgetMs, Set.of(), false);
+    }
+
+    /** Refresh overload (graceful absence, with the current assignment as known topics). */
+    private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics,
+                                               long budgetMs, Set<String> alreadyKnownTopics) {
+        return partitionsFor(name, consumer, topics, budgetMs, alreadyKnownTopics, false);
     }
 
     /**
-     * Resolve every topic's partitions, or fail with {@link TopicMetadataTimeoutException}.
+     * Resolve the topics' partitions with ONE whole-cluster metadata request per pass
+     * ({@link KafkaConsumer#listTopics(Duration)}). Replaces the per-topic probe loop AND the
+     * optional-topic whitelist (deleted 2026-08-31): the whitelist itself was the recurring outage —
+     * dev wipes every topic nightly, so any newly bound topic someone forgot to whitelist made this
+     * method throw for the WHOLE consumer set, restarting it every 30s and blacking out every feed it
+     * carried (.pace.rank, gex.oi-status, spot-band-flow mornings). The per-topic probes were also the
+     * cost center: an UNKNOWN topic blocked ~1s per probe, so absent topics serially burned the budget;
+     * listTopics answers for every topic in one round trip, so absence costs nothing.
      *
-     * <p><b>Probe order is load-bearing, not cosmetic.</b> A metadata lookup for a topic the client already
-     * knows is answered from its cache in microseconds; a lookup for an UNKNOWN topic BLOCKS for its whole
-     * timeout while the client retries. With ~8 optional producers undeployed -- the normal state after the
-     * daily Kafka wipe -- probing in arbitrary order under one shared budget lets the absent topics consume
-     * it entirely and the pass never completes. Under the small refresh budget that is fatal: every refresh
-     * throws, growth is never discovered, and the 4->32 incident silently returns. So:
-     *
-     * <ol>
-     *   <li>{@code alreadyKnownTopics} (the caller's current assignment) are probed FIRST. These are the
-     *       cheap cache reads, and they are the ones that actually detect growth -- the mission.</li>
-     *   <li>Everything else is probed afterwards with whatever budget remains, starting at a ROTATING
-     *       offset so no topic is permanently starved by the ones ahead of it. Running out of budget on an
-     *       OPTIONAL one is not a failure -- it is simply still absent, which the union assignment already
-     *       tolerates.</li>
-     * </ol>
-     *
-     * <p>Bootstrap passes an empty {@code alreadyKnownTopics} and the full 30s budget: nothing is known
-     * yet and every topic must resolve, so ordering is irrelevant and strictness is correct.
-     *
-     * <p>Running out of budget on a MANDATORY topic still fails the pass, and a partial pass is never
-     * published as an observation -- a short list must never be read as "those partitions are gone".
+     * <p>The contract, per pass:
+     * <ul>
+     *   <li><b>An absent topic is skipped, not fatal.</b> Its absence is transition-logged
+     *       ({@code RGW_ALERT GATEWAY_TOPIC_ABSENT}, greppable) and the topic is re-checked on every
+     *       {@link PartitionRefresh} pass — the producer coming up later is picked up without a gateway
+     *       restart, and one missing topic can only dark its OWN feature, never the shared consumer.</li>
+     *   <li><b>Resolving NOTHING is a failure, never a success.</b> An empty resolution would make the
+     *       caller {@code assign([])} — whose next {@code poll()} throws an IllegalStateException that no
+     *       longer names the topics — and would let {@code caughtUp({})} certify an EMPTY cache as ready.
+     *       The pass retries within the budget and then throws, naming the unresolved set.</li>
+     *   <li><b>An ALREADY-ASSIGNED topic vanishing from metadata fails the pass.</b> A broker that stops
+     *       answering for topics this consumer is actively assigned to is a metadata outage, not a
+     *       producer that has not started: the throw keeps {@link PartitionRefresh}'s absorb site and its
+     *       refreshFailing / GATEWAY_PARTITION_METADATA_STALE alarms honest.</li>
+     *   <li><b>{@code strictAbsence} restores all-or-nothing</b> for callers whose correctness needs the
+     *       FULL set: replay (a missing run topic must surface as a failure, never a silent
+     *       REPLAY_COMPLETE with 0 records) and the source-switch offset barrier (a partial barrier map
+     *       would wave pre-switch records through on the skipped topic's partitions).</li>
+     * </ul>
      */
     private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics,
-                                               long budgetMs, Set<String> alreadyKnownTopics) {
+                                               long budgetMs, Set<String> alreadyKnownTopics,
+                                               boolean strictAbsence) {
         long deadlineMs = System.currentTimeMillis() + budgetMs;
-        Map<String, List<PartitionInfo>> metadata = new HashMap<>();
-        while (running.get() && System.currentTimeMillis() < deadlineMs) {
-            metadata.clear();
-            boolean complete = true;
-            for (String topic : probeOrder(topics, alreadyKnownTopics)) {
-                boolean known = alreadyKnownTopics.contains(topic);
-                long remainingMs = deadlineMs - System.currentTimeMillis();
-                if (remainingMs <= 0L) {
-                    if (known || !isOptionalTopic(topic)) {
-                        complete = false; // partial view of a topic we must resolve -- never publish it
-                        break;
-                    }
-                    // Budget spent probing other absent optional topics. Leave this one for a later cycle;
-                    // its absence is an expected steady state and must not starve growth detection.
-                    continue;
-                }
-                List<PartitionInfo> partitions =
-                        consumer.partitionsFor(topic, Duration.ofMillis(Math.min(1_000L, remainingMs)));
+        Set<String> unresolved = Set.copyOf(topics);
+        while (running.get()) {
+            long remainingMs = deadlineMs - System.currentTimeMillis();
+            if (remainingMs <= 0L) {
+                break;
+            }
+            Map<String, List<PartitionInfo>> cluster;
+            try {
+                cluster = consumer.listTopics(Duration.ofMillis(Math.min(5_000L, remainingMs)));
+            } catch (org.apache.kafka.common.errors.TimeoutException clusterMetadataTimedOut) {
+                continue; // one slice answered nothing; retry within the budget, throw (named) after it
+            }
+            Map<String, List<PartitionInfo>> resolved = new HashMap<>();
+            List<String> absent = new ArrayList<>();
+            for (String topic : new java.util.TreeSet<>(topics)) { // stable order for readable logs
+                List<PartitionInfo> partitions = cluster.get(topic);
                 if (partitions == null || partitions.isEmpty()) {
-                    if (isOptionalTopic(topic)) {
-                        // OPTIONAL topic (producer not deployed yet / absent): skip it so its absence can
-                        // NEVER block or crash-loop the shared consumer and starve the mandatory feeds. It
-                        // is picked up by the periodic PartitionRefresh once the producer creates it -- no
-                        // gateway restart required. Log the TRANSITION only: this runs every refresh
-                        // interval for every consumer that binds an optional topic, and an undeployed
-                        // producer is an expected steady state after the daily wipe.
-                        if (absentOptionalTopics.add(name + "|" + topic)) {
-                            System.err.println("Feed gateway " + name
-                                    + ": optional topic absent, consuming without it: " + topic);
-                        }
-                        continue;
-                    }
-                    complete = false;
-                    break;
+                    absent.add(topic);
+                } else {
+                    resolved.put(topic, partitions);
                 }
-                if (absentOptionalTopics.remove(name + "|" + topic)) {
-                    System.out.println("Feed gateway " + name + ": optional topic present again: " + topic);
-                }
-                metadata.put(topic, partitions);
             }
-            if (complete) {
-                List<TopicPartition> result = new ArrayList<>();
-                for (Map.Entry<String, List<PartitionInfo>> entry : metadata.entrySet()) {
-                    for (PartitionInfo partition : entry.getValue()) {
-                        result.add(new TopicPartition(entry.getKey(), partition.partition()));
-                    }
-                }
-                result.sort(Comparator.comparing(TopicPartition::topic).thenComparingInt(TopicPartition::partition));
-                return result;
+            unresolved = Set.copyOf(absent);
+            boolean vanishedKnown = absent.stream().anyMatch(alreadyKnownTopics::contains);
+            boolean nothingResolved = resolved.isEmpty() && !topics.isEmpty();
+            if ((strictAbsence && !absent.isEmpty()) || vanishedKnown || nothingResolved) {
+                // Not a publishable observation (see contract). Brief pause so a fast broker answer of
+                // "topic not there yet" does not spin this into a hot loop for the whole budget.
+                sleepQuietly(Math.min(200L, Math.max(1L, deadlineMs - System.currentTimeMillis())));
+                continue;
             }
+            for (String topic : absent) {
+                if (absentTopics.add(name + "|" + topic)) {
+                    System.err.println("RGW_ALERT GATEWAY_TOPIC_ABSENT " + name
+                            + ": topic absent, consuming without it (rechecked every partition refresh): "
+                            + topic);
+                }
+            }
+            List<TopicPartition> result = new ArrayList<>();
+            for (Map.Entry<String, List<PartitionInfo>> entry : resolved.entrySet()) {
+                if (absentTopics.remove(name + "|" + entry.getKey())) {
+                    System.out.println("Feed gateway " + name + ": topic present again: " + entry.getKey());
+                }
+                for (PartitionInfo partition : entry.getValue()) {
+                    result.add(new TopicPartition(entry.getKey(), partition.partition()));
+                }
+            }
+            result.sort(Comparator.comparing(TopicPartition::topic).thenComparingInt(TopicPartition::partition));
+            return result;
         }
-        throw new TopicMetadataTimeoutException("Timed out waiting for Kafka topic metadata: " + topics);
+        throw new TopicMetadataTimeoutException("Timed out waiting for Kafka topic metadata: " + unresolved);
     }
 
-    /** Known topics first (cheap, detects growth), then the rest from a rotating offset (never starved). */
-    List<String> probeOrder(Set<String> topics, Set<String> alreadyKnownTopics) {
-        List<String> known = new ArrayList<>();
-        List<String> unknown = new ArrayList<>();
-        for (String topic : new java.util.TreeSet<>(topics)) { // stable order so rotation is meaningful
-            if (alreadyKnownTopics.contains(topic)) {
-                known.add(topic);
-            } else {
-                unknown.add(topic);
-            }
+    private static void sleepQuietly(long ms) {
+        if (ms <= 0L) {
+            return;
         }
-        if (unknown.size() > 1) {
-            int offset = Math.floorMod(unknownProbeRotation.getAndIncrement(), unknown.size());
-            java.util.Collections.rotate(unknown, -offset);
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
         }
-        known.addAll(unknown);
-        return known;
     }
 
     /**
@@ -3230,7 +3154,7 @@ public class FeedGatewayService implements ReplayRunner {
      * The assignment a refresh may install: everything currently assigned PLUS what was discovered — never
      * the discovered list on its own.
      *
-     * <p>{@link #partitionsFor} deliberately SKIPS an optional topic that is momentarily absent from
+     * <p>{@link #partitionsFor} deliberately SKIPS a topic that is momentarily absent from
      * metadata (see {@link #isOptionalTopic}). At bootstrap that is a documented, logged, self-healing
      * choice. Inside the poll loop it is not: assigning the discovered list verbatim would silently
      * unassign that topic's partitions for the entire life of the consumer, which is exactly the
@@ -3788,7 +3712,8 @@ public class FeedGatewayService implements ReplayRunner {
         // would return the last-stable offset and capture a too-low barrier while a pre-open txn is open).
         barrierProps.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, BARRIER_CONSUMER_ISOLATION);
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(barrierProps)) {
-            List<TopicPartition> partitions = partitionsFor("barrier", consumer, Set.copyOf(topics));
+            List<TopicPartition> partitions = partitionsFor("barrier", consumer, Set.copyOf(topics),
+                    settings.metadataTimeoutMs(), Set.of(), true);
             Map<TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
             System.out.println("Feed gateway captured " + endOffsets.size()
                     + " switch offset barriers for " + selection.source()
@@ -9189,7 +9114,7 @@ public class FeedGatewayService implements ReplayRunner {
         // suppress each other's absent/present transitions.
         List<TopicPartition> partitions =
                 partitionsFor("replay-" + appSessionId + (avro ? "-avro" : "-str"),
-                        consumer, topicEvents.keySet());
+                        consumer, topicEvents.keySet(), settings.metadataTimeoutMs(), Set.of(), true);
         consumer.assign(partitions);
         Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
         if (params.hasRun()) {
@@ -10479,7 +10404,7 @@ public class FeedGatewayService implements ReplayRunner {
                     + " oldestBootstrapAgeMs=" + oldestBootstrapAgeMs);
             // Alert ONLY when discovery sees MORE than is assigned: partitions exist that this consumer is
             // knowably not reading. The opposite direction (assigned > discovered) is healthy and expected:
-            // the union assignment deliberately RETAINS an optional topic's partitions while that topic is
+            // the union assignment deliberately RETAINS an absent topic's partitions while that topic is
             // momentarily absent from a discovery pass, so equality is not an invariant.
             if (discovered > 0 && assigned >= 0 && discovered > assigned) {
                 System.err.println("RGW_ALERT event=GATEWAY_PARTITION_ASSIGNMENT_INCOMPLETE"
