@@ -66,8 +66,13 @@ class SpotBandForwardingTest {
                 "consumed with nowhere to put it is the same as not consumed");
         assertTrue(source.contains("case \"spot-band\" -> {"), "updateCache must have a store branch");
         assertTrue(source.contains("spotBands.put(key, json);"));
-        assertTrue(source.contains("key = strikeFlowCacheKey(json, key);"),
-                "a per-strike event needs a per-strike cache key or every strike overwrites the last");
+        // This assertion was WRONG in its first form: it demanded strikeFlowCacheKey, which is
+        // symbol|expiry, and the cache duly held one entry for the whole board. A strike-flow record
+        // is chain-wide; a band record is one strike. The test asserted the bug.
+        int at = source.indexOf("} else if (\"spot-band\".equals(event)) {");
+        assertTrue(at > 0, "spot-band must have its own cache-key branch");
+        assertTrue(source.substring(at, at + 700).contains("key = deltaFlowCacheKey(json, key);"),
+                "a per-strike event needs the PER-STRIKE keyer or every strike overwrites the last");
         assertTrue(source.contains("case \"spot-band\" -> spotBandJsons.add(cachedEvent.json());"),
                 "collected into the batch");
         assertTrue(source.contains("\"spotBands\\\":\" + jsonArray(spotBandJsons)"),
