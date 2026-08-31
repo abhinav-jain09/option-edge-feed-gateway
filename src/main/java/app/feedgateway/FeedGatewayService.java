@@ -776,9 +776,6 @@ public class FeedGatewayService implements ReplayRunner {
         // contract leak), then live routed data (FR-11).
         if (perSessionRouting()) {
             replayCachedToSocket(session);
-            // Bands are the one cached surface with no per-message client handler, so they cannot ride
-            // replayCachedToSocket. Without this, an authenticated gateway delivers them on NO route.
-            replaySpotBandBatchToSocket(session);
             // short-premium is a GLOBAL advisory (symbol-filtered client-side), not per-session
             // routed — replayCacheMap can't deliver it (no GatewayRecordMapper case), so replay it
             // the same standalone way legacy mode does, so an auth-mode reload restores the overlay.
@@ -8582,11 +8579,13 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "pace-rank", paceRanks);
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
-        // spot-band is deliberately NOT replayed here. replayCacheMap sends ONE socket message per
-        // cache entry, and there is no client handler for a "spot-band" message — the page reads bands
-        // only from the ui-batch's spotBands array. Replaying ~200 per-strike entries therefore sent a
-        // burst the browser discarded, and contradicted this field's own contract. The batch is the
-        // delivery path on both routes: sourceSwitchReplayEvents() for a switch, pendingSpotBands live.
+        // Bands go out as ONE batch, not through replayCacheMap: that sends a socket message per cache
+        // entry and the web client has no handler for a "spot-band" message, so ~200 per-strike messages
+        // were simply discarded by the browser. It belongs HERE rather than in addClient because this is
+        // the common per-socket replay path — connect, source switch, and return-to-live from a
+        // historical replay (replayLiveCacheToAppSession) all arrive through it, and in authenticated
+        // mode broadcastCachedState drops the source-switch batch, so this is their only route.
+        replaySpotBandBatchToSocket(session);
         replayCacheMap(session, "delta-flow", deltaFlows);
         replayCacheMap(session, "strike-intel", strikeIntels);
         replayCacheMap(session, "option-truth", optionTruths);

@@ -165,10 +165,16 @@ class SpotBandForwardingTest {
     void theAuthenticatedRouteStillHasABandDeliveryPath() throws Exception {
         String source = Files.readString(Path.of(SERVICE));
 
-        int at = source.indexOf("if (perSessionRouting()) {\n            replayCachedToSocket(session);");
-        assertTrue(at > 0, "expected the per-session connect branch");
-        assertTrue(source.substring(at, at + 600).contains("replaySpotBandBatchToSocket(session);"),
-                "per-session connect must deliver bands, or an authenticated browser gets none");
+        // It must sit in the COMMON per-socket replay path, not only in addClient: connect, source
+        // switch and return-to-live (replayLiveCacheToAppSession) all go through replayCachedToSocket,
+        // and in authenticated mode broadcastCachedState drops the source-switch batch.
+        int at = source.indexOf("private void replayCachedToSocket(WebSocketSession session) {");
+        assertTrue(at > 0, "expected the common per-socket replay path");
+        int end = source.indexOf("\n    }", at);
+        assertTrue(source.substring(at, end).contains("replaySpotBandBatchToSocket(session);"),
+                "bands must replay on every per-socket route, not just on connect");
+        assertFalse(source.contains("replaySpotBandBatchToSocket(session);\n            replayShortPremiumCached"),
+                "must not be duplicated into addClient — the common path already covers connect");
 
         assertTrue(source.contains("sendEnvelope(session, uiBatchEnvelopeJson(asBatch));"),
                 "and it must be ONE batch, not one message per strike");
