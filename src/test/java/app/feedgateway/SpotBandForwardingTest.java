@@ -4,6 +4,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -13,6 +16,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
+import org.springframework.web.socket.WebSocketSession;
 
 /**
  * Per-strike spot-band flow reaching the browser.
@@ -125,9 +129,11 @@ class SpotBandForwardingTest {
     void noRouteBroadcastsIndividualRecords() throws Exception {
         String source = Files.readString(Path.of(SERVICE));
 
-        int at = source.indexOf("if (\"spot-band\".equals(binding.event())) {");
+        int at = source.indexOf("if (skipsLiveSpotBandForward(binding.event(), perSessionRouting())) {");
         assertTrue(at > 0, "there must be an explicit live-path skip, not an accident of ordering");
-        assertTrue(source.substring(at, at + 500).contains("continue;"), "the skip must actually skip");
+        int blockEnd = source.indexOf("\n                    }", at);
+        assertTrue(blockEnd > at, "expected the guard block to close");
+        assertTrue(source.substring(at, blockEnd).contains("continue;"), "the skip must actually skip");
 
         assertFalse(source.contains("replayCacheMap(session, \"spot-band\", spotBands);"),
                 "replayCacheMap sends one socket message per entry and no client reads a spot-band message");
@@ -294,6 +300,59 @@ class SpotBandForwardingTest {
         assertTrue(source.contains("pendingSpotBands.clear();"), "a batch that never clears repeats itself");
         assertTrue(source.contains("\"spotBands\\\":\" + jsonArray(spotBandJsons)"),
                 "and emitted as a batch field the page can read");
+    }
+
+    /**
+     * THE dev regression. The live consumer skipped spot-band unconditionally, and the branch it was
+     * skipping ends in enqueuePending — which IS the ui-batch. So pendingSpotBands stayed permanently
+     * empty and every batch shipped "spotBands":[] while the cache held a full board. The page rendered
+     * both Band columns and every cell read "--", with the gateway metric showing 40 cached matrices.
+     *
+     * <p>The skip is legitimate ONLY under per-session routing, where the live path sends one socket
+     * message per record and no client handler exists for it.
+     */
+    @Test
+    void theLiveSkipAppliesToPerSessionModeOnly() {
+        assertTrue(FeedGatewayService.skipsLiveSpotBandForward("spot-band", true),
+                "per-session routes one message per record and the client cannot read it");
+        assertFalse(FeedGatewayService.skipsLiveSpotBandForward("spot-band", false),
+                "legacy mode MUST fall through to enqueuePending — that is the ui-batch the page reads");
+        assertFalse(FeedGatewayService.skipsLiveSpotBandForward("strike-flow", true),
+                "the guard must not swallow any other event");
+    }
+
+    /** …and the consume loop must actually use that predicate, not an unconditional skip. */
+    @Test
+    void theConsumeLoopUsesTheGuardedSkip() throws Exception {
+        String source = Files.readString(Path.of(SERVICE));
+        assertTrue(source.contains("if (skipsLiveSpotBandForward(binding.event(), perSessionRouting())) {"),
+                "an unconditional continue here empties the batch in legacy mode");
+    }
+
+    /**
+     * End-to-end on the batch itself: a record handed to enqueuePending must come back out inside the
+     * envelope's spotBands array. This is what the page reads; the wiring assertions elsewhere only
+     * prove the field EXISTS.
+     */
+    @Test
+    void anEnqueuedBandRidesTheBatchEnvelope() throws Exception {
+        FeedGatewayService service = service();
+        String json = bandJson(6400);
+
+        // enqueuePending returns early when no client is connected — a real gate, not a test artefact.
+        WebSocketSession client = mock(WebSocketSession.class);
+        when(client.getId()).thenReturn("socket-1");
+        when(client.isOpen()).thenReturn(true);
+        service.addClient(client);
+
+        Method enqueue = FeedGatewayService.class.getDeclaredMethod(
+                "enqueuePending", String.class, String.class, String.class);
+        enqueue.setAccessible(true);
+        enqueue.invoke(service, "spot-band", "DATABENTO|SPX|20260901|6400", json);
+
+        Map<String, String> pending = cacheOf(service, "pendingSpotBands");
+        assertEquals(1, pending.size(), "enqueuePending must land in pendingSpotBands");
+        assertTrue(pending.values().iterator().next().contains("SPOT_BAND_FLOW"));
     }
 
     private static int occurrences(String text, String needle) {

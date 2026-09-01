@@ -2609,10 +2609,16 @@ public class FeedGatewayService implements ReplayRunner {
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
-                    if ("spot-band".equals(binding.event())) {
-                        // Same reason as seller-activity below: one record per strike, republished on
-                        // change. Forwarding each would flood the chain socket. updateCache above is the
-                        // ingestion path; the ui-batch carries it to the page.
+                    if (skipsLiveSpotBandForward(binding.event(), perSessionRouting())) {
+                        // ONLY in per-session mode. There the live path routes one socket message per
+                        // record, and the client has no "spot-band" message handler, so the browser would
+                        // discard ~200 of them per republish; that mode is served by the batch replays in
+                        // replayCachedToSocket / markSelectionReady instead.
+                        //
+                        // In LEGACY mode this record must NOT be skipped: the branch it falls through to
+                        // ends in enqueuePending, and that IS the ui-batch the page reads. Skipping both
+                        // left pendingSpotBands permanently empty, so the batch shipped "spotBands":[]
+                        // every time while the cache held a full board — the exact symptom on dev.
                         continue;
                     }
                     if ("seller-activity".equals(binding.event())) {
@@ -3817,6 +3823,17 @@ public class FeedGatewayService implements ReplayRunner {
             );
         }
         return List.of();
+    }
+
+    /**
+     * Whether a LIVE spot-band record must skip the individual forward.
+     *
+     * <p>True only under per-session routing, where the live path sends one socket message per record and
+     * no client handler exists for it. Under legacy routing it must be FALSE, so the record falls through
+     * to enqueuePending — the ui-batch, which is the only route the page reads.
+     */
+    static boolean skipsLiveSpotBandForward(String event, boolean perSessionRouting) {
+        return "spot-band".equals(event) && perSessionRouting;
     }
 
     static List<String> sourceSwitchReplayEvents() {
