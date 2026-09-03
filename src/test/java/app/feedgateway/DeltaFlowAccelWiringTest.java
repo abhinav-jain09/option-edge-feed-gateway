@@ -31,5 +31,12 @@ class DeltaFlowAccelWiringTest {
         assertEquals(2, count, "cache + live consumers must stay symmetric — one binding per consumer");
         assertTrue(src.contains("if (\"delta-flow-accel\".equals(binding.event())) {"),
                 "the frame is broadcast STANDALONE, same delivery class as es-cvd");
+        // Coalescable: a 1 Hz current-state frame must collapse behind a slow client rather than
+        // queue toward a disconnect — only the newest verdict matters. COALESCABLE_EVENTS is
+        // private; the membership is pinned the same structural way as the binding symmetry above.
+        int setStart = src.indexOf("COALESCABLE_EVENTS = Set.of(");
+        int setEnd = src.indexOf(");", setStart);
+        assertTrue(setStart > 0 && src.substring(setStart, setEnd).contains("\"delta-flow-accel\""),
+                "delta-flow-accel must be in COALESCABLE_EVENTS");
     }
 }

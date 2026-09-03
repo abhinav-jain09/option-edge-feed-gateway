@@ -136,6 +136,9 @@ public class FeedGatewayService implements ReplayRunner {
             "gamma-migration",
             "es-gex",
             "es-strike-intel",
+            // A replaceable 1 Hz current-state frame: behind a slow client only the newest verdict
+            // matters, and letting frames queue contributes to avoidable disconnects.
+            "delta-flow-accel",
             "gex-strike-lifecycle",
             "max-pain",
             "liquidity-heatmap",
