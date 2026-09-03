@@ -271,6 +271,8 @@ public class FeedGatewayService implements ReplayRunner {
      * consumer ever wants this, wire it in ONE change across all of those sites (Codex).
      */
     private final Map<String, String> gammaRotation = new ConcurrentHashMap<>();
+    /** Leader-fragility panel per chain (GMS-R14). REST-only, same contract as gammaRotation. */
+    private final Map<String, String> gammaFragility = new ConcurrentHashMap<>();
     // ES-on-SPX aligned whole-book per symbol|expiry (JSON, roll-forward: latest emitEventTimeMs wins).
     private final Map<String, String> esGex = new ConcurrentHashMap<>();
     // ES strike-intelligence projected onto SPX strikes, keyed by NATIVE ES identity (symbol|expiry|esStrike,
@@ -1570,6 +1572,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
         topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
+        topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
@@ -1712,6 +1715,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
         topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
+        topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
@@ -3831,6 +3835,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.databentoGexMagnetTopic(),
                     settings.gammaMigrationTopic(),
                     settings.gammaRotationTopic(),
+                    settings.gammaFragilityTopic(),
                     settings.databentoMaxPainTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic(),
@@ -5030,6 +5035,13 @@ public class FeedGatewayService implements ReplayRunner {
                 gammaMigration.put(key, json);
                 return key;
             }
+            case "gamma-fragility" -> {
+                // Same contract as gamma-rotation: one record per chain is the whole panel.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gammaFragility.put(key, json);
+                return key;
+            }
             case "gamma-rotation" -> {
                 // Same contract as gamma-migration: one compacted record per chain is the whole
                 // current answer, so last-value-wins with no tombstones.
@@ -5824,7 +5836,7 @@ public class FeedGatewayService implements ReplayRunner {
             // Drives join freshness (joinDealerLedger), purge eviction, and cached-replay uniformly.
             return CachePolicy.expiring(settings.dealerLedgerTtlMs());
         }
-        if ("gamma-rotation".equals(event)) {
+        if ("gamma-fragility".equals(event) || "gamma-rotation".equals(event)) {
             // NEVER the generic 15-minute TTL. This topic publishes only when the peak MOVES, so a
             // quiet stretch is the normal state of a healthy chain — and eviction after 15 quiet
             // minutes threw away the whole session's move log, after which the endpoint answered
@@ -6350,6 +6362,8 @@ public class FeedGatewayService implements ReplayRunner {
             gammaMigration.remove(versionKey.substring("gamma-migration:".length()));
         } else if (versionKey.startsWith("gamma-rotation:")) {
             gammaRotation.remove(versionKey.substring("gamma-rotation:".length()));
+        } else if (versionKey.startsWith("gamma-fragility:")) {
+            gammaFragility.remove(versionKey.substring("gamma-fragility:".length()));
         } else if (versionKey.startsWith("hot-strike:")) {
             hotStrikes.remove(versionKey.substring("hot-strike:".length()));
         } else if (versionKey.startsWith("es-gex:")) {
@@ -6469,6 +6483,11 @@ public class FeedGatewayService implements ReplayRunner {
     /** The peak-rotation windows and raw move log for one chain, or null when none is cached. */
     public String cachedGammaRotation(String symbol, String expiry) {
         return cachedByChain(gammaRotation, symbol, expiry);
+    }
+
+    /** The leader-fragility panel for one chain, or null when none is cached. */
+    public String cachedGammaFragility(String symbol, String expiry) {
+        return cachedByChain(gammaFragility, symbol, expiry);
     }
 
     /**
@@ -9069,6 +9088,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.databentoGexMagnetTopic(), "gex-magnet");
                 avroTopics.put(settings.gammaMigrationTopic(), "gamma-migration");
                 avroTopics.put(settings.gammaRotationTopic(), "gamma-rotation");
+                avroTopics.put(settings.gammaFragilityTopic(), "gamma-fragility");
                 avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");

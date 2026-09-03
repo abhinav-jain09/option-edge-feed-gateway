@@ -842,6 +842,16 @@ public final class GatewaySettings {
         return value("KAFKA_GAMMA_ROTATION_TOPIC", "options.spx.gamma-migration.rotation");
     }
 
+    /**
+     * Leader FRAGILITY panel (GMS-R14, Avro, per-chain last-value-wins). Broadcast as event
+     * "gamma-fragility". Its own topic for the same reason the rotation got one: the snapshot
+     * record's 8KB budget has no room left. Quiet by design — the producer publishes only when a
+     * quantized reading moves, so the rotation's no-TTL reasoning applies verbatim.
+     */
+    public String gammaFragilityTopic() {
+        return value("KAFKA_GAMMA_FRAGILITY_TOPIC", "options.spx.gamma-migration.fragility");
+    }
+
     /** GEX magnet strike (Avro, per-chain last-value-wins). Broadcast as event "gex-magnet". */
     public String databentoGexMagnetTopic() {
         return value("KAFKA_DATABENTO_GEX_MAGNET_TOPIC", "options.databento.gex.magnet");
