@@ -337,6 +337,15 @@ public final class GatewaySettings {
     }
 
     /**
+     * Server-rated Δ-flow acceleration verdicts (JSON {@code DeltaFlowAcceleration.Response}, one
+     * frame per second from the web tier), forwarded as the standalone {@code delta-flow-accel}
+     * event so the Delta Flow page's dials draw from the stream instead of polling.
+     */
+    public String deltaFlowAccelTopic() {
+        return value("KAFKA_DELTA_FLOW_ACCEL_TOPIC", "delta-flow.acceleration.current");
+    }
+
+    /**
      * Per-strike strike-intelligence topic (JSON {@code StrikeIntelligenceSignal}, one record per
      * {@code symbol|expiry|strike}) from strike-intelligence-service. Broadcast as event
      * {@code "strike-intel"}. Like the delta-flow topic, this is UNPREFIXED — the default is the

@@ -1609,6 +1609,9 @@ public class FeedGatewayService implements ReplayRunner {
         // delta-flow-by-strike is plain JSON (DeltaFlowStrikeSnapshot), per-strike keyed
         // (symbol|date|expiry|strike) — this JSON-state consumer, never the Avro one.
         topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
+        // Server-rated Δ-flow acceleration verdicts: one JSON frame per second from the web tier,
+        // chain-global for the active symbol — standalone broadcast, same delivery class as es-cvd.
+        topicEvents.put(settings.deltaFlowAccelTopic(), new TopicBinding("DATABENTO", "delta-flow-accel"));
         // strike-intelligence-by-strike is plain JSON (StrikeIntelligenceSignal), per-strike keyed
         // (symbol|expiry|strike) — this JSON-state consumer, never the Avro one (mirrors delta-flow).
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
@@ -1745,6 +1748,8 @@ public class FeedGatewayService implements ReplayRunner {
         // delta-flow-by-strike is plain JSON, per-strike keyed — keep the cache + live JSON consumer
         // topic sets symmetric (same rule as gex-history/strike-flow above).
         topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
+        // Δ-flow acceleration — cache/live symmetry, same rule as delta-flow above.
+        topicEvents.put(settings.deltaFlowAccelTopic(), new TopicBinding("DATABENTO", "delta-flow-accel"));
         // strike-intelligence-by-strike is plain JSON, per-strike keyed — keep the cache + live JSON
         // consumer topic sets symmetric (same rule as delta-flow above).
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
@@ -2546,6 +2551,13 @@ public class FeedGatewayService implements ReplayRunner {
                             forwardedEvents.incrementAndGet();
                         }
                         noteCvdSpxLevelsProgress(binding, record);
+                        continue;
+                    }
+                    if ("delta-flow-accel".equals(binding.event())) {
+                        // Same standalone-delivery reasoning as es-cvd below: one frame per second,
+                        // no option-expiry identity, never selection-gated.
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
                         continue;
                     }
                     if ("es-cvd".equals(binding.event())) {
@@ -9699,6 +9711,9 @@ public class FeedGatewayService implements ReplayRunner {
             // es-cvd/es-cvd-bar frame as non-routable.
             "es-cvd",
             "es-cvd-bar",
+            // Server-rated Δ-flow acceleration: chain-global advisory; a non-allowlisted event is
+            // dropped as non-routable in per-session (auth) mode.
+            "delta-flow-accel",
             // U16: SPX-translated CVD structure levels — ES-global advisory overlay on the tape page,
             // fail-closed client-side (ES-CVD-SPX-LEVELS-DESIGN.md CL-R7).
             "es-cvd-spx-levels");

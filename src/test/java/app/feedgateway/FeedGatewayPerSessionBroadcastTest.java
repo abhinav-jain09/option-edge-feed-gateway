@@ -251,6 +251,10 @@ class FeedGatewayPerSessionBroadcastTest {
         // Discrete spread-skew transitions are a global one-shot alert (turn-alert sibling) — allowlisted
         // so they are not silently dropped in per-session mode; the SNAPSHOT stays routed market data.
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("spread-skew-event"));
+        // Server-rated Δ-flow acceleration: one chain-global frame per second from the web tier;
+        // without the allowlist entry, per-session (auth) mode drops every frame as non-routable —
+        // the exact defect that once silenced es-cvd.
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("delta-flow-accel"));
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("spread-skew"));
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("snapshot"));
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("pace"));
