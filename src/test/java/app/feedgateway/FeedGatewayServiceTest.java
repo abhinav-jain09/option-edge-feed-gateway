@@ -2309,11 +2309,51 @@ class FeedGatewayServiceTest {
      */
     private static void tapeZonesBroadcast(FeedGatewayService service, Object binding,
                                            ConsumerRecord<String, String> record, String json) throws Exception {
+        FeedGatewayService.CacheGate caughtUpGate = new FeedGatewayService.CacheGate(
+                new java.util.concurrent.atomic.AtomicBoolean(true));
+        tapeZonesBroadcast(service, binding, record, json, caughtUpGate);
+    }
+
+    private static void tapeZonesBroadcast(FeedGatewayService service, Object binding,
+                                           ConsumerRecord<String, String> record, String json,
+                                           FeedGatewayService.CacheGate gate) throws Exception {
         Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
         Method method = FeedGatewayService.class.getDeclaredMethod("tapeZonesBroadcast",
-                bindingType, ConsumerRecord.class, String.class, java.util.concurrent.atomic.AtomicBoolean.class);
+                bindingType, ConsumerRecord.class, String.class, FeedGatewayService.CacheGate.class);
         method.setAccessible(true);
-        method.invoke(service, binding, record, json, new java.util.concurrent.atomic.AtomicBoolean(true));
+        method.invoke(service, binding, record, json, gate);
+    }
+
+    @Test
+    void tapeZonesForwardsOnceItsOwnLaneIsCaughtUpEvenWhileTheFamilyIsNot() throws Exception {
+        // The restart-blackout fix, driven through the REAL delivery seam: the family flag is still
+        // FALSE (some other topic of the state family is replaying a large history), but the
+        // tape-zones topic's own cache lane has reached its barrier — the board must forward.
+        // Under the old family-atomic gate this exact call forwarded NOTHING, which is how a slow
+        // auxiliary topic blacked out every feature at once.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String topic = settings.tapeZonesBoardTopic();
+        var binding = topicBinding("DATABENTO", "tapeZones");
+        List<String> sent = new ArrayList<>();
+        addRecordingClient(service, sent);
+        long now = System.currentTimeMillis();
+
+        java.util.concurrent.atomic.AtomicBoolean family = new java.util.concurrent.atomic.AtomicBoolean(false);
+        FeedGatewayService.CacheGate gate = new FeedGatewayService.CacheGate(family);
+
+        // Control 1 (old behaviour's blind spot): this topic's lane still PENDING => nothing forwards.
+        gate.applyBarrierStates(java.util.Map.of(topic, false));
+        String board = tapeZonesBoard("2026-08-07", false);
+        tapeZonesBroadcast(service, binding, recordAt(topic, 0, 1L, "ES|2026-08-07", board, now), board, gate);
+        assertTrue(sent.isEmpty(), "a pending lane must stay closed; got: " + sent);
+
+        // The lane reaches its barrier — family STILL false — and the board forwards.
+        gate.applyBarrierStates(java.util.Map.of(topic, true));
+        tapeZonesBroadcast(service, binding, recordAt(topic, 0, 2L, "ES|2026-08-07", board, now), board, gate);
+        assertEquals(1, sent.size(),
+                "a caught-up lane forwards while the family flag is still false; got: " + sent);
+        assertFalse(family.get(), "control: the family-atomic flag would still have gated this record");
     }
 
     private static long tapeZonesRejected(FeedGatewayService service) throws Exception {
