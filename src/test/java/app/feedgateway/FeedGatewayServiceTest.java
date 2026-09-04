@@ -17,6 +17,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.ZoneId;
@@ -3611,6 +3612,25 @@ class FeedGatewayServiceTest {
         int before = sent.size();
         invokeMarkSelectionReady(service, activeSelectionOf(service));
         assertEquals(before, sent.size(), "second readiness for the same selection must not re-broadcast");
+    }
+
+    @Test
+    void reconnectAfterSelectionIsReadyReceivesSourceReady() throws Exception {
+        FeedGatewayService service = service();
+        setActiveSelection(service, "DATABENTO", "SPX", "20260623");
+        invokeMarkSelectionReady(service, activeSelectionOf(service));
+
+        List<String> sent = Collections.synchronizedList(new ArrayList<>());
+        service.addClient(recordingSession(sent));
+
+        long deadline = System.currentTimeMillis() + 1_000L;
+        while (sent.stream().noneMatch(message -> message.contains("source-ready"))
+                && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10L);
+        }
+
+        assertTrue(sent.stream().anyMatch(message -> message.contains("source-ready")),
+                "a reconnecting client must receive the already-committed source-ready state");
     }
 
     @Test

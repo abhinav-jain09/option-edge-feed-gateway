@@ -900,6 +900,13 @@ public class FeedGatewayService implements ReplayRunner {
             // pending" — the page needs that distinction to choose `no_data` over staying blank.
             send(session, "cvd-hello", cvdHelloJson());
         }
+        // A client may reconnect after the one-shot readiness broadcast (for example after a
+        // gateway restart or a transient socket failure). Re-announce the already-committed
+        // readiness to this socket so its UI cannot remain stuck in source-switching forever.
+        ActiveSelection selection = activeSelection.get();
+        if (readySelectionKeyMatchesActive(selection)) {
+            send(session, "source-ready", activeSelectionJson(selection, "source-ready"));
+        }
         // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
         // each socket gets only the cached state matching its own AppSession selection (no cross-
         // contract leak), then live routed data (FR-11).
