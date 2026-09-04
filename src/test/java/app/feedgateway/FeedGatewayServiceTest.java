@@ -5842,18 +5842,19 @@ class FeedGatewayServiceTest {
     @org.junit.jupiter.api.Test
     void ibkrPreOpenWrapCarriesKeyOffsetAndUntouchedPayloadWithFullEscaping() throws Exception {
         String wrapped = FeedGatewayService.wrapIbkrPreOpenStatus(
-                "SPX|20260803|6300", 41L, "{\"state\":\"FRESH\",\"recordRevision\":7}");
+                "SPX|20260803|6300", 41L, 1754300000000L, "{\"state\":\"FRESH\",\"recordRevision\":7}");
         org.junit.jupiter.api.Assertions.assertEquals(
-                "{\"recordKey\":\"SPX|20260803|6300\",\"offset\":41,"
+                "{\"recordKey\":\"SPX|20260803|6300\",\"offset\":41,\"timestampMs\":1754300000000,"
                         + "\"status\":{\"state\":\"FRESH\",\"recordRevision\":7}}",
                 wrapped);
         // EVERY control character stays valid JSON (parse-verified, not eyeballed).
         com.fasterxml.jackson.databind.ObjectMapper jackson = new com.fasterxml.jackson.databind.ObjectMapper();
         String nasty = "a\"b\\c\nd\re\tf\u0001g";
         com.fasterxml.jackson.databind.JsonNode parsed = jackson.readTree(
-                FeedGatewayService.wrapIbkrPreOpenStatus(nasty, 7L, "{}"));
+                FeedGatewayService.wrapIbkrPreOpenStatus(nasty, 7L, 3L, "{}"));
         org.junit.jupiter.api.Assertions.assertEquals(nasty, parsed.get("recordKey").asText());
         org.junit.jupiter.api.Assertions.assertEquals(7L, parsed.get("offset").asLong());
+        org.junit.jupiter.api.Assertions.assertEquals(3L, parsed.get("timestampMs").asLong());
     }
 
     @org.junit.jupiter.api.Test
@@ -5909,6 +5910,1255 @@ class FeedGatewayServiceTest {
         java.util.Map<String, String> cache = (java.util.Map<String, String>) cacheField.get(service);
         String wrapped = cache.get("IBKR|SPX|20260803|6300");
         org.junit.jupiter.api.Assertions.assertEquals(
-                "{\"recordKey\":\"SPX|20260803|6300\",\"offset\":6,\"status\":" + newer + "}", wrapped);
+                "{\"recordKey\":\"SPX|20260803|6300\",\"offset\":6,\"timestampMs\":" + now
+                        + ",\"status\":" + newer + "}", wrapped);
+    }
+
+    // ==============================================================================
+    // rev13 Phase 3 slice 2: R-ARB arbitration on the shared gex topic + the R-STOP
+    // frozen-projection cache.
+    // ==============================================================================
+
+    private static final String IBKR_SESSION = "IBKR_PREOPEN:2026-08-04";
+
+    private static String ibkrGexJson(String sessionId, long gen, long epoch, long rev, long validUntil) {
+        return "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6300.0,\"netGex\":1.23E9,"
+                + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\",\"sessionId\":\"" + sessionId + "\","
+                + "\"outputGeneration\":" + gen + ",\"baselineEpoch\":" + epoch
+                + ",\"recordRevision\":" + rev + ",\"validUntilMs\":" + validUntil + "}";
+    }
+
+    private static String databentoGexJson() {
+        return "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6300.0,\"netGex\":9.9E8,"
+                + "\"source\":\"DATABENTO\",\"timeframe\":\"0DTE\"}";
+    }
+
+    private static boolean interceptSharedGex(
+            FeedGatewayService service, ConsumerRecord<String, String> record, String rawJson,
+            boolean liveBroadcast, long nowMs) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("interceptSharedGexRecord",
+                ConsumerRecord.class, String.class, boolean.class, long.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, record, rawJson, liveBroadcast, nowMs);
+    }
+
+    private static String ingestIbkrGex(
+            FeedGatewayService service, ConsumerRecord<String, String> record, String rawJson,
+            long nowMs) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("ingestIbkrPreOpenGexValue",
+                ConsumerRecord.class, com.fasterxml.jackson.databind.JsonNode.class,
+                String.class, long.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service, record, new ObjectMapper().readTree(rawJson), rawJson, nowMs);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> planeMap(FeedGatewayService service, String field) throws Exception {
+        Field mapField = FeedGatewayService.class.getDeclaredField(field);
+        mapField.setAccessible(true);
+        return (Map<String, Object>) mapField.get(service);
+    }
+
+    private static long planeCounter(FeedGatewayService service, String field) throws Exception {
+        Field counterField = FeedGatewayService.class.getDeclaredField(field);
+        counterField.setAccessible(true);
+        return ((java.util.concurrent.atomic.AtomicLong) counterField.get(service)).get();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void seedTakeoverWatermark(FeedGatewayService service, long fence, int partition,
+            long offset) throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("ibkrPreOpenTakeoverWatermarks");
+        field.setAccessible(true);
+        ((Map<Long, Map<Integer, Long>>) field.get(service))
+                .computeIfAbsent(fence, k -> new java.util.concurrent.ConcurrentHashMap<>())
+                .put(partition, offset);
+    }
+
+    /** Seed the per-strike Databento observation with BOTH axes, as the live path records them. */
+    @SuppressWarnings("unchecked")
+    private static void seedDatabentoObservation(FeedGatewayService service, String identity,
+            long commitMs, int partition, long offset) throws Exception {
+        Class<?> type = Class.forName(
+                "app.feedgateway.FeedGatewayService$IbkrPreOpenDatabentoObservation");
+        java.lang.reflect.Constructor<?> ctor =
+                type.getDeclaredConstructor(long.class, int.class, long.class);
+        ctor.setAccessible(true);
+        Field field = FeedGatewayService.class.getDeclaredField("ibkrPreOpenDatabentoMaxCommitMs");
+        field.setAccessible(true);
+        ((Map<String, Object>) field.get(service))
+                .put(identity, ctor.newInstance(commitMs, partition, offset));
+    }
+
+    private static boolean strikeTakenOver(FeedGatewayService service, String identity, long fence)
+            throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "isIbkrPreOpenStrikeTakenOverLocked", String.class, long.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(service, identity, fence);
+    }
+
+    /**
+     * Backdate the gateway's process-start so a window whose 09:30 boundary is in the test's past
+     * counts as OBSERVED LIVE. Real gateways that ran through the boundary are the common case;
+     * tests that construct the service after choosing a past fence must say so explicitly, because
+     * the takeover predicate deliberately differs for a gateway that restarted after 09:30.
+     */
+    private static void backdateProcessStart(FeedGatewayService service, long startMs)
+            throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("ibkrPreOpenProcessStartMs");
+        field.setAccessible(true);
+        // final long -> set via Unsafe-free reflection is not possible; the field is non-final.
+        field.setLong(service, startMs);
+    }
+
+    /** Drive the window sweeper at an explicit wall-clock, so the 09:30 watermark snapshot exists. */
+    private static void sweepWindows(FeedGatewayService service, long nowMs) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod(
+                "sweepIbkrPreOpenGexWindows", long.class);
+        method.setAccessible(true);
+        method.invoke(service, nowMs);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<Integer, Long> takeoverWatermark(FeedGatewayService service, long fence)
+            throws Exception {
+        Field field = FeedGatewayService.class.getDeclaredField("ibkrPreOpenTakeoverWatermarks");
+        field.setAccessible(true);
+        return ((Map<Long, Map<Integer, Long>>) field.get(service)).get(fence);
+    }
+
+    /** The per-strike identity the window keys its planes by, for a plain record key. */
+    private static String gexIdentity(FeedGatewayService service, String recordKey) throws Exception {
+        Method method = FeedGatewayService.class.getDeclaredMethod("gexIdentityFromNode",
+                com.fasterxml.jackson.databind.JsonNode.class, String.class);
+        method.setAccessible(true);
+        return (String) method.invoke(service,
+                new ObjectMapper().readTree(databentoGexJson()), recordKey);
+    }
+
+    private static Object candidateComponent(Object candidate, String accessor) throws Exception {
+        Method method = candidate.getClass().getDeclaredMethod(accessor);
+        method.setAccessible(true);
+        return method.invoke(candidate);
+    }
+
+    private static void seedIbkrStatus(FeedGatewayService service, String recordKey, long offset,
+            String statusJson) throws Exception {
+        seedIbkrStatus(service, recordKey, offset, System.currentTimeMillis(), statusJson);
+    }
+
+    /** Seed a status with an EXPLICIT broker CreateTime — the R-STOP pairing proof requires the
+     *  status half committed BEFORE the fence, so post-fence-window tests must backdate it. */
+    private static void seedIbkrStatus(FeedGatewayService service, String recordKey, long offset,
+            long timestampMs, String statusJson) throws Exception {
+        GatewaySettings settings = new GatewaySettings();
+        updateCache(service, topicBinding("IBKR", "ibkr-preopen-status"),
+                recordAt(settings.ibkrPreOpenStatusTopic(), 0, offset, recordKey, statusJson,
+                        timestampMs), statusJson);
+    }
+
+    private static ConsumerRecord<String, String> gexRecord(long offset, String key, String json,
+            long timestampMs) {
+        return recordAt(new GatewaySettings().databentoGexTopic(), 0, offset, key, json, timestampMs);
+    }
+
+    @Test
+    void sharedGexClassificationScopesEnforcementToExactProvenanceTuples() throws Exception {
+        ObjectMapper jackson = new ObjectMapper();
+        assertEquals(FeedGatewayService.SharedGexClass.DATABENTO,
+                FeedGatewayService.classifySharedGexRecord(jackson.readTree(databentoGexJson())));
+        assertEquals(FeedGatewayService.SharedGexClass.IBKR_PREOPEN,
+                FeedGatewayService.classifySharedGexRecord(jackson.readTree(
+                        ibkrGexJson(IBKR_SESSION, 1, 1, 1, 1L))));
+        assertEquals(FeedGatewayService.SharedGexClass.PREOPEN,
+                FeedGatewayService.classifySharedGexRecord(jackson.readTree(
+                        "{\"source\":\"PREOPEN\",\"timeframe\":\"PREOPEN\"}")));
+        // A record CLAIMING a session without the exact tuple fails closed as UNKNOWN_SESSIONED:
+        // sessioned source without the timeframe...
+        assertEquals(FeedGatewayService.SharedGexClass.UNKNOWN_SESSIONED,
+                FeedGatewayService.classifySharedGexRecord(jackson.readTree(
+                        "{\"source\":\"IBKR\",\"timeframe\":\"0DTE\"}")));
+        // ...a bare non-blank sessionId...
+        assertEquals(FeedGatewayService.SharedGexClass.UNKNOWN_SESSIONED,
+                FeedGatewayService.classifySharedGexRecord(jackson.readTree(
+                        "{\"source\":\"DATABENTO\",\"sessionId\":\"X:2026-08-04\"}")));
+        // ...and a mis-cased tuple (exact tuples are case-sensitive; the claim check is not).
+        assertEquals(FeedGatewayService.SharedGexClass.UNKNOWN_SESSIONED,
+                FeedGatewayService.classifySharedGexRecord(jackson.readTree(
+                        "{\"source\":\"ibkr\",\"timeframe\":\"ibkr_preopen\",\"sessionId\":\"s\"}")));
+    }
+
+    @Test
+    void databentoRecordsBypassArbitrationEntirely() throws Exception {
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        // A genuine Databento record: intercept says "fall through" and the plane stays empty.
+        assertFalse(interceptSharedGex(service, gexRecord(10L, "SPX|20260804|6300",
+                databentoGexJson(), now), databentoGexJson(), false, now));
+        // Malformed / non-JSON values fall through too — the existing pipeline's behavior for
+        // them is unchanged (they cannot claim a session).
+        assertFalse(interceptSharedGex(service, gexRecord(11L, "k", "not-json", now),
+                "not-json", false, now));
+        assertFalse(interceptSharedGex(service, gexRecord(12L, "k", "", now), "", false, now));
+        assertTrue(planeMap(service, "ibkrPreOpenGexCandidates").isEmpty());
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertEquals(0L, planeCounter(service, "ibkrPreOpenGexDroppedSessioned"));
+    }
+
+    @Test
+    void ibkrPreOpenValueNeverEntersDatabentoPlaneAndIsNeverRelabelled() throws Exception {
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, now + 600_000L);
+        assertTrue(interceptSharedGex(service, gexRecord(5L, "SPX|20260804|6300", json, now),
+                json, false, now));
+        // Never in the DATABENTO gex cache (no relabel, no clobber)...
+        Field gexField = FeedGatewayService.class.getDeclaredField("gexByStrike");
+        gexField.setAccessible(true);
+        assertTrue(((Map<?, ?>) gexField.get(service)).isEmpty());
+        // ...but a live candidate on its own plane, payload byte-untouched (no marketDataSource).
+        Map<String, Object> candidates = planeMap(service, "ibkrPreOpenGexCandidates");
+        assertEquals(1, candidates.size());
+        Object candidate = candidates.values().iterator().next();
+        assertEquals(json, candidateComponent(candidate, "json"));
+        assertEquals("SPX|20260804|6300", candidateComponent(candidate, "recordKey"));
+    }
+
+    @Test
+    void unknownSessionedAndPreopenTuplesFailClosedWithoutConditioningDatabento() throws Exception {
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        String unknown = "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6300.0,"
+                + "\"source\":\"IBKR\",\"timeframe\":\"0DTE\",\"sessionId\":\"weird\"}";
+        assertTrue(interceptSharedGex(service, gexRecord(1L, "SPX|20260804|6300", unknown, now),
+                unknown, false, now));
+        String preopen = "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6300.0,"
+                + "\"source\":\"PREOPEN\",\"timeframe\":\"PREOPEN\",\"sessionId\":\"PREOPEN:2026-08-04\"}";
+        assertTrue(interceptSharedGex(service, gexRecord(2L, "SPX|20260804|6300", preopen, now),
+                preopen, false, now));
+        // Both dropped fail-closed: never cached, never a candidate.
+        assertEquals(2L, planeCounter(service, "ibkrPreOpenGexDroppedSessioned"));
+        assertTrue(planeMap(service, "ibkrPreOpenGexCandidates").isEmpty());
+        // And a valid tuple missing its validity bound is dropped too (no provable window).
+        String noValidity = "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6300.0,"
+                + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\",\"sessionId\":\"" + IBKR_SESSION + "\"}";
+        assertTrue(interceptSharedGex(service, gexRecord(3L, "SPX|20260804|6300", noValidity, now),
+                noValidity, false, now));
+        assertEquals(3L, planeCounter(service, "ibkrPreOpenGexDroppedSessioned"));
+        // Databento is NOT conditioned by any of it: the next genuine record still falls through.
+        assertFalse(interceptSharedGex(service, gexRecord(4L, "SPX|20260804|6300",
+                databentoGexJson(), now), databentoGexJson(), false, now));
+    }
+
+    @Test
+    void liveCandidatesAreOffsetOrderedAndDuplicatesStillDeliver() throws Exception {
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long validUntil = now + 600_000L;
+        String v7 = ibkrGexJson(IBKR_SESSION, 3, 2, 7, validUntil);
+        String v8 = ibkrGexJson(IBKR_SESSION, 3, 2, 8, validUntil);
+        // Offset 5 admitted -> LIVE wrap of the record itself.
+        assertEquals("{\"recordKey\":\"SPX|20260804|6300\",\"offset\":5,\"phase\":\"LIVE\",\"gex\":" + v7 + "}",
+                ingestIbkrGex(service, gexRecord(5L, "SPX|20260804|6300", v7, now), v7, now));
+        // The sibling consumer's EXACT duplicate is not an admission but still returns the
+        // CURRENT wrap — live delivery must never be suppressed by losing the admission race.
+        assertEquals("{\"recordKey\":\"SPX|20260804|6300\",\"offset\":5,\"phase\":\"LIVE\",\"gex\":" + v7 + "}",
+                ingestIbkrGex(service, gexRecord(5L, "SPX|20260804|6300", v7, now), v7, now));
+        // A regressed offset is rejected; a higher offset supersedes.
+        assertNull(ingestIbkrGex(service, gexRecord(4L, "SPX|20260804|6300", v7, now), v7, now));
+        assertEquals("{\"recordKey\":\"SPX|20260804|6300\",\"offset\":6,\"phase\":\"LIVE\",\"gex\":" + v8 + "}",
+                ingestIbkrGex(service, gexRecord(6L, "SPX|20260804|6300", v8, now), v8, now));
+        // The same strike arriving on a DIFFERENT partition breaks the key->partition contract:
+        // fail closed, never reorder.
+        assertNull(ingestIbkrGex(service,
+                recordAt(new GatewaySettings().databentoGexTopic(), 1, 99L, "SPX|20260804|6300", v8, now),
+                v8, now));
+        assertEquals(1, planeMap(service, "ibkrPreOpenGexCandidates").size());
+    }
+
+    @Test
+    void fenceCaptureFreezesOnlyPairedNumberBearingStrikes() throws Exception {
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now + 60_000L;
+        String pairedJson = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        String gatedJson = "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6305.0,\"netGex\":1.0E9,"
+                + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\",\"sessionId\":\"" + IBKR_SESSION + "\","
+                + "\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":4,\"validUntilMs\":" + fence + "}";
+        String mismatchJson = "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6310.0,\"netGex\":1.0E9,"
+                + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\",\"sessionId\":\"" + IBKR_SESSION + "\","
+                + "\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":9,\"validUntilMs\":" + fence + "}";
+        assertNotNull(ingestIbkrGex(service, gexRecord(1L, "SPX|20260804|6300", pairedJson, now), pairedJson, now));
+        assertNotNull(ingestIbkrGex(service, gexRecord(2L, "SPX|20260804|6305", gatedJson, now), gatedJson, now));
+        assertNotNull(ingestIbkrGex(service, gexRecord(3L, "SPX|20260804|6310", mismatchJson, now), mismatchJson, now));
+        // Statuses: 6300 FRESH revision-EQUAL (number-bearing pair); 6305 GATED (numberless);
+        // 6310 FRESH but revision-UNEQUAL (pairing broken).
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        seedIbkrStatus(service, "SPX|20260804|6305", 1L,
+                "{\"state\":\"GATED\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":4}");
+        seedIbkrStatus(service, "SPX|20260804|6310", 1L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":8}");
+        service.sweepIbkrPreOpenGexWindows(fence + 1_000L);
+        // The atomic fence transition: live candidates invalidated, ONLY the revision-equal
+        // number-bearing pair survives as a frozen projection; the rest are frozen-blank.
+        assertTrue(planeMap(service, "ibkrPreOpenGexCandidates").isEmpty());
+        Map<String, Object> projections = planeMap(service, "ibkrPreOpenFrozenProjections");
+        assertEquals(1, projections.size());
+        assertEquals("SPX|20260804|6300",
+                candidateComponent(projections.values().iterator().next(), "recordKey"));
+    }
+
+    @Test
+    void recordsCommittedAtOrAfterTheFenceNeverEnterTheProjection() throws Exception {
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 60_000L; // fence already passed
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        // Committed AT/AFTER the fence: never a projection (and no longer a live candidate).
+        assertNull(ingestIbkrGex(service, gexRecord(5L, "SPX|20260804|6300", json, fence), json, now));
+        assertNull(ingestIbkrGex(service, gexRecord(6L, "SPX|20260804|6300", json, fence + 1L), json, now));
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        // Committed BEFORE the fence, observed during the window: frozen-projection
+        // RECONSTRUCTION (R-STOP recovery for a gateway starting 09:25-09:35).
+        assertEquals("{\"recordKey\":\"SPX|20260804|6300\",\"offset\":7,\"phase\":\"FROZEN\",\"gex\":" + json + "}",
+                ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L), json, now));
+        assertEquals(1, planeMap(service, "ibkrPreOpenFrozenProjections").size());
+        // After the 09:35 destruction boundary nothing ever enters again.
+        FeedGatewayService late = service();
+        seedIbkrStatus(late, "SPX|20260804|6300", 1L, fence - 10_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        long afterWindow = fence + 10 * 60_000L + 1L;
+        assertNull(ingestIbkrGex(late, gexRecord(8L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, afterWindow));
+        assertTrue(planeMap(late, "ibkrPreOpenFrozenProjections").isEmpty());
+    }
+
+    @Test
+    void takeoverEvictsOnlyNewlyIngestedDatabentoRecords() throws Exception {
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        // This gateway was RUNNING when the 09:30 boundary passed: both takeover axes apply.
+        backdateProcessStart(service, now - 60 * 60_000L);
+        long fence = now - 6 * 60_000L;          // fence 6 min ago -> takeover boundary 1 min ago
+        long boundary = fence + 5 * 60_000L;
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertNotNull(ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, boundary - 30_000L)); // reconstructed projection inside the freeze window
+        // A pre-boundary Databento record raises the observed high-watermark to 100 but cannot
+        // take over (observed before 09:30).
+        assertFalse(interceptSharedGex(service, gexRecord(100L, "SPX|20260804|6300",
+                databentoGexJson(), boundary - 10_000L), databentoGexJson(), false, boundary - 10_000L));
+        assertEquals(1, planeMap(service, "ibkrPreOpenFrozenProjections").size());
+        // Boundary passes: the watermark snapshot (<=100) is taken by the sweep.
+        service.sweepIbkrPreOpenGexWindows(boundary + 1_000L);
+        // A record AT/BELOW the 09:30 high-watermark never evicts (compacted/bootstrap/cached prior).
+        assertFalse(interceptSharedGex(service, gexRecord(90L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 2_000L), databentoGexJson(), false, boundary + 2_000L));
+        assertEquals(1, planeMap(service, "ibkrPreOpenFrozenProjections").size());
+        // A record beyond the watermark but COMMITTED before 09:30 never evicts either.
+        assertFalse(interceptSharedGex(service, gexRecord(101L, "SPX|20260804|6300",
+                databentoGexJson(), boundary - 5_000L), databentoGexJson(), false, boundary + 2_000L));
+        assertEquals(1, planeMap(service, "ibkrPreOpenFrozenProjections").size());
+        // The strike's FIRST newly-ingested record (beyond the watermark, committed after 09:30):
+        // per-strike takeover — the projection dies.
+        assertFalse(interceptSharedGex(service, gexRecord(102L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 3_000L), databentoGexJson(), false, boundary + 3_000L));
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        // TERMINAL: a late compacted redelivery of the pre-fence value (higher offset, still
+        // committed before the fence) can never resurrect the taken-over strike — not even as a
+        // pending pair.
+        assertNull(ingestIbkrGex(service, gexRecord(8L, "SPX|20260804|6300", json, fence - 4_000L),
+                json, boundary + 4_000L));
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(planeMap(service, "ibkrPreOpenPendingProjections").isEmpty());
+    }
+
+    @Test
+    void windowEndDestroysAllRemainingProjectionsForever() throws Exception {
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 60_000L;
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertNotNull(ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, now));
+        assertEquals(1, planeMap(service, "ibkrPreOpenFrozenProjections").size());
+        service.sweepIbkrPreOpenGexWindows(fence + 10 * 60_000L + 1L);
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        // Evicted values never reappear (no post-window resurrection).
+        assertNull(ingestIbkrGex(service, gexRecord(8L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, fence + 10 * 60_000L + 2L));
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+    }
+
+    @Test
+    void statusArrivingAfterItsValueStillReconstructsTheProjection() throws Exception {
+        // Round-1 finding 1: the value and status streams ride INDEPENDENT consumers, so a
+        // restarted gateway can observe the value first. Reconstruction must be order-independent.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 60_000L; // inside the 09:25-09:35 reconstruction window
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        // Value observed FIRST (committed pre-fence, status not yet consumed): pending, never
+        // presented, never lost.
+        assertNull(ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, now));
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertEquals(1, planeMap(service, "ibkrPreOpenPendingProjections").size());
+        // The revision-equal number-bearing status arrives (committed pre-fence): the pair
+        // completes AT STATUS INGEST — no further value record needed.
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        assertTrue(planeMap(service, "ibkrPreOpenPendingProjections").isEmpty());
+        Map<String, Object> projections = planeMap(service, "ibkrPreOpenFrozenProjections");
+        assertEquals(1, projections.size());
+        assertEquals("SPX|20260804|6300",
+                candidateComponent(projections.values().iterator().next(), "recordKey"));
+        // An unpaired pending value dies at 09:35 like everything else (frozen-blank forever).
+        FeedGatewayService unpaired = service();
+        assertNull(ingestIbkrGex(unpaired, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, now));
+        assertEquals(1, planeMap(unpaired, "ibkrPreOpenPendingProjections").size());
+        unpaired.sweepIbkrPreOpenGexWindows(fence + 10 * 60_000L + 1L);
+        assertTrue(planeMap(unpaired, "ibkrPreOpenPendingProjections").isEmpty());
+        assertTrue(planeMap(unpaired, "ibkrPreOpenFrozenProjections").isEmpty());
+    }
+
+    @Test
+    void statusCommittedAtOrAfterTheFenceNeverProvesAFrozenPair() throws Exception {
+        // Round-1 finding 4: R-STOP pins the frozen pair as committed BEFORE 09:25 — BOTH halves.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 60_000L;
+        // Status committed AT the fence: revision-equal and FRESH, but it cannot prove a
+        // pre-fence pair.
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertNull(ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, now));
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        // The value waits pending — if a PRE-fence status commit is later observed (compacted
+        // replay order), the pair still completes; the at-fence status alone never does.
+        assertEquals(1, planeMap(service, "ibkrPreOpenPendingProjections").size());
+        service.sweepIbkrPreOpenGexWindows(now);
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+    }
+
+    @Test
+    void fenceCaptureRequiresAProvablePreFenceValueCommit() throws Exception {
+        // Round-1 finding 4 (capture side): a candidate admitted live on the gateway clock whose
+        // broker CreateTime is at/after the fence (producer clock skew) must not be captured.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now + 60_000L;
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, now,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        // Admitted as a LIVE candidate (presentation is gateway-clock governed)...
+        assertNotNull(ingestIbkrGex(service, gexRecord(5L, "SPX|20260804|6300", json, fence + 5_000L),
+                json, now));
+        assertEquals(1, planeMap(service, "ibkrPreOpenGexCandidates").size());
+        // ...but the fence capture cannot prove a pre-fence commit: frozen-blank, not pending.
+        service.sweepIbkrPreOpenGexWindows(fence + 1_000L);
+        assertTrue(planeMap(service, "ibkrPreOpenGexCandidates").isEmpty());
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(planeMap(service, "ibkrPreOpenPendingProjections").isEmpty());
+    }
+
+    @Test
+    void observedHighWatermarkAdvancesForEveryRecordClassOnTheLiveTopic() throws Exception {
+        // Round-1 finding 5: the 09:30 snapshot must be the gateway's real observed POSITION on
+        // the partition — sessioned/malformed records advance it too, or a delayed sibling
+        // delivery between the last Databento offset and the true position reads as new.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        // This gateway was RUNNING when the 09:30 boundary passed: both takeover axes apply.
+        backdateProcessStart(service, now - 60 * 60_000L);
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertNotNull(ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, boundary - 30_000L));
+        // Before the boundary the gateway observes offsets 98-100 as SESSIONED/malformed records
+        // (no Databento record anywhere near the position).
+        String unknown = "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6300.0,"
+                + "\"source\":\"IBKR\",\"timeframe\":\"0DTE\",\"sessionId\":\"weird\"}";
+        assertTrue(interceptSharedGex(service, gexRecord(98L, "SPX|20260804|6300", unknown,
+                boundary - 10_000L), unknown, false, boundary - 10_000L));
+        assertFalse(interceptSharedGex(service, gexRecord(99L, "k", "not-json",
+                boundary - 9_000L), "not-json", false, boundary - 9_000L));
+        String preFenceIbkr = ibkrGexJson(IBKR_SESSION, 3, 2, 8, fence);
+        assertTrue(interceptSharedGex(service, gexRecord(100L, "SPX|20260804|6300", preFenceIbkr,
+                fence - 4_000L), preFenceIbkr, false, boundary - 8_000L));
+        // Boundary passes: the snapshot must be 100, not "no Databento seen".
+        service.sweepIbkrPreOpenGexWindows(boundary + 1_000L);
+        // A delayed sibling-consumer Databento delivery at offset 99 — even with a post-boundary
+        // producer timestamp (clock skew) — is AT/BELOW the observed position: never a takeover.
+        assertFalse(interceptSharedGex(service, gexRecord(99L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 2_000L), databentoGexJson(), false, boundary + 2_000L));
+        assertEquals(1, planeMap(service, "ibkrPreOpenFrozenProjections").size());
+        // The genuinely new record beyond the position takes over.
+        assertFalse(interceptSharedGex(service, gexRecord(101L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 3_000L), databentoGexJson(), false, boundary + 3_000L));
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+    }
+
+    @Test
+    void revocationControlEvictsTheNamedGenerationAndPinsIt() throws Exception {
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long validUntil = now + 600_000L;
+        String gen3 = ibkrGexJson(IBKR_SESSION, 3, 2, 7, validUntil);
+        assertNotNull(ingestIbkrGex(service, gexRecord(5L, "SPX|20260804|6300", gen3, now), gen3, now));
+        assertEquals(1, planeMap(service, "ibkrPreOpenGexCandidates").size());
+        // The __revocation control arrives on the status stream (slice-1 ingest path).
+        seedIbkrStatus(service, "__revocation|2026-08-04|3", 9L, "{\"revoked\":true}");
+        assertTrue(planeMap(service, "ibkrPreOpenGexCandidates").isEmpty());
+        // Stragglers of the revoked generation can never re-enter; a NEWER generation can.
+        assertNull(ingestIbkrGex(service, gexRecord(6L, "SPX|20260804|6300", gen3, now), gen3, now));
+        String gen4 = ibkrGexJson(IBKR_SESSION, 4, 2, 1, validUntil);
+        assertNotNull(ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6300", gen4, now), gen4, now));
+        assertEquals(1, planeMap(service, "ibkrPreOpenGexCandidates").size());
+    }
+
+    @Test
+    void newOutputGenerationSupersedesEveryLowerOne() throws Exception {
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long validUntil = now + 600_000L;
+        String gen1a = ibkrGexJson(IBKR_SESSION, 1, 2, 7, validUntil);
+        String gen1b = "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6305.0,\"netGex\":1.0E9,"
+                + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\",\"sessionId\":\"" + IBKR_SESSION + "\","
+                + "\"outputGeneration\":1,\"baselineEpoch\":2,\"recordRevision\":2,\"validUntilMs\":" + validUntil + "}";
+        String gen2 = "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6310.0,\"netGex\":1.0E9,"
+                + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\",\"sessionId\":\"" + IBKR_SESSION + "\","
+                + "\"outputGeneration\":2,\"baselineEpoch\":3,\"recordRevision\":1,\"validUntilMs\":" + validUntil + "}";
+        assertNotNull(ingestIbkrGex(service, gexRecord(1L, "SPX|20260804|6300", gen1a, now), gen1a, now));
+        assertNotNull(ingestIbkrGex(service, gexRecord(2L, "SPX|20260804|6305", gen1b, now), gen1b, now));
+        assertEquals(2, planeMap(service, "ibkrPreOpenGexCandidates").size());
+        // The first gen-2 record supersedes the WHOLE gen-1 universe (a re-arm republishes the
+        // full universe under the new generation).
+        assertNotNull(ingestIbkrGex(service, gexRecord(3L, "SPX|20260804|6310", gen2, now), gen2, now));
+        Map<String, Object> candidates = planeMap(service, "ibkrPreOpenGexCandidates");
+        assertEquals(1, candidates.size());
+        assertEquals("SPX|20260804|6310",
+                candidateComponent(candidates.values().iterator().next(), "recordKey"));
+        // An old-generation straggler is rejected.
+        assertNull(ingestIbkrGex(service, gexRecord(4L, "SPX|20260804|6300", gen1a, now), gen1a, now));
+    }
+
+    @Test
+    void ibkrPreOpenGexWrapShapesAndEscaping() throws Exception {
+        assertEquals("{\"recordKey\":\"SPX|20260804|6300\",\"offset\":41,\"phase\":\"LIVE\","
+                        + "\"gex\":{\"netGex\":1.5}}",
+                FeedGatewayService.wrapIbkrPreOpenGex("SPX|20260804|6300", 41L, "LIVE", "{\"netGex\":1.5}"));
+        assertEquals("{\"recordKey\":\"SPX|20260804|6300\",\"phase\":\"EVICTED\",\"reason\":\"TAKEOVER\"}",
+                FeedGatewayService.wrapIbkrPreOpenGexEviction("SPX|20260804|6300", "TAKEOVER"));
+        // Full escaping, parse-verified (the status-wrap discipline).
+        ObjectMapper jackson = new ObjectMapper();
+        String nasty = "a\"b\\c\nd\re\tfg";
+        com.fasterxml.jackson.databind.JsonNode parsed = jackson.readTree(
+                FeedGatewayService.wrapIbkrPreOpenGex(nasty, 7L, "FROZEN", "{}"));
+        assertEquals(nasty, parsed.get("recordKey").asText());
+        assertEquals("FROZEN", parsed.get("phase").asText());
+        assertEquals(7L, parsed.get("offset").asLong());
+    }
+
+    @Test
+    void ibkrPreOpenGexIsAGlobalBroadcastEventInPerSessionMode() {
+        assertTrue(FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains("ibkr-preopen-gex"),
+                "auth-mode sockets must receive the standalone value-plane broadcasts");
+    }
+
+    @Test
+    void ibkrPreOpenGexBroadcastGateIsPerPartitionExactlyOnceInOrder() {
+        FeedGatewayService service = service();
+        assertTrue(service.shouldBroadcastIbkrPreOpenGex(0, 5L));
+        assertFalse(service.shouldBroadcastIbkrPreOpenGex(0, 5L)); // sibling consumer's duplicate
+        assertFalse(service.shouldBroadcastIbkrPreOpenGex(0, 4L)); // regression never fires
+        assertTrue(service.shouldBroadcastIbkrPreOpenGex(0, 6L));
+        // Partitions are independent offset spaces.
+        assertTrue(service.shouldBroadcastIbkrPreOpenGex(1, 3L));
+        assertFalse(service.shouldBroadcastIbkrPreOpenGex(1, 3L));
+    }
+
+    private static void setCaughtUpBarrier(FeedGatewayService service, String field, boolean value)
+            throws Exception {
+        Field barrier = FeedGatewayService.class.getDeclaredField(field);
+        barrier.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicBoolean) barrier.get(service)).set(value);
+    }
+
+    /** Drive the REAL recovery transition (caught-up -> recovering) on the named barrier. */
+    private static void markRecovering(FeedGatewayService service, String field) throws Exception {
+        Field barrier = FeedGatewayService.class.getDeclaredField(field);
+        barrier.setAccessible(true);
+        Method recovering = FeedGatewayService.class.getDeclaredMethod(
+                "markCacheRecovering", java.util.concurrent.atomic.AtomicBoolean.class);
+        recovering.setAccessible(true);
+        recovering.invoke(service, barrier.get(service));
+    }
+
+    /** A serving gateway (both barriers up, latch proven by a delivered broadcast) holding one
+     *  frozen projection for SPX|20260804|6300 with the given fence. Returns the sink. */
+    private static List<String> servingServiceWithFrozenProjection(
+            FeedGatewayService service, long fence, long nowMs) throws Exception {
+        List<String> sink = new ArrayList<>();
+        addRecordingClient(service, sink);
+        setCaughtUpBarrier(service, "avroCaughtUp", true);
+        setCaughtUpBarrier(service, "stateCaughtUp", true);
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertTrue(interceptSharedGex(service, gexRecord(7L, "SPX|20260804|6300", json,
+                fence - 5_000L), json, true, nowMs));
+        assertEquals(1, planeMap(service, "ibkrPreOpenFrozenProjections").size());
+        assertTrue(sink.stream().anyMatch(m -> m.contains("FROZEN")),
+                "setup must prove the plane was SERVING before recovery: " + sink);
+        sink.clear();
+        return sink;
+    }
+
+    @Test
+    void valuePlaneLiveBroadcastRequiresBothConsumerBarriers() throws Exception {
+        // Round-2 finding 1: gating replay alone is not enough — the LIVE broadcast path serves
+        // connected clients too, and must not deliver a value before the state consumer has
+        // reconstructed the revocation/generation controls.
+        FeedGatewayService service = service();
+        List<String> sink = new ArrayList<>();
+        addRecordingClient(service, sink);
+        setCaughtUpBarrier(service, "avroCaughtUp", true);
+        setCaughtUpBarrier(service, "stateCaughtUp", false);
+        long now = System.currentTimeMillis();
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, now + 600_000L);
+        assertTrue(interceptSharedGex(service, gexRecord(5L, "SPX|20260804|6300", json, now),
+                json, true, now));
+        assertTrue(sink.stream().noneMatch(m -> m.contains("ibkr-preopen-gex")),
+                "value delivered before the state barrier: " + sink);
+        // The suppressed delivery must NOT have consumed the per-partition CAS gate: once the
+        // LAST barrier clears, the same offset (the sibling consumer's duplicate) still delivers.
+        setCaughtUpBarrier(service, "stateCaughtUp", true);
+        assertTrue(interceptSharedGex(service, gexRecord(5L, "SPX|20260804|6300", json, now),
+                json, true, now));
+        assertTrue(sink.stream().anyMatch(m -> m.contains("ibkr-preopen-gex")),
+                "value not delivered after both barriers: " + sink);
+    }
+
+    @Test
+    void authModeValuePlaneReplayRequiresBothConsumerBarriers() throws Exception {
+        // Round-2 finding 1: the per-session (auth-mode) connect path replays through
+        // replayCachedToSocket, which must gate the value plane on BOTH barriers too.
+        System.setProperty("GATEWAY_IBKR_PREOPEN_ENABLED", "true");
+        try {
+            FeedGatewayService service = service();
+            long now = System.currentTimeMillis();
+            String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, now + 600_000L);
+            assertNotNull(ingestIbkrGex(service, gexRecord(5L, "SPX|20260804|6300", json, now),
+                    json, now));
+            Method replay = FeedGatewayService.class.getDeclaredMethod(
+                    "replayCachedToSocket", WebSocketSession.class);
+            replay.setAccessible(true);
+            List<String> sink = new ArrayList<>();
+            WebSocketSession session = recordingSession(sink);
+            setCaughtUpBarrier(service, "avroCaughtUp", true);
+            setCaughtUpBarrier(service, "stateCaughtUp", false);
+            replay.invoke(service, session);
+            assertTrue(sink.stream().noneMatch(m -> m.contains("ibkr-preopen-gex")),
+                    "auth-mode replay served a value before the state barrier: " + sink);
+            setCaughtUpBarrier(service, "stateCaughtUp", true);
+            replay.invoke(service, session);
+            assertTrue(sink.stream().anyMatch(m -> m.contains("ibkr-preopen-gex")),
+                    "auth-mode replay missing after both barriers: " + sink);
+        } finally {
+            System.clearProperty("GATEWAY_IBKR_PREOPEN_ENABLED");
+        }
+    }
+
+    @Test
+    void takeoverIsTerminalForAPendingProjectionToo() throws Exception {
+        // Round-2 finding 2: pre-fence value pending (status consumer lagging) -> first
+        // newly-ingested Databento record after 09:30 -> late status arrives. The pending pair
+        // must NEVER present: the strike's takeover is terminal whether the projection was
+        // frozen or still pending.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        // Pre-fence-committed value observed during the window with NO status yet: pending.
+        assertTrue(interceptSharedGex(service, gexRecord(7L, "SPX|20260804|6300", json,
+                fence - 5_000L), json, false, boundary - 30_000L));
+        assertEquals(1, planeMap(service, "ibkrPreOpenPendingProjections").size());
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        // Boundary passes: the watermark snapshot must cover PENDING-only windows too.
+        service.sweepIbkrPreOpenGexWindows(boundary + 1_000L);
+        // The strike's first newly-ingested Databento record: terminal takeover of the pending pair.
+        assertFalse(interceptSharedGex(service, gexRecord(102L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 2_000L), databentoGexJson(), false, boundary + 2_000L));
+        assertTrue(planeMap(service, "ibkrPreOpenPendingProjections").isEmpty());
+        assertEquals(1, planeMap(service, "ibkrPreOpenTakenOverStrikes").size());
+        // The late revision-equal pre-fence status can no longer resurrect the strike.
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(planeMap(service, "ibkrPreOpenPendingProjections").isEmpty());
+        // Neither can a late compacted redelivery of the pre-fence value.
+        assertNull(ingestIbkrGex(service, gexRecord(8L, "SPX|20260804|6300", json, fence - 4_000L),
+                json, boundary + 4_000L));
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(planeMap(service, "ibkrPreOpenPendingProjections").isEmpty());
+    }
+
+    @Test
+    void generationControlAloneSupersedesEveryLowerGeneration() throws Exception {
+        // Round-2 finding 3: __generation|<D>|<gen> is the AUTHORITATIVE "max observed output
+        // generation" signal (R-WIRE.2). After the state consumer observes it, a delayed
+        // lower-generation value must be rejected even though no value of the new generation
+        // has been observed yet.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long validUntil = now + 600_000L;
+        String gen1 = ibkrGexJson(IBKR_SESSION, 1, 2, 7, validUntil);
+        assertNotNull(ingestIbkrGex(service, gexRecord(5L, "SPX|20260804|6300", gen1, now), gen1, now));
+        assertEquals(1, planeMap(service, "ibkrPreOpenGexCandidates").size());
+        // The generation control arrives on the status stream — no gen-2 value anywhere yet.
+        seedIbkrStatus(service, "__generation|2026-08-04|2", 9L, "{\"outputGeneration\":2}");
+        assertTrue(planeMap(service, "ibkrPreOpenGexCandidates").isEmpty(),
+                "superseded live candidate survived the __generation control");
+        // A delayed gen-1 straggler is rejected on the control's authority alone.
+        assertNull(ingestIbkrGex(service, gexRecord(6L, "SPX|20260804|6300", gen1, now), gen1, now));
+        // The new generation's values are admitted.
+        String gen2 = ibkrGexJson(IBKR_SESSION, 2, 3, 1, validUntil);
+        assertNotNull(ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6300", gen2, now), gen2, now));
+        assertEquals(1, planeMap(service, "ibkrPreOpenGexCandidates").size());
+    }
+
+    @Test
+    void unprovenNewerGenerationNeverDestroysAProvenFrozenProjection() throws Exception {
+        // Round-2 finding 4: R-STOP makes the frozen cache NON-CANDIDATE state — generation
+        // supersession never touches it. A proven frozen pair is replaced only when the newer
+        // generation PROVES its own pre-fence pair.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 60_000L; // inside the 09:25-09:35 window
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, fence - 10_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":3,"
+                        + "\"baselineEpoch\":2,\"recordRevision\":7}");
+        String gen3 = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertNotNull(ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6300", gen3, fence - 5_000L),
+                gen3, now));
+        assertEquals(1, planeMap(service, "ibkrPreOpenFrozenProjections").size());
+        // (a) A gen-4 value committed AT the fence: advances the max generation, is itself
+        // rejected (no pre-fence commit) — and the proven gen-3 projection SURVIVES.
+        String gen4 = ibkrGexJson(IBKR_SESSION, 4, 3, 1, fence);
+        assertNull(ingestIbkrGex(service, gexRecord(8L, "SPX|20260804|6300", gen4, fence), gen4, now));
+        Map<String, Object> projections = planeMap(service, "ibkrPreOpenFrozenProjections");
+        assertEquals(1, projections.size());
+        assertEquals(3L, candidateComponent(projections.values().iterator().next(), "outputGeneration"));
+        // (b) A gen-5 value committed pre-fence but UNPAIRED: pending, not presented — and the
+        // proven gen-3 projection STILL survives.
+        String gen5 = ibkrGexJson(IBKR_SESSION, 5, 4, 2, fence);
+        assertNull(ingestIbkrGex(service, gexRecord(9L, "SPX|20260804|6300", gen5, fence - 3_000L),
+                gen5, now));
+        assertEquals(1, planeMap(service, "ibkrPreOpenPendingProjections").size());
+        projections = planeMap(service, "ibkrPreOpenFrozenProjections");
+        assertEquals(1, projections.size());
+        assertEquals(3L, candidateComponent(projections.values().iterator().next(), "outputGeneration"));
+        // (c) The gen-5 pre-fence status arrives: the newer pair is PROVEN and only now
+        // replaces the gen-3 projection.
+        seedIbkrStatus(service, "SPX|20260804|6300", 2L, fence - 8_000L,
+                "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION + "\",\"outputGeneration\":5,"
+                        + "\"baselineEpoch\":4,\"recordRevision\":2}");
+        assertTrue(planeMap(service, "ibkrPreOpenPendingProjections").isEmpty());
+        projections = planeMap(service, "ibkrPreOpenFrozenProjections");
+        assertEquals(1, projections.size());
+        assertEquals(5L, candidateComponent(projections.values().iterator().next(), "outputGeneration"));
+    }
+
+    @Test
+    void featureOffObservablePayloadsAreEquivalentToABuildWithoutTheFeature() throws Exception {
+        // Round-2 finding 5 (O7 feature-off identity): every payload an observer can see — the
+        // "status" WebSocket message each connecting client receives, the /health JSON, and the
+        // Prometheus scrape — must be equivalent to a build without this feature when the flag
+        // is OFF.
+        Method statusJson = FeedGatewayService.class.getDeclaredMethod("statusJson");
+        statusJson.setAccessible(true);
+        FeedGatewayService off = service();
+        String offHealth = off.healthJson();
+        assertFalse(offHealth.contains("ibkrPreOpen"),
+                "feature-off health payload leaks pre-open fields: " + offHealth);
+        assertFalse(((String) statusJson.invoke(off)).contains("ibkrPreOpen"),
+                "feature-off WS status payload leaks pre-open fields");
+        assertFalse(off.metrics().contains("ibkr_preopen_gex"),
+                "feature-off metrics leak pre-open series");
+        System.setProperty("GATEWAY_IBKR_PREOPEN_ENABLED", "true");
+        try {
+            FeedGatewayService on = service();
+            String onHealth = on.healthJson();
+            assertTrue(onHealth.contains("\"ibkrPreOpenFrozenProjections\":0"),
+                    "flag-on health payload missing pre-open fields: " + onHealth);
+            assertTrue(on.metrics().contains("options_edge_feed_gateway_ibkr_preopen_gex_candidates 0"));
+            // The WS status payload never carries pre-open fields in either mode (the value
+            // plane rides its own standalone events), and both health variants must stay valid
+            // JSON (the conditional block must not break commas).
+            assertFalse(((String) statusJson.invoke(on)).contains("ibkrPreOpen"));
+            ObjectMapper jackson = new ObjectMapper();
+            assertNotNull(jackson.readTree(offHealth));
+            assertNotNull(jackson.readTree(onHealth));
+        } finally {
+            System.clearProperty("GATEWAY_IBKR_PREOPEN_ENABLED");
+        }
+    }
+
+    @Test
+    void takeoverEvictionStillBroadcastsWhileTheAvroBarrierIsRecovering() throws Exception {
+        // Round-3 finding 1: the caught-up flags are NOT monotonic — markCacheRecovering flips
+        // one back to false. A terminal transition during that interval must still reach clients
+        // that already hold the value, or they keep a frozen projection forever.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        List<String> sink = servingServiceWithFrozenProjection(service, fence, boundary - 30_000L);
+        service.sweepIbkrPreOpenGexWindows(boundary + 1_000L); // watermark snapshot
+        markRecovering(service, "avroCaughtUp");
+        // The strike's first newly-ingested Databento record arrives mid-recovery.
+        assertFalse(interceptSharedGex(service, gexRecord(102L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 2_000L), databentoGexJson(), false, boundary + 2_000L));
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(sink.stream().anyMatch(m -> m.contains("TAKEOVER")),
+                "takeover eviction lost during avro recovery: " + sink);
+    }
+
+    @Test
+    void revocationEvictionStillBroadcastsWhileTheStateBarrierIsRecovering() throws Exception {
+        // Round-3 finding 1, revocation flavor, with the STATE barrier recovering.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 60_000L;
+        List<String> sink = servingServiceWithFrozenProjection(service, fence, now);
+        markRecovering(service, "stateCaughtUp");
+        seedIbkrStatus(service, "__revocation|2026-08-04|3", 9L, "{\"revoked\":true}");
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(sink.stream().anyMatch(m -> m.contains("REVOKED")),
+                "revocation eviction lost during state recovery: " + sink);
+    }
+
+    @Test
+    void windowDestructionStillBroadcastsWhileABarrierIsRecovering() throws Exception {
+        // Round-3 finding 1, 09:35 destruction flavor.
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        long fence = now - 60_000L;
+        List<String> sink = servingServiceWithFrozenProjection(service, fence, now);
+        markRecovering(service, "stateCaughtUp");
+        service.sweepIbkrPreOpenGexWindows(fence + 10 * 60_000L + 1L);
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(sink.stream().anyMatch(m -> m.contains("WINDOW_END")),
+                "09:35 destruction lost during recovery: " + sink);
+    }
+
+    @Test
+    void aPostFenceGenerationMustNotDestroyTheProvenPreFenceProjection() throws Exception {
+        // Round-4 finding 1: consumer loops process a whole BATCH before sweeping, so an unproven
+        // gen-4 record — one committed AT its own fence, which the capture branch will refuse —
+        // can arrive while gen-3 is still a valid paired live candidate. Generation supersession
+        // evicts every lower-generation candidate, so evicting on that unproven record destroyed
+        // gen-3's projection and then refused to capture gen-4: the window lost both.
+        long now = System.currentTimeMillis();
+        long fence = now + 60_000L;                    // fence ahead: gen-3 is provable
+        FeedGatewayService service = service();
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+        seedIbkrStatus(service, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        String gen3 = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertNotNull(ingestIbkrGex(service, gexRecord(10L, "SPX|20260804|6300", gen3, now - 5_000L),
+                gen3, now), "gen-3 is pre-fence and paired — it must be admitted");
+        assertEquals(1, planeMap(service, "ibkrPreOpenGexCandidates").size());
+
+        // An unproven gen-4 for ANOTHER strike, committed AT its fence.
+        String gen4 = ibkrGexJson(IBKR_SESSION, 4, 3, 1, fence).replace("6300.0", "6305.0");
+        ingestIbkrGex(service, gexRecord(11L, "SPX|20260804|6305", gen4, fence), gen4, now);
+
+        Map<String, Object> candidates = planeMap(service, "ibkrPreOpenGexCandidates");
+        assertTrue(candidates.containsKey(gexIdentity(service, "SPX|20260804|6300")),
+                "the proven gen-3 candidate must SURVIVE an unproven higher generation");
+        assertEquals(3L, candidateComponent(
+                candidates.get(gexIdentity(service, "SPX|20260804|6300")), "outputGeneration"));
+    }
+
+    @Test
+    void arbitrationIsScopedToTheSharedLiveTopicOnly() throws Exception {
+        // Round-5 finding 4: the (DATABENTO, gex-by-strike) binding also carries the separate JSON
+        // history topic. Arbitrating there would drop session-claiming records out of a
+        // pre-existing Databento pipeline this feature must leave untouched, so BOTH consumer call
+        // sites gate on the record's topic. Asserted on the source, because the guard lives at the
+        // call sites rather than inside the interceptor.
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of(
+                "src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int guards = source.split("settings\\.databentoGexTopic\\(\\)\\.equals\\(record\\.topic\\(\\)\\)", -1).length - 1;
+        assertEquals(2, guards,
+                "both interceptSharedGexRecord call sites must require the shared LIVE topic");
+        for (String callSite : source.split("interceptSharedGexRecord\\(record")) {
+            // every call site's guard block must mention the topic check before it
+            if (!callSite.endsWith("(")) {
+                continue;
+            }
+        }
+        // The history topic really is bound to the same (source, event) pair — which is why the
+        // guard is needed at all.
+        assertTrue(source.contains("topicEvents.put(settings.databentoGexHistoryTopic(), "
+                        + "new TopicBinding(\"DATABENTO\", \"gex-by-strike\"))"),
+                "the history topic shares the binding this guard protects against");
+    }
+
+    @Test
+    void sessionIdAndKeyReconciliationAreExactNotMerelyWellShaped() throws Exception {
+        // Round-6 finding 4: text() trims before the regex, so a PADDED session id was accepted;
+        // the regex alone admits impossible dates like 2026-99-99; and key reconciliation compared
+        // only the first three components case-insensitively, so an over-long or mis-cased key
+        // passed. All four are the same contract: EXACT, or fail closed.
+        long now = System.currentTimeMillis();
+        long fence = now + 60_000L;
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+
+        // (a) padded session id
+        FeedGatewayService padded = service();
+        seedIbkrStatus(padded, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        String p = ibkrGexJson(" " + IBKR_SESSION + " ", 3, 2, 7, fence);
+        assertNull(ingestIbkrGex(padded, gexRecord(5L, "SPX|20260804|6300", p, now - 5_000L), p, now),
+                "a padded session id must not be trimmed into validity");
+
+        // (b) impossible calendar date
+        FeedGatewayService badDate = service();
+        seedIbkrStatus(badDate, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        String d = ibkrGexJson("IBKR_PREOPEN:2026-99-99", 3, 2, 7, fence);
+        assertNull(ingestIbkrGex(badDate, gexRecord(5L, "SPX|20260804|6300", d, now - 5_000L), d, now),
+                "the shape alone is not enough — the date must be real");
+
+        // (c) key with extra components
+        FeedGatewayService extra = service();
+        seedIbkrStatus(extra, "SPX|20260804|6300|X", 1L, now - 10_000L, status);
+        String j = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        assertNull(ingestIbkrGex(extra, gexRecord(5L, "SPX|20260804|6300|X", j, now - 5_000L), j, now),
+                "a key carrying extra components is not the canonical key");
+
+        // Control: the exact contract is still admitted.
+        FeedGatewayService ok = service();
+        seedIbkrStatus(ok, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        assertNotNull(ingestIbkrGex(ok, gexRecord(5L, "SPX|20260804|6300", j, now - 5_000L), j, now));
+    }
+
+    @Test
+    void aProcessCrossingTheBoundaryFencesEvenWithNoProjectionsYet() throws Exception {
+        // Round-6 finding 2: a process that started BEFORE 09:30 while cache reconstruction lagged
+        // met its first post-boundary Databento record with no state at all and returned early, so
+        // no watermark was taken. Reconstruction then saw a live-observed boundary with no
+        // watermark and admitted the projection, and the NEXT sweep snapshotted offsets that
+        // already included that takeover record — classifying it at/below its own watermark, so the
+        // projection survived to 09:35. The boundary must be fenced when it is crossed, not when a
+        // projection happens to exist.
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        FeedGatewayService service = service();
+        backdateProcessStart(service, now - 60 * 60_000L);   // live ACROSS the boundary
+
+        // The fence is KNOWN — a value named it — but nothing landed in any plane: this record is
+        // refused after the fence is observed (its key names another strike), which is exactly the
+        // pre-boundary-start shape where reconstruction has not produced state yet.
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        ingestIbkrGex(service, gexRecord(7L, "SPX|20260804|6305", json, fence - 5_000L),
+                json, boundary + 1_000L);
+        assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty()
+                        && planeMap(service, "ibkrPreOpenPendingProjections").isEmpty()
+                        && planeMap(service, "ibkrPreOpenGexCandidates").isEmpty(),
+                "test premise: the fence is observed but NO plane holds state");
+
+        // First post-boundary Databento record arrives.
+        String db = databentoGexJson();
+        interceptSharedGex(service, gexRecord(900L, "SPX|20260804|6300", db, boundary + 2_000L),
+                db, false, boundary + 2_000L);
+        assertNotNull(takeoverWatermark(service, fence),
+                "the boundary must be fenced when crossed, even with no projections yet");
+    }
+
+    @Test
+    void admissionIsFailClosedOnTheWholeContractNotJustTheTuple() throws Exception {
+        // Round-5 finding 3. A record can carry the exact source/timeframe pair and still be
+        // malformed, and every one of these must be refused rather than "helpfully" accepted.
+        ObjectMapper jackson = new ObjectMapper();
+
+        // (a) text() trims, so a PADDED tuple would otherwise read as exact.
+        assertEquals(FeedGatewayService.SharedGexClass.UNKNOWN_SESSIONED,
+                FeedGatewayService.classifySharedGexRecord(jackson.readTree(
+                        "{\"source\":\" IBKR \",\"timeframe\":\"IBKR_PREOPEN\",\"sessionId\":\""
+                                + IBKR_SESSION + "\"}")),
+                "a padded source must not be normalized into the exact tuple");
+        assertEquals(FeedGatewayService.SharedGexClass.UNKNOWN_SESSIONED,
+                FeedGatewayService.classifySharedGexRecord(jackson.readTree(
+                        "{\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN \",\"sessionId\":\""
+                                + IBKR_SESSION + "\"}")),
+                "a padded timeframe must not be normalized into the exact tuple");
+
+        long now = System.currentTimeMillis();
+        long fence = now + 60_000L;
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+
+        // (b) A session id outside the pinned IBKR_PREOPEN:<yyyy-MM-dd> shape.
+        FeedGatewayService badSession = service();
+        seedIbkrStatus(badSession, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        String malformed = ibkrGexJson("IBKR_PREOPEN:not-a-date", 3, 2, 7, fence);
+        assertNull(ingestIbkrGex(badSession, gexRecord(5L, "SPX|20260804|6300", malformed,
+                now - 5_000L), malformed, now));
+        assertTrue(planeMap(badSession, "ibkrPreOpenGexCandidates").isEmpty());
+
+        // (c) Zero/default ordering fields — R-WIRE.5 cannot order an unversioned record.
+        for (String unversioned : List.of(
+                ibkrGexJson(IBKR_SESSION, 0, 2, 7, fence),
+                ibkrGexJson(IBKR_SESSION, 3, 0, 7, fence),
+                ibkrGexJson(IBKR_SESSION, 3, 2, 0, fence))) {
+            FeedGatewayService svc = service();
+            seedIbkrStatus(svc, "SPX|20260804|6300", 1L, now - 10_000L, status);
+            assertNull(ingestIbkrGex(svc, gexRecord(5L, "SPX|20260804|6300", unversioned,
+                    now - 5_000L), unversioned, now), "unversioned record: " + unversioned);
+            assertTrue(planeMap(svc, "ibkrPreOpenGexCandidates").isEmpty());
+        }
+
+        // (d) The payload identity must agree with the Kafka key it was partitioned under.
+        FeedGatewayService mismatched = service();
+        seedIbkrStatus(mismatched, "SPX|20260804|6305", 1L, now - 10_000L, status);
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);   // payload says strike 6300
+        assertNull(ingestIbkrGex(mismatched, gexRecord(5L, "SPX|20260804|6305", json,
+                now - 5_000L), json, now),
+                "a record whose payload names another strike than its key must fail closed");
+        assertTrue(planeMap(mismatched, "ibkrPreOpenGexCandidates").isEmpty());
+
+        // Control: the fully-conforming record is still admitted.
+        FeedGatewayService ok = service();
+        seedIbkrStatus(ok, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        assertNotNull(ingestIbkrGex(ok, gexRecord(5L, "SPX|20260804|6300", json, now - 5_000L),
+                json, now));
+    }
+
+    @Test
+    void aGatewayThatRestartedAfterTheBoundaryNeverSynthesizesAWatermark() throws Exception {
+        // Round-5 finding 1: a watermark is a record of where THIS gateway stood on each partition
+        // when 09:30 passed. A gateway that started afterwards has no such record, and snapshotting
+        // now would capture offsets read AFTER the boundary — for a second strike that snapshot can
+        // contain a record already observed post-boundary, letting the first strike resurrect. The
+        // pinned recovery rule for that case is commit-time only, so no watermark may be created.
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        FeedGatewayService restarted = service();      // started AFTER the boundary — not backdated
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+        seedIbkrStatus(restarted, "SPX|20260804|6300", 1L, fence - 10_000L, status);
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        ingestIbkrGex(restarted, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, boundary + 1_000L);
+        sweepWindows(restarted, boundary + 2_000L);
+        assertNull(takeoverWatermark(restarted, fence),
+                "a restarted gateway must never synthesize a 09:30 watermark retrospectively");
+
+        // ...and its takeover judgment is commit-time only: a post-boundary commit takes over
+        // whatever its offset, because there is no position to compare against.
+        String identity = gexIdentity(restarted, "SPX|20260804|6300");
+        seedDatabentoObservation(restarted, identity, boundary + 1_000L, 0, 1L);
+        assertTrue(strikeTakenOver(restarted, identity, fence),
+                "commit-time-only recovery still honours a post-boundary takeover");
+
+        // A gateway that DID run through the boundary snapshots one, and uses both axes.
+        FeedGatewayService live = service();
+        backdateProcessStart(live, now - 60 * 60_000L);
+        seedIbkrStatus(live, "SPX|20260804|6300", 1L, fence - 10_000L, status);
+        ingestIbkrGex(live, gexRecord(7L, "SPX|20260804|6300", json, fence - 5_000L),
+                json, boundary + 1_000L);
+        sweepWindows(live, boundary + 2_000L);
+        assertNotNull(takeoverWatermark(live, fence),
+                "a gateway running through the boundary records where it stood");
+    }
+
+    @Test
+    void aPostBoundaryDatabentoRecordAtOrBelowTheWatermarkNeverTakesTheStrikeOver() throws Exception {
+        // Round-4 finding 3: the observation memory carried COMMIT TIME ALONE, so a record the
+        // immediate path correctly refused on the WATERMARK axis — committed after 09:30 but at or
+        // below the snapshotted high-watermark, i.e. a prior record — could still kill a later
+        // pending promotion or pre-fence reconstruction through that memory. Both axes must travel
+        // together, and the predicate must apply both.
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        FeedGatewayService service = service();
+        // This gateway was RUNNING when the 09:30 boundary passed: both takeover axes apply.
+        backdateProcessStart(service, now - 60 * 60_000L);
+        String identity = gexIdentity(service, "SPX|20260804|6300");
+        seedTakeoverWatermark(service, fence, 0, 500L);
+
+        // Post-boundary commit, but AT the watermark: a prior record.
+        seedDatabentoObservation(service, identity, boundary + 1_000L, 0, 500L);
+        assertFalse(strikeTakenOver(service, identity, fence),
+                "an at/below-watermark record is a PRIOR record — it must not tombstone the strike");
+
+        // Same commit time, BEYOND the watermark: the real takeover.
+        seedDatabentoObservation(service, identity, boundary + 1_000L, 0, 501L);
+        assertTrue(strikeTakenOver(service, identity, fence),
+                "beyond the watermark AND after the boundary is the takeover");
+
+        // ...and a pre-boundary commit is never a takeover whatever its offset.
+        FeedGatewayService early = service();
+        String id2 = gexIdentity(early, "SPX|20260804|6300");
+        seedTakeoverWatermark(early, fence, 0, 500L);
+        seedDatabentoObservation(early, id2, boundary - 1_000L, 0, 9_999L);
+        assertFalse(strikeTakenOver(early, id2, fence),
+                "committed before 09:30 is a bootstrap/compacted record, never a takeover");
+    }
+
+    @Test
+    void theDatabentoObservationIsPublishedBeforeTheTakeoverCheck() throws Exception {
+        // Round-4 finding 2: the check/evict ran BEFORE the memory was published, leaving a gap in
+        // which a concurrently rewinding cache consumer could reconstruct a projection that the
+        // eviction had already passed and the memory did not yet cover. Publishing first closes it:
+        // reconstruction either sees the observation, or completes before it and is caught by the
+        // eviction — never neither. Asserted on the source order, because the race itself is not
+        // deterministically reproducible in a unit test.
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of(
+                "src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int publish = source.indexOf("ibkrPreOpenDatabentoMaxCommitMs.merge(observed, incoming");
+        int check = source.indexOf("maybeEvictIbkrProjectionOnTakeover(record, root, nowMs);");
+        assertTrue(publish > 0 && check > 0, "both sites must exist");
+        assertTrue(publish < check,
+                "the observation must be published BEFORE the takeover check, or a concurrent "
+                        + "reconstruction can slip between them");
+    }
+
+    @Test
+    void freshRestartDatabentoObservedBeforeReconstructionNeverResurrectsTheStrike() throws Exception {
+        // Round-3 finding 2: on a fresh restart the live consumer starts at END while the cache
+        // consumer rewinds. A post-boundary Databento record observed BEFORE any frozen/pending
+        // state exists must still terminally take over the strike once reconstruction is
+        // attempted — in either reconstruction order.
+        long now = System.currentTimeMillis();
+        long fence = now - 6 * 60_000L;
+        long boundary = fence + 5 * 60_000L;
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, fence);
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + IBKR_SESSION
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+        // Order 1: status reconstructed first, then the value.
+        FeedGatewayService statusFirst = service();
+        assertFalse(interceptSharedGex(statusFirst, gexRecord(200L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 2_000L), databentoGexJson(), false, boundary + 2_000L));
+        seedIbkrStatus(statusFirst, "SPX|20260804|6300", 1L, fence - 10_000L, status);
+        assertNull(ingestIbkrGex(statusFirst, gexRecord(7L, "SPX|20260804|6300", json,
+                fence - 5_000L), json, boundary + 3_000L));
+        assertTrue(planeMap(statusFirst, "ibkrPreOpenFrozenProjections").isEmpty());
+        assertTrue(planeMap(statusFirst, "ibkrPreOpenPendingProjections").isEmpty());
+        assertEquals(1, planeMap(statusFirst, "ibkrPreOpenTakenOverStrikes").size(),
+                "the prior post-boundary observation must convert to a terminal tombstone");
+        // Order 2: value first (would otherwise stash pending), then the status.
+        FeedGatewayService valueFirst = service();
+        assertFalse(interceptSharedGex(valueFirst, gexRecord(200L, "SPX|20260804|6300",
+                databentoGexJson(), boundary + 2_000L), databentoGexJson(), false, boundary + 2_000L));
+        assertNull(ingestIbkrGex(valueFirst, gexRecord(7L, "SPX|20260804|6300", json,
+                fence - 5_000L), json, boundary + 3_000L));
+        assertTrue(planeMap(valueFirst, "ibkrPreOpenPendingProjections").isEmpty(),
+                "a taken-over strike must not even stash a pending pair");
+        seedIbkrStatus(valueFirst, "SPX|20260804|6300", 1L, fence - 10_000L, status);
+        assertTrue(planeMap(valueFirst, "ibkrPreOpenFrozenProjections").isEmpty());
+        // Negative control: a Databento record committed BEFORE the boundary (bootstrap/compacted
+        // prior record) must NOT poison the reconstruction.
+        FeedGatewayService priorRecord = service();
+        assertFalse(interceptSharedGex(priorRecord, gexRecord(200L, "SPX|20260804|6300",
+                databentoGexJson(), boundary - 10_000L), databentoGexJson(), false, boundary + 2_000L));
+        seedIbkrStatus(priorRecord, "SPX|20260804|6300", 1L, fence - 10_000L, status);
+        assertNotNull(ingestIbkrGex(priorRecord, gexRecord(7L, "SPX|20260804|6300", json,
+                fence - 5_000L), json, boundary + 3_000L));
+        assertEquals(1, planeMap(priorRecord, "ibkrPreOpenFrozenProjections").size());
+    }
+
+    @Test
+    void replayAppliesTheSharedTopicClassificationTupleMatrix() throws Exception {
+        // Round-3 finding 3: the historical-replay reader must share the cache/live readers'
+        // R-WIRE.1 classification. Matrix on the ONE chokepoint...
+        FeedGatewayService service = service();
+        long now = System.currentTimeMillis();
+        assertTrue(service.isSessionedSharedGexJson(ibkrGexJson(IBKR_SESSION, 3, 2, 7, now)),
+                "exact IBKR tuple is pre-open-plane only — never an ordinary replay row");
+        assertTrue(service.isSessionedSharedGexJson(
+                "{\"symbol\":\"SPX\",\"source\":\"PREOPEN\",\"timeframe\":\"PREOPEN\"}"),
+                "conflicting PREOPEN tuple fails closed in replay like the live reader");
+        assertTrue(service.isSessionedSharedGexJson(
+                "{\"symbol\":\"SPX\",\"source\":\"IBKR\",\"timeframe\":\"0DTE\",\"sessionId\":\"weird\"}"),
+                "unknown sessioned tuple fails closed in replay like the live reader");
+        assertFalse(service.isSessionedSharedGexJson(databentoGexJson()));
+        assertFalse(service.isSessionedSharedGexJson("not-json"));
+        assertFalse(service.isSessionedSharedGexJson(""));
+        assertFalse(service.isSessionedSharedGexJson(null));
+        // ...and the wiring: emitReplayRecord drops each sessioned class (counted) with the flag
+        // ON, and passes a genuine Databento record through to the ordinary path.
+        System.setProperty("GATEWAY_IBKR_PREOPEN_ENABLED", "true");
+        try {
+            FeedGatewayService wired = service();
+            Method emit = FeedGatewayService.class.getDeclaredMethod("emitReplayRecord",
+                    String.class, ReplayParams.class, app.feedgateway.mtsession.MarketDataSource.class,
+                    FeedGatewayService.MergeRecord.class, FeedGatewayService.ReplayHandle.class);
+            emit.setAccessible(true);
+            ReplayParams params = new ReplayParams("app:u1", "SPX", "20260804", 1_000L, 2_000L, 1000, null);
+            FeedGatewayService.ReplayHandle handle = new FeedGatewayService.ReplayHandle(1L);
+            java.util.function.BiFunction<String, Long, Object> emitRaw = (payload, offset) -> {
+                try {
+                    return emit.invoke(wired, "app:u1", params,
+                            app.feedgateway.mtsession.MarketDataSource.DATABENTO,
+                            new FeedGatewayService.MergeRecord(
+                                    new app.feedgateway.mtsession.gateway.ReplayChronology.Cursor(
+                                            now, new GatewaySettings().databentoGexTopic(), 0, offset),
+                                    "gex-by-strike", payload, false),
+                            handle);
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            };
+            assertEquals(Boolean.FALSE, emitRaw.apply(ibkrGexJson(IBKR_SESSION, 3, 2, 7, now), 1L));
+            assertEquals(1L, planeCounter(wired, "ibkrPreOpenGexDroppedSessioned"),
+                    "an exact IBKR tuple must be dropped (counted) by the replay reader");
+            assertEquals(Boolean.FALSE, emitRaw.apply(
+                    "{\"symbol\":\"SPX\",\"source\":\"PREOPEN\",\"timeframe\":\"PREOPEN\"}", 2L));
+            assertEquals(Boolean.FALSE, emitRaw.apply(
+                    "{\"symbol\":\"SPX\",\"source\":\"IBKR\",\"timeframe\":\"0DTE\",\"sessionId\":\"x\"}", 3L));
+            assertEquals(3L, planeCounter(wired, "ibkrPreOpenGexDroppedSessioned"));
+            // A genuine Databento record passes the classifier (whatever the downstream
+            // session-routing outcome, it is not a sessioned drop).
+            emitRaw.apply(databentoGexJson(), 4L);
+            assertEquals(3L, planeCounter(wired, "ibkrPreOpenGexDroppedSessioned"),
+                    "a Databento record must never count as a sessioned drop in replay");
+        } finally {
+            System.clearProperty("GATEWAY_IBKR_PREOPEN_ENABLED");
+        }
     }
 }
