@@ -101,6 +101,20 @@ class FeedGatewayPerSessionBroadcastTest {
     }
 
     @Test
+    void dropNowcastBroadcastsToEverySocketInPerSessionMode() throws Exception {
+        // drop-classifier SHADOW verdict: a GLOBAL advisory (identical for every user) —
+        // it MUST be in GLOBAL_BROADCAST_EVENTS or authenticated prod silently drops it
+        // (UI review r1 finding #1).
+        broadcast("drop-nowcast",
+                "{\"message_type\":\"NOWCAST\",\"mode\":\"SHADOW\","
+                + "\"drop_id\":\"ES-20260812-093500484-S31096-DN\",\"eval_index\":1,"
+                + "\"t_break_ms\":1786541700484,\"ref_level\":7774.0,"
+                + "\"ref_kind\":\"SWING_LOW\",\"category_k1\":\"LIQUIDITY_SWEEP\"}");
+        assertEquals(1, u1.size(), "drop-nowcast must reach every per-session socket");
+        assertEquals(1, u2.size(), "drop-nowcast must reach every per-session socket");
+    }
+
+    @Test
     void broadcastSuppressesMarketDataButAllowsGlobalLifecycleEvents() throws Exception {
         broadcast("snapshot", "{\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":7500}");
         assertTrue(u1.isEmpty(), "snapshot must not broadcast in per-session mode");
@@ -237,6 +251,10 @@ class FeedGatewayPerSessionBroadcastTest {
         // Discrete spread-skew transitions are a global one-shot alert (turn-alert sibling) — allowlisted
         // so they are not silently dropped in per-session mode; the SNAPSHOT stays routed market data.
         assertTrue(FeedGatewayService.isGlobalBroadcastEvent("spread-skew-event"));
+        // Server-rated Δ-flow acceleration: one chain-global frame per second from the web tier;
+        // without the allowlist entry, per-session (auth) mode drops every frame as non-routable —
+        // the exact defect that once silenced es-cvd.
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("delta-flow-accel"));
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("spread-skew"));
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("snapshot"));
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("pace"));

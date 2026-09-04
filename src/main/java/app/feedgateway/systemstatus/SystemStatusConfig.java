@@ -58,8 +58,14 @@ public class SystemStatusConfig {
         cfg.setInitializationFailTimeout(-1L);   // never validate at boot
         cfg.setAutoCommit(true);
         Properties dsProps = new Properties();
-        dsProps.setProperty("socketTimeout",
-                Integer.toString(settings.systemStatusQueryTimeoutSeconds() + 2));
+        // Backstop for a socket that never answers, sized off the WIDEST per-statement budget (the
+        // last-run section's) so it can never fire before the statement timeout it is backing up.
+        // Long arithmetic + clamp: an operator-supplied maximum plus a constant must not wrap negative.
+        long socketTimeout = Math.min(
+                (long) GatewaySettings.SYSTEM_STATUS_MAX_TIMEOUT_S + 2L,
+                Math.max((long) settings.systemStatusQueryTimeoutSeconds(),
+                         (long) settings.systemStatusSlowQueryTimeoutSeconds()) + 2L);
+        dsProps.setProperty("socketTimeout", Long.toString(socketTimeout));
         dsProps.setProperty("connectTimeout", "2");
         dsProps.setProperty("loginTimeout", "2");
         dsProps.setProperty("ApplicationName", "feed-gateway-system-status");

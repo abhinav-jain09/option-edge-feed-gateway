@@ -49,6 +49,10 @@ public enum EventType {
     // per-strike would deliver it only to sessions already watching the strike that just heated up,
     // which is precisely the session that does not need telling.
     GAMMA_MIGRATION(Scope.CONTRACT),
+    // Corridor gauge: one record per (symbol,expiry) describing the whole chain's corridor —
+    // walls, share, verdict — so it routes CONTRACT-scoped with NO strike filter, exactly like
+    // GAMMA_MIGRATION. SHADOW mode: the UI labels it unvalidated until its gate passes.
+    CORRIDOR_GAUGE(Scope.CONTRACT),
     // Max pain is a per-(symbol,expiry) aggregate (one value covers the whole chain), so it routes
     // CONTRACT-scoped by source|symbol|expiry with NO strike filter — every session on that chain receives it.
     MAX_PAIN(Scope.CONTRACT),

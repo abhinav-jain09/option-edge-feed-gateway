@@ -130,21 +130,28 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "spot-band", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "gex-oi-status",
             "strike-sr",
             "gex-magnet",
             "gamma-migration",
             "es-gex",
             "es-strike-intel",
+            // A replaceable 1 Hz current-state frame: behind a slow client only the newest verdict
+            // matters, and letting frames queue contributes to avoidable disconnects.
+            "delta-flow-accel",
             "gex-strike-lifecycle",
             "max-pain",
             "liquidity-heatmap",
             "option-price-behavior",
             "dealer-ledger",
+            "corridor-gauge",
             "zero-dte-intelligence",
             "greek-move-auth",
             "spot-vol-regime",
+            "vol-premium-ivrv",
+            "indicators",
+            "tapeZones",
             "opb-by-option", "opb-session",
             "index-price", "vix-price", "spx-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
             "hpsf-audit", "hpsf-exit-intent");
@@ -179,6 +186,21 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> paceRanks = new ConcurrentHashMap<>(); // board-level pace ranking, keyed by boardKey
     private final Map<String, String> directionalPressures = new ConcurrentHashMap<>();
     private final Map<String, String> strikeFlows = new ConcurrentHashMap<>();
+    // Per-strike premium binned by where spot stood. Modelled on strikeFlows (a plain in-memory
+    // map, not seller-activity's disk store) because a band matrix is a short sparse list, not a
+    // session history — but it follows seller-activity's OTHER rule: never broadcast one record at
+    // a time. ~200 strikes republished on change would fill the chain's outbound queue; it rides
+    // the ui-batch instead, exactly as strikeFlows does. That holds on EVERY route: the live
+    // consumer skips it (see the spot-band continue) and replayCachedToSocket does not replay it.
+    private final Map<String, String> spotBands = new ConcurrentHashMap<>();
+    // socketId -> the readiness key whose completed band board this socket has already been sent by a
+    // SWITCH-time replay. Readiness and the connect bracket both race to serve the same board; rather
+    // than reason about which iterator ordering wins, both go through it and the loser is a no-op.
+    // Connect and return-to-live replays are NOT deduplicated here — a reset owes a fresh board. That is
+    // also why a STALE claim cannot cost a socket its board: if an id were ever reused, the new
+    // connection still gets the full board from the connect replay, which never consults this ledger.
+    // Bounded by the live socket set on every switch (see replaySpotBandBatchAfterSourceSwitch).
+    private final Map<String, String> spotBandSwitchDelivered = new ConcurrentHashMap<>();
     private final SellerActivityDiskStore sellerActivityStore = new SellerActivityDiskStore();
     // Per-strike delta-flow snapshots, keyed by source|symbol|expiry|strike (last-value-wins per
     // strike). JSON on the wire (DeltaFlowStrikeSnapshot) — lives on the JSON-state consumer.
@@ -331,6 +353,22 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     private final Map<String, String> gammaMigration = new ConcurrentHashMap<>();
+    /** Corridor-gauge live state per symbol|expiry (JSON, last-value-wins). Standalone event. */
+    private final Map<String, String> corridorGauges = new ConcurrentHashMap<>();
+    /**
+     * Peak rotation windows and the raw move log, per chain. Same shape as gammaMigration.
+     *
+     * <p>REST-ONLY, deliberately: it is consumed by {@code GET /api/gamma-rotation} and nothing
+     * else. It is therefore consumed into this cache and evicted with it, but is NOT plumbed
+     * through the websocket paths — no EventType, no pending map, no per-session replay, no batch
+     * field. Half-wiring it there is worse than not wiring it: entries would be collected into a
+     * snapshot that has no field to carry them and silently dropped, and every one of those sites
+     * would then have to be kept in step for a delivery path with no subscriber. If a websocket
+     * consumer ever wants this, wire it in ONE change across all of those sites (Codex).
+     */
+    private final Map<String, String> gammaRotation = new ConcurrentHashMap<>();
+    /** Leader-fragility panel per chain (GMS-R14). REST-only, same contract as gammaRotation. */
+    private final Map<String, String> gammaFragility = new ConcurrentHashMap<>();
     // ES-on-SPX aligned whole-book per symbol|expiry (JSON, roll-forward: latest emitEventTimeMs wins).
     private final Map<String, String> esGex = new ConcurrentHashMap<>();
     // ES strike-intelligence projected onto SPX strikes, keyed by NATIVE ES identity (symbol|expiry|esStrike,
@@ -372,6 +410,118 @@ public class FeedGatewayService implements ReplayRunner {
     // pill simply vanishes. Same standalone/global/JSON pass-through delivery class as the
     // greek-move-auth sibling above; NOT in the ui-batch. Keyed by symbol.
     private final Map<String, String> spotVolRegime = new ConcurrentHashMap<>();
+    // Vol-premium IV-vs-realised reading: ONE current value per SYMBOL|sessionDate
+    // (last-value-wins) on the SHORT volPremiumIvrvTtlMs window, so a stale reading (dead producer,
+    // overnight leftover) is evicted rather than replayed as live — the chart simply has no current
+    // point. Same standalone/global/JSON pass-through class as the spot-vol-regime sibling above;
+    // NOT in the ui-batch.
+    private final Map<String, String> volPremiumIvrv = new ConcurrentHashMap<>();
+    // Indicator CURRENT snapshots: ONE per canonical symbol (ES|SPX), per-symbol
+    // cache + (runId, revision) supersession (rev 14 §6.9/§8): a new runId is
+    // accepted in arrival(=offset) order on the single-partition compacted topic and
+    // retires the prior; within a run, revisions must strictly increase; retired-run
+    // returns are rejected.
+    private final Map<String, String> indicatorsCurrent = new ConcurrentHashMap<>();
+    private final Map<String, String> indicatorsRunId = new ConcurrentHashMap<>();
+    private final Map<String, Long> indicatorsRevision = new ConcurrentHashMap<>();
+    /** r1 finding 7 / r2 finding 4: retirement memory is bounded at a cap no real
+     * deployment approaches (one retirement per producer restart; 4096 ≈ years of
+     * restarts within one gateway uptime), so eviction can never let a genuinely
+     * retired run re-enter in practice — while heap stays bounded (~400 KiB max). */
+    private static final int INDICATORS_RETIRED_RUNS_CAP = 4096;
+    private final java.util.Set<String> indicatorsRetiredRuns =
+            java.util.Collections.synchronizedSet(
+                    new java.util.LinkedHashSet<>());
+    /**
+     * r1 finding 3: serializes the live (cache-update → broadcast-enqueue) pair
+     * against the connect/caught-up replay's (cache-read → session-send) pair, so a
+     * replay-captured older revision can never be enqueued AFTER a newer live frame
+     * (coalescing keeps the LAST enqueue).
+     */
+    private final Object indicatorsEmitLock = new Object();
+    /**
+     * Same role as {@link #indicatorsEmitLock} and for the same two races. The cache and live
+     * consumers read the SAME single partition, and the contract permits an equal-event-time
+     * correction at a later offset — so without one lock spanning (cache update -> broadcast) and
+     * (cache read -> replay enqueue), a superseded offset can win the broadcast, or a replay can
+     * enqueue an older frame over a newer one already queued under the same coalescing key.
+     */
+    private final Object volPremiumIvrvEmitLock = new Object();
+    private final Map<String, java.util.concurrent.atomic.AtomicLong> volPremiumIvrvBroadcastOffset
+            = new ConcurrentHashMap<>();
+    /**
+     * Times a vol-premium record arrived behind the stored offset while carrying a strictly newer
+     * event time — the signature of a recreated topic, which no incarnation of this one can
+     * otherwise produce. Counted because it is a recovery, and a recovery nobody can see is
+     * indistinguishable from the outage it fixed.
+     */
+    static final java.util.concurrent.atomic.AtomicLong VOL_PREMIUM_TOPIC_RESETS =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** r2 finding 1: exactly-one in-order live delivery per offset across BOTH
+     * ingesting consumers — whichever reaches an offset first broadcasts it. */
+    private final Map<String, java.util.concurrent.atomic.AtomicLong>
+            indicatorsBroadcastOffset = new ConcurrentHashMap<>();
+
+    /** Exactly-one, in-order live delivery per offset — the single-partition contract. */
+    boolean shouldBroadcastVolPremiumIvrv(String cacheKey, long offset) {
+        var gate = volPremiumIvrvBroadcastOffset.computeIfAbsent(cacheKey,
+                k -> new java.util.concurrent.atomic.AtomicLong(-1L));
+        while (true) {
+            long current = gate.get();
+            if (offset <= current) {
+                return false;
+            }
+            if (gate.compareAndSet(current, offset)) {
+                return true;
+            }
+        }
+    }
+
+    boolean shouldBroadcastIndicators(String cacheKey, long offset) {
+        var gate = indicatorsBroadcastOffset.computeIfAbsent(cacheKey,
+                k -> new java.util.concurrent.atomic.AtomicLong(-1L));
+        while (true) {
+            long current = gate.get();
+            if (offset <= current) {
+                return false;
+            }
+            if (gate.compareAndSet(current, offset)) {
+                return true;
+            }
+        }
+    }
+    // Tape-zones CURRENT board (TAPE-ZONES-REQUIREMENT §6.2, UI design §3): the standalone
+    // service's whole-session snapshot on a compacted 1-partition topic keyed ES|sessionDate.
+    // The producer value is the SSOT and rides byte-untouched — the gateway performs NO
+    // computation or reshaping; every field the card needs (cells, merged zones, aggregates,
+    // quality banner, terminalFlushed) is already on it. Same standalone/global/JSON
+    // pass-through delivery class as spot-vol-regime/indicators; NOT in the ui-batch.
+    // Keyed by source|sessionDate; the parallel map holds (offset, kafkaRecordTimeMs) so the
+    // emitted wire form can carry the board's own age without mutating the payload.
+    private final Map<String, String> tapeZonesBoards = new ConcurrentHashMap<>();
+    private final Map<String, long[]> tapeZonesPositions = new ConcurrentHashMap<>();
+    /** Exactly-one, in-order live delivery per offset — single-partition contract (§6.2). */
+    private final java.util.concurrent.atomic.AtomicLong tapeZonesBroadcastOffset =
+            new java.util.concurrent.atomic.AtomicLong(-1L);
+    /**
+     * Serializes the live (cache-update → broadcast-enqueue) pair against the replay's
+     * (cache-read → session-send) pair, so a replay-captured older board can never be enqueued
+     * AFTER a newer live frame (coalescing keeps the LAST enqueue). Same seam as
+     * {@code indicatorsEmitLock}.
+     */
+    private final Object tapeZonesEmitLock = new Object();
+
+    boolean shouldBroadcastTapeZones(long offset) {
+        while (true) {
+            long current = tapeZonesBroadcastOffset.get();
+            if (offset <= current) {
+                return false;
+            }
+            if (tapeZonesBroadcastOffset.compareAndSet(current, offset)) {
+                return true;
+            }
+        }
+    }
     // SPX close-direction (design CLOSE-DIRECTION-GATE1 §8/CD-R30): ONE topic, two cache classes.
     // VERDICTS (key V|sessionDate) are once-a-session frozen decisions on the LONG
     // closeDirectionTtlMs window; INTERIMS (key I|sessionDate) are 1/min monitoring reads whose
@@ -409,6 +559,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> pendingPaceRanks = new LinkedHashMap<>();
     private final Map<String, String> pendingDirectionalPressures = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeFlows = new LinkedHashMap<>();
+    private final Map<String, String> pendingSpotBands = new LinkedHashMap<>();
     private final Map<String, String> pendingSellerActivities = new LinkedHashMap<>();
     private final Map<String, String> pendingDeltaFlows = new LinkedHashMap<>();
     private final Map<String, String> pendingStrikeIntels = new LinkedHashMap<>();
@@ -450,6 +601,22 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong batchesSent = new AtomicLong();
     private final AtomicLong consumerRestarts = new AtomicLong();
     private final AtomicLong forwardedEvents = new AtomicLong();
+    /** drop-nowcast values dropped at the parse gate (review finding #4). */
+    private final AtomicLong dropNowcastMalformed = new AtomicLong();
+    /** U16: latest ACCEPTED es-cvd-spx-levels record (verbatim), replayed on connect; null = none. */
+    private final java.util.concurrent.atomic.AtomicReference<String> cvdSpxLevelsLatest =
+            new java.util.concurrent.atomic.AtomicReference<>();
+    /** U16: es-cvd-spx-levels records rejected at the boundary (invalid, oversize, tombstone). */
+    private final AtomicLong cvdSpxLevelsDrops = new AtomicLong();
+    /** U16: records refused because their provenance REGRESSED against what is retained (CL-R7 V1). */
+    private final AtomicLong cvdSpxLevelsRegressions = new AtomicLong();
+    /** U16 retention baseline: the provenance of the retained record; guarded by the retain lock. */
+    private CvdSpxLevelsProvenance cvdSpxLevelsProvenance;
+    /** U16: the end offset hydration read to, handed to the live consumer once; -1 = none. */
+    private final AtomicLong cvdSpxLevelsHandoffOffset = new AtomicLong(-1L);
+    /** U16: the next offset to read on this partition, so a consumer RETRY resumes instead of
+     *  replaying history (a historical tombstone or reset must never be re-applied as new). */
+    private final AtomicLong cvdSpxLevelsNextOffset = new AtomicLong(-1L);
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -457,11 +624,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong sourceStaleEvents = new AtomicLong();
     private final AtomicLong lastSourceStaleBroadcastMs = new AtomicLong();
     private final AtomicLong lastLagCheckMs = new AtomicLong();
-    /** Optional topics currently absent from metadata — shared across consumer threads, so log-once. */
-    private final Set<String> absentOptionalTopics = ConcurrentHashMap.newKeySet();
-    /** Rotates which absent optional topic gets probed first, so none is permanently starved. */
-    private final java.util.concurrent.atomic.AtomicInteger unknownProbeRotation =
-            new java.util.concurrent.atomic.AtomicInteger();
+    /** Topics currently absent from metadata — shared across consumer threads, so log-once per name|topic. */
+    private final Set<String> absentTopics = ConcurrentHashMap.newKeySet();
     /**
      * Partitions discovered mid-run that are still replaying their cache rebuild, published at SERVICE
      * scope because two independent threads need them: the owning cache consumer (to keep them out of the
@@ -501,6 +665,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong droppedByCacheGate = new AtomicLong();         // records dropped because cacheCaughtUpFlag was false
     private final AtomicLong droppedByOtherReasons = new AtomicLong();      // caught-up + non-forwardable (source/symbol/expiry mismatch, etc.)
     private final AtomicLong strikeBandsRejected = new AtomicLong();        // spot-vol-regime strikeBand blocks refused by sanitizeStrikeBand
+    private final AtomicLong tapeZonesRejected = new AtomicLong();          // tape-zones boards refused by the fail-closed identity contract
     private final AtomicBoolean strikeBandRejectionLogged = new AtomicBoolean(false); // log the first rejection only; the rest are counted
     private final AtomicLong rolloverCount = new AtomicLong();              // number of session-boundary rollovers observed
     private final AtomicLong forwardStalledAlerts = new AtomicLong();       // number of GATEWAY_FORWARD_STALLED_DURING_MARKET_HOURS emissions
@@ -597,6 +762,15 @@ public class FeedGatewayService implements ReplayRunner {
             thread.setDaemon(true);
             return thread;
         });
+        // U16 (CL-R8/G19): HYDRATE the retained levels record BEFORE anything else starts — this
+        // is a barrier, not a background task. Submitting it to the executor would return from
+        // start() immediately, so a client connecting in the next second still got levels:null,
+        // and worse, a live tombstone could clear retention only for the late hydration to
+        // resurrect the withdrawn record. Running it here means the live consumer begins with the
+        // baseline already in place, and every ordering after that is the live one's.
+        if (settings.esCvdSpxLevelsEnabled()) {
+            hydrateCvdSpxLevels();
+        }
         executor.submit(this::runSelectionConsumer);
         executor.submit(this::runAvroLiveConsumer);
         executor.submit(this::runJsonStateLiveConsumer);
@@ -718,16 +892,41 @@ public class FeedGatewayService implements ReplayRunner {
         clients.add(session);
         clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
+        if (settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled()) {
+            // R46 hello: the per-timeframe high-water marks of the bar view, so the page can bound
+            // its REST backfill to exactly what this gateway holds and buffer WS bars past it.
+            // U16 (CL-R8/G19): the latest ACCEPTED levels record rides INSIDE this same hello, so
+            // "hello carried no levels record" (levels: null) is distinguishable from "replay still
+            // pending" — the page needs that distinction to choose `no_data` over staying blank.
+            send(session, "cvd-hello", cvdHelloJson());
+        }
         // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
         // each socket gets only the cached state matching its own AppSession selection (no cross-
         // contract leak), then live routed data (FR-11).
         if (perSessionRouting()) {
+            // A socket that connects BETWEEN a source switch and its readiness can be served a cache that
+            // is still filling, and the readiness replay iterates `clients` weakly — if its iterator was
+            // snapshotted before this session was registered, no later attempt repairs it, because
+            // readiness is one-shot per selection key. Bracket the replay with the key: if readiness
+            // committed while we were replaying, take the completed band board ourselves.
+            String keyBeforeReplay = readySelectionKey.get();
             replayCachedToSocket(session);
+            if (!java.util.Objects.equals(keyBeforeReplay, readySelectionKey.get())) {
+                replaySpotBandBatchOncePerReadiness(session);
+            }
             // short-premium is a GLOBAL advisory (symbol-filtered client-side), not per-session
             // routed — replayCacheMap can't deliver it (no GatewayRecordMapper case), so replay it
             // the same standalone way legacy mode does, so an auth-mode reload restores the overlay.
             replayShortPremiumCached(session);
+            // corridor-gauge standalone replay: a reload mid-session restores the strip instantly
+            replayCorridorGaugeCached(session);
             replayZeroDteIntelligenceCached(session);
+            // Indicators are the same GLOBAL advisory class (symbol-filtered
+            // client-side) — the production auth mode owes the connect replay too
+            // (r1 finding 5).
+            replayIndicatorsCached(session);
+            // Tape-zones board is the same GLOBAL advisory class — auth mode owes it too.
+            replayTapeZonesCached(session);
             return;
         }
         if (avroCaughtUp.get()) {
@@ -735,7 +934,7 @@ public class FeedGatewayService implements ReplayRunner {
             sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gamma-migration", "gex-strike-lifecycle"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
+            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "spot-band", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
             replayOptionTruthCachedLegacy(session);
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
@@ -756,6 +955,9 @@ public class FeedGatewayService implements ReplayRunner {
             // track rather than waiting for the next live verdict.
             replayGreekMoveAuthCached(session);
             replaySpotVolRegimeCached(session);
+            replayVolPremiumIvrvCached(session);
+            replayIndicatorsCached(session);
+            replayTapeZonesCached(session);
             replayIbkrPreOpenCached(session);
             // Close-direction: replay the session's frozen verdict (or the current interim) so a page
             // reload in the final hour restores the card instead of waiting for the next minute tick.
@@ -796,6 +998,7 @@ public class FeedGatewayService implements ReplayRunner {
     public void removeClient(WebSocketSession session) {
         String id = session.getId();
         OutboundChannel channel = outbound.remove(id);
+        spotBandSwitchDelivered.remove(id);
         WebSocketSession stored = clientsById.remove(id);
         if (stored != null) {
             clients.remove(stored);
@@ -1108,6 +1311,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"paceRanks\":" + paceRanks.size() + ","
                 + "\"directionalPressures\":" + directionalPressures.size() + ","
                 + "\"strikeFlows\":" + strikeFlows.size() + ","
+                + "\"spotBands\":" + spotBands.size() + ","
                 + "\"deltaFlows\":" + deltaFlows.size() + ","
                 + "\"strikeIntels\":" + strikeIntels.size() + ","
                 + "\"optionTruths\":" + optionTruths.size() + ","
@@ -1155,6 +1359,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"coalescedUpdates\":" + coalescedUpdates.get() + ","
                 + "\"batchesSent\":" + batchesSent.get() + ","
                 + "\"forwardedEvents\":" + forwardedEvents.get() + ","
+                + "\"dropNowcastMalformed\":" + dropNowcastMalformed.get() + ","
                 + "\"inactiveDroppedEvents\":" + inactiveDroppedEvents.get() + ","
                 + "\"droppedNonRoutableEvents\":" + droppedNonRoutableEvents.get() + ","
                 + "\"staleDroppedEvents\":" + staleDroppedEvents.get() + ","
@@ -1204,6 +1409,23 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_gateway_ws_dropped_on_close_total Queued messages discarded when a slow client was dropped.\n"
                 + "# TYPE options_edge_gateway_ws_dropped_on_close_total counter\n"
                 + "options_edge_gateway_ws_dropped_on_close_total " + wsDroppedOnClose.get() + "\n"
+                + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
+                + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
+                + "gateway_cvd_spx_levels_enabled " + boolMetric(settings.esCvdSpxLevelsEnabled()) + "\n"
+                + "# HELP gateway_cvd_spx_levels_drops_total es-cvd-spx-levels records dropped at the gateway boundary (invalid, oversize, tombstone).\n"
+                + "# TYPE gateway_cvd_spx_levels_drops_total counter\n"
+                + "gateway_cvd_spx_levels_drops_total " + cvdSpxLevelsDrops.get() + "\n"
+                + "# HELP gateway_cvd_spx_levels_position_regressions_total es-cvd-spx-levels records refused because their fold provenance regressed.\n"
+                + "# TYPE gateway_cvd_spx_levels_position_regressions_total counter\n"
+                + "gateway_cvd_spx_levels_position_regressions_total " + cvdSpxLevelsRegressions.get() + "\n"
+                + "# HELP gateway_vol_premium_topic_resets_total vol-premium-ivrv records admitted as a "
+                + "recreated topic: behind the cached offset AND strictly newer, which no incarnation "
+                + "of that topic can otherwise produce. Each one is a recovery from a reset that "
+                + "would otherwise have frozen the card for the rest of the session; a rising count "
+                + "with no operator action behind it means the detector is firing on something "
+                + "else.\n"
+                + "# TYPE gateway_vol_premium_topic_resets_total counter\n"
+                + "gateway_vol_premium_topic_resets_total " + VOL_PREMIUM_TOPIC_RESETS.get() + "\n"
                 + "# HELP options_edge_feed_gateway_snapshots Cached option snapshot count.\n"
                 + "# TYPE options_edge_feed_gateway_snapshots gauge\n"
                 + "options_edge_feed_gateway_snapshots " + snapshots.size() + "\n"
@@ -1219,6 +1441,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_strike_flows Cached strike-flow count.\n"
                 + "# TYPE options_edge_feed_gateway_strike_flows gauge\n"
                 + "options_edge_feed_gateway_strike_flows " + strikeFlows.size() + "\n"
+                + "# HELP options_edge_feed_gateway_spot_bands Cached per-strike spot-band matrices.\n"
+                + "# TYPE options_edge_feed_gateway_spot_bands gauge\n"
+                + "options_edge_feed_gateway_spot_bands " + spotBands.size() + "\n"
                 + "# HELP options_edge_feed_gateway_delta_flows Cached delta-flow count.\n"
                 + "# TYPE options_edge_feed_gateway_delta_flows gauge\n"
                 + "options_edge_feed_gateway_delta_flows " + deltaFlows.size() + "\n"
@@ -1261,6 +1486,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_gex_magnet Cached per-(symbol,expiry) gex-magnet count.\n"
                 + "# TYPE options_edge_feed_gateway_gex_magnet gauge\n"
                 + "options_edge_feed_gateway_gex_magnet " + gexMagnet.size() + "\n"
+                + "# HELP options_edge_feed_gateway_corridor_gauges Cached corridor-gauge chain count.\n"
+                + "# TYPE options_edge_feed_gateway_corridor_gauges gauge\n"
+                + "options_edge_feed_gateway_corridor_gauges " + corridorGauges.size() + "\n"
                 + (settings.esGexEnabled()
                         ? "# HELP options_edge_feed_gateway_es_gex Cached per-(symbol,expiry) ES-on-SPX aligned book count.\n"
                           + "# TYPE options_edge_feed_gateway_es_gex gauge\n"
@@ -1343,6 +1571,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_gateway_forwarded_total Selected-source records forwarded to browsers.\n"
                 + "# TYPE options_edge_gateway_forwarded_total counter\n"
                 + "options_edge_gateway_forwarded_total " + forwardedEvents.get() + "\n"
+                + "# HELP options_edge_gateway_drop_nowcast_malformed_total Malformed drop-nowcast records dropped before broadcast.\n"
+                + "# TYPE options_edge_gateway_drop_nowcast_malformed_total counter\n"
+                + "options_edge_gateway_drop_nowcast_malformed_total " + dropNowcastMalformed.get() + "\n"
                 + "# HELP options_edge_gateway_inactive_dropped_total Inactive-source records consumed but not forwarded.\n"
                 + "# TYPE options_edge_gateway_inactive_dropped_total counter\n"
                 + "options_edge_gateway_inactive_dropped_total " + inactiveDroppedEvents.get() + "\n"
@@ -1499,6 +1730,8 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
+        topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
+        topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
@@ -1531,6 +1764,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
+        topicEvents.put(settings.databentoSpotBandTopic(), new TopicBinding("DATABENTO", "spot-band"));
         if (settings.esGexEnabled()) {
             topicEvents.put(settings.esGexSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-gex"));
         }
@@ -1540,6 +1774,9 @@ public class FeedGatewayService implements ReplayRunner {
         // delta-flow-by-strike is plain JSON (DeltaFlowStrikeSnapshot), per-strike keyed
         // (symbol|date|expiry|strike) — this JSON-state consumer, never the Avro one.
         topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
+        // Server-rated Δ-flow acceleration verdicts: one JSON frame per second from the web tier,
+        // chain-global for the active symbol — standalone broadcast, same delivery class as es-cvd.
+        topicEvents.put(settings.deltaFlowAccelTopic(), new TopicBinding("DATABENTO", "delta-flow-accel"));
         // strike-intelligence-by-strike is plain JSON (StrikeIntelligenceSignal), per-strike keyed
         // (symbol|expiry|strike) — this JSON-state consumer, never the Avro one (mirrors delta-flow).
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
@@ -1561,6 +1798,8 @@ public class FeedGatewayService implements ReplayRunner {
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
         topicEvents.put(settings.dealerLedgerStateTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
+        // corridor-gauge live state: JSON per symbol|expiry, standalone delivery like dealer-ledger
+        topicEvents.put(settings.corridorGaugeTopic(), new TopicBinding("DATABENTO", "corridor-gauge"));
         // Liquidity-heatmap frames are JSON (StrikeLiquidityHeatmapFrame) — this string consumer,
         // never the Avro one (the Avro-read-as-JSON bug class).
         topicEvents.put(settings.strikeLiquidityTopic(), new TopicBinding("DATABENTO", "liquidity-heatmap"));
@@ -1571,6 +1810,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.spreadSkewTopic(), new TopicBinding("DATABENTO", "spread-skew"));
         // spread-skew.events: discrete FIRE/EXIT/REVERSAL/RESTART transitions, broadcast STANDALONE (never cached).
         topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding("DATABENTO", "spread-skew-event"));
+        // drop-classifier SHADOW nowcast: discrete k=1 verdicts + refinements, broadcast STANDALONE
+        // (never cached) — the spread-skew-event sibling. Advisory-only (SHADOW).
+        topicEvents.put(settings.dropNowcastTopic(), new TopicBinding("DATABENTO", "drop-nowcast"));
         topicEvents.put(settings.optionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
         topicEvents.put(settings.optionPriceBehaviorByOptionTopic(), new TopicBinding("DATABENTO", "opb-by-option"));
         topicEvents.put(settings.optionPriceBehaviorSessionTopic(), new TopicBinding("DATABENTO", "opb-session"));
@@ -1590,6 +1832,17 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
+        // Vol-premium IV/RV rides the same optional/standalone JSON class as spot-vol-regime.
+        topicEvents.put(settings.volPremiumIvrvTopic(), new TopicBinding("DATABENTO", "vol-premium-ivrv"));
+        // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
+        // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
+        for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
+            topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
+        }
+        // Tape-zones CURRENT board (plain JSON, key ES|sessionDate): standalone global advisory on
+        // the SHORT tapeZonesTtlMs window, OPTIONAL topic — absent on dev/prod until the MM1 mirror
+        // is installed and on es4 until the service first produces (§6.2).
+        topicEvents.put(settings.tapeZonesBoardTopic(), new TopicBinding("DATABENTO", "tapeZones"));
         // SPX close-direction interims + frozen verdict (JSON, key = symbol|expiry): standalone global
         // advisory, OPTIONAL topic — LONG closeDirectionTtlMs window (verdict class) bounds the seek-back;
         // interim replay freshness is separately bounded (closeDirectionInterimFreshMs).
@@ -1597,6 +1850,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.esAggressorFlowEnabled()) {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
+        addEsCvdTopics(topicEvents);
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
@@ -1619,6 +1873,8 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
+        topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
+        topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
@@ -1648,6 +1904,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
+        topicEvents.put(settings.databentoSpotBandTopic(), new TopicBinding("DATABENTO", "spot-band"));
         if (settings.esGexEnabled()) {
             topicEvents.put(settings.esGexSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-gex"));
         }
@@ -1657,6 +1914,8 @@ public class FeedGatewayService implements ReplayRunner {
         // delta-flow-by-strike is plain JSON, per-strike keyed — keep the cache + live JSON consumer
         // topic sets symmetric (same rule as gex-history/strike-flow above).
         topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
+        // Δ-flow acceleration — cache/live symmetry, same rule as delta-flow above.
+        topicEvents.put(settings.deltaFlowAccelTopic(), new TopicBinding("DATABENTO", "delta-flow-accel"));
         // strike-intelligence-by-strike is plain JSON, per-strike keyed — keep the cache + live JSON
         // consumer topic sets symmetric (same rule as delta-flow above).
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
@@ -1674,6 +1933,8 @@ public class FeedGatewayService implements ReplayRunner {
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
         topicEvents.put(settings.dealerLedgerStateTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
+        // corridor-gauge live state: JSON per symbol|expiry, standalone delivery like dealer-ledger
+        topicEvents.put(settings.corridorGaugeTopic(), new TopicBinding("DATABENTO", "corridor-gauge"));
         // Keep the cache + live JSON consumer topic sets symmetric (same rule as gex-history).
         topicEvents.put(settings.strikeLiquidityTopic(), new TopicBinding("DATABENTO", "liquidity-heatmap"));
         topicEvents.put(settings.databentoPaceMissionTopic(), new TopicBinding("DATABENTO", "mission-pace"));
@@ -1683,6 +1944,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.spreadSkewTopic(), new TopicBinding("DATABENTO", "spread-skew"));
         // spread-skew.events: discrete FIRE/EXIT/REVERSAL/RESTART transitions, broadcast STANDALONE (never cached).
         topicEvents.put(settings.spreadSkewEventsTopic(), new TopicBinding("DATABENTO", "spread-skew-event"));
+        // drop-classifier SHADOW nowcast: discrete k=1 verdicts + refinements, broadcast STANDALONE
+        // (never cached) — the spread-skew-event sibling. Advisory-only (SHADOW).
+        topicEvents.put(settings.dropNowcastTopic(), new TopicBinding("DATABENTO", "drop-nowcast"));
         topicEvents.put(settings.optionPriceBehaviorDashboardTopic(), new TopicBinding("DATABENTO", "option-price-behavior"));
         topicEvents.put(settings.optionPriceBehaviorByOptionTopic(), new TopicBinding("DATABENTO", "opb-by-option"));
         topicEvents.put(settings.optionPriceBehaviorSessionTopic(), new TopicBinding("DATABENTO", "opb-session"));
@@ -1698,14 +1962,40 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
+        // Vol-premium IV/RV rides the same optional/standalone JSON class as spot-vol-regime.
+        topicEvents.put(settings.volPremiumIvrvTopic(), new TopicBinding("DATABENTO", "vol-premium-ivrv"));
+        // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
+        // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
+        for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
+            topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
+        }
+        // Tape-zones CURRENT board (plain JSON, key ES|sessionDate): standalone global advisory on
+        // the SHORT tapeZonesTtlMs window, OPTIONAL topic — absent on dev/prod until the MM1 mirror
+        // is installed and on es4 until the service first produces (§6.2).
+        topicEvents.put(settings.tapeZonesBoardTopic(), new TopicBinding("DATABENTO", "tapeZones"));
         // Keep the cache + live JSON consumer topic sets symmetric: the SPX close-direction signal
         // (JSON, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
         if (settings.esAggressorFlowEnabled()) {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
+        addEsCvdTopics(topicEvents);
+        if (settings.esCvdSpxLevelsEnabled()) {
+            // U16: SPX-translated CVD structure levels (compacted single-partition heartbeat,
+            // >=1 record per ALIGN_HEARTBEAT while the aligner runs) — LIVE consumer only. The
+            // cache consumer is deliberately NOT subscribed: updateCache has no case for it, and
+            // this event keeps its own latest-record retention for the connect replay.
+            topicEvents.put(settings.esCvdSpxLevelsTopic(), new TopicBinding("DATABENTO", "es-cvd-spx-levels"));
+        }
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
+    }
+
+    private void addEsCvdTopics(Map<String, TopicBinding> topicEvents) {
+        if (!settings.esCvdEnabled()) return;
+        // One wiring path is shared by bootstrap and live consumers so their topic sets cannot drift.
+        topicEvents.put(settings.esCvdTopic(), new TopicBinding("DATABENTO", "es-cvd"));
+        topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding("DATABENTO", "es-cvd-bar"));
     }
 
     private void runAlertConsumer() {
@@ -1997,9 +2287,11 @@ public class FeedGatewayService implements ReplayRunner {
                     TopicBinding binding = topicEvents.get(record.topic());
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
                     // pairing fields, control JSON): it reaches the browser byte-untouched —
-                    // never enriched/reserialized.
+                    // never enriched/reserialized. The tape-zones board is the same class: it is
+                    // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
+                    // stamping must never overwrite the service's own sessionDate (UI design §3).
                     String json;
-                    if (binding != null && "ibkr-preopen-status".equals(binding.event())) {
+                    if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
                         String rawJson = avro ? avroJson(record.value()) : stringJson(record.value());
@@ -2035,6 +2327,46 @@ public class FeedGatewayService implements ReplayRunner {
                     if (!isTrustedIndexPrice(binding, json) || !isValidSpxPrice(binding, json)) {
                         inactiveDroppedEvents.incrementAndGet();
                         droppedByOtherReasons.incrementAndGet();
+                        continue;
+                    }
+                    if (binding != null && "vol-premium-ivrv".equals(binding.event())) {
+                        // Same reason as indicators below: THIS consumer also ingests the IV/RV
+                        // topic, so whichever consumer wins updateCache for an offset must be the
+                        // one that broadcasts it. Without this block the cache consumer takes the
+                        // offset, the live consumer's duplicate is then correctly rejected by the
+                        // offset gate, and nobody broadcasts — clients starve while the cache is
+                        // perfectly up to date.
+                        synchronized (volPremiumIvrvEmitLock) {
+                            String ivrvKey = updateCache(binding, record, json);
+                            if (ivrvKey != null && caughtUpFlag.get()
+                                    && shouldBroadcastVolPremiumIvrv(ivrvKey, record.offset())) {
+                                broadcast(binding.event(), json);
+                                forwardedEvents.incrementAndGet();
+                            }
+                        }
+                        continue;
+                    }
+                    if (binding != null && "indicators".equals(binding.event())) {
+                        // r2 findings 1+2: the cache consumer consumes this offset —
+                        // if it wins the CAS gate it must also BROADCAST, or the
+                        // live consumer's duplicate is suppressed and clients starve.
+                        // The emit lock covers mutation+enqueue as one unit.
+                        synchronized (indicatorsEmitLock) {
+                            String indicatorKey = updateCache(binding, record, json);
+                            if (indicatorKey != null && caughtUpFlag.get()
+                                    && shouldBroadcastIndicators(indicatorKey, record.offset())) {
+                                broadcast(binding.event(), json);
+                                forwardedEvents.incrementAndGet();
+                            }
+                        }
+                        continue;
+                    }
+                    if (binding != null && "tapeZones".equals(binding.event())) {
+                        // Same reason as indicators above: this consumer also ingests the board
+                        // topic, so whichever consumer wins updateCache for an offset must be the
+                        // one that broadcasts it — otherwise the live consumer's duplicate is
+                        // correctly rejected by the offset gate and clients starve.
+                        tapeZonesBroadcast(binding, record, json, caughtUpFlag);
                         continue;
                     }
                     updateCache(binding, record, json);
@@ -2168,12 +2500,20 @@ public class FeedGatewayService implements ReplayRunner {
                                          Map<String, TopicBinding> topicEvents) {
         Set<TopicPartition> onGrownTopics = Set.copyOf(refresh.addedOnGrownTopics());
         List<TopicPartition> recoverFromBeginning = new ArrayList<>();
+        List<TopicPartition> recoverDisplayWindow = new ArrayList<>();
         List<TopicPartition> toEnd = new ArrayList<>();
         for (TopicPartition partition : refresh.added()) {
             TopicBinding binding = topicEvents.get(partition.topic());
             boolean liveOnly = binding != null && isLiveOnlyRebuiltEvent(binding.event());
             if (liveOnly && onGrownTopics.contains(partition)) {
                 recoverFromBeginning.add(partition);
+            } else if (binding != null && "drop-nowcast".equals(binding.event())) {
+                // A drop-nowcast topic that just APPEARED (the optional producer creating it
+                // mid-session) may already hold verdicts; END would lose the very first one and
+                // nothing rebuilds it. Beginning would replay full retention (7 d). Bounded
+                // recovery instead: seek by timestamp over the client's 10-minute display
+                // window (review finding #3).
+                recoverDisplayWindow.add(partition);
             } else {
                 toEnd.add(partition);
             }
@@ -2184,6 +2524,29 @@ public class FeedGatewayService implements ReplayRunner {
         if (!recoverFromBeginning.isEmpty()) {
             consumer.seekToBeginning(recoverFromBeginning);
         }
+        if (!recoverDisplayWindow.isEmpty()) {
+            long fromMs = System.currentTimeMillis() - 10 * 60_000L;
+            Map<TopicPartition, Long> query = new HashMap<>();
+            for (TopicPartition p : recoverDisplayWindow) {
+                query.put(p, fromMs);
+            }
+            try {
+                Map<TopicPartition, org.apache.kafka.clients.consumer.OffsetAndTimestamp> offsets =
+                        consumer.offsetsForTimes(query);
+                for (TopicPartition p : recoverDisplayWindow) {
+                    org.apache.kafka.clients.consumer.OffsetAndTimestamp ot =
+                            offsets == null ? null : offsets.get(p);
+                    if (ot != null) {
+                        consumer.seek(p, ot.offset());
+                    } else {
+                        consumer.seekToEnd(List.of(p));
+                    }
+                }
+            } catch (Exception e) {
+                // bounded-recovery best effort: END is the safe fallback
+                consumer.seekToEnd(recoverDisplayWindow);
+            }
+        }
     }
 
     /**
@@ -2193,7 +2556,9 @@ public class FeedGatewayService implements ReplayRunner {
      * has no case for it, so the cache consumer reads those records and drops them.
      *
      * <ul>
-     *   <li>{@code turn-alert}, {@code spread-skew-event} — discrete one-shot transitions, never cached.</li>
+     *   <li>{@code turn-alert}, {@code spread-skew-event}, {@code drop-nowcast} — discrete one-shot
+     *       transitions, never cached ({@code drop-nowcast} additionally gets a bounded 10-minute
+     *       timestamp-seek when its OPTIONAL topic first appears — see seekAddedLivePartitions).</li>
      *   <li>{@code strike-cluster} — dashboard + recent-signals trail, cached into {@code strikeClusters}
      *       by the live branch only and replayed to connecting clients from there.</li>
      * </ul>
@@ -2207,6 +2572,7 @@ public class FeedGatewayService implements ReplayRunner {
     private static boolean isLiveOnlyRebuiltEvent(String event) {
         return "turn-alert".equals(event)
                 || "spread-skew-event".equals(event)
+                || "drop-nowcast".equals(event)
                 || "strike-cluster".equals(event);
     }
 
@@ -2241,8 +2607,10 @@ public class FeedGatewayService implements ReplayRunner {
             consumer.assign(partitions);
             if (retry) {
                 seekToCacheWindow(consumer, partitions, topicEvents);
+                resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
             } else {
                 consumer.seekToEnd(partitions);
+                seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
             }
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
             while (running.get()) {
@@ -2279,9 +2647,11 @@ public class FeedGatewayService implements ReplayRunner {
                     TopicBinding binding = topicEvents.get(record.topic());
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
                     // pairing fields, control JSON): it reaches the browser byte-untouched —
-                    // never enriched/reserialized.
+                    // never enriched/reserialized. The tape-zones board is the same class: it is
+                    // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
+                    // stamping must never overwrite the service's own sessionDate (UI design §3).
                     String json;
-                    if (binding != null && "ibkr-preopen-status".equals(binding.event())) {
+                    if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
                         String rawJson = avro ? avroJson(record.value()) : stringJson(record.value());
@@ -2295,7 +2665,6 @@ public class FeedGatewayService implements ReplayRunner {
                                 && "DATABENTO".equals(binding.source())
                                 // Shared LIVE topic only — see the cache path for why.
                                 && settings.databentoGexTopic().equals(record.topic())
-
                                 && interceptSharedGexRecord(record, rawJson, cacheCaughtUpFlag.get(),
                                         System.currentTimeMillis())) {
                             continue;
@@ -2305,6 +2674,8 @@ public class FeedGatewayService implements ReplayRunner {
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
                         evictEsStrikeIntelTombstone(binding, record);
+                        evictCvdSpxLevelsTombstone(binding == null ? null : binding.event(), record);
+                        noteCvdSpxLevelsProgress(binding, record);
                         continue;
                     }
                     if (!isTrustedIndexPrice(binding, json) || !isValidSpxPrice(binding, json)) {
@@ -2352,12 +2723,66 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                         continue;
                     }
+                    if ("drop-nowcast".equals(binding.event())) {
+                        // Drop-classifier verdict/refinement: one-shot advisory, broadcast STANDALONE
+                        // to every client (never selection-gated, never cached — the client keys by
+                        // drop_id and expires its own banner). SHADOW: display-only.
+                        // A malformed value must never reach the envelope: enrichJson() would pass
+                        // unparseable text through verbatim and poison every legacy client's frame,
+                        // so parse-gate here — drop and count instead (review finding #4).
+                        if (!isBroadcastableDropNowcast(mapper, json)) {
+                            dropNowcastMalformed.incrementAndGet();
+                            continue;
+                        }
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                        continue;
+                    }
                     if ("spread-skew-event".equals(binding.event())) {
                         // Discrete spread-skew transition (FIRE/EXIT/REVERSAL/RESTART; own message.type),
                         // symbol-filtered client-side. Broadcast STANDALONE to every client — never
                         // selection-gated and never cached (a transition is a one-shot alert; the 5s
                         // spread-skew snapshot carries the current state for late joiners) — the
                         // turn-alert sibling.
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("es-cvd-spx-levels".equals(binding.event())) {
+                        // U16 (CL-R7): producer-authored transactional attestation, delivered
+                        // VERBATIM (raw pass-through — never enriched). Boundary checks only; the
+                        // aligner already validated the full schema. Anything rejected here is
+                        // counted and dropped — never broadcast, never retained.
+                        CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(
+                                record.key() == null ? null : String.valueOf(record.key()), json);
+                        if (accepted == null) {
+                            cvdSpxLevelsDrops.incrementAndGet();
+                        } else if (retainCvdSpxLevels(accepted)) {
+                            broadcast(binding.event(), json);
+                            forwardedEvents.incrementAndGet();
+                        }
+                        noteCvdSpxLevelsProgress(binding, record);
+                        continue;
+                    }
+                    if ("delta-flow-accel".equals(binding.event())) {
+                        // Same standalone-delivery reasoning as es-cvd below: one frame per second,
+                        // no option-expiry identity, never selection-gated.
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("es-cvd".equals(binding.event())) {
+                        // Same standalone-delivery reasoning as es-aggressor-flow below: one compacted
+                        // ES.v.0 snapshot per second, no option-expiry identity, never selection-gated.
+                        broadcast(binding.event(), json);
+                        forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("es-cvd-bar".equals(binding.event())) {
+                        // Keyed view first (the REST backfill's source of truth), then the live
+                        // broadcast — clients apply the same last-per-key upsert rule, so at-least-once
+                        // delivery is invisible in every materialized state (ES-CVD-DESIGN.md R31).
+                        upsertCvdBar(json);
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
                         continue;
@@ -2371,7 +2796,54 @@ public class FeedGatewayService implements ReplayRunner {
                         forwardedEvents.incrementAndGet();
                         continue;
                     }
+                    if ("vol-premium-ivrv".equals(binding.event())) {
+                        // Same shape as indicators below, and needed for the same two races: the
+                        // whole cache→CAS→enqueue decision is ONE unit under the emit lock, and the
+                        // offset CAS makes whichever consumer wins the broadcaster. Both consumers
+                        // read the same single partition, and the contract allows an equal-
+                        // event-time correction at a later offset — so an event-time gate alone
+                        // would let a superseded offset broadcast over its own correction.
+                        //
+                        // Freshness stays fail-closed: a stale reading yields a null key from
+                        // updateCache and is therefore never live-broadcast.
+                        synchronized (volPremiumIvrvEmitLock) {
+                            String ivrvKey = updateCache(binding, record, json);
+                            if (ivrvKey != null && cacheCaughtUpFlag.get()
+                                    && shouldBroadcastVolPremiumIvrv(ivrvKey, record.offset())) {
+                                broadcast(binding.event(), json);
+                                forwardedEvents.incrementAndGet();
+                            }
+                        }
+                        continue;
+                    }
+                    if ("indicators".equals(binding.event())) {
+                        // r2 findings 1+2: the whole supersede→cache→CAS→enqueue
+                        // decision is ONE unit under the emit lock, and the offset
+                        // CAS gate makes whichever consumer wins the broadcaster.
+                        synchronized (indicatorsEmitLock) {
+                            String indicatorsKey = updateCache(binding, record, json);
+                            if (indicatorsKey != null && cacheCaughtUpFlag.get()
+                                    && shouldBroadcastIndicators(indicatorsKey,
+                                            record.offset())) {
+                                broadcast(binding.event(), json);
+                                forwardedEvents.incrementAndGet();
+                            }
+                        }
+                        continue;
+                    }
                     String cacheKey = updateCache(binding, record, json);
+                    if (skipsLiveSpotBandForward(binding.event(), perSessionRouting())) {
+                        // ONLY in per-session mode. There the live path routes one socket message per
+                        // record, and the client has no "spot-band" message handler, so the browser would
+                        // discard ~200 of them per republish; that mode is served by the batch replays in
+                        // replayCachedToSocket / markSelectionReady instead.
+                        //
+                        // In LEGACY mode this record must NOT be skipped: the branch it falls through to
+                        // ends in enqueuePending, and that IS the ui-batch the page reads. Skipping both
+                        // left pendingSpotBands permanently empty, so the batch shipped "spotBands":[]
+                        // every time while the cache held a full board — the exact symptom on dev.
+                        continue;
+                    }
                     if ("seller-activity".equals(binding.event())) {
                         // REST-only: every record contains one strike's full session history. Replaying or
                         // forwarding hundreds of these through the option-chain WebSocket recreates the
@@ -2403,6 +2875,27 @@ public class FeedGatewayService implements ReplayRunner {
                                             record.offset(), record.timestamp(), json));
                             forwardedEvents.incrementAndGet();
                         }
+                        continue;
+                    }
+                    if ("tapeZones".equals(binding.event())) {
+                        // Tape-zones board: a STANDALONE global advisory — its own websocket event,
+                        // never a ui-batch row, never selection-routed (the board is ES-global; the
+                        // SPX view is a unit toggle on the SAME record). The board rides VERBATIM
+                        // inside the wrapper; only the gateway's own clock stamps are added (§3).
+                        //
+                        // DELIVERY IS GATED ON updateCache's RETURN, not merely on the offset CAS.
+                        // updateCache is where the fail-closed identity contract, the offset
+                        // ordering gate and the TTL all live, and it answers null for every record
+                        // that fails one of them. Broadcasting past a null would put a malformed,
+                        // duplicated, rewound or expired board on every authenticated socket while
+                        // the cache correctly refused it — the card and the cache would disagree
+                        // about the same offset. Nothing may reach a client that the cache rejected.
+                        //
+                        // Both consumers ingest this topic, so the (updateCache → CAS → enqueue)
+                        // decision is ONE unit under the emit lock: whichever consumer wins
+                        // updateCache for an offset is the one that broadcasts it, and the loser's
+                        // null correctly suppresses only its own duplicate.
+                        tapeZonesBroadcast(binding, record, json, cacheCaughtUpFlag);
                         continue;
                     }
                     if ("zero-dte-intelligence".equals(binding.event())) {
@@ -2572,6 +3065,10 @@ public class FeedGatewayService implements ReplayRunner {
                         if ("dealer-ledger".equals(binding.event())) {
                             // Delivered STANDALONE (its own message.type), never inside a ui-batch — the UI
                             // has a dedicated dealer-ledger handler and reads no dealerLedgers batch array.
+                            broadcast(binding.event(), forwardJson);
+                        } else if ("corridor-gauge".equals(binding.event())) {
+                            // Likewise STANDALONE: the strike-board strip has its own handler; keeping it
+                            // out of ui-batch leaves the established batch schema untouched (shadow mode).
                             broadcast(binding.event(), forwardJson);
                         } else if ("option-truth".equals(binding.event())) {
                             // Compact per-strike signal has its own event in legacy mode. Keeping it out of
@@ -2765,47 +3262,22 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * Topics whose producers may legitimately be absent (graceful-absence contract). Every other
-     * topic in a consumer set is mandatory and keeps the strict metadata requirement.
+     * Parse gate for the drop-classifier verdict stream. A malformed value must never reach the
+     * envelope: enrichJson() passes unparseable text through verbatim, which would poison every
+     * legacy client's frame ("Bad Data" on the whole feed). Only a JSON object that is a NOWCAST
+     * with a non-empty drop_id may broadcast; everything else is dropped (and counted by the
+     * caller via dropNowcastMalformed).
      */
-    private boolean isOptionalTopic(String topic) {
-        // OPTIONAL: absence must never block/crash-loop the SHARED consumer. The dealer-ledger topics
-        // are produced by a separate service that may not be deployed (and, since Kafka is wiped and
-        // services restart each day, are simply absent until that service first produces) — treat them
-        // as optional so their absence can't starve strike-flow / mission-pace / the other JSON feeds.
-        return topic != null
-                && (topic.equals(settings.strikeLiquidityTopic())
-                    || topic.equals(settings.dealerLedgerProfileTopic())
-                    || topic.equals(settings.dealerLedgerStateTopic())
-                    || topic.equals(settings.strikeIntelByStrikeTopic())
-                    || topic.equals(settings.optionTruthByStrikeTopic())
-                    || topic.equals(settings.strikeInvasionTopic())
-                    // Both spread-skew topics come from the same brand-new spread-skew-service, which may
-                    // not be deployed during a staged rollout — BOTH must be optional (like strike-invasion)
-                    // so their absence cannot starve the shared JSON consumer.
-                    || topic.equals(settings.spreadSkewTopic())
-                    || topic.equals(settings.spreadSkewEventsTopic())
-                    || topic.equals(settings.shortPremiumRecommendationTopic())
-                    // ES open-direction forecast/outcome producer is a brand-new service that may not be
-                    // deployed (and the topics are absent after the daily Kafka wipe until it first
-                    // produces) — optional, so their absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.esOpenDirectionForecastTopic())
-                    || topic.equals(settings.esOpenDirectionOutcomeTopic())
-                    // The live STATUS heartbeat comes from the same may-not-be-deployed producer, and is
-                    // additionally absent whenever no overnight session is active — optional like its siblings.
-                    || topic.equals(settings.esOpenDirectionStatusTopic())
-                    // Greek-move-authenticity is a brand-new standalone service that may not be deployed (and
-                    // the topic is absent after the daily Kafka wipe until it first produces) — optional, so
-                    // its absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.greekMoveAuthCurrentTopic())
-                    // Spot-vol-regime is a brand-new standalone service that may not be deployed (and the
-                    // topic is absent after the daily Kafka wipe until it first produces) — optional, so
-                    // its absence can never starve the shared JSON consumer.
-                    || topic.equals(settings.spotVolRegimeTopic())
-                    // Close-direction is a brand-new standalone service that may not be deployed (and the
-                    // topic is absent until it first produces) — optional like its advisory siblings.
-                    || topic.equals(settings.closeDirectionSignalTopic())
-                    || topic.equals(settings.vixOptionInteligenceTopic()));
+    static boolean isBroadcastableDropNowcast(com.fasterxml.jackson.databind.ObjectMapper mapper,
+            String json) {
+        try {
+            com.fasterxml.jackson.databind.JsonNode parsed = mapper.readTree(json);
+            return parsed != null && parsed.isObject()
+                    && "NOWCAST".equals(parsed.path("message_type").asText())
+                    && !parsed.path("drop_id").asText("").isEmpty();
+        } catch (Exception malformed) {
+            return false;
+        }
     }
 
     private void markCacheRecovering(AtomicBoolean caughtUpFlag) {
@@ -2818,126 +3290,114 @@ public class FeedGatewayService implements ReplayRunner {
         return partitionsFor(name, consumer, topics, settings.metadataTimeoutMs());
     }
 
-    /**
-     * Resolve every topic's partitions, or fail with {@link TopicMetadataTimeoutException}.
-     *
-     * <p>{@code budgetMs} is a TOTAL deadline for the whole call, enforced before EVERY per-topic metadata
-     * request — not merely once per pass. Each request against a topic the client does not know blocks for
-     * its own timeout, so an unbounded per-topic timeout made the real cost {@code 1s x absent-topics}:
-     * with ~8 optional topics undeployed (the normal state after the daily Kafka wipe) a single pass could
-     * stall ~8s. At bootstrap that is harmless; from {@link PartitionRefresh} it runs ON THE POLL THREAD
-     * every refresh interval, so it stalls consumption, and the resulting backlog can trip
-     * {@link #maybeSeekSelectedSourceToLatest} into seeking the selected partitions to END — turning a
-     * metadata hiccup into real skipped data.
-     *
-     * <p>Running out of budget mid-pass yields an INCOMPLETE view, which must never be mistaken for a
-     * complete one: {@code complete} is cleared so the call throws rather than returning a short list that
-     * a caller could read as "these topics no longer have those partitions".
-     */
+    /** Graceful-absence overload — see the full overload for the contract. */
     private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics,
                                                long budgetMs) {
-        return partitionsFor(name, consumer, topics, budgetMs, Set.of());
+        return partitionsFor(name, consumer, topics, budgetMs, Set.of(), false);
+    }
+
+    /** Refresh overload (graceful absence, with the current assignment as known topics). */
+    private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics,
+                                               long budgetMs, Set<String> alreadyKnownTopics) {
+        return partitionsFor(name, consumer, topics, budgetMs, alreadyKnownTopics, false);
     }
 
     /**
-     * Resolve every topic's partitions, or fail with {@link TopicMetadataTimeoutException}.
+     * Resolve the topics' partitions with ONE whole-cluster metadata request per pass
+     * ({@link KafkaConsumer#listTopics(Duration)}). Replaces the per-topic probe loop AND the
+     * optional-topic whitelist (deleted 2026-08-31): the whitelist itself was the recurring outage —
+     * dev wipes every topic nightly, so any newly bound topic someone forgot to whitelist made this
+     * method throw for the WHOLE consumer set, restarting it every 30s and blacking out every feed it
+     * carried (.pace.rank, gex.oi-status, spot-band-flow mornings). The per-topic probes were also the
+     * cost center: an UNKNOWN topic blocked ~1s per probe, so absent topics serially burned the budget;
+     * listTopics answers for every topic in one round trip, so absence costs nothing.
      *
-     * <p><b>Probe order is load-bearing, not cosmetic.</b> A metadata lookup for a topic the client already
-     * knows is answered from its cache in microseconds; a lookup for an UNKNOWN topic BLOCKS for its whole
-     * timeout while the client retries. With ~8 optional producers undeployed -- the normal state after the
-     * daily Kafka wipe -- probing in arbitrary order under one shared budget lets the absent topics consume
-     * it entirely and the pass never completes. Under the small refresh budget that is fatal: every refresh
-     * throws, growth is never discovered, and the 4->32 incident silently returns. So:
-     *
-     * <ol>
-     *   <li>{@code alreadyKnownTopics} (the caller's current assignment) are probed FIRST. These are the
-     *       cheap cache reads, and they are the ones that actually detect growth -- the mission.</li>
-     *   <li>Everything else is probed afterwards with whatever budget remains, starting at a ROTATING
-     *       offset so no topic is permanently starved by the ones ahead of it. Running out of budget on an
-     *       OPTIONAL one is not a failure -- it is simply still absent, which the union assignment already
-     *       tolerates.</li>
-     * </ol>
-     *
-     * <p>Bootstrap passes an empty {@code alreadyKnownTopics} and the full 30s budget: nothing is known
-     * yet and every topic must resolve, so ordering is irrelevant and strictness is correct.
-     *
-     * <p>Running out of budget on a MANDATORY topic still fails the pass, and a partial pass is never
-     * published as an observation -- a short list must never be read as "those partitions are gone".
+     * <p>The contract, per pass:
+     * <ul>
+     *   <li><b>An absent topic is skipped, not fatal.</b> Its absence is transition-logged
+     *       ({@code RGW_ALERT GATEWAY_TOPIC_ABSENT}, greppable) and the topic is re-checked on every
+     *       {@link PartitionRefresh} pass — the producer coming up later is picked up without a gateway
+     *       restart, and one missing topic can only dark its OWN feature, never the shared consumer.</li>
+     *   <li><b>Resolving NOTHING is a failure, never a success.</b> An empty resolution would make the
+     *       caller {@code assign([])} — whose next {@code poll()} throws an IllegalStateException that no
+     *       longer names the topics — and would let {@code caughtUp({})} certify an EMPTY cache as ready.
+     *       The pass retries within the budget and then throws, naming the unresolved set.</li>
+     *   <li><b>An ALREADY-ASSIGNED topic vanishing from metadata fails the pass.</b> A broker that stops
+     *       answering for topics this consumer is actively assigned to is a metadata outage, not a
+     *       producer that has not started: the throw keeps {@link PartitionRefresh}'s absorb site and its
+     *       refreshFailing / GATEWAY_PARTITION_METADATA_STALE alarms honest.</li>
+     *   <li><b>{@code strictAbsence} restores all-or-nothing</b> for callers whose correctness needs the
+     *       FULL set: replay (a missing run topic must surface as a failure, never a silent
+     *       REPLAY_COMPLETE with 0 records) and the source-switch offset barrier (a partial barrier map
+     *       would wave pre-switch records through on the skipped topic's partitions).</li>
+     * </ul>
      */
     private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics,
-                                               long budgetMs, Set<String> alreadyKnownTopics) {
+                                               long budgetMs, Set<String> alreadyKnownTopics,
+                                               boolean strictAbsence) {
         long deadlineMs = System.currentTimeMillis() + budgetMs;
-        Map<String, List<PartitionInfo>> metadata = new HashMap<>();
-        while (running.get() && System.currentTimeMillis() < deadlineMs) {
-            metadata.clear();
-            boolean complete = true;
-            for (String topic : probeOrder(topics, alreadyKnownTopics)) {
-                boolean known = alreadyKnownTopics.contains(topic);
-                long remainingMs = deadlineMs - System.currentTimeMillis();
-                if (remainingMs <= 0L) {
-                    if (known || !isOptionalTopic(topic)) {
-                        complete = false; // partial view of a topic we must resolve -- never publish it
-                        break;
-                    }
-                    // Budget spent probing other absent optional topics. Leave this one for a later cycle;
-                    // its absence is an expected steady state and must not starve growth detection.
-                    continue;
-                }
-                List<PartitionInfo> partitions =
-                        consumer.partitionsFor(topic, Duration.ofMillis(Math.min(1_000L, remainingMs)));
+        Set<String> unresolved = Set.copyOf(topics);
+        while (running.get()) {
+            long remainingMs = deadlineMs - System.currentTimeMillis();
+            if (remainingMs <= 0L) {
+                break;
+            }
+            Map<String, List<PartitionInfo>> cluster;
+            try {
+                cluster = consumer.listTopics(Duration.ofMillis(Math.min(5_000L, remainingMs)));
+            } catch (org.apache.kafka.common.errors.TimeoutException clusterMetadataTimedOut) {
+                continue; // one slice answered nothing; retry within the budget, throw (named) after it
+            }
+            Map<String, List<PartitionInfo>> resolved = new HashMap<>();
+            List<String> absent = new ArrayList<>();
+            for (String topic : new java.util.TreeSet<>(topics)) { // stable order for readable logs
+                List<PartitionInfo> partitions = cluster.get(topic);
                 if (partitions == null || partitions.isEmpty()) {
-                    if (isOptionalTopic(topic)) {
-                        // OPTIONAL topic (producer not deployed yet / absent): skip it so its absence can
-                        // NEVER block or crash-loop the shared consumer and starve the mandatory feeds. It
-                        // is picked up by the periodic PartitionRefresh once the producer creates it -- no
-                        // gateway restart required. Log the TRANSITION only: this runs every refresh
-                        // interval for every consumer that binds an optional topic, and an undeployed
-                        // producer is an expected steady state after the daily wipe.
-                        if (absentOptionalTopics.add(name + "|" + topic)) {
-                            System.err.println("Feed gateway " + name
-                                    + ": optional topic absent, consuming without it: " + topic);
-                        }
-                        continue;
-                    }
-                    complete = false;
-                    break;
+                    absent.add(topic);
+                } else {
+                    resolved.put(topic, partitions);
                 }
-                if (absentOptionalTopics.remove(name + "|" + topic)) {
-                    System.out.println("Feed gateway " + name + ": optional topic present again: " + topic);
-                }
-                metadata.put(topic, partitions);
             }
-            if (complete) {
-                List<TopicPartition> result = new ArrayList<>();
-                for (Map.Entry<String, List<PartitionInfo>> entry : metadata.entrySet()) {
-                    for (PartitionInfo partition : entry.getValue()) {
-                        result.add(new TopicPartition(entry.getKey(), partition.partition()));
-                    }
-                }
-                result.sort(Comparator.comparing(TopicPartition::topic).thenComparingInt(TopicPartition::partition));
-                return result;
+            unresolved = Set.copyOf(absent);
+            boolean vanishedKnown = absent.stream().anyMatch(alreadyKnownTopics::contains);
+            boolean nothingResolved = resolved.isEmpty() && !topics.isEmpty();
+            if ((strictAbsence && !absent.isEmpty()) || vanishedKnown || nothingResolved) {
+                // Not a publishable observation (see contract). Brief pause so a fast broker answer of
+                // "topic not there yet" does not spin this into a hot loop for the whole budget.
+                sleepQuietly(Math.min(200L, Math.max(1L, deadlineMs - System.currentTimeMillis())));
+                continue;
             }
+            for (String topic : absent) {
+                if (absentTopics.add(name + "|" + topic)) {
+                    System.err.println("RGW_ALERT GATEWAY_TOPIC_ABSENT " + name
+                            + ": topic absent, consuming without it (rechecked every partition refresh): "
+                            + topic);
+                }
+            }
+            List<TopicPartition> result = new ArrayList<>();
+            for (Map.Entry<String, List<PartitionInfo>> entry : resolved.entrySet()) {
+                if (absentTopics.remove(name + "|" + entry.getKey())) {
+                    System.out.println("Feed gateway " + name + ": topic present again: " + entry.getKey());
+                }
+                for (PartitionInfo partition : entry.getValue()) {
+                    result.add(new TopicPartition(entry.getKey(), partition.partition()));
+                }
+            }
+            result.sort(Comparator.comparing(TopicPartition::topic).thenComparingInt(TopicPartition::partition));
+            return result;
         }
-        throw new TopicMetadataTimeoutException("Timed out waiting for Kafka topic metadata: " + topics);
+        throw new TopicMetadataTimeoutException("Timed out waiting for Kafka topic metadata: " + unresolved);
     }
 
-    /** Known topics first (cheap, detects growth), then the rest from a rotating offset (never starved). */
-    List<String> probeOrder(Set<String> topics, Set<String> alreadyKnownTopics) {
-        List<String> known = new ArrayList<>();
-        List<String> unknown = new ArrayList<>();
-        for (String topic : new java.util.TreeSet<>(topics)) { // stable order so rotation is meaningful
-            if (alreadyKnownTopics.contains(topic)) {
-                known.add(topic);
-            } else {
-                unknown.add(topic);
-            }
+    private static void sleepQuietly(long ms) {
+        if (ms <= 0L) {
+            return;
         }
-        if (unknown.size() > 1) {
-            int offset = Math.floorMod(unknownProbeRotation.getAndIncrement(), unknown.size());
-            java.util.Collections.rotate(unknown, -offset);
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
         }
-        known.addAll(unknown);
-        return known;
     }
 
     /**
@@ -2964,7 +3424,7 @@ public class FeedGatewayService implements ReplayRunner {
      * The assignment a refresh may install: everything currently assigned PLUS what was discovered — never
      * the discovered list on its own.
      *
-     * <p>{@link #partitionsFor} deliberately SKIPS an optional topic that is momentarily absent from
+     * <p>{@link #partitionsFor} deliberately SKIPS a topic that is momentarily absent from
      * metadata (see {@link #isOptionalTopic}). At bootstrap that is a documented, logged, self-healing
      * choice. Inside the poll loop it is not: assigning the discovered list verbatim would silently
      * unassign that topic's partitions for the entire life of the consumer, which is exactly the
@@ -3227,6 +3687,8 @@ public class FeedGatewayService implements ReplayRunner {
             }
             if ("ibkr-preopen-status".equals(binding.event())
                     || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
+                    || "indicators".equals(binding.event())
+                    || "tapeZones".equals(binding.event())
                     || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 // The pre-open status/control stream is SOURCE-INDEPENDENT window state:
                 // stateCaughtUp must include its partition regardless of the active market-data
@@ -3234,6 +3696,9 @@ public class FeedGatewayService implements ReplayRunner {
                 // With the pre-open feature enabled the SHARED live gex topic (slice 2) is window
                 // state too — its sessioned records must be caught up before replay claims
                 // completeness, whatever source the user selected.
+                // Indicators (r1 finding 4) are likewise source-independent GLOBAL truth —
+                // their partitions gate the barrier no matter which source is active. The
+                // tape-zones board joins them: it is ES-global truth, not per-source market data.
                 selectedEndOffsets.put(entry.getKey(), entry.getValue());
             }
         }
@@ -3255,7 +3720,11 @@ public class FeedGatewayService implements ReplayRunner {
         for (Map.Entry<TopicPartition, Long> entry : endOffsets.entrySet()) {
             TopicBinding preOpenBinding = topicEvents.get(entry.getKey().topic());
             if (preOpenBinding != null && ("ibkr-preopen-status".equals(preOpenBinding.event())
-                    || isIbkrPreOpenSharedGexTopic(entry.getKey().topic()))) {
+                    || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
+                    || "indicators".equals(preOpenBinding.event())
+                    || "tapeZones".equals(preOpenBinding.event()))) {
+                // Source-independent streams (pre-open control + shared live gex + indicators +
+                // tape-zones board) always gate mid-run barriers too (r1 finding 4).
                 selected.put(entry.getKey(), entry.getValue());
                 continue;
             }
@@ -3319,6 +3788,27 @@ public class FeedGatewayService implements ReplayRunner {
             if (events.contains("spot-vol-regime")) {
                 for (WebSocketSession client : clients) {
                     replaySpotVolRegimeCached(client);
+                }
+            }
+            // Vol-premium IV/RV is its OWN standalone event with its OWN topic. Gating its
+            // catch-up on spot-vol-regime's presence meant a consumer carrying only the IV/RV
+            // topic never re-pushed it, and one carrying only spot-vol-regime re-pushed IV/RV it
+            // had not consumed.
+            if (events.contains("vol-premium-ivrv")) {
+                for (WebSocketSession client : clients) {
+                    replayVolPremiumIvrvCached(client);
+                }
+            }
+            // Indicator CURRENT is STANDALONE too: explicit re-push once caught up.
+            if (events.contains("indicators")) {
+                for (WebSocketSession client : clients) {
+                    replayIndicatorsCached(client);
+                }
+            }
+            // Tape-zones board is STANDALONE too: explicit re-push once caught up.
+            if (events.contains("tapeZones")) {
+                for (WebSocketSession client : clients) {
+                    replayTapeZonesCached(client);
                 }
             }
             if (events.contains("ibkr-preopen-status")) {
@@ -3422,6 +3912,11 @@ public class FeedGatewayService implements ReplayRunner {
             broadcast("source-switching", activeSelectionJson(next, "source-switching"));
             broadcast("status", statusJson());
             boolean replayed = broadcastCachedState(sourceSwitchReplayEvents());
+            // NB: the band batch is deliberately NOT replayed here. When this selection is already
+            // serviceable, markSelectionReady(next) runs immediately below and replays it — doing it
+            // here too sent every socket the same batch twice for one switch. Readiness is also the
+            // correct moment: before it, the new selection's cache is knowably incomplete, so a replay
+            // here would push exactly the partial board the readiness gate exists to withhold.
             // WITHHOLD readiness while the newly selected source has partitions still replaying a mid-run
             // rebuild. Announcing source-ready here would certify a cache that is knowably missing every
             // strike on those partitions — the original incident's symptom, reached by a different route.
@@ -3515,7 +4010,8 @@ public class FeedGatewayService implements ReplayRunner {
         // would return the last-stable offset and capture a too-low barrier while a pre-open txn is open).
         barrierProps.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, BARRIER_CONSUMER_ISOLATION);
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(barrierProps)) {
-            List<TopicPartition> partitions = partitionsFor("barrier", consumer, Set.copyOf(topics));
+            List<TopicPartition> partitions = partitionsFor("barrier", consumer, Set.copyOf(topics),
+                    settings.metadataTimeoutMs(), Set.of(), true);
             Map<TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
             System.out.println("Feed gateway captured " + endOffsets.size()
                     + " switch offset barriers for " + selection.source()
@@ -3558,6 +4054,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.strikeIntelByStrikeTopic(),
                     settings.optionTruthByStrikeTopic(),
                     settings.strikeInvasionTopic(),
+                    settings.corridorGaugeTopic(),
                     settings.strikeLiquidityTopic(),
                     settings.databentoPaceMissionTopic(),
                     settings.missionControlTopic(),
@@ -3569,6 +4066,8 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.unifiedSrTopic(),
                     settings.databentoGexMagnetTopic(),
                     settings.gammaMigrationTopic(),
+                    settings.gammaRotationTopic(),
+                    settings.gammaFragilityTopic(),
                     settings.databentoMaxPainTopic(),
                     settings.databentoVolumeSandwichTopic(),
                     settings.databentoVolumeSandwichAlertsTopic(),
@@ -3578,10 +4077,21 @@ public class FeedGatewayService implements ReplayRunner {
         return List.of();
     }
 
+    /**
+     * Whether a LIVE spot-band record must skip the individual forward.
+     *
+     * <p>True only under per-session routing, where the live path sends one socket message per record and
+     * no client handler exists for it. Under legacy routing it must be FALSE, so the record falls through
+     * to enqueuePending — the ui-batch, which is the only route the page reads.
+     */
+    static boolean skipsLiveSpotBandForward(String event, boolean perSessionRouting) {
+        return "spot-band".equals(event) && perSessionRouting;
+    }
+
     static List<String> sourceSwitchReplayEvents() {
         // NB: dealer-ledger is intentionally ABSENT — it is delivered standalone (not via the ui-batch
         // this list feeds). After a source switch it self-heals from the next live dealer-ledger record.
-        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "gamma-migration", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
+        return List.of("snapshot", "pace", "pace-rank", "directional-pressure", "vix-price", "index-price", "spx-price", "strike-flow", "spot-band", "seller-activity", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "gex-by-strike", "gex-oi-status", "strike-sr", "gex-magnet", "gamma-migration", "es-gex", "es-strike-intel", "max-pain", "gex-strike-lifecycle");
     }
 
     /**
@@ -3725,6 +4235,13 @@ public class FeedGatewayService implements ReplayRunner {
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesActiveSelection(json, selection);
         }
+        if ("corridor-gauge".equals(binding.event())) {
+            // Same class as gamma-migration: low-frequency derived per-chain state; the offset
+            // barrier would suppress fresh values indefinitely after a source switch.
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
+                    && matchesActiveSelection(json, selection);
+        }
         if ("gamma-migration".equals(binding.event())) {
             // Same class as gex-magnet: a low-frequency derived per-chain signal that may be
             // (re)started after the source-switch offset barrier is captured, so applying that
@@ -3853,6 +4370,7 @@ public class FeedGatewayService implements ReplayRunner {
             // would stay blank until a manual refresh or the next market open.
             broadcast("source-ready", activeSelectionJson(selection, "source-ready"));
             broadcastCachedState(sourceSwitchReplayEvents());
+            replaySpotBandBatchAfterSourceSwitch();
         }
     }
 
@@ -4232,6 +4750,10 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private synchronized String updateCache(TopicBinding binding, ConsumerRecord<String, ?> record, String json) {
+        // Set by the offset gate when a record shows the recreated-topic shape, and ACTED ON only
+        // where the record is genuinely admitted — see both sites. Declared here because those two
+        // places are in different scopes and the fact has to travel between them.
+        boolean volPremiumRecreatedTopic = false;
         String event = binding.event();
         String key = record.key() == null || record.key().isBlank()
                 ? record.topic() + ":" + record.partition()
@@ -4256,6 +4778,12 @@ public class FeedGatewayService implements ReplayRunner {
             key = indexPriceCacheKey(json, key);
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
+        } else if ("spot-band".equals(event)) {
+            // PER-STRIKE, so the per-strike keyer — the same one seller-activity uses. strikeFlowCacheKey
+            // is symbol|expiry because a strike-flow record is CHAIN-WIDE (one record carrying strikes[]);
+            // a band record is one strike. Keying these board-level collapsed all ~200 into a single
+            // entry and the cache held exactly 1, which the spot_bands metric showed immediately.
+            key = deltaFlowCacheKey(json, key);
         } else if ("seller-activity".equals(event)) {
             key = deltaFlowCacheKey(json, key);
         } else if ("delta-flow".equals(event)) {
@@ -4276,6 +4804,12 @@ public class FeedGatewayService implements ReplayRunner {
             key = greekMoveAuthCacheKey(json, key);
         } else if ("spot-vol-regime".equals(event)) {
             key = spotVolRegimeCacheKey(json, key);
+        } else if ("vol-premium-ivrv".equals(event)) {
+            key = volPremiumIvrvCacheKey(json, key);
+        } else if ("indicators".equals(event)) {
+            key = indicatorsCacheKey(json, key);
+        } else if ("tapeZones".equals(event)) {
+            key = tapeZonesCacheKey(json, key);
         } else if ("close-direction".equals(event)) {
             key = closeDirectionCacheKey(json, key);
         } else if ("zero-dte-intelligence".equals(event)) {
@@ -4325,16 +4859,66 @@ public class FeedGatewayService implements ReplayRunner {
             key = binding.source() + "|" + key;
         }
         String versionKey = event + ":" + key;
-        if ("ibkr-preopen-status".equals(event)) {
-            // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5): the status topic is single-
-            // partition and strictly ordered by offset — Kafka timestamps may tie or regress
-            // across legitimate later offsets (and the cache + live consumers read the same
-            // partition). Accept ONLY a strictly higher offset on the same partition; a
-            // DIFFERENT partition for the same key is impossible on the 1-partition contract
-            // (fail-closed: reject, never reorder).
+        if ("ibkr-preopen-status".equals(event) || "indicators".equals(event)
+                || "tapeZones".equals(event) || "vol-premium-ivrv".equals(event)) {
+            // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5; indicators rev 14
+            // §6.9 r1 finding 2): these topics are single-partition per symbol and
+            // strictly ordered by offset — Kafka timestamps may tie or regress
+            // across legitimate later offsets (and the cache + live consumers read
+            // the same partition). Accept ONLY a strictly higher offset on the same
+            // partition; a DIFFERENT partition for the same key is fail-closed
+            // (reject, never reorder) — each indicator symbol lives on exactly one
+            // topic/partition (§7.3).
+            //
+            // vol-premium-ivrv belongs to exactly this class, and needs it for a reason the event
+            // time cannot cover: the contract permits an equal-event-time CORRECTION at a later
+            // offset (Kafka is last-write-wins), and the generic event-time gate accepts equal
+            // timestamps. Without the offset gate the cache consumer could take offset N+1 and the
+            // live consumer then take offset N, whose equal timestamp passes — broadcasting the
+            // value the correction had already superseded. The topic is single-partition by
+            // construction: the producer creates it with one partition and refuses to boot on any
+            // other count.
             RecordPosition incoming = recordPosition(record);
             RecordPosition previousPosition = cachePositions.get(versionKey);
-            if (previousPosition != null
+            // A TOPIC RECREATION IS NOT A REGRESSION, and the gate cannot tell them apart from the
+            // offset alone.
+            //
+            // A deleted-and-remade topic — an operator remaking it, the daily reset — starts again
+            // at offset zero while a perfectly fresh cache entry still holds the old incarnation's
+            // position. Every frame of the SAME session would then be refused until the offset
+            // climbed back past it, which for a mid-session recreation is the rest of the day. The
+            // cache freezes, live delivery stops, and nothing anywhere reports a fault.
+            //
+            // The EVENT TIME is what distinguishes the two. This producer stamps each reading with
+            // its own stream time, which never runs backwards, so a record that is BOTH behind the
+            // stored offset and strictly ahead of the stored event time cannot be a replay of
+            // something already seen — no incarnation of this topic can produce it. A recreation
+            // can, and does, on its very first record.
+            //
+            // So that shape RESETS the entry rather than being dropped: it is counted, and the
+            // fence goes with it, because a stale fence would suppress the same frames the
+            // position gate just stopped suppressing.
+            if (previousPosition != null && "vol-premium-ivrv".equals(event)) {
+                Long storedEventTime = cacheEventTimes.get(versionKey);
+                long incomingEventTime = eventCacheTimestamp(event, record, json);
+                // AT OR BELOW the stored offset, not strictly below. If the old incarnation had
+                // reached only offset 0 — a topic recreated moments after its first record, or one
+                // whose only frame was the session's first — the new incarnation's first record is
+                // offset 0 as well, and a strict comparison would drop the very frame this
+                // recovery exists to admit. Equal offset with a strictly newer event time is just
+                // as impossible within one incarnation as a lower one: an offset identifies a
+                // record, and this producer's event times never run backwards.
+                volPremiumRecreatedTopic = incoming.offset() <= previousPosition.offset()
+                        && previousPosition.partition().equals(incoming.partition())
+                        && storedEventTime != null && incomingEventTime > storedEventTime;
+                // NOTHING IS RECORDED HERE. Recognising the shape is not the recovery — the record
+                // still has the staleness gate ahead of it, and a recreated topic whose first
+                // record arrives past its TTL is refused. Counting and clearing the fence at this
+                // point would report a recovery that did not happen and would drop a fence for a
+                // record that never got cached or broadcast. Both happen where the record is
+                // actually admitted, below.
+            }
+            if (!volPremiumRecreatedTopic && previousPosition != null
                     && (!previousPosition.partition().equals(incoming.partition())
                         || incoming.offset() <= previousPosition.offset())) {
                 return null;
@@ -4348,8 +4932,24 @@ public class FeedGatewayService implements ReplayRunner {
         boolean isTerminalMaxPainShortCircuitBypass = "max-pain".equals(event) && isMaxPainExpired(json);
         if (!isTerminalMaxPainShortCircuitBypass
                 && !"ibkr-preopen-status".equals(event)
+                && !"indicators".equals(event)
+                && !"tapeZones".equals(event)
+                // vol-premium-ivrv is DELIBERATELY still timestamp-gated, unlike the three above.
+                //
+                // Its event time cannot legitimately regress: the producer stamps each reading
+                // with its own Kafka Streams stream time, which never runs backwards, so a later
+                // record always carries an equal or greater event time. Equal is the correction
+                // case and passes this gate; strictly EARLIER is a corrupt or foreign record, and
+                // dropping it here is the same rule the browser applies to its own series — which
+                // is the point. Excluding it here instead would leave the gateway accepting a
+                // regression that every browser then discards, so a live client and a late joiner
+                // would diverge with nothing failing anywhere. The offset gate above still does
+                // the work the timestamp gate cannot: it decides which CONSUMER broadcasts, and
+                // orders the equal-time corrections that this gate lets through.
                 && previousEventTime != null && previousEventTime > eventTime) {
-            return null;   // (the pre-open stream is offset-ordered above, never timestamp-gated)
+            return null;   // (offset-ordered streams above are never timestamp-gated —
+                           // a publishedAt wall-clock regression must not outrank a
+                           // higher offset + higher revision, r1 finding 2)
         }
         if ("gex-by-strike".equals(event)
                 && previousEventTime != null
@@ -4416,6 +5016,12 @@ public class FeedGatewayService implements ReplayRunner {
                 strikeFlows.put(key, json);
                 return key;
             }
+            case "spot-band" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                spotBands.put(key, json);
+                return key;
+            }
             case "seller-activity" -> {
                 sellerActivityStore.put(key, json, eventTime);
                 return key;
@@ -4468,10 +5074,35 @@ public class FeedGatewayService implements ReplayRunner {
                 greekMoveAuthCurrent.put(key, json); // ONE current verdict per symbol — last-value-wins
                 return key;
             }
+            case "vol-premium-ivrv" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                volPremiumIvrv.put(key, json); // ONE current reading per source|SYMBOL|sessionDate
+                if (volPremiumRecreatedTopic) {
+                    // HERE, where the record is genuinely admitted, so the counter means what its
+                    // HELP text says — a recovery that happened — and the fence is dropped only
+                    // for a reading that will actually be cached and offered for broadcast.
+                    VOL_PREMIUM_TOPIC_RESETS.incrementAndGet();
+                    volPremiumIvrvBroadcastOffset.remove(key);
+                }
+                return key;
+            }
             case "spot-vol-regime" -> {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 spotVolRegime.put(key, json); // ONE current regime per symbol — last heartbeat wins
+                return key;
+            }
+            case "indicators" -> {
+                // (runId, revision) supersession (rev 14 §6.9): accept a NEW runId in
+                // arrival order and retire the prior; require strictly increasing
+                // revision within the active run; reject retired-run returns.
+                if (!indicatorsSupersedes(key, json)) {
+                    return null; // regression/retired-run — never cached or broadcast
+                }
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                indicatorsCurrent.put(key, json);
                 return key;
             }
             case "close-direction" -> {
@@ -4599,6 +5230,16 @@ public class FeedGatewayService implements ReplayRunner {
                 reevaluateIbkrPreOpenPendingProjections(System.currentTimeMillis());
                 return key;
             }
+            case "tapeZones" -> {
+                // Last-value-wins per sessionDate on the compacted 1-partition board topic. The
+                // RAW producer value is cached (enrichJson bypassed at ingest); the wrapper is
+                // built at EMIT so replay carries the true age rather than a frozen stamp.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                tapeZonesBoards.put(key, json);
+                tapeZonesPositions.put(key, new long[]{record.offset(), eventTime});
+                return key;
+            }
             case "liquidity-heatmap" -> {
                 // Latest column frame per symbol|expiry, last-value-wins; short TTL keeps a dead
                 // producer from replaying minutes-old liquidity as live on connect.
@@ -4622,11 +5263,38 @@ public class FeedGatewayService implements ReplayRunner {
                 gexMagnet.put(key, json);
                 return key;
             }
+            case "corridor-gauge" -> {
+                // Per-chain last-value-wins upsert; the producer never tombstones. The cache key
+                // is SOURCE|symbol|expiry (UI-review r2 #2): replayCacheMap derives the routing
+                // source from the prefix before the first '|', and the record key alone would
+                // hand it "SPX" as a source.
+                key = binding.source() + "|" + key;
+                versionKey = event + ":" + key;
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                corridorGauges.put(key, json);
+                return key;
+            }
             case "gamma-migration" -> {
                 // Per-chain (symbol|expiry) last-value-wins upsert, same shape as gex-magnet.
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gammaMigration.put(key, json);
+                return key;
+            }
+            case "gamma-fragility" -> {
+                // Same contract as gamma-rotation: one record per chain is the whole panel.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gammaFragility.put(key, json);
+                return key;
+            }
+            case "gamma-rotation" -> {
+                // Same contract as gamma-migration: one compacted record per chain is the whole
+                // current answer, so last-value-wins with no tombstones.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gammaRotation.put(key, json);
                 return key;
             }
             case "es-gex" -> {
@@ -5107,6 +5775,7 @@ public class FeedGatewayService implements ReplayRunner {
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> new CachedEvent("gamma-migration", entry.getValue()))
                         .forEach(cachedEvents::add);
+
                 case "gex-magnet" -> gexMagnet.entrySet().stream()
                         // DATABENTO-only Avro per-chain magnet value (last-value-wins). Replay while the
                         // cache entry is alive, enforcing source/symbol/expiry isolation below.
@@ -5327,6 +5996,17 @@ public class FeedGatewayService implements ReplayRunner {
             // live. Same ONE-seam consequences as the sibling above.
             return CachePolicy.expiring(settings.spotVolRegimeTtlMs());
         }
+        if ("vol-premium-ivrv".equals(event)) {
+            // Vol-premium IV/RV reading: same SHORT freshness class — an implied-vs-realised point
+            // is only meaningful while CURRENT, and a dead producer's last reading must read as
+            // absent rather than replay as live.
+            return CachePolicy.expiring(settings.volPremiumIvrvTtlMs());
+        }
+        if ("indicators".equals(event)) {
+            // Indicator CURRENT snapshot: same SHORT freshness class — a dead
+            // producer's snapshot must read as ABSENT on late-join, never as live.
+            return CachePolicy.expiring(settings.indicatorsTtlMs());
+        }
         if ("close-direction".equals(event)) {
             // Long last-value-wins window (default 12h, the max-pain/es-open-direction class): the
             // frozen T-11m VERDICT stays decision-relevant until the close and must survive a gateway
@@ -5357,6 +6037,14 @@ public class FeedGatewayService implements ReplayRunner {
             // Pre-open window state: one session's horizon (default 4h) — survives an intra-window
             // reconnect, can never replay yesterday's window as live (rev13 R-STATE).
             return CachePolicy.expiring(settings.ibkrPreOpenStatusTtlMs());
+        }
+        if ("tapeZones".equals(event)) {
+            // Tape-zones board: the SHORT freshness class (spot-vol-regime/indicators). A board
+            // from a dead service or a stale mirror must read as ABSENT on late-join, never live.
+            // Sub-TTL aging is the card's own business — §5's 10 s STALE overlay reads the emitted
+            // ageMs; eviction here is deliberately much looser because the board publishes ON
+            // CHANGE and a quiet minute is a normal, renderable state.
+            return CachePolicy.expiring(settings.tapeZonesTtlMs());
         }
         if ("es-gex".equals(event)) {
             // ES-on-SPX aligned book: the align service re-emits ~5s, but a quiet chain may pause; a long
@@ -5394,6 +6082,18 @@ public class FeedGatewayService implements ReplayRunner {
             // otherwise a stalled/dead producer's last ARMED/DEFENDED would render as an active permission.
             // Drives join freshness (joinDealerLedger), purge eviction, and cached-replay uniformly.
             return CachePolicy.expiring(settings.dealerLedgerTtlMs());
+        }
+        if ("gamma-fragility".equals(event) || "gamma-rotation".equals(event)) {
+            // NEVER the generic 15-minute TTL. This topic publishes only when the peak MOVES, so a
+            // quiet stretch is the normal state of a healthy chain — and eviction after 15 quiet
+            // minutes threw away the whole session's move log, after which the endpoint answered
+            // present:false and the card said "the peak has not moved yet today". That is the
+            // precise false claim the card was built to avoid (Codex).
+            //
+            // The record is a SESSION-LONG accumulation, not a heartbeat: its age says nothing
+            // about whether it is still true, and the producer replaces it at the ET rollover.
+            // Seek-back matches, so a restart rebuilds a log whose last move was hours ago.
+            return CachePolicy.noEviction(settings.optionChainOffHoursSeekBackMs());
         }
         if (MARKET_AWARE_CHAIN_EVENTS.contains(event)) {
             if (isRegularTradingHours(nowMs)) {
@@ -5515,11 +6215,19 @@ public class FeedGatewayService implements ReplayRunner {
             // pass the SHORT greekMoveAuthTtlMs window and render the authenticity track as live.
             return greekMoveAuthTimestamp(json);
         }
+        if ("vol-premium-ivrv".equals(event)) {
+            // Freshness tracks the PAYLOAD's own event time, never the Kafka ARRIVAL time, so a
+            // producer catching up on a backlog cannot render a stale reading as live.
+            return volPremiumIvrvTimestamp(json);
+        }
         if ("spot-vol-regime".equals(event)) {
             // Same rule as greek-move-auth: freshness tracks the PAYLOAD stream-time (asOfEventTimeMs),
             // never the Kafka ARRIVAL time, so a producer catching up on a backlog cannot render a
             // stale regime as live.
             return spotVolRegimeTimestamp(json);
+        }
+        if ("indicators".equals(event)) {
+            return indicatorsTimestamp(json);
         }
         if ("liquidity-heatmap".equals(event)) {
             long payloadTime = liquidityHeatmapTimestamp(json);
@@ -5661,6 +6369,22 @@ public class FeedGatewayService implements ReplayRunner {
      * implausibly-future and fails closed — same freeze-safety rationale as
      * {@link #greekMoveAuthTimestamp}.
      */
+    /**
+     * Stream-time (eventTimeMs) of a vol-premium reading; -1 means malformed/absent/implausibly
+     * future and fails closed — same freeze-safety rationale as {@link #spotVolRegimeTimestamp}.
+     */
+    private long volPremiumIvrvTimestamp(String json) {
+        try {
+            long eventTimeMs = longField(mapper.readTree(json), "eventTimeMs", -1L);
+            if (eventTimeMs > System.currentTimeMillis() + SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS) {
+                return -1L; // implausibly future — fail closed, never cache or replay
+            }
+            return eventTimeMs;
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
+    }
+
     private long spotVolRegimeTimestamp(String json) {
         try {
             long eventTimeMs = longField(mapper.readTree(json), "asOfEventTimeMs", -1L);
@@ -5757,7 +6481,18 @@ public class FeedGatewayService implements ReplayRunner {
         return new RecordPosition(new TopicPartition(record.topic(), record.partition()), record.offset());
     }
 
-    private void removeCacheEntry(String versionKey) {
+    /**
+     * SYNCHRONIZED, and on the instance monitor rather than on any event's emit lock.
+     *
+     * <p>updateCache holds this same monitor, so a cache entry cannot be half-removed while a
+     * record is being installed, and the fence below is removed with the rest of the entry as one
+     * unit relative to ingest.
+     *
+     * <p>It must NOT take an event emit lock. Both ingest paths acquire the emit lock and then
+     * call updateCache, which takes this monitor; a removal taking them in the other order is a
+     * lock-order inversion, and the deadlock it buys costs far more than the window it closes.
+     */
+    private synchronized void removeCacheEntry(String versionKey) {
         cacheEventTimes.remove(versionKey);
         cachePositions.remove(versionKey);
         if (versionKey.startsWith("snapshot:")) {
@@ -5786,6 +6521,37 @@ public class FeedGatewayService implements ReplayRunner {
             greekMoveAuthCurrent.remove(versionKey.substring("greek-move-auth:".length()));
         } else if (versionKey.startsWith("spot-vol-regime:")) {
             spotVolRegime.remove(versionKey.substring("spot-vol-regime:".length()));
+        } else if (versionKey.startsWith("vol-premium-ivrv:")) {
+            String ivrvKey = versionKey.substring("vol-premium-ivrv:".length());
+            volPremiumIvrv.remove(ivrvKey);
+            // THE BROADCAST FENCE GOES WITH THE ENTRY IT FENCES.
+            //
+            // The fence remembers the greatest offset already broadcast for a key, which is what
+            // lets two consumers of one topic agree on who delivers a record. Kept after the cache
+            // entry is gone, it stops being a fence and becomes a floor: if the topic is recreated
+            // — deleted and remade by an operator, or wiped by the daily reset — offsets start at
+            // zero again, and every fresh frame of the SAME session would be silently refused
+            // until the offset climbed back past the old incarnation's high-water mark. The cache
+            // itself recovers, so late joiners would be served correctly while every already-open
+            // page froze: the worst shape, because nothing is failing.
+            //
+            // WHAT THIS IS AND IS NOT ATOMIC WITH, stated exactly, because the first version of
+            // this comment claimed more than the code gives.
+            //
+            // It is atomic with INGEST: updateCache holds the same instance monitor this method
+            // now holds, so the fence is removed with the timestamp, the position and the reading
+            // as one unit — a record can never find half an entry.
+            //
+            // It is NOT atomic with a consumer's BROADCAST DECISION, which runs under the emit
+            // lock and not under this monitor, and deliberately so: taking the emit lock here
+            // would invert the order both ingest paths use and deadlock the gateway. The window
+            // that leaves is benign in the only direction that matters. A purge landing between a
+            // consumer's cache write and its shouldBroadcast call can only RESET the fence, so
+            // that record broadcasts — never the reverse — and only for an entry already old
+            // enough to expire, which a freshly written one is not.
+            volPremiumIvrvBroadcastOffset.remove(ivrvKey);
+        } else if (versionKey.startsWith("indicators:")) {
+            indicatorsCurrent.remove(versionKey.substring("indicators:".length()));
         } else if (versionKey.startsWith("close-direction:")) {
             String cdKey = versionKey.substring("close-direction:".length());
             if (cdKey.contains("|V|")) {
@@ -5797,6 +6563,8 @@ public class FeedGatewayService implements ReplayRunner {
             zeroDteIntelligence.remove(versionKey.substring("zero-dte-intelligence:".length()));
         } else if (versionKey.startsWith("strike-flow:")) {
             strikeFlows.remove(versionKey.substring("strike-flow:".length()));
+        } else if (versionKey.startsWith("spot-band:")) {
+            spotBands.remove(versionKey.substring("spot-band:".length()));
         } else if (versionKey.startsWith("seller-activity:")) {
             sellerActivityStore.remove(versionKey.substring("seller-activity:".length()));
         } else if (versionKey.startsWith("delta-flow:")) {
@@ -5825,14 +6593,24 @@ public class FeedGatewayService implements ReplayRunner {
             gexOiStatus.remove(versionKey.substring("gex-oi-status:".length()));
         } else if (versionKey.startsWith("ibkr-preopen-status:")) {
             ibkrPreOpenStatus.remove(versionKey.substring("ibkr-preopen-status:".length()));
+        } else if (versionKey.startsWith("tapeZones:")) {
+            String tapeZonesKey = versionKey.substring("tapeZones:".length());
+            tapeZonesBoards.remove(tapeZonesKey);
+            tapeZonesPositions.remove(tapeZonesKey);
         } else if (versionKey.startsWith("strike-sr:")) {
             strikeSr.remove(versionKey.substring("strike-sr:".length()));
         } else if (versionKey.startsWith("gex-strike-lifecycle:")) {
             gexStrikeLifecycle.remove(versionKey.substring("gex-strike-lifecycle:".length()));
         } else if (versionKey.startsWith("gex-magnet:")) {
             gexMagnet.remove(versionKey.substring("gex-magnet:".length()));
+        } else if (versionKey.startsWith("corridor-gauge:")) {
+            corridorGauges.remove(versionKey.substring("corridor-gauge:".length()));
         } else if (versionKey.startsWith("gamma-migration:")) {
             gammaMigration.remove(versionKey.substring("gamma-migration:".length()));
+        } else if (versionKey.startsWith("gamma-rotation:")) {
+            gammaRotation.remove(versionKey.substring("gamma-rotation:".length()));
+        } else if (versionKey.startsWith("gamma-fragility:")) {
+            gammaFragility.remove(versionKey.substring("gamma-fragility:".length()));
         } else if (versionKey.startsWith("hot-strike:")) {
             hotStrikes.remove(versionKey.substring("hot-strike:".length()));
         } else if (versionKey.startsWith("es-gex:")) {
@@ -5946,11 +6724,30 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     public String cachedGammaMigration(String symbol, String expiry) {
+        return cachedByChain(gammaMigration, symbol, expiry);
+    }
+
+    /** The peak-rotation windows and raw move log for one chain, or null when none is cached. */
+    public String cachedGammaRotation(String symbol, String expiry) {
+        return cachedByChain(gammaRotation, symbol, expiry);
+    }
+
+    /** The leader-fragility panel for one chain, or null when none is cached. */
+    public String cachedGammaFragility(String symbol, String expiry) {
+        return cachedByChain(gammaFragility, symbol, expiry);
+    }
+
+    /**
+     * ONE key derivation for both. They are written by the same producer under the same key, so
+     * two hand-rolled copies could only ever drift apart — and a mismatch here is invisible: the
+     * endpoint answers present:false for a chain that is publishing once a second.
+     */
+    private String cachedByChain(Map<String, String> cache, String symbol, String expiry) {
         if (symbol == null || expiry == null) {
             return null;
         }
         String key = "DATABENTO|" + symbol.trim().toUpperCase(Locale.ROOT) + "|" + normalizeExpiry(expiry);
-        return gammaMigration.get(key);
+        return cache.get(key);
     }
 
     /**
@@ -6372,6 +7169,35 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** Legacy-mode cached replay of the standalone corridor-gauge state on connect. Fresh
+     *  entries only; the strip otherwise waits at most one 60s heartbeat for a live frame. */
+    private void replayCorridorGaugeCached(WebSocketSession session) {
+        // Purge first (dealer-ledger precedent), then per-entry freshness AND active-selection
+        // isolation (UI-review r2 #2): a legacy client must not receive another chain's frame.
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        ActiveSelection selection = activeSelection.get();
+        for (Map.Entry<String, String> entry : corridorGauges.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("corridor-gauge:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            // the cache key ENCODES the source (SOURCE|symbol|expiry); the payload itself is
+            // source-less, so the key is the only authoritative source check here (r3 #1)
+            if (selection == null
+                    || !entry.getKey().startsWith(selection.source() + "|")) {
+                continue;
+            }
+            if (!matchesCachedSelection(json, selection)) {
+                continue;
+            }
+            send(session, "corridor-gauge", json);
+        }
+    }
+
     private void replayShortPremiumCached(WebSocketSession session) {
         // Purge first so a recommendation that crossed its (12h) TTL since the last poll purge is evicted
         // before replay rather than sent to the connecting client. Unlike dealer-ledger this is intentionally
@@ -6475,6 +7301,35 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /**
+     * Late-join delivery for the vol-premium IV/RV reading: same GLOBAL advisory class as
+     * {@link #replaySpotVolRegimeCached} — deliberately NOT filtered by the active market
+     * selection, and symbol-filtered client-side. Purge-first plus the SHORT window means a late
+     * joiner gets the CURRENT reading only; anything older is simply absent and the chart shows no
+     * current point rather than a stale one.
+     */
+    private void replayVolPremiumIvrvCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        // The (cache-read -> send-enqueue) pair is atomic under the emit lock, so a live update
+        // either lands BEFORE (and replay reads the newer value) or AFTER (and its enqueue
+        // supersedes ours via coalescing). The stale ordering — live N+1 enqueued, then replayed
+        // N enqueued over it under the same coalescing key, leaving the socket on the older value
+        // until some later frame happens to arrive — cannot happen.
+        synchronized (volPremiumIvrvEmitLock) {
+            for (Map.Entry<String, String> entry : volPremiumIvrv.entrySet()) {
+                String json = entry.getValue();
+                if (json == null || json.isBlank()) {
+                    continue;
+                }
+                if (!isCacheFresh("vol-premium-ivrv:" + entry.getKey(), nowMs)) {
+                    continue;
+                }
+                send(session, "vol-premium-ivrv", json);
+            }
+        }
+    }
+
     private void replaySpotVolRegimeCached(WebSocketSession session) {
         // Late-join delivery for the spot-vol-regime CURRENT snapshot: same GLOBAL advisory class as
         // replayGreekMoveAuthCached above — intentionally NOT filtered by the active market selection,
@@ -6495,6 +7350,145 @@ public class FeedGatewayService implements ReplayRunner {
             // outlives the close by 4 minutes. Strip the band (never the snapshot) once the session is
             // over so a browser opened at 16:01 does not late-join into a coloured chain.
             send(session, "spot-vol-regime", suppressStrikeBandAfterClose(json, nowMs));
+        }
+    }
+
+    /**
+     * Late-join delivery for indicator CURRENT snapshots (rev 14 §8): PER-SYMBOL —
+     * both ES and SPX replay independently; GLOBAL advisory class, symbol-filtered
+     * client-side; SHORT-TTL fresh-gated so a dead producer reads as absent.
+     */
+    private void replayIndicatorsCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        // r1 finding 3: the (cache-read → send-enqueue) pair is atomic under the
+        // emit lock — a live update either lands before (replay reads the newer
+        // value) or after (its enqueue supersedes ours via coalescing). The stale
+        // ordering "live N+1 enqueued, then replayed N enqueued" cannot happen.
+        synchronized (indicatorsEmitLock) {
+            for (Map.Entry<String, String> entry : indicatorsCurrent.entrySet()) {
+                String json = entry.getValue();
+                if (json == null || json.isBlank()) {
+                    continue;
+                }
+                if (!isCacheFresh("indicators:" + entry.getKey(), nowMs)) {
+                    continue;
+                }
+                send(session, "indicators", json);
+            }
+        }
+    }
+
+    /**
+     * Canonical symbol (ES|SPX) keys the indicator cache — STRICT (r1 finding 6):
+     * the payload symbol must be exactly ES or SPX AND equal the Kafka record key
+     * (a keyed-SPX record claiming ES may never overwrite ES state); the frame must
+     * carry schemaVersion 1, a bounded runId, an INTEGRAL non-negative revision and
+     * a parseable publishedAt. Anything else is dropped (null), never cached or
+     * forwarded.
+     */
+    private String indicatorsCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol");
+            if (!"ES".equals(symbol) && !"SPX".equals(symbol)) {
+                return null;
+            }
+            if (fallback != null && !symbol.equals(fallback)) {
+                return null; // Kafka key / payload identity mismatch — poisoning guard
+            }
+            JsonNode sv = root.get("schemaVersion");
+            if (sv == null || !sv.isIntegralNumber() || !sv.canConvertToInt()
+                    || sv.asInt() != 1) {
+                return null;
+            }
+            JsonNode runNode = root.get("runId");
+            if (runNode == null || !runNode.isTextual()) {
+                return null; // r3 finding 2: a numeric/boolean runId is type-invalid
+            }
+            String runId = runNode.asText();
+            if (runId.isBlank() || runId.length() > 64) {
+                return null;
+            }
+            JsonNode rev = root.get("revision");
+            if (rev == null || !rev.isIntegralNumber() || !rev.canConvertToLong()
+                    || rev.asLong() < 0) {
+                return null;
+            }
+            String publishedAt = text(root, "publishedAt");
+            java.time.Instant.parse(publishedAt);
+            return symbol;
+        } catch (Exception malformed) {
+            return null;
+        }
+    }
+
+    /** Payload publish time (publishedAt ISO) drives freshness; -1 = malformed. */
+    private long indicatorsTimestamp(String json) {
+        try {
+            String publishedAt = text(mapper.readTree(json), "publishedAt");
+            if (publishedAt.isBlank()) {
+                return -1L;
+            }
+            long ms = java.time.Instant.parse(publishedAt).toEpochMilli();
+            if (ms > System.currentTimeMillis() + SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS) {
+                return -1L; // implausibly future — fail closed
+            }
+            return ms;
+        } catch (Exception ignored) {
+            return -1L;
+        }
+    }
+
+    /** Rev 14 §6.9 cross-run ordering; returns false on any regression. */
+    private boolean indicatorsSupersedes(String symbol, String json) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            JsonNode runNode = root.get("runId");
+            if (runNode == null || !runNode.isTextual()) {
+                return false; // r3 finding 2: strict schema — runId is a string
+            }
+            String runId = runNode.asText();
+            JsonNode revNode = root.get("revision");
+            // r1 finding 6: revision must be an INTEGRAL JSON number — a textual
+            // number is a schema violation, never coerced.
+            if (runId.isBlank() || runId.length() > 64 || revNode == null
+                    || !revNode.isIntegralNumber() || !revNode.canConvertToLong()
+                    || revNode.asLong() < 0) {
+                return false;
+            }
+            long revision = revNode.asLong();
+            synchronized (indicatorsRevision) {
+                String currentRun = indicatorsRunId.get(symbol);
+                if (runId.equals(currentRun)) {
+                    Long last = indicatorsRevision.get(symbol);
+                    if (last != null && revision <= last) {
+                        return false; // stale revision within the active run
+                    }
+                } else {
+                    if (indicatorsRetiredRuns.contains(symbol + "|" + runId)) {
+                        return false; // a retired run may never return
+                    }
+                    if (currentRun != null) {
+                        // r3 finding 1: the never-return rule is ABSOLUTE — eviction
+                        // is forbidden. At the (operationally unreachable) cap the
+                        // gateway FAILS CLOSED: no further run transitions are
+                        // accepted, the current run keeps serving, and memory stays
+                        // bounded. A retired run can never re-enter.
+                        synchronized (indicatorsRetiredRuns) {
+                            if (indicatorsRetiredRuns.size() >= INDICATORS_RETIRED_RUNS_CAP) {
+                                return false;
+                            }
+                            indicatorsRetiredRuns.add(symbol + "|" + currentRun);
+                        }
+                    }
+                    indicatorsRunId.put(symbol, runId);
+                }
+                indicatorsRevision.put(symbol, revision);
+            }
+            return true;
+        } catch (JsonProcessingException e) {
+            return false;
         }
     }
 
@@ -7713,6 +8707,196 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
+     * Events whose Kafka value is a PRODUCER-authored contract that must reach the browser
+     * byte-untouched: {@link #enrichJson} is bypassed at ingest so the gateway can never stamp
+     * {@code marketDataSource}/{@code source}/{@code sessionDate} over the producer's own fields.
+     */
+    private static boolean isRawPassThroughEvent(String event) {
+        return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
+                || "es-cvd-spx-levels".equals(event);
+    }
+
+    /**
+     * The wire form for the tape-zones board: the producer record rides VERBATIM under
+     * {@code board} and the gateway adds ONLY its own clock stamps around it (UI design §3 —
+     * "no gateway-side computation ... the board record already carries everything").
+     *
+     * <p>{@code boardTimeMs} is the KAFKA RECORD timestamp, i.e. when the service published this
+     * board — deliberately NOT the payload's {@code quality.watermark}. The watermark is STREAM
+     * time (max eventTime of released trades) and legitimately stops advancing on a quiet tape or
+     * is null before the first release, so using it for liveness would paint a healthy board STALE.
+     * The record timestamp answers the only question §5's 10 s overlay asks: is the producer alive.
+     *
+     * <p>{@code serverTime} + {@code ageMs} are stamped at EMIT, from ONE clock (the gateway's), so
+     * the card never differences a producer clock against a browser clock. {@code offset} is the
+     * ordering token: live and replay deliveries can interleave at the socket, so the client
+     * renders last-writer-wins by offset exactly as the pre-open sibling does.
+     */
+    static String wrapTapeZonesBoard(long offset, long boardTimeMs, long serverTimeMs, String json) {
+        long ageMs = boardTimeMs <= 0 ? -1L : Math.max(0L, serverTimeMs - boardTimeMs);
+        return "{\"offset\":" + offset
+                + ",\"boardTimeMs\":" + boardTimeMs
+                + ",\"serverTime\":" + serverTimeMs
+                + ",\"ageMs\":" + ageMs
+                + ",\"board\":" + json + "}";
+    }
+
+    /**
+     * The ONE live-delivery seam for the tape-zones board, shared by both ingesting consumers.
+     *
+     * <p>Order is load-bearing and the whole point of the fix: {@link #updateCache} runs FIRST and
+     * its return value is the gate. It answers null for a record that fails the fail-closed
+     * identity contract, that repeats or rewinds an offset on the single-partition topic, or whose
+     * event time is already outside the TTL — and in every one of those cases nothing is broadcast.
+     * A client can therefore never be shown a board the cache refused to keep.
+     *
+     * <p>The offset CAS behind it makes delivery exactly-once ACROSS the two consumers, and the
+     * emit lock makes (cache-mutate → enqueue) atomic against the replay's (cache-read → send), so
+     * a replayed older board can never be enqueued after a newer live one.
+     */
+    private void tapeZonesBroadcast(TopicBinding binding, ConsumerRecord<String, ?> record, String json,
+                                    AtomicBoolean caughtUpFlag) {
+        synchronized (tapeZonesEmitLock) {
+            String cacheKey = updateCache(binding, record, json);
+            if (cacheKey == null) {
+                return;   // refused by identity / ordering / TTL — never forwarded
+            }
+            if (!caughtUpFlag.get() || !shouldBroadcastTapeZones(record.offset())) {
+                return;
+            }
+            // Re-read the position the cache just committed rather than re-deriving it from the
+            // record: the replay path reads the SAME pair, so the two surfaces cannot disagree
+            // about a board's age.
+            long[] position = tapeZonesPositions.get(cacheKey);
+            if (position == null) {
+                return;
+            }
+            broadcast(binding.event(),
+                    wrapTapeZonesBoard(position[0], position[1], System.currentTimeMillis(), json));
+            forwardedEvents.incrementAndGet();
+        }
+    }
+
+    /**
+     * Late-join delivery for the tape-zones board: STANDALONE global advisory class, fresh-gated on
+     * the SHORT tapeZonesTtlMs window so a dead service (or an un-mirrored dev/prod broker) reads as
+     * absent rather than replaying yesterday's session as live. The age stamps are recomputed HERE,
+     * at emit, so a client connecting ten minutes after the last change sees the true age.
+     */
+    private void replayTapeZonesCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        // The (cache-read → send-enqueue) pair is atomic against the live seam: a live update
+        // either lands before (we read the newer value) or after (its enqueue supersedes ours via
+        // coalescing). The stale ordering "live N+1 enqueued, then replayed N enqueued" cannot happen.
+        synchronized (tapeZonesEmitLock) {
+            for (Map.Entry<String, String> entry : tapeZonesBoards.entrySet()) {
+                String board = entry.getValue();
+                if (board == null || board.isBlank()) {
+                    continue;
+                }
+                if (!isCacheFresh("tapeZones:" + entry.getKey(), nowMs)) {
+                    continue;
+                }
+                long[] position = tapeZonesPositions.get(entry.getKey());
+                if (position == null) {
+                    continue; // no ordering/age token — never emit an unaged board
+                }
+                send(session, "tapeZones", wrapTapeZonesBoard(position[0], position[1], nowMs, board));
+            }
+        }
+    }
+
+    /**
+     * Cache key for the tape-zones board — the payload's own {@code sessionDate} (§6.2 keys the
+     * topic {@code ES|sessionDate}). STRICT, fail-closed: the frame must carry schemaVersion 1 and
+     * a non-blank sessionDate, and when the Kafka key names a session it must MATCH the payload's
+     * (a record keyed for one session may never overwrite another's board). Anything else returns
+     * null — never cached, never forwarded.
+     */
+    /**
+     * The literal record-key prefix the tape-zones service writes. Verified against the producer,
+     * not the design doc: {@code TapeZonesRuntime} publishes
+     * {@code new ProducerRecord<>(boardTopic, "ES|" + session, board)}. The tape is ES-only by
+     * construction (TAPE-ZONES-REQUIREMENT §11 explicitly rules out an SPX/SPY tape variant), so
+     * this is a CONSTANT, not a symbol the gateway should be flexible about.
+     */
+    private static final String TAPE_ZONES_KEY_PREFIX = "ES|";
+
+    /**
+     * Cache key for the tape-zones board — FAIL-CLOSED on the full identity contract.
+     *
+     * <p>The board is a single-key compacted topic that every authenticated client renders as
+     * "the session". There is therefore no such thing as a partially-trusted board: a record whose
+     * identity cannot be proven must not enter the cache, because everything downstream (live
+     * broadcast, connect replay, the caught-up re-push) reads the cache and would fan it out.
+     *
+     * <p>ALL of the following must hold, or the record is rejected and counted:
+     * <ul>
+     *   <li>the payload carries {@code schemaVersion} exactly 1 — an unknown shape is refused,
+     *       never guessed at;</li>
+     *   <li>the Kafka key is present and starts with the exact {@code ES|} prefix. A null/blank
+     *       key, a bare {@code 2026-08-07}, or {@code NDX|2026-08-07} are all rejected: the second
+     *       cannot be attributed to a producer at all and the third is a DIFFERENT instrument's
+     *       record that would otherwise silently overwrite the ES board;</li>
+     *   <li>the keyed session is a strictly valid ISO {@code yyyy-MM-dd} calendar date (so
+     *       {@code 2026-02-30} or {@code 2026-8-7} are refused, not coerced);</li>
+     *   <li>the payload's own {@code sessionDate} is likewise a valid calendar date AND equal to
+     *       the keyed one — a record keyed for one session may never overwrite another's board.</li>
+     * </ul>
+     */
+    private String tapeZonesCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            JsonNode schemaVersion = root.get("schemaVersion");
+            if (schemaVersion == null || !schemaVersion.isIntegralNumber()
+                    || !schemaVersion.canConvertToInt() || schemaVersion.asInt() != 1) {
+                return rejectTapeZones();
+            }
+            // The Kafka key is REQUIRED, not a best-effort cross-check. Without it the record has
+            // no verifiable producer identity, and "trust the payload's own claim about itself" is
+            // exactly the hole a poisoned record walks through.
+            if (fallback == null || !fallback.startsWith(TAPE_ZONES_KEY_PREFIX)) {
+                return rejectTapeZones();
+            }
+            String keyedSession = fallback.substring(TAPE_ZONES_KEY_PREFIX.length());
+            if (!isIsoCalendarDate(keyedSession)) {
+                return rejectTapeZones();
+            }
+            String sessionDate = text(root, "sessionDate");
+            if (!isIsoCalendarDate(sessionDate) || !keyedSession.equals(sessionDate)) {
+                return rejectTapeZones();
+            }
+            return sessionDate;
+        } catch (Exception malformed) {
+            return rejectTapeZones();
+        }
+    }
+
+    /** Count the refusal and return null (the "dropped" contract updateCache's callers expect). */
+    private String rejectTapeZones() {
+        tapeZonesRejected.incrementAndGet();
+        return null;
+    }
+
+    /**
+     * Strict ISO calendar date: the shape {@code yyyy-MM-dd} AND a date that really exists.
+     * {@code LocalDate.parse} alone would accept neither {@code 2026-8-7} (wrong shape) nor
+     * {@code 2026-02-30} (not a real day), which is precisely the point — both are rejected.
+     */
+    static boolean isIsoCalendarDate(String text) {
+        if (text == null || !text.matches("\\d{4}-\\d{2}-\\d{2}")) {
+            return false;
+        }
+        try {
+            java.time.LocalDate.parse(text);
+            return true;
+        } catch (java.time.format.DateTimeParseException notADate) {
+            return false;
+        }
+    }
+
+    /**
      * True for the three ES open-direction advisory events (once-a-day forecast + per-horizon outcome +
      * the 60s live status heartbeat). They share the standalone/global/never-selection-gated delivery
      * class; freshness deliberately does NOT: cachePolicyFor gives the status its own SHORT window
@@ -7989,6 +9173,86 @@ public class FeedGatewayService implements ReplayRunner {
         return fallback;
     }
 
+    /**
+     * Key a vol-premium reading by SYMBOL|sessionDate, matching the producer's own record key.
+     * updateCache then source-prefixes it, so the stored key is source|SYMBOL|sessionDate — the
+     * sessionDate component is what stops two sessions sharing one cache slot.
+     */
+    /**
+     * The vol-premium reader, which is STRICTER than the shared mapper on one specific point.
+     *
+     * <p>Jackson fills a missing record component with the Java default — 0 for an int, null for a
+     * reference — so a payload with maxContiguousGapSlots simply deleted deserialises to a
+     * perfectly valid reading of zero, and the constructor has nothing to object to. The browser
+     * refuses it, because undefined is not a count. That is precisely the divergence this
+     * boundary exists to prevent: the live client keeps what it has while a late joiner is served
+     * only the broken record and shows nothing.
+     *
+     * <p>Two features, because the same hole has two doors. FAIL_ON_MISSING_CREATOR_PROPERTIES
+     * closes the omitted field. FAIL_ON_NULL_FOR_PRIMITIVES closes the adjacent one: an EXPLICIT
+     * null for a primitive component is also converted to the Java default, so
+     * {@code "maxContiguousGapSlots": null} arrives as a valid-looking zero by a different route.
+     *
+     * <p>Neither touches the four legitimately nullable fields — atmIvPct, impliedAsOfMs,
+     * realisedVolPct and the spread are boxed, are null on purpose, and are validated against each
+     * other by the record itself.
+     */
+    private static final com.fasterxml.jackson.databind.ObjectReader VOL_PREMIUM_READER =
+            new com.fasterxml.jackson.databind.ObjectMapper()
+                    .enable(com.fasterxml.jackson.databind.DeserializationFeature
+                            .FAIL_ON_MISSING_CREATOR_PROPERTIES)
+                    .enable(com.fasterxml.jackson.databind.DeserializationFeature
+                            .FAIL_ON_NULL_FOR_PRIMITIVES)
+                    .readerFor(com.optionsedge.contracts.volpremium.IvRvReading.class);
+
+    private String volPremiumIvrvCacheKey(String json, String fallback) {
+        com.optionsedge.contracts.volpremium.IvRvReading reading;
+        try {
+            // The WHOLE contract, not the two fields the key is built from.
+            //
+            // This method is the single gate for both paths — updateCache stores under the key it
+            // returns, and a null key also suppresses the broadcast — so whatever it admits is
+            // what a late joiner is served. Checking only symbol and sessionDate admitted a
+            // payload with a valid identity and a broken body: a bad schemaVersion, an ordinal
+            // that disagreed with its own timestamp, a coverage outside [0,1], a measurement epoch
+            // from another day. Such a record has a valid event time, so it passes freshness, and
+            // its identity is the SAME cache slot as the good reading at a higher offset — it
+            // evicts a still-fresh value and is broadcast in its place. Live browsers reject it
+            // and keep what they have; a late joiner receives only the broken value and shows
+            // nothing, with no way to tell that a good reading existed.
+            //
+            // Deserialising through the contract record makes this boundary exactly as strong as
+            // the browser's and as the producer's, because it IS the producer's: every invariant
+            // is enforced by the record's own constructor rather than by a copy of it kept here
+            // and left to drift.
+            //
+            // THE COST IS DELIBERATE AND FAIL-CLOSED: this pins the gateway to the contract
+            // version it was built against, so a producer that bumps schemaVersion blanks the card
+            // until the gateway is redeployed with the new contract. That is the safe direction —
+            // the browser pins the same version and would reject the payload anyway — and it makes
+            // a contract bump a deployment-ordering fact rather than a silent divergence.
+            reading = VOL_PREMIUM_READER.readValue(json);
+        } catch (JsonProcessingException | RuntimeException invalid) {
+            // NULL, not the record key. Falling back was justified as "malformed payloads expire
+            // immediately anyway", and that is only true of unparseable JSON or a bad event time.
+            // Because the Kafka key for this topic already IS "SPX|sessionDate", the fallback
+            // handed a malformed record the SAME cache slot as the good value.
+            return null;
+        }
+        // Locale.ROOT, not the JVM default: a cache KEY must not depend on the host's locale.
+        String key = reading.symbol().toUpperCase(Locale.ROOT) + "|" + reading.sessionDate();
+        // And the record KEY must agree with the payload it carries. Kafka's key is what compaction
+        // and last-write-wins act on, so a record keyed for one session carrying another session's
+        // body would take the first session's slot and hold it — the payload decides what is
+        // displayed, the key decides what it displaces, and only agreement makes those the same
+        // thing.
+        if (fallback != null && !fallback.isBlank()
+                && !fallback.toUpperCase(Locale.ROOT).equals(key)) {
+            return null;
+        }
+        return key;
+    }
+
     private String spotVolRegimeCacheKey(String json, String fallback) {
         try {
             String symbol = text(mapper.readTree(json), "symbol").toUpperCase();
@@ -8058,6 +9322,635 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (JsonProcessingException ignored) {
             return false;
         }
+    }
+
+    /** Keyed view of the current session's CVD bar-close records — tf|barStartMs -> record JSON. */
+    private final java.util.TreeMap<String, String> cvdBars = new java.util.TreeMap<>();
+    private volatile String cvdBarsSessionDate;
+
+    /**
+     * At-least-once keyed upsert (ES-CVD-DESIGN.md R31): last record per tf|barStartMs wins, so a
+     * restart's re-emission overwrites rather than duplicates. Session rollover clears the view —
+     * the backfill contract is CURRENT-session bars only. A foreign-shaped record is dropped from
+     * the view but still broadcast; clients apply the same keyed-upsert rule downstream.
+     */
+    void upsertCvdBar(String json) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String tf = text(root, "timeframe");
+            JsonNode bar = root.path("bar");
+            if (tf.isEmpty() || !bar.hasNonNull("barStartMs")) return;
+            String key = tf + "|" + bar.get("barStartMs").asLong();
+            String sd = text(root, "sessionDate");
+            synchronized (cvdBars) {
+                if (!sd.isEmpty()) {
+                    String current = cvdBarsSessionDate;
+                    // MONOTONIC rollover (merge-gate finding 4): sessionDate is yyyymmdd, so string
+                    // order IS date order. A NEWER date rolls the view forward; an OLDER date is a
+                    // late/replayed record from a dead session and must never resurrect it.
+                    if (current == null || sd.compareTo(current) > 0) {
+                        cvdBars.clear();
+                        cvdBarsSessionDate = sd;
+                    } else if (sd.compareTo(current) < 0) {
+                        return;                                // stale-session record: dropped
+                    }
+                }
+                cvdBars.put(key, json);
+            }
+        } catch (JsonProcessingException ignored) {
+        }
+    }
+
+    /** U16 boundary cap: one levels record may never exceed the design's 64 KiB record bound. */
+    static final int CVD_SPX_LEVELS_MAX_BYTES = 65536;
+
+    /**
+     * U16 (CL-R7/CL-R8): the provenance a levels record carries through the hop —
+     * {@code (sessionDate, foldPositionMs, foldPrints)} of the SOURCE fold that caused it, plus the
+     * two combination-matrix flags. Ordering is CALENDAR-AWARE and TOTAL: sessionDate first
+     * (the aligner emits it zero-padded, so lexical order IS date order), then foldPositionMs, then
+     * foldPrints. A CROSSED pair — one component higher, the other lower within the same session —
+     * cannot come from any single monotone fold, so it is inconsistent provenance and rejected like
+     * a regression rather than ordered.
+     */
+    record CvdSpxLevelsProvenance(String sessionDate, long foldPositionMs, long foldPrints) {
+        boolean crossed(CvdSpxLevelsProvenance other) {
+            if (!sessionDate.equals(other.sessionDate)) return false;
+            return (foldPositionMs > other.foldPositionMs && foldPrints < other.foldPrints)
+                    || (foldPositionMs < other.foldPositionMs && foldPrints > other.foldPrints);
+        }
+
+        /** −1 / 0 / +1 against another provenance in the SAME total order the aligner uses. */
+        int compareTo(CvdSpxLevelsProvenance other) {
+            int c = sessionDate.compareTo(other.sessionDate);
+            if (c != 0) return c < 0 ? -1 : 1;
+            if (foldPositionMs != other.foldPositionMs) return foldPositionMs < other.foldPositionMs ? -1 : 1;
+            if (foldPrints != other.foldPrints) return foldPrints < other.foldPrints ? -1 : 1;
+            return 0;
+        }
+    }
+
+    /**
+     * Parsed acceptance verdict for one levels record: the bytes to forward, the SOURCE provenance
+     * it carries (null when none has ever existed), and the two matrix flags.
+     */
+    record CvdSpxLevelsAccepted(String json, CvdSpxLevelsProvenance provenance,
+                                boolean provenanceRetained, boolean baselineReset) { }
+
+    /**
+     * U16 (CL-R7/CL-R8) schema validation for ONE levels record. Refuses: oversized (pre-parse),
+     * unparseable, non-object, schema major != 1 (minors ignored), state outside {OK, UNAVAILABLE},
+     * and every combination outside the design's provenance MATRIX:
+     *
+     * <ul>
+     *   <li>tombstone-derived absence — {null provenance, baselineReset true, retained false}</li>
+     *   <li>pre-first-source startup absence — {null, false, false} (never resets)</li>
+     *   <li>provenance-unrecoverable malformed — {non-null, false, retained true}</li>
+     *   <li>causally-validated source-derived — {non-null, false, false}</li>
+     * </ul>
+     *
+     * Anything else is MALFORMED and dropped — never forwarded, and never treated as a baseline
+     * erase: an invalid reset combination must not be able to wipe the gateway's retention.
+     */
+    CvdSpxLevelsAccepted validateCvdSpxLevels(String json) {
+        return validateCvdSpxLevels(CVD_SPX_LEVELS_KEY, json);
+    }
+
+    /** The topic's contractual key; the payload's symbol must agree with it (CL-R7). */
+    static final String CVD_SPX_LEVELS_KEY = "ES.v.0";
+
+    /**
+     * U16 (§2 / CL-R7 / CL-R8): the FULL gateway schema gate for one aligned levels record. The
+     * record reaches the browser byte-for-byte, so anything this misses is something a page has to
+     * survive — the aligner validating its own output is not a substitute for the boundary between
+     * a producer and every client.
+     *
+     * <p>Refused: a foreign Kafka key or a payload {@code symbol} disagreeing with it; oversize
+     * (pre-parse); unparseable or non-object; schema major != 1; a state outside {OK, UNAVAILABLE};
+     * any field the state forbids; a missing or unknown UNAVAILABLE reason; every provenance
+     * combination outside the matrix; and, on OK records, the whole structure contract — required
+     * envelope fields, array bounds, per-level shape with the side-sign rule and duplicate-price
+     * rejection, flip and balance shape, basis fields with a known state, and the cross-field
+     * bounds (level touches and the flip crossing lie at or before the record's own flow time).
+     * Every integral field must be JS-exact and non-truncating; a {@code BigIntegerNode} is
+     * integral and {@code asLong()} would wrap it.
+     */
+    CvdSpxLevelsAccepted validateCvdSpxLevels(String key, String json) {
+        if (json == null || !CVD_SPX_LEVELS_KEY.equals(key)) return null;
+        if (json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > CVD_SPX_LEVELS_MAX_BYTES) {
+            return null;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode n = mapper.readTree(json);
+            if (n == null || !n.isObject()) return null;
+            if (!n.path("schemaVersion").asText("").matches("1\\.\\d+\\.\\d+")) return null;
+            if (!CVD_SPX_LEVELS_KEY.equals(n.path("symbol").asText(""))) return null;
+            Long alignedAtMs = levelsInt(n, "alignedAtMs");
+            if (alignedAtMs == null || alignedAtMs <= 0) return null;
+            String state = n.path("state").asText("");
+
+            if ("OK".equals(state)) {
+                for (String unavailableOnly : CVD_SPX_LEVELS_UNAVAILABLE_ONLY_FIELDS) {
+                    if (n.has(unavailableOnly)) return null;      // present at all, whatever its value
+                }
+                if (!n.path("sessionComplete").isBoolean()) return null;
+                // TEXTUAL by contract: asText() coerces the integer 20260817 into "20260817", so a
+                // strict-type violation would pass a check that looks like it enforces the type.
+                if (!n.path("sessionDate").isTextual()) return null;
+                String sessionDate = n.path("sessionDate").asText("");
+                if (!sessionDate.matches("\\d{8}") || !isCalendarDate(sessionDate)) return null;
+                Long flow = levelsInt(n, "flowEventTimeMs");
+                Long sourcePublished = levelsInt(n, "sourcePublishedAtMs");
+                Long basisCents = levelsInt(n, "basisCents");
+                Long basisMeasured = levelsInt(n, "basisMeasuredAtMs");
+                Long pos = levelsInt(n, "foldPositionMs");
+                Long prints = levelsInt(n, "foldPrints");
+                if (flow == null || flow < 0 || sourcePublished == null || sourcePublished <= 0
+                        || basisCents == null || basisMeasured == null || basisMeasured <= 0
+                        || pos == null || pos < 0 || prints == null || prints < 0) {
+                    return null;
+                }
+                if (!CVD_SPX_LEVELS_BASIS_STATES.contains(n.path("basisState").asText(""))) return null;
+                if (!validLevelsArray(n.get("buyLevels"), true, flow)
+                        || !validLevelsArray(n.get("sellLevels"), false, flow)) {
+                    return null;
+                }
+                com.fasterxml.jackson.databind.JsonNode flip = n.get("flip");
+                if (flip == null) return null;                            // present, possibly null
+                if (!flip.isNull()) {
+                    if (!flip.isObject()) return null;
+                    Long fp = levelsInt(flip, "priceCents");
+                    Long at = levelsInt(flip, "atMs");
+                    Long cross = levelsInt(flip, "cvdAtCross");
+                    String dir = flip.path("direction").asText("");
+                    if (fp == null || fp <= 0 || fp > CVD_SPX_LEVELS_MAX_PRICE_CENTS
+                            || at == null || at <= 0 || at > flow || cross == null
+                            || (!"UP".equals(dir) && !"DOWN".equals(dir))) {
+                        return null;
+                    }
+                }
+                com.fasterxml.jackson.databind.JsonNode balance = n.get("balancePriceCents");
+                if (balance == null) return null;                         // present, possibly null
+                if (!balance.isNull()) {
+                    Long b = levelsInt(n, "balancePriceCents");
+                    if (b == null || b <= 0 || b > CVD_SPX_LEVELS_MAX_PRICE_CENTS) return null;
+                }
+                return new CvdSpxLevelsAccepted(json,
+                        new CvdSpxLevelsProvenance(sessionDate, pos, prints), false, false);
+            }
+            if (!"UNAVAILABLE".equals(state)) return null;
+
+            if (!CVD_SPX_LEVELS_REASONS.contains(n.path("reason").asText(""))) return null;
+            for (String okOnly : CVD_SPX_LEVELS_OK_ONLY_FIELDS) {
+                if (n.has(okOnly)) return null;                           // OK-only field on UNAVAILABLE
+            }
+            if (!n.path("provenanceRetained").isBoolean() || !n.path("baselineReset").isBoolean()) return null;
+            if (!n.has("sourceProvenance")) return null;
+            boolean retained = n.path("provenanceRetained").asBoolean();
+            boolean reset = n.path("baselineReset").asBoolean();
+            com.fasterxml.jackson.databind.JsonNode sp = n.get("sourceProvenance");
+            CvdSpxLevelsProvenance p = null;
+            if (!sp.isNull()) {
+                p = provenanceOfUnavailable(sp);
+                if (p == null) return null;
+            }
+            boolean hasProvenance = p != null;
+            boolean matrixOk =
+                    (!hasProvenance && reset && !retained)       // tombstone-derived absence
+                    || (!hasProvenance && !reset && !retained)   // pre-first-source startup absence
+                    || (hasProvenance && !reset && retained)     // provenance-unrecoverable malformed
+                    || (hasProvenance && !reset && !retained);   // causally validated
+            if (!matrixOk) return null;
+            return new CvdSpxLevelsAccepted(json, p, retained, reset);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * U16 startup hydration: read the compacted levels partition's latest COMMITTED record and
+     * apply it through the ordinary validate+retain path, so a restarted gateway serves the
+     * governing record in its very first hello instead of a null. Bounded and best-effort by
+     * design — a failure leaves the replay empty, which the page renders as no_data (fail-closed),
+     * and the next live record hydrates it anyway.
+     */
+    /** Bounded: this runs on the startup path, so it must never hold the service down. */
+    static final long CVD_SPX_LEVELS_HYDRATE_DEADLINE_MS = 15_000L;
+
+    void hydrateCvdSpxLevels() {
+        String topic = settings.esCvdSpxLevelsTopic();
+        Properties props = stringObjectConsumerProperties("cvd-spx-levels-hydrate");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none");
+        // ONE absolute deadline, taken BEFORE the first Kafka call and spent down by every blocking
+        // operation including the close. Per-call 10s timeouts do not bound a startup step: three
+        // metadata calls plus a position() plus a bounded close can each pay their own timeout, and
+        // "15 seconds" would quietly become a minute on a sick broker.
+        final long deadlineNanos = System.nanoTime()
+                + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(CVD_SPX_LEVELS_HYDRATE_DEADLINE_MS);
+        // The CONSTRUCTOR is inside the guard: a config, security or client-initialization failure
+        // here would otherwise escape a best-effort startup step and abort @PostConstruct — the
+        // opposite of the fail-closed levels:null this promises.
+        KafkaConsumer<String, Object> consumer = null;
+        try {
+            consumer = new KafkaConsumer<>(props);
+            var infos = consumer.partitionsFor(topic, hydrateRemaining(deadlineNanos));
+            if (infos == null || infos.isEmpty()) return;               // topic not created yet
+            if (infos.size() != 1) {
+                System.err.println("cvd-spx-levels hydration skipped: " + topic + " has "
+                        + infos.size() + " partitions, expected 1");
+                return;
+            }
+            TopicPartition tp = new TopicPartition(topic, infos.get(0).partition());
+            consumer.assign(List.of(tp));
+            long begin = consumer.beginningOffsets(List.of(tp), hydrateRemaining(deadlineNanos)).get(tp);
+            long end = consumer.endOffsets(List.of(tp), hydrateRemaining(deadlineNanos)).get(tp);
+            // The end offset is the HANDOFF POINT: the live consumer starts this partition here
+            // instead of at its own later seekToEnd, so a record committed between the two can no
+            // longer fall into a gap that leaves the hydrated record replaying indefinitely.
+            cvdSpxLevelsHandoffOffset.set(end);
+            if (end <= begin) return;                                   // empty log
+            consumer.seek(tp, begin);
+            // A read_committed scan can legitimately return NOTHING between begin and end — the
+            // range may hold only aborted batches or transaction control records. That is not a
+            // withdrawal, so it must not be counted as one; the two states are tracked apart.
+            boolean sawRecord = false;
+            String latestValue = null;
+            while (consumer.position(tp, hydrateRemaining(deadlineNanos)) < end) {
+                if (System.nanoTime() >= deadlineNanos) {
+                    System.err.println("cvd-spx-levels hydration timed out; the first hello may carry no levels");
+                    return;
+                }
+                for (ConsumerRecord<String, Object> rec : consumer.poll(hydrateRemaining(deadlineNanos))) {
+                    if (rec.offset() >= end) continue;
+                    // PER KEY, because compaction is per key: a later foreign-key record can sit
+                    // after the governing ES.v.0 one, and taking "the last record in the
+                    // partition" would drop the real state, leave the replay empty, and hand the
+                    // live consumer an offset past it — invisible until the next heartbeat, or
+                    // forever with the aligner stopped. Live ingestion already refuses a foreign
+                    // key without displacing retained state; hydration now matches it, counting
+                    // the foreign record exactly as the live path would.
+                    if (!CVD_SPX_LEVELS_KEY.equals(rec.key())) {
+                        cvdSpxLevelsDrops.incrementAndGet();
+                        continue;
+                    }
+                    sawRecord = true;
+                    latestValue = rec.value() == null ? null : String.valueOf(rec.value());
+                }
+            }
+            if (!sawRecord) return;                                     // nothing committed to hydrate from
+            if (latestValue == null) {
+                // A retained TOMBSTONE is a withdrawal, and CL-R8 counts every one of them. Being
+                // silent here made the counter depend on whether the gateway happened to restart
+                // after the wipe — the same operator action, two different histories.
+                cvdSpxLevelsDrops.incrementAndGet();
+                return;
+            }
+            CvdSpxLevelsAccepted accepted = validateCvdSpxLevels(CVD_SPX_LEVELS_KEY, latestValue);
+            if (accepted == null) {
+                cvdSpxLevelsDrops.incrementAndGet();                    // malformed retained: stay empty
+                return;
+            }
+            retainCvdSpxLevels(accepted);
+        } catch (RuntimeException e) {
+            System.err.println("cvd-spx-levels hydration failed; the first hello may carry no levels: " + e);
+        } finally {
+            if (consumer != null) {
+                try {
+                    consumer.close(hydrateRemaining(deadlineNanos));    // the close is inside the budget too
+                } catch (RuntimeException ignored) { }
+            }
+        }
+    }
+
+    /**
+     * U16 handoff: hydration read to end offset E and closed its consumer; the live consumer would
+     * otherwise seekToEnd to a LATER E', silently skipping everything committed in between — and
+     * if the aligner then stopped, the gateway would replay the older hydrated record forever.
+     * Starting this one partition at E instead makes the two reads continuous. Consumed once, so a
+     * reconnect after a live tombstone cannot rewind to a pre-tombstone position.
+     */
+    /**
+     * Where a levels cursor may actually be honoured. Returns the offset to seek to, or
+     * {@link #CVD_SPX_LEVELS_SEEK_END} when the cursor cannot be trusted: no cursor at all, or one
+     * outside the partition's CURRENT range. The log moves underneath a process-local cursor —
+     * compaction and retention advance the start, a recreation or truncation can leave the whole
+     * log behind it — and this partition shares the state-live consumer, so an out-of-range seek
+     * would take every other JSON state stream down with it (repeated OffsetOutOfRange below the
+     * beginning, a stranded position above the end).
+     *
+     * <p>Pure on purpose: the decision is the part worth testing, and it is testable without a
+     * broker.
+     */
+    static long resolveCvdSpxLevelsSeek(long cursor, long beginningOffset, long endOffset) {
+        if (cursor < 0) return CVD_SPX_LEVELS_SEEK_END;
+        if (cursor < beginningOffset || cursor > endOffset) return CVD_SPX_LEVELS_SEEK_END;
+        return cursor;
+    }
+
+    /** Sentinel: "do not trust the cursor, start at the end". */
+    static final long CVD_SPX_LEVELS_SEEK_END = -1L;
+
+    /** Apply the decision, reading the live range; any failure takes the safe end-seek. */
+    private void seekCvdSpxLevelsWithin(KafkaConsumer<String, Object> consumer, TopicPartition owned,
+                                        long cursor, AtomicLong cursorHolder) {
+        List<TopicPartition> one = List.of(owned);
+        long target;
+        try {
+            long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
+            long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
+            target = resolveCvdSpxLevelsSeek(cursor, beginning, end);
+        } catch (RuntimeException e) {
+            target = CVD_SPX_LEVELS_SEEK_END;                  // range unknown: the safe fallback
+        }
+        if (target == CVD_SPX_LEVELS_SEEK_END) {
+            if (cursorHolder != null) cursorHolder.set(-1L);    // stale: never retried forever
+            consumer.seekToEnd(one);
+            return;
+        }
+        consumer.seek(owned, target);
+    }
+
+    private void seekCvdSpxLevelsToHandoff(KafkaConsumer<String, Object> consumer,
+                                           List<TopicPartition> partitions) {
+        // OWNERSHIP FIRST, consumption second. Both live consumers run this helper, and consuming
+        // the offset before finding the partition let whichever ran first (avro-live, which never
+        // holds this topic) destroy the handoff — leaving state-live at its own later seekToEnd
+        // and reopening the very gap this exists to close. getAndSet then runs only in the
+        // consumer that actually owns the partition, so exactly one seek can happen.
+        String topic = settings.esCvdSpxLevelsTopic();
+        TopicPartition owned = null;
+        for (TopicPartition tp : partitions) {
+            if (tp.topic().equals(topic)) {
+                owned = tp;
+                break;
+            }
+        }
+        if (owned == null) return;
+        long handoff = cvdSpxLevelsHandoffOffset.getAndSet(-1L);
+        if (handoff < 0) return;
+        // Same lifecycle exposure as the retry cursor: between hydration and this seek, retention,
+        // compaction, truncation or a recreation can make the handoff offset invalid.
+        seekCvdSpxLevelsWithin(consumer, owned, handoff, null);
+    }
+
+    /** Remember where this partition got to, so a retry resumes rather than replays. */
+    private void noteCvdSpxLevelsProgress(TopicBinding binding, ConsumerRecord<String, ?> record) {
+        if (binding != null && "es-cvd-spx-levels".equals(binding.event())) {
+            cvdSpxLevelsNextOffset.set(record.offset() + 1);
+        }
+    }
+
+    /**
+     * U16 retry continuity. The generic retry path seeks every partition back into its cache
+     * window — up to 15 minutes — which on a COMPACTED state topic means re-reading history that
+     * has not been cleaned yet. A historical tombstone would then erase the baseline again, a
+     * historical {@code baselineReset} would be re-applied as a fresh operator wipe, and older
+     * post-reset records would be accepted and broadcast on the way back to now, with a concurrent
+     * hello seeing levels:null in the middle of it. None of that is new information: this consumer
+     * already processed those records. So the levels partition resumes from where it left off, and
+     * when nothing is known it starts at the END rather than in the past — a missed record is a
+     * bounded staleness the page already handles, while a replayed erase is a false one.
+     */
+    private void resumeCvdSpxLevels(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        String topic = settings.esCvdSpxLevelsTopic();
+        TopicPartition owned = null;
+        for (TopicPartition tp : partitions) {
+            if (tp.topic().equals(topic)) {
+                owned = tp;
+                break;
+            }
+        }
+        if (owned == null) return;
+        seekCvdSpxLevelsWithin(consumer, owned, cvdSpxLevelsNextOffset.get(), cvdSpxLevelsNextOffset);
+    }
+
+    /** What is left of the hydration budget; never negative, so a blown budget stops immediately. */
+    private static Duration hydrateRemaining(long deadlineNanos) {
+        long remaining = deadlineNanos - System.nanoTime();
+        return remaining <= 0 ? Duration.ZERO : Duration.ofNanos(remaining);
+    }
+
+    /**
+     * The basis states an OK record may carry. SOURCE OF TRUTH: the aligner's
+     * {@code CvdSpxLevelsAligner.OK_BASIS_STATES} in options-edge-processing, which is itself
+     * parity-tested against {@code BasisSnapshot.isValid}. This repo cannot import that constant,
+     * so the set is pinned by a test here that names the same authority — a drift on either side
+     * fails a test rather than silently accepting (or rejecting) a state at the boundary.
+     */
+    static final Set<String> CVD_SPX_LEVELS_BASIS_STATES =
+            Set.of("ANCHORED", "MEASURED", "PROJECTED");
+
+    /** The aligner's reason precedence chain — an unknown reason is a schema violation. */
+    private static final Set<String> CVD_SPX_LEVELS_REASONS = Set.of(
+            "source_absent", "source_malformed", "source_wrong_session", "source_future_dated",
+            "source_overflow", "source_not_observable", "source_stale", "basis_unusable",
+            "translation_error");
+
+    /**
+     * The state-field matrix, both directions. A record carrying a field its state does not define
+     * is malformed WHATEVER the field's value: the record reaches the browser verbatim, so an
+     * UNAVAILABLE frame with a sessionDate and fold provenance in it reads as structure the
+     * aligner never attested.
+     */
+    private static final List<String> CVD_SPX_LEVELS_OK_ONLY_FIELDS = List.of(
+            "buyLevels", "sellLevels", "flip", "balancePriceCents", "basisCents", "basisState",
+            "basisMeasuredAtMs", "sourcePublishedAtMs", "flowEventTimeMs", "sessionComplete",
+            "sessionDate", "foldPositionMs", "foldPrints");
+
+    private static final List<String> CVD_SPX_LEVELS_UNAVAILABLE_ONLY_FIELDS = List.of(
+            "reason", "sourceProvenance", "provenanceRetained", "baselineReset");
+
+    /**
+     * One integral field, read WITHOUT truncation and bounded to JS-exact. A BigIntegerNode is
+     * integral and {@code asLong()} silently wraps it, which would let an oversized value pass a
+     * positive check and then corrupt ordering — so convertibility is required, then the bound.
+     */
+    private static Long levelsInt(com.fasterxml.jackson.databind.JsonNode parent, String field) {
+        com.fasterxml.jackson.databind.JsonNode v = parent.get(field);
+        if (v == null || !v.isIntegralNumber() || !v.canConvertToLong()) return null;
+        long x = v.asLong();
+        return (x > CVD_SPX_LEVELS_MAX_SAFE || x < -CVD_SPX_LEVELS_MAX_SAFE) ? null : x;
+    }
+
+    /** JavaScript's exact-integer bound: the browser is the consumer of every one of these. */
+    static final long CVD_SPX_LEVELS_MAX_SAFE = (1L << 53) - 1;
+
+    /** §2: every translated SPX price is in (0, 10_000_000] cents — balance included. */
+    static final long CVD_SPX_LEVELS_MAX_PRICE_CENTS = 10_000_000L;
+
+    /** A real calendar date, not merely eight digits — 99999999 must not order as a session. */
+    private static boolean isCalendarDate(String yyyymmdd) {
+        try {
+            java.time.LocalDate.parse(yyyymmdd, java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
+            return true;
+        } catch (java.time.format.DateTimeParseException e) {
+            return false;
+        }
+    }
+
+    /** One side's levels: bounded array, per-level shape, side-sign rule, no duplicate prices. */
+    private static boolean validLevelsArray(com.fasterxml.jackson.databind.JsonNode arr,
+                                            boolean buy, long flowEventTimeMs) {
+        if (arr == null || !arr.isArray() || arr.size() > 10) return false;
+        Set<Long> prices = new java.util.HashSet<>();
+        for (com.fasterxml.jackson.databind.JsonNode l : arr) {
+            if (!l.isObject()) return false;
+            Long price = levelsInt(l, "priceCents");
+            Long delta = levelsInt(l, "deltaSum");
+            Long count = levelsInt(l, "tradeCount");
+            Long touch = levelsInt(l, "lastTouchMs");
+            if (price == null || price <= 0 || price > CVD_SPX_LEVELS_MAX_PRICE_CENTS
+                    || !prices.add(price)) return false;
+            if (delta == null || (buy ? delta <= 0 : delta >= 0)) return false;   // side sign
+            if (count == null || count <= 0 || touch == null || touch <= 0) return false;
+            if (touch > flowEventTimeMs) return false;      // bounded by the record's own flow time
+        }
+        return true;
+    }
+
+    /** OK records carry the source's provenance inline (sessionDate + foldPositionMs + foldPrints). */
+    /** UNAVAILABLE records carry it under sourceProvenance when any validated record has existed. */
+    private static CvdSpxLevelsProvenance provenanceOfUnavailable(com.fasterxml.jackson.databind.JsonNode sp) {
+        if (!sp.isObject() || !sp.path("sessionDate").isTextual()) return null;   // textual by contract
+        String sd = sp.path("sessionDate").asText("");
+        Long pos = levelsInt(sp, "foldPositionMs");
+        Long prints = levelsInt(sp, "foldPrints");
+        if (!sd.matches("\\d{8}") || !isCalendarDate(sd)
+                || pos == null || pos < 0 || prints == null || prints < 0) {
+            return null;
+        }
+        return new CvdSpxLevelsProvenance(sd, pos, prints);
+    }
+
+    /**
+     * U16 retention (CL-R7 V1, hop-to-hop freshness): accept the record iff it does not REGRESS
+     * against what is retained, applying the SAME calendar-aware total order the aligner applies.
+     * ONLY the exact tombstone combination resets the baseline; a provenance-less startup-absence
+     * record is accepted only when nothing is retained (never a regression to "nothing known").
+     * Rejections increment gateway_cvd_spx_levels_position_regressions_total and forward nothing,
+     * so a lagging incarnation can never displace a newer attestation on the browser.
+     */
+    synchronized boolean retainCvdSpxLevels(CvdSpxLevelsAccepted accepted) {
+        if (accepted.baselineReset()) {
+            cvdSpxLevelsProvenance = null;                       // operator wipe flows through
+            cvdSpxLevelsLatest.set(accepted.json());
+            return true;
+        }
+        CvdSpxLevelsProvenance incoming = accepted.provenance();
+        if (incoming == null) {
+            if (cvdSpxLevelsProvenance != null) {
+                cvdSpxLevelsRegressions.incrementAndGet();
+                return false;
+            }
+            cvdSpxLevelsLatest.set(accepted.json());
+            return true;
+        }
+        CvdSpxLevelsProvenance held = cvdSpxLevelsProvenance;
+        if (held != null && (incoming.crossed(held) || incoming.compareTo(held) < 0)) {
+            cvdSpxLevelsRegressions.incrementAndGet();
+            return false;
+        }
+        cvdSpxLevelsProvenance = incoming;
+        cvdSpxLevelsLatest.set(accepted.json());
+        return true;
+    }
+
+    /**
+     * U16 withdrawal handling: a TOMBSTONE on the levels topic (reset tooling) clears the connect
+     * replay AND the retention baseline — a withdrawn record must never be served to a late joiner,
+     * and the next record must not be judged against an erased history. Counted so the operation is
+     * visible. Non-tombstone unparseable values just count.
+     */
+    synchronized void evictCvdSpxLevelsTombstone(String event, org.apache.kafka.clients.consumer.ConsumerRecord<String, ?> record) {
+        if (!"es-cvd-spx-levels".equals(event)) {
+            return;
+        }
+        // A withdrawal is as governing as a value, so it passes the SAME key gate: a foreign-key
+        // tombstone is malformed input, counted and ignored, never an erase of the baseline.
+        if (record.value() == null && CVD_SPX_LEVELS_KEY.equals(record.key())) {
+            cvdSpxLevelsLatest.set(null);
+            cvdSpxLevelsProvenance = null;
+        }
+        cvdSpxLevelsDrops.incrementAndGet();
+    }
+
+    java.util.concurrent.atomic.AtomicReference<String> cvdSpxLevelsLatestForTest() {
+        return cvdSpxLevelsLatest;
+    }
+
+    long cvdSpxLevelsDropsForTest() {
+        return cvdSpxLevelsDrops.get();
+    }
+
+    long cvdSpxLevelsRegressionsForTest() {
+        return cvdSpxLevelsRegressions.get();
+    }
+
+    /** R46 hello payload: {"sessionDate":...,"hwm":{"30s":<lastBarStartMs>,...}}. */
+    String cvdHelloJson() {
+        StringBuilder sb = new StringBuilder("{\"sessionDate\":");
+        String sd = cvdBarsSessionDate;
+        sb.append(sd == null ? "null" : "\"" + sd + "\"").append(",\"hwm\":{");
+        boolean first = true;
+        for (java.util.Map.Entry<String, Long> e : cvdBarsHighWaterMarks().entrySet()) {
+            if (!first) sb.append(',');
+            sb.append('\"').append(e.getKey()).append("\":").append(e.getValue());
+            first = false;
+        }
+        sb.append('}');
+        if (settings.esCvdSpxLevelsEnabled()) {
+            // Verbatim record or an explicit null — the FIELD's presence is the completion signal.
+            String levels = cvdSpxLevelsLatest.get();
+            sb.append(",\"levels\":").append(levels == null ? "null" : levels);
+        }
+        return sb.append('}').toString();
+    }
+
+    /** One ATOMIC backfill page: session check, rows, cursor and session stamp under one lock. */
+    public record CvdBarsPage(String sessionDate, boolean sessionMismatch,
+                              java.util.List<String> bars, Long nextCursor) { }
+
+    /**
+     * R46 (merge-gate finding 3): the mismatch check, the rows, the response session and the
+     * cursor are ONE synchronized snapshot — a rollover can happen before or after this call,
+     * never inside it, so a page can never mix sessions or mislabel itself.
+     */
+    public CvdBarsPage cvdBarsPage(String timeframe, long toMsInclusive, long afterMsExclusive,
+                                   int limit, String expectedSessionDate) {
+        synchronized (cvdBars) {
+            String current = cvdBarsSessionDate;
+            if (expectedSessionDate != null && !expectedSessionDate.isEmpty()
+                    && current != null && !expectedSessionDate.equals(current)) {
+                return new CvdBarsPage(current, true, java.util.List.of(), null);
+            }
+            java.util.List<String> out = new java.util.ArrayList<>();
+            long lastStart = -1;
+            for (java.util.Map.Entry<String, String> e : cvdBars.entrySet()) {
+                int sep = e.getKey().lastIndexOf('|');
+                if (!e.getKey().substring(0, sep).equals(timeframe)) continue;
+                long start = Long.parseLong(e.getKey().substring(sep + 1));
+                if (start <= afterMsExclusive || start > toMsInclusive) continue;
+                out.add(e.getValue());
+                lastStart = start;
+                if (out.size() >= limit) break;
+            }
+            return new CvdBarsPage(current, false, out, out.size() >= limit ? lastStart : null);
+        }
+    }
+
+    public String cvdBarsSessionDate() { return cvdBarsSessionDate; }
+
+    /** Per-timeframe high-water marks of the keyed CVD bar view, for the R46 handshake. */
+    public java.util.Map<String, Long> cvdBarsHighWaterMarks() {
+        java.util.Map<String, Long> hwm = new java.util.LinkedHashMap<>();
+        synchronized (cvdBars) {
+            for (String key : cvdBars.keySet()) {
+                int sep = key.lastIndexOf('|');
+                hwm.merge(key.substring(0, sep), Long.parseLong(key.substring(sep + 1)), Math::max);
+            }
+        }
+        return hwm;
     }
 
     private static String text(JsonNode root, String field) {
@@ -8161,6 +10054,14 @@ public class FeedGatewayService implements ReplayRunner {
         replayCacheMap(session, "pace-rank", paceRanks);
         replayCacheMap(session, "directional-pressure", directionalPressures);
         replayCacheMap(session, "strike-flow", strikeFlows);
+        // Bands go out as ONE batch, not through replayCacheMap: that sends a socket message per cache
+        // entry and the web client has no handler for a "spot-band" message, so ~200 per-strike messages
+        // were simply discarded by the browser. It belongs HERE rather than in addClient because this is
+        // the common per-socket replay path, which has exactly two triggers: connect (addClient) and
+        // return-to-live (resumeLive -> replayLiveCacheToAppSession). A SOURCE SWITCH does NOT come
+        // through here — that is handled separately in applySelection/markSelectionReady, because in
+        // per-session mode broadcastCachedState drops the switch batch outright.
+        replaySpotBandBatchToSocket(session);
         replayCacheMap(session, "delta-flow", deltaFlows);
         replayCacheMap(session, "strike-intel", strikeIntels);
         replayCacheMap(session, "option-truth", optionTruths);
@@ -8197,6 +10098,11 @@ public class FeedGatewayService implements ReplayRunner {
         // The joined dealer-ledger envelope, standalone per session. dealerLedgers holds only envelopes
         // built from fresh halves (joinDealerLedger) and evicted on role expiry (removeCacheEntry).
         replayCacheMap(session, "dealer-ledger", dealerLedgers);
+        // corridor-gauge per-session replay goes through the GENERIC path on purpose
+        // (UI-review r2 #2): replayCacheMap applies BOTH the per-entry freshness gate (the
+        // event is registered in requiresFreshPerSessionReplay) and the routing engine's
+        // shouldDeliverToSocket — the bespoke helper would bypass selection isolation here.
+        replayCacheMap(session, "corridor-gauge", corridorGauges);
         replayCacheMap(session, "opb-by-option", opbByOptions);
         replayCacheMap(session, "opb-session", opbSessions);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
@@ -8220,6 +10126,11 @@ public class FeedGatewayService implements ReplayRunner {
         // return-to-live from a historical replay (replayLiveCacheToAppSession -> replayCachedToSocket).
         replayGreekMoveAuthCached(session);
         replaySpotVolRegimeCached(session);
+        // Same STANDALONE global-advisory class, and the same reason it must be here as well as in
+        // addClient: this is the path that serves per-session (auth) connections and return-to-live
+        // from a historical replay. Without it the card was permanently blank in authenticated
+        // prod, which is the only mode prod runs in.
+        replayVolPremiumIvrvCached(session);
         if (stateCaughtUp.get()) {
             // R-WIRE.5 high-watermark-before-serving: a mid-bootstrap auth connection must not
             // see strike/path rows that a not-yet-consumed revocation or generation supersedes.
@@ -8238,8 +10149,20 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void replayCacheMap(WebSocketSession session, String event, Map<String, String> cache) {
+        for (String json : deliverableCacheEntries(session, event, cache)) {
+            send(session, event, json);
+        }
+    }
+
+    /**
+     * The entries of {@code cache} this socket is allowed to see, in cache order. Shared by the
+     * per-entry replay above and the batch replay below so the freshness and per-session routing
+     * filters can never drift apart between the two delivery shapes.
+     */
+    private List<String> deliverableCacheEntries(WebSocketSession session, String event, Map<String, String> cache) {
+        List<String> deliverable = new ArrayList<>();
         if (routingEngine == null) {
-            return;
+            return deliverable;
         }
         String socketId = session.getId();
         long nowMs = System.currentTimeMillis();
@@ -8263,16 +10186,80 @@ public class FeedGatewayService implements ReplayRunner {
                         : (root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "");
                 Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
                 if (rec.isPresent() && routingEngine.shouldDeliverToSocket(rec.get(), socketId)) {
-                    send(session, event, json);
+                    deliverable.add(json);
                 }
             } catch (JsonProcessingException ignored) {
                 // skip malformed cached entry
             }
         }
+        return deliverable;
+    }
+
+    /**
+     * Bands as ONE ui-batch, never one socket message per strike.
+     *
+     * <p>This exists because the per-session route has no other way to deliver them: enqueuePending and
+     * broadcastCachedState both drop when perSessionRouting() is true, so the coalesced batch and the
+     * source-switch batch are dead on an authenticated gateway. The earlier version replayed bands
+     * through replayCacheMap, which does deliver — as ~200 individual "spot-band" messages that the web
+     * client has no handler for, so an authenticated browser received nothing at all. Same per-socket
+     * routing filter as the per-entry path; one envelope out.
+     */
+    /**
+     * Bands after a source switch, for per-session sockets only.
+     *
+     * <p>broadcastCachedState DROPS when perSessionRouting() is true, so the switch batch never leaves
+     * the gateway in authenticated mode. Every other cached surface still recovers, because live routed
+     * records refill it at the consume sites — bands cannot, since the live consumer skips them by
+     * design (one message per strike would flood the chain socket). Suppressing the live path is what
+     * makes this replay owed. Per-socket filtered by the same routing check, one batch each.
+     *
+     * <p>Called from markSelectionReady ONLY — never also from applySelection, which would double-send
+     * on the common path where a switch is serviceable at once and marks itself ready inline.
+     */
+    private void replaySpotBandBatchAfterSourceSwitch() {
+        if (!perSessionRouting()) {
+            return;
+        }
+        // Self-healing prune. removeClient clears a socket's claim, but onSlowDisconnect, closeSockets
+        // (logout / session expiry) and closeExpiredAuthSessions drop sockets by other routes whose close
+        // callback can be delayed or suppressed, so the ledger must not depend on any of them running.
+        // Retaining only live sockets bounds it by the connected set on every switch.
+        spotBandSwitchDelivered.keySet().retainAll(clientsById.keySet());
+        for (WebSocketSession client : clients) {
+            replaySpotBandBatchOncePerReadiness(client);
+        }
+    }
+
+    /**
+     * The switch-time band board, at most once per socket per readiness key. Both the readiness replay
+     * and the connect bracket call this; whichever arrives first claims the key and the other no-ops, so
+     * exactly-once holds under EITHER iterator ordering instead of depending on the interleaving.
+     */
+    private void replaySpotBandBatchOncePerReadiness(WebSocketSession session) {
+        String key = readySelectionKey.get();
+        String previous = spotBandSwitchDelivered.put(session.getId(), key);
+        if (java.util.Objects.equals(previous, key)) {
+            return;
+        }
+        replaySpotBandBatchToSocket(session);
+    }
+
+    private void replaySpotBandBatchToSocket(WebSocketSession session) {
+        List<String> deliverable = deliverableCacheEntries(session, "spot-band", spotBands);
+        if (deliverable.isEmpty()) {
+            return;
+        }
+        List<CachedEvent> asBatch = new ArrayList<>(deliverable.size());
+        for (String json : deliverable) {
+            asBatch.add(new CachedEvent("spot-band", json));
+        }
+        sendEnvelope(session, uiBatchEnvelopeJson(asBatch));
     }
 
     private boolean requiresFreshPerSessionReplay(String event) {
         return "option-truth".equals(event)
+                || "corridor-gauge".equals(event)
                 || "strike-sr".equals(event)
                 || "gex-magnet".equals(event)
                 || "gamma-migration".equals(event)
@@ -8509,11 +10496,14 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.unifiedSrTopic(), "strike-sr");
                 avroTopics.put(settings.databentoGexMagnetTopic(), "gex-magnet");
                 avroTopics.put(settings.gammaMigrationTopic(), "gamma-migration");
+                avroTopics.put(settings.gammaRotationTopic(), "gamma-rotation");
+                avroTopics.put(settings.gammaFragilityTopic(), "gamma-fragility");
                 avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.strikeIntelByStrikeTopic(), "strike-intel");
                 stringTopics.put(settings.strikeInvasionTopic(), "strike-invasion");
+                stringTopics.put(settings.corridorGaugeTopic(), "corridor-gauge");
                 stringTopics.put(settings.strikeLiquidityTopic(), "liquidity-heatmap");
                 stringTopics.put(settings.databentoPaceMissionTopic(), "mission-pace");
                 stringTopics.put(settings.missionControlTopic(), "mission-control");
@@ -8724,7 +10714,7 @@ public class FeedGatewayService implements ReplayRunner {
         // suppress each other's absent/present transitions.
         List<TopicPartition> partitions =
                 partitionsFor("replay-" + appSessionId + (avro ? "-avro" : "-str"),
-                        consumer, topicEvents.keySet());
+                        consumer, topicEvents.keySet(), settings.metadataTimeoutMs(), Set.of(), true);
         consumer.assign(partitions);
         Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
         if (params.hasRun()) {
@@ -9110,6 +11100,16 @@ public class FeedGatewayService implements ReplayRunner {
             // class as its status sibling — sessionId-gated client-side, never selection-routed
             // (GatewayRecordMapper deliberately has no route for it).
             "ibkr-preopen-gex",
+            // Drop-classifier SHADOW nowcast: a GLOBAL advisory (identical for every user,
+            // display-only). Allowlisted so the standalone broadcast reaches per-session
+            // (auth) sockets too — without this, authenticated prod silently drops it.
+            "drop-nowcast",
+            // Vol-premium IV-vs-realised reading is a GLOBAL advisory (identical for every user,
+            // display-only, symbol-filtered client-side). GatewayRecordMapper deliberately has no
+            // route for it, so without this entry broadcast() drops it whenever per-session routing
+            // is on — i.e. the card is permanently blank in authenticated prod while every test
+            // that exercises the unauthenticated path still passes.
+            "vol-premium-ivrv",
             // Agent A short-premium recommendation is a GLOBAL advisory overlay (the UI filters by
             // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
             // in per-session (auth) mode too, not only legacy mode — otherwise it is silently
@@ -9141,6 +11141,13 @@ public class FeedGatewayService implements ReplayRunner {
             // symbol-filtered client-side); staleness enforced upstream by the SHORT
             // spotVolRegimeTtlMs window in updateCache.
             "spot-vol-regime",
+            "indicators",
+            // The tape-zones board is ES-global session truth rendered in its own card — the same
+            // GLOBAL advisory class. Allowlist it so the standalone broadcast reaches sockets in
+            // per-session (auth) mode too; GatewayRecordMapper deliberately has no route for it.
+            // Staleness is enforced upstream (SHORT tapeZonesTtlMs window) and downstream (the
+            // card's own 10 s overlay off the emitted ageMs).
+            "tapeZones",
             // SPX close-direction interims + frozen verdict are the same class of GLOBAL advisory
             // overlay (one session at a time, rendered in its own summary card) — allowlist so
             // routeOrBroadcast/broadcast fan them out in per-session (auth) mode too. Malformed and
@@ -9148,7 +11155,18 @@ public class FeedGatewayService implements ReplayRunner {
             "close-direction",
             // Continuous ES futures buyer/seller pressure is an ES-global advisory card. The payload is
             // symbol-filtered by the browser and deliberately has no option-chain expiry identity.
-            "es-aggressor-flow");
+            "es-aggressor-flow",
+            // DEFECT FIX (found during U16): the ES CVD stream is the same ES-global advisory class,
+            // but was never allowlisted — in per-session (auth) mode broadcast() dropped every
+            // es-cvd/es-cvd-bar frame as non-routable.
+            "es-cvd",
+            "es-cvd-bar",
+            // Server-rated Δ-flow acceleration: chain-global advisory; a non-allowlisted event is
+            // dropped as non-routable in per-session (auth) mode.
+            "delta-flow-accel",
+            // U16: SPX-translated CVD structure levels — ES-global advisory overlay on the tape page,
+            // fail-closed client-side (ES-CVD-SPX-LEVELS-DESIGN.md CL-R7).
+            "es-cvd-spx-levels");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);
@@ -9250,6 +11268,18 @@ public class FeedGatewayService implements ReplayRunner {
         try {
             JsonNode root = mapper.readTree(json);
             String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
+            if ("indicators".equals(event)) {
+                // r3 finding 3: the frozen key is literally `indicators|symbol` —
+                // additive fields must never split the coalescing identity.
+                return event + "|" + symbol;
+            }
+            if ("tapeZones".equals(event)) {
+                // ONE board per session (§6.2). The wrapper's own fields (offset/serverTime/ageMs)
+                // must NEVER enter the key — they change on every emit, so keying on them would
+                // defeat coalescing entirely and let a slow socket queue a session's worth of
+                // whole-board snapshots. Frozen key: the event name alone.
+                return event;
+            }
             String expiry = root.hasNonNull("expiry") ? root.get("expiry").asText("") : "";
             String strike = root.hasNonNull("strike") ? root.get("strike").asText("") : "";
             String horizon = "option-truth".equals(event) && root.hasNonNull("horizon")
@@ -9339,6 +11369,7 @@ public class FeedGatewayService implements ReplayRunner {
             case "pace-rank" -> pendingPaceRanks;
             case "directional-pressure" -> pendingDirectionalPressures;
             case "strike-flow" -> pendingStrikeFlows;
+            case "spot-band" -> pendingSpotBands;
             // Seller activity is REST-only and must never enter the option-chain WebSocket batch.
             case "delta-flow" -> pendingDeltaFlows;
             case "strike-intel" -> pendingStrikeIntels;
@@ -9401,6 +11432,7 @@ public class FeedGatewayService implements ReplayRunner {
                         new ArrayList<>(pendingPaceRanks.values()),
                         new ArrayList<>(pendingDirectionalPressures.values()),
                         new ArrayList<>(pendingStrikeFlows.values()),
+                        new ArrayList<>(pendingSpotBands.values()),
                         new ArrayList<>(pendingSellerActivities.values()),
                         new ArrayList<>(pendingDeltaFlows.values()),
                         new ArrayList<>(pendingStrikeIntels.values()),
@@ -9459,6 +11491,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + pendingPaceRanks.size()
                 + pendingDirectionalPressures.size()
                 + pendingStrikeFlows.size()
+                + pendingSpotBands.size()
                 + pendingSellerActivities.size()
                 + pendingDeltaFlows.size()
                 + pendingStrikeIntels.size()
@@ -9496,6 +11529,7 @@ public class FeedGatewayService implements ReplayRunner {
         pendingPaceRanks.clear();
         pendingDirectionalPressures.clear();
         pendingStrikeFlows.clear();
+        pendingSpotBands.clear();
         pendingSellerActivities.clear();
         pendingDeltaFlows.clear();
         pendingStrikeIntels.clear();
@@ -9538,6 +11572,7 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> paceRankJsons = new ArrayList<>();
         List<String> directionalPressureJsons = new ArrayList<>();
         List<String> strikeFlowJsons = new ArrayList<>();
+        List<String> spotBandJsons = new ArrayList<>();
         List<String> sellerActivityJsons = new ArrayList<>();
         List<String> deltaFlowJsons = new ArrayList<>();
         List<String> strikeIntelJsons = new ArrayList<>();
@@ -9574,6 +11609,7 @@ public class FeedGatewayService implements ReplayRunner {
                 case "pace-rank" -> paceRankJsons.add(cachedEvent.json());
                 case "directional-pressure" -> directionalPressureJsons.add(cachedEvent.json());
                 case "strike-flow" -> strikeFlowJsons.add(cachedEvent.json());
+                case "spot-band" -> spotBandJsons.add(cachedEvent.json());
                 case "seller-activity" -> {
                     // REST-only. Keep the additive sellerActivities field empty for older clients.
                 }
@@ -9618,6 +11654,7 @@ public class FeedGatewayService implements ReplayRunner {
                 paceRankJsons,
                 directionalPressureJsons,
                 strikeFlowJsons,
+                spotBandJsons,
                 sellerActivityJsons,
                 deltaFlowJsons,
                 strikeIntelJsons,
@@ -9690,7 +11727,8 @@ public class FeedGatewayService implements ReplayRunner {
     ) {
         return uiBatchEnvelopeJson(
                 snapshotJsons, paceJsons, paceRankJsons, directionalPressureJsons, strikeFlowJsons,
-                List.of(), deltaFlowJsons, strikeIntelJsons, strikeInvasionJsons, liquidityHeatmapJsons,
+                // this older overload carries neither seller-activity nor spot-band
+                List.of(), List.of(), deltaFlowJsons, strikeIntelJsons, strikeInvasionJsons, liquidityHeatmapJsons,
                 missionPaceJsons, missionControlJsons, spreadSkewJsons, indexPriceJsons,
                 volumeSandwichJsons, missionSandwichJsons, gexByStrikeJsons, gexOiStatusJsons, strikeSrJsons,
                 gexMagnetJsons, gexStrikeLifecycleJsons, maxPainJsons, optionPriceBehaviorJsons,
@@ -9705,6 +11743,7 @@ public class FeedGatewayService implements ReplayRunner {
             List<String> paceRankJsons,
             List<String> directionalPressureJsons,
             List<String> strikeFlowJsons,
+            List<String> spotBandJsons,
             List<String> sellerActivityJsons,
             List<String> deltaFlowJsons,
             List<String> strikeIntelJsons,
@@ -9752,6 +11791,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"paceRanks\":" + jsonArray(paceRankJsons) + ","
                 + "\"directionalPressures\":" + jsonArray(directionalPressureJsons) + ","
                 + "\"strikeFlows\":" + jsonArray(strikeFlowJsons) + ","
+                + "\"spotBands\":" + jsonArray(spotBandJsons) + ","
                 + "\"sellerActivities\":" + jsonArray(sellerActivityJsons) + ","
                 + "\"deltaFlows\":" + jsonArray(deltaFlowJsons) + ","
                 + "\"strikeIntels\":" + jsonArray(strikeIntelJsons) + ","
@@ -9897,6 +11937,21 @@ public class FeedGatewayService implements ReplayRunner {
         // captureOffsetBarriers + BARRIER_CONSUMER_ISOLATION.
         properties.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, RECORD_CONSUMER_ISOLATION);
         properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        // A READER NEVER CREATES A TOPIC. Subscribing to an absent topic makes the consumer ask the
+        // broker for its metadata, and with auto-creation enabled the broker MAKES it — at cluster
+        // defaults, which here is 32 partitions and no compaction.
+        //
+        // That is not a tidiness point. options.spx.vol-premium.ivrv is a single ordered series
+        // whose consumers read a per-session frame ordinal to decide whether two readings were
+        // observed back to back, and its producer refuses to start on any partition count but one.
+        // On 2026-08-28 this gateway auto-created that topic at 32 partitions within two seconds of
+        // it being deleted, and the producer then crash-looped: a service correctly refusing to
+        // publish an unorderable series, blocked by a reader that had no business creating anything.
+        // Every clean-slate would have reproduced it.
+        //
+        // The owner of a topic is whoever declares it — the deploy repo's topics.env, or the
+        // producer's own ensureTopics. This process is neither, for any topic it reads.
+        properties.put(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, "false");
         properties.put(ConsumerConfig.CLIENT_ID_CONFIG, settings.groupIdBase() + "-" + name);
         properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, Integer.toString(settings.maxPollRecords()));
         properties.put(ConsumerConfig.FETCH_MAX_BYTES_CONFIG, Integer.toString(settings.fetchMaxBytes()));
@@ -9980,7 +12035,7 @@ public class FeedGatewayService implements ReplayRunner {
                     + " oldestBootstrapAgeMs=" + oldestBootstrapAgeMs);
             // Alert ONLY when discovery sees MORE than is assigned: partitions exist that this consumer is
             // knowably not reading. The opposite direction (assigned > discovered) is healthy and expected:
-            // the union assignment deliberately RETAINS an optional topic's partitions while that topic is
+            // the union assignment deliberately RETAINS an absent topic's partitions while that topic is
             // momentarily absent from a discovery pass, so equality is not an invariant.
             if (discovered > 0 && assigned >= 0 && discovered > assigned) {
                 System.err.println("RGW_ALERT event=GATEWAY_PARTITION_ASSIGNMENT_INCOMPLETE"
@@ -10051,6 +12106,7 @@ public class FeedGatewayService implements ReplayRunner {
                     + " inactiveDroppedEvents=" + inactiveDroppedEvents.get()
                     + " staleDroppedEvents=" + staleDroppedEvents.get()
                     + " strikeBandsRejected=" + strikeBandsRejected.get()
+                    + " tapeZonesRejected=" + tapeZonesRejected.get()
                     + " sourceStaleEvents=" + sourceStaleEvents.get()
                     + " offsetBarriers=" + offsetBarriers.get().size()
                     + " running=" + running.get()

@@ -3,6 +3,7 @@ package app.feedgateway;
 import com.optionsedge.contracts.greekmoveauth.GreekMoveAuthTopics;
 import com.optionsedge.contracts.spotvolregime.SpotVolRegimeTopics;
 import com.optionsedge.contracts.strikeintelligence.StrikeIntelligenceTopics;
+import com.optionsedge.contracts.volpremium.VolPremiumTopics;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
@@ -259,6 +260,34 @@ public final class GatewaySettings {
         return boolValue("GATEWAY_ES_AGGRESSOR_FLOW_ENABLED", false);
     }
 
+    /** Latest ES CVD live snapshot (JSON, keyed by ES.v.0; 1 Hz, compacted). */
+    public String esCvdTopic() {
+        return value("KAFKA_ES_CVD_TOPIC", "futures.cvd");
+    }
+
+    /** ES CVD bar-close records (JSON, keyed symbol|timeframe|barStartMs; at-least-once upserts). */
+    public String esCvdBarsTopic() {
+        return value("KAFKA_ES_CVD_BARS_TOPIC", "futures.cvd.bars");
+    }
+
+    /** Opt-in for the same reason as the aggressor: the ES-only topics do not exist on every cluster. */
+    public boolean esCvdEnabled() {
+        return boolValue("GATEWAY_ES_CVD_ENABLED", false);
+    }
+
+    /**
+     * U16: SPX-translated CVD structure levels from es-spx-align (JSON, compacted, single
+     * partition, transactional producer — read_committed everywhere). OFF by default: the flag is
+     * the LAST rollout step (ES-CVD-SPX-LEVELS-DESIGN.md CL-R11) and also the paging-alert gate.
+     */
+    public String esCvdSpxLevelsTopic() {
+        return value("KAFKA_ES_CVD_SPX_LEVELS_TOPIC", "options.es-cvd-spx-levels");
+    }
+
+    public boolean esCvdSpxLevelsEnabled() {
+        return boolValue("GATEWAY_ES_CVD_SPX_LEVELS_ENABLED", false);
+    }
+
     public String databentoDirectionalPressureTopic() {
         return value("KAFKA_DATABENTO_DIRECTIONAL_PRESSURE_TOPIC", "options.databento.directional-pressure");
     }
@@ -289,6 +318,15 @@ public final class GatewaySettings {
     }
 
     /**
+     * Per-strike premium binned by where the underlying was standing when it printed, compacted and
+     * split from the chain-wide snapshot for the same reason Seller Activity is: a per-strike x per-bin
+     * matrix cannot ride inside a record that is republished on every dashboard tick.
+     */
+    public String databentoSpotBandTopic() {
+        return value("KAFKA_DATABENTO_SPOT_BAND_TOPIC", "options.databento.spot-band-flow");
+    }
+
+    /**
      * Per-strike delta-flow topic (JSON {@code DeltaFlowStrikeSnapshot}, one record per
      * {@code symbol|date|expiry|strike}) from delta-flow-service. Broadcast as event
      * {@code "delta-flow"}. NB: unlike the {@code options.databento.*} topics, the delta-flow
@@ -296,6 +334,15 @@ public final class GatewaySettings {
      */
     public String databentoDeltaFlowByStrikeTopic() {
         return value("KAFKA_DATABENTO_DELTA_FLOW_BY_STRIKE_TOPIC", "delta-flow-by-strike");
+    }
+
+    /**
+     * Server-rated Δ-flow acceleration verdicts (JSON {@code DeltaFlowAcceleration.Response}, one
+     * frame per second from the web tier), forwarded as the standalone {@code delta-flow-accel}
+     * event so the Delta Flow page's dials draw from the stream instead of polling.
+     */
+    public String deltaFlowAccelTopic() {
+        return value("KAFKA_DELTA_FLOW_ACCEL_TOPIC", "delta-flow.acceleration.current");
     }
 
     /**
@@ -499,11 +546,64 @@ public final class GatewaySettings {
     }
 
     public int systemStatusCacheMs() {
-        return intValue("OE_SYSTEM_STATUS_CACHE_MS", 30_000, 1_000);
+        return clamped("OE_SYSTEM_STATUS_CACHE_MS", 30_000, 1_000, 300_000);
     }
 
+    /**
+     * How old a cached ledger snapshot may get before it stops counting as evidence at all. Past this
+     * the page must not show green states or an empty incident list from it: a stuck refresh would
+     * otherwise leave yesterday's "all healthy" on screen forever, which is the same lie as a blank
+     * page, only more convincing.
+     */
+    public int systemStatusMaxStaleMs() {
+        return clamped("OE_SYSTEM_STATUS_MAX_STALE_MS", 300_000, 1_000, 3_600_000);
+    }
+
+    /** Ceiling shared by both ledger budgets: past this the gateway is no longer a live process. */
+    public static final int SYSTEM_STATUS_MAX_TIMEOUT_S = 60;
+
+    /**
+     * Per-statement budget for the FAST ledger sections (topics, incidents, restarts). These answer in
+     * single-digit milliseconds against the current views, so 3s is a genuine safety net here.
+     */
     public int systemStatusQueryTimeoutSeconds() {
-        return intValue("OE_SYSTEM_STATUS_QUERY_TIMEOUT_S", 3, 1);
+        return clamped("OE_SYSTEM_STATUS_QUERY_TIMEOUT_S", 3, 1, SYSTEM_STATUS_MAX_TIMEOUT_S);
+    }
+
+    /**
+     * Per-statement budget for the SLOW last-run section only. {@code oe_watch.v_runs} answers in
+     * ~250ms warm but takes seconds on a cold Postgres cache, and 2026-08-19 proved what happens when
+     * that budget is a failure switch rather than a safety net: the whole page went blank. Only this
+     * one section gets the wide allowance — giving it to all four would let a single request occupy a
+     * two-connection pool for a minute. Bounded above by {@link #SYSTEM_STATUS_MAX_TIMEOUT_S} so an
+     * operator cannot accidentally configure an unbounded wait into a live market-data process.
+     */
+    public int systemStatusSlowQueryTimeoutSeconds() {
+        return clamped("OE_SYSTEM_STATUS_SLOW_QUERY_TIMEOUT_S", 15, 1, SYSTEM_STATUS_MAX_TIMEOUT_S);
+    }
+
+    /**
+     * Whole-request budget across ALL ledger sections. Per-section timeouts alone do not bound a
+     * request: four sequential reads can each spend their own allowance. The deadline is what makes the
+     * endpoint's worst case a number rather than a sum.
+     */
+    public int systemStatusRequestBudgetSeconds() {
+        return clamped("OE_SYSTEM_STATUS_REQUEST_BUDGET_S", 25, 1, SYSTEM_STATUS_MAX_TIMEOUT_S * 2);
+    }
+
+    /**
+     * How long a COLD-START request waits for the one in-flight ledger read — i.e. only when no
+     * snapshot exists at all, since any existing snapshot answers immediately. Kept well under the
+     * database budget on purpose: a waiting request thread is a thread not serving market data.
+     * Callers clamp it to the request budget, so it can never outlast the read it is waiting for.
+     */
+    public int systemStatusColdStartWaitMs() {
+        return clamped("OE_SYSTEM_STATUS_COLD_START_WAIT_MS", 2_000, 100, 10_000);
+    }
+
+    /** Bounded on BOTH sides — {@link #intValue} only enforces a floor, so a huge value silently won. */
+    private int clamped(String key, int fallback, int min, int max) {
+        return Math.min(max, intValue(key, fallback, min));
     }
 
     public int systemStatusAdminTimeoutMs() {
@@ -648,6 +748,18 @@ public final class GatewaySettings {
         return value("KAFKA_SPREAD_SKEW_EVENTS_TOPIC", "options.spx.spread-skew.events");
     }
 
+    /**
+     * Drop-classifier SHADOW nowcast (LIQUIDITY_SWEEP vs REAL_DROP instant
+     * k=1 verdicts + refinements) from drop-classifier-service — plain JSON
+     * on the LOCAL prod broker (the service publishes here by design; the
+     * es4 broker wipes nightly). Broadcast as event {@code "drop-nowcast"}
+     * (own message.type) — STANDALONE and never cached, the spread-skew-event
+     * sibling. Advisory-only: SHADOW mode, never a trade signal.
+     */
+    public String dropNowcastTopic() {
+        return value("KAFKA_DROP_NOWCAST_TOPIC", "es.drop.nowcast");
+    }
+
     public String ibkrVolumeSandwichTopic() {
         return value("KAFKA_IBKR_VOLUME_SANDWICH_CURRENT_TOPIC",
                 value("KAFKA_VOLUME_SANDWICH_CURRENT_TOPIC", "options.ibkr.volume-sandwich.current"));
@@ -706,8 +818,38 @@ public final class GatewaySettings {
      * dwell and drift, the mass balance either side of spot, the strike heating up, and any wall
      * that has crossed zero.
      */
+    /** Corridor-gauge live state (shadow mode): per-(symbol|expiry) JSON, compacted last-value.
+     *  Broadcast STANDALONE as event "corridor-gauge" — the UI renders it with an UNVALIDATED
+     *  badge until the CORRIDOR-GAUGE-GATE1 acceptance gate passes. */
+    public String corridorGaugeTopic() {
+        return value("KAFKA_CORRIDOR_GAUGE_TOPIC", "corridor-gauge-state");
+    }
+
     public String gammaMigrationTopic() {
         return value("KAFKA_GAMMA_MIGRATION_TOPIC", "options.spx.gamma-migration.current");
+    }
+
+    /**
+     * Peak ROTATION (Avro, per-chain last-value-wins). Broadcast as event "gamma-rotation".
+     *
+     * <p>A separate topic from {@link #gammaMigrationTopic()} because the snapshot record has no
+     * room left: the windows were built onto it first and measured 8199 bytes against a hard 8192
+     * ceiling. Where the migration record says where the peak is NOW — an instantaneous reading
+     * that is true for one second and gone — this says where it has BEEN going, consolidated over
+     * 1m / 5m / 15m / 30m / 4h / session, plus the raw log of individual moves behind it.
+     */
+    public String gammaRotationTopic() {
+        return value("KAFKA_GAMMA_ROTATION_TOPIC", "options.spx.gamma-migration.rotation");
+    }
+
+    /**
+     * Leader FRAGILITY panel (GMS-R14, Avro, per-chain last-value-wins). Broadcast as event
+     * "gamma-fragility". Its own topic for the same reason the rotation got one: the snapshot
+     * record's 8KB budget has no room left. Quiet by design — the producer publishes only when a
+     * quantized reading moves, so the rotation's no-TTL reasoning applies verbatim.
+     */
+    public String gammaFragilityTopic() {
+        return value("KAFKA_GAMMA_FRAGILITY_TOPIC", "options.spx.gamma-migration.fragility");
     }
 
     /** GEX magnet strike (Avro, per-chain last-value-wins). Broadcast as event "gex-magnet". */
@@ -1115,6 +1257,95 @@ public final class GatewaySettings {
     }
 
     /**
+     * Compacted IV-vs-realised topic of the standalone vol-premium service (JSON
+     * {@code IvRvReading} &mdash; see {@link VolPremiumTopics#IVRV}). One record per
+     * {@code SYMBOL|sessionDate}, published every frame. Resolved through the platform topic-prefix
+     * helper at deploy time, matching the spot-vol-regime sibling above.
+     */
+    public String volPremiumIvrvTopic() {
+        return value("KAFKA_VOL_PREMIUM_IVRV_TOPIC", VolPremiumTopics.IVRV);
+    }
+
+    /**
+     * Freshness TTL for the vol-premium IV/RV cache. Same SHORT freshness class as
+     * {@link #spotVolRegimeTtlMs()}: a volatility reading minutes old (dead producer, overnight
+     * leftover) is misleading and must read as absent &mdash; the chart simply has no current point
+     * &mdash; never replay as live. Default 5 min.
+     */
+    public long volPremiumIvrvTtlMs() {
+        return longValue("GATEWAY_VOL_PREMIUM_IVRV_TTL_MS", 300_000L, 0L);
+    }
+
+    /**
+     * Compacted CURRENT topic of the standalone indicator-service (JSON
+     * {@code IndicatorSnapshot}, rev 14 §7.1). One record per canonical symbol
+     * (ES|SPX) every 5 s during the active session plus event-triggered publishes.
+     * Resolved through the platform topic-prefix helper at deploy time.
+     */
+    public String indicatorsSnapshotTopic() {
+        return value("KAFKA_INDICATORS_SNAPSHOT_TOPIC",
+                com.optionsedge.contracts.indicators.IndicatorTopics.INDICATORS_SNAPSHOT_CURRENT);
+    }
+
+    /**
+     * BOTH indicator CURRENT topics this environment must consume (rev 14 §7.3):
+     * the prefix-resolved local topic (dev/prod = SPX computed locally; es4 = the
+     * es.-prefixed native ES stream) PLUS the es4-mirrored ES topic
+     * {@code es.options.indicators.snapshot.current} on dev/prod. On es4 the two
+     * coincide and the set collapses to one — no duplicate subscription.
+     */
+    public java.util.Set<String> indicatorsSnapshotTopics() {
+        java.util.LinkedHashSet<String> topics = new java.util.LinkedHashSet<>();
+        topics.add(indicatorsSnapshotTopic());
+        topics.add("es." + com.optionsedge.contracts.indicators.IndicatorTopics
+                .INDICATORS_SNAPSHOT_CURRENT);
+        return topics;
+    }
+
+    /**
+     * Freshness TTL for the indicators CURRENT cache — same SHORT class as
+     * {@link #spotVolRegimeTtlMs()}: a minutes-old snapshot (dead producer) must
+     * read as absent on late-join, never replay as live. The page's own
+     * transport-staleness banner handles sub-TTL aging. Default 5 min.
+     */
+    public long indicatorsTtlMs() {
+        return longValue("GATEWAY_INDICATORS_TTL_MS", 300_000L, 0L);
+    }
+
+    /**
+     * Compacted CURRENT board of the standalone tape-zones service (plain JSON — NOT Avro — see
+     * TAPE-ZONES-REQUIREMENT §6.2: 1 partition, key {@code ES|sessionDate}, ≤1 msg/s on change,
+     * carrying the whole session's cell table + merged zones + aggregates + quality banner +
+     * {@code terminalFlushed}).
+     *
+     * <p>Resolved through the same {@code _TOPIC} prefix helper every other topic uses. The default
+     * is ALREADY {@code es.}-prefixed (the tape is an ES-only product — TAPE-ZONES-REQUIREMENT §6.2
+     * names the topic literally), so on es4 ({@code TOPIC_PREFIX=es.})
+     * {@link #applyTopicPrefix(String)}'s {@code startsWith} guard makes it a strict no-op and the
+     * name stays {@code es.tape-zones.board} — exactly the {@code es.open-direction.*} precedent.
+     * On dev/prod the same name resolves to the MM1-mirrored copy of the es4 topic (§6.2
+     * "Prod/dev visibility: per-topic MM1 mirror"), so ONE binary serves all three environments.
+     */
+    public String tapeZonesBoardTopic() {
+        return value("KAFKA_TAPE_ZONES_BOARD_TOPIC", "es.tape-zones.board");
+    }
+
+    /**
+     * Freshness TTL for the tape-zones board cache — the SHORT class shared with
+     * {@link #spotVolRegimeTtlMs()}/{@link #indicatorsTtlMs()}: a board minutes old (dead service,
+     * un-installed mirror, overnight leftover) must read as ABSENT on late-join rather than replay
+     * as live. Default 5 min.
+     *
+     * <p>This is the EVICTION window, deliberately far longer than the card's 10 s STALE overlay
+     * (TAPE-ZONES-UI-DESIGN §5): the board publishes only ON CHANGE, so a quiet minute is normal
+     * and must still render — dimmed by the card's own age read, never withheld. Evicting at 10 s
+     * would blank a perfectly healthy board between changes.
+     */
+    public long tapeZonesTtlMs() {
+        return longValue("GATEWAY_TAPE_ZONES_TTL_MS", 300_000L, 0L);
+    }
+
+    /**
      * Freshness TTL for the structural option-chain cache (the {@code snapshot} strike ladder — see
      * {@code FeedGatewayService.MARKET_AWARE_CHAIN_EVENTS}) DURING regular trading hours — default 10 min.
      * Off-hours the chain is never evicted (see {@link FeedGatewayService} cache policy + {@link #marketCalendar()}),
@@ -1307,6 +1538,54 @@ public final class GatewaySettings {
      */
     public String approvalRole() {
         return value("GATEWAY_APPROVAL_ROLE", "");
+    }
+
+    // ---- stock-gex-service proxy (/api/stock-gex/board, /api/stock-gex/stream) ----
+    // Same override shape as the pin-flow / system-status upstreams: a dotted key wins when present,
+    // otherwise the SCREAMING_SNAKE env the deploy wiring sets, otherwise the in-cluster default.
+
+    /** Base URL of the standalone stock-gex-service the board/stream endpoints proxy. */
+    public String stockGexBaseUrl() {
+        return firstNonBlank(value("stock-gex.base-url", ""),
+                             value("STOCK_GEX_BASE_URL", "http://stock-gex-service:8021"));
+    }
+
+    /** TCP connect budget for BOTH stock-gex calls; exceeded → 502 with a JSON error, never a stack trace. */
+    public long stockGexConnectTimeoutMs() {
+        return longValue("STOCK_GEX_CONNECT_TIMEOUT_MS", 2_000L, 200L);
+    }
+
+    /**
+     * Whole-request budget for the BOARD call only. Deliberately NOT applied to the stream: an SSE
+     * response is long-lived by construction (heartbeats arrive at ~10s and the session runs for hours),
+     * so any request-level deadline there would kill a perfectly healthy stream.
+     */
+    public long stockGexBoardTimeoutMs() {
+        return longValue("STOCK_GEX_BOARD_TIMEOUT_MS", 5_000L, 200L);
+    }
+
+    // ---- context-tape-service proxy (/api/context-tape/session) ----
+    // Same override shape as the stock-gex / pin-flow / system-status upstreams: a dotted key wins when
+    // present, otherwise the SCREAMING_SNAKE env the deploy wiring sets, otherwise the in-cluster default.
+
+    /** Base URL of the standalone context-tape-service the session endpoint proxies. */
+    public String contextTapeBaseUrl() {
+        return firstNonBlank(value("context-tape.base-url", ""),
+                             value("CONTEXT_TAPE_BASE_URL", "http://context-tape-service:8134"));
+    }
+
+    /** TCP connect budget for the session call; exceeded → 502 with a JSON error, never a stack trace. */
+    public long contextTapeConnectTimeoutMs() {
+        return longValue("CONTEXT_TAPE_CONNECT_TIMEOUT_MS", 2_000L, 200L);
+    }
+
+    /**
+     * Whole-request budget for the session call — a plain JSON snapshot, no stream to spare. 10s, not
+     * the stock-gex 5s: a full-session snapshot is ~150 KB and on a cold path (service just readied,
+     * caches empty) the assembly plus transfer can legitimately outlast the smaller board budget.
+     */
+    public long contextTapeRequestTimeoutMs() {
+        return longValue("CONTEXT_TAPE_REQUEST_TIMEOUT_MS", 10_000L, 200L);
     }
 
     public static String value(String key, String fallback) {

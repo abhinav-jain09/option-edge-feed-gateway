@@ -1,7 +1,15 @@
 @Library('oe') _
 
 pipeline {
-  agent { label 'mac' }
+  // agent none: the build agent is chosen per-environment from oeProfile(ENVIRONMENT).
+  // buildAgentLabel, which cannot be read before the pipeline starts. BOTH dev and production
+  // now compile on the .74 arm64 builders so the dev Mac (.102) does no build work during
+  // market hours — it runs the controller, the dev cluster, the registry and the broker.
+  // Production still builds its amd64 IMAGE natively on REMOTE_BUILD_HOST (.252); only the
+  // Maven compile/test/package moves, and the jar is architecture-independent.
+  // The Deploy stage needs no cluster access — it triggers `service-deploy`, which is
+  // itself pinned to an agent on .102 that holds the kubeconfigs.
+  agent none
   options {
     // Serialize builds so each build's push -> Deploy+verify is atomic: two concurrent
     // builds must not both move the mutable :dev tag while the other's Deploy+verify
@@ -22,13 +30,33 @@ pipeline {
   }
   stages {
     stage('Resolve profile') {
+      // Runs anywhere: pure Groovy, no workspace needed. Publishes the agent label the
+      // Build stage then pins itself to.
+      // skipDefaultCheckout: a declarative `agent` normally triggers an implicit `checkout scm`,
+      // so this stage was doing a full git fetch on whatever node it landed on — including the
+      // dev Mac, which must not do build I/O during market hours. It only calls oeProfile(), so
+      // it needs no working copy at all.
+      agent any
+      options { skipDefaultCheckout() }
       steps {
         script {
           def p = oeProfile(params.ENVIRONMENT)
           env.IMAGE_REGISTRY = params.IMAGE_REGISTRY?.trim() ? params.IMAGE_REGISTRY : p.registry
+          // Push address for THIS builder. Identical to IMAGE_REGISTRY except where the
+          // builder is not the registry host (dev on .74): host.docker.internal is
+          // host-relative and would resolve to the builder itself. Same storage either
+          // way, so the digest the deploy resolves via IMAGE_REGISTRY is unchanged.
+          // An explicit IMAGE_REGISTRY override applies to both, preserving back-compat
+          // for callers like bring-up-all that pass one registry for everything.
+          env.PUSH_REGISTRY = params.IMAGE_REGISTRY?.trim() ? params.IMAGE_REGISTRY : p.registryFromBuildAgent
+          // Strict preference with fallback, resolved at runtime. NOT a `a || b` label
+          // expression: that is an unordered union and would let .102 win while the .74
+          // builders sat idle, which defeats the offload.
+          env.BUILD_AGENT_LABEL = oeBuildAgent(p)
           env.BUILD_PLATFORM = params.BUILD_PLATFORM?.trim() ? params.BUILD_PLATFORM : p.platform
-          // Build the set of plain-http registries from EVERY profile (not a hardcoded
-          // list of env names — so adding a new profile auto-extends this), normalize
+          // Build the set of plain-http registries from the deployable profiles listed in
+          // knownEnvs below (dev + production; `experiment` is deliberately out of scope for
+          // this job, whose ENVIRONMENT choices are dev/production), normalize
           // for robust matching (strip scheme + trailing slash + lowercase), and add
           // dev-registry loopback aliases. The Image stage writes a buildkit insecure-
           // registry config for the EFFECTIVE IMAGE_REGISTRY iff its normalized form is
@@ -37,14 +65,25 @@ pipeline {
             r?.toString()?.trim()?.toLowerCase()?.replaceFirst(/^https?:\/\//, '')?.replaceFirst(/\/+$/, '')
           }
           def knownEnvs = ['dev', 'production']
+          // Include BOTH vantage points on each registry: an off-host builder pushes to
+          // registryFromBuildAgent, and buildkit needs that exact address marked insecure
+          // or the plain-http push fails with 'server gave HTTP response to HTTPS client'.
           def insecure = knownEnvs.findAll { oeProfile(it).insecureRegistry }
-                                  .collect { normalize(oeProfile(it).registry) }
+                                  .collectMany { [normalize(oeProfile(it).registry),
+                                                  normalize(oeProfile(it).registryFromBuildAgent)] }
           insecure += ['localhost:5001', '127.0.0.1:5001']   // loopback aliases of the dev registry
           env.INSECURE_REGISTRIES = insecure.unique().findAll { it }.join(' ')
-          echo "resolved (env=${params.ENVIRONMENT}): registry=${env.IMAGE_REGISTRY} platform=${env.BUILD_PLATFORM} insecureRegistries='${env.INSECURE_REGISTRIES}'"
+          echo "resolved (env=${params.ENVIRONMENT}): registry=${env.IMAGE_REGISTRY} push=${env.PUSH_REGISTRY} buildAgent=${env.BUILD_AGENT_LABEL} platform=${env.BUILD_PLATFORM} insecureRegistries='${env.INSECURE_REGISTRIES}'"
         }
       }
     }
+    // All four build stages share ONE agent and ONE workspace (Package's jar is consumed by
+    // Image), so they are nested under a single parent stage that pins the agent. Their
+    // bodies are unchanged and deliberately left at their original indentation to keep this
+    // diff reviewable line-by-line.
+    stage('Build') {
+      agent { label "${env.BUILD_AGENT_LABEL}" }
+      stages {
     stage('Install Contracts') {
       steps {
         sh '''
@@ -65,6 +104,14 @@ pipeline {
           rm -rf .deps/options-edge-contracts
           git clone git@github.com:abhinav-jain09/options-edge-contracts.git .deps/options-edge-contracts
           git -C .deps/options-edge-contracts checkout "${CONTRACTS_BRANCH:-main}"
+          # RECORD THE REVISION, because the branch is mutable and the contract is EXECUTABLE here.
+          # The gateway validates vol-premium readings by deserialising them through
+          # IvRvReading's own constructor, so what this clone resolved to decides which payloads
+          # the gateway admits at runtime. Without the SHA, two images built from the same gateway
+          # commit can behave differently at that boundary with nothing in their provenance to say
+          # why. Mirrors what options-edge-processing already records.
+          git -C .deps/options-edge-contracts rev-parse HEAD > .contracts-sha
+          echo "contracts revision: $(cat .contracts-sha)"
           mvn -B -f .deps/options-edge-contracts/pom.xml install
         '''
       }
@@ -115,6 +162,21 @@ pipeline {
       steps {
         sh '''
           set -eu
+          # Preflight: this stage may run on a builder whose Docker is not always up (the .74
+          # agents use Docker Desktop, which needs a GUI session and does not survive reboot).
+          # Fail here with something actionable rather than obscurely mid-buildx.
+          # ONLY for builds that actually use the local daemon: production ships the source to
+          # REMOTE_BUILD_HOST and builds there, so it must not depend on Docker being up on the
+          # agent (Codex: that would fail prod for a reason that has nothing to do with prod).
+          needs_local_docker=true
+          if [ "${ENVIRONMENT:-dev}" = "production" ] && [ "$PUSH_IMAGE" = "true" ]; then
+            needs_local_docker=false
+          fi
+          if [ "$needs_local_docker" = "true" ] && ! docker info >/dev/null 2>&1; then
+            echo "Docker daemon is not reachable on this build agent ($(hostname))." >&2
+            echo "If this is the .74 builder, start Docker Desktop on it and re-run." >&2
+            exit 1
+          fi
           # <build-number>-<git-sha>: unique per run (git-sha alone repeats across rebuilds of
           # one commit); :dev (DEV_TAG) pushed alongside. Deploy pins by digest of :dev.
           # Clean replace: prod publishes ONLY :prod, NOT :dev — the deploy resolves :prod, so
@@ -128,42 +190,63 @@ pipeline {
           fi
           DEV_TAG="${DEV_IMAGE_TAG:-}"
           BUILD_PLATFORM="${BUILD_PLATFORM:-linux/arm64}"
-          IMAGE="$IMAGE_REGISTRY/options-edge-feed-gateway:$TAG"
-          DEV_IMAGE="$IMAGE_REGISTRY/options-edge-feed-gateway:$DEV_TAG"
-          PROD_IMAGE="$IMAGE_REGISTRY/options-edge-feed-gateway:prod"  # self-documenting prod moving tag
+          # Refs are built from PUSH_REGISTRY (this builder's address for the registry), which
+          # equals IMAGE_REGISTRY everywhere except a builder that is not the registry host.
+          # Same underlying storage, so the deploy still resolves the digest via IMAGE_REGISTRY.
+          PUSH_REGISTRY="${PUSH_REGISTRY:-$IMAGE_REGISTRY}"
+          IMAGE="$PUSH_REGISTRY/options-edge-feed-gateway:$TAG"
+          DEV_IMAGE="$PUSH_REGISTRY/options-edge-feed-gateway:$DEV_TAG"
+          PROD_IMAGE="$PUSH_REGISTRY/options-edge-feed-gateway:prod"  # self-documenting prod moving tag
           BUILDER_NAME="options-edge-feed-gateway-${BUILD_NUMBER:-local}"
           BUILDKITD_CONFIG="$(mktemp)"
-          # Write a buildkit insecure-registry entry for the EFFECTIVE registry iff it
-          # (normalized: scheme stripped, trailing slash stripped, lowercased) matches
+          # Register the file-only cleanup IMMEDIATELY: several fallible commands run before the
+          # builder exists, and under `set -e` a failure there would otherwise leak the temp
+          # config. Redefined below once the builder is actually created.
+          cleanup() { rm -f "$BUILDKITD_CONFIG"; }
+          trap cleanup EXIT
+          # Write a buildkit insecure-registry entry for the registry we actually PUSH to
+          # (normalized: scheme stripped, trailing slash stripped, lowercased) iff it matches
           # any entry in $INSECURE_REGISTRIES (derived from oeProfile in Resolve profile,
-          # normalized the same way). Without this, prod pushes via docker buildx fail
-          # with 'http: server gave HTTP response to HTTPS client'.
+          # normalized the same way). Without this, pushes via docker buildx fail with
+          # 'http: server gave HTTP response to HTTPS client'.
+          # This MUST test and emit PUSH_REGISTRY, not IMAGE_REGISTRY: when the builder is
+          # not the registry host they differ, and a stanza written for the pull-side name
+          # leaves the push endpoint unconfigured, failing before anything is uploaded.
           normalize() {
             printf '%s' "$1" | tr 'A-Z' 'a-z' \
               | sed -e 's#^http://##' -e 's#^https://##' \
               | sed -e 's#/*$##'
           }
-          effective_norm=$(normalize "$IMAGE_REGISTRY")
+          effective_norm=$(normalize "$PUSH_REGISTRY")
           registry_insecure=false
           for r in $INSECURE_REGISTRIES; do
             if [ "$effective_norm" = "$(normalize "$r")" ]; then registry_insecure=true; break; fi
           done
           if [ "$registry_insecure" = "true" ]; then
             cat > "$BUILDKITD_CONFIG" <<EOF
-[registry."$IMAGE_REGISTRY"]
+[registry."$PUSH_REGISTRY"]
   http = true
   insecure = true
 EOF
           else
             : > "$BUILDKITD_CONFIG"
           fi
-          docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-          docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" --use >/dev/null
-          cleanup() {
+          # Same reasoning as the preflight: the production remote-build path never touches the
+          # local daemon, so do not create/destroy a local buildx builder for it.
+          if [ "$needs_local_docker" = "true" ]; then
             docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-            rm -f "$BUILDKITD_CONFIG"
-          }
-          trap cleanup EXIT
+            docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" --use >/dev/null
+            # Builder now exists — widen cleanup to remove it too. The EXIT trap already points
+            # at `cleanup`, so redefining the function is enough.
+            cleanup() {
+              docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
+              rm -f "$BUILDKITD_CONFIG"
+            }
+          fi
+          CONTRACTS_SHA="$(cat .contracts-sha 2>/dev/null || echo unknown)"
+          # A LABEL, so the revision travels with the image rather than only with the build log —
+          # see the note in the contracts install stage.
+          BUILD_LABELS="--label options-edge.contracts-revision=$CONTRACTS_SHA"
           TAG_ARGS="-t $IMAGE"
           if [ -n "$DEV_TAG" ] && [ "$DEV_TAG" != "$TAG" ]; then
             TAG_ARGS="$TAG_ARGS -t $DEV_IMAGE"
@@ -190,15 +273,17 @@ EOF
               ./ "$remote:$remote_dir/"
             push_cmd=""
             for ref in $push_refs; do push_cmd="$push_cmd && docker push '$ref'"; done
-            ssh "$remote" "cd '$remote_dir' && docker build --no-cache $TAG_ARGS . $push_cmd && rm -rf '$remote_dir'"
+            ssh "$remote" "cd '$remote_dir' && docker build --no-cache $BUILD_LABELS $TAG_ARGS . $push_cmd && rm -rf '$remote_dir'"
           elif [ "$PUSH_IMAGE" = "true" ]; then
-            docker buildx build --platform "$BUILD_PLATFORM" --no-cache $TAG_ARGS --push .
+            docker buildx build --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS --push .
           else
-            docker buildx build --platform "$BUILD_PLATFORM" --no-cache $TAG_ARGS --load .
+            docker buildx build --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS --load .
           fi
         '''
       }
     }
+      }
+    }   // end stage('Build')
 
     // --- CLOSE THE SILENT-STALE-BUILD GAP -------------------------------------------
     // A build that pushes a new image does NOT update the running pod (build != deploy),
@@ -209,6 +294,10 @@ EOF
     // image, THIS build turns red. Dev only: production keeps the manual promote gate.
     // Guarded to the canonical main job (JOB_NAME) so PR/branch jobs never auto-deploy.
     stage('Deploy + verify (dev)') {
+      // `build job:` is a controller-side step and needs no cluster access here: the
+      // downstream service-deploy job is pinned to its own agent on .102 which holds the
+      // kubeconfigs. So this can run anywhere.
+      agent any
       when {
         expression {
           params.ENVIRONMENT == 'dev' && params.PUSH_IMAGE && params.DEPLOY_AND_VERIFY &&
