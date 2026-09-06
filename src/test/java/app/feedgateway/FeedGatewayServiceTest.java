@@ -3170,6 +3170,41 @@ class FeedGatewayServiceTest {
                 + "\"baselineMode\":\"UNCALIBRATED\",\"codeVersion\":\"abc1234\"}";
     }
 
+    // ----- gamma-leadership CURRENT reading relay ---------------------------------------------------
+
+    @Test
+    void gammaLeadershipTopicIsOptionalGlobalAndOnTheShortFiveMinuteWindow() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("options.spx.gamma-leadership.current", settings.gammaLeadershipTopic());
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("gamma-leadership"),
+                "the reading must fan out in per-session (auth) mode like its advisory siblings");
+        assertEquals(300_000L, settings.gammaLeadershipTtlMs(), "default TTL must be 5 minutes");
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, "gamma-leadership", now - 2L * 60_000L, now));
+        assertTrue(isExpired(service, "gamma-leadership", now - 6L * 60_000L, now),
+                "a 6-min-old reading must be STALE — never routed or replayed as current");
+    }
+
+    @Test
+    void gammaLeadershipUsesPayloadTsAndChainKey() throws Exception {
+        // Freshness tracks the PAYLOAD ts, not Kafka arrival; the cache key is the chain
+        // (underlying|expiry) source-prefixed, exactly how the service keys its compacted topic.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long ts = System.currentTimeMillis() - 1_000L;
+        String payload = "{\"messageType\":\"GAMMA_LEADERSHIP\",\"ts\":" + ts
+                + ",\"underlying\":\"SPX\",\"expiry\":\"20260908\",\"spot\":7740.5,"
+                + "\"K_A\":7720.0,\"K_B\":7705.0,\"L\":1.09,\"flags\":[]}";
+        ConsumerRecord<String, String> record = recordAt(
+                settings.gammaLeadershipTopic(), 0, 1L, "SPX|20260908", payload, System.currentTimeMillis());
+        assertEquals(ts, eventCacheTimestamp(service, "gamma-leadership", record),
+                "fresh Kafka arrival must not disguise a stale reading");
+        assertEquals("DATABENTO|SPX|20260908",
+                updateCache(service, topicBinding("DATABENTO", "gamma-leadership"), record, payload),
+                "updateCache must key the reading by source|underlying|expiry");
+    }
+
     // ----- spot-vol-regime CURRENT snapshot relay --------------------------------------------------
 
     @Test

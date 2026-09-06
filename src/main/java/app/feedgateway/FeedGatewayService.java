@@ -149,6 +149,7 @@ public class FeedGatewayService implements ReplayRunner {
             "zero-dte-intelligence",
             "greek-move-auth",
             "spot-vol-regime",
+            "gamma-leadership",
             "vol-premium-ivrv",
             "indicators",
             "tapeZones",
@@ -416,6 +417,10 @@ public class FeedGatewayService implements ReplayRunner {
     // point. Same standalone/global/JSON pass-through class as the spot-vol-regime sibling above;
     // NOT in the ui-batch.
     private final Map<String, String> volPremiumIvrv = new ConcurrentHashMap<>();
+    // Gamma-leadership CURRENT reading: ONE current value per chain (underlying|expiry),
+    // last-value-wins on the SHORT gammaLeadershipTtlMs window. Same standalone/global/JSON
+    // pass-through class as the two siblings above; NOT in the ui-batch.
+    private final Map<String, String> gammaLeadership = new ConcurrentHashMap<>();
     // Indicator CURRENT snapshots: ONE per canonical symbol (ES|SPX), per-symbol
     // cache + (runId, revision) supersession (rev 14 §6.9/§8): a new runId is
     // accepted in arrival(=offset) order on the single-partition compacted topic and
@@ -962,6 +967,7 @@ public class FeedGatewayService implements ReplayRunner {
             // track rather than waiting for the next live verdict.
             replayGreekMoveAuthCached(session);
             replaySpotVolRegimeCached(session);
+            replayGammaLeadershipCached(session);
             replayVolPremiumIvrvCached(session);
             replayIndicatorsCached(session);
             replayTapeZonesCached(session);
@@ -1331,6 +1337,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"spxPrices\":" + spxPrices.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
+                + "\"gammaLeadership\":" + gammaLeadership.size() + ","
                 // Pre-open IBKR plane counters appear ONLY with the feature flag ON: O7
                 // (feature-off identity) pins every OFF-state observable — this /health payload
                 // included — equivalent to a build without the feature (round-2 finding 5).
@@ -1487,6 +1494,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_gex_by_strike Cached Unusual Whales GEX strike count.\n"
                 + "# TYPE options_edge_feed_gateway_gex_by_strike gauge\n"
                 + "options_edge_feed_gateway_gex_by_strike " + gexByStrike.size() + "\n"
+                + "# HELP options_edge_feed_gateway_gamma_leadership Cached gamma-leadership chain count.\n"
+                + "# TYPE options_edge_feed_gateway_gamma_leadership gauge\n"
+                + "options_edge_feed_gateway_gamma_leadership " + gammaLeadership.size() + "\n"
                 + "# HELP options_edge_feed_gateway_strike_sr Cached unified support/resistance level count.\n"
                 + "# TYPE options_edge_feed_gateway_strike_sr gauge\n"
                 + "options_edge_feed_gateway_strike_sr " + strikeSr.size() + "\n"
@@ -1841,6 +1851,8 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         // Vol-premium IV/RV rides the same optional/standalone JSON class as spot-vol-regime.
         topicEvents.put(settings.volPremiumIvrvTopic(), new TopicBinding("DATABENTO", "vol-premium-ivrv"));
+        // Gamma-leadership CURRENT rides the same optional/standalone JSON class.
+        topicEvents.put(settings.gammaLeadershipTopic(), new TopicBinding("DATABENTO", "gamma-leadership"));
         // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
         // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
         for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
@@ -1971,6 +1983,8 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         // Vol-premium IV/RV rides the same optional/standalone JSON class as spot-vol-regime.
         topicEvents.put(settings.volPremiumIvrvTopic(), new TopicBinding("DATABENTO", "vol-premium-ivrv"));
+        // Gamma-leadership CURRENT rides the same optional/standalone JSON class.
+        topicEvents.put(settings.gammaLeadershipTopic(), new TopicBinding("DATABENTO", "gamma-leadership"));
         // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
         // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
         for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
@@ -2938,6 +2952,16 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                         continue;
                     }
+                    if ("gamma-leadership".equals(binding.event())) {
+                        // Gamma-leadership CURRENT: same GLOBAL advisory class as the siblings below —
+                        // own websocket event, never a ui-batch row, never selection-routed. Freshness
+                        // fail-closed via the SHORT gammaLeadershipTtlMs window.
+                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                            broadcast(binding.event(), forwardJson);
+                            forwardedEvents.incrementAndGet();
+                        }
+                        continue;
+                    }
                     if ("spot-vol-regime".equals(binding.event())) {
                         // Spot-vol regime CURRENT snapshot: same GLOBAL advisory delivery class as
                         // greek-move-auth above — own websocket event, never a ui-batch row, never
@@ -3792,6 +3816,11 @@ public class FeedGatewayService implements ReplayRunner {
             }
             // Spot-vol-regime CURRENT is STANDALONE (never in the ui-batch) too: re-push it explicitly
             // once this consumer's cache is caught up (fresh-window-gated inside the replay helper).
+            if (events.contains("gamma-leadership")) {
+                for (WebSocketSession client : clients) {
+                    replayGammaLeadershipCached(client);
+                }
+            }
             if (events.contains("spot-vol-regime")) {
                 for (WebSocketSession client : clients) {
                     replaySpotVolRegimeCached(client);
@@ -4809,6 +4838,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = esOpenDirectionStatusCacheKey(json, key);
         } else if ("greek-move-auth".equals(event)) {
             key = greekMoveAuthCacheKey(json, key);
+        } else if ("gamma-leadership".equals(event)) {
+            key = gammaLeadershipCacheKey(json, key);
         } else if ("spot-vol-regime".equals(event)) {
             key = spotVolRegimeCacheKey(json, key);
         } else if ("vol-premium-ivrv".equals(event)) {
@@ -5092,6 +5123,12 @@ public class FeedGatewayService implements ReplayRunner {
                     VOL_PREMIUM_TOPIC_RESETS.incrementAndGet();
                     volPremiumIvrvBroadcastOffset.remove(key);
                 }
+                return key;
+            }
+            case "gamma-leadership" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gammaLeadership.put(key, json); // ONE current reading per chain — last-value-wins
                 return key;
             }
             case "spot-vol-regime" -> {
@@ -5996,6 +6033,11 @@ public class FeedGatewayService implements ReplayRunner {
             // seekBackMs) after a gateway restart.
             return CachePolicy.expiring(settings.greekMoveAuthTtlMs());
         }
+        if ("gamma-leadership".equals(event)) {
+            // Gamma-leadership CURRENT: SHORT window — a leadership reading is only meaningful while
+            // CURRENT; a dead producer's last value must read as absent, never replay as live.
+            return CachePolicy.expiring(settings.gammaLeadershipTtlMs());
+        }
         if ("spot-vol-regime".equals(event)) {
             // Spot-vol regime CURRENT snapshot: SHORT window (default 5 min, the greek-move-auth /
             // es-open-direction STATUS freshness class) — a regime is only meaningful while CURRENT.
@@ -6227,6 +6269,10 @@ public class FeedGatewayService implements ReplayRunner {
             // producer catching up on a backlog cannot render a stale reading as live.
             return volPremiumIvrvTimestamp(json);
         }
+        if ("gamma-leadership".equals(event)) {
+            // Freshness tracks the PAYLOAD event time (ts), never Kafka arrival time.
+            return gammaLeadershipTimestamp(json);
+        }
         if ("spot-vol-regime".equals(event)) {
             // Same rule as greek-move-auth: freshness tracks the PAYLOAD stream-time (asOfEventTimeMs),
             // never the Kafka ARRIVAL time, so a producer catching up on a backlog cannot render a
@@ -6385,6 +6431,18 @@ public class FeedGatewayService implements ReplayRunner {
             long eventTimeMs = longField(mapper.readTree(json), "eventTimeMs", -1L);
             if (eventTimeMs > System.currentTimeMillis() + SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS) {
                 return -1L; // implausibly future — fail closed, never cache or replay
+            }
+            return eventTimeMs;
+        } catch (JsonProcessingException ignored) {
+            return -1L;
+        }
+    }
+
+    private long gammaLeadershipTimestamp(String json) {
+        try {
+            long eventTimeMs = longField(mapper.readTree(json), "ts", -1L);
+            if (eventTimeMs > System.currentTimeMillis() + SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS) {
+                return -1L; // implausibly future — fail closed, never cache/replay
             }
             return eventTimeMs;
         } catch (JsonProcessingException ignored) {
@@ -7334,6 +7392,25 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 send(session, "vol-premium-ivrv", json);
             }
+        }
+    }
+
+    private void replayGammaLeadershipCached(WebSocketSession session) {
+        // Late-join delivery for the gamma-leadership CURRENT reading: same GLOBAL advisory class as
+        // the siblings — intentionally NOT filtered by the active market selection, chain-filtered
+        // client-side. Purge-first + isCacheFresh on the SHORT window: a late joiner gets the CURRENT
+        // reading only; anything older is simply absent.
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        for (Map.Entry<String, String> entry : gammaLeadership.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh("gamma-leadership:" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, "gamma-leadership", json);
         }
     }
 
@@ -9260,6 +9337,21 @@ public class FeedGatewayService implements ReplayRunner {
         return key;
     }
 
+    /** One current reading per chain: underlying|expiry, as the service keys its compacted topic. */
+    private String gammaLeadershipCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String underlying = text(root, "underlying").toUpperCase();
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            if (!underlying.isBlank() && !expiry.isBlank()) {
+                return underlying + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Malformed payloads expire immediately via gammaLeadershipTimestamp.
+        }
+        return fallback;
+    }
+
     private String spotVolRegimeCacheKey(String json, String fallback) {
         try {
             String symbol = text(mapper.readTree(json), "symbol").toUpperCase();
@@ -10133,6 +10225,7 @@ public class FeedGatewayService implements ReplayRunner {
         // return-to-live from a historical replay (replayLiveCacheToAppSession -> replayCachedToSocket).
         replayGreekMoveAuthCached(session);
         replaySpotVolRegimeCached(session);
+        replayGammaLeadershipCached(session);
         // Same STANDALONE global-advisory class, and the same reason it must be here as well as in
         // addClient: this is the path that serves per-session (auth) connections and return-to-live
         // from a historical replay. Without it the card was permanently blank in authenticated
@@ -11173,7 +11266,10 @@ public class FeedGatewayService implements ReplayRunner {
             "delta-flow-accel",
             // U16: SPX-translated CVD structure levels — ES-global advisory overlay on the tape page,
             // fail-closed client-side (ES-CVD-SPX-LEVELS-DESIGN.md CL-R7).
-            "es-cvd-spx-levels");
+            "es-cvd-spx-levels",
+            // gamma-leadership CURRENT: standalone global advisory (own websocket event, never a
+            // ui-batch row, never selection-routed), chain-filtered client-side.
+            "gamma-leadership");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);

@@ -1257,6 +1257,21 @@ public final class GatewaySettings {
     }
 
     /**
+     * Compacted CURRENT topic of the standalone gamma-leadership service (JSON, one record per
+     * chain {@code underlying|expiry}; the service re-emits on every coherent spot move). No
+     * contracts constant exists yet, so the default is the literal topic name — the same shape as
+     * the display/pace getters above.
+     */
+    public String gammaLeadershipTopic() {
+        return value("KAFKA_GAMMA_LEADERSHIP_CURRENT_TOPIC", "options.spx.gamma-leadership.current");
+    }
+
+    /** Freshness window for a gamma-leadership reading: the SHORT advisory class (5 min). */
+    public long gammaLeadershipTtlMs() {
+        return longValue("GATEWAY_GAMMA_LEADERSHIP_TTL_MS", 300_000L, 0L);
+    }
+
+    /**
      * Compacted IV-vs-realised topic of the standalone vol-premium service (JSON
      * {@code IvRvReading} &mdash; see {@link VolPremiumTopics#IVRV}). One record per
      * {@code SYMBOL|sessionDate}, published every frame. Resolved through the platform topic-prefix
