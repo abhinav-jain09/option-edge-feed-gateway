@@ -476,51 +476,42 @@ class EsAuctionWiringTest {
         assertTrue(source.contains("recoverEsAuction.add(partition)") && source.contains("consumer.seekToBeginning(List.of(p))"));
     }
 
-    @Test void theAuctionCursorIsActuallyRecordedAndTheColdStartHandsOffFromHydration() throws Exception {
-        // Code review round 7: the live branch returned before the cursor was recorded, so every retry
-        // still went to END; and a cold start jumped to END without a handoff from the cache consumer.
+
+
+
+    @Test void theAuctionIsNeverConsumedLiveFromAGuessedPositionAndTheHelloWaitsForACompleteHandoff() throws Exception {
+        // Rounds 6-10, one contract in three parts:
+        //  (a) the LIVE path records its own cursor so a retry resumes instead of skipping the retry gap;
+        //  (b) the cold start PAUSES the auction until the frozen handoff exists — seekToEnd is lazy, so a
+        //      live consumer that started before hydration froze could resolve END after the cache barrier
+        //      and skip everything in between, which the cache then swallowed silently;
+        //  (c) the hello is released only when EVERY auction partition has a handoff, so a failed position
+        //      read holds the hello instead of leaving a partition to fall back to END.
         String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int note = source.indexOf("private void noteCvdSpxLevelsProgress(");
+        assertTrue(source.substring(note, note + 700).contains("esAuctionNextOffset.put("), "(a) the live path records a per-partition cursor");
         int liveBranch = source.indexOf("if (\"es-auction\".equals(binding.event())) {");
         String branch = source.substring(liveBranch, liveBranch + 900);
-        assertTrue(branch.indexOf("noteCvdSpxLevelsProgress(binding, record)") < branch.indexOf("continue;"), "the cursor is recorded BEFORE the branch continues");
-        int cacheBranch = source.indexOf("onEsAuctionCacheRecord(record.key()");
-        assertTrue(source.substring(cacheBranch, cacheBranch + 400).contains("esAuctionCacheNextOffset.put("), "hydration records its handoff point");
+        assertTrue(branch.indexOf("noteCvdSpxLevelsProgress(binding, record)") < branch.indexOf("continue;"), "(a) recorded BEFORE the branch continues");
+
         int liveOnce = source.indexOf("private void runLiveConsumerOnce(");
-        assertTrue(source.substring(liveOnce, liveOnce + 1500).contains("seekEsAuctionToHandoff(consumer, partitions)"), "the cold start hands off");
-        int within = source.indexOf("private void seekEsAuctionWithinAt(");
-        String w = source.substring(within, within + 1100);
-        assertTrue(w.contains("catch (RuntimeException rangeUnknown)") && w.contains("consumer.seek(owned, cursor)"), "an unknown range keeps the cursor rather than skipping to END");
-    }
+        String live = source.substring(liveOnce, liveOnce + 2000);
+        assertTrue(live.contains("pauseEsAuctionUntilHandoff(consumer, partitions)"), "(b) the cold start pauses the auction");
+        assertTrue(live.contains("resumeEsAuctionOnceHandoffExists(consumer, partitions)"), "(b) and resumes it inside the poll loop");
+        int pause = source.indexOf("private void pauseEsAuctionUntilHandoff(");
+        assertTrue(source.substring(pause, pause + 700).contains("consumer.pause(owned)"), "(b) actually paused");
+        int resume = source.indexOf("private void resumeEsAuctionOnceHandoffExists(");
+        String r = source.substring(resume, resume + 900);
+        assertTrue(r.contains("esAuctionHandoffOffset.get(tp)") && r.contains("seekEsAuctionWithinAt(consumer, tp, handoff)") && r.contains("consumer.resume("), "(b) positioned exactly, then resumed");
 
-    @Test void theHandoffIsFrozenAtTheCatchUpBoundaryNotWhereverTheCacheHasSinceReached() throws Exception {
-        // Code review round 8: the cache cursor keeps moving after hydration. Handing the live consumer the
-        // MOVING value would let it seek past records the cache had already swallowed silently.
-        String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int freeze = source.indexOf("void tryFreezeEsAuctionHandoff(");
+        String f = source.substring(freeze, freeze + 1600);
+        assertTrue(f.contains("consumer.position(tp)"), "(c) the ACTUAL position");
+        assertTrue(f.contains("attempt < 3"), "(c) retried rather than swallowed");
+        assertTrue(f.indexOf("if (!complete || !sawPartition) return;") < f.indexOf("flushEsAuctionHellos()"), "(c) the hello waits for a COMPLETE handoff");
+        assertTrue(f.contains("putIfAbsent(tp, at)"), "(c) captured once per partition: later movement is ignored");
         int mark = source.indexOf("private void markCacheCaughtUp(");
-        String body = source.substring(mark, mark + 900);
-        assertTrue(body.indexOf("freezeEsAuctionHandoff()") < body.indexOf("flushEsAuctionHellos()"), "frozen at the same instant the hello is released, before it");
-        int freeze = source.indexOf("private void freezeEsAuctionHandoff()");
-        assertTrue(source.substring(freeze, freeze + 400).contains("compareAndSet(false, true)"), "the first freeze wins");
-        int handoff = source.indexOf("private void seekEsAuctionToHandoff(");
-        String h = source.substring(handoff, handoff + 900);
-        assertTrue(h.contains("esAuctionHandoffOffset.get(tp)"), "the live consumer reads the FROZEN cursor");
-        assertFalse(h.contains("esAuctionCacheNextOffset.get(tp)"), "never the moving one");
-    }
-
-    @Test void everyAuctionPartitionHasAHandoffValueAtTheFreeze() throws Exception {
-        // Code review round 9: the freeze only had a value for partitions on which a record happened to be
-        // processed. A partition with none fell through to END on the cold start, so a minute produced
-        // between the cache barrier and that seek was skipped live and swallowed silently by the cache.
-        String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
-        int rec = source.indexOf("private void recordEsAuctionCachePositions(");
-        assertTrue(rec > 0, "positions are captured for every auction partition");
-        assertTrue(source.substring(rec, rec + 800).contains("consumer.position(tp)"), "the ACTUAL position, not a record offset");
-        int first = source.indexOf("recordEsAuctionCachePositions(consumer, partitions);");
-        int firstMark = source.indexOf("markCacheCaughtUp(name, events, caughtUpFlag);", first);
-        assertTrue(first > 0 && firstMark > first && firstMark - first < 220, "captured immediately before the first mark");
-        int second = source.indexOf("recordEsAuctionCachePositions(consumer, partitions);", firstMark);
-        int secondMark = source.indexOf("markCacheCaughtUp(name, events, caughtUpFlag);", second);
-        assertTrue(second > 0 && secondMark > second && secondMark - second < 220, "and before the retried mark");
+        assertFalse(source.substring(mark, mark + 900).contains("flushEsAuctionHellos()"), "(c) the barrier alone no longer releases the hello");
     }
 
     @Test void foreignShapesNeverPoisonTheView() {

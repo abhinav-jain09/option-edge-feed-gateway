@@ -637,12 +637,9 @@ public class FeedGatewayService implements ReplayRunner {
     /** Per-partition next offset for the auction topic on the LIVE path, so a retry RESUMES instead of
      *  replaying its seven-day cache window or skipping whatever was produced during the retry gap. */
     private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionNextOffset = new java.util.concurrent.ConcurrentHashMap<>();
-    /** Where the CACHE consumer's hydration reached: the live consumer starts there on a cold start, so a
-     *  record produced between hydration completing and the live seek is not silently skipped. */
-    private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionCacheNextOffset = new java.util.concurrent.ConcurrentHashMap<>();
-    /** The cache cursor FROZEN at the catch-up boundary — the same instant the hello is released. The live
-     *  cursor keeps moving as the cache consumer works, so handing the live consumer the moving value would
-     *  let it seek PAST records the cache had already swallowed silently (code review round 8). */
+    /** Where the CACHE consumer's hydration stopped, captured ONCE per partition at the catch-up boundary
+     *  (putIfAbsent, so later movement is ignored). The live consumer starts exactly there, which is why the
+     *  hello is not released until every auction partition has a value here (code review rounds 8–10). */
     private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionHandoffOffset = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicBoolean esAuctionHandoffFrozen = new AtomicBoolean(false);
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
@@ -2355,8 +2352,8 @@ public class FeedGatewayService implements ReplayRunner {
             boolean live = caughtUp(consumer, catchUpEndOffsets);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
             if (live) {
-                recordEsAuctionCachePositions(consumer, partitions);
                 markCacheCaughtUp(name, events, caughtUpFlag);
+                tryFreezeEsAuctionHandoff(consumer, partitions);
             }
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
@@ -2491,7 +2488,6 @@ public class FeedGatewayService implements ReplayRunner {
                         // shape) and the /api/auction/minutes view stayed EMPTY after a restart
                         // until the next live minute arrived. Fed the KAFKA KEY, like the live branch.
                         onEsAuctionCacheRecord(record.key() == null ? null : String.valueOf(record.key()), json);
-                        esAuctionCacheNextOffset.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
                         continue;
                     }
                     updateCache(binding, record, json);
@@ -2535,8 +2531,8 @@ public class FeedGatewayService implements ReplayRunner {
                     // once the last barrier retires, and markCacheCaughtUp's false->true CAS may never fire
                     // again. Both calls are idempotent and markSelectionReady re-validates under readyLock,
                     // so this is safe and cheap.
-                    recordEsAuctionCachePositions(consumer, partitions);
                     markCacheCaughtUp(name, events, caughtUpFlag);
+                    tryFreezeEsAuctionHandoff(consumer, partitions);
                     ActiveSelection liveSelection = activeSelection.get();
                     if (liveSelection != null
                             && !selectionKey(liveSelection).equals(readySelectionKey.get())) {
@@ -2752,10 +2748,11 @@ public class FeedGatewayService implements ReplayRunner {
             } else {
                 consumer.seekToEnd(partitions);
                 seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
-                seekEsAuctionToHandoff(consumer, partitions);      // the same continuity for the auction
+                pauseEsAuctionUntilHandoff(consumer, partitions);  // never consume the auction from a guessed position
             }
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
             while (running.get()) {
+                resumeEsAuctionOnceHandoffExists(consumer, partitions);
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
@@ -3933,10 +3930,8 @@ public class FeedGatewayService implements ReplayRunner {
             // ONLY the state consumer hydrates the auction view. Flushing on any other cache consumer's
             // catch-up would hand out a hello bounded by a partly hydrated view, and the records that
             // arrive afterwards are silent by design (code review round 4).
-            if (caughtUpFlag == stateCaughtUp) {
-                freezeEsAuctionHandoff();   // the live consumer must start exactly HERE, not wherever the cache has since reached
-                flushEsAuctionHellos();
-            }
+            // The auction hellos are NOT flushed here: they wait for a complete per-partition handoff, which
+            // only the cache consumer's own thread can capture (tryFreezeEsAuctionHandoff, driven from its loop).
             // Run the whole catch-up replay under readyLock so the active selection is STABLE across the
             // capture, the cached-batch build (cachedEvents/uiBatchEnvelopeJson re-read activeSelection),
             // and the readiness commit. Without the lock a concurrent applySelection could swap the active
@@ -10499,6 +10494,35 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
+     * Cold start: the auction partitions are PAUSED until their handoff exists. `seekToEnd` is lazy — it
+     * resolves at the next poll — so a live consumer that started before hydration froze could resolve END
+     * AFTER the cache barrier and skip everything in between, which the cache then swallowed silently
+     * (code review round 10). Paused, it consumes nothing until it can be positioned exactly.
+     */
+    private void pauseEsAuctionUntilHandoff(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        List<TopicPartition> owned = new java.util.ArrayList<>();
+        for (TopicPartition tp : partitions) if (tp.topic().equals(topic) && !esAuctionHandoffOffset.containsKey(tp)) owned.add(tp);
+        if (!owned.isEmpty()) consumer.pause(owned);
+    }
+
+    /** Positions and resumes each paused auction partition the moment its frozen handoff appears. */
+    private void resumeEsAuctionOnceHandoffExists(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        java.util.Set<TopicPartition> paused = consumer.paused();
+        if (paused.isEmpty()) return;
+        for (TopicPartition tp : partitions) {
+            if (!tp.topic().equals(topic) || !paused.contains(tp)) continue;
+            Long handoff = esAuctionHandoffOffset.get(tp);
+            if (handoff == null) continue;
+            seekEsAuctionWithinAt(consumer, tp, handoff);
+            consumer.resume(List.of(tp));
+        }
+    }
+
+    /**
      * Cold start: begin where the CACHE consumer's hydration reached, not at the end. The cache can finish
      * hydrating and release the hello before this consumer performs its seek, and a record produced in that
      * window would then be cached silently and skipped on the wire, so the page that already has its hello
@@ -10510,7 +10534,7 @@ public class FeedGatewayService implements ReplayRunner {
         for (TopicPartition tp : partitions) {
             if (!tp.topic().equals(topic)) continue;
             Long handoff = esAuctionHandoffOffset.get(tp);
-            if (handoff == null) continue;                          // hydration has not reached its boundary yet: END is correct
+            if (handoff == null) continue;                          // still paused; resumed the moment it appears
             seekEsAuctionWithinAt(consumer, tp, handoff);
         }
     }
@@ -12807,19 +12831,32 @@ public class FeedGatewayService implements ReplayRunner {
      * live seek fell through to END, and a minute produced between the cache barrier and that seek was
      * skipped on the wire while the cache swallowed it silently (code review round 9).
      */
-    private void recordEsAuctionCachePositions(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions) {
-        if (!settings.esAuctionEnabled() || esAuctionHandoffFrozen.get()) return;
+    /**
+     * Captures the cache consumer's ACTUAL position on every auction partition, once per partition, and
+     * releases the held hellos only when EVERY one of them has a value. A swallowed `position()` failure
+     * used to leave a partition without a handoff, and the cold-start live seek then fell back to END —
+     * exactly the silent loss the handoff exists to prevent (code review round 10). So a failure is not
+     * swallowed: the hello stays held and the next loop iteration tries again.
+     *
+     * <p>Called from the cache consumer's own thread, which is the only thread that may touch its consumer.
+     */
+    void tryFreezeEsAuctionHandoff(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled() || esAuctionHandoffFrozen.get() || !stateCaughtUp.get()) return;
         String topic = settings.esAuctionTopic();
+        boolean complete = true, sawPartition = false;
         for (TopicPartition tp : partitions) {
             if (!tp.topic().equals(topic)) continue;
-            try { esAuctionCacheNextOffset.put(tp, consumer.position(tp)); } catch (RuntimeException ignored) { /* the freeze simply has no value for it */ }
+            sawPartition = true;
+            if (esAuctionHandoffOffset.containsKey(tp)) continue;
+            Long at = null;
+            for (int attempt = 0; attempt < 3 && at == null; attempt++) {
+                try { at = consumer.position(tp); } catch (RuntimeException retryable) { at = null; }
+            }
+            if (at == null) { complete = false; System.out.println("es-auction: cannot read the cache position for " + tp + "; the hello stays held until it can"); continue; }
+            esAuctionHandoffOffset.putIfAbsent(tp, at);
         }
-    }
-
-    /** Freezes the cache cursor at the catch-up boundary; the first freeze wins, later movement is ignored. */
-    private void freezeEsAuctionHandoff() {
-        if (!esAuctionHandoffFrozen.compareAndSet(false, true)) return;
-        esAuctionHandoffOffset.putAll(esAuctionCacheNextOffset);
+        if (!complete || !sawPartition) return;
+        if (esAuctionHandoffFrozen.compareAndSet(false, true)) flushEsAuctionHellos();
     }
 
     /** Sends the auction hello to every socket that connected before the view had hydrated. */
