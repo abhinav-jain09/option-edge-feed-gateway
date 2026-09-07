@@ -3243,9 +3243,21 @@ class FeedGatewayServiceTest {
         String alert = "{\"symbol\":\"SPX\",\"sessionDate\":\"" + today + "\",\"alertId\":\"pushalert|c1\",\"alertClass\":\"PUSH_EXHAUSTED\",\"ts\":" + (now - 500L) + ",\"eventTMs\":" + (now - 2_500L) + "}";
         ConsumerRecord<String, String> a1 = recordAt(settings.directionAlertTopic(), 0, 1L, "SPX|c1", alert, now);
         assertEquals("DATABENTO|pushalert|c1", updateCache(service, topicBinding("DATABENTO", "direction-alert"), a1, alert));
-        assertEquals(now - 500L, eventCacheTimestamp(service, "direction-alert", a1));
+        assertEquals(now - 2_500L, eventCacheTimestamp(service, "direction-alert", a1), "the OLDER of ts/eventTMs is the alert's clock");
         assertTrue(isExpired(service, "direction-alert", now - 61_000L, now));
         assertFalse(isExpired(service, "direction-alert", now - 59_000L, now));
+        String backlogAlert = alert.replace("\"eventTMs\":" + (now - 2_500L), "\"eventTMs\":" + (now - 120_000L));
+        assertTrue(isExpired(service, "direction-alert", eventCacheTimestamp(service, "direction-alert",
+                recordAt(settings.directionAlertTopic(), 0, 2L, "SPX|c2", backlogAlert, now)), now),
+                "a fresh transport stamp on an old event is a backlog, never a live alert (r11 #1)");
+        // expiry evicts the payload, not only its clock (r11 #7)
+        assertTrue(service.healthJson().contains("\"directionAlert\":1"), service.healthJson());
+        Method remove = FeedGatewayService.class.getDeclaredMethod("removeCacheEntry", String.class);
+        remove.setAccessible(true);
+        remove.invoke(service, "direction-alert:DATABENTO|pushalert|c1");
+        assertTrue(service.healthJson().contains("\"directionAlert\":0"), service.healthJson());
+        remove.invoke(service, "direction-push:DATABENTO|SPX");
+        assertTrue(service.healthJson().contains("\"directionPush\":0"), service.healthJson());
     }
 
     // ----- gamma-leadership CURRENT reading relay ---------------------------------------------------

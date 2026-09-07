@@ -6380,11 +6380,11 @@ public class FeedGatewayService implements ReplayRunner {
             // Freshness tracks the PAYLOAD event time (ts), never Kafka arrival time.
             return gammaLeadershipTimestamp(json);
         }
-        if ("direction".equals(event) || "direction-alert".equals(event) || "direction-scorecard".equals(event)) {
+        if ("direction".equals(event) || "direction-scorecard".equals(event)) {
             return directionTimestamp(json);
         }
-        if ("direction-push".equals(event)) {
-            return directionPushTimestamp(json);
+        if ("direction-push".equals(event) || "direction-alert".equals(event)) {
+            return directionPushTimestamp(json);   // both stamps: an alert with a fresh publish stamp on an old event is a backlog (r11 #1)
         }
         if ("spot-vol-regime".equals(event)) {
             // Same rule as greek-move-auth: freshness tracks the PAYLOAD stream-time (asOfEventTimeMs),
@@ -6699,6 +6699,14 @@ public class FeedGatewayService implements ReplayRunner {
             greekMoveAuthCurrent.remove(versionKey.substring("greek-move-auth:".length()));
         } else if (versionKey.startsWith("spot-vol-regime:")) {
             spotVolRegime.remove(versionKey.substring("spot-vol-regime:".length()));
+        } else if (versionKey.startsWith("direction:")) {
+            directionCurrent.remove(versionKey.substring("direction:".length()));
+        } else if (versionKey.startsWith("direction-push:")) {
+            directionPush.remove(versionKey.substring("direction-push:".length()));
+        } else if (versionKey.startsWith("direction-alert:")) {
+            directionAlert.remove(versionKey.substring("direction-alert:".length()));   // an expired alert leaves the cache (r11 #7)
+        } else if (versionKey.startsWith("direction-scorecard:")) {
+            directionScorecard.remove(versionKey.substring("direction-scorecard:".length()));
         } else if (versionKey.startsWith("vol-premium-ivrv:")) {
             String ivrvKey = versionKey.substring("vol-premium-ivrv:".length());
             volPremiumIvrv.remove(ivrvKey);
