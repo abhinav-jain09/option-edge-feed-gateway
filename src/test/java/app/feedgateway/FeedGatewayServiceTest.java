@@ -3299,15 +3299,38 @@ class FeedGatewayServiceTest {
                     path + " leaked the alert payload under another event name; got: " + sink);
         }
 
-        // The two helpers above are what a join calls, but a direct send could also be written into the join wrapper
-        // itself, where an outbound channel makes behavioural capture unreliable in a unit test. So the rule is also
-        // enforced structurally, over the WHOLE service: no join or replay path may address a session with an alert.
-        String src = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
-        assertEquals(0, src.split("send\\(session, \"direction-alert\"", -1).length - 1,
-                "no path that addresses a single session may send a direction-alert (A4.10)");
-        for (String joinPath : java.util.List.of("public void addClient(WebSocketSession session)",
-                "private void replayCachedToSocket(", "private void replayDirectionPushCached(")) {
-            assertTrue(src.contains(joinPath), joinPath + " moved — this guard no longer covers the join");
+        // …and the REAL join, addClient, with the replay gate on: everything a browser is handed when it connects.
+        // A direct alert send written anywhere into that path — however the event name is spelled — fails here.
+        System.setProperty("GATEWAY_ES_CVD_ENABLED", "true");
+        try {
+            FeedGatewayService joined = service();
+            assertEquals("DATABENTO|SPX", updateCache(joined, topicBinding("DATABENTO", "direction-push"),
+                    recordAt(settings.directionPushTopic(), 0, 1L, "SPX", push, now), push));
+            assertEquals("DATABENTO|pushalert|c1", updateCache(joined, topicBinding("DATABENTO", "direction-alert"),
+                    recordAt(settings.directionAlertTopic(), 0, 1L, "SPX|c1", alert, now), alert));
+            assertEquals("DATABENTO|SPX", updateCache(joined, topicBinding("DATABENTO", "direction-scorecard"),
+                    recordAt(settings.directionScorecardTopic(), 0, 1L, "SPX", scorecard, now), scorecard));
+            // the direction replays live behind the state consumer's catch-up flag, as they do in production
+            for (String flag : java.util.List.of("stateCaughtUp", "avroCaughtUp")) {
+                java.lang.reflect.Field f = FeedGatewayService.class.getDeclaredField(flag);
+                f.setAccessible(true);
+                ((java.util.concurrent.atomic.AtomicBoolean) f.get(joined)).set(true);
+            }
+            List<String> sent = Collections.synchronizedList(new ArrayList<>());
+            joined.addClient(recordingSession(sent));
+            long deadline = System.currentTimeMillis() + 2_000L;
+            while (sent.stream().noneMatch(m -> m.contains("\"type\":\"direction-push\""))
+                    && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10L);
+            }
+            assertTrue(sent.stream().anyMatch(m -> m.contains("\"type\":\"direction-push\"")),
+                    "the real join must deliver the push state; got: " + sent);
+            assertTrue(sent.stream().anyMatch(m -> m.contains("\"type\":\"direction-scorecard\"")),
+                    "the real join must deliver the scorecard; got: " + sent);
+            assertTrue(sent.stream().noneMatch(m -> m.contains("direction-alert") || m.contains("pushalert|c1")),
+                    "the real join must NEVER hand a joining client an alert, however it is spelled (A4.10); got: " + sent);
+        } finally {
+            System.clearProperty("GATEWAY_ES_CVD_ENABLED");
         }
     }
 
