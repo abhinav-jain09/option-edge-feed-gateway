@@ -492,6 +492,21 @@ class EsAuctionWiringTest {
         assertTrue(w.contains("catch (RuntimeException rangeUnknown)") && w.contains("consumer.seek(owned, cursor)"), "an unknown range keeps the cursor rather than skipping to END");
     }
 
+    @Test void theHandoffIsFrozenAtTheCatchUpBoundaryNotWhereverTheCacheHasSinceReached() throws Exception {
+        // Code review round 8: the cache cursor keeps moving after hydration. Handing the live consumer the
+        // MOVING value would let it seek past records the cache had already swallowed silently.
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int mark = source.indexOf("private void markCacheCaughtUp(");
+        String body = source.substring(mark, mark + 900);
+        assertTrue(body.indexOf("freezeEsAuctionHandoff()") < body.indexOf("flushEsAuctionHellos()"), "frozen at the same instant the hello is released, before it");
+        int freeze = source.indexOf("private void freezeEsAuctionHandoff()");
+        assertTrue(source.substring(freeze, freeze + 400).contains("compareAndSet(false, true)"), "the first freeze wins");
+        int handoff = source.indexOf("private void seekEsAuctionToHandoff(");
+        String h = source.substring(handoff, handoff + 900);
+        assertTrue(h.contains("esAuctionHandoffOffset.get(tp)"), "the live consumer reads the FROZEN cursor");
+        assertFalse(h.contains("esAuctionCacheNextOffset.get(tp)"), "never the moving one");
+    }
+
     @Test void foreignShapesNeverPoisonTheView() {
         var s = service();
         assertFalse(s.upsertEsAuctionMinute(null, "{\"unrelated\":true}"));

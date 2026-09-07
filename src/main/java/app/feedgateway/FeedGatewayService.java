@@ -640,6 +640,11 @@ public class FeedGatewayService implements ReplayRunner {
     /** Where the CACHE consumer's hydration reached: the live consumer starts there on a cold start, so a
      *  record produced between hydration completing and the live seek is not silently skipped. */
     private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionCacheNextOffset = new java.util.concurrent.ConcurrentHashMap<>();
+    /** The cache cursor FROZEN at the catch-up boundary — the same instant the hello is released. The live
+     *  cursor keeps moving as the cache consumer works, so handing the live consumer the moving value would
+     *  let it seek PAST records the cache had already swallowed silently (code review round 8). */
+    private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionHandoffOffset = new java.util.concurrent.ConcurrentHashMap<>();
+    private final AtomicBoolean esAuctionHandoffFrozen = new AtomicBoolean(false);
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -3926,7 +3931,10 @@ public class FeedGatewayService implements ReplayRunner {
             // ONLY the state consumer hydrates the auction view. Flushing on any other cache consumer's
             // catch-up would hand out a hello bounded by a partly hydrated view, and the records that
             // arrive afterwards are silent by design (code review round 4).
-            if (caughtUpFlag == stateCaughtUp) flushEsAuctionHellos();
+            if (caughtUpFlag == stateCaughtUp) {
+                freezeEsAuctionHandoff();   // the live consumer must start exactly HERE, not wherever the cache has since reached
+                flushEsAuctionHellos();
+            }
             // Run the whole catch-up replay under readyLock so the active selection is STABLE across the
             // capture, the cached-batch build (cachedEvents/uiBatchEnvelopeJson re-read activeSelection),
             // and the readiness commit. Without the lock a concurrent applySelection could swap the active
@@ -10499,8 +10507,8 @@ public class FeedGatewayService implements ReplayRunner {
         String topic = settings.esAuctionTopic();
         for (TopicPartition tp : partitions) {
             if (!tp.topic().equals(topic)) continue;
-            Long handoff = esAuctionCacheNextOffset.get(tp);
-            if (handoff == null) continue;                          // nothing hydrated yet: END is already correct
+            Long handoff = esAuctionHandoffOffset.get(tp);
+            if (handoff == null) continue;                          // hydration has not reached its boundary yet: END is correct
             seekEsAuctionWithinAt(consumer, tp, handoff);
         }
     }
@@ -12789,6 +12797,12 @@ public class FeedGatewayService implements ReplayRunner {
                 Long.toString(settings.partitionMetadataRefreshMs()));
         settings.applyKafkaSecurity(properties); // TLS/SASL when configured (required under auth — P0)
         return properties;
+    }
+
+    /** Freezes the cache cursor at the catch-up boundary; the first freeze wins, later movement is ignored. */
+    private void freezeEsAuctionHandoff() {
+        if (!esAuctionHandoffFrozen.compareAndSet(false, true)) return;
+        esAuctionHandoffOffset.putAll(esAuctionCacheNextOffset);
     }
 
     /** Sends the auction hello to every socket that connected before the view had hydrated. */
