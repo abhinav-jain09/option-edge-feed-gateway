@@ -609,6 +609,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean avroCaughtUp = new AtomicBoolean(false);
     private final AtomicBoolean stateCaughtUp = new AtomicBoolean(false);
+    /** Sockets that connected before the auction view finished hydrating; each gets its hello when it does. */
+    private final Set<WebSocketSession> esAuctionHelloPending = new CopyOnWriteArraySet<>();
     private final AtomicBoolean hpsfCaughtUp = new AtomicBoolean(false);
     private final AtomicReference<ActiveSelection> activeSelection;
     private final AtomicReference<Map<TopicPartition, Long>> offsetBarriers = new AtomicReference<>(Map.of());
@@ -923,9 +925,18 @@ public class FeedGatewayService implements ReplayRunner {
             send(session, "source-ready", activeSelectionJson(selection, "source-ready"));
         }
         if (settings.esAuctionEnabled()) {
-            // Auction-desk hello: what this gateway holds for the current trade date, so the page
-            // can bound its /api/auction/minutes backfill and buffer live WS minutes past it.
-            send(session, "es-auction-hello", esAuctionHelloJson());
+            // Auction-desk hello: what this gateway holds for the current trade date, so the page can
+            // bound its /api/auction/minutes backfill and buffer live WS minutes past it. It must NOT
+            // go out before the state cache consumer has finished its seven-day hydration (code review
+            // round 3): a page that reconnects mid-restart would bound its backfill by a PARTIAL view
+            // and never learn about the records hydrated afterwards, because the hydration path is
+            // deliberately silent. Hold the socket instead — the page buffers live frames until the
+            // hello arrives — and flush every held socket the moment hydration completes.
+            if (stateCaughtUp.get()) {
+                send(session, "es-auction-hello", esAuctionHelloJson());
+            } else {
+                esAuctionHelloPending.add(session);
+            }
         }
         // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
         // each socket gets only the cached state matching its own AppSession selection (no cross-
@@ -1026,6 +1037,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     public void removeClient(WebSocketSession session) {
+        esAuctionHelloPending.remove(session);   // a socket that closed while waiting for its hello must not be held
         String id = session.getId();
         OutboundChannel channel = outbound.remove(id);
         spotBandSwitchDelivered.remove(id);
@@ -1462,6 +1474,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP gateway_es_auction_backfill_requests_total /api/auction/minutes backfill pages served.\n"
                 + "# TYPE gateway_es_auction_backfill_requests_total counter\n"
                 + "gateway_es_auction_backfill_requests_total " + esAuctionBackfillRequests.get() + "\n"
+                + "gateway_es_auction_orphan_envelopes_total " + esAuctionOrphanEnvelopes.get() + "\n"
                 + "# HELP gateway_vol_premium_topic_resets_total vol-premium-ivrv records admitted as a "
                 + "recreated topic: behind the cached offset AND strictly newer, which no incarnation "
                 + "of that topic can otherwise produce. Each one is a recovery from a reset that "
@@ -3877,6 +3890,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
         if (caughtUpFlag.compareAndSet(false, true)) {
+            flushEsAuctionHellos();
             // Run the whole catch-up replay under readyLock so the active selection is STABLE across the
             // capture, the cached-batch build (cachedEvents/uiBatchEnvelopeJson re-read activeSelection),
             // and the readiness commit. Without the lock a concurrent applySelection could swap the active
@@ -9759,6 +9773,8 @@ public class FeedGatewayService implements ReplayRunner {
     private volatile String esAuctionPrevTradeDate;
     private final AtomicLong esAuctionRecords = new AtomicLong();
     private final AtomicLong esAuctionBackfillRequests = new AtomicLong();
+    /** Envelopes that arrived with no minute to correct: counted, never stored (the view holds MINUTES). */
+    private final AtomicLong esAuctionOrphanEnvelopes = new AtomicLong();
 
     /**
      * Live-path handler for one es-auction Kafka record: keyed upsert, then the VERBATIM
@@ -9848,6 +9864,11 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (tradeDate == null || tradeDate.isEmpty() || minute == null || minute.isEmpty()) { outcome[0] = EsAuctionUpsert.DROPPED; return false; }
         String viewKey = tradeDate + "|" + minute;
+        // A §7b CorrectionEnvelope is a SPARSE PATCH, not a minute. /api/auction/minutes promises MINUTES,
+        // and a page loading cold cannot reconstruct one from a patch whose base it never receives, so the
+        // view stores the MATERIALIZED record: the envelope applied to the minute it corrects (code review
+        // round 3). The wire still carries the envelope verbatim; the page applies the same operations.
+        boolean envelope = esAuctionIsEnvelope(json);
         synchronized (esAuctionMinutes) {
             // ORDER-INDEPENDENT retention: the view holds the two GREATEST trade dates it has seen,
             // whatever order they arrived in (a restart's replay is not sorted across partitions,
@@ -9865,8 +9886,14 @@ public class FeedGatewayService implements ReplayRunner {
                 if (existingRev > rev) { outcome[0] = EsAuctionUpsert.DROPPED; return false; }   // superseded correction
                 duplicate = existingRev == rev && existing.equals(json);
             }
+            String stored = json;
+            if (envelope) {
+                if (existing == null) { outcome[0] = EsAuctionUpsert.DROPPED; esAuctionOrphanEnvelopes.incrementAndGet(); return live; }
+                stored = esAuctionMaterialize(existing, json);
+                duplicate = stored.equals(existing);
+            }
             if (!duplicate) {
-                esAuctionMinutes.put(viewKey, json);
+                esAuctionMinutes.put(viewKey, stored);
                 esAuctionRecomputeRetentionLocked();
             }
             outcome[0] = duplicate ? EsAuctionUpsert.DUPLICATE : existing == null ? EsAuctionUpsert.NEW : EsAuctionUpsert.REPLACED;
@@ -9894,6 +9921,77 @@ public class FeedGatewayService implements ReplayRunner {
         }
         esAuctionTradeDate = current;
         esAuctionPrevTradeDate = prev;
+    }
+
+    /** §7b: correctionRev >= 1 carrying callOmitted or corrected[] and no call — a patch, not a minute. */
+    static boolean esAuctionIsEnvelope(String json) {
+        try {
+            JsonNode n = new ObjectMapper().readTree(json);
+            if (n == null || !n.isObject()) return false;
+            if (n.path("correctionRev").asLong(0L) < 1L) return false;
+            if (n.has("call") && !n.path("call").isNull()) return false;
+            return n.path("callOmitted").asBoolean(false) || n.path("corrected").isArray();
+        } catch (JsonProcessingException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Applies an envelope's typed patch to the minute it corrects and returns the MATERIALIZED record.
+     * §7b: a path segment landing on an array addresses an element by its IDENTITY key (eventId / refId),
+     * never by index. The envelope's own header fields replace the base's; everything else survives, and
+     * the call, traderLine and policy stand as published (§8.10). On any malformed input the base is kept.
+     */
+    String esAuctionMaterialize(String base, String envelope) {
+        try {
+            ObjectMapper m = new ObjectMapper();
+            JsonNode baseNode = m.readTree(base), envNode = m.readTree(envelope);
+            if (!(baseNode instanceof com.fasterxml.jackson.databind.node.ObjectNode out) || !envNode.isObject()) return base;
+            for (JsonNode op : envNode.path("corrected")) {
+                String path = op.path("path").asText("");
+                if (path.isEmpty()) continue;
+                java.util.List<String> parts = new java.util.ArrayList<>();
+                for (String seg : path.split("/")) if (!seg.isEmpty()) parts.add(seg);
+                if (parts.isEmpty()) continue;
+                String last = parts.remove(parts.size() - 1);
+                JsonNode node = out;
+                for (String seg : parts) { node = esAuctionStep(node, seg); if (node == null) break; }
+                if (node == null) continue;
+                boolean delete = "DELETE".equals(op.path("op").asText(""));
+                if (node instanceof com.fasterxml.jackson.databind.node.ArrayNode arr) {
+                    int at = esAuctionIndexOfIdentity(arr, last);
+                    if (at < 0) { if (!delete && op.has("value")) arr.add(op.get("value")); continue; }
+                    if (delete) arr.remove(at); else arr.set(at, op.get("value"));
+                } else if (node instanceof com.fasterxml.jackson.databind.node.ObjectNode obj) {
+                    if (delete) obj.remove(last); else obj.set(last, op.get("value"));
+                }
+            }
+            for (String f : new String[]{"schemaVersion", "requirementsRevision", "effectiveTs", "publishTs", "emittedBy",
+                    "correctionRev", "correctionCause", "supersedes", "receivedTs", "provenance", "dataQuality"}) {
+                if (envNode.has(f)) out.set(f, envNode.get(f));
+            }
+            return m.writeValueAsString(out);
+        } catch (RuntimeException | JsonProcessingException e) {
+            return base;
+        }
+    }
+
+    private static JsonNode esAuctionStep(JsonNode node, String seg) {
+        if (node instanceof com.fasterxml.jackson.databind.node.ArrayNode arr) {
+            int at = esAuctionIndexOfIdentity(arr, seg);
+            return at < 0 ? null : arr.get(at);
+        }
+        return node != null && node.isObject() ? node.get(seg) : null;
+    }
+
+    private static int esAuctionIndexOfIdentity(com.fasterxml.jackson.databind.node.ArrayNode arr, String seg) {
+        String want = seg.indexOf('=') > 0 ? seg.substring(seg.indexOf('=') + 1) : seg;
+        for (int i = 0; i < arr.size(); i++) {
+            JsonNode e = arr.get(i);
+            if (e != null && e.isObject()
+                    && (want.equals(e.path("eventId").asText(null)) || want.equals(e.path("refId").asText(null)) || want.equals(e.path("id").asText(null)))) return i;
+        }
+        return -1;
     }
 
     private long esAuctionCorrectionRev(String json) {
@@ -12593,6 +12691,24 @@ public class FeedGatewayService implements ReplayRunner {
         settings.applyKafkaSecurity(properties); // TLS/SASL when configured (required under auth — P0)
         return properties;
     }
+
+    /** Sends the auction hello to every socket that connected before the view had hydrated. */
+    void flushEsAuctionHellos() {
+        if (!settings.esAuctionEnabled() || esAuctionHelloPending.isEmpty()) return;
+        String hello = esAuctionHelloJson();
+        for (WebSocketSession held : esAuctionHelloPending) {
+            esAuctionHelloPending.remove(held);
+            send(held, "es-auction-hello", hello);
+        }
+    }
+
+    /** True once the auction view has hydrated and the hello may be sent on connect. */
+    boolean esAuctionHelloReady() { return stateCaughtUp.get(); }
+
+    int esAuctionHelloPendingForTest() { return esAuctionHelloPending.size(); }
+
+    /** Test seam: marks the auction view hydrated and releases every held hello, as markCacheCaughtUp does. */
+    void markStateCaughtUpForTest() { stateCaughtUp.set(true); flushEsAuctionHellos(); }
 
     private static String escapeJson(String value) {
         StringBuilder escaped = new StringBuilder();

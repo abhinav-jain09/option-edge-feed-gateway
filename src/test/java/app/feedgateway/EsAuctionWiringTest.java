@@ -376,6 +376,54 @@ class EsAuctionWiringTest {
         assertTrue(sink.get(1).contains("raced-r1"));
     }
 
+    @Test void theBackfillEndpointRefusesParametersItWouldEchoUnescaped() {
+        // Code review round 3: the response echoes tradeDate and the cursor, so a value carrying a quote
+        // or a backslash would emit malformed application/json. Only the contract's own shapes are accepted.
+        var s = service();
+        s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"));
+        GatewayController c = new GatewayController(s, new org.springframework.beans.factory.ObjectProvider<>() {
+            @Override public app.feedgateway.liquidityhistory.LiquidityHistoryStore getObject() { return null; }
+            @Override public app.feedgateway.liquidityhistory.LiquidityHistoryStore getObject(Object... args) { return null; }
+            @Override public app.feedgateway.liquidityhistory.LiquidityHistoryStore getIfAvailable() { return null; }
+            @Override public app.feedgateway.liquidityhistory.LiquidityHistoryStore getIfUnique() { return null; }
+        });
+        String bad = c.auctionMinutes("2026-09-08\" ,\"x\":\"", "", 10);
+        assertTrue(bad.contains("\"error\""), "a quote in tradeDate is refused: " + bad);
+        assertFalse(bad.contains("x\":\""), "and never reaches the body: " + bad);
+        assertTrue(c.auctionMinutes("", "10:31\\", 10).contains("\"error\""), "a backslash in from is refused too");
+        String ok = c.auctionMinutes("2026-09-08", "09:30", 10);
+        assertFalse(ok.contains("\"error\""), "the contract's own shapes still work: " + ok);
+        assertTrue(ok.startsWith("{\"tradeDate\":\"2026-09-08\""), ok);
+    }
+
+    @Test void theViewStoresMaterializedMinutesNotCorrectionEnvelopes() {
+        // Code review round 3: /api/auction/minutes promises MINUTES. A page loading cold cannot rebuild
+        // one from a patch whose base it never receives, so the view applies the envelope to the minute
+        // it corrects and serves the result; the wire still carries the envelope verbatim.
+        var s = service();
+        String base = "{\"tradeDate\":\"2026-09-08\",\"minute\":\"09:30\",\"correctionRev\":0,\"callId\":\"c0\","
+                + "\"call\":{\"instruction\":\"HOLD\"},\"profile\":{\"rows\":[1,2,3],\"vva\":{\"poc\":10}},"
+                + "\"references\":[{\"refId\":\"r1\",\"row\":5},{\"refId\":\"r2\",\"row\":6}],\"publishTs\":\"T0\"}";
+        assertTrue(s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), base));
+        String env = "{\"tradeDate\":\"2026-09-08\",\"minute\":\"09:30\",\"correctionRev\":1,\"callOmitted\":true,"
+                + "\"emittedBy\":\"CORRECTION\",\"publishTs\":\"T1\",\"corrected\":["
+                + "{\"op\":\"SET\",\"path\":\"/profile/vva/poc\",\"value\":99},"
+                + "{\"op\":\"SET\",\"path\":\"/references/r1/row\",\"value\":42},"
+                + "{\"op\":\"DELETE\",\"path\":\"/references/r2\"}]}";
+        assertTrue(s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), env));
+        String stored = s.auctionMinutesPage("2026-09-08", "", 10).minutes().get(0);
+        assertTrue(stored.contains("\"poc\":99"), "a nested SET applied: " + stored);
+        assertTrue(stored.contains("\"refId\":\"r1\",\"row\":42"), "an identity-addressed SET applied: " + stored);
+        assertFalse(stored.contains("\"r2\""), "the identity-addressed DELETE applied: " + stored);
+        assertTrue(stored.contains("\"rows\":[1,2,3]"), "everything unchanged survived: " + stored);
+        assertTrue(stored.contains("\"instruction\":\"HOLD\""), "the call stands as published");
+        assertTrue(stored.contains("\"correctionRev\":1") && stored.contains("\"publishTs\":\"T1\""), "the envelope's header replaced the base's");
+        assertFalse(stored.contains("callOmitted"), "the materialized record is a MINUTE, not a patch");
+        // An envelope with no minute to correct is counted, never stored as if it were one.
+        assertFalse(s.upsertEsAuctionMinute(key("2026-09-08", "09:31"), env.replace("09:30", "09:31")));
+        assertTrue(s.auctionMinutesPage("2026-09-08", "", 10).minutes().size() == 1, "no orphan patch entered the view");
+    }
+
     @Test void foreignShapesNeverPoisonTheView() {
         var s = service();
         assertFalse(s.upsertEsAuctionMinute(null, "{\"unrelated\":true}"));
@@ -412,6 +460,13 @@ class EsAuctionWiringTest {
         on.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"));
         List<String> onSink = new ArrayList<>();
         on.addClient(socket("on", onSink));
+        // The hello waits for hydration (code review round 3): a page must never bound its backfill by a
+        // PARTIAL view. Until then the socket is HELD, and it is flushed the moment hydration completes.
+        assertFalse(on.esAuctionHelloReady(), "the state cache consumer has not caught up in this harness");
+        assertFalse(onSink.stream().anyMatch(m -> m.contains("\"type\":\"es-auction-hello\"")), "held, not sent");
+        assertEquals(1, on.esAuctionHelloPendingForTest());
+        on.markStateCaughtUpForTest();
+        assertEquals(0, on.esAuctionHelloPendingForTest(), "the held socket was flushed");
         assertTrue(onSink.contains("{\"type\":\"es-auction-hello\",\"data\":"
                         + "{\"tradeDate\":\"2026-09-08\",\"minutes\":1,\"lastMinute\":\"09:30\"}}"),
                 "got " + onSink);

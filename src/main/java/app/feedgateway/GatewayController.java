@@ -79,11 +79,23 @@ public class GatewayController {
      * {"tradeDate":..., "minutes":[<verbatim record>...], "nextCursor": "HH:mm" or null} where the
      * cursor is the first minute NOT returned (feed it back as {@code from}).
      */
+    private static final java.util.regex.Pattern TRADE_DATE = java.util.regex.Pattern.compile("\\d{4}-\\d{2}-\\d{2}");
+    private static final java.util.regex.Pattern MINUTE = java.util.regex.Pattern.compile("\\d{2}:\\d{2}");
+
     @GetMapping(value = "/api/auction/minutes", produces = MediaType.APPLICATION_JSON_VALUE)
     public String auctionMinutes(@org.springframework.web.bind.annotation.RequestParam(value = "tradeDate", defaultValue = "") String tradeDate,
                                  @org.springframework.web.bind.annotation.RequestParam(value = "from", defaultValue = "") String from,
                                  @org.springframework.web.bind.annotation.RequestParam(value = "limit", defaultValue = "400") int limit) {
         int capped = Math.max(1, Math.min(limit, 1000));
+        // The response ECHOES tradeDate and the cursor, so both are validated here rather than escaped
+        // downstream: a value carrying a quote or a backslash would otherwise emit malformed JSON
+        // (code review round 3). The contract's own shapes are the whole of what is accepted.
+        if (!tradeDate.isEmpty() && !TRADE_DATE.matcher(tradeDate).matches()) {
+            return "{\"error\":\"tradeDate must be YYYY-MM-DD\",\"tradeDate\":null,\"minutes\":[],\"nextCursor\":null}";
+        }
+        if (!from.isEmpty() && !MINUTE.matcher(from).matches()) {
+            return "{\"error\":\"from must be HH:mm\",\"tradeDate\":null,\"minutes\":[],\"nextCursor\":null}";
+        }
         // Trade date, rows and cursor are ONE atomic snapshot (the cvdBarsPage rule).
         FeedGatewayService.EsAuctionMinutesPage page = service.auctionMinutesPage(tradeDate, from, capped);
         StringBuilder sb = new StringBuilder("{\"tradeDate\":");
