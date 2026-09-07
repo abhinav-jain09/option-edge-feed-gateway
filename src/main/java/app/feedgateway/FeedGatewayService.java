@@ -634,6 +634,9 @@ public class FeedGatewayService implements ReplayRunner {
     /** U16: the next offset to read on this partition, so a consumer RETRY resumes instead of
      *  replaying history (a historical tombstone or reset must never be re-applied as new). */
     private final AtomicLong cvdSpxLevelsNextOffset = new AtomicLong(-1L);
+    /** Per-partition next offset for the auction topic on the LIVE path, so a retry RESUMES instead of
+     *  replaying its seven-day cache window or skipping whatever was produced during the retry gap. */
+    private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionNextOffset = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -2613,12 +2616,20 @@ public class FeedGatewayService implements ReplayRunner {
         Set<TopicPartition> onGrownTopics = Set.copyOf(refresh.addedOnGrownTopics());
         List<TopicPartition> recoverFromBeginning = new ArrayList<>();
         List<TopicPartition> recoverDisplayWindow = new ArrayList<>();
+        List<TopicPartition> recoverEsAuction = new ArrayList<>();
         List<TopicPartition> toEnd = new ArrayList<>();
         for (TopicPartition partition : refresh.added()) {
             TopicBinding binding = topicEvents.get(partition.topic());
             boolean liveOnly = binding != null && isLiveOnlyRebuiltEvent(binding.event());
             if (liveOnly && onGrownTopics.contains(partition)) {
                 recoverFromBeginning.add(partition);
+            } else if (binding != null && "es-auction".equals(binding.event())) {
+                // The auction topic is optional and may appear (or gain a partition) after startup. END
+                // would lose every minute written before this refresh: the cache consumer hydrates them
+                // silently, and the pages already had their hello, so nothing would put them on the wire
+                // (code review round 6). Resume from this partition's own cursor when there is one, and
+                // otherwise from what the topic still retains — bounded by its seven-day retention.
+                recoverEsAuction.add(partition);
             } else if (binding != null && "drop-nowcast".equals(binding.event())) {
                 // A drop-nowcast topic that just APPEARED (the optional producer creating it
                 // mid-session) may already hold verdicts; END would lose the very first one and
@@ -2635,6 +2646,12 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (!recoverFromBeginning.isEmpty()) {
             consumer.seekToBeginning(recoverFromBeginning);
+        }
+        if (!recoverEsAuction.isEmpty()) {
+            for (TopicPartition p : recoverEsAuction) {
+                if (esAuctionNextOffset.containsKey(p)) seekEsAuctionWithin(consumer, p);
+                else consumer.seekToBeginning(List.of(p));
+            }
         }
         if (!recoverDisplayWindow.isEmpty()) {
             long fromMs = System.currentTimeMillis() - 10 * 60_000L;
@@ -10422,6 +10439,9 @@ public class FeedGatewayService implements ReplayRunner {
         if (binding != null && "es-cvd-spx-levels".equals(binding.event())) {
             cvdSpxLevelsNextOffset.set(record.offset() + 1);
         }
+        if (binding != null && "es-auction".equals(binding.event())) {
+            esAuctionNextOffset.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
+        }
     }
 
     /**
@@ -10459,10 +10479,28 @@ public class FeedGatewayService implements ReplayRunner {
     private void resumeEsAuction(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
         if (!settings.esAuctionEnabled()) return;
         String topic = settings.esAuctionTopic();
-        List<TopicPartition> owned = new java.util.ArrayList<>();
-        for (TopicPartition tp : partitions) if (tp.topic().equals(topic)) owned.add(tp);
-        if (owned.isEmpty()) return;
-        consumer.seekToEnd(owned);
+        for (TopicPartition tp : partitions) if (tp.topic().equals(topic)) seekEsAuctionWithin(consumer, tp);
+    }
+
+    /**
+     * Resume this auction partition where the LIVE path last was. Seeking to END would silently skip
+     * every minute produced during the retry gap: the cache consumer would hydrate them, but the pages
+     * have already had their hello and never backfill again, so nothing would ever put them on the wire
+     * (code review round 6). END is used only when there is no cursor, or the cursor has fallen outside
+     * the partition's retained range.
+     */
+    private void seekEsAuctionWithin(KafkaConsumer<?, ?> consumer, TopicPartition owned) {
+        List<TopicPartition> one = List.of(owned);
+        Long cursor = esAuctionNextOffset.get(owned);
+        if (cursor == null || cursor < 0) { consumer.seekToEnd(one); return; }
+        try {
+            long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
+            long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
+            if (cursor < beginning || cursor > end) { esAuctionNextOffset.remove(owned); consumer.seekToEnd(one); return; }
+            consumer.seek(owned, cursor);
+        } catch (RuntimeException e) {
+            consumer.seekToEnd(one);                                   // range unknown: the safe fallback
+        }
     }
 
     /** What is left of the hydration budget; never negative, so a blown budget stops immediately. */
