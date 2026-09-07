@@ -2720,6 +2720,7 @@ public class FeedGatewayService implements ReplayRunner {
             if (retry) {
                 seekToCacheWindow(consumer, partitions, topicEvents);
                 resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
+                resumeEsAuction(consumer, partitions);             // nor the auction's seven-day window
             } else {
                 consumer.seekToEnd(partitions);
                 seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
@@ -3838,6 +3839,7 @@ public class FeedGatewayService implements ReplayRunner {
                     || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
                     || "indicators".equals(binding.event())
                     || "tapeZones".equals(binding.event())
+                    || "es-auction".equals(binding.event())
                     || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 // The pre-open status/control stream is SOURCE-INDEPENDENT window state:
                 // stateCaughtUp must include its partition regardless of the active market-data
@@ -3871,7 +3873,8 @@ public class FeedGatewayService implements ReplayRunner {
             if (preOpenBinding != null && ("ibkr-preopen-status".equals(preOpenBinding.event())
                     || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
                     || "indicators".equals(preOpenBinding.event())
-                    || "tapeZones".equals(preOpenBinding.event()))) {
+                    || "tapeZones".equals(preOpenBinding.event())
+                    || "es-auction".equals(preOpenBinding.event()))) {
                 // Source-independent streams (pre-open control + shared live gex + indicators +
                 // tape-zones board) always gate mid-run barriers too (r1 finding 4).
                 selected.put(entry.getKey(), entry.getValue());
@@ -10443,6 +10446,23 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (owned == null) return;
         seekCvdSpxLevelsWithin(consumer, owned, cvdSpxLevelsNextOffset.get(), cvdSpxLevelsNextOffset);
+    }
+
+    /**
+     * A live-consumer RETRY must not replay the auction's seven-day cache window. That window belongs to
+     * the CACHE consumer, which fills the view silently; replayed on the LIVE path every one of those
+     * minutes would pass the emitted ledger (hydration deliberately marks nothing as emitted) and be
+     * broadcast to every page as if it were happening now (code review round 5). History is the cache
+     * consumer's job, so the live consumer resumes at the END of the auction partition, exactly as
+     * {@link #resumeCvdSpxLevels} does for the CVD levels topic.
+     */
+    private void resumeEsAuction(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        List<TopicPartition> owned = new java.util.ArrayList<>();
+        for (TopicPartition tp : partitions) if (tp.topic().equals(topic)) owned.add(tp);
+        if (owned.isEmpty()) return;
+        consumer.seekToEnd(owned);
     }
 
     /** What is left of the hydration budget; never negative, so a blown budget stops immediately. */

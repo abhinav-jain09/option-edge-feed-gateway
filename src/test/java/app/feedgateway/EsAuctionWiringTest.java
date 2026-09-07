@@ -439,6 +439,24 @@ class EsAuctionWiringTest {
         assertEquals(0, s.esAuctionHelloPendingForTest(), "nothing left pending");
     }
 
+    @Test void theAuctionIsSourceIndependentForCatchUpAndItsHistoryIsNeverReplayedLive() throws Exception {
+        // Code review round 5, item 1: es-auction is ES-global. Left out of the source-independent barrier
+        // lists, an IBKR selection would let catch-up be declared before the seven-day auction replay ended.
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int catchUp = source.indexOf("private Map<TopicPartition, Long> catchUpEndOffsets(");
+        int barriers = source.indexOf("private Map<TopicPartition, Long> selectedSourceBarriers(");
+        assertTrue(catchUp > 0 && barriers > 0);
+        assertTrue(source.substring(catchUp, catchUp + 1600).contains("\"es-auction\".equals(binding.event())"), "catchUpEndOffsets gates on es-auction");
+        assertTrue(source.substring(barriers, barriers + 1600).contains("\"es-auction\".equals(preOpenBinding.event())"), "selectedSourceBarriers gates on es-auction too");
+        // Item 2: a live retry seeks the cache window for every topic, which for es-auction is SEVEN DAYS.
+        // Replayed on the live path those minutes would all pass the emitted ledger and be broadcast.
+        int live = source.indexOf("private void runLiveConsumerOnce(");
+        String body = source.substring(live, live + 1400);
+        assertTrue(body.contains("resumeEsAuction(consumer, partitions)"), "the live retry resumes the auction at the end");
+        int resume = source.indexOf("private void resumeEsAuction(");
+        assertTrue(resume > 0 && source.substring(resume, resume + 700).contains("consumer.seekToEnd(owned)"));
+    }
+
     @Test void foreignShapesNeverPoisonTheView() {
         var s = service();
         assertFalse(s.upsertEsAuctionMinute(null, "{\"unrelated\":true}"));
