@@ -1,8 +1,12 @@
 # ES Footprint — Gateway bindings (Gate 2, F-R20)
 
 Revision 10 — 2026-09-07 (Codex rounds 1–9: 7 + 3 + 2 + 2 + 3 + 3 + 3 + 2 + 1 findings → all dispositioned below).
-Requirement doc per rule.md (doc → Codex review → code). Nothing here is IMPLEMENTED until the
-coordinated-PR protocol says so.
+Requirement doc per rule.md (doc → Codex review → code).
+
+**Gate-2 DESIGN: APPROVED** — Codex round 10, 2026-09-07 (`ES-FOOTPRINT-GATEWAY-CODEX-ROUND10.md`; rounds
+1–9 produced 7+3+2+2+3+3+3+2+1 findings, every one dispositioned in the change logs below). The code
+change set that implements G-R1–G-R11 carries its own CODE gate (`ES-FOOTPRINT-GATEWAY-CODE-CODEX-ROUND*.md`).
+Nothing is IMPLEMENTED until that gate and the coordinated-PR protocol say so.
 
 Upstream contract: `options-edge-processing/ES-FOOTPRINT-DESIGN.md` revision 13 (§5 grammar,
 F-R14 topics and keys, F-R15 live publication, F-E8 bounds, F-R20). Downstream: the Gate-3 page in
