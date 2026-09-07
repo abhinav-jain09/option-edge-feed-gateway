@@ -496,13 +496,14 @@ class EsAuctionWiringTest {
         assertEquals(1, sb.split("positionEsAuction\\(consumer, partitions\\)", -1).length - 1, "(b) ONE rule, applied after the generic seek on BOTH the cold start and the retry");
         assertTrue(sb.indexOf("positionEsAuction") > sb.indexOf("seekCvdSpxLevelsToHandoff"), "(b) it runs AFTER the generic seek it overrides");
         assertTrue(live.contains("resumeEsAuctionOnceHandoffExists(consumer, partitions)"), "(b) paused partitions are positioned inside the poll loop");
-        int pos = source.indexOf("private void positionEsAuction(");
-        String pb = source.substring(pos, pos + 1100);
+        String pb = methodBody(source, "private void positionEsAuction(");
         assertTrue(pb.indexOf("esAuctionNextOffset.get(tp)") < pb.indexOf("esAuctionHandoffOffset.get(tp)"), "(b) the live cursor first, then the frozen handoff");
         assertTrue(pb.contains("consumer.pause(pause)"), "(b) and with neither, PAUSE rather than guess");
-        int resume = source.indexOf("private void resumeEsAuctionOnceHandoffExists(");
-        String r = source.substring(resume, resume + 900);
-        assertTrue(r.contains("esAuctionHandoffOffset.get(tp)") && r.contains("seekEsAuctionWithinAt(consumer, tp, handoff)") && r.contains("consumer.resume("), "(b) positioned exactly, then resumed");
+        String r = methodBody(source, "private void resumeEsAuctionOnceHandoffExists(");
+        assertTrue(r.contains("esAuctionHandoffOffset.get(tp)") && r.contains("seekEsAuctionWithinAt(consumer, tp, handoff, generation, true)"),
+                "(b) positioned exactly, and resumed inside the same generation-checked step");
+        assertTrue(r.indexOf("esAuctionGeneration.get()") < r.indexOf("esAuctionHandoffOffset.get(tp)"),
+                "(b) the generation is read BEFORE the cursor");
         // (d) a socket arriving while the capture is incomplete is HELD: readiness is the frozen handoff.
         int connect = source.indexOf("if (settings.esAuctionEnabled()) {");
         String cb = source.substring(connect, connect + 1400);
@@ -799,10 +800,14 @@ class EsAuctionWiringTest {
         s.esAuctionTopicIdReader = t -> id;
         s.markStateCaughtUpWithoutHandoffForTest();
         s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));   // records the incarnation
-        assertTrue(s.seekEsAuctionWithinAt(consumer, tp, 12L), "a named, unchanged incarnation seeks normally");
+        long gen = 0L;   // no invalidation has happened in this test
+        assertTrue(s.seekEsAuctionWithinAt(consumer, tp, 12L, gen, false), "a named, unchanged incarnation seeks normally");
         assertEquals(12L, consumer.position(tp));
         s.esAuctionTopicIdReader = t -> null;
-        assertFalse(s.seekEsAuctionWithinAt(consumer, tp, 20L), "an unnamed log is not seeked into");
+        assertFalse(s.seekEsAuctionWithinAt(consumer, tp, 20L, gen, false), "an unnamed log is not seeked into");
+        s.esAuctionTopicIdReader = t -> id;
+        assertFalse(s.seekEsAuctionWithinAt(consumer, tp, 20L, gen + 1, false), "a cursor read under another incarnation is never adopted");
+        assertEquals(12L, consumer.position(tp), "the partition still did not move");
         assertEquals(12L, consumer.position(tp), "the partition did not move");
     }
 

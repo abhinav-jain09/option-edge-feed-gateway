@@ -2937,12 +2937,13 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (!recoverEsAuction.isEmpty()) {
             for (TopicPartition p : recoverEsAuction) {
+                long generation = esAuctionGeneration.get();   // read BEFORE the cursor (round 21)
                 Long cursor = esAuctionNextOffset.get(p);
                 if (cursor == null) cursor = esAuctionHandoffOffset.get(p);
                 // Seeding from the retained beginning would REPLAY that history onto the wire, since
                 // hydration marks nothing as emitted. With no cursor the partition is paused, exactly as at
                 // cold start, and positioned when its handoff appears (code review round 12).
-                if (cursor == null || !seekEsAuctionWithinAt(consumer, p, cursor)) consumer.pause(List.of(p));
+                if (cursor == null || !seekEsAuctionWithinAt(consumer, p, cursor, generation, false)) consumer.pause(List.of(p));
             }
         }
         if (!recoverDisplayWindow.isEmpty()) {
@@ -10797,9 +10798,12 @@ public class FeedGatewayService implements ReplayRunner {
         List<TopicPartition> pause = new java.util.ArrayList<>();
         for (TopicPartition tp : partitions) {
             if (!tp.topic().equals(topic)) continue;
+            // The generation is read BEFORE the cursor, never after: read after, an invalidation in between
+            // would hand a cursor from the OLD log to a check that sees the NEW generation (round 21).
+            long generation = esAuctionGeneration.get();
             Long cursor = esAuctionNextOffset.get(tp);
             if (cursor == null) cursor = esAuctionHandoffOffset.get(tp);
-            if (cursor == null || !seekEsAuctionWithinAt(consumer, tp, cursor)) { pause.add(tp); continue; }
+            if (cursor == null || !seekEsAuctionWithinAt(consumer, tp, cursor, generation, false)) { pause.add(tp); continue; }
         }
         if (!pause.isEmpty()) consumer.pause(pause);
     }
@@ -10812,45 +10816,55 @@ public class FeedGatewayService implements ReplayRunner {
         if (paused.isEmpty()) return;
         for (TopicPartition tp : partitions) {
             if (!tp.topic().equals(topic) || !paused.contains(tp)) continue;
+            long generation = esAuctionGeneration.get();
             Long handoff = esAuctionHandoffOffset.get(tp);
             if (handoff == null) continue;                                 // still paused; resumed the moment it appears
-            if (!seekEsAuctionWithinAt(consumer, tp, handoff)) continue;    // a stale incarnation: stay paused for the re-capture
-            consumer.resume(List.of(tp));
+            // The RESUME belongs inside the same generation-checked step as the seek: an invalidation between
+            // the two would leave the partition resumed on a cursor from the old log (round 21).
+            seekEsAuctionWithinAt(consumer, tp, handoff, generation, true);
         }
     }
 
     /** Seeks to {@code cursor}, clamped to what the partition retains. A failed RANGE QUERY does NOT mean
      *  "skip to the end": the cursor was valid when it was recorded, so it is used as it stands and only a
      *  failed SEEK falls back to END (code review round 7). */
-    boolean seekEsAuctionWithinAt(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, TopicPartition owned, long cursor) {
+    boolean seekEsAuctionWithinAt(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, TopicPartition owned, long cursor,
+                                 long generation, boolean resumeAfterSeek) {
         List<TopicPartition> one = List.of(owned);
-        // IDENTITY FIRST. Offsets cannot see a recreation that has already grown past the old cursor:
-        // `cursor <= end` would look valid and the consumer would seek into the NEW log, silently skipping
-        // everything before the cursor while hydration stays non-broadcasting (round 15).
+        /* IDENTITY FIRST, and it must be KNOWN. Offsets cannot see a recreation that has already grown past
+           the old cursor: `cursor <= end` would look valid and the consumer would seek into the NEW log,
+           silently skipping everything before the cursor while hydration stays non-broadcasting (round 15).
+           An id that is unknown or unreadable is the same case unverified, so both fail CLOSED — the partition
+           stays paused until the incarnation can be named (rounds 20, 21). */
         org.apache.kafka.common.Uuid known = esAuctionTopicId;
-        if (known != null) {
-            org.apache.kafka.common.Uuid now = esAuctionTopicIdReader.apply(owned.topic());
-            /* FAIL CLOSED on an unreadable id. Trusting the cursor without being able to name the log is
-               exactly the case the offsets cannot see: if the topic was recreated and has already grown past
-               it, this seeks into the NEW log and skips its retained prefix while hydration stays silent
-               (code review round 20). The partition stays paused until the incarnation can be verified. */
-            if (now == null) { System.out.println("es-auction: the topic id of " + owned + " cannot be read; the partition stays paused rather than trust a cursor on an unnamed log"); return false; }
-            if (!now.equals(known)) { esAuctionForgetIncarnation("topic " + owned.topic() + " was recreated (" + known + " -> " + now + ")"); return false; }
-        }
+        if (known == null) { System.out.println("es-auction: no incarnation is on record for " + owned + "; the partition stays paused until a handoff is captured"); return false; }
+        org.apache.kafka.common.Uuid now = esAuctionTopicIdReader.apply(owned.topic());
+        if (now == null) { System.out.println("es-auction: the topic id of " + owned + " cannot be read; the partition stays paused rather than trust a cursor on an unnamed log"); return false; }
+        if (!now.equals(known)) { esAuctionForgetIncarnation("topic " + owned.topic() + " was recreated (" + known + " -> " + now + ")"); return false; }
+        long target;
         try {
             long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
             long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
-            if (cursor < beginning) { consumer.seek(owned, beginning); return true; }   // aged out: take what is left
             if (cursor > end) {
-                // Belt and braces for the case the ID check cannot cover (an unreadable id): a cursor
-                // beyond the log end is not a position on this log at all.
+                // Belt and braces for what the ID check cannot cover: a cursor beyond the log end is not a
+                // position on this log at all.
                 esAuctionForgetIncarnation("cursor " + cursor + " is beyond the log end of " + owned);
                 return false;
             }
-            consumer.seek(owned, cursor);
-            return true;
+            target = Math.max(cursor, beginning);   // aged out: take what is left
         } catch (RuntimeException rangeUnknown) {
-            try { consumer.seek(owned, cursor); return true; } catch (RuntimeException seekFailed) { return false; }
+            /* A failed RANGE QUERY does NOT mean "skip to the end": the cursor was valid when it was
+               recorded, so it is used as it stands and only a failed SEEK gives up (round 7). */
+            target = cursor;
+        }
+        /* The seek AND the resume happen under the incarnation lock with the generation confirmed: an
+           invalidation between the identity check and either of them would otherwise leave this partition
+           consuming a recreated log from a cursor that belongs to the old one (round 21). */
+        synchronized (esAuctionIncarnationLock) {
+            if (esAuctionGeneration.get() != generation) return false;
+            try { consumer.seek(owned, target); } catch (RuntimeException seekFailed) { return false; }
+            if (resumeAfterSeek) consumer.resume(one);
+            return true;
         }
     }
 
