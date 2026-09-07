@@ -70,7 +70,11 @@ class FootprintWiringTest {
         int cvd = src.indexOf("if (\"es-cvd\".equals(binding.event())) {");
         assertTrue(live > 0 && live < cvd, "the live-consumer footprint branch precedes the es-cvd branch");
         String branch = src.substring(live, src.indexOf("continue;", live));
-        assertTrue(branch.contains("admitFootprintRecord(binding.event(), json, \"live\")") && branch.contains("broadcast(binding.event(), json);"), "view first, then broadcast");
+        assertTrue(branch.contains("onFootprintLiveRecord(binding.event(), json);"), "the live branch delegates to the one admit-then-broadcast method");
+        int method = src.indexOf("boolean onFootprintLiveRecord(String event, String json) {");
+        String body = src.substring(method, src.indexOf("\n    }", method));
+        assertTrue(body.indexOf("admitFootprintRecord(event, json, \"live\")") < body.indexOf("broadcast(event, json);"), "view first, then broadcast");
+        assertTrue(body.contains("if (!admitFootprintRecord(event, json, \"live\")) return false;"), "an oversize record is never broadcast");
         int cache = src.indexOf("admitFootprintRecord(binding.event(), json, \"cache\");");
         assertTrue(cache > 0 && cache < src.indexOf("updateCache(binding, record, json);", cache), "the cache consumer admits before the generic cache and never broadcasts");
         int raw = src.indexOf("private static boolean isRawPassThroughEvent(String event)");

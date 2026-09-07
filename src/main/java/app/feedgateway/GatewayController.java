@@ -136,14 +136,17 @@ public class GatewayController {
 
     /**
      * G-R7 step (7): {@code {"sessionDate":..,["sessionMismatch":true,]"<field>":[..],"nextCursor":..}}
-     * streamed through ONE fixed 64 KiB buffer; each record is written as its own ASCII bytes (F-E8
-     * alphabet), so transient memory per request is bounded by one record plus the buffer.
+     * streamed straight into the servlet response stream, whose ONLY buffer is the container's
+     * response buffer, set here to {@link #FOOTPRINT_WRITE_BUFFER} (64 KiB) before the first byte —
+     * no page-side buffer exists (round-1 #5). Each record is written as its own ASCII byte array
+     * (F-E8 alphabet), so transient memory per request is ≤ one record + the 64 KiB response buffer.
      */
     private static void writePage(jakarta.servlet.http.HttpServletResponse response, String sessionDate, boolean mismatch,
                                   String field, java.util.List<String> records, String cursorJson) throws java.io.IOException {
         response.setStatus(200);
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
-        java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(response.getOutputStream(), FOOTPRINT_WRITE_BUFFER);
+        try { response.setBufferSize(FOOTPRINT_WRITE_BUFFER); } catch (IllegalStateException alreadyCommitted) { /* keep the container's */ }
+        java.io.OutputStream out = response.getOutputStream();
         StringBuilder head = new StringBuilder("{\"sessionDate\":");
         head.append(sessionDate == null ? "null" : "\"" + sessionDate + "\"");
         if (mismatch) head.append(",\"sessionMismatch\":true");

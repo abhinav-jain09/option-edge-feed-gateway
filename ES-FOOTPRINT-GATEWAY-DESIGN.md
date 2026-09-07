@@ -3,6 +3,19 @@
 Revision 10 — 2026-09-07 (Codex rounds 1–9: 7 + 3 + 2 + 2 + 3 + 3 + 3 + 2 + 1 findings → all dispositioned below).
 Requirement doc per rule.md (doc → Codex review → code).
 
+**As-built amendments (from the CODE build, recorded per the Implemented-Code Documentation Accuracy Rule):**
+1. G-R8a, live consumer: footprint partitions always seek END on the live consumer — on a retry (after
+   the shared cache-window seek) and on every late adoption. The cache consumer alone replays the
+   session into the coordinator; without this the live retry would re-broadcast a day of compacted
+   bars (CODE round-1 #1).
+2. G-R7 bars cursor: `afterMs ≥ EPOCH_MAX_MS` returns an empty page, and the `+1` is taken only inside
+   the epoch domain, so the cursor is exclusive at the boundary (CODE round-1 #2).
+3. G-R8/G-R8a preflight runs BEFORE any lifecycle state moves in `start()` (no `running` flag, no
+   executor), so a refusal leaves the process clean (CODE round-1 #3).
+4. G-R7 streaming: the page is written straight into the servlet response stream with the container's
+   response buffer set to 64 KiB; there is no second page-side buffer, so transient memory per request
+   is one record plus that buffer (CODE round-1 #5).
+
 **Gate-2 DESIGN: APPROVED** — Codex round 10, 2026-09-07 (`ES-FOOTPRINT-GATEWAY-CODEX-ROUND10.md`; rounds
 1–9 produced 7+3+2+2+3+3+3+2+1 findings, every one dispositioned in the change logs below). The code
 change set that implements G-R1–G-R11 carries its own CODE gate (`ES-FOOTPRINT-GATEWAY-CODE-CODEX-ROUND*.md`).

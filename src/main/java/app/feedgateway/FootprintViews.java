@@ -221,9 +221,11 @@ final class FootprintViews {
             if (mismatch(expectedSessionDate, current)) return new BarsPage(current, true, List.of(), null);
             List<String> out = new ArrayList<>();
             Long last = null;
-            if (TIMEFRAME_KEY.matcher(tf == null ? "" : tf).matches() && toMsInclusive >= 0) {
-                long from = Math.max(0L, afterMsExclusive + 1L);
-                String lo = barKey(tf, Math.min(from, EPOCH_MAX_MS));
+            // Exclusive cursor at the domain edges (round-1 #2): a cursor at or past the last epoch
+            // value can have nothing after it, and the increment is taken only inside the domain.
+            if (TIMEFRAME_KEY.matcher(tf == null ? "" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive < EPOCH_MAX_MS) {
+                long from = afterMsExclusive < 0 ? 0L : afterMsExclusive + 1L;
+                String lo = barKey(tf, from);
                 String hi = barKey(tf, Math.min(toMsInclusive, EPOCH_MAX_MS));
                 if (lo.compareTo(hi) <= 0) {
                     for (Map.Entry<String, String> e : bars.subMap(lo, true, hi, true).entrySet()) {

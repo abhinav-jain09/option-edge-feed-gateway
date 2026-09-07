@@ -792,7 +792,33 @@ public class FeedGatewayService implements ReplayRunner {
                 settings.esFootprintBarsTopic(), settings.esFootprintOutcomesTopic());
     }
 
+    /** G-R8 layout check + G-R8a start-up validation; throws to refuse start-up. Runs before any lifecycle state moves. */
+    void footprintPreflight() {
+        // G-R8: the retained-heap arithmetic assumes compressed oops, compressed class pointers and
+        // compact strings; a JVM without them refuses to run the relay rather than run it unbounded.
+        FootprintTopicGate.layoutViolation(FootprintTopicGate.hotSpotVmOptions()).ifPresent(flag -> {
+            throw new IllegalStateException("ES_FOOTPRINT_JVM_LAYOUT " + flag + " — the footprint memory bound does not hold on this JVM");
+        });
+        // G-R8a start-up: existing invalid topic or a non-unknown Admin failure refuses start-up;
+        // an absent topic is admitted later by the consumers' refresh path once validated.
+        footprintGate.validateExisting();
+    }
+
     boolean footprintEnabled() { return footprintViews != null; }
+    boolean runningForTest() { return running.get(); }
+    void setRunningForTest(boolean value) { running.set(value); }
+    /** Test seam for the G-R8a predicate seam: a refresh over the given topics with the given gate, past its first interval. */
+    Object partitionRefreshForTest(String name, Set<String> topics, Predicate<String> admit) {
+        PartitionRefresh r = new PartitionRefresh(name, topics, admit);
+        r.nextRefreshMs = 0L;
+        return r;
+    }
+    @SuppressWarnings("unchecked")
+    List<TopicPartition>[] applyRefreshForTest(Object refresh, KafkaConsumer<?, ?> consumer, List<TopicPartition> assigned) {
+        Refresh r = ((PartitionRefresh) refresh).apply(consumer, assigned);
+        ((PartitionRefresh) refresh).nextRefreshMs = 0L;
+        return new List[]{r.partitions(), r.added(), r.addedOnNewTopics()};
+    }
     FootprintViews footprintViews() { return footprintViews; }
     FootprintTopicGate footprintGate() { return footprintGate; }
     java.util.concurrent.Semaphore footprintBackfillPermits() { return footprintBackfillPermits; }
@@ -827,6 +853,27 @@ public class FeedGatewayService implements ReplayRunner {
             footprintCounter("drops_total{event=\"" + event + "\",consumer=\"" + consumer + "\",reason=\"" + a.reason().name().toLowerCase() + "\"}").incrementAndGet();
         }
         return a.reason() != FootprintViews.Reason.OVERSIZE;
+    }
+
+    /**
+     * G-R8a on the LIVE consumer: footprint partitions always start at END — the cache consumer owns
+     * the session replay into the coordinator; the live consumer only broadcasts what arrives from
+     * now on. Called after the retry cache-window seek and after every late adoption (round-1 #1).
+     */
+    void seekFootprintToEnd(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions) {
+        if (footprintGate == null) return;
+        List<TopicPartition> footprint = new ArrayList<>();
+        for (TopicPartition p : partitions) if (footprintGate.topics().contains(p.topic())) footprint.add(p);
+        if (!footprint.isEmpty()) consumer.seekToEnd(footprint);
+    }
+
+    /** The live consumer's footprint branch (G-R3/G-R9): admit, then broadcast unless oversize. Package-private for the fan-out tests. */
+    boolean onFootprintLiveRecord(String event, String json) {
+        if (!admitFootprintRecord(event, json, "live")) return false;
+        broadcast(event, json);
+        footprintCounter("broadcast_total{event=\"" + event + "\"}").incrementAndGet();
+        forwardedEvents.incrementAndGet();
+        return true;
     }
 
     /** G-R8a: the admission predicate applied to a bootstrap resolution; identity when the flag is off. */
@@ -906,7 +953,15 @@ public class FeedGatewayService implements ReplayRunner {
 
     @PostConstruct
     public void start() {
-        if (!settings.enabled() || !running.compareAndSet(false, true)) {
+        if (!settings.enabled()) {
+            return;
+        }
+        // ES Footprint preflight (G-R8/G-R8a) BEFORE any lifecycle state changes: a refusal here
+        // leaves running=false and no executor (round-1 #3), so the process dies clean.
+        if (footprintGate != null) {
+            footprintPreflight();
+        }
+        if (!running.compareAndSet(false, true)) {
             return;
         }
         executor = Executors.newFixedThreadPool(8, runnable -> {
@@ -922,16 +977,6 @@ public class FeedGatewayService implements ReplayRunner {
         // baseline already in place, and every ordering after that is the live one's.
         if (settings.esCvdSpxLevelsEnabled()) {
             hydrateCvdSpxLevels();
-        }
-        if (footprintGate != null) {
-            // G-R8: the retained-heap arithmetic assumes compressed oops, compressed class pointers and
-            // compact strings; a JVM without them refuses to run the relay rather than run it unbounded.
-            FootprintTopicGate.layoutViolation(FootprintTopicGate.hotSpotVmOptions()).ifPresent(flag -> {
-                throw new IllegalStateException("ES_FOOTPRINT_JVM_LAYOUT " + flag + " — the footprint memory bound does not hold on this JVM");
-            });
-            // G-R8a start-up: existing invalid topic or a non-unknown Admin failure refuses start-up;
-            // an absent topic is admitted later by the consumers' refresh path once validated.
-            footprintGate.validateExisting();
         }
         executor.submit(this::runSelectionConsumer);
         executor.submit(this::runAvroLiveConsumer);
@@ -2838,6 +2883,7 @@ public class FeedGatewayService implements ReplayRunner {
             if (retry) {
                 seekToCacheWindow(consumer, partitions, topicEvents);
                 resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
+                seekFootprintToEnd(consumer, partitions);          // G-R8a: the LIVE consumer never replays footprint history (round-1 #1)
             } else {
                 consumer.seekToEnd(partitions);
                 seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
@@ -2849,6 +2895,7 @@ public class FeedGatewayService implements ReplayRunner {
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
                     seekAddedLivePartitions(consumer, refresh, topicEvents);
+                    seekFootprintToEnd(consumer, refresh.added());  // a late-admitted footprint topic starts at END on the live consumer
                 }
                 // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
                 // is only read by dumpDiagnosticState() to distinguish "consumers polling" from "forward gate stuck".
@@ -3005,11 +3052,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // ES Footprint (G-R3): keyed records go to the coordinator FIRST (the backfill's
                         // source of truth), then the VERBATIM standalone broadcast — except an oversize
                         // record, which is dropped entirely; the two live snapshots are broadcast as-is.
-                        if (admitFootprintRecord(binding.event(), json, "live")) {
-                            broadcast(binding.event(), json);
-                            footprintCounter("broadcast_total{event=\"" + binding.event() + "\"}").incrementAndGet();
-                            forwardedEvents.incrementAndGet();
-                        }
+                        onFootprintLiveRecord(binding.event(), json);
                         continue;
                     }
                     if ("es-cvd".equals(binding.event())) {
