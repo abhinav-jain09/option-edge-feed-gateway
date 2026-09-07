@@ -13108,10 +13108,9 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (esAuctionHandoffFrozen.get()) return;
         String topic = settings.esAuctionTopic();
-        boolean complete = true, sawPartition = false;
+        boolean complete = true;
         for (TopicPartition tp : partitions) {
             if (!tp.topic().equals(topic)) continue;
-            sawPartition = true;
             if (esAuctionHandoffOffset.containsKey(tp)) continue;
             Long at = null;
             for (int attempt = 0; attempt < 3 && at == null; attempt++) {
@@ -13120,7 +13119,10 @@ public class FeedGatewayService implements ReplayRunner {
             if (at == null) { complete = false; System.out.println("es-auction: cannot read the cache position for " + tp + "; the hello stays held until it can"); continue; }
             esAuctionHandoffOffset.putIfAbsent(tp, at);
         }
-        if (!complete || !sawPartition) return;
+        /* An enabled topic with NO partitions right now satisfies "every current partition has a handoff"
+           vacuously, so the empty set FREEZES: otherwise every socket would wait for a hello for ever. The
+           missing-handoff check above reopens the latch the moment a partition appears (round 13). */
+        if (!complete) return;
         esAuctionHandoffFrozen.set(true);
         flushEsAuctionHellos();
     }

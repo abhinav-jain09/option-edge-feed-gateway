@@ -500,10 +500,10 @@ class EsAuctionWiringTest {
         assertTrue(cb.contains("if (esAuctionHandoffFrozen.get()) {"), "(d) connect gates on the frozen handoff");
 
         int freeze = source.indexOf("void tryFreezeEsAuctionHandoff(");
-        String f = source.substring(freeze, freeze + 1600);
+        String f = source.substring(freeze, freeze + 2600);
         assertTrue(f.contains("consumer.position(tp)"), "(c) the ACTUAL position");
         assertTrue(f.contains("attempt < 3"), "(c) retried rather than swallowed");
-        assertTrue(f.indexOf("if (!complete || !sawPartition) return;") < f.indexOf("flushEsAuctionHellos()"), "(c) the hello waits for a COMPLETE handoff");
+        assertTrue(f.indexOf("if (!complete) return;") < f.indexOf("flushEsAuctionHellos()"), "(c) the hello waits for a COMPLETE handoff; an empty partition set satisfies it vacuously (round 13)");
         assertTrue(f.contains("putIfAbsent(tp, at)"), "(c) captured once per partition: later movement is ignored");
         int mark = source.indexOf("private void markCacheCaughtUp(");
         assertFalse(source.substring(mark, mark + 900).contains("flushEsAuctionHellos()"), "(c) the barrier alone no longer releases the hello");
