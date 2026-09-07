@@ -3170,6 +3170,96 @@ class FeedGatewayServiceTest {
                 + "\"baselineMode\":\"UNCALIBRATED\",\"codeVersion\":\"abc1234\"}";
     }
 
+    // ----- Candle Direction CURRENT decision relay ---------------------------------------------------
+
+    @Test
+    void directionTopicIsOptionalGlobalAndOnTheThreeMinuteWindow() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("context-tape.direction.current", settings.directionCurrentTopic());
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("direction"),
+                "the decision must fan out in per-session (auth) mode like its advisory siblings");
+        assertEquals(180_000L, settings.directionTtlMs(), "default TTL must be 3 minutes");
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, "direction", now - 2L * 60_000L, now));
+        assertTrue(isExpired(service, "direction", now - 4L * 60_000L, now),
+                "a 4-min-old decision must be STALE — never routed or replayed as current");
+    }
+
+    @Test
+    void directionUsesPayloadTsAndSymbolKey() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long ts = System.currentTimeMillis() - 1_000L;
+        String payload = "{\"symbol\":\"SPX\",\"sessionDate\":\"" + java.time.LocalDate.now(java.time.ZoneId.of("America/New_York")) + "\",\"slice\":\"COMMISSIONING_SHADOW\",\"actionable\":false,\"ts\":" + ts
+                + ",\"barEndMs\":" + (ts - 2_000L) + ",\"direction\":\"UP\",\"posture\":\"TREND\",\"intendedSide\":\"LONG_DELTA\"}";
+        ConsumerRecord<String, String> record = recordAt(
+                settings.directionCurrentTopic(), 0, 1L, "SPX", payload, System.currentTimeMillis());
+        assertEquals(ts, eventCacheTimestamp(service, "direction", record),
+                "fresh Kafka arrival must not disguise a stale decision");
+        assertEquals("DATABENTO|SPX",
+                updateCache(service, topicBinding("DATABENTO", "direction"), record, payload),
+                "updateCache must key the decision by source|symbol");
+        String future = payload.replace("\"ts\":" + ts, "\"ts\":" + (System.currentTimeMillis() + 10L * 60_000L));
+        ConsumerRecord<String, String> futureRecord = recordAt(settings.directionCurrentTopic(), 0, 2L, "SPX", future, System.currentTimeMillis());
+        assertEquals(-1L, eventCacheTimestamp(service, "direction", futureRecord), "an implausibly future stamp fails closed");
+    }
+
+    @Test
+    void directionPushIsFreshOnlyWhileBothStampsAreInsideTheWindow_andAlertsKeyByAlertId() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("context-tape.direction.push", settings.directionPushTopic());
+        assertEquals("context-tape.direction.alert", settings.directionAlertTopic());
+        assertEquals("context-tape.direction.scorecard", settings.directionScorecardTopic());
+        assertEquals(30_000L, settings.directionPushTtlMs());
+        assertEquals(60_000L, settings.directionAlertTtlMs());
+        for (String ev : java.util.List.of("direction-push", "direction-alert", "direction-scorecard")) {
+            assertTrue(FeedGatewayService.isGlobalBroadcastEvent(ev), ev);
+        }
+        long now = System.currentTimeMillis();
+        String today = java.time.LocalDate.now(java.time.ZoneId.of("America/New_York")).toString();
+        // fresh publish stamp but an OLD event time: the older stamp decides — stale
+        String backlog = "{\"symbol\":\"SPX\",\"sessionDate\":\"" + today + "\",\"slice\":\"COMMISSIONING_SHADOW\",\"actionable\":false,\"ts\":" + (now - 1_000L)
+                + ",\"eventTMs\":" + (now - 45_000L) + ",\"state\":\"EXHAUSTED\"}";
+        ConsumerRecord<String, String> r1 = recordAt(settings.directionPushTopic(), 0, 1L, "SPX", backlog, now);
+        assertEquals(now - 45_000L, eventCacheTimestamp(service, "direction-push", r1));
+        assertTrue(isExpired(service, "direction-push", now - 45_000L, now), "45 s old event time is STALE on the 30 s window");
+        assertFalse(isExpired(service, "direction-push", now - 20_000L, now));
+        String fresh = backlog.replace("\"eventTMs\":" + (now - 45_000L), "\"eventTMs\":" + (now - 2_000L));
+        ConsumerRecord<String, String> r2 = recordAt(settings.directionPushTopic(), 0, 2L, "SPX", fresh, now);
+        assertEquals(now - 2_000L, eventCacheTimestamp(service, "direction-push", r2));
+        assertEquals("DATABENTO|SPX", updateCache(service, topicBinding("DATABENTO", "direction-push"), r2, fresh));
+        // a record missing either stamp never caches; a FUTURE stamp never caches; another session never caches
+        String noEvent = "{\"symbol\":\"SPX\",\"sessionDate\":\"" + today + "\",\"ts\":" + now + "}";
+        assertEquals(-1L, eventCacheTimestamp(service, "direction-push", recordAt(settings.directionPushTopic(), 0, 3L, "SPX", noEvent, now)));
+        String future = fresh.replace("\"ts\":" + (now - 1_000L), "\"ts\":" + (now + 5_000L));
+        assertEquals(-1L, eventCacheTimestamp(service, "direction-push", recordAt(settings.directionPushTopic(), 0, 4L, "SPX", future, now)),
+                "a future stamp is never fresh — no skew allowance");
+        String yesterday = fresh.replace("\"sessionDate\":\"" + today + "\"", "\"sessionDate\":\"2000-01-01\"");
+        assertEquals(-1L, eventCacheTimestamp(service, "direction-push", recordAt(settings.directionPushTopic(), 0, 5L, "SPX", yesterday, now)),
+                "another session is never current");
+        // alerts: keyed by alertId, 60 s on ts, same-session
+        String alert = "{\"symbol\":\"SPX\",\"sessionDate\":\"" + today + "\",\"alertId\":\"pushalert|c1\",\"alertClass\":\"PUSH_EXHAUSTED\",\"ts\":" + (now - 500L) + ",\"eventTMs\":" + (now - 2_500L) + "}";
+        ConsumerRecord<String, String> a1 = recordAt(settings.directionAlertTopic(), 0, 1L, "SPX|c1", alert, now);
+        assertEquals("DATABENTO|pushalert|c1", updateCache(service, topicBinding("DATABENTO", "direction-alert"), a1, alert));
+        assertEquals(now - 2_500L, eventCacheTimestamp(service, "direction-alert", a1), "the OLDER of ts/eventTMs is the alert's clock");
+        assertTrue(isExpired(service, "direction-alert", now - 61_000L, now));
+        assertFalse(isExpired(service, "direction-alert", now - 59_000L, now));
+        String backlogAlert = alert.replace("\"eventTMs\":" + (now - 2_500L), "\"eventTMs\":" + (now - 120_000L));
+        assertTrue(isExpired(service, "direction-alert", eventCacheTimestamp(service, "direction-alert",
+                recordAt(settings.directionAlertTopic(), 0, 2L, "SPX|c2", backlogAlert, now)), now),
+                "a fresh transport stamp on an old event is a backlog, never a live alert (r11 #1)");
+        // expiry evicts the payload, not only its clock (r11 #7)
+        assertTrue(service.healthJson().contains("\"directionAlert\":1"), service.healthJson());
+        Method remove = FeedGatewayService.class.getDeclaredMethod("removeCacheEntry", String.class);
+        remove.setAccessible(true);
+        remove.invoke(service, "direction-alert:DATABENTO|pushalert|c1");
+        assertTrue(service.healthJson().contains("\"directionAlert\":0"), service.healthJson());
+        remove.invoke(service, "direction-push:DATABENTO|SPX");
+        assertTrue(service.healthJson().contains("\"directionPush\":0"), service.healthJson());
+    }
+
     // ----- gamma-leadership CURRENT reading relay ---------------------------------------------------
 
     @Test
