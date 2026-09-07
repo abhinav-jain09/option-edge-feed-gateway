@@ -469,11 +469,27 @@ class EsAuctionWiringTest {
         assertFalse(body.contains("consumer.seekToEnd(owned)"), "and no longer seeks the whole topic to END");
         int within = source.indexOf("private void seekEsAuctionWithin(");
         String w = source.substring(within, within + 900);
-        assertTrue(w.contains("consumer.seek(owned, cursor)") && w.contains("cursor < beginning || cursor > end"), "END only without a usable cursor");
+        assertTrue(w.contains("seekEsAuctionWithinAt(consumer, owned, cursor)"), "the cursor is honoured; END only without one (round 7 moved the clamping into seekEsAuctionWithinAt)");
         // A partition discovered after startup recovers rather than jumping to END.
         int refresh = source.indexOf("List<TopicPartition> recoverEsAuction = new ArrayList<>();");
         assertTrue(refresh > 0, "the discovery path has an auction bucket");
         assertTrue(source.contains("recoverEsAuction.add(partition)") && source.contains("consumer.seekToBeginning(List.of(p))"));
+    }
+
+    @Test void theAuctionCursorIsActuallyRecordedAndTheColdStartHandsOffFromHydration() throws Exception {
+        // Code review round 7: the live branch returned before the cursor was recorded, so every retry
+        // still went to END; and a cold start jumped to END without a handoff from the cache consumer.
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int liveBranch = source.indexOf("if (\"es-auction\".equals(binding.event())) {");
+        String branch = source.substring(liveBranch, liveBranch + 900);
+        assertTrue(branch.indexOf("noteCvdSpxLevelsProgress(binding, record)") < branch.indexOf("continue;"), "the cursor is recorded BEFORE the branch continues");
+        int cacheBranch = source.indexOf("onEsAuctionCacheRecord(record.key()");
+        assertTrue(source.substring(cacheBranch, cacheBranch + 400).contains("esAuctionCacheNextOffset.put("), "hydration records its handoff point");
+        int liveOnce = source.indexOf("private void runLiveConsumerOnce(");
+        assertTrue(source.substring(liveOnce, liveOnce + 1500).contains("seekEsAuctionToHandoff(consumer, partitions)"), "the cold start hands off");
+        int within = source.indexOf("private void seekEsAuctionWithinAt(");
+        String w = source.substring(within, within + 1100);
+        assertTrue(w.contains("catch (RuntimeException rangeUnknown)") && w.contains("consumer.seek(owned, cursor)"), "an unknown range keeps the cursor rather than skipping to END");
     }
 
     @Test void foreignShapesNeverPoisonTheView() {

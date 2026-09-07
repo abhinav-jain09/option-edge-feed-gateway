@@ -637,6 +637,9 @@ public class FeedGatewayService implements ReplayRunner {
     /** Per-partition next offset for the auction topic on the LIVE path, so a retry RESUMES instead of
      *  replaying its seven-day cache window or skipping whatever was produced during the retry gap. */
     private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionNextOffset = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Where the CACHE consumer's hydration reached: the live consumer starts there on a cold start, so a
+     *  record produced between hydration completing and the live seek is not silently skipped. */
+    private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionCacheNextOffset = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -2482,6 +2485,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // shape) and the /api/auction/minutes view stayed EMPTY after a restart
                         // until the next live minute arrived. Fed the KAFKA KEY, like the live branch.
                         onEsAuctionCacheRecord(record.key() == null ? null : String.valueOf(record.key()), json);
+                        esAuctionCacheNextOffset.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
                         continue;
                     }
                     updateCache(binding, record, json);
@@ -2741,6 +2745,7 @@ public class FeedGatewayService implements ReplayRunner {
             } else {
                 consumer.seekToEnd(partitions);
                 seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
+                seekEsAuctionToHandoff(consumer, partitions);      // the same continuity for the auction
             }
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
             while (running.get()) {
@@ -2924,6 +2929,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // selection-gated). Clients apply the same latest-correctionRev-per-minute
                         // rule, so at-least-once delivery is invisible downstream.
                         onEsAuctionRecord(record.key() == null ? null : String.valueOf(record.key()), json);
+                        noteCvdSpxLevelsProgress(binding, record);   // the cursor a retry resumes from
                         continue;
                     }
                     if ("es-aggressor-flow".equals(binding.event())) {
@@ -10483,6 +10489,23 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
+     * Cold start: begin where the CACHE consumer's hydration reached, not at the end. The cache can finish
+     * hydrating and release the hello before this consumer performs its seek, and a record produced in that
+     * window would then be cached silently and skipped on the wire, so the page that already has its hello
+     * would never see it (code review round 7).
+     */
+    private void seekEsAuctionToHandoff(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        for (TopicPartition tp : partitions) {
+            if (!tp.topic().equals(topic)) continue;
+            Long handoff = esAuctionCacheNextOffset.get(tp);
+            if (handoff == null) continue;                          // nothing hydrated yet: END is already correct
+            seekEsAuctionWithinAt(consumer, tp, handoff);
+        }
+    }
+
+    /**
      * Resume this auction partition where the LIVE path last was. Seeking to END would silently skip
      * every minute produced during the retry gap: the cache consumer would hydrate them, but the pages
      * have already had their hello and never backfill again, so nothing would ever put them on the wire
@@ -10490,16 +10513,24 @@ public class FeedGatewayService implements ReplayRunner {
      * the partition's retained range.
      */
     private void seekEsAuctionWithin(KafkaConsumer<?, ?> consumer, TopicPartition owned) {
-        List<TopicPartition> one = List.of(owned);
         Long cursor = esAuctionNextOffset.get(owned);
-        if (cursor == null || cursor < 0) { consumer.seekToEnd(one); return; }
+        if (cursor == null || cursor < 0) { consumer.seekToEnd(List.of(owned)); return; }
+        seekEsAuctionWithinAt(consumer, owned, cursor);
+    }
+
+    /** Seeks to {@code cursor}, clamped to what the partition retains. A failed RANGE QUERY does NOT mean
+     *  "skip to the end": the cursor was valid when it was recorded, so it is used as it stands and only a
+     *  failed SEEK falls back to END (code review round 7). */
+    private void seekEsAuctionWithinAt(KafkaConsumer<?, ?> consumer, TopicPartition owned, long cursor) {
+        List<TopicPartition> one = List.of(owned);
         try {
             long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
             long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
-            if (cursor < beginning || cursor > end) { esAuctionNextOffset.remove(owned); consumer.seekToEnd(one); return; }
+            if (cursor < beginning) { consumer.seek(owned, beginning); return; }   // aged out: take what is left
+            if (cursor > end) { esAuctionNextOffset.remove(owned); consumer.seekToEnd(one); return; }
             consumer.seek(owned, cursor);
-        } catch (RuntimeException e) {
-            consumer.seekToEnd(one);                                   // range unknown: the safe fallback
+        } catch (RuntimeException rangeUnknown) {
+            try { consumer.seek(owned, cursor); } catch (RuntimeException seekFailed) { consumer.seekToEnd(one); }
         }
     }
 
