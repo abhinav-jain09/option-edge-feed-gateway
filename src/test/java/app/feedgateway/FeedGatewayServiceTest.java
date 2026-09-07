@@ -3260,6 +3260,25 @@ class FeedGatewayServiceTest {
         assertTrue(service.healthJson().contains("\"directionPush\":0"), service.healthJson());
     }
 
+    @Test
+    void directionAlertsAreNeverReplayedToAJoiningClient_butThePushStateIs() throws Exception {
+        // A4.10: an alert is a SPOKEN event. A late joiner must see the push state and the scorecard, and must NOT be
+        // handed alerts it never lived through — that is what would let a browser speak history as if it were now.
+        String src = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int from = src.indexOf("private void replayDirectionPushCached(");
+        int to = src.indexOf("private void replayDirectionCached(", from);
+        assertTrue(from > 0 && to > from, "the direction replay helper moved");
+        String body = src.substring(from, to);
+        assertTrue(body.contains("send(session, \"direction-push\""), "the push state IS replayed");
+        assertTrue(body.contains("send(session, \"direction-scorecard\""), "the scorecard IS replayed");
+        assertFalse(body.contains("send(session, \"direction-alert\""), "an alert is NEVER replayed (A4.10)");
+        for (String site : java.util.List.of("replayCachedToSocket", "addClient")) {
+            assertTrue(src.contains(site), site + " moved");
+        }
+        assertEquals(0, src.split("send\\(session, \"direction-alert\"", -1).length - 1,
+                "no replay path anywhere may send a direction-alert");
+    }
+
     // ----- gamma-leadership CURRENT reading relay ---------------------------------------------------
 
     @Test
