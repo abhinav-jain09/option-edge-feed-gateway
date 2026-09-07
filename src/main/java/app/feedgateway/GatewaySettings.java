@@ -1271,6 +1271,16 @@ public final class GatewaySettings {
         return longValue("GATEWAY_GAMMA_LEADERSHIP_TTL_MS", 300_000L, 0L);
     }
 
+    /** Candle Direction CURRENT decision (context-tape-service, commissioning shadow), keyed by symbol. */
+    public String directionCurrentTopic() {
+        return value("KAFKA_DIRECTION_CURRENT_TOPIC", "context-tape.direction.current");
+    }
+
+    /** Freshness window for a direction decision: one minute's call is current for three minutes. */
+    public long directionTtlMs() {
+        return longValue("GATEWAY_DIRECTION_TTL_MS", 180_000L, 0L);
+    }
+
     /**
      * Compacted IV-vs-realised topic of the standalone vol-premium service (JSON
      * {@code IvRvReading} &mdash; see {@link VolPremiumTopics#IVRV}). One record per

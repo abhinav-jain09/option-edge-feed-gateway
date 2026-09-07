@@ -3170,6 +3170,41 @@ class FeedGatewayServiceTest {
                 + "\"baselineMode\":\"UNCALIBRATED\",\"codeVersion\":\"abc1234\"}";
     }
 
+    // ----- Candle Direction CURRENT decision relay ---------------------------------------------------
+
+    @Test
+    void directionTopicIsOptionalGlobalAndOnTheThreeMinuteWindow() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("context-tape.direction.current", settings.directionCurrentTopic());
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("direction"),
+                "the decision must fan out in per-session (auth) mode like its advisory siblings");
+        assertEquals(180_000L, settings.directionTtlMs(), "default TTL must be 3 minutes");
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, "direction", now - 2L * 60_000L, now));
+        assertTrue(isExpired(service, "direction", now - 4L * 60_000L, now),
+                "a 4-min-old decision must be STALE — never routed or replayed as current");
+    }
+
+    @Test
+    void directionUsesPayloadTsAndSymbolKey() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long ts = System.currentTimeMillis() - 1_000L;
+        String payload = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"slice\":\"COMMISSIONING_SHADOW\",\"actionable\":false,\"ts\":" + ts
+                + ",\"barEndMs\":" + (ts - 2_000L) + ",\"direction\":\"UP\",\"posture\":\"TREND\",\"intendedSide\":\"LONG_DELTA\"}";
+        ConsumerRecord<String, String> record = recordAt(
+                settings.directionCurrentTopic(), 0, 1L, "SPX", payload, System.currentTimeMillis());
+        assertEquals(ts, eventCacheTimestamp(service, "direction", record),
+                "fresh Kafka arrival must not disguise a stale decision");
+        assertEquals("DATABENTO|SPX",
+                updateCache(service, topicBinding("DATABENTO", "direction"), record, payload),
+                "updateCache must key the decision by source|symbol");
+        String future = payload.replace("\"ts\":" + ts, "\"ts\":" + (System.currentTimeMillis() + 10L * 60_000L));
+        ConsumerRecord<String, String> futureRecord = recordAt(settings.directionCurrentTopic(), 0, 2L, "SPX", future, System.currentTimeMillis());
+        assertEquals(-1L, eventCacheTimestamp(service, "direction", futureRecord), "an implausibly future stamp fails closed");
+    }
+
     // ----- gamma-leadership CURRENT reading relay ---------------------------------------------------
 
     @Test
