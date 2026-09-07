@@ -507,6 +507,22 @@ class EsAuctionWiringTest {
         assertFalse(h.contains("esAuctionCacheNextOffset.get(tp)"), "never the moving one");
     }
 
+    @Test void everyAuctionPartitionHasAHandoffValueAtTheFreeze() throws Exception {
+        // Code review round 9: the freeze only had a value for partitions on which a record happened to be
+        // processed. A partition with none fell through to END on the cold start, so a minute produced
+        // between the cache barrier and that seek was skipped live and swallowed silently by the cache.
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int rec = source.indexOf("private void recordEsAuctionCachePositions(");
+        assertTrue(rec > 0, "positions are captured for every auction partition");
+        assertTrue(source.substring(rec, rec + 800).contains("consumer.position(tp)"), "the ACTUAL position, not a record offset");
+        int first = source.indexOf("recordEsAuctionCachePositions(consumer, partitions);");
+        int firstMark = source.indexOf("markCacheCaughtUp(name, events, caughtUpFlag);", first);
+        assertTrue(first > 0 && firstMark > first && firstMark - first < 220, "captured immediately before the first mark");
+        int second = source.indexOf("recordEsAuctionCachePositions(consumer, partitions);", firstMark);
+        int secondMark = source.indexOf("markCacheCaughtUp(name, events, caughtUpFlag);", second);
+        assertTrue(second > 0 && secondMark > second && secondMark - second < 220, "and before the retried mark");
+    }
+
     @Test void foreignShapesNeverPoisonTheView() {
         var s = service();
         assertFalse(s.upsertEsAuctionMinute(null, "{\"unrelated\":true}"));

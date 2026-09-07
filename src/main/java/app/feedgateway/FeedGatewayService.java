@@ -2355,6 +2355,7 @@ public class FeedGatewayService implements ReplayRunner {
             boolean live = caughtUp(consumer, catchUpEndOffsets);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
             if (live) {
+                recordEsAuctionCachePositions(consumer, partitions);
                 markCacheCaughtUp(name, events, caughtUpFlag);
             }
             while (running.get()) {
@@ -2534,6 +2535,7 @@ public class FeedGatewayService implements ReplayRunner {
                     // once the last barrier retires, and markCacheCaughtUp's false->true CAS may never fire
                     // again. Both calls are idempotent and markSelectionReady re-validates under readyLock,
                     // so this is safe and cheap.
+                    recordEsAuctionCachePositions(consumer, partitions);
                     markCacheCaughtUp(name, events, caughtUpFlag);
                     ActiveSelection liveSelection = activeSelection.get();
                     if (liveSelection != null
@@ -12797,6 +12799,21 @@ public class FeedGatewayService implements ReplayRunner {
                 Long.toString(settings.partitionMetadataRefreshMs()));
         settings.applyKafkaSecurity(properties); // TLS/SASL when configured (required under auth — P0)
         return properties;
+    }
+
+    /**
+     * Records the cache consumer's ACTUAL position on every auction partition, so the freeze has a value for
+     * each of them — including a partition on which no record has been processed. Without it the cold-start
+     * live seek fell through to END, and a minute produced between the cache barrier and that seek was
+     * skipped on the wire while the cache swallowed it silently (code review round 9).
+     */
+    private void recordEsAuctionCachePositions(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled() || esAuctionHandoffFrozen.get()) return;
+        String topic = settings.esAuctionTopic();
+        for (TopicPartition tp : partitions) {
+            if (!tp.topic().equals(topic)) continue;
+            try { esAuctionCacheNextOffset.put(tp, consumer.position(tp)); } catch (RuntimeException ignored) { /* the freeze simply has no value for it */ }
+        }
     }
 
     /** Freezes the cache cursor at the catch-up boundary; the first freeze wins, later movement is ignored. */
