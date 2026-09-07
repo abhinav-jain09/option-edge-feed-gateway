@@ -529,7 +529,7 @@ class EsAuctionWiringTest {
         assertTrue(f.indexOf("esAuctionTopicIdReader.apply") < f.indexOf("consumer.position(tp)"),
                 "the incarnation is named BEFORE any position is captured (round 16)");
         assertTrue(f.indexOf("if (id == null)") < f.indexOf("consumer.position(tp)"), "an unreadable id captures nothing and holds the hello");
-        String w = methodBody(source, "private boolean seekEsAuctionWithinAt(");
+        String w = methodBody(source, "boolean seekEsAuctionWithinAt(");
         assertTrue(w.indexOf("esAuctionTopicIdReader.apply(owned.topic())") < w.indexOf("beginningOffsets"), "identity is checked BEFORE any offset reasoning");
         assertTrue(w.contains("esAuctionForgetIncarnation("), "a different id drops every cursor and reopens the latch");
         String g = methodBody(source, "void esAuctionForgetIncarnation(");
@@ -759,6 +759,51 @@ class EsAuctionWiringTest {
         s.tryFreezeEsAuctionHandoff(racing, List.of(tp));
         assertFalse(s.esAuctionHelloReady(), "the interrupted pass froze nothing");
         assertEquals(0, s.esAuctionHandoffCountForTest(), "and left no cursor from the old incarnation behind");
+    }
+
+    /** While the latch is CLOSED nothing else looks at the topic's identity, so a recreation with the same
+     *  partition count would be served from the old view until the live consumer happened to seek. */
+    @Test void aFrozenHandoffStillNoticesTheTopicBeingRecreated() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 0L);
+        org.apache.kafka.common.Uuid first = org.apache.kafka.common.Uuid.randomUuid();
+        var current = new java.util.concurrent.atomic.AtomicReference<>(first);
+        s.esAuctionTopicIdReader = t -> current.get();
+        s.markStateCaughtUpWithoutHandoffForTest();
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertTrue(s.esAuctionHelloReady());
+        s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"));
+
+        // Nothing changed: an already-frozen latch stays frozen.
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertTrue(s.esAuctionHelloReady());
+        assertEquals(1, s.esAuctionMinutesCached());
+
+        current.set(org.apache.kafka.common.Uuid.randomUuid());
+        s.expireEsAuctionIdCheckForTest();      // the cadence is a throttle, not the rule
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertFalse(s.esAuctionHelloReady(), "the recreation is noticed without waiting for a live seek");
+        assertEquals(0, s.esAuctionMinutesCached(), "and the old log's view goes with it");
+    }
+
+    /** Trusting a cursor without being able to NAME the log is the case offsets cannot see: if the topic was
+     *  recreated and has already grown past it, the seek lands in the new log and skips its retained prefix. */
+    @Test void anUnreadableTopicIdKeepsTheLivePartitionPaused() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 40L);
+        org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
+        s.esAuctionTopicIdReader = t -> id;
+        s.markStateCaughtUpWithoutHandoffForTest();
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));   // records the incarnation
+        assertTrue(s.seekEsAuctionWithinAt(consumer, tp, 12L), "a named, unchanged incarnation seeks normally");
+        assertEquals(12L, consumer.position(tp));
+        s.esAuctionTopicIdReader = t -> null;
+        assertFalse(s.seekEsAuctionWithinAt(consumer, tp, 20L), "an unnamed log is not seeked into");
+        assertEquals(12L, consumer.position(tp), "the partition did not move");
     }
 
     @Test void foreignShapesNeverPoisonTheView() {

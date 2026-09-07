@@ -666,6 +666,11 @@ public class FeedGatewayService implements ReplayRunner {
      *  view that had just been dropped, so the generation is read at the start of a capture pass and confirmed
      *  under this lock before the latch closes (code review round 17). */
     private final Object esAuctionIncarnationLock = new Object();
+    /** How often the identity of an ALREADY FROZEN topic is re-read. Nothing else looks at it while the latch
+     *  is closed, so without this a recreation with the same partition count would be served from the old view
+     *  until the live consumer happened to seek (code review round 20). */
+    private static final long ES_AUCTION_ID_CHECK_MS = 30_000L;
+    private volatile long esAuctionLastIdCheckMs;
     private final java.util.concurrent.atomic.AtomicLong esAuctionGeneration = new java.util.concurrent.atomic.AtomicLong();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
@@ -10817,7 +10822,7 @@ public class FeedGatewayService implements ReplayRunner {
     /** Seeks to {@code cursor}, clamped to what the partition retains. A failed RANGE QUERY does NOT mean
      *  "skip to the end": the cursor was valid when it was recorded, so it is used as it stands and only a
      *  failed SEEK falls back to END (code review round 7). */
-    private boolean seekEsAuctionWithinAt(KafkaConsumer<?, ?> consumer, TopicPartition owned, long cursor) {
+    boolean seekEsAuctionWithinAt(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, TopicPartition owned, long cursor) {
         List<TopicPartition> one = List.of(owned);
         // IDENTITY FIRST. Offsets cannot see a recreation that has already grown past the old cursor:
         // `cursor <= end` would look valid and the consumer would seek into the NEW log, silently skipping
@@ -10825,7 +10830,12 @@ public class FeedGatewayService implements ReplayRunner {
         org.apache.kafka.common.Uuid known = esAuctionTopicId;
         if (known != null) {
             org.apache.kafka.common.Uuid now = esAuctionTopicIdReader.apply(owned.topic());
-            if (now != null && !now.equals(known)) { esAuctionForgetIncarnation("topic " + owned.topic() + " was recreated (" + known + " -> " + now + ")"); return false; }
+            /* FAIL CLOSED on an unreadable id. Trusting the cursor without being able to name the log is
+               exactly the case the offsets cannot see: if the topic was recreated and has already grown past
+               it, this seeks into the NEW log and skips its retained prefix while hydration stays silent
+               (code review round 20). The partition stays paused until the incarnation can be verified. */
+            if (now == null) { System.out.println("es-auction: the topic id of " + owned + " cannot be read; the partition stays paused rather than trust a cursor on an unnamed log"); return false; }
+            if (!now.equals(known)) { esAuctionForgetIncarnation("topic " + owned.topic() + " was recreated (" + known + " -> " + now + ")"); return false; }
         }
         try {
             long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
@@ -13136,12 +13146,15 @@ public class FeedGatewayService implements ReplayRunner {
            has been captured too (round 12) — UNDER the incarnation lock, the same monitor connect and flush
            decide on, so a hello can never be sent on a latch this thread is in the middle of reopening
            (code review round 19). */
+        boolean frozen;
         synchronized (esAuctionIncarnationLock) {
             for (TopicPartition tp : partitions) {
                 if (tp.topic().equals(topic) && !esAuctionHandoffOffset.containsKey(tp)) { esAuctionHandoffFrozen.set(false); break; }
             }
-            if (esAuctionHandoffFrozen.get()) return;
+            frozen = esAuctionHandoffFrozen.get();
         }
+        // The identity round trip stays OUTSIDE the lock: an invalidation must never wait on a broker call.
+        if (frozen) { verifyFrozenEsAuctionIncarnation(topic); return; }
         if (!esAuctionRehydrated(consumer, partitions, generation)) return;
         /* IDENTITY FIRST: a position is meaningless without knowing which LOG it is a position on (round 16). */
         org.apache.kafka.common.Uuid id = esAuctionTopicIdReader.apply(topic);
@@ -13226,6 +13239,25 @@ public class FeedGatewayService implements ReplayRunner {
         return esAuctionRehydrateBarrier.isEmpty();
     }
 
+    /**
+     * Re-reads the identity of an ALREADY FROZEN topic, on a slow cadence. While the latch is closed the
+     * capture path returns immediately and nothing else looks at the topic's identity, so a recreation whose
+     * new log has the same partition count would be served from the OLD view indefinitely — until the live
+     * consumer happened to seek (code review round 20). A mismatch invalidates. An UNREADABLE id does not: a
+     * transient admin failure is not evidence of a recreation, and dropping a working view on one would be a
+     * self-inflicted outage.
+     */
+    void verifyFrozenEsAuctionIncarnation(String topic) {
+        long now = System.currentTimeMillis();
+        if (now - esAuctionLastIdCheckMs < ES_AUCTION_ID_CHECK_MS) return;
+        esAuctionLastIdCheckMs = now;
+        org.apache.kafka.common.Uuid known = esAuctionTopicId;
+        if (known == null) return;
+        org.apache.kafka.common.Uuid seen = esAuctionTopicIdReader.apply(topic);
+        if (seen == null) { System.out.println("es-auction: the topic id cannot be read; the frozen handoff stands until it can"); return; }
+        if (!seen.equals(known)) esAuctionForgetIncarnation("topic " + topic + " was recreated (" + known + " -> " + seen + ")");
+    }
+
     /** Clears the replay request only while {@code generation} is still the current incarnation. */
     private boolean clearRehydrateIfCurrent(long generation) {
         synchronized (esAuctionIncarnationLock) {
@@ -13307,6 +13339,9 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** Test seam: the view has hydrated but NO handoff has been captured — the state tryFreeze is asked from. */
     void markStateCaughtUpWithoutHandoffForTest() { stateCaughtUp.set(true); }
+
+    /** Test seam: makes the next identity check of a frozen topic due, instead of waiting out the cadence. */
+    void expireEsAuctionIdCheckForTest() { esAuctionLastIdCheckMs = 0L; }
 
     /** Test seam: how many auction partitions currently hold a frozen handoff. */
     int esAuctionHandoffCountForTest() { return esAuctionHandoffOffset.size(); }
