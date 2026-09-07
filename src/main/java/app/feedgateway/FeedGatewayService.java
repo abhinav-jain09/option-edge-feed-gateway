@@ -656,6 +656,11 @@ public class FeedGatewayService implements ReplayRunner {
     private volatile org.apache.kafka.common.Uuid esAuctionTopicId;
     /** Reader seam: the real one is {@code AdminClient.describeTopics(...).topicId()}. */
     java.util.function.Function<String, org.apache.kafka.common.Uuid> esAuctionTopicIdReader = this::describeTopicId;
+    /** Set when a recreation dropped the view: the whole RETAINED log of the new incarnation is re-read
+     *  before any hello may promise the view again (code review round 16). */
+    private final AtomicBoolean esAuctionRehydrate = new AtomicBoolean(false);
+    /** While non-empty, the freeze is refused: each auction partition must reach this end offset first. */
+    private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionRehydrateBarrier = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -10167,7 +10172,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** @return true when this record must reach the wire: it is the view's current copy of its minute
      *  AND no record for that minute at this correctionRev has been broadcast yet. */
-    private boolean upsertEsAuctionMinuteOutcome(String key, String json, boolean live) {
+    boolean upsertEsAuctionMinuteOutcome(String key, String json, boolean live) {
         return upsertEsAuctionMinuteOutcome(key, json, live, new EsAuctionUpsert[1]);
     }
 
@@ -13117,8 +13122,9 @@ public class FeedGatewayService implements ReplayRunner {
      *
      * <p>Called from the cache consumer's own thread, which is the only thread that may touch its consumer.
      */
-    void tryFreezeEsAuctionHandoff(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions) {
+    void tryFreezeEsAuctionHandoff(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions) {
         if (!settings.esAuctionEnabled() || !stateCaughtUp.get()) return;
+        if (!esAuctionRehydrated(consumer, partitions)) return;
         // The latch is not permanent: an auction partition ADDED after the freeze has no handoff, so
         // readiness no longer covers every current partition. Reopen it and hold new sockets until the
         // added partition has been captured too (code review round 12).
@@ -13127,6 +13133,17 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (esAuctionHandoffFrozen.get()) return;
         String topic = settings.esAuctionTopic();
+        /* IDENTITY FIRST, and it is recorded before anything is captured. A position is meaningless without
+           knowing which LOG it is a position on: captured while the id was unreadable, it used to survive in
+           `esAuctionHandoffOffset` and be adopted by whatever id was read on a later attempt — so offsets from
+           the old incarnation would be bound to the new one and live would seek past its records (round 16).
+           Recording the id here also means a recreation between two partial capture passes is SEEN, because
+           the next pass compares against it. */
+        org.apache.kafka.common.Uuid id = esAuctionTopicIdReader.apply(topic);
+        if (id == null) { System.out.println("es-auction: cannot read the topic id; nothing is captured and the hello stays held"); return; }
+        org.apache.kafka.common.Uuid known = esAuctionTopicId;
+        if (known != null && !known.equals(id)) { esAuctionForgetIncarnation("topic " + topic + " was recreated (" + known + " -> " + id + ")"); return; }
+        esAuctionTopicId = id;
         boolean complete = true;
         for (TopicPartition tp : partitions) {
             if (!tp.topic().equals(topic)) continue;
@@ -13142,16 +13159,47 @@ public class FeedGatewayService implements ReplayRunner {
            vacuously, so the empty set FREEZES: otherwise every socket would wait for a hello for ever. The
            missing-handoff check above reopens the latch the moment a partition appears (round 13). */
         if (!complete) return;
-        // The incarnation the handoff belongs to. Without it the hello would promise a view whose
-        // continuation cannot be proven, so a topic whose ID cannot be read holds the hello (round 15).
-        org.apache.kafka.common.Uuid id = esAuctionTopicIdReader.apply(settings.esAuctionTopic());
-        if (id == null) { System.out.println("es-auction: cannot read the topic id; the hello stays held"); return; }
-        esAuctionTopicId = id;
+        // ...and confirmed unchanged after: a capture that straddled a recreation belongs to neither log.
+        org.apache.kafka.common.Uuid after = esAuctionTopicIdReader.apply(topic);
+        if (after == null || !after.equals(id)) { esAuctionForgetIncarnation("the topic id changed while the handoff was being captured"); return; }
         esAuctionHandoffFrozen.set(true);
         flushEsAuctionHellos();
     }
 
     /** Sends the auction hello to every socket that connected before the view had hydrated. */
+    /**
+     * True once the auction view is trustworthy again. A recreation drops the view and the emission ledger,
+     * so the gateway holds nothing for the new incarnation; it then re-reads that log from its BEGINNING and
+     * refuses the freeze until every auction partition has reached the end offset captured at the moment of
+     * the re-seek. Without this the hello would go out over an empty view a moment after the drop (round 16).
+     * Runs on the cache consumer's own thread, the only one that may touch its consumer.
+     */
+    private boolean esAuctionRehydrated(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions) {
+        String topic = settings.esAuctionTopic();
+        List<TopicPartition> owned = partitions.stream().filter(tp -> tp.topic().equals(topic)).toList();
+        if (esAuctionRehydrate.get()) {
+            if (owned.isEmpty()) { esAuctionRehydrate.set(false); esAuctionRehydrateBarrier.clear(); return true; }
+            try {
+                Map<TopicPartition, Long> beginning = consumer.beginningOffsets(owned, Duration.ofSeconds(10));
+                Map<TopicPartition, Long> end = consumer.endOffsets(owned, Duration.ofSeconds(10));
+                esAuctionRehydrateBarrier.clear();
+                for (TopicPartition tp : owned) { consumer.seek(tp, beginning.get(tp)); esAuctionRehydrateBarrier.put(tp, end.get(tp)); }
+                esAuctionRehydrate.set(false);
+                System.out.println("es-auction: re-reading the retained log of the new incarnation before any hello");
+            } catch (RuntimeException retryable) {
+                return false;   // the hello stays held; the next loop iteration tries again
+            }
+        }
+        if (esAuctionRehydrateBarrier.isEmpty()) return true;
+        for (Map.Entry<TopicPartition, Long> e : esAuctionRehydrateBarrier.entrySet()) {
+            long at;
+            try { at = consumer.position(e.getKey()); } catch (RuntimeException retryable) { return false; }
+            if (at < e.getValue()) return false;
+            esAuctionRehydrateBarrier.remove(e.getKey());
+        }
+        return esAuctionRehydrateBarrier.isEmpty();
+    }
+
     /** {@code AdminClient.describeTopics(topic).topicId()}, or null when it cannot be read. */
     private org.apache.kafka.common.Uuid describeTopicId(String topic) {
         java.util.Properties props = new java.util.Properties();
@@ -13170,11 +13218,21 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** Invalidates every auction cursor and reopens the latch: the topic this gateway knew is gone. */
-    private void esAuctionForgetIncarnation(String why) {
+    void esAuctionForgetIncarnation(String why) {
         esAuctionNextOffset.clear();
         esAuctionHandoffOffset.clear();
         esAuctionTopicId = null;
         esAuctionHandoffFrozen.set(false);
+        /* The VIEW and the emission ledger belong to the old log too. Kept, its rows would still be served by
+           backfill as if they were this incarnation's, and a key the new log reuses at the same or a lower
+           correctionRev would be suppressed as already broadcast — the row would never reach a socket
+           (round 16). The whole retained log is re-read before the hello is released again. */
+        synchronized (esAuctionMinutes) {
+            esAuctionMinutes.clear();
+            esAuctionEmitted.clear();
+        }
+        esAuctionRehydrate.set(true);
+        esAuctionRehydrateBarrier.clear();
         System.out.println("es-auction: " + why + " — every cursor dropped, the hello waits for a fresh handoff");
     }
 
@@ -13194,6 +13252,12 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** Test seam: marks the auction view hydrated and releases every held hello, as markCacheCaughtUp does. */
     void markStateCaughtUpForTest() { stateCaughtUp.set(true); esAuctionHandoffFrozen.set(true); flushEsAuctionHellos(); }
+
+    /** Test seam: the view has hydrated but NO handoff has been captured — the state tryFreeze is asked from. */
+    void markStateCaughtUpWithoutHandoffForTest() { stateCaughtUp.set(true); }
+
+    /** Test seam: how many auction partitions currently hold a frozen handoff. */
+    int esAuctionHandoffCountForTest() { return esAuctionHandoffOffset.size(); }
 
     private static String escapeJson(String value) {
         StringBuilder escaped = new StringBuilder();

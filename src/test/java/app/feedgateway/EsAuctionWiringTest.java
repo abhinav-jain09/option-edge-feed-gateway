@@ -43,6 +43,15 @@ class EsAuctionWiringTest {
         return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
     }
 
+    /** The WHOLE body of one method. A fixed character window silently truncates as the method grows, and an
+     *  ordering assertion then compares against indexOf == -1 and passes or fails for the wrong reason. */
+    private static String methodBody(String source, String signature) {
+        int at = source.indexOf(signature);
+        assertTrue(at >= 0, "no such method: " + signature);
+        int end = source.indexOf("\n    }\n", at);
+        return source.substring(at, end < 0 ? source.length() : end);
+    }
+
     private static String minute(String tradeDate, String hhmm, int rev, String marker) {
         return "{\"sessionId\":\"" + tradeDate + "-RTH\",\"tradeDate\":\"" + tradeDate + "\",\"minute\":\"" + hhmm
                 + "\",\"effectiveTs\":\"" + tradeDate + "T" + hhmm + ":00Z\",\"publishTs\":\"" + tradeDate + "T" + hhmm
@@ -499,8 +508,7 @@ class EsAuctionWiringTest {
         String cb = source.substring(connect, connect + 1400);
         assertTrue(cb.contains("if (esAuctionHandoffFrozen.get()) {"), "(d) connect gates on the frozen handoff");
 
-        int freeze = source.indexOf("void tryFreezeEsAuctionHandoff(");
-        String f = source.substring(freeze, freeze + 2600);
+        String f = methodBody(source, "void tryFreezeEsAuctionHandoff(");
         assertTrue(f.contains("consumer.position(tp)"), "(c) the ACTUAL position");
         assertTrue(f.contains("attempt < 3"), "(c) retried rather than swallowed");
         assertTrue(f.indexOf("if (!complete) return;") < f.indexOf("flushEsAuctionHellos()"), "(c) the hello waits for a COMPLETE handoff; an empty partition set satisfies it vacuously (round 13)");
@@ -513,25 +521,103 @@ class EsAuctionWiringTest {
         // Code review round 15: once a recreated topic has grown past the old cursor, `cursor <= end` looks
         // valid and the consumer seeks into the NEW log, skipping everything before it while hydration stays
         // non-broadcasting. Only the topic's Kafka UUID identifies the incarnation.
-        var s = service();
-        java.util.List<String> asked = new java.util.ArrayList<>();
-        org.apache.kafka.common.Uuid first = org.apache.kafka.common.Uuid.randomUuid();
-        s.esAuctionTopicIdReader = t -> { asked.add(t); return first; };
-        s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"));
-        s.markStateCaughtUpForTest();
         String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
-        int freeze = source.indexOf("void tryFreezeEsAuctionHandoff(");
-        String f = source.substring(freeze, freeze + 2600);
-        assertTrue(f.indexOf("esAuctionTopicIdReader.apply") < f.indexOf("esAuctionHandoffFrozen.set(true)"), "the id is recorded BEFORE the latch closes");
-        assertTrue(f.contains("if (id == null)") && f.indexOf("if (id == null)") < f.indexOf("flushEsAuctionHellos()"), "an unreadable id holds the hello");
-        int seek = source.indexOf("private boolean seekEsAuctionWithinAt(");
-        String w = source.substring(seek, seek + 1800);
+        String f = methodBody(source, "void tryFreezeEsAuctionHandoff(");
+        assertTrue(f.indexOf("esAuctionTopicIdReader.apply") < f.indexOf("consumer.position(tp)"),
+                "the incarnation is named BEFORE any position is captured (round 16)");
+        assertTrue(f.indexOf("if (id == null)") < f.indexOf("consumer.position(tp)"), "an unreadable id captures nothing and holds the hello");
+        String w = methodBody(source, "private boolean seekEsAuctionWithinAt(");
         assertTrue(w.indexOf("esAuctionTopicIdReader.apply(owned.topic())") < w.indexOf("beginningOffsets"), "identity is checked BEFORE any offset reasoning");
         assertTrue(w.contains("esAuctionForgetIncarnation("), "a different id drops every cursor and reopens the latch");
-        int forget = source.indexOf("private void esAuctionForgetIncarnation(");
-        String g = source.substring(forget, forget + 700);
+        String g = methodBody(source, "void esAuctionForgetIncarnation(");
         assertTrue(g.contains("esAuctionNextOffset.clear()") && g.contains("esAuctionHandoffOffset.clear()")
-                && g.contains("esAuctionTopicId = null") && g.contains("esAuctionHandoffFrozen.set(false)"), "nothing from the old incarnation survives");
+                && g.contains("esAuctionTopicId = null") && g.contains("esAuctionHandoffFrozen.set(false)")
+                && g.contains("esAuctionMinutes.clear()") && g.contains("esAuctionEmitted.clear()")
+                && g.contains("esAuctionRehydrate.set(true)"), "nothing from the old incarnation survives");
+    }
+
+    // ---- round 16: the incarnation binds the capture, and a recreation drops the view ----
+
+    private static org.apache.kafka.clients.consumer.MockConsumer<String, Object> mockAuctionConsumer(long beginning, long end) {
+        var c = new org.apache.kafka.clients.consumer.MockConsumer<String, Object>("earliest");
+        var tp = new TopicPartition("es.futures.auction", 0);
+        c.assign(List.of(tp));
+        c.updateBeginningOffsets(Map.of(tp, beginning));
+        c.updateEndOffsets(Map.of(tp, end));
+        c.seek(tp, beginning);
+        return c;
+    }
+
+    /** A position is meaningless without knowing which LOG it is a position ON. Captured while the id was
+     *  unreadable, it used to survive and be adopted by whatever id was read later — binding the OLD
+     *  incarnation's offsets to the new one. Nothing is captured until the incarnation can be named. */
+    @Test void noHandoffIsCapturedWhileTheIncarnationCannotBeNamed() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 0L);
+        s.esAuctionTopicIdReader = t -> null;
+        s.markStateCaughtUpWithoutHandoffForTest();
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertEquals(0, s.esAuctionHandoffCountForTest(), "an unnameable incarnation captures nothing");
+        assertFalse(s.esAuctionHelloReady(), "and the hello stays held");
+        org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
+        s.esAuctionTopicIdReader = t -> id;
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertEquals(1, s.esAuctionHandoffCountForTest(), "once the id reads, the handoff is captured under it");
+        assertTrue(s.esAuctionHelloReady());
+    }
+
+    /** A capture that straddled a recreation belongs to neither log: the id is confirmed unchanged after it. */
+    @Test void aCaptureThatStraddlesARecreationIsDiscarded() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 0L);
+        var ids = new java.util.ArrayDeque<>(List.of(org.apache.kafka.common.Uuid.randomUuid(), org.apache.kafka.common.Uuid.randomUuid()));
+        s.esAuctionTopicIdReader = t -> ids.poll();
+        s.markStateCaughtUpWithoutHandoffForTest();
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertFalse(s.esAuctionHelloReady(), "the id changed between the read before and the read after");
+        assertEquals(0, s.esAuctionHandoffCountForTest(), "and the straddling capture is not kept");
+    }
+
+    /** The view and the emission ledger belong to the old log too: kept, backfill would serve the old rows as
+     *  this incarnation's, and a key the new log reuses at the same revision would be suppressed for ever. */
+    @Test void aRecreationDropsTheViewAndTheEmissionLedger() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        assertTrue(s.upsertEsAuctionMinuteOutcome(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"), true),
+                "the first live copy of a minute goes on the wire");
+        assertFalse(s.upsertEsAuctionMinuteOutcome(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"), true),
+                "the ledger suppresses a re-broadcast within one incarnation");
+        s.markStateCaughtUpForTest();
+        s.esAuctionForgetIncarnation("the topic was recreated");
+        assertEquals(0, s.esAuctionMinutesCached(), "no row of the old log survives in the view");
+        assertFalse(s.esAuctionHelloReady(), "and the hello is held again");
+        assertTrue(s.upsertEsAuctionMinuteOutcome(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"), true),
+                "the same key at the same revision on the NEW log must reach a socket");
+    }
+
+    /** After the drop the whole RETAINED log of the new incarnation is re-read before any hello promises it. */
+    @Test void theHelloWaitsForTheNewIncarnationsRetainedLogToBeReRead() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 3L);
+        org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
+        s.esAuctionTopicIdReader = t -> id;
+        s.markStateCaughtUpForTest();
+        s.esAuctionForgetIncarnation("the topic was recreated");
+        consumer.seek(tp, 2L);                       // wherever the cache consumer happened to be
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertEquals(0L, consumer.position(tp), "the re-seek takes the cache back to the beginning of the new log");
+        assertFalse(s.esAuctionHelloReady(), "and the hello waits while the log is re-read");
+        for (long o = 0; o < 3; o++) consumer.addRecord(new org.apache.kafka.clients.consumer.ConsumerRecord<>(tp.topic(), tp.partition(), o, key("2026-09-08", "09:3" + o), (Object) minute("2026-09-08", "09:3" + o, 0, "r" + o)));
+        consumer.poll(java.time.Duration.ZERO);
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertTrue(s.esAuctionHelloReady(), "once the retained log has been re-read the hello is released");
+        assertEquals(1, s.esAuctionHandoffCountForTest());
     }
 
     @Test void foreignShapesNeverPoisonTheView() {
