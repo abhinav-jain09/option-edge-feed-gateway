@@ -672,6 +672,10 @@ public class FeedGatewayService implements ReplayRunner {
     private static final long ES_AUCTION_ID_CHECK_MS = 30_000L;
     private volatile long esAuctionLastIdCheckMs;
     private final java.util.concurrent.atomic.AtomicLong esAuctionGeneration = new java.util.concurrent.atomic.AtomicLong();
+    /** The incarnation each LIVE partition was positioned under. A record from a batch polled before an
+     *  invalidation must not write a cursor, be applied to the fresh view, or keep the partition consuming
+     *  the old log — and the record itself carries no generation, so the partition's does (round 22). */
+    private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionCursorGeneration = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -3029,6 +3033,7 @@ public class FeedGatewayService implements ReplayRunner {
             liveBootstrapSeek(consumer, partitions, topicEvents, retry);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             while (running.get()) {
+                pauseEsAuctionOnIncarnationChange(consumer, partitions);
                 resumeEsAuctionOnceHandoffExists(consumer, partitions);
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
@@ -3216,8 +3221,12 @@ public class FeedGatewayService implements ReplayRunner {
                         // then the VERBATIM standalone broadcast (raw pass-through, never
                         // selection-gated). Clients apply the same latest-correctionRev-per-minute
                         // rule, so at-least-once delivery is invisible downstream.
-                        onEsAuctionRecord(record.key() == null ? null : String.valueOf(record.key()), json);
-                        noteCvdSpxLevelsProgress(binding, record);   // the cursor a retry resumes from
+                        // A record of a superseded incarnation is dropped whole: applying it would put an
+                        // old log's minute into the fresh view and put it on the wire (round 22).
+                        if (esAuctionRecordIsCurrent(record)) {
+                            onEsAuctionRecord(record.key() == null ? null : String.valueOf(record.key()), json);
+                            noteCvdSpxLevelsProgress(binding, record);   // the cursor a retry resumes from
+                        }
                         continue;
                     }
                     if ("es-aggressor-flow".equals(binding.event())) {
@@ -10752,13 +10761,53 @@ public class FeedGatewayService implements ReplayRunner {
         seekCvdSpxLevelsWithin(consumer, owned, handoff, null);
     }
 
+    /** Whether this live record belongs to the incarnation its partition is currently positioned on. */
+    private boolean esAuctionRecordIsCurrent(ConsumerRecord<String, ?> record) {
+        TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+        synchronized (esAuctionIncarnationLock) {
+            Long positionedUnder = esAuctionCursorGeneration.get(tp);
+            return positionedUnder != null && positionedUnder == esAuctionGeneration.get();
+        }
+    }
+
+    /**
+     * Stops consuming any auction partition whose incarnation is gone. The invalidation runs on the CACHE
+     * thread and only ever cleared cursors; an ACTIVE live partition kept polling the old numeric position
+     * — or reset to `latest` — straight through the recreation, because the resume path only ever looked at
+     * partitions that were ALREADY paused (code review round 22). Pausing here is what makes the rest of the
+     * live path converge: `resumeEsAuctionOnceHandoffExists` repositions it once a fresh handoff exists.
+     */
+    private void pauseEsAuctionOnIncarnationChange(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        java.util.Set<TopicPartition> paused = consumer.paused();
+        List<TopicPartition> drop = new java.util.ArrayList<>();
+        synchronized (esAuctionIncarnationLock) {
+            long generation = esAuctionGeneration.get();
+            for (TopicPartition tp : partitions) {
+                if (!tp.topic().equals(topic) || paused.contains(tp)) continue;
+                Long positionedUnder = esAuctionCursorGeneration.get(tp);
+                if (positionedUnder == null || positionedUnder != generation) { drop.add(tp); esAuctionCursorGeneration.remove(tp); esAuctionNextOffset.remove(tp); }
+            }
+            if (!drop.isEmpty()) consumer.pause(drop);
+        }
+        if (!drop.isEmpty()) System.out.println("es-auction: " + drop + " paused — the incarnation they were reading is gone; waiting for a fresh handoff");
+    }
+
     /** Remember where this partition got to, so a retry resumes rather than replays. */
     private void noteCvdSpxLevelsProgress(TopicBinding binding, ConsumerRecord<String, ?> record) {
         if (binding != null && "es-cvd-spx-levels".equals(binding.event())) {
             cvdSpxLevelsNextOffset.set(record.offset() + 1);
         }
         if (binding != null && "es-auction".equals(binding.event())) {
-            esAuctionNextOffset.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
+            TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+            /* Only while this partition is still reading the incarnation it was positioned under. A record
+               from a batch polled before an invalidation would otherwise repopulate the cleared map with an
+               offset from the OLD log, and that cursor then outranks the fresh handoff (round 22). */
+            synchronized (esAuctionIncarnationLock) {
+                Long positionedUnder = esAuctionCursorGeneration.get(tp);
+                if (positionedUnder != null && positionedUnder == esAuctionGeneration.get()) esAuctionNextOffset.put(tp, record.offset() + 1);
+            }
         }
     }
 
@@ -10863,6 +10912,7 @@ public class FeedGatewayService implements ReplayRunner {
         synchronized (esAuctionIncarnationLock) {
             if (esAuctionGeneration.get() != generation) return false;
             try { consumer.seek(owned, target); } catch (RuntimeException seekFailed) { return false; }
+            esAuctionCursorGeneration.put(owned, generation);   // what this partition is now reading
             if (resumeAfterSeek) consumer.resume(one);
             return true;
         }
@@ -13303,6 +13353,7 @@ public class FeedGatewayService implements ReplayRunner {
         synchronized (esAuctionIncarnationLock) {
         esAuctionGeneration.incrementAndGet();
         esAuctionNextOffset.clear();
+        esAuctionCursorGeneration.clear();
         esAuctionHandoffOffset.clear();
         esAuctionTopicId = null;
         esAuctionHandoffFrozen.set(false);

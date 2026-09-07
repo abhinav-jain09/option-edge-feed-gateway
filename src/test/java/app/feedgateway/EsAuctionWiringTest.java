@@ -483,11 +483,12 @@ class EsAuctionWiringTest {
         //  (c) the hello is released only when EVERY auction partition has a handoff, so a failed position
         //      read holds the hello instead of leaving a partition to fall back to END.
         String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
-        int note = source.indexOf("private void noteCvdSpxLevelsProgress(");
-        assertTrue(source.substring(note, note + 700).contains("esAuctionNextOffset.put("), "(a) the live path records a per-partition cursor");
+        assertTrue(methodBody(source, "private void noteCvdSpxLevelsProgress(").contains("esAuctionNextOffset.put("), "(a) the live path records a per-partition cursor");
         int liveBranch = source.indexOf("if (\"es-auction\".equals(binding.event())) {");
-        String branch = source.substring(liveBranch, liveBranch + 900);
+        String branch = source.substring(liveBranch, liveBranch + 1600);
         assertTrue(branch.indexOf("noteCvdSpxLevelsProgress(binding, record)") < branch.indexOf("continue;"), "(a) recorded BEFORE the branch continues");
+        assertTrue(branch.indexOf("esAuctionRecordIsCurrent(record)") < branch.indexOf("onEsAuctionRecord("),
+                "(a) and only for a record of the incarnation this partition is reading (round 22)");
 
         int liveOnce = source.indexOf("private void runLiveConsumerOnce(");
         String live = source.substring(liveOnce, liveOnce + 2000);
