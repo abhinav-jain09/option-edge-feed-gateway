@@ -464,10 +464,17 @@ class CvdSpxLevelsWiringTest {
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         assertTrue(source.contains("cvdSpxLevelsHandoffOffset.set(end)"),
                 "hydration records the offset it read to");
+        // The live consumer's bootstrap seek now lives in the liveBootstrapSeek seam (ES Footprint
+        // Gate 2, CODE round-1 #1), CALLED before the first poll — the guarantee is unchanged, so the
+        // pin follows the code: the call precedes any poll, and the handoff seek is inside the seam.
         int live = source.indexOf("private void runLiveConsumerOnce(");
-        int seek = source.indexOf("seekCvdSpxLevelsToHandoff(consumer, partitions)", live);
+        int seam = source.indexOf("liveBootstrapSeek(consumer, partitions, topicEvents, retry);", live);
         int poll = source.indexOf("consumer.poll(", live);
-        assertTrue(seek > live && seek < poll, "and the live consumer starts there, before its first poll");
+        assertTrue(seam > live && seam < poll, "the bootstrap seek runs before the live consumer's first poll");
+        int body = source.indexOf("void liveBootstrapSeek(");
+        String seekBody = source.substring(body, source.indexOf("\n    }", body));
+        assertTrue(seekBody.contains("seekCvdSpxLevelsToHandoff(consumer, partitions)"),
+                "and the live consumer starts at the hydration handoff offset");
         assertTrue(source.contains("cvdSpxLevelsHandoffOffset.getAndSet(-1L)"),
                 "consumed ONCE, so a reconnect cannot rewind past a live tombstone");
     }
@@ -576,11 +583,17 @@ class CvdSpxLevelsWiringTest {
         // baselineReset would be re-applied as a fresh operator wipe, and older post-reset records
         // would be accepted and broadcast on the way back to now.
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        // Same relocation as above: the retry branch is inside liveBootstrapSeek, which
+        // runLiveConsumerOnce calls before its first poll. Both halves of the ordering are pinned.
         int live = source.indexOf("private void runLiveConsumerOnce(");
-        int retry = source.indexOf("seekToCacheWindow(consumer, partitions, topicEvents);", live);
-        int resume = source.indexOf("resumeCvdSpxLevels(consumer, partitions);", live);
+        int seam = source.indexOf("liveBootstrapSeek(consumer, partitions, topicEvents, retry);", live);
         int poll = source.indexOf("consumer.poll(", live);
-        assertTrue(retry > 0 && resume > retry && resume < poll,
+        assertTrue(seam > live && seam < poll, "the bootstrap seek runs before any poll");
+        int seekAt = source.indexOf("void liveBootstrapSeek(");
+        String seekBody = source.substring(seekAt, source.indexOf("\n    }", seekAt));
+        int retry = seekBody.indexOf("seekToCacheWindow(consumer, partitions, topicEvents);");
+        int resume = seekBody.indexOf("resumeCvdSpxLevels(consumer, partitions);");
+        assertTrue(retry >= 0 && resume > retry,
                 "the levels partition is re-seeked AFTER the generic window seek, before any poll");
 
         int helper = source.indexOf("private void resumeCvdSpxLevels");

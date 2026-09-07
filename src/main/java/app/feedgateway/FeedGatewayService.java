@@ -708,7 +708,8 @@ public class FeedGatewayService implements ReplayRunner {
     private record CachedEvent(String event, String json) {
     }
 
-    private record TopicBinding(String source, String event) {
+    /** Package-private so the acceptance tests can drive the production consumer seams. */
+    record TopicBinding(String source, String event) {
     }
 
     private record RecordPosition(TopicPartition partition, long offset) {
@@ -853,6 +854,45 @@ public class FeedGatewayService implements ReplayRunner {
             footprintCounter("drops_total{event=\"" + event + "\",consumer=\"" + consumer + "\",reason=\"" + a.reason().name().toLowerCase() + "\"}").incrementAndGet();
         }
         return a.reason() != FootprintViews.Reason.OVERSIZE;
+    }
+
+    /**
+     * The bootstrap resolution + assignment BOTH state consumers use (G-R8a): partitions of a footprint
+     * topic that has not validated are withheld, so they are never assigned, sought or polled — exactly
+     * like a topic that does not exist yet. Package-private: the seam the acceptance tests execute.
+     */
+    List<TopicPartition> bootstrapAssign(String name, KafkaConsumer<?, ?> consumer, Map<String, TopicBinding> topicEvents) {
+        List<TopicPartition> partitions = footprintAdmitted(partitionsFor(name, consumer, topicEvents.keySet()));
+        consumer.assign(partitions);
+        return partitions;
+    }
+
+    /**
+     * The LIVE consumer's bootstrap seek, in one place so its ordering is executable: on a RETRY the
+     * shared cache window, then the levels resume, then footprint partitions forced to END (G-R8a: the
+     * cache consumer alone replays the footprint session); on a first attempt everything starts at END.
+     */
+    void liveBootstrapSeek(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions,
+                           Map<String, TopicBinding> topicEvents, boolean retry) {
+        if (retry) {
+            seekToCacheWindow(consumer, partitions, topicEvents);
+            resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
+            seekFootprintToEnd(consumer, partitions);          // G-R8a (CODE round-1 #1)
+        } else {
+            consumer.seekToEnd(partitions);
+            seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
+        }
+    }
+
+    /** The LIVE consumer's adoption seek: the existing per-event rule, then footprint partitions to END. */
+    void liveAdoptionSeek(KafkaConsumer<?, ?> consumer, Refresh refresh, Map<String, TopicBinding> topicEvents) {
+        seekAddedLivePartitions(consumer, refresh, topicEvents);
+        seekFootprintToEnd(consumer, refresh.added());
+    }
+
+    /** Test seam: a Refresh describing partitions adopted on newly appeared topics. */
+    Refresh refreshForTest(List<TopicPartition> merged, List<TopicPartition> added, List<TopicPartition> previouslyAssigned) {
+        return Refresh.grown(merged, added, previouslyAssigned);
     }
 
     /**
@@ -2485,8 +2525,7 @@ public class FeedGatewayService implements ReplayRunner {
         // are obsolete, and a dead attempt's entry could never be retired (retirement needs this consumer's
         // position()), which would withhold readiness for that source forever.
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
-            List<TopicPartition> partitions = footprintAdmitted(partitionsFor(name, consumer, topicEvents.keySet()));
-            consumer.assign(partitions);
+            List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
             seekToCacheWindow(consumer, partitions, topicEvents);
             // Bootstrap gets the BOOTSTRAP budget: a broker that answers in 10s is slow, not broken, and
             // must bootstrap rather than crash-loop. The 2s refresh budget applies only inside the poll
@@ -2878,24 +2917,15 @@ public class FeedGatewayService implements ReplayRunner {
             boolean retry
     ) {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
-            List<TopicPartition> partitions = footprintAdmitted(partitionsFor(name, consumer, topicEvents.keySet()));
-            consumer.assign(partitions);
-            if (retry) {
-                seekToCacheWindow(consumer, partitions, topicEvents);
-                resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
-                seekFootprintToEnd(consumer, partitions);          // G-R8a: the LIVE consumer never replays footprint history (round-1 #1)
-            } else {
-                consumer.seekToEnd(partitions);
-                seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
-            }
+            List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
+            liveBootstrapSeek(consumer, partitions, topicEvents, retry);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
-                    seekAddedLivePartitions(consumer, refresh, topicEvents);
-                    seekFootprintToEnd(consumer, refresh.added());  // a late-admitted footprint topic starts at END on the live consumer
+                    liveAdoptionSeek(consumer, refresh, topicEvents);
                 }
                 // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
                 // is only read by dumpDiagnosticState() to distinguish "consumers polling" from "forward gate stuck".
@@ -3951,7 +3981,7 @@ public class FeedGatewayService implements ReplayRunner {
      * @param partitions the assignment now in effect — the caller MUST adopt it before seeking, so a seek
      *                   failure cannot leave the caller tracking a stale list.
      */
-    private record Refresh(
+    record Refresh(
             List<TopicPartition> partitions,
             List<TopicPartition> added,
             List<TopicPartition> addedOnGrownTopics,

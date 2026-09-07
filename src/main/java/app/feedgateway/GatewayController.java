@@ -39,7 +39,8 @@ public class GatewayController {
 
     /** G-R7: both routes clamp the page to [1, 100]. */
     static final int FOOTPRINT_LIMIT_MAX = 100;
-    private static final int FOOTPRINT_WRITE_BUFFER = 64 * 1024;
+    /** G-R7/G-R8: the ONLY buffer between the page bytes and the socket; VERIFIED, not assumed (CODE round-1 #5). */
+    static final int FOOTPRINT_WRITE_BUFFER = 64 * 1024;
 
     /**
      * {@code GET /api/footprint/bars?tf&toMs&afterMs=-1&limit=100&sessionDate=} — processing order
@@ -136,16 +137,29 @@ public class GatewayController {
 
     /**
      * G-R7 step (7): {@code {"sessionDate":..,["sessionMismatch":true,]"<field>":[..],"nextCursor":..}}
-     * streamed straight into the servlet response stream, whose ONLY buffer is the container's
-     * response buffer, set here to {@link #FOOTPRINT_WRITE_BUFFER} (64 KiB) before the first byte —
-     * no page-side buffer exists (round-1 #5). Each record is written as its own ASCII byte array
-     * (F-E8 alphabet), so transient memory per request is ≤ one record + the 64 KiB response buffer.
+     * streamed straight into the servlet response stream. There is NO page-side buffer; the only
+     * buffer between these bytes and the socket is the container's response buffer, which this method
+     * REQUESTS at {@link #FOOTPRINT_WRITE_BUFFER} (64 KiB) and then VERIFIES with
+     * {@code getBufferSize()} — a container that reports more refuses the page with 503 rather than
+     * streaming behind an unbounded buffer, so the transient bound (≤ one record + 64 KiB) is enforced
+     * rather than assumed (CODE round-1 #5). Each record is written as its own ASCII byte array (F-E8
+     * alphabet), so no copy of the page as a whole ever exists.
      */
     private static void writePage(jakarta.servlet.http.HttpServletResponse response, String sessionDate, boolean mismatch,
                                   String field, java.util.List<String> records, String cursorJson) throws java.io.IOException {
+        try { response.setBufferSize(FOOTPRINT_WRITE_BUFFER); } catch (IllegalStateException alreadyCommitted) { /* verified below */ }
+        int buffer = response.getBufferSize();
+        if (buffer > FOOTPRINT_WRITE_BUFFER) {
+            response.setStatus(503);
+            response.setHeader("Retry-After", "5");
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.getOutputStream().write(("{\"error\":\"response buffer " + buffer + " exceeds " + FOOTPRINT_WRITE_BUFFER + "\"}")
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            response.flushBuffer();
+            return;
+        }
         response.setStatus(200);
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
-        try { response.setBufferSize(FOOTPRINT_WRITE_BUFFER); } catch (IllegalStateException alreadyCommitted) { /* keep the container's */ }
         java.io.OutputStream out = response.getOutputStream();
         StringBuilder head = new StringBuilder("{\"sessionDate\":");
         head.append(sessionDate == null ? "null" : "\"" + sessionDate + "\"");

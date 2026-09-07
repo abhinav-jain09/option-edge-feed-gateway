@@ -61,7 +61,10 @@ class FootprintWiringTest {
         int added = src.indexOf("List<TopicPartition> added = addedPartitions(assigned, admitted);", apply);
         int assign = src.indexOf("consumer.assign(merged);", apply);
         assertTrue(apply > 0 && filter > apply && added > filter && assign > added, "gate → added() → merge/assign, in that order inside apply()");
-        assertEquals(2, occurrences(src, "footprintAdmitted(partitionsFor(name, consumer, topicEvents.keySet()))"), "bootstrap resolution filtered at both state sites");
+        assertEquals(2, occurrences(src, "bootstrapAssign(name, consumer, topicEvents)"), "both state consumers bootstrap through the ONE filtered assign seam");
+        int seam = src.indexOf("List<TopicPartition> bootstrapAssign(String name, KafkaConsumer<?, ?> consumer, Map<String, TopicBinding> topicEvents) {");
+        String seamBody = src.substring(seam, src.indexOf("\n    }", seam));
+        assertTrue(seamBody.indexOf("footprintAdmitted(partitionsFor(") < seamBody.indexOf("consumer.assign(partitions);"), "filtered BEFORE the assign");
     }
 
     @Test void deliveryClassesAreWiredAsDesigned() throws Exception {

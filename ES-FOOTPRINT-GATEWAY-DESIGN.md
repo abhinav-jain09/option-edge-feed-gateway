@@ -12,9 +12,16 @@ Requirement doc per rule.md (doc → Codex review → code).
    the epoch domain, so the cursor is exclusive at the boundary (CODE round-1 #2).
 3. G-R8/G-R8a preflight runs BEFORE any lifecycle state moves in `start()` (no `running` flag, no
    executor), so a refusal leaves the process clean (CODE round-1 #3).
-4. G-R7 streaming: the page is written straight into the servlet response stream with the container's
-   response buffer set to 64 KiB; there is no second page-side buffer, so transient memory per request
-   is one record plus that buffer (CODE round-1 #5).
+4. G-R7 streaming: the page is written straight into the servlet response stream; there is no
+   page-side buffer, and the container's response buffer is REQUESTED at 64 KiB and then VERIFIED
+   with `getBufferSize()` — a container reporting more refuses the page with 503 instead of streaming
+   behind an unbounded buffer, so "≤ one record + 64 KiB per request" is enforced, not assumed (CODE
+   rounds 1–2 #5).
+5. The consumer orchestration the acceptance tests execute is the production code: `bootstrapAssign`
+   (the filtered resolve-and-assign both state consumers call), `liveBootstrapSeek` (the live
+   consumer's retry/first-attempt seek including the footprint END override) and `liveAdoptionSeek`
+   (per-event adoption seek plus the footprint END override). G-R11's seam tests drive these against
+   a mocked consumer rather than reading source text (CODE round-2 #4).
 
 **Gate-2 DESIGN: APPROVED** — Codex round 10, 2026-09-07 (`ES-FOOTPRINT-GATEWAY-CODEX-ROUND10.md`; rounds
 1–9 produced 7+3+2+2+3+3+3+2+1 findings, every one dispositioned in the change logs below). The code

@@ -89,13 +89,23 @@ class FootprintSeamTest {
         s.setRunningForTest(true);
         List<TopicPartition> resolved = List.of(tp("futures.cvd.bars"), tp("futures.footprint.bars"), tp("futures.footprint.outcomes"));
         assertEquals(List.of(tp("futures.cvd.bars")), s.footprintAdmitted(resolved), "bootstrap: both unvalidated footprint partitions withheld");
-        for (String name : new String[]{"state", "state-live"}) {                     // the two state flows share one gate
+        // The PRODUCTION bootstrap seam both state consumers call, executed once per flow.
+        Map<String, FeedGatewayService.TopicBinding> events = new HashMap<>();
+        events.put("futures.cvd.bars", new FeedGatewayService.TopicBinding("DATABENTO", "es-cvd-bar"));
+        events.put("futures.footprint.bars", new FeedGatewayService.TopicBinding("DATABENTO", "es-footprint-bar"));
+        events.put("futures.footprint.outcomes", new FeedGatewayService.TopicBinding("DATABENTO", "es-footprint-outcome"));
+        for (String name : new String[]{"state", "state-live"}) {
             KafkaConsumer<String, Object> consumer = consumerWith(List.of("futures.cvd.bars", "futures.footprint.bars", "futures.footprint.outcomes"));
+            List<TopicPartition> assigned = s.bootstrapAssign(name, consumer, events);
+            assertEquals(List.of(tp("futures.cvd.bars")), assigned, name + ": unvalidated footprint partitions never reach the assignment");
+            verify(consumer).assign(List.of(tp("futures.cvd.bars")));
             Object refresh = s.partitionRefreshForTest(name, TOPICS, s.footprintGate()::admit);
-            assertTrue(s.applyRefreshForTest(refresh, consumer, List.of(tp("futures.cvd.bars")))[1].isEmpty(), name);
+            assertTrue(s.applyRefreshForTest(refresh, consumer, assigned)[1].isEmpty(), name + ": nor the refresh's added()");
         }
         reader.valid("futures.footprint.bars").valid("futures.footprint.outcomes");
         assertEquals(resolved, s.footprintAdmitted(resolved));
+        KafkaConsumer<String, Object> after = consumerWith(List.of("futures.cvd.bars", "futures.footprint.bars", "futures.footprint.outcomes"));
+        assertEquals(3, s.bootstrapAssign("state", after, events).size(), "…and the production assign takes all three once valid");
     }
 
     // ---- round-1 #1: the live consumer never replays footprint history -------------------------------
@@ -113,14 +123,42 @@ class FootprintSeamTest {
         verify(untouched, org.mockito.Mockito.never()).seekToEnd(anyCollection());
     }
 
-    @Test void theLiveRetryPathAndTheAdoptionPathBothCallTheEndSeek() throws Exception {
-        String src = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
-        int live = src.indexOf("private void runLiveConsumerOnce(");
-        int retrySeek = src.indexOf("seekFootprintToEnd(consumer, partitions);", live);
-        int adoptSeek = src.indexOf("seekFootprintToEnd(consumer, refresh.added());", live);
-        int loop = src.indexOf("while (running.get())", live);
-        assertTrue(retrySeek > live && retrySeek < loop, "retry branch seeks footprint partitions to END after the cache-window seek");
-        assertTrue(adoptSeek > loop, "late adoption seeks the added footprint partitions to END");
+    @Test @SuppressWarnings("unchecked")
+    void theLiveBootstrapSeekLeavesFootprintPartitionsAtEndOnEveryRetry() {
+        // The PRODUCTION seam runLiveConsumerOnce calls, executed: a retry replays the cache window for
+        // the ordinary topics and then forces the footprint partitions to END.
+        FeedGatewayService s = FootprintWiringTest.on();
+        KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
+        when(consumer.offsetsForTimes(any(Map.class))).thenReturn(Collections.emptyMap());
+        Map<String, FeedGatewayService.TopicBinding> events = new HashMap<>();
+        events.put("futures.cvd.bars", new FeedGatewayService.TopicBinding("DATABENTO", "es-cvd-bar"));
+        events.put("futures.footprint.bars", new FeedGatewayService.TopicBinding("DATABENTO", "es-footprint-bar"));
+        events.put("futures.footprint", new FeedGatewayService.TopicBinding("DATABENTO", "es-footprint"));
+        List<TopicPartition> partitions = List.of(tp("futures.cvd.bars"), tp("futures.footprint.bars"), tp("futures.footprint"));
+        List<TopicPartition> footprint = List.of(tp("futures.footprint.bars"), tp("futures.footprint"));
+
+        s.liveBootstrapSeek(consumer, partitions, events, true);
+        verify(consumer).seekToEnd(footprint);                      // the LAST word on the footprint partitions is END
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(consumer);
+        order.verify(consumer).offsetsForTimes(any(Map.class));     // the cache-window seek ran first…
+        order.verify(consumer).seekToEnd(footprint);                // …and the footprint override after it
+
+        KafkaConsumer<String, Object> first = mock(KafkaConsumer.class);
+        s.liveBootstrapSeek(first, partitions, events, false);
+        verify(first).seekToEnd(partitions);                        // first attempt: everything at END anyway
+        verify(first, org.mockito.Mockito.never()).offsetsForTimes(any(Map.class));
+    }
+
+    @Test @SuppressWarnings("unchecked")
+    void aLateAdoptedFootprintPartitionStartsAtEndOnTheLiveConsumer() {
+        FeedGatewayService s = FootprintWiringTest.on();
+        KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
+        Map<String, FeedGatewayService.TopicBinding> events = new HashMap<>();
+        events.put("futures.footprint.outcomes", new FeedGatewayService.TopicBinding("DATABENTO", "es-footprint-outcome"));
+        List<TopicPartition> added = List.of(tp("futures.footprint.outcomes"));
+        s.liveAdoptionSeek(consumer, s.refreshForTest(added, added, List.of()), events);
+        verify(consumer, org.mockito.Mockito.atLeastOnce()).seekToEnd(added);
+        verify(consumer, org.mockito.Mockito.never()).seekToBeginning(anyCollection());
     }
 
     // ---- G-R3/D5: real socket fan-out through the live branch -----------------------------------------
