@@ -2658,8 +2658,11 @@ public class FeedGatewayService implements ReplayRunner {
             for (TopicPartition p : recoverEsAuction) {
                 Long cursor = esAuctionNextOffset.get(p);
                 if (cursor == null) cursor = esAuctionHandoffOffset.get(p);
+                // Seeding from the retained beginning would REPLAY that history onto the wire, since
+                // hydration marks nothing as emitted. With no cursor the partition is paused, exactly as at
+                // cold start, and positioned when its handoff appears (code review round 12).
                 if (cursor != null) seekEsAuctionWithinAt(consumer, p, cursor);
-                else consumer.seekToBeginning(List.of(p));   // newly appeared: take what the topic still retains
+                else consumer.pause(List.of(p));
             }
         }
         if (!recoverDisplayWindow.isEmpty()) {
@@ -12805,7 +12808,14 @@ public class FeedGatewayService implements ReplayRunner {
      * <p>Called from the cache consumer's own thread, which is the only thread that may touch its consumer.
      */
     void tryFreezeEsAuctionHandoff(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions) {
-        if (!settings.esAuctionEnabled() || esAuctionHandoffFrozen.get() || !stateCaughtUp.get()) return;
+        if (!settings.esAuctionEnabled() || !stateCaughtUp.get()) return;
+        // The latch is not permanent: an auction partition ADDED after the freeze has no handoff, so
+        // readiness no longer covers every current partition. Reopen it and hold new sockets until the
+        // added partition has been captured too (code review round 12).
+        for (TopicPartition tp : partitions) {
+            if (tp.topic().equals(settings.esAuctionTopic()) && !esAuctionHandoffOffset.containsKey(tp)) { esAuctionHandoffFrozen.set(false); break; }
+        }
+        if (esAuctionHandoffFrozen.get()) return;
         String topic = settings.esAuctionTopic();
         boolean complete = true, sawPartition = false;
         for (TopicPartition tp : partitions) {
@@ -12820,7 +12830,8 @@ public class FeedGatewayService implements ReplayRunner {
             esAuctionHandoffOffset.putIfAbsent(tp, at);
         }
         if (!complete || !sawPartition) return;
-        if (esAuctionHandoffFrozen.compareAndSet(false, true)) flushEsAuctionHellos();
+        esAuctionHandoffFrozen.set(true);
+        flushEsAuctionHellos();
     }
 
     /** Sends the auction hello to every socket that connected before the view had hydrated. */
