@@ -125,6 +125,64 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <executions>
+                    <!--
+                      GatewayContextSmokeTest refreshes the REAL Spring context, so its JVM must not
+                      inherit configuration that would let the container reach outside the build. It
+                      gets its OWN forked run with the flags pinned as ENVIRONMENT variables, because
+                      GatewaySettings.value() gives System.getenv() precedence over
+                      System.getProperty() — a system property could not override an inherited
+                      KAFKA_ENABLED=true on a developer shell or CI agent, and the smoke test would
+                      then open real consumers against the configured broker.
+
+                      The pin is scoped to this one execution, NOT the whole suite: KAFKA_ENABLED
+                      also decides whether FeedGatewayService.start() returns before its footprint
+                      preflight, so pinning it globally silently defeats FootprintSeamTest's
+                      "an existing invalid topic refuses start-up" case. Every other test keeps the
+                      default environment it was written against.
+
+                      GatewayContextSmokeTest asserts both values in @BeforeAll, before the Spring
+                      extension builds the context, so removing this execution fails the test rather
+                      than quietly connecting to a broker.
+                    -->
+                    <execution>
+                        <id>default-test</id>
+                        <goals><goal>test</goal></goals>
+                        <configuration>
+                            <excludes>
+                                <exclude>**/GatewayContextSmokeTest.java</exclude>
+                            </excludes>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>context-smoke</id>
+                        <phase>test</phase>
+                        <goals><goal>test</goal></goals>
+                        <configuration>
+                            <includes>
+                                <include>**/GatewayContextSmokeTest.java</include>
+                            </includes>
+                            <!--
+                              Explicit, so `-DforkCount=0` cannot reach it: environmentVariables are
+                              applied to the FORKED process, and with forking off the execution would
+                              run inside Maven's own JVM and inherit Maven's environment. POM
+                              configuration beats the forkCount user property. (Even then the
+                              @BeforeAll assertion stops the class before the context is built — this
+                              keeps a legitimate `-DforkCount=0` diagnostic run from going red for a
+                              reason that has nothing to do with the code under test.)
+                            -->
+                            <forkCount>1</forkCount>
+                            <environmentVariables>
+                                <KAFKA_ENABLED>false</KAFKA_ENABLED>
+                                <GATEWAY_AUTH_ENABLED>false</GATEWAY_AUTH_ENABLED>
+                            </environmentVariables>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 </project>

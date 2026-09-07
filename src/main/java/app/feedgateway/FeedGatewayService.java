@@ -18,6 +18,7 @@ import app.feedgateway.mtsession.gateway.GatewayRecordMapper;
 import app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor;
 import java.util.Optional;
 import java.util.OptionalDouble;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.lang.Nullable;
 import com.optionsedge.contracts.hpsf.HpsfAuditEvent;
 import com.optionsedge.contracts.hpsf.HpsfExitIntentEvent;
@@ -748,6 +749,11 @@ public class FeedGatewayService implements ReplayRunner {
         void run(boolean retry) throws RuntimeException;
     }
 
+    // EXPLICIT: the test seam below is a second constructor, and two constructors with neither
+    // annotated leave Spring nothing to choose from — it falls back to the no-arg default, which
+    // does not exist, and the whole gateway fails to start (not just the footprint relay). The
+    // annotation names the production constructor so adding another seam can never repeat this.
+    @Autowired
     public FeedGatewayService(GatewaySettings settings, ObjectMapper mapper, HpsfGatewayViewMapper hpsfViewMapper,
                               @Nullable SessionRoutingEngine routingEngine) {
         this.settings = settings;

@@ -16,6 +16,10 @@ public class GatewayController {
     /** ES Footprint (G-R7): explicit in-handler authentication, the LiquidityHistoryController convention (a function seam over the final auth bean). */
     private final java.util.function.Function<String, app.feedgateway.liquidityhistory.LiquidityHistoryAuth.Result> footprintAuth;
 
+    // EXPLICIT: the test seam below is a second constructor, and two constructors with neither
+    // annotated leave Spring nothing to choose from — it falls back to a no-arg default that does
+    // not exist, and the context never refreshes. Named so another seam cannot repeat it.
+    @org.springframework.beans.factory.annotation.Autowired
     public GatewayController(FeedGatewayService service,
                              org.springframework.beans.factory.ObjectProvider<
                                      app.feedgateway.liquidityhistory.LiquidityHistoryStore> historyStore,
