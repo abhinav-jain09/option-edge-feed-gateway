@@ -9763,11 +9763,21 @@ public class FeedGatewayService implements ReplayRunner {
      * the view and the wire can never disagree on what "latest" means.
      */
     void onEsAuctionRecord(String key, String json) {
-        upsertEsAuctionMinute(key, json);
-        broadcast("es-auction", json);
-        forwardedEvents.incrementAndGet();
         esAuctionRecords.incrementAndGet();
+        // IDEMPOTENT wire: only a record the view accepted as NEW or as a NEWER correction reaches
+        // the clients. A consumer retry re-seeks the topic (the same seek-back the restart
+        // hydration uses) and replays sessions of minutes the pages already hold; without this
+        // rule every such replay duplicated them on every socket. A superseded correction and a
+        // dead-session record are likewise never broadcast (code review round 1).
+        EsAuctionUpsert outcome = upsertEsAuctionMinuteOutcome(key, json);
+        if (outcome == EsAuctionUpsert.NEW || outcome == EsAuctionUpsert.REPLACED) {
+            broadcast("es-auction", json);
+            forwardedEvents.incrementAndGet();
+        }
     }
+
+    /** What the keyed upsert did with a record; only NEW and REPLACED reach the wire. */
+    enum EsAuctionUpsert { NEW, REPLACED, DUPLICATE, DROPPED }
 
     /**
      * Cache-consumer (restart hydration) handler for one es-auction Kafka record: the SAME keyed
@@ -9791,17 +9801,22 @@ public class FeedGatewayService implements ReplayRunner {
      * @return true when the record now sits in the view
      */
     boolean upsertEsAuctionMinute(String key, String json) {
+        EsAuctionUpsert o = upsertEsAuctionMinuteOutcome(key, json);
+        return o == EsAuctionUpsert.NEW || o == EsAuctionUpsert.REPLACED || o == EsAuctionUpsert.DUPLICATE;
+    }
+
+    EsAuctionUpsert upsertEsAuctionMinuteOutcome(String key, String json) {
         String tradeDate = null;
         String minute = null;
         long rev = 0L;
         try {
             JsonNode root = mapper.readTree(json);
-            if (root == null || !root.isObject()) return false;
+            if (root == null || !root.isObject()) return EsAuctionUpsert.DROPPED;
             tradeDate = text(root, "tradeDate");
             minute = text(root, "minute");
             rev = longField(root, "correctionRev", 0L);
         } catch (JsonProcessingException e) {
-            return false;
+            return EsAuctionUpsert.DROPPED;
         }
         if (key != null) {
             // The Kafka key is the contract's identity; the payload fields are only a fallback
@@ -9812,27 +9827,44 @@ public class FeedGatewayService implements ReplayRunner {
                 minute = key.substring(sep + 1).trim();
             }
         }
-        if (tradeDate == null || tradeDate.isEmpty() || minute == null || minute.isEmpty()) return false;
+        if (tradeDate == null || tradeDate.isEmpty() || minute == null || minute.isEmpty()) return EsAuctionUpsert.DROPPED;
         String viewKey = tradeDate + "|" + minute;
         synchronized (esAuctionMinutes) {
-            String current = esAuctionTradeDate;
-            if (current == null) {
-                esAuctionTradeDate = tradeDate;
-            } else if (tradeDate.compareTo(current) > 0) {
-                // MONOTONIC rollover: keep the date we roll from, drop anything older than it.
-                esAuctionPrevTradeDate = current;
-                esAuctionTradeDate = tradeDate;
-                esAuctionMinutes.headMap(current + "|", false).clear();
-            } else if (tradeDate.compareTo(current) < 0 && !tradeDate.equals(esAuctionPrevTradeDate)) {
-                return false;                                  // dead-session record: dropped
+            // ORDER-INDEPENDENT retention: the view holds the two GREATEST trade dates it has seen,
+            // whatever order they arrived in (a restart's replay is not sorted across partitions,
+            // and live ingestion can race the hydration). A record older than the second-greatest
+            // retained date is a dead-session record and is dropped, never resurrected.
+            String prev = esAuctionPrevTradeDate;
+            if (prev != null && tradeDate.compareTo(prev) < 0) {
+                return EsAuctionUpsert.DROPPED;
             }
             String existing = esAuctionMinutes.get(viewKey);
-            if (existing != null && esAuctionCorrectionRev(existing) > rev) {
-                return false;                                  // superseded correction: dropped
+            if (existing != null) {
+                long existingRev = esAuctionCorrectionRev(existing);
+                if (existingRev > rev) return EsAuctionUpsert.DROPPED;          // superseded correction
+                if (existingRev == rev && existing.equals(json)) return EsAuctionUpsert.DUPLICATE;   // a re-emission: the view is unchanged, nothing new for the wire
             }
             esAuctionMinutes.put(viewKey, json);
-            return true;
+            esAuctionRecomputeRetentionLocked();
+            return existing == null ? EsAuctionUpsert.NEW : EsAuctionUpsert.REPLACED;
         }
+    }
+
+    /** Derives current/previous from the dates held and evicts every older date (lock held). */
+    private void esAuctionRecomputeRetentionLocked() {
+        java.util.TreeSet<String> dates = new java.util.TreeSet<>();
+        for (String k : esAuctionMinutes.keySet()) {
+            int sep = k.indexOf('|');
+            if (sep > 0) dates.add(k.substring(0, sep));
+        }
+        if (dates.isEmpty()) { esAuctionTradeDate = null; esAuctionPrevTradeDate = null; return; }
+        String current = dates.last();
+        String prev = dates.lower(current);
+        if (prev != null) {
+            esAuctionMinutes.headMap(prev + "|", false).clear();   // everything below the previous date
+        }
+        esAuctionTradeDate = current;
+        esAuctionPrevTradeDate = prev;
     }
 
     private long esAuctionCorrectionRev(String json) {

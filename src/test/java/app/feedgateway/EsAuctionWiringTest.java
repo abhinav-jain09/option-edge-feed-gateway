@@ -151,12 +151,14 @@ class EsAuctionWiringTest {
         String payload = minute("2026-09-08", "09:31", 0, "first");
         s.onEsAuctionRecord(key("2026-09-08", "09:31"), payload);
         assertEquals(List.of("{\"type\":\"es-auction\",\"data\":" + payload + "}"), sink);
-        // A superseded correction is dropped from the VIEW but still reaches the wire — clients
-        // apply the same keyed rule, so view and wire can never disagree.
+        // A newer correction replaces the view entry and reaches the wire; a superseded one, a
+        // re-emission of an identical record (a consumer retry's replay) and a dead-session record
+        // never do — the wire carries exactly what the view accepted (code review round 1, item 2).
         s.onEsAuctionRecord(key("2026-09-08", "09:31"), minute("2026-09-08", "09:31", 2, "corr"));
         s.onEsAuctionRecord(key("2026-09-08", "09:31"), minute("2026-09-08", "09:31", 1, "late"));
-        assertEquals(3, sink.size());
-        assertEquals(3L, s.esAuctionRecordsForTest());
+        s.onEsAuctionRecord(key("2026-09-08", "09:31"), minute("2026-09-08", "09:31", 2, "corr"));
+        assertEquals(2, sink.size(), "first + newer correction only");
+        assertEquals(4L, s.esAuctionRecordsForTest(), "every record is counted as received");
         var page = s.auctionMinutesPage(null, null, 10);
         assertEquals(1, page.minutes().size());
         assertTrue(page.minutes().get(0).contains("\"callId\":\"corr\""), "latest correctionRev wins");
@@ -231,11 +233,11 @@ class EsAuctionWiringTest {
         List<String> sink = new ArrayList<>();
         s.addClient(socket("s1", sink));
         sink.clear();
-        // Hydration rebuilt rev 2; a live re-emission of the superseded rev 1 must not regress the view
-        // (it still reaches the wire — clients apply the same keyed rule).
+        // Hydration rebuilt rev 2; a live re-emission of the superseded rev 1 must not regress the view,
+        // and must not reach the wire either — the pages already hold rev 2 (code review round 1, item 2).
         s.onEsAuctionCacheRecord(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 2, "hydrated-r2"));
         s.onEsAuctionRecord(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 1, "live-r1"));
-        assertEquals(1, sink.size());
+        assertEquals(0, sink.size(), "a superseded correction is dropped from the view AND from the wire");
         assertTrue(s.auctionMinutesPage(null, null, 10).minutes().get(0).contains("\"callId\":\"hydrated-r2\""));
         // A genuinely newer live correction replaces it.
         s.onEsAuctionRecord(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 3, "live-r3"));
@@ -248,7 +250,7 @@ class EsAuctionWiringTest {
         var page = s.auctionMinutesPage(null, null, 10);
         assertEquals(2, page.minutes().size(), "one row per minute, never a duplicate");
         assertTrue(page.minutes().get(1).contains("\"callId\":\"hydrated-r1\""));
-        assertEquals(3, sink.size(), "only the live records reached the wire");
+        assertEquals(2, sink.size(), "only the live records the VIEW ACCEPTED reached the wire (rev 3 and the new 09:31); the superseded rev 1 did not");
     }
 
     @Test void restartSeekBackCoversTheRetainedTradeDatesNotTheGenericWindow() throws Exception {
@@ -318,6 +320,36 @@ class EsAuctionWiringTest {
         assertFalse(s.upsertEsAuctionMinute(key("2026-09-04", "09:31"), minute("2026-09-04", "09:31", 0, "thu-late")));
         assertEquals("2026-09-08", s.esAuctionTradeDate(), "rollover is monotonic");
         assertEquals(3, s.esAuctionMinutesCached());
+    }
+
+    @Test void retentionIsOrderIndependentAcrossHydrationAndLive() {
+        // A restart's replay is not sorted across partitions and can race live ingestion: the view
+        // must keep the two GREATEST dates whatever the arrival order (code review round 1, item 1).
+        var s = service();
+        s.onEsAuctionCacheRecord(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "mon"));
+        s.onEsAuctionCacheRecord(key("2026-09-04", "09:30"), minute("2026-09-04", "09:30", 0, "thu"));
+        s.onEsAuctionCacheRecord(key("2026-09-05", "09:30"), minute("2026-09-05", "09:30", 0, "fri"));
+        s.onEsAuctionCacheRecord(key("2026-09-05", "09:31"), minute("2026-09-05", "09:31", 0, "fri2"));
+        assertEquals("2026-09-08", s.esAuctionTradeDate());
+        assertEquals(2, s.auctionMinutesPage("2026-09-05", "", 10).minutes().size(), "Friday retained although it arrived after Monday");
+        assertTrue(s.auctionMinutesPage("2026-09-04", "", 10).minutes().isEmpty(), "Thursday evicted once two greater dates exist");
+        assertEquals(3, s.esAuctionMinutesCached());
+        assertEquals(FeedGatewayService.EsAuctionUpsert.DROPPED, s.upsertEsAuctionMinuteOutcome(key("2026-09-03", "09:30"), minute("2026-09-03", "09:30", 0, "wed")));
+    }
+
+    @Test void aConsumerRetryReplayNeverRebroadcastsWhatThePagesAlreadyHold() throws Exception {
+        var s = service();
+        s.runOutboundWritesInline();
+        List<String> sink = new ArrayList<>();
+        s.addClient(socket("s1", sink));
+        sink.clear();
+        for (String m : List.of("09:30", "09:31", "09:32")) s.onEsAuctionRecord(key("2026-09-08", m), minute("2026-09-08", m, 0, m));
+        assertEquals(3, sink.size());
+        for (String m : List.of("09:30", "09:31", "09:32")) s.onEsAuctionRecord(key("2026-09-08", m), minute("2026-09-08", m, 0, m));   // the retry's replay
+        s.onEsAuctionRecord(key("2026-09-05", "09:30"), minute("2026-09-05", "09:30", 0, "fri"));      // a previous date first seen now: NEW, broadcast
+        s.onEsAuctionRecord(key("2026-09-04", "09:30"), minute("2026-09-04", "09:30", 0, "thu"));      // dead session: dropped, not broadcast
+        assertEquals(4, sink.size(), "replayed duplicates and dead-session records stay off the wire");
+        assertEquals(4, s.esAuctionMinutesCached());
     }
 
     @Test void foreignShapesNeverPoisonTheView() {
