@@ -2920,8 +2920,7 @@ public class FeedGatewayService implements ReplayRunner {
                 // Seeding from the retained beginning would REPLAY that history onto the wire, since
                 // hydration marks nothing as emitted. With no cursor the partition is paused, exactly as at
                 // cold start, and positioned when its handoff appears (code review round 12).
-                if (cursor != null) seekEsAuctionWithinAt(consumer, p, cursor);
-                else consumer.pause(List.of(p));
+                if (cursor == null || !seekEsAuctionWithinAt(consumer, p, cursor)) consumer.pause(List.of(p));
             }
         }
         if (!recoverDisplayWindow.isEmpty()) {
@@ -10778,8 +10777,7 @@ public class FeedGatewayService implements ReplayRunner {
             if (!tp.topic().equals(topic)) continue;
             Long cursor = esAuctionNextOffset.get(tp);
             if (cursor == null) cursor = esAuctionHandoffOffset.get(tp);
-            if (cursor == null) { pause.add(tp); continue; }
-            seekEsAuctionWithinAt(consumer, tp, cursor);
+            if (cursor == null || !seekEsAuctionWithinAt(consumer, tp, cursor)) { pause.add(tp); continue; }
         }
         if (!pause.isEmpty()) consumer.pause(pause);
     }
@@ -10793,8 +10791,8 @@ public class FeedGatewayService implements ReplayRunner {
         for (TopicPartition tp : partitions) {
             if (!tp.topic().equals(topic) || !paused.contains(tp)) continue;
             Long handoff = esAuctionHandoffOffset.get(tp);
-            if (handoff == null) continue;
-            seekEsAuctionWithinAt(consumer, tp, handoff);
+            if (handoff == null) continue;                                 // still paused; resumed the moment it appears
+            if (!seekEsAuctionWithinAt(consumer, tp, handoff)) continue;    // a stale incarnation: stay paused for the re-capture
             consumer.resume(List.of(tp));
         }
     }
@@ -10802,16 +10800,28 @@ public class FeedGatewayService implements ReplayRunner {
     /** Seeks to {@code cursor}, clamped to what the partition retains. A failed RANGE QUERY does NOT mean
      *  "skip to the end": the cursor was valid when it was recorded, so it is used as it stands and only a
      *  failed SEEK falls back to END (code review round 7). */
-    private void seekEsAuctionWithinAt(KafkaConsumer<?, ?> consumer, TopicPartition owned, long cursor) {
+    private boolean seekEsAuctionWithinAt(KafkaConsumer<?, ?> consumer, TopicPartition owned, long cursor) {
         List<TopicPartition> one = List.of(owned);
         try {
             long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
             long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
-            if (cursor < beginning) { consumer.seek(owned, beginning); return; }   // aged out: take what is left
-            if (cursor > end) { esAuctionNextOffset.remove(owned); consumer.seekToEnd(one); return; }
+            if (cursor < beginning) { consumer.seek(owned, beginning); return true; }   // aged out: take what is left
+            if (cursor > end) {
+                // A cursor BEYOND the log end is not a position on this topic: it belongs to an earlier
+                // incarnation, because a TopicPartition is only (topic, partition) and a recreated topic
+                // reuses both. Seeking to END here would silently skip everything the new incarnation
+                // already holds, so BOTH cursors are dropped, the latch is reopened so the hello waits for
+                // a fresh capture, and the partition is left unpositioned — the caller pauses it (round 14).
+                esAuctionNextOffset.remove(owned);
+                esAuctionHandoffOffset.remove(owned);
+                esAuctionHandoffFrozen.set(false);
+                System.out.println("es-auction: cursor " + cursor + " is beyond the log end of " + owned + "; the partition was recreated — re-capturing its handoff");
+                return false;
+            }
             consumer.seek(owned, cursor);
+            return true;
         } catch (RuntimeException rangeUnknown) {
-            try { consumer.seek(owned, cursor); } catch (RuntimeException seekFailed) { consumer.seekToEnd(one); }
+            try { consumer.seek(owned, cursor); return true; } catch (RuntimeException seekFailed) { return false; }
         }
     }
 
