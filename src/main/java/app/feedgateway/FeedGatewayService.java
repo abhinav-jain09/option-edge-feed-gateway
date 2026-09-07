@@ -1194,16 +1194,15 @@ public class FeedGatewayService implements ReplayRunner {
             // and never learn about the records hydrated afterwards, because the hydration path is
             // deliberately silent. Hold the socket instead — the page buffers live frames until the
             // hello arrives — and flush every held socket the moment hydration completes.
-            if (esAuctionHandoffFrozen.get()) {
-                send(session, "es-auction-hello", esAuctionHelloJson());
-            } else {
-                esAuctionHelloPending.add(session);
-                // LOST WAKEUP: hydration can complete between the check above and the insertion, flushing
-                // an empty set and leaving this socket pending forever. Re-check after inserting; the
-                // remove() that returns true is the one that owns the send, so a concurrent flush and this
-                // recheck cannot both deliver it (code review round 4).
-                if (esAuctionHandoffFrozen.get() && esAuctionHelloPending.remove(session)) {
+            // The latch and the send are ONE step, under the incarnation lock an invalidation also holds:
+            // checked and sent separately, an invalidation could land in between and this socket would be
+            // promised a view that had just been dropped (code review round 18). The lost-wakeup recheck of
+            // round 4 is then unnecessary — the insertion cannot race a flush that needs the same lock.
+            synchronized (esAuctionIncarnationLock) {
+                if (esAuctionHandoffFrozen.get()) {
                     send(session, "es-auction-hello", esAuctionHelloJson());
+                } else {
+                    esAuctionHelloPending.add(session);
                 }
             }
         }
@@ -13131,7 +13130,7 @@ public class FeedGatewayService implements ReplayRunner {
     void tryFreezeEsAuctionHandoff(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions) {
         if (!settings.esAuctionEnabled() || !stateCaughtUp.get()) return;
         long generation = esAuctionGeneration.get();
-        if (!esAuctionRehydrated(consumer, partitions)) return;
+        if (!esAuctionRehydrated(consumer, partitions, generation)) return;
         // The latch is not permanent: an auction partition ADDED after the freeze has no handoff, so
         // readiness no longer covers every current partition. Reopen it and hold new sockets until the
         // added partition has been captured too (code review round 12).
@@ -13174,9 +13173,7 @@ public class FeedGatewayService implements ReplayRunner {
             if (after == null || !after.equals(id)) { esAuctionForgetIncarnation("the topic id changed while the handoff was being captured"); return; }
             esAuctionHandoffFrozen.set(true);
         }
-        // Outside the lock: a slow socket must not block an invalidation. The latch is re-read because an
-        // invalidation between the two reopens it, and the hello then waits for the next capture.
-        if (esAuctionHandoffFrozen.get()) flushEsAuctionHellos();
+        flushEsAuctionHellos();   // re-checks the latch under the same lock
     }
 
     /** Sends the auction hello to every socket that connected before the view had hydrated. */
@@ -13187,11 +13184,11 @@ public class FeedGatewayService implements ReplayRunner {
      * the re-seek. Without this the hello would go out over an empty view a moment after the drop (round 16).
      * Runs on the cache consumer's own thread, the only one that may touch its consumer.
      */
-    private boolean esAuctionRehydrated(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions) {
+    private boolean esAuctionRehydrated(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions, long generation) {
         String topic = settings.esAuctionTopic();
         List<TopicPartition> owned = partitions.stream().filter(tp -> tp.topic().equals(topic)).toList();
         if (esAuctionRehydrate.get()) {
-            if (owned.isEmpty()) { esAuctionRehydrate.set(false); esAuctionRehydrateBarrier.clear(); return true; }
+            if (owned.isEmpty()) { esAuctionRehydrateBarrier.clear(); return clearRehydrateIfCurrent(generation); }
             try {
                 Map<TopicPartition, Long> beginning = consumer.beginningOffsets(owned, Duration.ofSeconds(10));
                 Map<TopicPartition, Long> end = consumer.endOffsets(owned, Duration.ofSeconds(10));
@@ -13203,7 +13200,11 @@ public class FeedGatewayService implements ReplayRunner {
                    supersede a valid new record. The seek is the first instant at which no old-log record can
                    still arrive on this thread, so the view is dropped again HERE (code review round 17). */
                 synchronized (esAuctionMinutes) { esAuctionDropViewLocked(); }
-                esAuctionRehydrate.set(false);
+                /* Generation-aware: an invalidation that landed WHILE this pass was seeking has already asked
+                   for its own replay, and clearing the request unconditionally would erase it — the next pass
+                   would then see nothing pending and could freeze without ever replaying the newest log
+                   (round 18). Its own barrier and view drop still stand; this pass simply ends. */
+                if (!clearRehydrateIfCurrent(generation)) return false;
                 System.out.println("es-auction: re-reading the retained log of the new incarnation before any hello");
             } catch (RuntimeException retryable) {
                 return false;   // the hello stays held; the next loop iteration tries again
@@ -13217,6 +13218,15 @@ public class FeedGatewayService implements ReplayRunner {
             esAuctionRehydrateBarrier.remove(e.getKey());
         }
         return esAuctionRehydrateBarrier.isEmpty();
+    }
+
+    /** Clears the replay request only while {@code generation} is still the current incarnation. */
+    private boolean clearRehydrateIfCurrent(long generation) {
+        synchronized (esAuctionIncarnationLock) {
+            if (esAuctionGeneration.get() != generation) return false;
+            esAuctionRehydrate.set(false);
+            return true;
+        }
     }
 
     /** {@code AdminClient.describeTopics(topic).topicId()}, or null when it cannot be read. */
@@ -13266,10 +13276,17 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     void flushEsAuctionHellos() {
-        if (!settings.esAuctionEnabled() || esAuctionHelloPending.isEmpty()) return;
-        String hello = esAuctionHelloJson();
-        for (WebSocketSession held : esAuctionHelloPending) {
-            if (esAuctionHelloPending.remove(held)) send(held, "es-auction-hello", hello);   // the remover owns the send: exactly once
+        if (!settings.esAuctionEnabled()) return;
+        /* Under the incarnation lock, so the latch cannot be reopened between the check and the send: a hello
+           released after an invalidation would promise a view that had just been dropped (round 18). An
+           invalidation waits on a slow socket here, which is the correct trade — it costs a pause, while the
+           other order costs a wrong promise. */
+        synchronized (esAuctionIncarnationLock) {
+            if (!esAuctionHandoffFrozen.get() || esAuctionHelloPending.isEmpty()) return;
+            String hello = esAuctionHelloJson();
+            for (WebSocketSession held : esAuctionHelloPending) {
+                if (esAuctionHelloPending.remove(held)) send(held, "es-auction-hello", hello);   // the remover owns the send: exactly once
+            }
         }
     }
 

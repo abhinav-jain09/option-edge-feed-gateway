@@ -679,6 +679,63 @@ class EsAuctionWiringTest {
                 "the new log's own retained records are not judged against the old log's `prev`");
     }
 
+    // ---- round 18: the latch and the send are one step, and a replay request is never erased ----
+
+    /** A hello released after an invalidation would promise a view that had just been dropped. The latch check
+     *  and the send share the incarnation lock, so an invalidation cannot land between them. */
+    @Test void aHelloIsNeverReleasedAfterTheIncarnationWasInvalidated() throws Exception {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        s.runOutboundWritesInline();
+        s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"));
+        List<String> sink = new ArrayList<>();
+        s.addClient(socket("held", sink));
+        assertEquals(1, s.esAuctionHelloPendingForTest(), "held while the handoff is unfrozen");
+        s.markStateCaughtUpForTest();
+        assertEquals(0, s.esAuctionHelloPendingForTest());
+        assertTrue(sink.stream().anyMatch(m -> m.contains("\"es-auction-hello\"")));
+
+        // A second socket arrives, the incarnation is invalidated, and a flush is attempted anyway.
+        List<String> late = new ArrayList<>();
+        s.addClient(socket("late", late));
+        assertTrue(late.stream().anyMatch(m -> m.contains("\"es-auction-hello\"")), "while frozen, connect answers immediately");
+        s.esAuctionForgetIncarnation("the topic was recreated");
+        List<String> after = new ArrayList<>();
+        s.addClient(socket("after", after));
+        assertFalse(after.stream().anyMatch(m -> m.contains("\"es-auction-hello\"")), "after the invalidation the socket is held again");
+        assertEquals(1, s.esAuctionHelloPendingForTest());
+        s.flushEsAuctionHellos();
+        assertEquals(1, s.esAuctionHelloPendingForTest(), "a flush cannot release a hello while the latch is open");
+        assertFalse(after.stream().anyMatch(m -> m.contains("\"es-auction-hello\"")));
+    }
+
+    /** An invalidation landing WHILE a rehydration pass is seeking asks for its own replay. Clearing the
+     *  request unconditionally erased it, and the next pass could freeze without ever replaying the newest log. */
+    @Test void anInvalidationDuringTheSeekIsNotErasedByThePassItInterrupted() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var mock = mockAuctionConsumer(0L, 3L);
+        org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
+        s.esAuctionTopicIdReader = t -> id;
+        var invalidated = new java.util.concurrent.atomic.AtomicBoolean(false);
+        // A Consumer that fires the live thread's invalidation on the FIRST seek — exactly mid-pass.
+        var racing = (org.apache.kafka.clients.consumer.Consumer<?, ?>) java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{org.apache.kafka.clients.consumer.Consumer.class},
+                (proxy, method, args) -> {
+                    if ("seek".equals(method.getName()) && invalidated.compareAndSet(false, true)) s.esAuctionForgetIncarnation("the live thread saw a recreation");
+                    return method.invoke(mock, args);
+                });
+        s.markStateCaughtUpForTest();
+        s.esAuctionForgetIncarnation("the topic was recreated");
+        s.tryFreezeEsAuctionHandoff(racing, List.of(tp));
+        assertFalse(s.esAuctionHelloReady(), "the interrupted pass froze nothing");
+        // The newer invalidation's replay request survived: the next pass still re-seeks and still refuses.
+        s.tryFreezeEsAuctionHandoff(mock, List.of(tp));
+        assertEquals(0L, mock.position(tp), "the pending replay was honoured, not erased");
+        assertFalse(s.esAuctionHelloReady(), "and the hello still waits for the retained log");
+    }
+
     @Test void foreignShapesNeverPoisonTheView() {
         var s = service();
         assertFalse(s.upsertEsAuctionMinute(null, "{\"unrelated\":true}"));
