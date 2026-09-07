@@ -922,6 +922,11 @@ public class FeedGatewayService implements ReplayRunner {
         if (readySelectionKeyMatchesActive(selection)) {
             send(session, "source-ready", activeSelectionJson(selection, "source-ready"));
         }
+        if (settings.esAuctionEnabled()) {
+            // Auction-desk hello: what this gateway holds for the current trade date, so the page
+            // can bound its /api/auction/minutes backfill and buffer live WS minutes past it.
+            send(session, "es-auction-hello", esAuctionHelloJson());
+        }
         // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
         // each socket gets only the cached state matching its own AppSession selection (no cross-
         // contract leak), then live routed data (FR-11).
@@ -1448,6 +1453,15 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP gateway_cvd_spx_levels_position_regressions_total es-cvd-spx-levels records refused because their fold provenance regressed.\n"
                 + "# TYPE gateway_cvd_spx_levels_position_regressions_total counter\n"
                 + "gateway_cvd_spx_levels_position_regressions_total " + cvdSpxLevelsRegressions.get() + "\n"
+                + "# HELP gateway_es_auction_records_total SPX Auction Desk minute records forwarded verbatim as es-auction.\n"
+                + "# TYPE gateway_es_auction_records_total counter\n"
+                + "gateway_es_auction_records_total " + esAuctionRecords.get() + "\n"
+                + "# HELP gateway_es_auction_minutes_cached Minute records held in the es-auction backfill view (current plus previous trade date).\n"
+                + "# TYPE gateway_es_auction_minutes_cached gauge\n"
+                + "gateway_es_auction_minutes_cached " + esAuctionMinutesCached() + "\n"
+                + "# HELP gateway_es_auction_backfill_requests_total /api/auction/minutes backfill pages served.\n"
+                + "# TYPE gateway_es_auction_backfill_requests_total counter\n"
+                + "gateway_es_auction_backfill_requests_total " + esAuctionBackfillRequests.get() + "\n"
                 + "# HELP gateway_vol_premium_topic_resets_total vol-premium-ivrv records admitted as a "
                 + "recreated topic: behind the cached offset AND strictly newer, which no incarnation "
                 + "of that topic can otherwise produce. Each one is a recovery from a reset that "
@@ -1903,6 +1917,7 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
         addEsCvdTopics(topicEvents);
+        addEsAuctionTopics(topicEvents);
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
@@ -2039,6 +2054,7 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
         addEsCvdTopics(topicEvents);
+        addEsAuctionTopics(topicEvents);
         if (settings.esCvdSpxLevelsEnabled()) {
             // U16: SPX-translated CVD structure levels (compacted single-partition heartbeat,
             // >=1 record per ALIGN_HEARTBEAT while the aligner runs) — LIVE consumer only. The
@@ -2055,6 +2071,12 @@ public class FeedGatewayService implements ReplayRunner {
         // One wiring path is shared by bootstrap and live consumers so their topic sets cannot drift.
         topicEvents.put(settings.esCvdTopic(), new TopicBinding("DATABENTO", "es-cvd"));
         topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding("DATABENTO", "es-cvd-bar"));
+    }
+
+    /** SPX Auction Desk minute stream: same shared-wiring rule as {@link #addEsCvdTopics}. */
+    private void addEsAuctionTopics(Map<String, TopicBinding> topicEvents) {
+        if (!settings.esAuctionEnabled()) return;
+        topicEvents.put(settings.esAuctionTopic(), new TopicBinding("DATABENTO", "es-auction"));
     }
 
     private void runAlertConsumer() {
@@ -2426,6 +2448,17 @@ public class FeedGatewayService implements ReplayRunner {
                         // one that broadcasts it — otherwise the live consumer's duplicate is
                         // correctly rejected by the offset gate and clients starve.
                         tapeZonesBroadcast(binding, record, json, caughtUpFlag);
+                        continue;
+                    }
+                    if (binding != null && "es-auction".equals(binding.event())) {
+                        // RESTART HYDRATION ONLY. The SAME keyed upsert as the live branch (latest
+                        // correctionRev per tradeDate|HH:mm wins, current + previous trade date
+                        // retention) and NO broadcast — the live consumer owns the wire, and a
+                        // second emitter would duplicate every minute on every socket. Without this
+                        // branch the record fell through updateCache's default (no generic cache
+                        // shape) and the /api/auction/minutes view stayed EMPTY after a restart
+                        // until the next live minute arrived. Fed the KAFKA KEY, like the live branch.
+                        onEsAuctionCacheRecord(record.key() == null ? null : String.valueOf(record.key()), json);
                         continue;
                     }
                     updateCache(binding, record, json);
@@ -2844,6 +2877,15 @@ public class FeedGatewayService implements ReplayRunner {
                         upsertCvdBar(json);
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("es-auction".equals(binding.event())) {
+                        // SPX Auction Desk minute record: same delivery class as es-cvd-bar — keyed
+                        // minute view first (the /api/auction/minutes backfill's source of truth),
+                        // then the VERBATIM standalone broadcast (raw pass-through, never
+                        // selection-gated). Clients apply the same latest-correctionRev-per-minute
+                        // rule, so at-least-once delivery is invisible downstream.
+                        onEsAuctionRecord(record.key() == null ? null : String.valueOf(record.key()), json);
                         continue;
                     }
                     if ("es-aggressor-flow".equals(binding.event())) {
@@ -6257,6 +6299,15 @@ public class FeedGatewayService implements ReplayRunner {
             }
             return CachePolicy.noEviction(settings.optionChainOffHoursSeekBackMs());
         }
+        if ("es-auction".equals(event)) {
+            // SPX Auction Desk minutes never enter the generic cache maps (the keyed minute view
+            // applies its own current + previous trade date retention), so ONLY the seek-back
+            // matters here: the cache consumer must replay enough of the compacted topic after a
+            // restart to rebuild BOTH retained trade dates. The generic 15-min window rebuilt at
+            // most the last few minutes. Default = the topic's 7-day retention, which covers the
+            // previous trade date across any weekend/holiday gap; ~390 records per date, so cheap.
+            return CachePolicy.noEviction(settings.esAuctionSeekBackMs());
+        }
         return CachePolicy.expiring(settings.cacheTtlMs());
     }
 
@@ -8952,7 +9003,7 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private static boolean isRawPassThroughEvent(String event) {
         return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
-                || "es-cvd-spx-levels".equals(event);
+                || "es-cvd-spx-levels".equals(event) || "es-auction".equals(event);
     }
 
     /**
@@ -9688,6 +9739,178 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (JsonProcessingException ignored) {
         }
     }
+
+    // ---- SPX Auction Desk minute view (es-auction) ------------------------------------------
+
+    /**
+     * Keyed view of the SPX Auction Desk minute records — {@code tradeDate|HH:mm} -> record JSON
+     * (verbatim). String order IS (tradeDate, minute) order because both components are
+     * fixed-width and {@code '|'} sorts above every digit, so a per-trade-date sub-map is a plain
+     * prefix range and pages come out in minute order for free.
+     */
+    private final java.util.TreeMap<String, String> esAuctionMinutes = new java.util.TreeMap<>();
+    /** The newest trade date the view has seen (the "current" one); null until the first record. */
+    private volatile String esAuctionTradeDate;
+    /** The trade date the current one rolled forward FROM; retained so late corrections still land. */
+    private volatile String esAuctionPrevTradeDate;
+    private final AtomicLong esAuctionRecords = new AtomicLong();
+    private final AtomicLong esAuctionBackfillRequests = new AtomicLong();
+
+    /**
+     * Live-path handler for one es-auction Kafka record: keyed upsert, then the VERBATIM
+     * standalone broadcast. A record the view refuses (stale trade date, superseded
+     * correctionRev, foreign shape) is still broadcast — clients apply the same keyed rule — so
+     * the view and the wire can never disagree on what "latest" means.
+     */
+    void onEsAuctionRecord(String key, String json) {
+        upsertEsAuctionMinute(key, json);
+        broadcast("es-auction", json);
+        forwardedEvents.incrementAndGet();
+        esAuctionRecords.incrementAndGet();
+    }
+
+    /**
+     * Cache-consumer (restart hydration) handler for one es-auction Kafka record: the SAME keyed
+     * upsert as {@link #onEsAuctionRecord} — latest correctionRev wins, current + previous trade
+     * date retention — and NOTHING else. No broadcast (the live consumer owns the wire) and no
+     * forwarded/records counters (those count what reached the wire), so a restart's replay of
+     * the compacted topic rebuilds the {@code /api/auction/minutes} view and the connect hello
+     * silently. Order-independent with the live path by construction: both feed one keyed rule.
+     */
+    void onEsAuctionCacheRecord(String key, String json) {
+        upsertEsAuctionMinute(key, json);
+    }
+
+    /**
+     * At-least-once keyed upsert: the latest {@code correctionRev} per {@code tradeDate|HH:mm}
+     * wins (an equal rev overwrites, so a restart's re-emission replaces rather than duplicates).
+     * Retention is the CURRENT trade date plus the PREVIOUS one: a newer date rolls the view
+     * forward and evicts everything older than the date it rolled from; a record older than the
+     * previous date is a replay from a dead session and is dropped, never resurrected.
+     *
+     * @return true when the record now sits in the view
+     */
+    boolean upsertEsAuctionMinute(String key, String json) {
+        String tradeDate = null;
+        String minute = null;
+        long rev = 0L;
+        try {
+            JsonNode root = mapper.readTree(json);
+            if (root == null || !root.isObject()) return false;
+            tradeDate = text(root, "tradeDate");
+            minute = text(root, "minute");
+            rev = longField(root, "correctionRev", 0L);
+        } catch (JsonProcessingException e) {
+            return false;
+        }
+        if (key != null) {
+            // The Kafka key is the contract's identity; the payload fields are only a fallback
+            // for a record produced without one.
+            int sep = key.indexOf('|');
+            if (sep > 0 && sep < key.length() - 1) {
+                tradeDate = key.substring(0, sep).trim();
+                minute = key.substring(sep + 1).trim();
+            }
+        }
+        if (tradeDate == null || tradeDate.isEmpty() || minute == null || minute.isEmpty()) return false;
+        String viewKey = tradeDate + "|" + minute;
+        synchronized (esAuctionMinutes) {
+            String current = esAuctionTradeDate;
+            if (current == null) {
+                esAuctionTradeDate = tradeDate;
+            } else if (tradeDate.compareTo(current) > 0) {
+                // MONOTONIC rollover: keep the date we roll from, drop anything older than it.
+                esAuctionPrevTradeDate = current;
+                esAuctionTradeDate = tradeDate;
+                esAuctionMinutes.headMap(current + "|", false).clear();
+            } else if (tradeDate.compareTo(current) < 0 && !tradeDate.equals(esAuctionPrevTradeDate)) {
+                return false;                                  // dead-session record: dropped
+            }
+            String existing = esAuctionMinutes.get(viewKey);
+            if (existing != null && esAuctionCorrectionRev(existing) > rev) {
+                return false;                                  // superseded correction: dropped
+            }
+            esAuctionMinutes.put(viewKey, json);
+            return true;
+        }
+    }
+
+    private long esAuctionCorrectionRev(String json) {
+        try {
+            return longField(mapper.readTree(json), "correctionRev", 0L);
+        } catch (JsonProcessingException e) {
+            return 0L;
+        }
+    }
+
+    /** Hello payload: {"tradeDate":...,"minutes":<count for that date>,"lastMinute":"HH:mm"|null}. */
+    String esAuctionHelloJson() {
+        synchronized (esAuctionMinutes) {
+            String td = esAuctionTradeDate;
+            StringBuilder sb = new StringBuilder("{\"tradeDate\":");
+            sb.append(td == null ? "null" : "\"" + escapeJson(td) + "\"");
+            java.util.NavigableMap<String, String> day = td == null
+                    ? java.util.Collections.emptyNavigableMap() : esAuctionDayLocked(td);
+            sb.append(",\"minutes\":").append(day.size());
+            String last = day.isEmpty() ? null : day.lastKey().substring(td.length() + 1);
+            sb.append(",\"lastMinute\":").append(last == null ? "null" : "\"" + escapeJson(last) + "\"");
+            return sb.append('}').toString();
+        }
+    }
+
+    /** The prefix range of one trade date; caller holds the view lock. */
+    private java.util.NavigableMap<String, String> esAuctionDayLocked(String tradeDate) {
+        // '|' + 1 == '}' — every "tradeDate|HH:mm" key sorts inside [tradeDate|, tradeDate}).
+        return esAuctionMinutes.subMap(tradeDate + "|", true, tradeDate + "}", false);
+    }
+
+    /** One ATOMIC backfill page: trade date, rows and cursor under one lock (the cvdBarsPage rule). */
+    public record EsAuctionMinutesPage(String tradeDate, java.util.List<String> minutes, String nextCursor) { }
+
+    /**
+     * Minute records for one trade date in minute order, starting at {@code fromMinuteInclusive}
+     * (null/blank = the first held minute), at most {@code limit} rows. {@code nextCursor} is the
+     * first minute NOT returned (feed it back as {@code from}) or null when the page reached the end
+     * — so a client never has to issue a trailing empty page to learn it is done. A null/blank
+     * {@code tradeDate} means the current one; a date the view does not hold answers an empty page
+     * labelled with the requested date.
+     */
+    public EsAuctionMinutesPage auctionMinutesPage(String tradeDate, String fromMinuteInclusive, int limit) {
+        esAuctionBackfillRequests.incrementAndGet();
+        synchronized (esAuctionMinutes) {
+            String td = tradeDate == null || tradeDate.isBlank() ? esAuctionTradeDate : tradeDate.trim();
+            if (td == null) {
+                return new EsAuctionMinutesPage(null, java.util.List.of(), null);
+            }
+            java.util.NavigableMap<String, String> day = esAuctionDayLocked(td);
+            if (fromMinuteInclusive != null && !fromMinuteInclusive.isBlank()) {
+                day = day.tailMap(td + "|" + fromMinuteInclusive.trim(), true);
+            }
+            java.util.List<String> out = new java.util.ArrayList<>();
+            String next = null;
+            for (java.util.Map.Entry<String, String> e : day.entrySet()) {
+                if (out.size() >= limit) {
+                    next = e.getKey().substring(td.length() + 1);
+                    break;
+                }
+                out.add(e.getValue());
+            }
+            return new EsAuctionMinutesPage(td, out, next);
+        }
+    }
+
+    public String esAuctionTradeDate() { return esAuctionTradeDate; }
+
+    /** Records held across both retained trade dates (the gateway_es_auction_minutes_cached gauge). */
+    int esAuctionMinutesCached() {
+        synchronized (esAuctionMinutes) {
+            return esAuctionMinutes.size();
+        }
+    }
+
+    long esAuctionRecordsForTest() { return esAuctionRecords.get(); }
+
+    long esAuctionBackfillRequestsForTest() { return esAuctionBackfillRequests.get(); }
 
     /** U16 boundary cap: one levels record may never exceed the design's 64 KiB record bound. */
     static final int CVD_SPX_LEVELS_MAX_BYTES = 65536;
@@ -11504,7 +11727,10 @@ public class FeedGatewayService implements ReplayRunner {
             // Candle Direction CURRENT decision (commissioning shadow): same class, symbol-filtered client-side.
             "direction",
             // A4 push state / alert / scorecard: same class.
-            "direction-push", "direction-alert", "direction-scorecard");
+            "direction-push", "direction-alert", "direction-scorecard",
+            // SPX Auction Desk minute records: ES-global, no option-expiry identity — the same
+            // allowlist rule as es-cvd, or per-session (auth) mode drops every frame as non-routable.
+            "es-auction");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);
