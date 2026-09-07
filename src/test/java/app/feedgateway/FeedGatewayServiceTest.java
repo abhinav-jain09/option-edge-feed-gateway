@@ -3260,6 +3260,80 @@ class FeedGatewayServiceTest {
         assertTrue(service.healthJson().contains("\"directionPush\":0"), service.healthJson());
     }
 
+    @Test
+    void directionAlertsAreNeverReplayedToAJoiningClient_butThePushStateIs() throws Exception {
+        // A4.10: an alert is a SPOKEN event. A late joiner must see the push state and the scorecard, and must NOT be
+        // handed alerts it never lived through — that is what would let a browser speak history as if it were now.
+        // This drives the actual join: three fresh records are cached, then a client joins on BOTH replay paths and
+        // we look at what it received. Adding direction-alert to any replay path fails here.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String today = java.time.LocalDate.now(java.time.ZoneId.of("America/New_York")).toString();
+        String stamps = "\"sessionDate\":\"" + today + "\",\"slice\":\"COMMISSIONING_SHADOW\",\"actionable\":false,\"ts\":"
+                + (now - 1_000L) + ",\"eventTMs\":" + (now - 2_000L);
+        String push = "{\"symbol\":\"SPX\"," + stamps + ",\"state\":\"EXHAUSTED\"}";
+        String alert = "{\"symbol\":\"SPX\",\"alertId\":\"pushalert|c1\",\"alertClass\":\"PUSH_EXHAUSTED\"," + stamps + "}";
+        String scorecard = "{\"symbol\":\"SPX\"," + stamps + ",\"primaryHorizon\":\"H5\"}";
+        assertEquals("DATABENTO|SPX", updateCache(service, topicBinding("DATABENTO", "direction-push"),
+                recordAt(settings.directionPushTopic(), 0, 1L, "SPX", push, now), push));
+        assertEquals("DATABENTO|pushalert|c1", updateCache(service, topicBinding("DATABENTO", "direction-alert"),
+                recordAt(settings.directionAlertTopic(), 0, 1L, "SPX|c1", alert, now), alert));
+        assertEquals("DATABENTO|SPX", updateCache(service, topicBinding("DATABENTO", "direction-scorecard"),
+                recordAt(settings.directionScorecardTopic(), 0, 1L, "SPX", scorecard, now), scorecard));
+        assertTrue(service.healthJson().contains("\"directionAlert\":1"),
+                "the alert IS cached — it is simply never replayed: " + service.healthJson());
+
+        for (String path : java.util.List.of("replayDirectionPushCached", "replayCachedToSocket")) {
+            List<String> sink = new ArrayList<>();
+            Method replay = FeedGatewayService.class.getDeclaredMethod(path, WebSocketSession.class);
+            replay.setAccessible(true);
+            replay.invoke(service, recordingSession(sink));
+            assertTrue(sink.stream().anyMatch(m -> m.contains("\"type\":\"direction-push\"")),
+                    path + " must deliver the push state to a joining client; got: " + sink);
+            assertTrue(sink.stream().anyMatch(m -> m.contains("\"type\":\"direction-scorecard\"")),
+                    path + " must deliver the scorecard; got: " + sink);
+            assertTrue(sink.stream().noneMatch(m -> m.contains("\"type\":\"direction-alert\"")),
+                    path + " must NEVER replay an alert to a joining client (A4.10); got: " + sink);
+            assertTrue(sink.stream().noneMatch(m -> m.contains("pushalert|c1")),
+                    path + " leaked the alert payload under another event name; got: " + sink);
+        }
+
+        // …and the REAL join, addClient, with the replay gate on: everything a browser is handed when it connects.
+        // A direct alert send written anywhere into that path — however the event name is spelled — fails here.
+        System.setProperty("GATEWAY_ES_CVD_ENABLED", "true");
+        try {
+            FeedGatewayService joined = service();
+            assertEquals("DATABENTO|SPX", updateCache(joined, topicBinding("DATABENTO", "direction-push"),
+                    recordAt(settings.directionPushTopic(), 0, 1L, "SPX", push, now), push));
+            assertEquals("DATABENTO|pushalert|c1", updateCache(joined, topicBinding("DATABENTO", "direction-alert"),
+                    recordAt(settings.directionAlertTopic(), 0, 1L, "SPX|c1", alert, now), alert));
+            assertEquals("DATABENTO|SPX", updateCache(joined, topicBinding("DATABENTO", "direction-scorecard"),
+                    recordAt(settings.directionScorecardTopic(), 0, 1L, "SPX", scorecard, now), scorecard));
+            // the direction replays live behind the state consumer's catch-up flag, as they do in production
+            for (String flag : java.util.List.of("stateCaughtUp", "avroCaughtUp")) {
+                java.lang.reflect.Field f = FeedGatewayService.class.getDeclaredField(flag);
+                f.setAccessible(true);
+                ((java.util.concurrent.atomic.AtomicBoolean) f.get(joined)).set(true);
+            }
+            List<String> sent = Collections.synchronizedList(new ArrayList<>());
+            joined.addClient(recordingSession(sent));
+            long deadline = System.currentTimeMillis() + 2_000L;
+            while (sent.stream().noneMatch(m -> m.contains("\"type\":\"direction-push\""))
+                    && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10L);
+            }
+            assertTrue(sent.stream().anyMatch(m -> m.contains("\"type\":\"direction-push\"")),
+                    "the real join must deliver the push state; got: " + sent);
+            assertTrue(sent.stream().anyMatch(m -> m.contains("\"type\":\"direction-scorecard\"")),
+                    "the real join must deliver the scorecard; got: " + sent);
+            assertTrue(sent.stream().noneMatch(m -> m.contains("direction-alert") || m.contains("pushalert|c1")),
+                    "the real join must NEVER hand a joining client an alert, however it is spelled (A4.10); got: " + sent);
+        } finally {
+            System.clearProperty("GATEWAY_ES_CVD_ENABLED");
+        }
+    }
+
     // ----- gamma-leadership CURRENT reading relay ---------------------------------------------------
 
     @Test
