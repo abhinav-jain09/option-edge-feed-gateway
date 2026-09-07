@@ -717,9 +717,10 @@ class EsAuctionWiringTest {
         List<String> after = new ArrayList<>();
         s.addClient(socket("after", after));
         assertFalse(after.stream().anyMatch(m -> m.contains("\"es-auction-hello\"")), "after the invalidation the socket is held again");
-        assertEquals(1, s.esAuctionHelloPendingForTest());
+        // The two already-connected sockets were re-armed by the invalidation (round 24), plus this one.
+        assertEquals(3, s.esAuctionHelloPendingForTest());
         s.flushEsAuctionHellos();
-        assertEquals(1, s.esAuctionHelloPendingForTest(), "a flush cannot release a hello while the latch is open");
+        assertEquals(3, s.esAuctionHelloPendingForTest(), "a flush cannot release a hello while the latch is open");
         assertFalse(after.stream().anyMatch(m -> m.contains("\"es-auction-hello\"")));
     }
 
@@ -819,6 +820,28 @@ class EsAuctionWiringTest {
         assertFalse(s.seekEsAuctionWithinAt(consumer, tp, 20L, gen + 1, false), "a cursor read under another incarnation is never adopted");
         assertEquals(12L, consumer.position(tp), "the partition still did not move");
         assertEquals(12L, consumer.position(tp), "the partition did not move");
+    }
+
+    /** A connected page was told what the OLD log held. The new log's prefix is hydrated silently and live
+     *  resumes at the fresh handoff, so without a second hello it keeps the old rows for ever. */
+    @Test void anInvalidationReArmsEveryConnectedSocketForAFreshHello() throws Exception {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        s.runOutboundWritesInline();
+        s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "old"));
+        List<String> sink = new ArrayList<>();
+        s.addClient(socket("page", sink));
+        s.markStateCaughtUpForTest();
+        assertEquals(1, sink.stream().filter(m -> m.contains("\"es-auction-hello\"")).count(), "the connect hello");
+        assertEquals(0, s.esAuctionHelloPendingForTest());
+
+        s.esAuctionForgetIncarnation("the topic was recreated");
+        assertEquals(1, s.esAuctionHelloPendingForTest(), "the connected page is re-armed, not left on the old log");
+        assertEquals(1, sink.stream().filter(m -> m.contains("\"es-auction-hello\"")).count(), "and held until a fresh handoff exists");
+
+        s.markStateCaughtUpForTest();   // a fresh handoff
+        assertEquals(2, sink.stream().filter(m -> m.contains("\"es-auction-hello\"")).count(), "then a SECOND hello, which the page reads as a reset");
+        assertEquals(0, s.esAuctionHelloPendingForTest());
     }
 
     @Test void foreignShapesNeverPoisonTheView() {

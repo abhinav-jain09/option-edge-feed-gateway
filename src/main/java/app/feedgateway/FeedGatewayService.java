@@ -13373,7 +13373,13 @@ public class FeedGatewayService implements ReplayRunner {
         synchronized (esAuctionMinutes) { esAuctionDropViewLocked(); }
         esAuctionRehydrate.set(true);
         esAuctionRehydrateBarrier.clear();
-        System.out.println("es-auction: " + why + " — every cursor dropped, the hello waits for a fresh handoff");
+        /* Already-connected clients are RE-ARMED. They were told what the OLD log held, and the new log's
+           retained prefix is hydrated silently while live resumes at the fresh handoff — so without this a
+           connected page keeps the old incarnation's rows and never learns of any minute before that handoff
+           (code review round 24). A second hello on one connection only ever happens here, and the page
+           treats it as a reset: it drops what it holds and re-runs its backfill. */
+        if (settings.esAuctionEnabled()) esAuctionHelloPending.addAll(clients);
+        System.out.println("es-auction: " + why + " — every cursor dropped, " + esAuctionHelloPending.size() + " socket(s) waiting for a fresh hello");
         }
     }
 
