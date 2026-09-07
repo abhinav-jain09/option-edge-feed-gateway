@@ -13130,26 +13130,30 @@ public class FeedGatewayService implements ReplayRunner {
     void tryFreezeEsAuctionHandoff(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions) {
         if (!settings.esAuctionEnabled() || !stateCaughtUp.get()) return;
         long generation = esAuctionGeneration.get();
-        if (!esAuctionRehydrated(consumer, partitions, generation)) return;
-        // The latch is not permanent: an auction partition ADDED after the freeze has no handoff, so
-        // readiness no longer covers every current partition. Reopen it and hold new sockets until the
-        // added partition has been captured too (code review round 12).
-        for (TopicPartition tp : partitions) {
-            if (tp.topic().equals(settings.esAuctionTopic()) && !esAuctionHandoffOffset.containsKey(tp)) { esAuctionHandoffFrozen.set(false); break; }
-        }
-        if (esAuctionHandoffFrozen.get()) return;
         String topic = settings.esAuctionTopic();
-        /* IDENTITY FIRST, and it is recorded before anything is captured. A position is meaningless without
-           knowing which LOG it is a position on: captured while the id was unreadable, it used to survive in
-           `esAuctionHandoffOffset` and be adopted by whatever id was read on a later attempt — so offsets from
-           the old incarnation would be bound to the new one and live would seek past its records (round 16).
-           Recording the id here also means a recreation between two partial capture passes is SEEN, because
-           the next pass compares against it. */
+        /* The latch is not permanent: an auction partition ADDED after the freeze has no handoff, so readiness
+           no longer covers every current partition. Reopen it and hold new sockets until the added partition
+           has been captured too (round 12) — UNDER the incarnation lock, the same monitor connect and flush
+           decide on, so a hello can never be sent on a latch this thread is in the middle of reopening
+           (code review round 19). */
+        synchronized (esAuctionIncarnationLock) {
+            for (TopicPartition tp : partitions) {
+                if (tp.topic().equals(topic) && !esAuctionHandoffOffset.containsKey(tp)) { esAuctionHandoffFrozen.set(false); break; }
+            }
+            if (esAuctionHandoffFrozen.get()) return;
+        }
+        if (!esAuctionRehydrated(consumer, partitions, generation)) return;
+        /* IDENTITY FIRST: a position is meaningless without knowing which LOG it is a position on (round 16). */
         org.apache.kafka.common.Uuid id = esAuctionTopicIdReader.apply(topic);
         if (id == null) { System.out.println("es-auction: cannot read the topic id; nothing is captured and the hello stays held"); return; }
         org.apache.kafka.common.Uuid known = esAuctionTopicId;
         if (known != null && !known.equals(id)) { esAuctionForgetIncarnation("topic " + topic + " was recreated (" + known + " -> " + id + ")"); return; }
-        esAuctionTopicId = id;
+        /* Captured LOCALLY and committed only under the lock. Written straight into the shared map, a position
+           read while an invalidation was clearing that map would be reinserted after the clear; this pass would
+           then notice the generation and give up, but the stale cursor would stay, and the next pass would see
+           the partition as already captured and freeze on it — seeking past records of the new log
+           (code review round 19). Nothing captured is shared until it has been validated. */
+        Map<TopicPartition, Long> captured = new LinkedHashMap<>();
         boolean complete = true;
         for (TopicPartition tp : partitions) {
             if (!tp.topic().equals(topic)) continue;
@@ -13159,7 +13163,7 @@ public class FeedGatewayService implements ReplayRunner {
                 try { at = consumer.position(tp); } catch (RuntimeException retryable) { at = null; }
             }
             if (at == null) { complete = false; System.out.println("es-auction: cannot read the cache position for " + tp + "; the hello stays held until it can"); continue; }
-            esAuctionHandoffOffset.putIfAbsent(tp, at);
+            captured.put(tp, at);
         }
         /* An enabled topic with NO partitions right now satisfies "every current partition has a handoff"
            vacuously, so the empty set FREEZES: otherwise every socket would wait for a hello for ever. The
@@ -13171,6 +13175,8 @@ public class FeedGatewayService implements ReplayRunner {
         synchronized (esAuctionIncarnationLock) {
             if (esAuctionGeneration.get() != generation) { System.out.println("es-auction: the incarnation was invalidated while the handoff was being captured; nothing is frozen"); return; }
             if (after == null || !after.equals(id)) { esAuctionForgetIncarnation("the topic id changed while the handoff was being captured"); return; }
+            esAuctionTopicId = id;
+            for (Map.Entry<TopicPartition, Long> e : captured.entrySet()) esAuctionHandoffOffset.putIfAbsent(e.getKey(), e.getValue());
             esAuctionHandoffFrozen.set(true);
         }
         flushEsAuctionHellos();   // re-checks the latch under the same lock

@@ -512,7 +512,10 @@ class EsAuctionWiringTest {
         assertTrue(f.contains("consumer.position(tp)"), "(c) the ACTUAL position");
         assertTrue(f.contains("attempt < 3"), "(c) retried rather than swallowed");
         assertTrue(f.indexOf("if (!complete) return;") < f.indexOf("flushEsAuctionHellos()"), "(c) the hello waits for a COMPLETE handoff; an empty partition set satisfies it vacuously (round 13)");
-        assertTrue(f.contains("putIfAbsent(tp, at)"), "(c) captured once per partition: later movement is ignored");
+        assertTrue(f.contains("captured.put(tp, at)") && f.contains("esAuctionHandoffOffset.putIfAbsent("),
+                "(c) captured once per partition: later movement is ignored");
+        assertTrue(f.indexOf("captured.put(tp, at)") < f.indexOf("synchronized (esAuctionIncarnationLock)", f.indexOf("captured.put(tp, at)")),
+                "(c) collected locally, committed under the incarnation lock");
         int mark = source.indexOf("private void markCacheCaughtUp(");
         assertFalse(source.substring(mark, mark + 900).contains("flushEsAuctionHellos()"), "(c) the barrier alone no longer releases the hello");
     }
@@ -734,6 +737,28 @@ class EsAuctionWiringTest {
         s.tryFreezeEsAuctionHandoff(mock, List.of(tp));
         assertEquals(0L, mock.position(tp), "the pending replay was honoured, not erased");
         assertFalse(s.esAuctionHelloReady(), "and the hello still waits for the retained log");
+    }
+
+    /** A position read while an invalidation was clearing the maps must not be reinserted after the clear: the
+     *  next pass would see the partition as already captured and freeze on a cursor from the OLD log. */
+    @Test void aPositionReadAcrossAnInvalidationIsNeverCommitted() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var mock = mockAuctionConsumer(0L, 0L);
+        org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
+        s.esAuctionTopicIdReader = t -> id;
+        var fired = new java.util.concurrent.atomic.AtomicBoolean(false);
+        var racing = (org.apache.kafka.clients.consumer.Consumer<?, ?>) java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{org.apache.kafka.clients.consumer.Consumer.class},
+                (proxy, method, args) -> {
+                    if ("position".equals(method.getName()) && fired.compareAndSet(false, true)) s.esAuctionForgetIncarnation("the live thread saw a recreation");
+                    return method.invoke(mock, args);
+                });
+        s.markStateCaughtUpWithoutHandoffForTest();
+        s.tryFreezeEsAuctionHandoff(racing, List.of(tp));
+        assertFalse(s.esAuctionHelloReady(), "the interrupted pass froze nothing");
+        assertEquals(0, s.esAuctionHandoffCountForTest(), "and left no cursor from the old incarnation behind");
     }
 
     @Test void foreignShapesNeverPoisonTheView() {
