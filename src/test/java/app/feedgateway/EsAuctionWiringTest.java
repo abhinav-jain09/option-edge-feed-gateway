@@ -844,6 +844,28 @@ class EsAuctionWiringTest {
         assertEquals(0, s.esAuctionHelloPendingForTest());
     }
 
+    /** The replay reads the NEW log and takes real time. A recreation part-way through leaves the view
+     *  holding rows of two logs and barrier offsets belonging to neither, so the replay must FINISH on the
+     *  incarnation it started on. */
+    @Test void aReplayInterruptedByAnotherRecreationIsAbandoned() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 3L);
+        var current = new java.util.concurrent.atomic.AtomicReference<>(org.apache.kafka.common.Uuid.randomUuid());
+        s.esAuctionTopicIdReader = t -> current.get();
+        s.markStateCaughtUpForTest();
+        s.esAuctionForgetIncarnation("the topic was recreated");
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));       // starts the replay, names the new incarnation
+        assertEquals(0L, consumer.position(tp), "seeked back to the beginning of the new log");
+        assertFalse(s.esAuctionHelloReady(), "the replay is not finished");
+
+        current.set(org.apache.kafka.common.Uuid.randomUuid());   // recreated AGAIN, mid-replay
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertFalse(s.esAuctionHelloReady(), "the interrupted replay is abandoned, not completed");
+        assertEquals(0, s.esAuctionMinutesCached(), "and its half-read view goes with it");
+    }
+
     @Test void foreignShapesNeverPoisonTheView() {
         var s = service();
         assertFalse(s.upsertEsAuctionMinute(null, "{\"unrelated\":true}"));

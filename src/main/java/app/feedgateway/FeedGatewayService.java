@@ -666,6 +666,8 @@ public class FeedGatewayService implements ReplayRunner {
      *  view that had just been dropped, so the generation is read at the start of a capture pass and confirmed
      *  under this lock before the latch closes (code review round 17). */
     private final Object esAuctionIncarnationLock = new Object();
+    /** The incarnation a post-invalidation replay STARTED on; the replay must finish on the same one. */
+    private volatile org.apache.kafka.common.Uuid esAuctionReplayTopicId;
     /** How often the identity of an ALREADY FROZEN topic is re-read. Nothing else looks at it while the latch
      *  is closed, so without this a recreation with the same partition count would be served from the old view
      *  until the live consumer happened to seek (code review round 20). */
@@ -2606,6 +2608,9 @@ public class FeedGatewayService implements ReplayRunner {
         // position()), which would withhold readiness for that source forever.
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
             List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
+            // The incarnation is named BEFORE the hydration reads a single record, so a recreation DURING
+            // hydration is seen: every later step compares against this id (code review round 25).
+            bindEsAuctionIncarnation(partitions);
             seekToCacheWindow(consumer, partitions, topicEvents);
             // Bootstrap gets the BOOTSTRAP budget: a broker that answers in 10s is slow, not broken, and
             // must bootstrap rather than crash-loop. The 2s refresh budget applies only inside the poll
@@ -13297,12 +13302,24 @@ public class FeedGatewayService implements ReplayRunner {
                    would then see nothing pending and could freeze without ever replaying the newest log
                    (round 18). Its own barrier and view drop still stand; this pass simply ends. */
                 if (!clearRehydrateIfCurrent(generation)) return false;
+                // The replay reads the NEW log, so it is named before it starts, for the same reason the
+                // bootstrap hydration is: without it both the barrier and the freeze could sample an id
+                // only after a second recreation had already mixed the view (round 25).
+                if (!bindEsAuctionIncarnation(owned)) return false;
+                esAuctionReplayTopicId = esAuctionTopicId;
                 System.out.println("es-auction: re-reading the retained log of the new incarnation before any hello");
             } catch (RuntimeException retryable) {
                 return false;   // the hello stays held; the next loop iteration tries again
             }
         }
         if (esAuctionRehydrateBarrier.isEmpty()) return true;
+        // The replay must FINISH on the incarnation it started on. A recreation part-way through leaves the
+        // view holding rows of two different logs, and the barrier offsets belong to neither (round 25).
+        org.apache.kafka.common.Uuid startedOn = esAuctionReplayTopicId;
+        if (startedOn != null && !startedOn.equals(esAuctionTopicIdReader.apply(topic))) {
+            esAuctionForgetIncarnation("the topic was recreated again while its retained log was being replayed");
+            return false;
+        }
         for (Map.Entry<TopicPartition, Long> e : esAuctionRehydrateBarrier.entrySet()) {
             long at;
             try { at = consumer.position(e.getKey()); } catch (RuntimeException retryable) { return false; }
@@ -13329,6 +13346,26 @@ public class FeedGatewayService implements ReplayRunner {
         org.apache.kafka.common.Uuid seen = esAuctionTopicIdReader.apply(topic);
         if (seen == null) { System.out.println("es-auction: the topic id cannot be read; the frozen handoff stands until it can"); return; }
         if (!seen.equals(known)) esAuctionForgetIncarnation("topic " + topic + " was recreated (" + known + " -> " + seen + ")");
+    }
+
+    /**
+     * Names the auction topic's incarnation if it is not on record, BEFORE anything reads it. Hydration and
+     * the post-invalidation replay both take real time, and until round 25 the id was first sampled only
+     * after they finished — so a recreation during either could be missed entirely and the freeze would
+     * release hellos over a view holding rows of two logs. Returns false when the id cannot be read, which
+     * holds the hello exactly as an unreadable id does everywhere else.
+     */
+    private boolean bindEsAuctionIncarnation(List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return true;
+        String topic = settings.esAuctionTopic();
+        if (partitions.stream().noneMatch(tp -> tp.topic().equals(topic))) return true;
+        if (esAuctionTopicId != null) return true;
+        org.apache.kafka.common.Uuid id = esAuctionTopicIdReader.apply(topic);
+        if (id == null) { System.out.println("es-auction: cannot name the incarnation before hydrating " + topic + "; the hello stays held"); return false; }
+        synchronized (esAuctionIncarnationLock) {
+            if (esAuctionTopicId == null) esAuctionTopicId = id;
+        }
+        return true;
     }
 
     /** Clears the replay request only while {@code generation} is still the current incarnation. */
@@ -13373,6 +13410,7 @@ public class FeedGatewayService implements ReplayRunner {
         synchronized (esAuctionMinutes) { esAuctionDropViewLocked(); }
         esAuctionRehydrate.set(true);
         esAuctionRehydrateBarrier.clear();
+        esAuctionReplayTopicId = null;
         /* Already-connected clients are RE-ARMED. They were told what the OLD log held, and the new log's
            retained prefix is hydrated silently while live resumes at the fresh handoff — so without this a
            connected page keeps the old incarnation's rows and never learns of any minute before that handoff
