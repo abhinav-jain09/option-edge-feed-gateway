@@ -532,8 +532,12 @@ class EsAuctionWiringTest {
         String g = methodBody(source, "void esAuctionForgetIncarnation(");
         assertTrue(g.contains("esAuctionNextOffset.clear()") && g.contains("esAuctionHandoffOffset.clear()")
                 && g.contains("esAuctionTopicId = null") && g.contains("esAuctionHandoffFrozen.set(false)")
-                && g.contains("esAuctionMinutes.clear()") && g.contains("esAuctionEmitted.clear()")
-                && g.contains("esAuctionRehydrate.set(true)"), "nothing from the old incarnation survives");
+                && g.contains("esAuctionDropViewLocked()") && g.contains("esAuctionRehydrate.set(true)")
+                && g.contains("esAuctionGeneration.incrementAndGet()"), "nothing from the old incarnation survives");
+        String d = methodBody(source, "private void esAuctionDropViewLocked(");
+        assertTrue(d.contains("esAuctionMinutes.clear()") && d.contains("esAuctionEmitted.clear()")
+                && d.contains("esAuctionTradeDate = null") && d.contains("esAuctionPrevTradeDate = null"),
+                "the view, the ledger and the retention labels go together");
     }
 
     // ---- round 16: the incarnation binds the capture, and a recreation drops the view ----
@@ -618,6 +622,61 @@ class EsAuctionWiringTest {
         s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
         assertTrue(s.esAuctionHelloReady(), "once the retained log has been re-read the hello is released");
         assertEquals(1, s.esAuctionHandoffCountForTest());
+    }
+
+    // ---- round 17: the freeze and the invalidation run on different threads ----
+
+    /** The capture runs on the CACHE thread and an invalidation on the LIVE one. One landing between the last
+     *  check and the latch used to leave the hello promising a view that had just been dropped. */
+    @Test void anInvalidationRacingTheFreezeLeavesTheLatchOpen() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 0L);
+        org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        // The SECOND read is the one taken after the capture: the live thread invalidates exactly there.
+        s.esAuctionTopicIdReader = t -> { if (calls.incrementAndGet() == 2) s.esAuctionForgetIncarnation("the live thread saw a recreation"); return id; };
+        s.markStateCaughtUpWithoutHandoffForTest();
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertFalse(s.esAuctionHelloReady(), "the latch stays open: the generation moved under the capture");
+    }
+
+    /** The invalidation lands on the live thread while the cache thread is still applying an already-polled
+     *  batch of the OLD log. Those rows must not survive: the seek is the replay boundary and drops the view
+     *  a second time, on the cache thread, where no old-log record can still arrive. */
+    @Test void rowsWrittenAfterTheInvalidationDoNotSurviveTheReplayBoundary() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 3L);
+        org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
+        s.esAuctionTopicIdReader = t -> id;
+        s.markStateCaughtUpForTest();
+        s.esAuctionForgetIncarnation("the topic was recreated");
+        // the tail of the old batch, applied after the clear but before the seek
+        assertTrue(s.upsertEsAuctionMinute(key("2026-09-08", "09:31"), minute("2026-09-08", "09:31", 7, "old")));
+        assertEquals(1, s.esAuctionMinutesCached());
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        assertEquals(0, s.esAuctionMinutesCached(), "the seek drops the view again, so no old row can outlive the replay");
+        assertFalse(s.esAuctionHelloReady());
+    }
+
+    /** The retention labels belong to the old log too: kept, an empty new incarnation advertises the old trade
+     *  date, and a stale `prev` rejects the new log's own retained records as dead-session replays. */
+    @Test void anInvalidationAlsoForgetsTheTradeDatesItWasRetaining() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        assertTrue(s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "thu")));
+        assertTrue(s.upsertEsAuctionMinute(key("2026-09-09", "09:30"), minute("2026-09-09", "09:30", 0, "fri")));
+        assertEquals("2026-09-09", s.esAuctionTradeDate());
+        assertEquals(FeedGatewayService.EsAuctionUpsert.DROPPED, s.upsertEsAuctionMinuteOutcome(key("2026-09-07", "09:30"), minute("2026-09-07", "09:30", 0, "wed")),
+                "older than `prev` is a dead-session replay while the labels stand");
+        s.esAuctionForgetIncarnation("the topic was recreated");
+        assertNull(s.esAuctionTradeDate(), "the hello must not advertise the old log's trade date");
+        assertEquals("{\"tradeDate\":null,\"minutes\":0,\"lastMinute\":null}", s.esAuctionHelloJson());
+        assertTrue(s.upsertEsAuctionMinute(key("2026-09-07", "09:30"), minute("2026-09-07", "09:30", 0, "wed")),
+                "the new log's own retained records are not judged against the old log's `prev`");
     }
 
     @Test void foreignShapesNeverPoisonTheView() {

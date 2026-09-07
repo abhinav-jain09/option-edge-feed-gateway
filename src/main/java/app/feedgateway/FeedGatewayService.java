@@ -661,6 +661,12 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicBoolean esAuctionRehydrate = new AtomicBoolean(false);
     /** While non-empty, the freeze is refused: each auction partition must reach this end offset first. */
     private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionRehydrateBarrier = new java.util.concurrent.ConcurrentHashMap<>();
+    /** The freeze runs on the CACHE consumer's thread and an invalidation on the LIVE one. Without a shared
+     *  monitor an invalidation landing between the last check and the latch would leave the hello promising a
+     *  view that had just been dropped, so the generation is read at the start of a capture pass and confirmed
+     *  under this lock before the latch closes (code review round 17). */
+    private final Object esAuctionIncarnationLock = new Object();
+    private final java.util.concurrent.atomic.AtomicLong esAuctionGeneration = new java.util.concurrent.atomic.AtomicLong();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -13124,6 +13130,7 @@ public class FeedGatewayService implements ReplayRunner {
      */
     void tryFreezeEsAuctionHandoff(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions) {
         if (!settings.esAuctionEnabled() || !stateCaughtUp.get()) return;
+        long generation = esAuctionGeneration.get();
         if (!esAuctionRehydrated(consumer, partitions)) return;
         // The latch is not permanent: an auction partition ADDED after the freeze has no handoff, so
         // readiness no longer covers every current partition. Reopen it and hold new sockets until the
@@ -13160,10 +13167,16 @@ public class FeedGatewayService implements ReplayRunner {
            missing-handoff check above reopens the latch the moment a partition appears (round 13). */
         if (!complete) return;
         // ...and confirmed unchanged after: a capture that straddled a recreation belongs to neither log.
+        // Read OUTSIDE the lock — it is a broker round trip, and an invalidation must never wait on one.
         org.apache.kafka.common.Uuid after = esAuctionTopicIdReader.apply(topic);
-        if (after == null || !after.equals(id)) { esAuctionForgetIncarnation("the topic id changed while the handoff was being captured"); return; }
-        esAuctionHandoffFrozen.set(true);
-        flushEsAuctionHellos();
+        synchronized (esAuctionIncarnationLock) {
+            if (esAuctionGeneration.get() != generation) { System.out.println("es-auction: the incarnation was invalidated while the handoff was being captured; nothing is frozen"); return; }
+            if (after == null || !after.equals(id)) { esAuctionForgetIncarnation("the topic id changed while the handoff was being captured"); return; }
+            esAuctionHandoffFrozen.set(true);
+        }
+        // Outside the lock: a slow socket must not block an invalidation. The latch is re-read because an
+        // invalidation between the two reopens it, and the hello then waits for the next capture.
+        if (esAuctionHandoffFrozen.get()) flushEsAuctionHellos();
     }
 
     /** Sends the auction hello to every socket that connected before the view had hydrated. */
@@ -13184,6 +13197,12 @@ public class FeedGatewayService implements ReplayRunner {
                 Map<TopicPartition, Long> end = consumer.endOffsets(owned, Duration.ofSeconds(10));
                 esAuctionRehydrateBarrier.clear();
                 for (TopicPartition tp : owned) { consumer.seek(tp, beginning.get(tp)); esAuctionRehydrateBarrier.put(tp, end.get(tp)); }
+                /* THE REPLAY BOUNDARY. The invalidation runs on the LIVE thread and can land while this thread
+                   is still applying an already-polled batch of the OLD log; those rows would be written back
+                   after that clear and would then survive the new log's replay, where a stale correctionRev can
+                   supersede a valid new record. The seek is the first instant at which no old-log record can
+                   still arrive on this thread, so the view is dropped again HERE (code review round 17). */
+                synchronized (esAuctionMinutes) { esAuctionDropViewLocked(); }
                 esAuctionRehydrate.set(false);
                 System.out.println("es-auction: re-reading the retained log of the new incarnation before any hello");
             } catch (RuntimeException retryable) {
@@ -13219,6 +13238,8 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** Invalidates every auction cursor and reopens the latch: the topic this gateway knew is gone. */
     void esAuctionForgetIncarnation(String why) {
+        synchronized (esAuctionIncarnationLock) {
+        esAuctionGeneration.incrementAndGet();
         esAuctionNextOffset.clear();
         esAuctionHandoffOffset.clear();
         esAuctionTopicId = null;
@@ -13227,13 +13248,21 @@ public class FeedGatewayService implements ReplayRunner {
            backfill as if they were this incarnation's, and a key the new log reuses at the same or a lower
            correctionRev would be suppressed as already broadcast — the row would never reach a socket
            (round 16). The whole retained log is re-read before the hello is released again. */
-        synchronized (esAuctionMinutes) {
-            esAuctionMinutes.clear();
-            esAuctionEmitted.clear();
-        }
+        synchronized (esAuctionMinutes) { esAuctionDropViewLocked(); }
         esAuctionRehydrate.set(true);
         esAuctionRehydrateBarrier.clear();
         System.out.println("es-auction: " + why + " — every cursor dropped, the hello waits for a fresh handoff");
+        }
+    }
+
+    /** Empties the view, the emission ledger AND the retention labels (caller holds the view lock). Leaving
+     *  the trade dates behind would make an empty new incarnation advertise the OLD date in its hello, and a
+     *  stale `prev` would reject retained records of the new log as dead-session replays (round 17). */
+    private void esAuctionDropViewLocked() {
+        esAuctionMinutes.clear();
+        esAuctionEmitted.clear();
+        esAuctionTradeDate = null;
+        esAuctionPrevTradeDate = null;
     }
 
     void flushEsAuctionHellos() {
