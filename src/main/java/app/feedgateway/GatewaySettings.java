@@ -1281,6 +1281,32 @@ public final class GatewaySettings {
         return longValue("GATEWAY_DIRECTION_TTL_MS", 180_000L, 0L);
     }
 
+    /** A4: the push state CURRENT topic (one record per symbol), its alerts (delete-retained) and its scorecard. */
+    public String directionPushTopic() {
+        return value("KAFKA_DIRECTION_PUSH_TOPIC", "context-tape.direction.push");
+    }
+
+    public String directionAlertTopic() {
+        return value("KAFKA_DIRECTION_ALERT_TOPIC", "context-tape.direction.alert");
+    }
+
+    public String directionScorecardTopic() {
+        return value("KAFKA_DIRECTION_SCORECARD_TOPIC", "context-tape.direction.scorecard");
+    }
+
+    /** A4.8: a push state is current for 30 s on BOTH its stamps; an alert for 60 s; a scorecard for 15 min. */
+    public long directionPushTtlMs() {
+        return longValue("GATEWAY_DIRECTION_PUSH_TTL_MS", 30_000L, 0L);
+    }
+
+    public long directionAlertTtlMs() {
+        return longValue("GATEWAY_DIRECTION_ALERT_TTL_MS", 60_000L, 0L);
+    }
+
+    public long directionScorecardTtlMs() {
+        return longValue("GATEWAY_DIRECTION_SCORECARD_TTL_MS", 900_000L, 0L);
+    }
+
     /**
      * Compacted IV-vs-realised topic of the standalone vol-premium service (JSON
      * {@code IvRvReading} &mdash; see {@link VolPremiumTopics#IVRV}). One record per

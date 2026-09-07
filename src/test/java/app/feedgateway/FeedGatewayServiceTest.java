@@ -3205,6 +3205,42 @@ class FeedGatewayServiceTest {
         assertEquals(-1L, eventCacheTimestamp(service, "direction", futureRecord), "an implausibly future stamp fails closed");
     }
 
+    @Test
+    void directionPushIsFreshOnlyWhileBothStampsAreInsideTheWindow_andAlertsKeyByAlertId() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("context-tape.direction.push", settings.directionPushTopic());
+        assertEquals("context-tape.direction.alert", settings.directionAlertTopic());
+        assertEquals("context-tape.direction.scorecard", settings.directionScorecardTopic());
+        assertEquals(30_000L, settings.directionPushTtlMs());
+        assertEquals(60_000L, settings.directionAlertTtlMs());
+        for (String ev : java.util.List.of("direction-push", "direction-alert", "direction-scorecard")) {
+            assertTrue(FeedGatewayService.isGlobalBroadcastEvent(ev), ev);
+        }
+        long now = System.currentTimeMillis();
+        // fresh publish stamp but an OLD event time: the older stamp decides — stale
+        String backlog = "{\"symbol\":\"SPX\",\"slice\":\"COMMISSIONING_SHADOW\",\"actionable\":false,\"ts\":" + (now - 1_000L)
+                + ",\"eventTMs\":" + (now - 45_000L) + ",\"state\":\"EXHAUSTED\"}";
+        ConsumerRecord<String, String> r1 = recordAt(settings.directionPushTopic(), 0, 1L, "SPX", backlog, now);
+        assertEquals(now - 45_000L, eventCacheTimestamp(service, "direction-push", r1));
+        assertTrue(isExpired(service, "direction-push", now - 45_000L, now), "45 s old event time is STALE on the 30 s window");
+        assertFalse(isExpired(service, "direction-push", now - 20_000L, now));
+        String fresh = backlog.replace("\"eventTMs\":" + (now - 45_000L), "\"eventTMs\":" + (now - 2_000L));
+        ConsumerRecord<String, String> r2 = recordAt(settings.directionPushTopic(), 0, 2L, "SPX", fresh, now);
+        assertEquals(now - 2_000L, eventCacheTimestamp(service, "direction-push", r2));
+        assertEquals("DATABENTO|SPX", updateCache(service, topicBinding("DATABENTO", "direction-push"), r2, fresh));
+        // a record missing either stamp never caches
+        String noEvent = "{\"symbol\":\"SPX\",\"ts\":" + now + "}";
+        assertEquals(-1L, eventCacheTimestamp(service, "direction-push", recordAt(settings.directionPushTopic(), 0, 3L, "SPX", noEvent, now)));
+        // alerts: keyed by alertId, 60 s on ts
+        String alert = "{\"symbol\":\"SPX\",\"alertId\":\"pushalert|c1\",\"alertClass\":\"PUSH_EXHAUSTED\",\"ts\":" + (now - 500L) + ",\"eventTMs\":" + (now - 2_500L) + "}";
+        ConsumerRecord<String, String> a1 = recordAt(settings.directionAlertTopic(), 0, 1L, "SPX|c1", alert, now);
+        assertEquals("DATABENTO|pushalert|c1", updateCache(service, topicBinding("DATABENTO", "direction-alert"), a1, alert));
+        assertEquals(now - 500L, eventCacheTimestamp(service, "direction-alert", a1));
+        assertTrue(isExpired(service, "direction-alert", now - 61_000L, now));
+        assertFalse(isExpired(service, "direction-alert", now - 59_000L, now));
+    }
+
     // ----- gamma-leadership CURRENT reading relay ---------------------------------------------------
 
     @Test
