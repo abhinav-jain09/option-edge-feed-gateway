@@ -141,7 +141,9 @@ class EsAuctionWiringTest {
         int direct = source.indexOf("if (\"es-auction\".equals(binding.event()))");
         int generic = source.indexOf("String cacheKey = updateCache(binding, record, json);", direct);
         assertTrue(direct >= 0 && generic > direct, "the branch precedes the generic cache-key gate");
-        assertTrue(source.substring(direct, generic).contains("onEsAuctionRecord(record.key()"),
+        assertTrue(source.substring(direct, generic).contains("applyEsAuctionRecordIfCurrent(binding, record, json)"),
+                "the live branch routes to the incarnation-checked apply");
+        assertTrue(methodBody(source, "private void applyEsAuctionRecordIfCurrent(").contains("onEsAuctionRecord(record.key()"),
                 "the handler is fed the KAFKA KEY (tradeDate|HH:mm) — the record's identity");
         // Not coalescable: every minute (and every correction) is a distinct record that must be delivered.
         int setStart = source.indexOf("COALESCABLE_EVENTS = Set.of(");
@@ -232,8 +234,11 @@ class EsAuctionWiringTest {
         int liveNext = source.indexOf("continue;", liveBranch);
         assertTrue(liveLoop >= 0 && liveBranch > liveLoop && liveNext > liveBranch);
         String liveBody = source.substring(liveBranch, liveNext);
-        assertTrue(liveBody.contains("onEsAuctionRecord(record.key()"));
+        assertTrue(liveBody.contains("applyEsAuctionRecordIfCurrent(binding, record, json)"), "the live branch routes to the broadcasting apply");
         assertFalse(liveBody.contains("onEsAuctionCacheRecord("));
+        String apply = methodBody(source, "private void applyEsAuctionRecordIfCurrent(");
+        assertTrue(apply.contains("onEsAuctionRecord(record.key()") && !apply.contains("onEsAuctionCacheRecord("),
+                "and that apply is the BROADCASTING handler, not the silent hydration one");
     }
 
     @Test void hydrationThenLiveUpdateForTheSameMinuteKeepsTheHigherCorrectionRev() throws Exception {
@@ -487,8 +492,12 @@ class EsAuctionWiringTest {
         int liveBranch = source.indexOf("if (\"es-auction\".equals(binding.event())) {");
         String branch = source.substring(liveBranch, liveBranch + 1600);
         assertTrue(branch.indexOf("noteCvdSpxLevelsProgress(binding, record)") < branch.indexOf("continue;"), "(a) recorded BEFORE the branch continues");
-        assertTrue(branch.indexOf("esAuctionRecordIsCurrent(record)") < branch.indexOf("onEsAuctionRecord("),
+        assertTrue(branch.contains("applyEsAuctionRecordIfCurrent(binding, record, json)"),
                 "(a) and only for a record of the incarnation this partition is reading (round 22)");
+        String apply = methodBody(source, "private void applyEsAuctionRecordIfCurrent(");
+        assertTrue(apply.indexOf("synchronized (esAuctionIncarnationLock)") < apply.indexOf("onEsAuctionRecord(")
+                && apply.indexOf("onEsAuctionRecord(") < apply.indexOf("noteCvdSpxLevelsProgress("),
+                "(a) the check, the apply and the cursor are ONE step under the incarnation lock (round 23)");
 
         int liveOnce = source.indexOf("private void runLiveConsumerOnce(");
         String live = source.substring(liveOnce, liveOnce + 2000);

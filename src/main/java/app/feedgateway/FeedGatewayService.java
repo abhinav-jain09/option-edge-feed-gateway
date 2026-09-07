@@ -3222,11 +3222,10 @@ public class FeedGatewayService implements ReplayRunner {
                         // selection-gated). Clients apply the same latest-correctionRev-per-minute
                         // rule, so at-least-once delivery is invisible downstream.
                         // A record of a superseded incarnation is dropped whole: applying it would put an
-                        // old log's minute into the fresh view and put it on the wire (round 22).
-                        if (esAuctionRecordIsCurrent(record)) {
-                            onEsAuctionRecord(record.key() == null ? null : String.valueOf(record.key()), json);
-                            noteCvdSpxLevelsProgress(binding, record);   // the cursor a retry resumes from
-                        }
+                        // old log's minute into the fresh view and put it on the wire (round 22). The check,
+                        // the apply and the cursor are ONE step under the incarnation lock, so an invalidation
+                        // linearizes strictly before or strictly after the whole record (round 23).
+                        applyEsAuctionRecordIfCurrent(binding, record, json);
                         continue;
                     }
                     if ("es-aggressor-flow".equals(binding.event())) {
@@ -10761,12 +10760,20 @@ public class FeedGatewayService implements ReplayRunner {
         seekCvdSpxLevelsWithin(consumer, owned, handoff, null);
     }
 
-    /** Whether this live record belongs to the incarnation its partition is currently positioned on. */
-    private boolean esAuctionRecordIsCurrent(ConsumerRecord<String, ?> record) {
+    /**
+     * Applies ONE live auction record, but only while its partition is still reading the incarnation it was
+     * positioned under — and the check, the keyed upsert, the broadcast and the cursor are one step under
+     * `esAuctionIncarnationLock`, the monitor an invalidation also holds for its whole body. Checked and then
+     * applied separately, an invalidation could land in between and this already-polled record of the OLD log
+     * would be inserted into the FRESH view and broadcast (code review round 23).
+     */
+    private void applyEsAuctionRecordIfCurrent(TopicBinding binding, ConsumerRecord<String, Object> record, String json) {
         TopicPartition tp = new TopicPartition(record.topic(), record.partition());
         synchronized (esAuctionIncarnationLock) {
             Long positionedUnder = esAuctionCursorGeneration.get(tp);
-            return positionedUnder != null && positionedUnder == esAuctionGeneration.get();
+            if (positionedUnder == null || positionedUnder != esAuctionGeneration.get()) return;
+            onEsAuctionRecord(record.key() == null ? null : String.valueOf(record.key()), json);
+            noteCvdSpxLevelsProgress(binding, record);   // the cursor a retry resumes from
         }
     }
 
@@ -10804,6 +10811,8 @@ public class FeedGatewayService implements ReplayRunner {
             /* Only while this partition is still reading the incarnation it was positioned under. A record
                from a batch polled before an invalidation would otherwise repopulate the cleared map with an
                offset from the OLD log, and that cursor then outranks the fresh handoff (round 22). */
+            /* The caller already holds `esAuctionIncarnationLock` on the live path (the lock is reentrant),
+               which is what makes the check and this write one step with the apply. */
             synchronized (esAuctionIncarnationLock) {
                 Long positionedUnder = esAuctionCursorGeneration.get(tp);
                 if (positionedUnder != null && positionedUnder == esAuctionGeneration.get()) esAuctionNextOffset.put(tp, record.offset() + 1);
