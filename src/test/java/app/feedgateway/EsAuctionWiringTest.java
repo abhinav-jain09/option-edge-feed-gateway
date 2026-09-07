@@ -201,7 +201,7 @@ class EsAuctionWiringTest {
         int handler = source.indexOf("void onEsAuctionCacheRecord(String key, String json)");
         int handlerEnd = source.indexOf("\n    }", handler);
         String handlerBody = source.substring(handler, handlerEnd);
-        assertTrue(handlerBody.contains("upsertEsAuctionMinute(key, json);"));
+        assertTrue(handlerBody.contains("upsertEsAuctionMinuteOutcome(key, json, false)"), "the cache path applies the record with live=false, so it can never emit or mark a record as emitted");
         assertFalse(handlerBody.contains("broadcast(") || handlerBody.contains("incrementAndGet()"));
     }
 
@@ -350,6 +350,30 @@ class EsAuctionWiringTest {
         s.onEsAuctionRecord(key("2026-09-04", "09:30"), minute("2026-09-04", "09:30", 0, "thu"));      // dead session: dropped, not broadcast
         assertEquals(4, sink.size(), "replayed duplicates and dead-session records stay off the wire");
         assertEquals(4, s.esAuctionMinutesCached());
+    }
+
+    @Test void aMinuteTheCacheConsumerSeesFirstIsStillBroadcastToThePages() throws Exception {
+        // Code review round 2: the cache consumer keeps polling after hydration and races the live path
+        // on every new offset. Gating the broadcast on the VIEW outcome dropped such a minute from every
+        // connected page, because the live copy looked like a duplicate. The emitted ledger is the gate.
+        var s = service();
+        s.runOutboundWritesInline();
+        List<String> sink = new ArrayList<>();
+        s.addClient(socket("s1", sink));
+        sink.clear();
+        String payload = minute("2026-09-08", "09:30", 0, "raced");
+        s.onEsAuctionCacheRecord(key("2026-09-08", "09:30"), payload);   // the cache consumer got there first
+        assertEquals(0, sink.size(), "hydration never broadcasts");
+        s.onEsAuctionRecord(key("2026-09-08", "09:30"), payload);        // the live consumer sees the same record
+        assertEquals(List.of("{\"type\":\"es-auction\",\"data\":" + payload + "}"), sink, "the pages still receive it");
+        s.onEsAuctionRecord(key("2026-09-08", "09:30"), payload);        // a retry replay of the very same record
+        assertEquals(1, sink.size(), "and only once");
+        // A newer correction the cache consumer also saw first still reaches the wire.
+        String corrected = minute("2026-09-08", "09:30", 1, "raced-r1");
+        s.onEsAuctionCacheRecord(key("2026-09-08", "09:30"), corrected);
+        s.onEsAuctionRecord(key("2026-09-08", "09:30"), corrected);
+        assertEquals(2, sink.size());
+        assertTrue(sink.get(1).contains("raced-r1"));
     }
 
     @Test void foreignShapesNeverPoisonTheView() {

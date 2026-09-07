@@ -9749,6 +9749,10 @@ public class FeedGatewayService implements ReplayRunner {
      * prefix range and pages come out in minute order for free.
      */
     private final java.util.TreeMap<String, String> esAuctionMinutes = new java.util.TreeMap<>();
+    /** minute key -> the highest correctionRev already BROADCAST for it. Separate from the view on purpose:
+     *  the cache consumer fills the view without emitting, so "is it in the view" cannot answer "have the
+     *  clients seen it". Pruned to the view's own keys, so it is bounded by the same retention. */
+    private final java.util.HashMap<String, Long> esAuctionEmitted = new java.util.HashMap<>();
     /** The newest trade date the view has seen (the "current" one); null until the first record. */
     private volatile String esAuctionTradeDate;
     /** The trade date the current one rolled forward FROM; retained so late corrections still land. */
@@ -9764,13 +9768,14 @@ public class FeedGatewayService implements ReplayRunner {
      */
     void onEsAuctionRecord(String key, String json) {
         esAuctionRecords.incrementAndGet();
-        // IDEMPOTENT wire: only a record the view accepted as NEW or as a NEWER correction reaches
-        // the clients. A consumer retry re-seeks the topic (the same seek-back the restart
-        // hydration uses) and replays sessions of minutes the pages already hold; without this
-        // rule every such replay duplicated them on every socket. A superseded correction and a
-        // dead-session record are likewise never broadcast (code review round 1).
-        EsAuctionUpsert outcome = upsertEsAuctionMinuteOutcome(key, json);
-        if (outcome == EsAuctionUpsert.NEW || outcome == EsAuctionUpsert.REPLACED) {
+        // IDEMPOTENT wire, decided by what the CLIENTS have been sent — not by what the view happens
+        // to hold. The cache consumer keeps polling after hydration and races this path on every new
+        // offset (code review round 2): if it upserts a minute first, the view calls the live copy a
+        // DUPLICATE, and gating the broadcast on the view outcome would silently drop that minute
+        // from every connected page. The emitted ledger is the gate instead: a record goes out once
+        // per (minute, correctionRev), so a consumer retry's replay is still silent, while a minute
+        // the cache consumer happened to see first is still delivered.
+        if (upsertEsAuctionMinuteOutcome(key, json, true)) {
             broadcast("es-auction", json);
             forwardedEvents.incrementAndGet();
         }
@@ -9788,7 +9793,7 @@ public class FeedGatewayService implements ReplayRunner {
      * silently. Order-independent with the live path by construction: both feed one keyed rule.
      */
     void onEsAuctionCacheRecord(String key, String json) {
-        upsertEsAuctionMinute(key, json);
+        upsertEsAuctionMinuteOutcome(key, json, false);   // hydration only: never emits, never marks a record as emitted
     }
 
     /**
@@ -9805,18 +9810,32 @@ public class FeedGatewayService implements ReplayRunner {
         return o == EsAuctionUpsert.NEW || o == EsAuctionUpsert.REPLACED || o == EsAuctionUpsert.DUPLICATE;
     }
 
+    /** Applies the record to the view without touching the emitted ledger (the tests' plain entry point). */
     EsAuctionUpsert upsertEsAuctionMinuteOutcome(String key, String json) {
+        EsAuctionUpsert[] seen = new EsAuctionUpsert[1];
+        upsertEsAuctionMinuteOutcome(key, json, false, seen);
+        return seen[0];
+    }
+
+    /** @return true when this record must reach the wire: it is the view's current copy of its minute
+     *  AND no record for that minute at this correctionRev has been broadcast yet. */
+    private boolean upsertEsAuctionMinuteOutcome(String key, String json, boolean live) {
+        return upsertEsAuctionMinuteOutcome(key, json, live, new EsAuctionUpsert[1]);
+    }
+
+    private boolean upsertEsAuctionMinuteOutcome(String key, String json, boolean live, EsAuctionUpsert[] outcome) {
         String tradeDate = null;
         String minute = null;
         long rev = 0L;
         try {
             JsonNode root = mapper.readTree(json);
-            if (root == null || !root.isObject()) return EsAuctionUpsert.DROPPED;
+            if (root == null || !root.isObject()) { outcome[0] = EsAuctionUpsert.DROPPED; return false; }
             tradeDate = text(root, "tradeDate");
             minute = text(root, "minute");
             rev = longField(root, "correctionRev", 0L);
         } catch (JsonProcessingException e) {
-            return EsAuctionUpsert.DROPPED;
+            outcome[0] = EsAuctionUpsert.DROPPED;
+            return false;
         }
         if (key != null) {
             // The Kafka key is the contract's identity; the payload fields are only a fallback
@@ -9827,7 +9846,7 @@ public class FeedGatewayService implements ReplayRunner {
                 minute = key.substring(sep + 1).trim();
             }
         }
-        if (tradeDate == null || tradeDate.isEmpty() || minute == null || minute.isEmpty()) return EsAuctionUpsert.DROPPED;
+        if (tradeDate == null || tradeDate.isEmpty() || minute == null || minute.isEmpty()) { outcome[0] = EsAuctionUpsert.DROPPED; return false; }
         String viewKey = tradeDate + "|" + minute;
         synchronized (esAuctionMinutes) {
             // ORDER-INDEPENDENT retention: the view holds the two GREATEST trade dates it has seen,
@@ -9836,17 +9855,27 @@ public class FeedGatewayService implements ReplayRunner {
             // retained date is a dead-session record and is dropped, never resurrected.
             String prev = esAuctionPrevTradeDate;
             if (prev != null && tradeDate.compareTo(prev) < 0) {
-                return EsAuctionUpsert.DROPPED;
+                outcome[0] = EsAuctionUpsert.DROPPED;
+                return false;                                                  // dead-session record
             }
             String existing = esAuctionMinutes.get(viewKey);
+            boolean duplicate = false;
             if (existing != null) {
                 long existingRev = esAuctionCorrectionRev(existing);
-                if (existingRev > rev) return EsAuctionUpsert.DROPPED;          // superseded correction
-                if (existingRev == rev && existing.equals(json)) return EsAuctionUpsert.DUPLICATE;   // a re-emission: the view is unchanged, nothing new for the wire
+                if (existingRev > rev) { outcome[0] = EsAuctionUpsert.DROPPED; return false; }   // superseded correction
+                duplicate = existingRev == rev && existing.equals(json);
             }
-            esAuctionMinutes.put(viewKey, json);
-            esAuctionRecomputeRetentionLocked();
-            return existing == null ? EsAuctionUpsert.NEW : EsAuctionUpsert.REPLACED;
+            if (!duplicate) {
+                esAuctionMinutes.put(viewKey, json);
+                esAuctionRecomputeRetentionLocked();
+            }
+            outcome[0] = duplicate ? EsAuctionUpsert.DUPLICATE : existing == null ? EsAuctionUpsert.NEW : EsAuctionUpsert.REPLACED;
+            if (!live) return false;
+            Long emitted = esAuctionEmitted.get(viewKey);
+            if (emitted != null && emitted >= rev) return false;               // already on the wire at this revision
+            esAuctionEmitted.put(viewKey, rev);
+            esAuctionEmitted.keySet().retainAll(esAuctionMinutes.keySet());    // the ledger follows the view's retention
+            return true;
         }
     }
 
