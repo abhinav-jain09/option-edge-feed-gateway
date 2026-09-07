@@ -452,29 +452,9 @@ class EsAuctionWiringTest {
         // Replayed on the live path those minutes would all pass the emitted ledger and be broadcast.
         int live = source.indexOf("private void runLiveConsumerOnce(");
         String body = source.substring(live, live + 1400);
-        assertTrue(body.contains("resumeEsAuction(consumer, partitions)"), "the live retry takes the auction off the generic cache-window seek");
-        int resume = source.indexOf("private void resumeEsAuction(");
-        assertTrue(resume > 0 && source.substring(resume, resume + 500).contains("seekEsAuctionWithin(consumer, tp)"), "resuming per partition (round 6)");
+        assertTrue(body.contains("positionEsAuction(consumer, partitions)"), "the live retry takes the auction off the generic cache-window seek");
     }
 
-    @Test void aLiveRetryResumesTheAuctionCursorAndADiscoveredPartitionIsRecovered() throws Exception {
-        // Code review round 6: seeking to END on every retry drops whatever was produced during the gap —
-        // the cache consumer hydrates it silently and the pages, already helloed, never backfill again.
-        String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
-        int note = source.indexOf("private void noteCvdSpxLevelsProgress(");
-        assertTrue(source.substring(note, note + 700).contains("esAuctionNextOffset.put("), "the live path records a per-partition cursor");
-        int resume = source.indexOf("private void resumeEsAuction(");
-        String body = source.substring(resume, resume + 500);
-        assertTrue(body.contains("seekEsAuctionWithin(consumer, tp)"), "the retry resumes per partition");
-        assertFalse(body.contains("consumer.seekToEnd(owned)"), "and no longer seeks the whole topic to END");
-        int within = source.indexOf("private void seekEsAuctionWithin(");
-        String w = source.substring(within, within + 900);
-        assertTrue(w.contains("seekEsAuctionWithinAt(consumer, owned, cursor)"), "the cursor is honoured; END only without one (round 7 moved the clamping into seekEsAuctionWithinAt)");
-        // A partition discovered after startup recovers rather than jumping to END.
-        int refresh = source.indexOf("List<TopicPartition> recoverEsAuction = new ArrayList<>();");
-        assertTrue(refresh > 0, "the discovery path has an auction bucket");
-        assertTrue(source.contains("recoverEsAuction.add(partition)") && source.contains("consumer.seekToBeginning(List.of(p))"));
-    }
 
 
 
@@ -496,13 +476,19 @@ class EsAuctionWiringTest {
 
         int liveOnce = source.indexOf("private void runLiveConsumerOnce(");
         String live = source.substring(liveOnce, liveOnce + 2000);
-        assertTrue(live.contains("pauseEsAuctionUntilHandoff(consumer, partitions)"), "(b) the cold start pauses the auction");
-        assertTrue(live.contains("resumeEsAuctionOnceHandoffExists(consumer, partitions)"), "(b) and resumes it inside the poll loop");
-        int pause = source.indexOf("private void pauseEsAuctionUntilHandoff(");
-        assertTrue(source.substring(pause, pause + 700).contains("consumer.pause(owned)"), "(b) actually paused");
+        assertEquals(2, live.split("positionEsAuction\\(consumer, partitions\\)", -1).length - 1, "(b) ONE rule on BOTH the cold start and the retry");
+        assertTrue(live.contains("resumeEsAuctionOnceHandoffExists(consumer, partitions)"), "(b) paused partitions are positioned inside the poll loop");
+        int pos = source.indexOf("private void positionEsAuction(");
+        String pb = source.substring(pos, pos + 1100);
+        assertTrue(pb.indexOf("esAuctionNextOffset.get(tp)") < pb.indexOf("esAuctionHandoffOffset.get(tp)"), "(b) the live cursor first, then the frozen handoff");
+        assertTrue(pb.contains("consumer.pause(pause)"), "(b) and with neither, PAUSE rather than guess");
         int resume = source.indexOf("private void resumeEsAuctionOnceHandoffExists(");
         String r = source.substring(resume, resume + 900);
         assertTrue(r.contains("esAuctionHandoffOffset.get(tp)") && r.contains("seekEsAuctionWithinAt(consumer, tp, handoff)") && r.contains("consumer.resume("), "(b) positioned exactly, then resumed");
+        // (d) a socket arriving while the capture is incomplete is HELD: readiness is the frozen handoff.
+        int connect = source.indexOf("if (settings.esAuctionEnabled()) {");
+        String cb = source.substring(connect, connect + 1400);
+        assertTrue(cb.contains("if (esAuctionHandoffFrozen.get()) {"), "(d) connect gates on the frozen handoff");
 
         int freeze = source.indexOf("void tryFreezeEsAuctionHandoff(");
         String f = source.substring(freeze, freeze + 1600);

@@ -940,7 +940,7 @@ public class FeedGatewayService implements ReplayRunner {
             // and never learn about the records hydrated afterwards, because the hydration path is
             // deliberately silent. Hold the socket instead — the page buffers live frames until the
             // hello arrives — and flush every held socket the moment hydration completes.
-            if (stateCaughtUp.get()) {
+            if (esAuctionHandoffFrozen.get()) {
                 send(session, "es-auction-hello", esAuctionHelloJson());
             } else {
                 esAuctionHelloPending.add(session);
@@ -948,7 +948,7 @@ public class FeedGatewayService implements ReplayRunner {
                 // an empty set and leaving this socket pending forever. Re-check after inserting; the
                 // remove() that returns true is the one that owns the send, so a concurrent flush and this
                 // recheck cannot both deliver it (code review round 4).
-                if (stateCaughtUp.get() && esAuctionHelloPending.remove(session)) {
+                if (esAuctionHandoffFrozen.get() && esAuctionHelloPending.remove(session)) {
                     send(session, "es-auction-hello", esAuctionHelloJson());
                 }
             }
@@ -2656,8 +2656,10 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (!recoverEsAuction.isEmpty()) {
             for (TopicPartition p : recoverEsAuction) {
-                if (esAuctionNextOffset.containsKey(p)) seekEsAuctionWithin(consumer, p);
-                else consumer.seekToBeginning(List.of(p));
+                Long cursor = esAuctionNextOffset.get(p);
+                if (cursor == null) cursor = esAuctionHandoffOffset.get(p);
+                if (cursor != null) seekEsAuctionWithinAt(consumer, p, cursor);
+                else consumer.seekToBeginning(List.of(p));   // newly appeared: take what the topic still retains
             }
         }
         if (!recoverDisplayWindow.isEmpty()) {
@@ -2744,11 +2746,11 @@ public class FeedGatewayService implements ReplayRunner {
             if (retry) {
                 seekToCacheWindow(consumer, partitions, topicEvents);
                 resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
-                resumeEsAuction(consumer, partitions);             // nor the auction's seven-day window
+                positionEsAuction(consumer, partitions);           // never the auction's seven-day window, and never a guess
             } else {
                 consumer.seekToEnd(partitions);
                 seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
-                pauseEsAuctionUntilHandoff(consumer, partitions);  // never consume the auction from a guessed position
+                positionEsAuction(consumer, partitions);           // the same rule as the retry path
             }
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
             while (running.get()) {
@@ -10480,31 +10482,23 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * A live-consumer RETRY must not replay the auction's seven-day cache window. That window belongs to
-     * the CACHE consumer, which fills the view silently; replayed on the LIVE path every one of those
-     * minutes would pass the emitted ledger (hydration deliberately marks nothing as emitted) and be
-     * broadcast to every page as if it were happening now (code review round 5). History is the cache
-     * consumer's job, so the live consumer resumes at the END of the auction partition, exactly as
-     * {@link #resumeCvdSpxLevels} does for the CVD levels topic.
+     * The ONE rule for positioning the auction on the live path, cold start and retry alike: resume where the
+     * LIVE path last was; failing that, where hydration froze; and failing both, do not guess — PAUSE the
+     * partition and let `resumeEsAuctionOnceHandoffExists` position it the moment the handoff appears.
+     * `seekToEnd` is lazy and would otherwise win, skipping whatever was produced in between (round 11).
      */
-    private void resumeEsAuction(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+    private void positionEsAuction(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
         if (!settings.esAuctionEnabled()) return;
         String topic = settings.esAuctionTopic();
-        for (TopicPartition tp : partitions) if (tp.topic().equals(topic)) seekEsAuctionWithin(consumer, tp);
-    }
-
-    /**
-     * Cold start: the auction partitions are PAUSED until their handoff exists. `seekToEnd` is lazy — it
-     * resolves at the next poll — so a live consumer that started before hydration froze could resolve END
-     * AFTER the cache barrier and skip everything in between, which the cache then swallowed silently
-     * (code review round 10). Paused, it consumes nothing until it can be positioned exactly.
-     */
-    private void pauseEsAuctionUntilHandoff(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
-        if (!settings.esAuctionEnabled()) return;
-        String topic = settings.esAuctionTopic();
-        List<TopicPartition> owned = new java.util.ArrayList<>();
-        for (TopicPartition tp : partitions) if (tp.topic().equals(topic) && !esAuctionHandoffOffset.containsKey(tp)) owned.add(tp);
-        if (!owned.isEmpty()) consumer.pause(owned);
+        List<TopicPartition> pause = new java.util.ArrayList<>();
+        for (TopicPartition tp : partitions) {
+            if (!tp.topic().equals(topic)) continue;
+            Long cursor = esAuctionNextOffset.get(tp);
+            if (cursor == null) cursor = esAuctionHandoffOffset.get(tp);
+            if (cursor == null) { pause.add(tp); continue; }
+            seekEsAuctionWithinAt(consumer, tp, cursor);
+        }
+        if (!pause.isEmpty()) consumer.pause(pause);
     }
 
     /** Positions and resumes each paused auction partition the moment its frozen handoff appears. */
@@ -10520,36 +10514,6 @@ public class FeedGatewayService implements ReplayRunner {
             seekEsAuctionWithinAt(consumer, tp, handoff);
             consumer.resume(List.of(tp));
         }
-    }
-
-    /**
-     * Cold start: begin where the CACHE consumer's hydration reached, not at the end. The cache can finish
-     * hydrating and release the hello before this consumer performs its seek, and a record produced in that
-     * window would then be cached silently and skipped on the wire, so the page that already has its hello
-     * would never see it (code review round 7).
-     */
-    private void seekEsAuctionToHandoff(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
-        if (!settings.esAuctionEnabled()) return;
-        String topic = settings.esAuctionTopic();
-        for (TopicPartition tp : partitions) {
-            if (!tp.topic().equals(topic)) continue;
-            Long handoff = esAuctionHandoffOffset.get(tp);
-            if (handoff == null) continue;                          // still paused; resumed the moment it appears
-            seekEsAuctionWithinAt(consumer, tp, handoff);
-        }
-    }
-
-    /**
-     * Resume this auction partition where the LIVE path last was. Seeking to END would silently skip
-     * every minute produced during the retry gap: the cache consumer would hydrate them, but the pages
-     * have already had their hello and never backfill again, so nothing would ever put them on the wire
-     * (code review round 6). END is used only when there is no cursor, or the cursor has fallen outside
-     * the partition's retained range.
-     */
-    private void seekEsAuctionWithin(KafkaConsumer<?, ?> consumer, TopicPartition owned) {
-        Long cursor = esAuctionNextOffset.get(owned);
-        if (cursor == null || cursor < 0) { consumer.seekToEnd(List.of(owned)); return; }
-        seekEsAuctionWithinAt(consumer, owned, cursor);
     }
 
     /** Seeks to {@code cursor}, clamped to what the partition retains. A failed RANGE QUERY does NOT mean
@@ -12868,13 +12832,14 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
-    /** True once the auction view has hydrated and the hello may be sent on connect. */
-    boolean esAuctionHelloReady() { return stateCaughtUp.get(); }
+    /** True once the auction view has hydrated AND every auction partition has a handoff: only then can a
+     *  hello promise a view the live stream will actually continue from. */
+    boolean esAuctionHelloReady() { return esAuctionHandoffFrozen.get(); }
 
     int esAuctionHelloPendingForTest() { return esAuctionHelloPending.size(); }
 
     /** Test seam: marks the auction view hydrated and releases every held hello, as markCacheCaughtUp does. */
-    void markStateCaughtUpForTest() { stateCaughtUp.set(true); flushEsAuctionHellos(); }
+    void markStateCaughtUpForTest() { stateCaughtUp.set(true); esAuctionHandoffFrozen.set(true); flushEsAuctionHellos(); }
 
     private static String escapeJson(String value) {
         StringBuilder escaped = new StringBuilder();
