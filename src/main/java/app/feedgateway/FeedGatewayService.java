@@ -649,6 +649,13 @@ public class FeedGatewayService implements ReplayRunner {
      *  hello is not released until every auction partition has a value here (code review rounds 8–10). */
     private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionHandoffOffset = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicBoolean esAuctionHandoffFrozen = new AtomicBoolean(false);
+    /** The auction topic's Kafka UUID as it was when the handoff froze. A TopicPartition is only
+     *  (topic, partition), so a recreated topic reuses both and its offsets say nothing: the ID is the
+     *  only sound incarnation identity, and offsets alone cannot see a recreation that has already grown
+     *  past the old cursor (code review round 15). */
+    private volatile org.apache.kafka.common.Uuid esAuctionTopicId;
+    /** Reader seam: the real one is {@code AdminClient.describeTopics(...).topicId()}. */
+    java.util.function.Function<String, org.apache.kafka.common.Uuid> esAuctionTopicIdReader = this::describeTopicId;
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -10802,20 +10809,22 @@ public class FeedGatewayService implements ReplayRunner {
      *  failed SEEK falls back to END (code review round 7). */
     private boolean seekEsAuctionWithinAt(KafkaConsumer<?, ?> consumer, TopicPartition owned, long cursor) {
         List<TopicPartition> one = List.of(owned);
+        // IDENTITY FIRST. Offsets cannot see a recreation that has already grown past the old cursor:
+        // `cursor <= end` would look valid and the consumer would seek into the NEW log, silently skipping
+        // everything before the cursor while hydration stays non-broadcasting (round 15).
+        org.apache.kafka.common.Uuid known = esAuctionTopicId;
+        if (known != null) {
+            org.apache.kafka.common.Uuid now = esAuctionTopicIdReader.apply(owned.topic());
+            if (now != null && !now.equals(known)) { esAuctionForgetIncarnation("topic " + owned.topic() + " was recreated (" + known + " -> " + now + ")"); return false; }
+        }
         try {
             long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
             long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
             if (cursor < beginning) { consumer.seek(owned, beginning); return true; }   // aged out: take what is left
             if (cursor > end) {
-                // A cursor BEYOND the log end is not a position on this topic: it belongs to an earlier
-                // incarnation, because a TopicPartition is only (topic, partition) and a recreated topic
-                // reuses both. Seeking to END here would silently skip everything the new incarnation
-                // already holds, so BOTH cursors are dropped, the latch is reopened so the hello waits for
-                // a fresh capture, and the partition is left unpositioned — the caller pauses it (round 14).
-                esAuctionNextOffset.remove(owned);
-                esAuctionHandoffOffset.remove(owned);
-                esAuctionHandoffFrozen.set(false);
-                System.out.println("es-auction: cursor " + cursor + " is beyond the log end of " + owned + "; the partition was recreated — re-capturing its handoff");
+                // Belt and braces for the case the ID check cannot cover (an unreadable id): a cursor
+                // beyond the log end is not a position on this log at all.
+                esAuctionForgetIncarnation("cursor " + cursor + " is beyond the log end of " + owned);
                 return false;
             }
             consumer.seek(owned, cursor);
@@ -13133,11 +13142,42 @@ public class FeedGatewayService implements ReplayRunner {
            vacuously, so the empty set FREEZES: otherwise every socket would wait for a hello for ever. The
            missing-handoff check above reopens the latch the moment a partition appears (round 13). */
         if (!complete) return;
+        // The incarnation the handoff belongs to. Without it the hello would promise a view whose
+        // continuation cannot be proven, so a topic whose ID cannot be read holds the hello (round 15).
+        org.apache.kafka.common.Uuid id = esAuctionTopicIdReader.apply(settings.esAuctionTopic());
+        if (id == null) { System.out.println("es-auction: cannot read the topic id; the hello stays held"); return; }
+        esAuctionTopicId = id;
         esAuctionHandoffFrozen.set(true);
         flushEsAuctionHellos();
     }
 
     /** Sends the auction hello to every socket that connected before the view had hydrated. */
+    /** {@code AdminClient.describeTopics(topic).topicId()}, or null when it cannot be read. */
+    private org.apache.kafka.common.Uuid describeTopicId(String topic) {
+        java.util.Properties props = new java.util.Properties();
+        props.put(org.apache.kafka.clients.admin.AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, settings.bootstrapServers());
+        props.put(org.apache.kafka.clients.admin.AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, "10000");
+        props.put(org.apache.kafka.clients.admin.AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, "10000");
+        try (org.apache.kafka.clients.admin.AdminClient admin = org.apache.kafka.clients.admin.AdminClient.create(props)) {
+            var d = admin.describeTopics(List.of(topic)).allTopicNames().get(10, TimeUnit.SECONDS).get(topic);
+            return d == null ? null : d.topicId();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Invalidates every auction cursor and reopens the latch: the topic this gateway knew is gone. */
+    private void esAuctionForgetIncarnation(String why) {
+        esAuctionNextOffset.clear();
+        esAuctionHandoffOffset.clear();
+        esAuctionTopicId = null;
+        esAuctionHandoffFrozen.set(false);
+        System.out.println("es-auction: " + why + " — every cursor dropped, the hello waits for a fresh handoff");
+    }
+
     void flushEsAuctionHellos() {
         if (!settings.esAuctionEnabled() || esAuctionHelloPending.isEmpty()) return;
         String hello = esAuctionHelloJson();

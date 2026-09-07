@@ -509,6 +509,31 @@ class EsAuctionWiringTest {
         assertFalse(source.substring(mark, mark + 900).contains("flushEsAuctionHellos()"), "(c) the barrier alone no longer releases the hello");
     }
 
+    @Test void aRecreatedTopicIsRecognisedByItsIdNotByItsOffsets() throws Exception {
+        // Code review round 15: once a recreated topic has grown past the old cursor, `cursor <= end` looks
+        // valid and the consumer seeks into the NEW log, skipping everything before it while hydration stays
+        // non-broadcasting. Only the topic's Kafka UUID identifies the incarnation.
+        var s = service();
+        java.util.List<String> asked = new java.util.ArrayList<>();
+        org.apache.kafka.common.Uuid first = org.apache.kafka.common.Uuid.randomUuid();
+        s.esAuctionTopicIdReader = t -> { asked.add(t); return first; };
+        s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"));
+        s.markStateCaughtUpForTest();
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int freeze = source.indexOf("void tryFreezeEsAuctionHandoff(");
+        String f = source.substring(freeze, freeze + 2600);
+        assertTrue(f.indexOf("esAuctionTopicIdReader.apply") < f.indexOf("esAuctionHandoffFrozen.set(true)"), "the id is recorded BEFORE the latch closes");
+        assertTrue(f.contains("if (id == null)") && f.indexOf("if (id == null)") < f.indexOf("flushEsAuctionHellos()"), "an unreadable id holds the hello");
+        int seek = source.indexOf("private boolean seekEsAuctionWithinAt(");
+        String w = source.substring(seek, seek + 1800);
+        assertTrue(w.indexOf("esAuctionTopicIdReader.apply(owned.topic())") < w.indexOf("beginningOffsets"), "identity is checked BEFORE any offset reasoning");
+        assertTrue(w.contains("esAuctionForgetIncarnation("), "a different id drops every cursor and reopens the latch");
+        int forget = source.indexOf("private void esAuctionForgetIncarnation(");
+        String g = source.substring(forget, forget + 700);
+        assertTrue(g.contains("esAuctionNextOffset.clear()") && g.contains("esAuctionHandoffOffset.clear()")
+                && g.contains("esAuctionTopicId = null") && g.contains("esAuctionHandoffFrozen.set(false)"), "nothing from the old incarnation survives");
+    }
+
     @Test void foreignShapesNeverPoisonTheView() {
         var s = service();
         assertFalse(s.upsertEsAuctionMinute(null, "{\"unrelated\":true}"));
