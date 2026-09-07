@@ -424,6 +424,21 @@ class EsAuctionWiringTest {
         assertTrue(s.auctionMinutesPage("2026-09-08", "", 10).minutes().size() == 1, "no orphan patch entered the view");
     }
 
+    @Test void aSocketThatConnectsExactlyAsHydrationCompletesStillGetsItsHello() throws Exception {
+        // Code review round 4: hydration can complete between the readiness check and the insertion,
+        // flushing an empty set; the socket must not stay pending forever. Whichever side removes it
+        // owns the send, so it is delivered exactly once.
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        s.runOutboundWritesInline();
+        s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"));
+        s.markStateCaughtUpForTest();                       // hydration finished BEFORE this socket arrives
+        List<String> sink = new ArrayList<>();
+        s.addClient(socket("late", sink));
+        assertEquals(1, sink.stream().filter(m -> m.contains("\"type\":\"es-auction-hello\"")).count(), "exactly one hello");
+        assertEquals(0, s.esAuctionHelloPendingForTest(), "nothing left pending");
+    }
+
     @Test void foreignShapesNeverPoisonTheView() {
         var s = service();
         assertFalse(s.upsertEsAuctionMinute(null, "{\"unrelated\":true}"));

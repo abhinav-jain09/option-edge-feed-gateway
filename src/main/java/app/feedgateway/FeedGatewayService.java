@@ -936,6 +936,13 @@ public class FeedGatewayService implements ReplayRunner {
                 send(session, "es-auction-hello", esAuctionHelloJson());
             } else {
                 esAuctionHelloPending.add(session);
+                // LOST WAKEUP: hydration can complete between the check above and the insertion, flushing
+                // an empty set and leaving this socket pending forever. Re-check after inserting; the
+                // remove() that returns true is the one that owns the send, so a concurrent flush and this
+                // recheck cannot both deliver it (code review round 4).
+                if (stateCaughtUp.get() && esAuctionHelloPending.remove(session)) {
+                    send(session, "es-auction-hello", esAuctionHelloJson());
+                }
             }
         }
         // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
@@ -3890,7 +3897,10 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
         if (caughtUpFlag.compareAndSet(false, true)) {
-            flushEsAuctionHellos();
+            // ONLY the state consumer hydrates the auction view. Flushing on any other cache consumer's
+            // catch-up would hand out a hello bounded by a partly hydrated view, and the records that
+            // arrive afterwards are silent by design (code review round 4).
+            if (caughtUpFlag == stateCaughtUp) flushEsAuctionHellos();
             // Run the whole catch-up replay under readyLock so the active selection is STABLE across the
             // capture, the cached-batch build (cachedEvents/uiBatchEnvelopeJson re-read activeSelection),
             // and the readiness commit. Without the lock a concurrent applySelection could swap the active
@@ -12697,8 +12707,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (!settings.esAuctionEnabled() || esAuctionHelloPending.isEmpty()) return;
         String hello = esAuctionHelloJson();
         for (WebSocketSession held : esAuctionHelloPending) {
-            esAuctionHelloPending.remove(held);
-            send(held, "es-auction-hello", hello);
+            if (esAuctionHelloPending.remove(held)) send(held, "es-auction-hello", hello);   // the remover owns the send: exactly once
         }
     }
 
