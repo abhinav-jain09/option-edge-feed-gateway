@@ -23,6 +23,11 @@ Requirement doc per rule.md (doc → Codex review → code).
    (per-event adoption seek plus the footprint END override). G-R11's seam tests drive these against
    a mocked consumer rather than reading source text (CODE round-2 #4).
 
+**Gate-2 CODE: APPROVED** — Codex round 3, 2026-09-07 (`ES-FOOTPRINT-GATEWAY-CODE-CODEX-ROUND3.md`;
+rounds 1–2 produced 5 + 2 findings, every one remediated). G-R1–G-R11 are IMPLEMENTED in
+`FootprintViews`, `FootprintTopicGate`, `FeedGatewayService` and `GatewayController`, behind
+`GATEWAY_ES_FOOTPRINT_ENABLED` (default off).
+
 **Gate-2 DESIGN: APPROVED** — Codex round 10, 2026-09-07 (`ES-FOOTPRINT-GATEWAY-CODEX-ROUND10.md`; rounds
 1–9 produced 7+3+2+2+3+3+3+2+1 findings, every one dispositioned in the change logs below). The code
 change set that implements G-R1–G-R11 carries its own CODE gate (`ES-FOOTPRINT-GATEWAY-CODE-CODEX-ROUND*.md`).
