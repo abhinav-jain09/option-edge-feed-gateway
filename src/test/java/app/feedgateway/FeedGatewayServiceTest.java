@@ -3298,6 +3298,17 @@ class FeedGatewayServiceTest {
             assertTrue(sink.stream().noneMatch(m -> m.contains("pushalert|c1")),
                     path + " leaked the alert payload under another event name; got: " + sink);
         }
+
+        // The two helpers above are what a join calls, but a direct send could also be written into the join wrapper
+        // itself, where an outbound channel makes behavioural capture unreliable in a unit test. So the rule is also
+        // enforced structurally, over the WHOLE service: no join or replay path may address a session with an alert.
+        String src = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        assertEquals(0, src.split("send\\(session, \"direction-alert\"", -1).length - 1,
+                "no path that addresses a single session may send a direction-alert (A4.10)");
+        for (String joinPath : java.util.List.of("public void addClient(WebSocketSession session)",
+                "private void replayCachedToSocket(", "private void replayDirectionPushCached(")) {
+            assertTrue(src.contains(joinPath), joinPath + " moved — this guard no longer covers the join");
+        }
     }
 
     // ----- gamma-leadership CURRENT reading relay ---------------------------------------------------
