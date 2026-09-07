@@ -1,0 +1,208 @@
+package app.feedgateway;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import org.junit.jupiter.api.Test;
+
+/**
+ * ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1/G-R2/G-R3/G-R6/G-R9/G-R10/G-R11 — the wiring-shape pins, the
+ * flag-off identity, the hello field, the admission path both consumers share, and the exact
+ * metrics contract, without a broker.
+ */
+class FootprintWiringTest {
+
+    private static final Path SERVICE = Path.of("src/main/java/app/feedgateway/FeedGatewayService.java");
+    private static final Path CONTROLLER = Path.of("src/main/java/app/feedgateway/GatewayController.java");
+
+    private static FeedGatewayService off() {
+        return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+    }
+
+    static FeedGatewayService on() {
+        FootprintTopicGateTest.FakeReader r = new FootprintTopicGateTest.FakeReader();
+        for (String t : List.of("futures.footprint", "futures.footprint.evidence", "futures.footprint.bars", "futures.footprint.outcomes")) r.valid(t);
+        return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null, r);
+    }
+
+    private static int occurrences(String text, String needle) {
+        int count = 0;
+        for (int at = 0; (at = text.indexOf(needle, at)) >= 0; at += needle.length()) count++;
+        return count;
+    }
+
+    // ---- G-R2: one wiring path, both state consumers, all four topics unconditionally --------------
+
+    @Test void bootstrapAndLiveConsumersShareOneFootprintTopicWiringPathWithAllFourTopics() throws Exception {
+        String src = Files.readString(SERVICE);
+        assertEquals(2, occurrences(src, "addEsFootprintTopics(topicEvents);"), "called from the state cache AND the state live consumer");
+        assertEquals(2, occurrences(src, "addEsCvdTopics(topicEvents);\n        addEsFootprintTopics(topicEvents);"), "right after the CVD wiring at both sites");
+        int start = src.indexOf("private void addEsFootprintTopics(");
+        String body = src.substring(start, src.indexOf("\n    }", start));
+        assertTrue(body.contains("if (footprintViews == null) return;"), "flag off adds nothing");
+        for (String e : new String[]{"es-footprint\"", "es-footprint-evidence\"", "es-footprint-bar\"", "es-footprint-outcome\""}) {
+            assertEquals(1, occurrences(body, "new TopicBinding(\"DATABENTO\", \"" + e + ")"), e);
+        }
+        assertFalse(body.contains("admit("), "the topic SET is unconditional; admission gates consumption, not discovery");
+    }
+
+    @Test void thePartitionRefreshPredicateSeamSitsBeforeMergeAndAssignAndBothStateSitesPassTheGate() throws Exception {
+        String src = Files.readString(SERVICE);
+        assertEquals(2, occurrences(src, "new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit())"), "the two STATE consumers pass the gate");
+        assertEquals(4, occurrences(src, "new PartitionRefresh(\"") + occurrences(src, "new PartitionRefresh(name, topicEvents.keySet());"),
+                "the other four sites keep the always-true predicate (through the two-argument constructor)");
+        int apply = src.indexOf("Refresh apply(KafkaConsumer<?, ?> consumer, List<TopicPartition> assigned)");
+        int filter = src.indexOf("if (topicAdmit.test(p.topic())) admitted.add(p);", apply);
+        int added = src.indexOf("List<TopicPartition> added = addedPartitions(assigned, admitted);", apply);
+        int assign = src.indexOf("consumer.assign(merged);", apply);
+        assertTrue(apply > 0 && filter > apply && added > filter && assign > added, "gate → added() → merge/assign, in that order inside apply()");
+        assertEquals(2, occurrences(src, "footprintAdmitted(partitionsFor(name, consumer, topicEvents.keySet()))"), "bootstrap resolution filtered at both state sites");
+    }
+
+    @Test void deliveryClassesAreWiredAsDesigned() throws Exception {
+        String src = Files.readString(SERVICE);
+        int live = src.indexOf("if (footprintViews != null && isFootprintEvent(binding.event())) {");
+        int cvd = src.indexOf("if (\"es-cvd\".equals(binding.event())) {");
+        assertTrue(live > 0 && live < cvd, "the live-consumer footprint branch precedes the es-cvd branch");
+        String branch = src.substring(live, src.indexOf("continue;", live));
+        assertTrue(branch.contains("admitFootprintRecord(binding.event(), json, \"live\")") && branch.contains("broadcast(binding.event(), json);"), "view first, then broadcast");
+        int cache = src.indexOf("admitFootprintRecord(binding.event(), json, \"cache\");");
+        assertTrue(cache > 0 && cache < src.indexOf("updateCache(binding, record, json);", cache), "the cache consumer admits before the generic cache and never broadcasts");
+        int raw = src.indexOf("private static boolean isRawPassThroughEvent(String event)");
+        assertTrue(src.substring(raw, src.indexOf("}", raw)).contains("isFootprintEvent(event)"), "verbatim: never enriched");
+        int allow = src.indexOf("\"es-cvd-bar\",");
+        String after = src.substring(allow, allow + 600);
+        for (String e : new String[]{"\"es-footprint\",", "\"es-footprint-evidence\",", "\"es-footprint-bar\",", "\"es-footprint-outcome\","}) assertTrue(after.contains(e), e + " allowlisted");
+    }
+
+    // ---- G-R1/G-R10: flag off is byte-identical ----------------------------------------------------
+
+    @Test void flagOffHasNoViewsNoHelloFieldAndOnlyTheEnabledGauge() {
+        FeedGatewayService s = off();
+        assertFalse(s.footprintEnabled());
+        assertNull(s.footprintViews());
+        assertEquals("{\"sessionDate\":null,\"hwm\":{}}", s.cvdHelloJson(), "today's hello, byte for byte");
+        String m = s.footprintMetricsText();
+        assertTrue(m.endsWith("gateway_footprint_enabled 0\n"));
+        assertEquals(1, m.lines().filter(l -> !l.startsWith("#")).count(), "exactly one footprint series flag-off");
+        assertTrue(s.metrics().contains("gateway_footprint_enabled 0\n"));
+    }
+
+    // ---- G-R6 hello ---------------------------------------------------------------------------------
+
+    @Test void flagOnAddsOneHelloFieldFromTheCoordinatorSnapshot() {
+        FeedGatewayService s = on();
+        assertEquals("{\"sessionDate\":null,\"hwm\":{},\"footprint\":{\"sessionDate\":null,\"hwm\":{},\"outcomeHwm\":{}}}", s.cvdHelloJson());
+        assertTrue(s.admitFootprintRecord("es-footprint-bar", FootprintViewsTest.bar("2026-08-14", "1m", 60_000), "live"));
+        assertTrue(s.cvdHelloJson().endsWith("\"footprint\":{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"outcomeHwm\":{}}}"));
+    }
+
+    // ---- G-R3/G-R9: the shared admission path and overlap identities --------------------------------
+
+    @Test void admissionCountsAndBroadcastDecisionsFollowTheOverlapRules() {
+        FeedGatewayService s = on();
+        assertTrue(s.admitFootprintRecord("es-footprint", "{\"schemaVersion\":6}", "live"), "live snapshots are broadcast, never admitted");
+        assertTrue(s.admitFootprintRecord("es-footprint-bar", FootprintViewsTest.bar("2026-08-14", "1m", 1), "live"));
+        assertTrue(s.admitFootprintRecord("es-footprint-bar", FootprintViewsTest.bar("2026-08-13", "1m", 1), "live"), "stale: dropped from the view, still broadcast");
+        assertTrue(s.admitFootprintRecord("es-footprint-outcome", "{\"unrelated\":true}", "cache"), "shape: dropped from the view (cache path never broadcasts anyway)");
+        assertFalse(s.admitFootprintRecord("es-footprint-outcome", "{\"pad\":\"" + "y".repeat(300_000) + "\"}", "live"), "oversize: dropped entirely");
+        String m = s.footprintMetricsText();
+        assertTrue(m.contains("gateway_footprint_records_total{event=\"es-footprint\",consumer=\"live\"} 1\n"), m);
+        assertTrue(m.contains("gateway_footprint_records_total{event=\"es-footprint-bar\",consumer=\"live\"} 2\n"));
+        assertTrue(m.contains("gateway_footprint_drops_total{event=\"es-footprint-bar\",consumer=\"live\",reason=\"stale_session\"} 1\n"));
+        assertTrue(m.contains("gateway_footprint_drops_total{event=\"es-footprint-outcome\",consumer=\"cache\",reason=\"shape\"} 1\n"));
+        assertTrue(m.contains("gateway_footprint_drops_total{event=\"es-footprint-outcome\",consumer=\"live\",reason=\"oversize\"} 1\n"));
+        assertTrue(m.contains("gateway_footprint_drops_total{event=\"es-footprint-bar\",consumer=\"cache\",reason=\"stale_session\"} 0\n"));
+        assertTrue(m.contains("gateway_footprint_bars_in_view 1\n"));
+        assertEquals(1, s.footprintViews().barsInView());
+    }
+
+    @Test void bootstrapAdmissionWithholdsOnlyUnvalidatedFootprintPartitions() {
+        FootprintTopicGateTest.FakeReader r = new FootprintTopicGateTest.FakeReader();
+        r.valid("futures.footprint").valid("futures.footprint.evidence").valid("futures.footprint.bars").unknown("futures.footprint.outcomes");
+        FeedGatewayService s = new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null, r);
+        List<org.apache.kafka.common.TopicPartition> resolved = List.of(
+                new org.apache.kafka.common.TopicPartition("futures.cvd", 0),
+                new org.apache.kafka.common.TopicPartition("futures.footprint.bars", 0),
+                new org.apache.kafka.common.TopicPartition("futures.footprint.outcomes", 0));
+        List<org.apache.kafka.common.TopicPartition> admitted = s.footprintAdmitted(resolved);
+        assertEquals(List.of(resolved.get(0), resolved.get(1)), admitted, "the absent/unvalidated topic's partition is withheld; others pass");
+        r.valid("futures.footprint.outcomes");
+        assertEquals(resolved, s.footprintAdmitted(resolved), "admitted on the next evaluation once validated");
+        assertEquals(resolved, off().footprintAdmitted(resolved), "flag off: identity");
+    }
+
+    // ---- G-R9/G-R11 (12): the exact contract flag-on at start-up -----------------------------------
+
+    @Test void everyMetricsSeriesIsExportedWithEveryLabelValueAtZeroAtStartUp() {
+        String m = on().footprintMetricsText();
+        String[] events = {"es-footprint", "es-footprint-evidence", "es-footprint-bar", "es-footprint-outcome"};
+        String[] topics = {"futures.footprint", "futures.footprint.evidence", "futures.footprint.bars", "futures.footprint.outcomes"};
+        java.util.List<String> expect = new java.util.ArrayList<>();
+        expect.add("gateway_footprint_enabled 1");
+        for (String e : events) for (String c : new String[]{"cache", "live"}) expect.add("gateway_footprint_records_total{event=\"" + e + "\",consumer=\"" + c + "\"} 0");
+        for (String e : new String[]{"es-footprint-bar", "es-footprint-outcome"}) for (String c : new String[]{"cache", "live"}) for (String r : new String[]{"oversize", "shape", "stale_session"})
+            expect.add("gateway_footprint_drops_total{event=\"" + e + "\",consumer=\"" + c + "\",reason=\"" + r + "\"} 0");
+        for (String e : events) expect.add("gateway_footprint_broadcast_total{event=\"" + e + "\"} 0");
+        expect.add("gateway_footprint_evictions_total{view=\"bars\"} 0"); expect.add("gateway_footprint_evictions_total{view=\"outcomes\"} 0");
+        expect.add("gateway_footprint_rollovers_total 0"); expect.add("gateway_footprint_bars_in_view 0"); expect.add("gateway_footprint_outcomes_in_view 0");
+        expect.add("gateway_footprint_view_bytes{view=\"bars\"} 0"); expect.add("gateway_footprint_view_bytes{view=\"outcomes\"} 0");
+        for (String r : new String[]{"bars", "outcomes"}) expect.add("gateway_footprint_backfill_requests_total{route=\"" + r + "\"} 0");
+        for (String r : new String[]{"bars", "outcomes"}) for (String x : new String[]{"busy", "bad_cursor", "session_mismatch"}) expect.add("gateway_footprint_backfill_rejected_total{route=\"" + r + "\",reason=\"" + x + "\"} 0");
+        for (String t : topics) expect.add("gateway_footprint_topic_validated{topic=\"" + t + "\"} 0");
+        for (String t : topics) for (String r : new String[]{"admin", "unknown", "ceiling", "compression"}) expect.add("gateway_footprint_topic_validation_failures_total{topic=\"" + t + "\",reason=\"" + r + "\"} 0");
+        List<String> actual = m.lines().filter(l -> !l.startsWith("#")).toList();
+        assertEquals(expect, actual, "exact series set, order and initial values");
+        for (String name : List.of("gateway_footprint_enabled", "gateway_footprint_records_total", "gateway_footprint_drops_total", "gateway_footprint_broadcast_total",
+                "gateway_footprint_evictions_total", "gateway_footprint_rollovers_total", "gateway_footprint_bars_in_view", "gateway_footprint_outcomes_in_view",
+                "gateway_footprint_view_bytes", "gateway_footprint_backfill_requests_total", "gateway_footprint_backfill_rejected_total",
+                "gateway_footprint_topic_validated", "gateway_footprint_topic_validation_failures_total")) {
+            assertEquals(1, occurrences(m, "# TYPE " + name + " "), name + " typed once");
+        }
+    }
+
+    @Test void validationSeriesFollowTheGateAfterStartUp() {
+        FootprintTopicGateTest.FakeReader r = new FootprintTopicGateTest.FakeReader();
+        r.valid("futures.footprint").valid("futures.footprint.evidence").valid("futures.footprint.bars").unknown("futures.footprint.outcomes");
+        FeedGatewayService s = new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null, r);
+        s.footprintGate().validateExisting();
+        assertFalse(s.footprintGate().admit("futures.footprint.outcomes"));
+        String m = s.footprintMetricsText();
+        assertTrue(m.contains("gateway_footprint_topic_validated{topic=\"futures.footprint.bars\"} 1\n"));
+        assertTrue(m.contains("gateway_footprint_topic_validated{topic=\"futures.footprint.outcomes\"} 0\n"));
+        assertTrue(m.contains("gateway_footprint_topic_validation_failures_total{topic=\"futures.footprint.outcomes\",reason=\"unknown\"} 2\n"));
+    }
+
+    @Test void settingsDefaults() {
+        GatewaySettings g = new GatewaySettings();
+        assertFalse(g.esFootprintEnabled());
+        assertEquals("futures.footprint", g.esFootprintTopic()); assertEquals("futures.footprint.evidence", g.esFootprintEvidenceTopic());
+        assertEquals("futures.footprint.bars", g.esFootprintBarsTopic()); assertEquals("futures.footprint.outcomes", g.esFootprintOutcomesTopic());
+        assertEquals(262_144L, g.esFootprintMaxRecordBytes()); assertEquals(128L << 20, g.esFootprintBarsMaxBytes()); assertEquals(12_000, g.esFootprintBarsMaxCount());
+        assertEquals(16L << 20, g.esFootprintOutcomesMaxBytes()); assertEquals(20_000, g.esFootprintOutcomesMaxCount());
+        assertEquals(4, g.esFootprintBackfillConcurrency()); assertEquals(1_048_588L, g.esFootprintMaxMessageBytesCeiling()); assertEquals(24L * 3_600_000L, g.esFootprintSeekBackMs());
+    }
+
+    @Test void theControllerOrderIsBindingFlagAuthPermitCursorSnapshotWrite() throws Exception {
+        String c = Files.readString(CONTROLLER);
+        int m = c.indexOf("public void footprintOutcomes(");
+        int flag = c.indexOf("footprintGate(response, \"outcomes\", authorization)", m);
+        int permit = c.indexOf("permits.tryAcquire()", m);
+        int cursor = c.indexOf("validOutcomeCursor(tf, after)", m);
+        int page = c.indexOf(".outcomesPage(", m);
+        int write = c.indexOf("writePage(", m);
+        assertTrue(m > 0 && flag > m && permit > flag && cursor > permit && page > cursor && write > page);
+        int gate = c.indexOf("private boolean footprintGate(");
+        String g = c.substring(gate, c.indexOf("\n    }", gate));
+        assertTrue(g.indexOf("footprintEnabled()") < g.indexOf("footprintBackfillRequested(route)") && g.indexOf("footprintBackfillRequested(route)") < g.indexOf("footprintAuth.apply(authorization)"),
+                "flag → count → auth");
+        Matcher lock = Pattern.compile("synchronized \\(lock\\)").matcher(Files.readString(Path.of("src/main/java/app/feedgateway/FootprintViews.java")));
+        assertTrue(lock.find(), "the coordinator lock exists");
+        assertFalse(c.contains("synchronized"), "the controller never holds the coordinator lock while writing");
+    }
+}

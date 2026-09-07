@@ -288,6 +288,74 @@ public final class GatewaySettings {
         return boolValue("GATEWAY_ES_CVD_SPX_LEVELS_ENABLED", false);
     }
 
+    // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1/G-R2/G-R7/G-R8/G-R8a) -----------------
+
+    /** G-R1: OFF by default — the four ES-only topics do not exist on every cluster. */
+    public boolean esFootprintEnabled() {
+        return boolValue("GATEWAY_ES_FOOTPRINT_ENABLED", false);
+    }
+
+    /** G-R2: live A1+A2 snapshot (event {@code es-footprint}), keyed symbol, change-driven + 5 s heartbeat. */
+    public String esFootprintTopic() {
+        return value("KAFKA_ES_FOOTPRINT_TOPIC", "futures.footprint");
+    }
+
+    /** G-R2: live evidence snapshot (event {@code es-footprint-evidence}). */
+    public String esFootprintEvidenceTopic() {
+        return value("KAFKA_ES_FOOTPRINT_EVIDENCE_TOPIC", "futures.footprint.evidence");
+    }
+
+    /** G-R2: closed bars (event {@code es-footprint-bar}), keyed symbol|timeframe|barStartMs, compacted. */
+    public String esFootprintBarsTopic() {
+        return value("KAFKA_ES_FOOTPRINT_BARS_TOPIC", "futures.footprint.bars");
+    }
+
+    /** G-R2: outcome resolutions (event {@code es-footprint-outcome}), keyed by identity, compacted. */
+    public String esFootprintOutcomesTopic() {
+        return value("KAFKA_ES_FOOTPRINT_OUTCOMES_TOPIC", "futures.footprint.outcomes");
+    }
+
+    /** G-R8: accepted-record ceiling — MUST equal the producer's FOOTPRINT_MAX_RECORD_BYTES (one value, set together). */
+    public long esFootprintMaxRecordBytes() {
+        return longValue("GATEWAY_ES_FOOTPRINT_MAX_RECORD_BYTES", 262_144L, 1L);
+    }
+
+    /** G-R8: bars view byte budget (summed record lengths) and count budget. */
+    public long esFootprintBarsMaxBytes() {
+        return longValue("GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES", 128L * 1024 * 1024, 1L);
+    }
+
+    public int esFootprintBarsMaxCount() {
+        return intValue("GATEWAY_ES_FOOTPRINT_BARS_MAX_COUNT", 12_000, 1);
+    }
+
+    /** G-R8: outcomes view byte and count budgets. */
+    public long esFootprintOutcomesMaxBytes() {
+        return longValue("GATEWAY_ES_FOOTPRINT_OUTCOMES_MAX_BYTES", 16L * 1024 * 1024, 1L);
+    }
+
+    public int esFootprintOutcomesMaxCount() {
+        return intValue("GATEWAY_ES_FOOTPRINT_OUTCOMES_MAX_COUNT", 20_000, 1);
+    }
+
+    /** G-R7: concurrently served footprint backfill requests; beyond it the route answers 503 busy. */
+    public int esFootprintBackfillConcurrency() {
+        return intValue("GATEWAY_ES_FOOTPRINT_BACKFILL_CONCURRENCY", 4, 1);
+    }
+
+    /** G-R8a: a footprint topic whose effective max.message.bytes exceeds this is never consumed (broker default 1 048 588). */
+    public long esFootprintMaxMessageBytesCeiling() {
+        return longValue("GATEWAY_ES_FOOTPRINT_MAX_MESSAGE_BYTES_CEILING", 1_048_588L, 1L);
+    }
+
+    /**
+     * Seek-back window for the two KEYED footprint topics on the cache consumer: a whole Globex session
+     * (23 h) plus margin, so a restart re-fills both views from the compacted topics' retained keys.
+     */
+    public long esFootprintSeekBackMs() {
+        return longValue("GATEWAY_ES_FOOTPRINT_SEEK_BACK_MS", 24L * 3_600_000L, 1L);
+    }
+
     public String databentoDirectionalPressureTopic() {
         return value("KAFKA_DATABENTO_DIRECTIONAL_PRESSURE_TOPIC", "options.databento.directional-pressure");
     }
