@@ -3191,7 +3191,7 @@ class FeedGatewayServiceTest {
         FeedGatewayService service = service();
         GatewaySettings settings = new GatewaySettings();
         long ts = System.currentTimeMillis() - 1_000L;
-        String payload = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"slice\":\"COMMISSIONING_SHADOW\",\"actionable\":false,\"ts\":" + ts
+        String payload = "{\"symbol\":\"SPX\",\"sessionDate\":\"" + java.time.LocalDate.now(java.time.ZoneId.of("America/New_York")) + "\",\"slice\":\"COMMISSIONING_SHADOW\",\"actionable\":false,\"ts\":" + ts
                 + ",\"barEndMs\":" + (ts - 2_000L) + ",\"direction\":\"UP\",\"posture\":\"TREND\",\"intendedSide\":\"LONG_DELTA\"}";
         ConsumerRecord<String, String> record = recordAt(
                 settings.directionCurrentTopic(), 0, 1L, "SPX", payload, System.currentTimeMillis());
@@ -3218,8 +3218,9 @@ class FeedGatewayServiceTest {
             assertTrue(FeedGatewayService.isGlobalBroadcastEvent(ev), ev);
         }
         long now = System.currentTimeMillis();
+        String today = java.time.LocalDate.now(java.time.ZoneId.of("America/New_York")).toString();
         // fresh publish stamp but an OLD event time: the older stamp decides — stale
-        String backlog = "{\"symbol\":\"SPX\",\"slice\":\"COMMISSIONING_SHADOW\",\"actionable\":false,\"ts\":" + (now - 1_000L)
+        String backlog = "{\"symbol\":\"SPX\",\"sessionDate\":\"" + today + "\",\"slice\":\"COMMISSIONING_SHADOW\",\"actionable\":false,\"ts\":" + (now - 1_000L)
                 + ",\"eventTMs\":" + (now - 45_000L) + ",\"state\":\"EXHAUSTED\"}";
         ConsumerRecord<String, String> r1 = recordAt(settings.directionPushTopic(), 0, 1L, "SPX", backlog, now);
         assertEquals(now - 45_000L, eventCacheTimestamp(service, "direction-push", r1));
@@ -3229,11 +3230,17 @@ class FeedGatewayServiceTest {
         ConsumerRecord<String, String> r2 = recordAt(settings.directionPushTopic(), 0, 2L, "SPX", fresh, now);
         assertEquals(now - 2_000L, eventCacheTimestamp(service, "direction-push", r2));
         assertEquals("DATABENTO|SPX", updateCache(service, topicBinding("DATABENTO", "direction-push"), r2, fresh));
-        // a record missing either stamp never caches
-        String noEvent = "{\"symbol\":\"SPX\",\"ts\":" + now + "}";
+        // a record missing either stamp never caches; a FUTURE stamp never caches; another session never caches
+        String noEvent = "{\"symbol\":\"SPX\",\"sessionDate\":\"" + today + "\",\"ts\":" + now + "}";
         assertEquals(-1L, eventCacheTimestamp(service, "direction-push", recordAt(settings.directionPushTopic(), 0, 3L, "SPX", noEvent, now)));
-        // alerts: keyed by alertId, 60 s on ts
-        String alert = "{\"symbol\":\"SPX\",\"alertId\":\"pushalert|c1\",\"alertClass\":\"PUSH_EXHAUSTED\",\"ts\":" + (now - 500L) + ",\"eventTMs\":" + (now - 2_500L) + "}";
+        String future = fresh.replace("\"ts\":" + (now - 1_000L), "\"ts\":" + (now + 5_000L));
+        assertEquals(-1L, eventCacheTimestamp(service, "direction-push", recordAt(settings.directionPushTopic(), 0, 4L, "SPX", future, now)),
+                "a future stamp is never fresh — no skew allowance");
+        String yesterday = fresh.replace("\"sessionDate\":\"" + today + "\"", "\"sessionDate\":\"2000-01-01\"");
+        assertEquals(-1L, eventCacheTimestamp(service, "direction-push", recordAt(settings.directionPushTopic(), 0, 5L, "SPX", yesterday, now)),
+                "another session is never current");
+        // alerts: keyed by alertId, 60 s on ts, same-session
+        String alert = "{\"symbol\":\"SPX\",\"sessionDate\":\"" + today + "\",\"alertId\":\"pushalert|c1\",\"alertClass\":\"PUSH_EXHAUSTED\",\"ts\":" + (now - 500L) + ",\"eventTMs\":" + (now - 2_500L) + "}";
         ConsumerRecord<String, String> a1 = recordAt(settings.directionAlertTopic(), 0, 1L, "SPX|c1", alert, now);
         assertEquals("DATABENTO|pushalert|c1", updateCache(service, topicBinding("DATABENTO", "direction-alert"), a1, alert));
         assertEquals(now - 500L, eventCacheTimestamp(service, "direction-alert", a1));

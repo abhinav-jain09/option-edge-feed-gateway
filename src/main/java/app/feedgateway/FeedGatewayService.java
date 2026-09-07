@@ -7521,13 +7521,8 @@ public class FeedGatewayService implements ReplayRunner {
                 send(session, "direction-scorecard", entry.getValue());
             }
         }
-        // alerts inside their window are replayed too: a late joiner still SEES them, the browser never speaks a replay
-        // (it speaks only on a live transition it observed itself — first reading after load is silent by contract)
-        for (Map.Entry<String, String> entry : directionAlert.entrySet()) {
-            if (entry.getValue() != null && !entry.getValue().isBlank() && isCacheFresh("direction-alert:" + entry.getKey(), nowMs)) {
-                send(session, "direction-alert", entry.getValue());
-            }
-        }
+        // alerts are NOT replayed (A4.10): an alert is a spoken event, and a replayed one could be spoken again by a late
+        // joiner; the push row carries the state. The cache only counts them (/health) inside their window.
     }
 
     private void replayDirectionCached(WebSocketSession session) {
@@ -9491,14 +9486,27 @@ public class FeedGatewayService implements ReplayRunner {
 
     private long directionTimestamp(String json) {
         try {
-            long eventTimeMs = longField(mapper.readTree(json), "ts", -1L);
-            if (eventTimeMs > System.currentTimeMillis() + SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS) {
-                return -1L; // implausibly future — fail closed, never cache/replay
+            var n = mapper.readTree(json);
+            long eventTimeMs = longField(n, "ts", -1L);
+            if (eventTimeMs > System.currentTimeMillis()) {
+                return -1L; // a FUTURE stamp is never fresh (A4.8: 0 <= now - stamp) — fail closed, never cache/replay
+            }
+            if (!directionSessionIsToday(n)) {
+                return -1L; // same-session rule: a record from another session is never current
             }
             return eventTimeMs;
         } catch (JsonProcessingException ignored) {
             return -1L;
         }
+    }
+
+    /** A4.8 same-session rule: the record's sessionDate must be the current ET trade date (a missing date fails closed). */
+    private static boolean directionSessionIsToday(com.fasterxml.jackson.databind.JsonNode n) {
+        String sd = text(n, "sessionDate");
+        if (sd.isBlank()) {
+            return false;
+        }
+        return sd.equals(java.time.LocalDate.now(java.time.ZoneId.of("America/New_York")).toString());
     }
 
     /** A4.8: a push state is current only while BOTH its transport stamp (ts) and its event time (eventTMs) are inside the
@@ -9511,11 +9519,14 @@ public class FeedGatewayService implements ReplayRunner {
             if (ts <= 0 || ev <= 0) {
                 return -1L;
             }
-            long older = Math.min(ts, ev);
-            if (older > System.currentTimeMillis() + SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS) {
+            long now = System.currentTimeMillis();
+            if (ts > now || ev > now) {
+                return -1L;   // each stamp individually in [now - TTL, now]: no future allowance (A4.8)
+            }
+            if (!directionSessionIsToday(n)) {
                 return -1L;
             }
-            return older;
+            return Math.min(ts, ev);
         } catch (JsonProcessingException ignored) {
             return -1L;
         }
