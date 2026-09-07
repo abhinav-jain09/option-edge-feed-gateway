@@ -1418,16 +1418,67 @@ public final class GatewaySettings {
     }
 
     /**
-     * The US options-market session calendar that drives market-aware cache freshness. Regular hours default
-     * to 09:30–16:00 America/New_York; {@code GATEWAY_MARKET_HOLIDAYS} (CSV of {@code yyyy-MM-dd}) and
-     * {@code GATEWAY_MARKET_EARLY_CLOSES} (CSV of {@code yyyy-MM-dd=HH:mm}) are operator-supplied. Warns when
-     * no holidays are configured (the calendar still works for weekends/RTH, but treats holidays as sessions).
+     * The US options-market session calendar. Regular hours default to 09:30–16:00 America/New_York;
+     * the holiday list (CSV of {@code yyyy-MM-dd}) and early closes (CSV of {@code yyyy-MM-dd=HH:mm}) are
+     * operator-supplied.
+     *
+     * <p>The calendar is read from the gateway-specific {@code GATEWAY_MARKET_HOLIDAYS} /
+     * {@code GATEWAY_MARKET_EARLY_CLOSES} when those yield at least one usable entry (so a typo'd
+     * override cannot silently stand in for a calendar), and otherwise FALLS BACK to the platform-wide
+     * {@code HPSF_MARKET_HOLIDAYS} / {@code HPSF_MARKET_EARLY_CLOSES} that every deployment's shared
+     * config map already carries. The fallback exists because the split names were a silent
+     * single-point-of-failure: on 2026-09-07 (Labor Day) the es4 config map defined only the HPSF keys,
+     * so the gateway calendar had NO holidays, {@link #initialExpiry()} AUTO-resolved to the holiday
+     * 20260907, and every fresh 20260908 record from the feed was dropped as belonging to an inactive
+     * expiry — millions of them — leaving the UI connected with a permanently blank chain. Two env
+     * names for one market calendar can diverge; one source of truth cannot.
+     *
+     * <p>Warns when NEITHER is set: the calendar still handles weekends and RTH, but it then treats every
+     * market holiday as a regular session, which is exactly the failure above.
      */
     public GatewayMarketCalendar marketCalendar() {
         LocalTime open = parseLocalTime(value("GATEWAY_MARKET_OPEN", "09:30"), LocalTime.of(9, 30));
         LocalTime close = parseLocalTime(value("GATEWAY_MARKET_CLOSE", "16:00"), LocalTime.of(16, 0));
+
+        // Fall back on "yielded nothing USABLE", not merely on "unset": a typo'd gateway list
+        // (2026/09/07, or a date-time) parses to zero holidays, and treating that as a valid override
+        // would silently reproduce the outage while a perfectly good shared list sat unread.
+        String holidayKey = "GATEWAY_MARKET_HOLIDAYS";
+        java.util.Set<LocalDate> holidays = parseHolidays(holidayKey);
+        if (holidays.isEmpty() && !value("HPSF_MARKET_HOLIDAYS", "").isBlank()) {
+            holidayKey = "HPSF_MARKET_HOLIDAYS";
+            holidays = parseHolidays(holidayKey);
+        }
+        String earlyCloseKey = "GATEWAY_MARKET_EARLY_CLOSES";
+        java.util.Map<LocalDate, LocalTime> earlyCloses = parseEarlyCloses(earlyCloseKey, close);
+        if (earlyCloses.isEmpty() && !value("HPSF_MARKET_EARLY_CLOSES", "").isBlank()) {
+            earlyCloseKey = "HPSF_MARKET_EARLY_CLOSES";
+            earlyCloses = parseEarlyCloses(earlyCloseKey, close);
+        }
+
+        if (holidays.isEmpty()) {
+            boolean configured = !value("GATEWAY_MARKET_HOLIDAYS", "").isBlank()
+                    || !value("HPSF_MARKET_HOLIDAYS", "").isBlank();
+            logOnce("WARN: the gateway market calendar has NO holidays — "
+                    + (configured
+                            ? "GATEWAY_MARKET_HOLIDAYS/HPSF_MARKET_HOLIDAYS are set but no entry parsed "
+                                    + "(dates must be yyyy-MM-dd, comma-separated)"
+                            : "neither GATEWAY_MARKET_HOLIDAYS nor HPSF_MARKET_HOLIDAYS is set")
+                    + ". Every market holiday will be treated as a regular session, so the AUTO expiry can "
+                    + "resolve to a non-trading date and the whole chain is then dropped as inactive. "
+                    + "Configure the OPRA/NYSE holiday list.");
+        } else {
+            logOnce("Market calendar: " + holidays.size() + " holiday(s) from " + holidayKey + ", "
+                    + earlyCloses.size() + " early close(s) from " + earlyCloseKey
+                    + ", session " + open + "-" + close + " " + MARKET_TIME_ZONE);
+        }
+        return new GatewayMarketCalendar(MARKET_TIME_ZONE, open, close, holidays, earlyCloses);
+    }
+
+    /** CSV of {@code yyyy-MM-dd} under {@code key}; unparseable entries are warned about and skipped. */
+    private static java.util.Set<LocalDate> parseHolidays(String key) {
         java.util.Set<LocalDate> holidays = new java.util.LinkedHashSet<>();
-        for (String token : value("GATEWAY_MARKET_HOLIDAYS", "").split(",")) {
+        for (String token : value(key, "").split(",")) {
             String d = token.trim();
             if (d.isEmpty()) {
                 continue;
@@ -1435,32 +1486,57 @@ public final class GatewaySettings {
             try {
                 holidays.add(LocalDate.parse(d));
             } catch (DateTimeParseException e) {
-                System.out.println("WARN: ignoring unparseable GATEWAY_MARKET_HOLIDAYS entry '" + d + "'");
+                logOnce("WARN: ignoring unparseable " + key + " entry '" + d + "'");
             }
         }
+        return holidays;
+    }
+
+    /**
+     * CSV of {@code yyyy-MM-dd=HH:mm} (the shared HPSF list writes {@code HH:mm:ss}; both parse) under
+     * {@code key}. A malformed TIME is warned about and the entry SKIPPED rather than silently recorded
+     * as {@code regularClose} — a half-day quietly restored to a full session makes the gateway treat the
+     * post-close hours as RTH and evict the published chain, with nothing in the log naming the typo.
+     */
+    private static java.util.Map<LocalDate, LocalTime> parseEarlyCloses(String key, LocalTime regularClose) {
         java.util.Map<LocalDate, LocalTime> earlyCloses = new java.util.LinkedHashMap<>();
-        for (String token : value("GATEWAY_MARKET_EARLY_CLOSES", "").split(",")) {
+        for (String token : value(key, "").split(",")) {
             String entry = token.trim();
             if (entry.isEmpty()) {
                 continue;
             }
             int eq = entry.indexOf('=');
             if (eq <= 0) {
-                System.out.println("WARN: ignoring malformed GATEWAY_MARKET_EARLY_CLOSES entry '" + entry + "'");
+                logOnce("WARN: ignoring malformed " + key + " entry '" + entry + "'");
                 continue;
             }
             try {
-                earlyCloses.put(LocalDate.parse(entry.substring(0, eq).trim()),
-                        parseLocalTime(entry.substring(eq + 1).trim(), close));
-            } catch (DateTimeParseException e) {
-                System.out.println("WARN: ignoring malformed GATEWAY_MARKET_EARLY_CLOSES entry '" + entry + "'");
+                LocalDate date = LocalDate.parse(entry.substring(0, eq).trim());
+                LocalTime at = LocalTime.parse(entry.substring(eq + 1).trim());
+                if (!at.isAfter(regularClose)) {
+                    earlyCloses.put(date, at);
+                } else {
+                    logOnce("WARN: ignoring " + key + " entry '" + entry + "' — an early close cannot be "
+                            + "after the regular close " + regularClose);
+                }
+            } catch (RuntimeException e) {
+                logOnce("WARN: ignoring malformed " + key + " entry '" + entry + "' (expected yyyy-MM-dd=HH:mm)");
             }
         }
-        if (holidays.isEmpty()) {
-            System.out.println("WARN: GATEWAY_MARKET_HOLIDAYS is empty — market-aware cache freshness will "
-                    + "treat market holidays as regular sessions. Configure the OPRA/NYSE holiday list.");
+        return earlyCloses;
+    }
+
+    /**
+     * {@link #marketCalendar()} is rebuilt per WS handshake (via {@link #initialExpiry()}), so an
+     * unconditional println would emit one line per connection. De-duplicating by message keeps the
+     * config resolution visible at startup without turning it into log noise.
+     */
+    private static final java.util.Set<String> LOGGED_ONCE = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private static void logOnce(String message) {
+        if (LOGGED_ONCE.add(message)) {
+            System.out.println(message);
         }
-        return new GatewayMarketCalendar(MARKET_TIME_ZONE, open, close, holidays, earlyCloses);
     }
 
     private static LocalTime parseLocalTime(String raw, LocalTime fallback) {
