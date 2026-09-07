@@ -76,6 +76,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Service
@@ -100,6 +101,12 @@ public class FeedGatewayService implements ReplayRunner {
     static final String BARRIER_CONSUMER_ISOLATION = "read_uncommitted";
     private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
+    // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1..G-R11) — null unless the flag is on ----
+    private final FootprintViews footprintViews;
+    private final FootprintTopicGate footprintGate;
+    private final java.util.concurrent.Semaphore footprintBackfillPermits;
+    /** G-R9 counters: records{event,consumer}, drops{event,consumer,reason}, broadcast{event}, backfill{route}, rejected{route,reason}. */
+    private final java.util.concurrent.ConcurrentHashMap<String, AtomicLong> footprintCounters = new java.util.concurrent.ConcurrentHashMap<>();
     private final GatewayMarketCalendar marketCalendar;
     // The ET trading date the AUTO expiry last rolled to. Seeded from the initial selection; advanced by
     // maybeAutoRollExpiry on each new trading day. A manual (control-topic) selection does NOT change it,
@@ -711,7 +718,8 @@ public class FeedGatewayService implements ReplayRunner {
     private record CachedEvent(String event, String json) {
     }
 
-    private record TopicBinding(String source, String event) {
+    /** Package-private so the acceptance tests can drive the production consumer seams. */
+    record TopicBinding(String source, String event) {
     }
 
     private record RecordPosition(TopicPartition partition, long offset) {
@@ -759,6 +767,226 @@ public class FeedGatewayService implements ReplayRunner {
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
         this.marketCalendar = settings.marketCalendar();
         this.autoRolledExpiry = this.activeSelection.get().expiry();
+        if (settings.esFootprintEnabled()) {
+            this.footprintViews = new FootprintViews(mapper, settings.esFootprintMaxRecordBytes(),
+                    settings.esFootprintBarsMaxBytes(), settings.esFootprintBarsMaxCount(),
+                    settings.esFootprintOutcomesMaxBytes(), settings.esFootprintOutcomesMaxCount());
+            this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(),
+                    FootprintTopicGate.adminReader(settings.bootstrapServers(), settings.partitionRefreshMetadataTimeoutMs()));
+            this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
+        } else {
+            this.footprintViews = null;
+            this.footprintGate = null;
+            this.footprintBackfillPermits = null;
+        }
+    }
+
+    /** Test seam: a service whose footprint gate reads topic configs from the supplied reader. */
+    FeedGatewayService(GatewaySettings settings, ObjectMapper mapper, HpsfGatewayViewMapper hpsfViewMapper,
+                       @Nullable SessionRoutingEngine routingEngine, FootprintTopicGate.ConfigReader footprintReader) {
+        this.settings = settings;
+        this.mapper = mapper;
+        this.hpsfViewMapper = hpsfViewMapper;
+        this.routingEngine = routingEngine;
+        this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
+        this.marketCalendar = settings.marketCalendar();
+        this.autoRolledExpiry = this.activeSelection.get().expiry();
+        this.footprintViews = new FootprintViews(mapper, settings.esFootprintMaxRecordBytes(),
+                settings.esFootprintBarsMaxBytes(), settings.esFootprintBarsMaxCount(),
+                settings.esFootprintOutcomesMaxBytes(), settings.esFootprintOutcomesMaxCount());
+        this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(), footprintReader);
+        this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
+    }
+
+    private List<String> footprintTopics() {
+        return List.of(settings.esFootprintTopic(), settings.esFootprintEvidenceTopic(),
+                settings.esFootprintBarsTopic(), settings.esFootprintOutcomesTopic());
+    }
+
+    /** G-R8 layout check + G-R8a start-up validation; throws to refuse start-up. Runs before any lifecycle state moves. */
+    void footprintPreflight() {
+        // G-R8: the retained-heap arithmetic assumes compressed oops, compressed class pointers and
+        // compact strings; a JVM without them refuses to run the relay rather than run it unbounded.
+        FootprintTopicGate.layoutViolation(FootprintTopicGate.hotSpotVmOptions()).ifPresent(flag -> {
+            throw new IllegalStateException("ES_FOOTPRINT_JVM_LAYOUT " + flag + " — the footprint memory bound does not hold on this JVM");
+        });
+        // G-R8a start-up: existing invalid topic or a non-unknown Admin failure refuses start-up;
+        // an absent topic is admitted later by the consumers' refresh path once validated.
+        footprintGate.validateExisting();
+    }
+
+    boolean footprintEnabled() { return footprintViews != null; }
+    boolean runningForTest() { return running.get(); }
+    void setRunningForTest(boolean value) { running.set(value); }
+    /** Test seam for the G-R8a predicate seam: a refresh over the given topics with the given gate, past its first interval. */
+    Object partitionRefreshForTest(String name, Set<String> topics, Predicate<String> admit) {
+        PartitionRefresh r = new PartitionRefresh(name, topics, admit);
+        r.nextRefreshMs = 0L;
+        return r;
+    }
+    @SuppressWarnings("unchecked")
+    List<TopicPartition>[] applyRefreshForTest(Object refresh, KafkaConsumer<?, ?> consumer, List<TopicPartition> assigned) {
+        Refresh r = ((PartitionRefresh) refresh).apply(consumer, assigned);
+        ((PartitionRefresh) refresh).nextRefreshMs = 0L;
+        return new List[]{r.partitions(), r.added(), r.addedOnNewTopics()};
+    }
+    FootprintViews footprintViews() { return footprintViews; }
+    FootprintTopicGate footprintGate() { return footprintGate; }
+    java.util.concurrent.Semaphore footprintBackfillPermits() { return footprintBackfillPermits; }
+
+    private static final String[] FOOTPRINT_EVENTS = {"es-footprint", "es-footprint-evidence", "es-footprint-bar", "es-footprint-outcome"};
+    private static final String[] FOOTPRINT_KEYED_EVENTS = {"es-footprint-bar", "es-footprint-outcome"};
+
+    static boolean isFootprintEvent(String event) {
+        return "es-footprint".equals(event) || "es-footprint-evidence".equals(event)
+                || "es-footprint-bar".equals(event) || "es-footprint-outcome".equals(event);
+    }
+
+    private AtomicLong footprintCounter(String series) {
+        return footprintCounters.computeIfAbsent(series, k -> new AtomicLong());
+    }
+
+    /** G-R9 counting: incremented at the route handler's flag check, so a 404 is never counted. */
+    void footprintBackfillRequested(String route) { footprintCounter("backfill_requests_total{route=\"" + route + "\"}").incrementAndGet(); }
+    void footprintBackfillRejected(String route, String reason) { footprintCounter("backfill_rejected_total{route=\"" + route + "\",reason=\"" + reason + "\"}").incrementAndGet(); }
+
+    /**
+     * G-R3/G-R4/G-R5/G-R9: ONE admission path for both consumers. Returns true when the LIVE consumer
+     * may broadcast the record (everything except an oversize drop; the cache consumer never broadcasts).
+     */
+    boolean admitFootprintRecord(String event, String json, String consumer) {   // package-private: the wiring tests drive both consumer paths through it
+        footprintCounter("records_total{event=\"" + event + "\",consumer=\"" + consumer + "\"}").incrementAndGet();
+        if (!"es-footprint-bar".equals(event) && !"es-footprint-outcome".equals(event)) {
+            return true;                                            // live snapshots: never admitted to a view
+        }
+        FootprintViews.Admission a = "es-footprint-bar".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);
+        if (a.reason() != FootprintViews.Reason.ADMITTED) {
+            footprintCounter("drops_total{event=\"" + event + "\",consumer=\"" + consumer + "\",reason=\"" + a.reason().name().toLowerCase() + "\"}").incrementAndGet();
+        }
+        return a.reason() != FootprintViews.Reason.OVERSIZE;
+    }
+
+    /**
+     * The bootstrap resolution + assignment BOTH state consumers use (G-R8a): partitions of a footprint
+     * topic that has not validated are withheld, so they are never assigned, sought or polled — exactly
+     * like a topic that does not exist yet. Package-private: the seam the acceptance tests execute.
+     */
+    List<TopicPartition> bootstrapAssign(String name, KafkaConsumer<?, ?> consumer, Map<String, TopicBinding> topicEvents) {
+        List<TopicPartition> partitions = footprintAdmitted(partitionsFor(name, consumer, topicEvents.keySet()));
+        consumer.assign(partitions);
+        return partitions;
+    }
+
+    /**
+     * The LIVE consumer's bootstrap seek, in one place so its ordering is executable: on a RETRY the
+     * shared cache window, then the levels resume, then footprint partitions forced to END (G-R8a: the
+     * cache consumer alone replays the footprint session); on a first attempt everything starts at END.
+     */
+    void liveBootstrapSeek(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions,
+                           Map<String, TopicBinding> topicEvents, boolean retry) {
+        if (retry) {
+            seekToCacheWindow(consumer, partitions, topicEvents);
+            resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
+            seekFootprintToEnd(consumer, partitions);          // G-R8a (CODE round-1 #1)
+        } else {
+            consumer.seekToEnd(partitions);
+            seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
+        }
+        // The auction is positioned by ONE rule on both paths: the live cursor, then the frozen handoff,
+        // and with neither the partition is PAUSED rather than consumed from a guessed position. It runs
+        // AFTER the generic seek above, whose lazy seekToEnd it deliberately overrides.
+        positionEsAuction(consumer, partitions);
+    }
+
+    /** The LIVE consumer's adoption seek: the existing per-event rule, then footprint partitions to END. */
+    void liveAdoptionSeek(KafkaConsumer<?, ?> consumer, Refresh refresh, Map<String, TopicBinding> topicEvents) {
+        seekAddedLivePartitions(consumer, refresh, topicEvents);
+        seekFootprintToEnd(consumer, refresh.added());
+    }
+
+    /** Test seam: a Refresh describing partitions adopted on newly appeared topics. */
+    Refresh refreshForTest(List<TopicPartition> merged, List<TopicPartition> added, List<TopicPartition> previouslyAssigned) {
+        return Refresh.grown(merged, added, previouslyAssigned);
+    }
+
+    /**
+     * G-R8a on the LIVE consumer: footprint partitions always start at END — the cache consumer owns
+     * the session replay into the coordinator; the live consumer only broadcasts what arrives from
+     * now on. Called after the retry cache-window seek and after every late adoption (round-1 #1).
+     */
+    void seekFootprintToEnd(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions) {
+        if (footprintGate == null) return;
+        List<TopicPartition> footprint = new ArrayList<>();
+        for (TopicPartition p : partitions) if (footprintGate.topics().contains(p.topic())) footprint.add(p);
+        if (!footprint.isEmpty()) consumer.seekToEnd(footprint);
+    }
+
+    /** The live consumer's footprint branch (G-R3/G-R9): admit, then broadcast unless oversize. Package-private for the fan-out tests. */
+    boolean onFootprintLiveRecord(String event, String json) {
+        if (!admitFootprintRecord(event, json, "live")) return false;
+        broadcast(event, json);
+        footprintCounter("broadcast_total{event=\"" + event + "\"}").incrementAndGet();
+        forwardedEvents.incrementAndGet();
+        return true;
+    }
+
+    /** G-R8a: the admission predicate applied to a bootstrap resolution; identity when the flag is off. */
+    List<TopicPartition> footprintAdmitted(List<TopicPartition> partitions) {
+        if (footprintGate == null) return partitions;
+        List<TopicPartition> out = new ArrayList<>();
+        for (TopicPartition p : partitions) if (footprintGate.admit(p.topic())) out.add(p);
+        return List.copyOf(out);
+    }
+
+    private Predicate<String> footprintTopicAdmit() {
+        return footprintGate == null ? t -> true : footprintGate::admit;
+    }
+
+    /** G-R9 text; the ONLY footprint line flag-off is the enabled gauge. */
+    String footprintMetricsText() {
+        if (footprintViews == null) {
+            return "# HELP gateway_footprint_enabled Whether the ES Footprint relay is enabled.\n"
+                    + "# TYPE gateway_footprint_enabled gauge\n"
+                    + "gateway_footprint_enabled 0\n";
+        }
+        String[] events = FOOTPRINT_EVENTS;
+        String[] consumers = {"cache", "live"};
+        String[] reasons = {"oversize", "shape", "stale_session"};
+        String[] routes = {"bars", "outcomes"};
+        String[] rejectReasons = {"busy", "bad_cursor", "session_mismatch"};
+        StringBuilder sb = new StringBuilder();
+        sb.append("# HELP gateway_footprint_enabled Whether the ES Footprint relay is enabled.\n# TYPE gateway_footprint_enabled gauge\ngateway_footprint_enabled 1\n");
+        sb.append("# HELP gateway_footprint_records_total Footprint Kafka records polled, before admission.\n# TYPE gateway_footprint_records_total counter\n");
+        for (String e : events) for (String c : consumers) line(sb, "gateway_footprint_records_total", "{event=\"" + e + "\",consumer=\"" + c + "\"}", footprintCounter("records_total{event=\"" + e + "\",consumer=\"" + c + "\"}").get());
+        sb.append("# HELP gateway_footprint_drops_total Keyed footprint records not admitted to a view (oversize records are also not broadcast).\n# TYPE gateway_footprint_drops_total counter\n");
+        for (String e : FOOTPRINT_KEYED_EVENTS) for (String c : consumers) for (String r : reasons) line(sb, "gateway_footprint_drops_total", "{event=\"" + e + "\",consumer=\"" + c + "\",reason=\"" + r + "\"}", footprintCounter("drops_total{event=\"" + e + "\",consumer=\"" + c + "\",reason=\"" + r + "\"}").get());
+        sb.append("# HELP gateway_footprint_broadcast_total Footprint frames handed to broadcast by the live consumer.\n# TYPE gateway_footprint_broadcast_total counter\n");
+        for (String e : events) line(sb, "gateway_footprint_broadcast_total", "{event=\"" + e + "\"}", footprintCounter("broadcast_total{event=\"" + e + "\"}").get());
+        sb.append("# HELP gateway_footprint_evictions_total Records evicted by the view byte/count budgets.\n# TYPE gateway_footprint_evictions_total counter\n");
+        line(sb, "gateway_footprint_evictions_total", "{view=\"bars\"}", footprintViews.barsEvictions());
+        line(sb, "gateway_footprint_evictions_total", "{view=\"outcomes\"}", footprintViews.outcomesEvictions());
+        sb.append("# HELP gateway_footprint_rollovers_total Session date advances that cleared both views.\n# TYPE gateway_footprint_rollovers_total counter\n");
+        line(sb, "gateway_footprint_rollovers_total", "", footprintViews.rollovers());
+        sb.append("# HELP gateway_footprint_bars_in_view Closed-bar records held.\n# TYPE gateway_footprint_bars_in_view gauge\n");
+        line(sb, "gateway_footprint_bars_in_view", "", footprintViews.barsInView());
+        sb.append("# HELP gateway_footprint_outcomes_in_view Outcome records held.\n# TYPE gateway_footprint_outcomes_in_view gauge\n");
+        line(sb, "gateway_footprint_outcomes_in_view", "", footprintViews.outcomesInView());
+        sb.append("# HELP gateway_footprint_view_bytes Summed record lengths held per view.\n# TYPE gateway_footprint_view_bytes gauge\n");
+        line(sb, "gateway_footprint_view_bytes", "{view=\"bars\"}", footprintViews.barsBytes());
+        line(sb, "gateway_footprint_view_bytes", "{view=\"outcomes\"}", footprintViews.outcomesBytes());
+        sb.append("# HELP gateway_footprint_backfill_requests_total Footprint backfill requests reaching the handler with the flag on.\n# TYPE gateway_footprint_backfill_requests_total counter\n");
+        for (String r : routes) line(sb, "gateway_footprint_backfill_requests_total", "{route=\"" + r + "\"}", footprintCounter("backfill_requests_total{route=\"" + r + "\"}").get());
+        sb.append("# HELP gateway_footprint_backfill_rejected_total Footprint backfill requests rejected, one reason each.\n# TYPE gateway_footprint_backfill_rejected_total counter\n");
+        for (String r : routes) for (String x : rejectReasons) line(sb, "gateway_footprint_backfill_rejected_total", "{route=\"" + r + "\",reason=\"" + x + "\"}", footprintCounter("backfill_rejected_total{route=\"" + r + "\",reason=\"" + x + "\"}").get());
+        sb.append("# HELP gateway_footprint_topic_validated Whether the footprint topic passed G-R8a validation this incarnation.\n# TYPE gateway_footprint_topic_validated gauge\n");
+        for (String t : footprintTopics()) line(sb, "gateway_footprint_topic_validated", "{topic=\"" + t + "\"}", footprintGate.validated(t) ? 1 : 0);
+        sb.append("# HELP gateway_footprint_topic_validation_failures_total Validation attempts that did not yield VALID, one reason each.\n# TYPE gateway_footprint_topic_validation_failures_total counter\n");
+        for (String t : footprintTopics()) for (FootprintTopicGate.Reason r : FootprintTopicGate.Reason.values()) line(sb, "gateway_footprint_topic_validation_failures_total", "{topic=\"" + t + "\",reason=\"" + r.name() + "\"}", footprintGate.failures(t, r));
+        return sb.toString();
+    }
+
+    private static void line(StringBuilder sb, String name, String labels, long value) {
+        sb.append(name).append(labels).append(' ').append(value).append('\n');
     }
 
     /**
@@ -779,7 +1007,15 @@ public class FeedGatewayService implements ReplayRunner {
 
     @PostConstruct
     public void start() {
-        if (!settings.enabled() || !running.compareAndSet(false, true)) {
+        if (!settings.enabled()) {
+            return;
+        }
+        // ES Footprint preflight (G-R8/G-R8a) BEFORE any lifecycle state changes: a refusal here
+        // leaves running=false and no executor (round-1 #3), so the process dies clean.
+        if (footprintGate != null) {
+            footprintPreflight();
+        }
+        if (!running.compareAndSet(false, true)) {
             return;
         }
         executor = Executors.newFixedThreadPool(8, runnable -> {
@@ -917,7 +1153,7 @@ public class FeedGatewayService implements ReplayRunner {
         clients.add(session);
         clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
-        if (settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled()) {
+        if (settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || footprintViews != null) {
             // R46 hello: the per-timeframe high-water marks of the bar view, so the page can bound
             // its REST backfill to exactly what this gateway holds and buffer WS bars past it.
             // U16 (CL-R8/G19): the latest ACCEPTED levels record rides INSIDE this same hello, so
@@ -1480,6 +1716,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP gateway_cvd_spx_levels_position_regressions_total es-cvd-spx-levels records refused because their fold provenance regressed.\n"
                 + "# TYPE gateway_cvd_spx_levels_position_regressions_total counter\n"
                 + "gateway_cvd_spx_levels_position_regressions_total " + cvdSpxLevelsRegressions.get() + "\n"
+                + footprintMetricsText()
                 + "# HELP gateway_es_auction_records_total SPX Auction Desk minute records forwarded verbatim as es-auction.\n"
                 + "# TYPE gateway_es_auction_records_total counter\n"
                 + "gateway_es_auction_records_total " + esAuctionRecords.get() + "\n"
@@ -1945,6 +2182,7 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
         addEsCvdTopics(topicEvents);
+        addEsFootprintTopics(topicEvents);
         addEsAuctionTopics(topicEvents);
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
@@ -2082,6 +2320,7 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
         addEsCvdTopics(topicEvents);
+        addEsFootprintTopics(topicEvents);
         addEsAuctionTopics(topicEvents);
         if (settings.esCvdSpxLevelsEnabled()) {
             // U16: SPX-translated CVD structure levels (compacted single-partition heartbeat,
@@ -2099,6 +2338,20 @@ public class FeedGatewayService implements ReplayRunner {
         // One wiring path is shared by bootstrap and live consumers so their topic sets cannot drift.
         topicEvents.put(settings.esCvdTopic(), new TopicBinding("DATABENTO", "es-cvd"));
         topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding("DATABENTO", "es-cvd-bar"));
+    }
+
+    /**
+     * ES Footprint (G-R2/G-R8a): the same one-wiring-path rule as {@link #addEsCvdTopics}. ALL FOUR
+     * topics are added unconditionally when the flag is on, so {@code PartitionRefresh}'s immutable
+     * topic set always contains them and discovers them whenever they appear; consumption is gated
+     * per topic by {@link FootprintTopicGate#admit} at bootstrap and inside every refresh.
+     */
+    private void addEsFootprintTopics(Map<String, TopicBinding> topicEvents) {
+        if (footprintViews == null) return;
+        topicEvents.put(settings.esFootprintTopic(), new TopicBinding("DATABENTO", "es-footprint"));
+        topicEvents.put(settings.esFootprintEvidenceTopic(), new TopicBinding("DATABENTO", "es-footprint-evidence"));
+        topicEvents.put(settings.esFootprintBarsTopic(), new TopicBinding("DATABENTO", "es-footprint-bar"));
+        topicEvents.put(settings.esFootprintOutcomesTopic(), new TopicBinding("DATABENTO", "es-footprint-outcome"));
     }
 
     /** SPX Auction Desk minute stream: same shared-wiring rule as {@link #addEsCvdTopics}. */
@@ -2326,8 +2579,7 @@ public class FeedGatewayService implements ReplayRunner {
         // are obsolete, and a dead attempt's entry could never be retired (retirement needs this consumer's
         // position()), which would withhold readiness for that source forever.
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
-            List<TopicPartition> partitions = partitionsFor(name, consumer, topicEvents.keySet());
-            consumer.assign(partitions);
+            List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
             seekToCacheWindow(consumer, partitions, topicEvents);
             // Bootstrap gets the BOOTSTRAP budget: a broker that answers in 10s is slow, not broken, and
             // must bootstrap rather than crash-loop. The 2s refresh budget applies only inside the poll
@@ -2350,7 +2602,7 @@ public class FeedGatewayService implements ReplayRunner {
                     new LinkedHashMap<>(catchUpEndOffsets(bootstrapEndOffsets, topicEvents));
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
             boolean live = caughtUp(consumer, catchUpEndOffsets);
-            PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
+            PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
                 tryFreezeEsAuctionHandoff(consumer, partitions);
@@ -2477,6 +2729,13 @@ public class FeedGatewayService implements ReplayRunner {
                         // one that broadcasts it — otherwise the live consumer's duplicate is
                         // correctly rejected by the offset gate and clients starve.
                         tapeZonesBroadcast(binding, record, json, caughtUpFlag);
+                        continue;
+                    }
+                    if (binding != null && footprintViews != null && isFootprintEvent(binding.event())) {
+                        // ES Footprint (G-R3/G-R9): the CACHE consumer admits keyed records into the
+                        // coordinator (never the generic cache — a footprint bar is ~64 KB) and never
+                        // broadcasts; the two live snapshots are neither cached nor retained.
+                        admitFootprintRecord(binding.event(), json, "cache");
                         continue;
                     }
                     if (binding != null && "es-auction".equals(binding.event())) {
@@ -2744,25 +3003,16 @@ public class FeedGatewayService implements ReplayRunner {
             boolean retry
     ) {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
-            List<TopicPartition> partitions = partitionsFor(name, consumer, topicEvents.keySet());
-            consumer.assign(partitions);
-            if (retry) {
-                seekToCacheWindow(consumer, partitions, topicEvents);
-                resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
-                positionEsAuction(consumer, partitions);           // never the auction's seven-day window, and never a guess
-            } else {
-                consumer.seekToEnd(partitions);
-                seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
-                positionEsAuction(consumer, partitions);           // the same rule as the retry path
-            }
-            PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
+            List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
+            liveBootstrapSeek(consumer, partitions, topicEvents, retry);
+            PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             while (running.get()) {
                 resumeEsAuctionOnceHandoffExists(consumer, partitions);
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
-                    seekAddedLivePartitions(consumer, refresh, topicEvents);
+                    liveAdoptionSeek(consumer, refresh, topicEvents);
                 }
                 // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
                 // is only read by dumpDiagnosticState() to distinguish "consumers polling" from "forward gate stuck".
@@ -2913,6 +3163,13 @@ public class FeedGatewayService implements ReplayRunner {
                         // no option-expiry identity, never selection-gated.
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if (footprintViews != null && isFootprintEvent(binding.event())) {
+                        // ES Footprint (G-R3): keyed records go to the coordinator FIRST (the backfill's
+                        // source of truth), then the VERBATIM standalone broadcast — except an oversize
+                        // record, which is dropped entirely; the two live snapshots are broadcast as-is.
+                        onFootprintLiveRecord(binding.event(), json);
                         continue;
                     }
                     if ("es-cvd".equals(binding.event())) {
@@ -3691,6 +3948,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final class PartitionRefresh {
         private final String name;
         private final Set<String> topics;
+        /** G-R8a: evaluated INSIDE apply() before merge/assign; discovered partitions whose topic fails are withheld. */
+        private final Predicate<String> topicAdmit;
         private long nextRefreshMs;
         /** When the topology was last observed successfully — diagnostics only, never a seek input. */
         private volatile long lastObservedMs;
@@ -3698,8 +3957,13 @@ public class FeedGatewayService implements ReplayRunner {
         private volatile int lastDiscoveredCount;
 
         PartitionRefresh(String name, Set<String> topics) {
+            this(name, topics, t -> true);
+        }
+
+        PartitionRefresh(String name, Set<String> topics, Predicate<String> topicAdmit) {
             this.name = name;
             this.topics = Set.copyOf(topics);
+            this.topicAdmit = topicAdmit;
             long nowMs = System.currentTimeMillis();
             // The caller has just completed its bootstrap partitionsFor(), so the topology is known good now.
             this.lastObservedMs = nowMs;
@@ -3757,7 +4021,12 @@ public class FeedGatewayService implements ReplayRunner {
             // Bound from the END of the attempt: a slow metadata call must not tight-loop.
             nextRefreshMs = lastObservedMs + settings.partitionMetadataRefreshMs();
 
-            List<TopicPartition> added = addedPartitions(assigned, discovered);
+            // G-R8a: a discovered partition of a topic the gate does not admit is WITHHELD here — not
+            // merged, not assigned, not in added(), hence never sought or booked — exactly like a
+            // topic that does not exist yet; it is re-discovered and re-evaluated next refresh.
+            List<TopicPartition> admitted = new ArrayList<>();
+            for (TopicPartition p : discovered) if (topicAdmit.test(p.topic())) admitted.add(p);
+            List<TopicPartition> added = addedPartitions(assigned, admitted);
             if (added.isEmpty()) {
                 return Refresh.unchanged(assigned);
             }
@@ -3809,7 +4078,7 @@ public class FeedGatewayService implements ReplayRunner {
      * @param partitions the assignment now in effect — the caller MUST adopt it before seeking, so a seek
      *                   failure cannot leave the caller tracking a stale list.
      */
-    private record Refresh(
+    record Refresh(
             List<TopicPartition> partitions,
             List<TopicPartition> added,
             List<TopicPartition> addedOnGrownTopics,
@@ -6188,6 +6457,15 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private CachePolicy cachePolicyFor(String event, long nowMs) {
+        if ("es-footprint-bar".equals(event) || "es-footprint-outcome".equals(event)) {
+            // ES Footprint keyed topics: the cache consumer seeks back a whole session so a restart
+            // re-fills both views from the compacted topics; the records never enter the generic cache.
+            return CachePolicy.expiring(settings.esFootprintSeekBackMs());
+        }
+        if ("es-footprint".equals(event) || "es-footprint-evidence".equals(event)) {
+            // Live snapshots are never retained: seek END (a heartbeat arrives within 5 s).
+            return CachePolicy.expiring(0L);
+        }
         if ("option-truth".equals(event)) {
             return CachePolicy.expiring(settings.optionTruthTtlMs());
         }
@@ -9063,7 +9341,9 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private static boolean isRawPassThroughEvent(String event) {
         return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
-                || "es-cvd-spx-levels".equals(event) || "es-auction".equals(event);
+                || "es-cvd-spx-levels".equals(event)
+                || "es-auction".equals(event)
+                || isFootprintEvent(event);
     }
 
     /**
@@ -10714,6 +10994,11 @@ public class FeedGatewayService implements ReplayRunner {
             String levels = cvdSpxLevelsLatest.get();
             sb.append(",\"levels\":").append(levels == null ? "null" : levels);
         }
+        if (footprintViews != null) {
+            // G-R6: ONE atomic snapshot of the footprint coordinator rides the SAME hello; the field's
+            // ABSENCE (flag off) tells the page this gateway has no footprint stream.
+            sb.append(",\"footprint\":").append(footprintViews.helloField());
+        }
         return sb.append('}').toString();
     }
 
@@ -11974,6 +12259,12 @@ public class FeedGatewayService implements ReplayRunner {
             // es-cvd/es-cvd-bar frame as non-routable.
             "es-cvd",
             "es-cvd-bar",
+            // ES Footprint (G-R3, D5): ES-global market microstructure, identical for every
+            // authenticated socket — the same class as es-cvd; the only gate is authentication.
+            "es-footprint",
+            "es-footprint-evidence",
+            "es-footprint-bar",
+            "es-footprint-outcome",
             // Server-rated Δ-flow acceleration: chain-global advisory; a non-allowlisted event is
             // dropped as non-routable in per-session (auth) mode.
             "delta-flow-accel",

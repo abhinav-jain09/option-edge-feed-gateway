@@ -311,6 +311,74 @@ public final class GatewaySettings {
         return boolValue("GATEWAY_ES_CVD_SPX_LEVELS_ENABLED", false);
     }
 
+    // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1/G-R2/G-R7/G-R8/G-R8a) -----------------
+
+    /** G-R1: OFF by default — the four ES-only topics do not exist on every cluster. */
+    public boolean esFootprintEnabled() {
+        return boolValue("GATEWAY_ES_FOOTPRINT_ENABLED", false);
+    }
+
+    /** G-R2: live A1+A2 snapshot (event {@code es-footprint}), keyed symbol, change-driven + 5 s heartbeat. */
+    public String esFootprintTopic() {
+        return value("KAFKA_ES_FOOTPRINT_TOPIC", "futures.footprint");
+    }
+
+    /** G-R2: live evidence snapshot (event {@code es-footprint-evidence}). */
+    public String esFootprintEvidenceTopic() {
+        return value("KAFKA_ES_FOOTPRINT_EVIDENCE_TOPIC", "futures.footprint.evidence");
+    }
+
+    /** G-R2: closed bars (event {@code es-footprint-bar}), keyed symbol|timeframe|barStartMs, compacted. */
+    public String esFootprintBarsTopic() {
+        return value("KAFKA_ES_FOOTPRINT_BARS_TOPIC", "futures.footprint.bars");
+    }
+
+    /** G-R2: outcome resolutions (event {@code es-footprint-outcome}), keyed by identity, compacted. */
+    public String esFootprintOutcomesTopic() {
+        return value("KAFKA_ES_FOOTPRINT_OUTCOMES_TOPIC", "futures.footprint.outcomes");
+    }
+
+    /** G-R8: accepted-record ceiling — MUST equal the producer's FOOTPRINT_MAX_RECORD_BYTES (one value, set together). */
+    public long esFootprintMaxRecordBytes() {
+        return longValue("GATEWAY_ES_FOOTPRINT_MAX_RECORD_BYTES", 262_144L, 1L);
+    }
+
+    /** G-R8: bars view byte budget (summed record lengths) and count budget. */
+    public long esFootprintBarsMaxBytes() {
+        return longValue("GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES", 128L * 1024 * 1024, 1L);
+    }
+
+    public int esFootprintBarsMaxCount() {
+        return intValue("GATEWAY_ES_FOOTPRINT_BARS_MAX_COUNT", 12_000, 1);
+    }
+
+    /** G-R8: outcomes view byte and count budgets. */
+    public long esFootprintOutcomesMaxBytes() {
+        return longValue("GATEWAY_ES_FOOTPRINT_OUTCOMES_MAX_BYTES", 16L * 1024 * 1024, 1L);
+    }
+
+    public int esFootprintOutcomesMaxCount() {
+        return intValue("GATEWAY_ES_FOOTPRINT_OUTCOMES_MAX_COUNT", 20_000, 1);
+    }
+
+    /** G-R7: concurrently served footprint backfill requests; beyond it the route answers 503 busy. */
+    public int esFootprintBackfillConcurrency() {
+        return intValue("GATEWAY_ES_FOOTPRINT_BACKFILL_CONCURRENCY", 4, 1);
+    }
+
+    /** G-R8a: a footprint topic whose effective max.message.bytes exceeds this is never consumed (broker default 1 048 588). */
+    public long esFootprintMaxMessageBytesCeiling() {
+        return longValue("GATEWAY_ES_FOOTPRINT_MAX_MESSAGE_BYTES_CEILING", 1_048_588L, 1L);
+    }
+
+    /**
+     * Seek-back window for the two KEYED footprint topics on the cache consumer: a whole Globex session
+     * (23 h) plus margin, so a restart re-fills both views from the compacted topics' retained keys.
+     */
+    public long esFootprintSeekBackMs() {
+        return longValue("GATEWAY_ES_FOOTPRINT_SEEK_BACK_MS", 24L * 3_600_000L, 1L);
+    }
+
     public String databentoDirectionalPressureTopic() {
         return value("KAFKA_DATABENTO_DIRECTIONAL_PRESSURE_TOPIC", "options.databento.directional-pressure");
     }
@@ -1441,16 +1509,67 @@ public final class GatewaySettings {
     }
 
     /**
-     * The US options-market session calendar that drives market-aware cache freshness. Regular hours default
-     * to 09:30–16:00 America/New_York; {@code GATEWAY_MARKET_HOLIDAYS} (CSV of {@code yyyy-MM-dd}) and
-     * {@code GATEWAY_MARKET_EARLY_CLOSES} (CSV of {@code yyyy-MM-dd=HH:mm}) are operator-supplied. Warns when
-     * no holidays are configured (the calendar still works for weekends/RTH, but treats holidays as sessions).
+     * The US options-market session calendar. Regular hours default to 09:30–16:00 America/New_York;
+     * the holiday list (CSV of {@code yyyy-MM-dd}) and early closes (CSV of {@code yyyy-MM-dd=HH:mm}) are
+     * operator-supplied.
+     *
+     * <p>The calendar is read from the gateway-specific {@code GATEWAY_MARKET_HOLIDAYS} /
+     * {@code GATEWAY_MARKET_EARLY_CLOSES} when those yield at least one usable entry (so a typo'd
+     * override cannot silently stand in for a calendar), and otherwise FALLS BACK to the platform-wide
+     * {@code HPSF_MARKET_HOLIDAYS} / {@code HPSF_MARKET_EARLY_CLOSES} that every deployment's shared
+     * config map already carries. The fallback exists because the split names were a silent
+     * single-point-of-failure: on 2026-09-07 (Labor Day) the es4 config map defined only the HPSF keys,
+     * so the gateway calendar had NO holidays, {@link #initialExpiry()} AUTO-resolved to the holiday
+     * 20260907, and every fresh 20260908 record from the feed was dropped as belonging to an inactive
+     * expiry — millions of them — leaving the UI connected with a permanently blank chain. Two env
+     * names for one market calendar can diverge; one source of truth cannot.
+     *
+     * <p>Warns when NEITHER is set: the calendar still handles weekends and RTH, but it then treats every
+     * market holiday as a regular session, which is exactly the failure above.
      */
     public GatewayMarketCalendar marketCalendar() {
         LocalTime open = parseLocalTime(value("GATEWAY_MARKET_OPEN", "09:30"), LocalTime.of(9, 30));
         LocalTime close = parseLocalTime(value("GATEWAY_MARKET_CLOSE", "16:00"), LocalTime.of(16, 0));
+
+        // Fall back on "yielded nothing USABLE", not merely on "unset": a typo'd gateway list
+        // (2026/09/07, or a date-time) parses to zero holidays, and treating that as a valid override
+        // would silently reproduce the outage while a perfectly good shared list sat unread.
+        String holidayKey = "GATEWAY_MARKET_HOLIDAYS";
+        java.util.Set<LocalDate> holidays = parseHolidays(holidayKey);
+        if (holidays.isEmpty() && !value("HPSF_MARKET_HOLIDAYS", "").isBlank()) {
+            holidayKey = "HPSF_MARKET_HOLIDAYS";
+            holidays = parseHolidays(holidayKey);
+        }
+        String earlyCloseKey = "GATEWAY_MARKET_EARLY_CLOSES";
+        java.util.Map<LocalDate, LocalTime> earlyCloses = parseEarlyCloses(earlyCloseKey, close);
+        if (earlyCloses.isEmpty() && !value("HPSF_MARKET_EARLY_CLOSES", "").isBlank()) {
+            earlyCloseKey = "HPSF_MARKET_EARLY_CLOSES";
+            earlyCloses = parseEarlyCloses(earlyCloseKey, close);
+        }
+
+        if (holidays.isEmpty()) {
+            boolean configured = !value("GATEWAY_MARKET_HOLIDAYS", "").isBlank()
+                    || !value("HPSF_MARKET_HOLIDAYS", "").isBlank();
+            logOnce("WARN: the gateway market calendar has NO holidays — "
+                    + (configured
+                            ? "GATEWAY_MARKET_HOLIDAYS/HPSF_MARKET_HOLIDAYS are set but no entry parsed "
+                                    + "(dates must be yyyy-MM-dd, comma-separated)"
+                            : "neither GATEWAY_MARKET_HOLIDAYS nor HPSF_MARKET_HOLIDAYS is set")
+                    + ". Every market holiday will be treated as a regular session, so the AUTO expiry can "
+                    + "resolve to a non-trading date and the whole chain is then dropped as inactive. "
+                    + "Configure the OPRA/NYSE holiday list.");
+        } else {
+            logOnce("Market calendar: " + holidays.size() + " holiday(s) from " + holidayKey + ", "
+                    + earlyCloses.size() + " early close(s) from " + earlyCloseKey
+                    + ", session " + open + "-" + close + " " + MARKET_TIME_ZONE);
+        }
+        return new GatewayMarketCalendar(MARKET_TIME_ZONE, open, close, holidays, earlyCloses);
+    }
+
+    /** CSV of {@code yyyy-MM-dd} under {@code key}; unparseable entries are warned about and skipped. */
+    private static java.util.Set<LocalDate> parseHolidays(String key) {
         java.util.Set<LocalDate> holidays = new java.util.LinkedHashSet<>();
-        for (String token : value("GATEWAY_MARKET_HOLIDAYS", "").split(",")) {
+        for (String token : value(key, "").split(",")) {
             String d = token.trim();
             if (d.isEmpty()) {
                 continue;
@@ -1458,32 +1577,57 @@ public final class GatewaySettings {
             try {
                 holidays.add(LocalDate.parse(d));
             } catch (DateTimeParseException e) {
-                System.out.println("WARN: ignoring unparseable GATEWAY_MARKET_HOLIDAYS entry '" + d + "'");
+                logOnce("WARN: ignoring unparseable " + key + " entry '" + d + "'");
             }
         }
+        return holidays;
+    }
+
+    /**
+     * CSV of {@code yyyy-MM-dd=HH:mm} (the shared HPSF list writes {@code HH:mm:ss}; both parse) under
+     * {@code key}. A malformed TIME is warned about and the entry SKIPPED rather than silently recorded
+     * as {@code regularClose} — a half-day quietly restored to a full session makes the gateway treat the
+     * post-close hours as RTH and evict the published chain, with nothing in the log naming the typo.
+     */
+    private static java.util.Map<LocalDate, LocalTime> parseEarlyCloses(String key, LocalTime regularClose) {
         java.util.Map<LocalDate, LocalTime> earlyCloses = new java.util.LinkedHashMap<>();
-        for (String token : value("GATEWAY_MARKET_EARLY_CLOSES", "").split(",")) {
+        for (String token : value(key, "").split(",")) {
             String entry = token.trim();
             if (entry.isEmpty()) {
                 continue;
             }
             int eq = entry.indexOf('=');
             if (eq <= 0) {
-                System.out.println("WARN: ignoring malformed GATEWAY_MARKET_EARLY_CLOSES entry '" + entry + "'");
+                logOnce("WARN: ignoring malformed " + key + " entry '" + entry + "'");
                 continue;
             }
             try {
-                earlyCloses.put(LocalDate.parse(entry.substring(0, eq).trim()),
-                        parseLocalTime(entry.substring(eq + 1).trim(), close));
-            } catch (DateTimeParseException e) {
-                System.out.println("WARN: ignoring malformed GATEWAY_MARKET_EARLY_CLOSES entry '" + entry + "'");
+                LocalDate date = LocalDate.parse(entry.substring(0, eq).trim());
+                LocalTime at = LocalTime.parse(entry.substring(eq + 1).trim());
+                if (!at.isAfter(regularClose)) {
+                    earlyCloses.put(date, at);
+                } else {
+                    logOnce("WARN: ignoring " + key + " entry '" + entry + "' — an early close cannot be "
+                            + "after the regular close " + regularClose);
+                }
+            } catch (RuntimeException e) {
+                logOnce("WARN: ignoring malformed " + key + " entry '" + entry + "' (expected yyyy-MM-dd=HH:mm)");
             }
         }
-        if (holidays.isEmpty()) {
-            System.out.println("WARN: GATEWAY_MARKET_HOLIDAYS is empty — market-aware cache freshness will "
-                    + "treat market holidays as regular sessions. Configure the OPRA/NYSE holiday list.");
+        return earlyCloses;
+    }
+
+    /**
+     * {@link #marketCalendar()} is rebuilt per WS handshake (via {@link #initialExpiry()}), so an
+     * unconditional println would emit one line per connection. De-duplicating by message keeps the
+     * config resolution visible at startup without turning it into log noise.
+     */
+    private static final java.util.Set<String> LOGGED_ONCE = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private static void logOnce(String message) {
+        if (LOGGED_ONCE.add(message)) {
+            System.out.println(message);
         }
-        return new GatewayMarketCalendar(MARKET_TIME_ZONE, open, close, holidays, earlyCloses);
     }
 
     private static LocalTime parseLocalTime(String raw, LocalTime fallback) {

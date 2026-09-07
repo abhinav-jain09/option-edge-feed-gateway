@@ -376,17 +376,22 @@ class EsAuctionWiringTest {
         assertTrue(sink.get(1).contains("raced-r1"));
     }
 
+    /** An ObjectProvider that supplies nothing — the optional liquidity-history beans this test does not use. */
+    private static <T> org.springframework.beans.factory.ObjectProvider<T> emptyProvider() {
+        return new org.springframework.beans.factory.ObjectProvider<>() {
+            @Override public T getObject() { return null; }
+            @Override public T getObject(Object... args) { return null; }
+            @Override public T getIfAvailable() { return null; }
+            @Override public T getIfUnique() { return null; }
+        };
+    }
+
     @Test void theBackfillEndpointRefusesParametersItWouldEchoUnescaped() {
         // Code review round 3: the response echoes tradeDate and the cursor, so a value carrying a quote
         // or a backslash would emit malformed application/json. Only the contract's own shapes are accepted.
         var s = service();
         s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"));
-        GatewayController c = new GatewayController(s, new org.springframework.beans.factory.ObjectProvider<>() {
-            @Override public app.feedgateway.liquidityhistory.LiquidityHistoryStore getObject() { return null; }
-            @Override public app.feedgateway.liquidityhistory.LiquidityHistoryStore getObject(Object... args) { return null; }
-            @Override public app.feedgateway.liquidityhistory.LiquidityHistoryStore getIfAvailable() { return null; }
-            @Override public app.feedgateway.liquidityhistory.LiquidityHistoryStore getIfUnique() { return null; }
-        });
+        GatewayController c = new GatewayController(s, emptyProvider(), emptyProvider());
         String bad = c.auctionMinutes("2026-09-08\" ,\"x\":\"", "", 10);
         assertTrue(bad.contains("\"error\""), "a quote in tradeDate is refused: " + bad);
         assertFalse(bad.contains("x\":\""), "and never reaches the body: " + bad);
@@ -452,7 +457,8 @@ class EsAuctionWiringTest {
         // Replayed on the live path those minutes would all pass the emitted ledger and be broadcast.
         int live = source.indexOf("private void runLiveConsumerOnce(");
         String body = source.substring(live, live + 1400);
-        assertTrue(body.contains("positionEsAuction(consumer, partitions)"), "the live retry takes the auction off the generic cache-window seek");
+        int seek = source.indexOf("void liveBootstrapSeek(");
+        assertTrue(source.substring(seek, seek + 1400).contains("positionEsAuction(consumer, partitions)"), "the live bootstrap takes the auction off the generic cache-window seek");
     }
 
 
@@ -476,7 +482,10 @@ class EsAuctionWiringTest {
 
         int liveOnce = source.indexOf("private void runLiveConsumerOnce(");
         String live = source.substring(liveOnce, liveOnce + 2000);
-        assertEquals(2, live.split("positionEsAuction\\(consumer, partitions\\)", -1).length - 1, "(b) ONE rule on BOTH the cold start and the retry");
+        int seek2 = source.indexOf("void liveBootstrapSeek(");
+        String sb = source.substring(seek2, seek2 + 1400);
+        assertEquals(1, sb.split("positionEsAuction\\(consumer, partitions\\)", -1).length - 1, "(b) ONE rule, applied after the generic seek on BOTH the cold start and the retry");
+        assertTrue(sb.indexOf("positionEsAuction") > sb.indexOf("seekCvdSpxLevelsToHandoff"), "(b) it runs AFTER the generic seek it overrides");
         assertTrue(live.contains("resumeEsAuctionOnceHandoffExists(consumer, partitions)"), "(b) paused partitions are positioned inside the poll loop");
         int pos = source.indexOf("private void positionEsAuction(");
         String pb = source.substring(pos, pos + 1100);
