@@ -1,0 +1,14 @@
+Every requirement above, and what this repository's mutation campaign established about it. The
+campaign refuses to start against a dirty tree or a red baseline; a kill must be an ASSERTION
+failure naming a test — or, where the clause under test IS "this must not throw", a propagated throw
+the spec declared in advance — never an incidental error under the right test's name; and the table
+below refuses to render a "pinned" cell for any record that does not carry its evidence. That
+evidence — the patch, the file, line and enclosing declaration, the command, the exit code, the
+verbatim failure lines and a SHA-256 of the run output — is in `ES-FOOTPRINT-CAMPAIGN.json` beside
+this document. Regenerate this section with `scripts/footprint-reqstate.sh`, or check it against the
+record with `scripts/footprint-reqstate.sh --check`.
+
+What this table cannot do is decide whether a quoted obligation is the clause a probe exercises.
+The generator refuses a quote that is not verbatim in the requirement it sits under, and one that
+shares no vocabulary with the clause recorded against it; beyond that, attribution is a judgement
+made in review, and the merge gate for this change corrected several of them.

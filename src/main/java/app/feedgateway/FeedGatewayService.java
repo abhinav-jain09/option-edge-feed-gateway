@@ -18,6 +18,7 @@ import app.feedgateway.mtsession.gateway.GatewayRecordMapper;
 import app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor;
 import java.util.Optional;
 import java.util.OptionalDouble;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.lang.Nullable;
 import com.optionsedge.contracts.hpsf.HpsfAuditEvent;
 import com.optionsedge.contracts.hpsf.HpsfExitIntentEvent;
@@ -76,6 +77,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Service
@@ -100,6 +102,12 @@ public class FeedGatewayService implements ReplayRunner {
     static final String BARRIER_CONSUMER_ISOLATION = "read_uncommitted";
     private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
+    // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1..G-R11) — null unless the flag is on ----
+    private final FootprintViews footprintViews;
+    private final FootprintTopicGate footprintGate;
+    private final java.util.concurrent.Semaphore footprintBackfillPermits;
+    /** G-R9 counters: records{event,consumer}, drops{event,consumer,reason}, broadcast{event}, backfill{route}, rejected{route,reason}. */
+    private final java.util.concurrent.ConcurrentHashMap<String, AtomicLong> footprintCounters = new java.util.concurrent.ConcurrentHashMap<>();
     private final GatewayMarketCalendar marketCalendar;
     // The ET trading date the AUTO expiry last rolled to. Seeded from the initial selection; advanced by
     // maybeAutoRollExpiry on each new trading day. A manual (control-topic) selection does NOT change it,
@@ -612,6 +620,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean avroCaughtUp = new AtomicBoolean(false);
     private final AtomicBoolean stateCaughtUp = new AtomicBoolean(false);
+    /** Sockets that connected before the auction view finished hydrating; each gets its hello when it does. */
+    private final Set<WebSocketSession> esAuctionHelloPending = new CopyOnWriteArraySet<>();
     private final AtomicBoolean hpsfCaughtUp = new AtomicBoolean(false);
     private final AtomicReference<ActiveSelection> activeSelection;
     private final AtomicReference<Map<TopicPartition, Long>> offsetBarriers = new AtomicReference<>(Map.of());
@@ -635,6 +645,47 @@ public class FeedGatewayService implements ReplayRunner {
     /** U16: the next offset to read on this partition, so a consumer RETRY resumes instead of
      *  replaying history (a historical tombstone or reset must never be re-applied as new). */
     private final AtomicLong cvdSpxLevelsNextOffset = new AtomicLong(-1L);
+    /** Per-partition next offset for the auction topic on the LIVE path, so a retry RESUMES instead of
+     *  replaying its seven-day cache window or skipping whatever was produced during the retry gap. */
+    private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionNextOffset = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Where the CACHE consumer's hydration stopped, captured ONCE per partition at the catch-up boundary
+     *  (putIfAbsent, so later movement is ignored). The live consumer starts exactly there, which is why the
+     *  hello is not released until every auction partition has a value here (code review rounds 8–10). */
+    private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionHandoffOffset = new java.util.concurrent.ConcurrentHashMap<>();
+    private final AtomicBoolean esAuctionHandoffFrozen = new AtomicBoolean(false);
+    /** The auction topic's Kafka UUID as it was when the handoff froze. A TopicPartition is only
+     *  (topic, partition), so a recreated topic reuses both and its offsets say nothing: the ID is the
+     *  only sound incarnation identity, and offsets alone cannot see a recreation that has already grown
+     *  past the old cursor (code review round 15). */
+    private volatile org.apache.kafka.common.Uuid esAuctionTopicId;
+    /** Reader seam: the real one is {@code AdminClient.describeTopics(...).topicId()}. */
+    java.util.function.Function<String, org.apache.kafka.common.Uuid> esAuctionTopicIdReader = this::describeTopicId;
+    /** Set when a recreation dropped the view: the whole RETAINED log of the new incarnation is re-read
+     *  before any hello may promise the view again (code review round 16). */
+    private final AtomicBoolean esAuctionRehydrate = new AtomicBoolean(false);
+    /** While non-empty, the freeze is refused: each auction partition must reach this end offset first. */
+    private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionRehydrateBarrier = new java.util.concurrent.ConcurrentHashMap<>();
+    /** The freeze runs on the CACHE consumer's thread and an invalidation on the LIVE one. Without a shared
+     *  monitor an invalidation landing between the last check and the latch would leave the hello promising a
+     *  view that had just been dropped, so the generation is read at the start of a capture pass and confirmed
+     *  under this lock before the latch closes (code review round 17). */
+    private final Object esAuctionIncarnationLock = new Object();
+    /** The incarnation a post-invalidation replay STARTED on; the replay must finish on the same one. */
+    private volatile org.apache.kafka.common.Uuid esAuctionReplayTopicId;
+    /** How often the identity of an ALREADY FROZEN topic is re-read. Nothing else looks at it while the latch
+     *  is closed, so without this a recreation with the same partition count would be served from the old view
+     *  until the live consumer happened to seek (code review round 20). */
+    private static final long ES_AUCTION_ID_CHECK_MS = 30_000L;
+    private volatile long esAuctionLastIdCheckMs;
+    /** Forces the NEXT identity check of a frozen topic to actually read, cadence or not. Set at the start of
+     *  every cache-consumer attempt: a retry re-hydrates with the old handoff still frozen, and a recreation
+     *  DURING that hydration would otherwise wait out the throttle before anyone looked (round 30). */
+    private final AtomicBoolean esAuctionIdCheckDue = new AtomicBoolean(false);
+    private final java.util.concurrent.atomic.AtomicLong esAuctionGeneration = new java.util.concurrent.atomic.AtomicLong();
+    /** The incarnation each LIVE partition was positioned under. A record from a batch polled before an
+     *  invalidation must not write a cursor, be applied to the fresh view, or keep the partition consuming
+     *  the old log — and the record itself carries no generation, so the partition's does (round 22). */
+    private final java.util.concurrent.ConcurrentHashMap<TopicPartition, Long> esAuctionCursorGeneration = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicLong inactiveDroppedEvents = new AtomicLong();
     private final AtomicLong droppedNonRoutableEvents = new AtomicLong();
     private final AtomicLong staleDroppedEvents = new AtomicLong();
@@ -704,7 +755,8 @@ public class FeedGatewayService implements ReplayRunner {
     private record CachedEvent(String event, String json) {
     }
 
-    private record TopicBinding(String source, String event) {
+    /** Package-private so the acceptance tests can drive the production consumer seams. */
+    record TopicBinding(String source, String event) {
     }
 
     private record RecordPosition(TopicPartition partition, long offset) {
@@ -743,6 +795,11 @@ public class FeedGatewayService implements ReplayRunner {
         void run(boolean retry) throws RuntimeException;
     }
 
+    // EXPLICIT: the test seam below is a second constructor, and two constructors with neither
+    // annotated leave Spring nothing to choose from — it falls back to the no-arg default, which
+    // does not exist, and the whole gateway fails to start (not just the footprint relay). The
+    // annotation names the production constructor so adding another seam can never repeat this.
+    @Autowired
     public FeedGatewayService(GatewaySettings settings, ObjectMapper mapper, HpsfGatewayViewMapper hpsfViewMapper,
                               @Nullable SessionRoutingEngine routingEngine) {
         this.settings = settings;
@@ -752,6 +809,226 @@ public class FeedGatewayService implements ReplayRunner {
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
         this.marketCalendar = settings.marketCalendar();
         this.autoRolledExpiry = this.activeSelection.get().expiry();
+        if (settings.esFootprintEnabled()) {
+            this.footprintViews = new FootprintViews(mapper, settings.esFootprintMaxRecordBytes(),
+                    settings.esFootprintBarsMaxBytes(), settings.esFootprintBarsMaxCount(),
+                    settings.esFootprintOutcomesMaxBytes(), settings.esFootprintOutcomesMaxCount());
+            this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(),
+                    FootprintTopicGate.adminReader(settings.bootstrapServers(), settings.partitionRefreshMetadataTimeoutMs()));
+            this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
+        } else {
+            this.footprintViews = null;
+            this.footprintGate = null;
+            this.footprintBackfillPermits = null;
+        }
+    }
+
+    /** Test seam: a service whose footprint gate reads topic configs from the supplied reader. */
+    FeedGatewayService(GatewaySettings settings, ObjectMapper mapper, HpsfGatewayViewMapper hpsfViewMapper,
+                       @Nullable SessionRoutingEngine routingEngine, FootprintTopicGate.ConfigReader footprintReader) {
+        this.settings = settings;
+        this.mapper = mapper;
+        this.hpsfViewMapper = hpsfViewMapper;
+        this.routingEngine = routingEngine;
+        this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
+        this.marketCalendar = settings.marketCalendar();
+        this.autoRolledExpiry = this.activeSelection.get().expiry();
+        this.footprintViews = new FootprintViews(mapper, settings.esFootprintMaxRecordBytes(),
+                settings.esFootprintBarsMaxBytes(), settings.esFootprintBarsMaxCount(),
+                settings.esFootprintOutcomesMaxBytes(), settings.esFootprintOutcomesMaxCount());
+        this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(), footprintReader);
+        this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
+    }
+
+    private List<String> footprintTopics() {
+        return List.of(settings.esFootprintTopic(), settings.esFootprintEvidenceTopic(),
+                settings.esFootprintBarsTopic(), settings.esFootprintOutcomesTopic());
+    }
+
+    /** G-R8 layout check + G-R8a start-up validation; throws to refuse start-up. Runs before any lifecycle state moves. */
+    void footprintPreflight() {
+        // G-R8: the retained-heap arithmetic assumes compressed oops, compressed class pointers and
+        // compact strings; a JVM without them refuses to run the relay rather than run it unbounded.
+        FootprintTopicGate.layoutViolation(FootprintTopicGate.hotSpotVmOptions()).ifPresent(flag -> {
+            throw new IllegalStateException("ES_FOOTPRINT_JVM_LAYOUT " + flag + " — the footprint memory bound does not hold on this JVM");
+        });
+        // G-R8a start-up: existing invalid topic or a non-unknown Admin failure refuses start-up;
+        // an absent topic is admitted later by the consumers' refresh path once validated.
+        footprintGate.validateExisting();
+    }
+
+    boolean footprintEnabled() { return footprintViews != null; }
+    boolean runningForTest() { return running.get(); }
+    void setRunningForTest(boolean value) { running.set(value); }
+    /** Test seam for the G-R8a predicate seam: a refresh over the given topics with the given gate, past its first interval. */
+    Object partitionRefreshForTest(String name, Set<String> topics, Predicate<String> admit) {
+        PartitionRefresh r = new PartitionRefresh(name, topics, admit);
+        r.nextRefreshMs = 0L;
+        return r;
+    }
+    @SuppressWarnings("unchecked")
+    List<TopicPartition>[] applyRefreshForTest(Object refresh, KafkaConsumer<?, ?> consumer, List<TopicPartition> assigned) {
+        Refresh r = ((PartitionRefresh) refresh).apply(consumer, assigned);
+        ((PartitionRefresh) refresh).nextRefreshMs = 0L;
+        return new List[]{r.partitions(), r.added(), r.addedOnNewTopics()};
+    }
+    FootprintViews footprintViews() { return footprintViews; }
+    FootprintTopicGate footprintGate() { return footprintGate; }
+    java.util.concurrent.Semaphore footprintBackfillPermits() { return footprintBackfillPermits; }
+
+    private static final String[] FOOTPRINT_EVENTS = {"es-footprint", "es-footprint-evidence", "es-footprint-bar", "es-footprint-outcome"};
+    private static final String[] FOOTPRINT_KEYED_EVENTS = {"es-footprint-bar", "es-footprint-outcome"};
+
+    static boolean isFootprintEvent(String event) {
+        return "es-footprint".equals(event) || "es-footprint-evidence".equals(event)
+                || "es-footprint-bar".equals(event) || "es-footprint-outcome".equals(event);
+    }
+
+    private AtomicLong footprintCounter(String series) {
+        return footprintCounters.computeIfAbsent(series, k -> new AtomicLong());
+    }
+
+    /** G-R9 counting: incremented at the route handler's flag check, so a 404 is never counted. */
+    void footprintBackfillRequested(String route) { footprintCounter("backfill_requests_total{route=\"" + route + "\"}").incrementAndGet(); }
+    void footprintBackfillRejected(String route, String reason) { footprintCounter("backfill_rejected_total{route=\"" + route + "\",reason=\"" + reason + "\"}").incrementAndGet(); }
+
+    /**
+     * G-R3/G-R4/G-R5/G-R9: ONE admission path for both consumers. Returns true when the LIVE consumer
+     * may broadcast the record (everything except an oversize drop; the cache consumer never broadcasts).
+     */
+    boolean admitFootprintRecord(String event, String json, String consumer) {   // package-private: the wiring tests drive both consumer paths through it
+        footprintCounter("records_total{event=\"" + event + "\",consumer=\"" + consumer + "\"}").incrementAndGet();
+        if (!"es-footprint-bar".equals(event) && !"es-footprint-outcome".equals(event)) {
+            return true;                                            // live snapshots: never admitted to a view
+        }
+        FootprintViews.Admission a = "es-footprint-bar".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);
+        if (a.reason() != FootprintViews.Reason.ADMITTED) {
+            footprintCounter("drops_total{event=\"" + event + "\",consumer=\"" + consumer + "\",reason=\"" + a.reason().name().toLowerCase() + "\"}").incrementAndGet();
+        }
+        return a.reason() != FootprintViews.Reason.OVERSIZE;
+    }
+
+    /**
+     * The bootstrap resolution + assignment BOTH state consumers use (G-R8a): partitions of a footprint
+     * topic that has not validated are withheld, so they are never assigned, sought or polled — exactly
+     * like a topic that does not exist yet. Package-private: the seam the acceptance tests execute.
+     */
+    List<TopicPartition> bootstrapAssign(String name, KafkaConsumer<?, ?> consumer, Map<String, TopicBinding> topicEvents) {
+        List<TopicPartition> partitions = footprintAdmitted(partitionsFor(name, consumer, topicEvents.keySet()));
+        consumer.assign(partitions);
+        return partitions;
+    }
+
+    /**
+     * The LIVE consumer's bootstrap seek, in one place so its ordering is executable: on a RETRY the
+     * shared cache window, then the levels resume, then footprint partitions forced to END (G-R8a: the
+     * cache consumer alone replays the footprint session); on a first attempt everything starts at END.
+     */
+    void liveBootstrapSeek(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions,
+                           Map<String, TopicBinding> topicEvents, boolean retry) {
+        if (retry) {
+            seekToCacheWindow(consumer, partitions, topicEvents);
+            resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
+            seekFootprintToEnd(consumer, partitions);          // G-R8a (CODE round-1 #1)
+        } else {
+            consumer.seekToEnd(partitions);
+            seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
+        }
+        // The auction is positioned by ONE rule on both paths: the live cursor, then the frozen handoff,
+        // and with neither the partition is PAUSED rather than consumed from a guessed position. It runs
+        // AFTER the generic seek above, whose lazy seekToEnd it deliberately overrides.
+        positionEsAuction(consumer, partitions);
+    }
+
+    /** The LIVE consumer's adoption seek: the existing per-event rule, then footprint partitions to END. */
+    void liveAdoptionSeek(KafkaConsumer<?, ?> consumer, Refresh refresh, Map<String, TopicBinding> topicEvents) {
+        seekAddedLivePartitions(consumer, refresh, topicEvents);
+        seekFootprintToEnd(consumer, refresh.added());
+    }
+
+    /** Test seam: a Refresh describing partitions adopted on newly appeared topics. */
+    Refresh refreshForTest(List<TopicPartition> merged, List<TopicPartition> added, List<TopicPartition> previouslyAssigned) {
+        return Refresh.grown(merged, added, previouslyAssigned);
+    }
+
+    /**
+     * G-R8a on the LIVE consumer: footprint partitions always start at END — the cache consumer owns
+     * the session replay into the coordinator; the live consumer only broadcasts what arrives from
+     * now on. Called after the retry cache-window seek and after every late adoption (round-1 #1).
+     */
+    void seekFootprintToEnd(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions) {
+        if (footprintGate == null) return;
+        List<TopicPartition> footprint = new ArrayList<>();
+        for (TopicPartition p : partitions) if (footprintGate.topics().contains(p.topic())) footprint.add(p);
+        if (!footprint.isEmpty()) consumer.seekToEnd(footprint);
+    }
+
+    /** The live consumer's footprint branch (G-R3/G-R9): admit, then broadcast unless oversize. Package-private for the fan-out tests. */
+    boolean onFootprintLiveRecord(String event, String json) {
+        if (!admitFootprintRecord(event, json, "live")) return false;
+        broadcast(event, json);
+        footprintCounter("broadcast_total{event=\"" + event + "\"}").incrementAndGet();
+        forwardedEvents.incrementAndGet();
+        return true;
+    }
+
+    /** G-R8a: the admission predicate applied to a bootstrap resolution; identity when the flag is off. */
+    List<TopicPartition> footprintAdmitted(List<TopicPartition> partitions) {
+        if (footprintGate == null) return partitions;
+        List<TopicPartition> out = new ArrayList<>();
+        for (TopicPartition p : partitions) if (footprintGate.admit(p.topic())) out.add(p);
+        return List.copyOf(out);
+    }
+
+    private Predicate<String> footprintTopicAdmit() {
+        return footprintGate == null ? t -> true : footprintGate::admit;
+    }
+
+    /** G-R9 text; the ONLY footprint line flag-off is the enabled gauge. */
+    String footprintMetricsText() {
+        if (footprintViews == null) {
+            return "# HELP gateway_footprint_enabled Whether the ES Footprint relay is enabled.\n"
+                    + "# TYPE gateway_footprint_enabled gauge\n"
+                    + "gateway_footprint_enabled 0\n";
+        }
+        String[] events = FOOTPRINT_EVENTS;
+        String[] consumers = {"cache", "live"};
+        String[] reasons = {"oversize", "shape", "stale_session"};
+        String[] routes = {"bars", "outcomes"};
+        String[] rejectReasons = {"busy", "bad_cursor", "session_mismatch"};
+        StringBuilder sb = new StringBuilder();
+        sb.append("# HELP gateway_footprint_enabled Whether the ES Footprint relay is enabled.\n# TYPE gateway_footprint_enabled gauge\ngateway_footprint_enabled 1\n");
+        sb.append("# HELP gateway_footprint_records_total Footprint Kafka records polled, before admission.\n# TYPE gateway_footprint_records_total counter\n");
+        for (String e : events) for (String c : consumers) line(sb, "gateway_footprint_records_total", "{event=\"" + e + "\",consumer=\"" + c + "\"}", footprintCounter("records_total{event=\"" + e + "\",consumer=\"" + c + "\"}").get());
+        sb.append("# HELP gateway_footprint_drops_total Keyed footprint records not admitted to a view (oversize records are also not broadcast).\n# TYPE gateway_footprint_drops_total counter\n");
+        for (String e : FOOTPRINT_KEYED_EVENTS) for (String c : consumers) for (String r : reasons) line(sb, "gateway_footprint_drops_total", "{event=\"" + e + "\",consumer=\"" + c + "\",reason=\"" + r + "\"}", footprintCounter("drops_total{event=\"" + e + "\",consumer=\"" + c + "\",reason=\"" + r + "\"}").get());
+        sb.append("# HELP gateway_footprint_broadcast_total Footprint frames handed to broadcast by the live consumer.\n# TYPE gateway_footprint_broadcast_total counter\n");
+        for (String e : events) line(sb, "gateway_footprint_broadcast_total", "{event=\"" + e + "\"}", footprintCounter("broadcast_total{event=\"" + e + "\"}").get());
+        sb.append("# HELP gateway_footprint_evictions_total Records evicted by the view byte/count budgets.\n# TYPE gateway_footprint_evictions_total counter\n");
+        line(sb, "gateway_footprint_evictions_total", "{view=\"bars\"}", footprintViews.barsEvictions());
+        line(sb, "gateway_footprint_evictions_total", "{view=\"outcomes\"}", footprintViews.outcomesEvictions());
+        sb.append("# HELP gateway_footprint_rollovers_total Session date advances that cleared both views.\n# TYPE gateway_footprint_rollovers_total counter\n");
+        line(sb, "gateway_footprint_rollovers_total", "", footprintViews.rollovers());
+        sb.append("# HELP gateway_footprint_bars_in_view Closed-bar records held.\n# TYPE gateway_footprint_bars_in_view gauge\n");
+        line(sb, "gateway_footprint_bars_in_view", "", footprintViews.barsInView());
+        sb.append("# HELP gateway_footprint_outcomes_in_view Outcome records held.\n# TYPE gateway_footprint_outcomes_in_view gauge\n");
+        line(sb, "gateway_footprint_outcomes_in_view", "", footprintViews.outcomesInView());
+        sb.append("# HELP gateway_footprint_view_bytes Summed record lengths held per view.\n# TYPE gateway_footprint_view_bytes gauge\n");
+        line(sb, "gateway_footprint_view_bytes", "{view=\"bars\"}", footprintViews.barsBytes());
+        line(sb, "gateway_footprint_view_bytes", "{view=\"outcomes\"}", footprintViews.outcomesBytes());
+        sb.append("# HELP gateway_footprint_backfill_requests_total Footprint backfill requests reaching the handler with the flag on.\n# TYPE gateway_footprint_backfill_requests_total counter\n");
+        for (String r : routes) line(sb, "gateway_footprint_backfill_requests_total", "{route=\"" + r + "\"}", footprintCounter("backfill_requests_total{route=\"" + r + "\"}").get());
+        sb.append("# HELP gateway_footprint_backfill_rejected_total Footprint backfill requests rejected, one reason each.\n# TYPE gateway_footprint_backfill_rejected_total counter\n");
+        for (String r : routes) for (String x : rejectReasons) line(sb, "gateway_footprint_backfill_rejected_total", "{route=\"" + r + "\",reason=\"" + x + "\"}", footprintCounter("backfill_rejected_total{route=\"" + r + "\",reason=\"" + x + "\"}").get());
+        sb.append("# HELP gateway_footprint_topic_validated Whether the footprint topic passed G-R8a validation this incarnation.\n# TYPE gateway_footprint_topic_validated gauge\n");
+        for (String t : footprintTopics()) line(sb, "gateway_footprint_topic_validated", "{topic=\"" + t + "\"}", footprintGate.validated(t) ? 1 : 0);
+        sb.append("# HELP gateway_footprint_topic_validation_failures_total Validation attempts that did not yield VALID, one reason each.\n# TYPE gateway_footprint_topic_validation_failures_total counter\n");
+        for (String t : footprintTopics()) for (FootprintTopicGate.Reason r : FootprintTopicGate.Reason.values()) line(sb, "gateway_footprint_topic_validation_failures_total", "{topic=\"" + t + "\",reason=\"" + r.name() + "\"}", footprintGate.failures(t, r));
+        return sb.toString();
+    }
+
+    private static void line(StringBuilder sb, String name, String labels, long value) {
+        sb.append(name).append(labels).append(' ').append(value).append('\n');
     }
 
     /**
@@ -772,7 +1049,15 @@ public class FeedGatewayService implements ReplayRunner {
 
     @PostConstruct
     public void start() {
-        if (!settings.enabled() || !running.compareAndSet(false, true)) {
+        if (!settings.enabled()) {
+            return;
+        }
+        // ES Footprint preflight (G-R8/G-R8a) BEFORE any lifecycle state changes: a refusal here
+        // leaves running=false and no executor (round-1 #3), so the process dies clean.
+        if (footprintGate != null) {
+            footprintPreflight();
+        }
+        if (!running.compareAndSet(false, true)) {
             return;
         }
         executor = Executors.newFixedThreadPool(8, runnable -> {
@@ -910,7 +1195,7 @@ public class FeedGatewayService implements ReplayRunner {
         clients.add(session);
         clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
-        if (settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled()) {
+        if (sendsCvdHello()) {
             // R46 hello: the per-timeframe high-water marks of the bar view, so the page can bound
             // its REST backfill to exactly what this gateway holds and buffer WS bars past it.
             // U16 (CL-R8/G19): the latest ACCEPTED levels record rides INSIDE this same hello, so
@@ -924,6 +1209,26 @@ public class FeedGatewayService implements ReplayRunner {
         ActiveSelection selection = activeSelection.get();
         if (readySelectionKeyMatchesActive(selection)) {
             send(session, "source-ready", activeSelectionJson(selection, "source-ready"));
+        }
+        if (settings.esAuctionEnabled()) {
+            // Auction-desk hello: what this gateway holds for the current trade date, so the page can
+            // bound its /api/auction/minutes backfill and buffer live WS minutes past it. It must NOT
+            // go out before the state cache consumer has finished its seven-day hydration (code review
+            // round 3): a page that reconnects mid-restart would bound its backfill by a PARTIAL view
+            // and never learn about the records hydrated afterwards, because the hydration path is
+            // deliberately silent. Hold the socket instead — the page buffers live frames until the
+            // hello arrives — and flush every held socket the moment hydration completes.
+            // The latch and the send are ONE step, under the incarnation lock an invalidation also holds:
+            // checked and sent separately, an invalidation could land in between and this socket would be
+            // promised a view that had just been dropped (code review round 18). The lost-wakeup recheck of
+            // round 4 is then unnecessary — the insertion cannot race a flush that needs the same lock.
+            synchronized (esAuctionIncarnationLock) {
+                if (esAuctionHandoffFrozen.get()) {
+                    send(session, "es-auction-hello", esAuctionHelloJson());
+                } else {
+                    esAuctionHelloPending.add(session);
+                }
+            }
         }
         // In per-session mode the GLOBAL cached replay is replaced by a PER-SESSION filtered replay:
         // each socket gets only the cached state matching its own AppSession selection (no cross-
@@ -1024,6 +1329,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     public void removeClient(WebSocketSession session) {
+        esAuctionHelloPending.remove(session);   // a socket that closed while waiting for its hello must not be held
         String id = session.getId();
         OutboundChannel channel = outbound.remove(id);
         spotBandSwitchDelivered.remove(id);
@@ -1452,6 +1758,17 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP gateway_cvd_spx_levels_position_regressions_total es-cvd-spx-levels records refused because their fold provenance regressed.\n"
                 + "# TYPE gateway_cvd_spx_levels_position_regressions_total counter\n"
                 + "gateway_cvd_spx_levels_position_regressions_total " + cvdSpxLevelsRegressions.get() + "\n"
+                + footprintMetricsText()
+                + "# HELP gateway_es_auction_records_total SPX Auction Desk minute records forwarded verbatim as es-auction.\n"
+                + "# TYPE gateway_es_auction_records_total counter\n"
+                + "gateway_es_auction_records_total " + esAuctionRecords.get() + "\n"
+                + "# HELP gateway_es_auction_minutes_cached Minute records held in the es-auction backfill view (current plus previous trade date).\n"
+                + "# TYPE gateway_es_auction_minutes_cached gauge\n"
+                + "gateway_es_auction_minutes_cached " + esAuctionMinutesCached() + "\n"
+                + "# HELP gateway_es_auction_backfill_requests_total /api/auction/minutes backfill pages served.\n"
+                + "# TYPE gateway_es_auction_backfill_requests_total counter\n"
+                + "gateway_es_auction_backfill_requests_total " + esAuctionBackfillRequests.get() + "\n"
+                + "gateway_es_auction_orphan_envelopes_total " + esAuctionOrphanEnvelopes.get() + "\n"
                 + "# HELP gateway_vol_premium_topic_resets_total vol-premium-ivrv records admitted as a "
                 + "recreated topic: behind the cached offset AND strictly newer, which no incarnation "
                 + "of that topic can otherwise produce. Each one is a recovery from a reset that "
@@ -1909,6 +2226,8 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
         addEsCvdTopics(topicEvents);
+        addEsFootprintTopics(topicEvents);
+        addEsAuctionTopics(topicEvents);
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
@@ -2046,6 +2365,8 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
         addEsCvdTopics(topicEvents);
+        addEsFootprintTopics(topicEvents);
+        addEsAuctionTopics(topicEvents);
         if (settings.esCvdSpxLevelsEnabled()) {
             // U16: SPX-translated CVD structure levels (compacted single-partition heartbeat,
             // >=1 record per ALIGN_HEARTBEAT while the aligner runs) — LIVE consumer only. The
@@ -2062,6 +2383,26 @@ public class FeedGatewayService implements ReplayRunner {
         // One wiring path is shared by bootstrap and live consumers so their topic sets cannot drift.
         topicEvents.put(settings.esCvdTopic(), new TopicBinding("DATABENTO", "es-cvd"));
         topicEvents.put(settings.esCvdBarsTopic(), new TopicBinding("DATABENTO", "es-cvd-bar"));
+    }
+
+    /**
+     * ES Footprint (G-R2/G-R8a): the same one-wiring-path rule as {@link #addEsCvdTopics}. ALL FOUR
+     * topics are added unconditionally when the flag is on, so {@code PartitionRefresh}'s immutable
+     * topic set always contains them and discovers them whenever they appear; consumption is gated
+     * per topic by {@link FootprintTopicGate#admit} at bootstrap and inside every refresh.
+     */
+    void addEsFootprintTopics(Map<String, TopicBinding> topicEvents) {   // package-private: the wiring test EXECUTES it
+        if (footprintViews == null) return;
+        topicEvents.put(settings.esFootprintTopic(), new TopicBinding("DATABENTO", "es-footprint"));
+        topicEvents.put(settings.esFootprintEvidenceTopic(), new TopicBinding("DATABENTO", "es-footprint-evidence"));
+        topicEvents.put(settings.esFootprintBarsTopic(), new TopicBinding("DATABENTO", "es-footprint-bar"));
+        topicEvents.put(settings.esFootprintOutcomesTopic(), new TopicBinding("DATABENTO", "es-footprint-outcome"));
+    }
+
+    /** SPX Auction Desk minute stream: same shared-wiring rule as {@link #addEsCvdTopics}. */
+    private void addEsAuctionTopics(Map<String, TopicBinding> topicEvents) {
+        if (!settings.esAuctionEnabled()) return;
+        topicEvents.put(settings.esAuctionTopic(), new TopicBinding("DATABENTO", "es-auction"));
     }
 
     private void runAlertConsumer() {
@@ -2283,8 +2624,24 @@ public class FeedGatewayService implements ReplayRunner {
         // are obsolete, and a dead attempt's entry could never be retired (retirement needs this consumer's
         // position()), which would withhold readiness for that source forever.
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
-            List<TopicPartition> partitions = partitionsFor(name, consumer, topicEvents.keySet());
-            consumer.assign(partitions);
+            List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
+            /* VERIFIED, not merely bound, before the hydration reads a single record. This runs on every
+               cache-consumer attempt including RETRIES, and an id from a previous attempt is already on
+               record: a topic recreated while that consumer was down would otherwise be merged into the old
+               view, with the old handoff still frozen, until the 30 s cadence noticed (round 29). Same call
+               as the late-discovery path — there is only one rule. */
+            /* ONLY the consumer that actually carries the auction topic touches any of this. Every assigned
+               cache consumer runs this loop, and one that owns no auction partitions would otherwise see an
+               empty auction set as "complete": it could freeze and flush a hello without capturing anything,
+               clear a pending replay, or consume the forced identity check before the owning consumer had
+               finished hydrating (code review round 32). */
+            boolean ownsAuction = settings.esAuctionEnabled() && topicEvents.containsKey(settings.esAuctionTopic());
+            if (ownsAuction) {
+                verifyOrBindEsAuctionIncarnation(partitions);
+                // ...and again, unconditionally, once this attempt's hydration has caught up: the check above
+                // only covers what was true BEFORE it read a record (round 30).
+                esAuctionIdCheckDue.set(true);
+            }
             seekToCacheWindow(consumer, partitions, topicEvents);
             // Bootstrap gets the BOOTSTRAP budget: a broker that answers in 10s is slow, not broken, and
             // must bootstrap rather than crash-loop. The 2s refresh budget applies only inside the poll
@@ -2307,9 +2664,10 @@ public class FeedGatewayService implements ReplayRunner {
                     new LinkedHashMap<>(catchUpEndOffsets(bootstrapEndOffsets, topicEvents));
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
             boolean live = caughtUp(consumer, catchUpEndOffsets);
-            PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
+            PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
+                tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
             }
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
@@ -2317,6 +2675,14 @@ public class FeedGatewayService implements ReplayRunner {
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
+                    // A topic discovered AFTER startup is hydrated by the same path and needs the same
+                    // guarantee: name its incarnation before a record of it is read (round 26) — and when
+                    // one is already on record, VERIFY it rather than skip, because a delete/recreate keeps
+                    // the topic name and partition count (round 27).
+                    if (ownsAuction) {
+                        reopenEsAuctionLatchForNewPartitions(refresh.added());
+                        verifyOrBindEsAuctionIncarnation(refresh.added());
+                    }
                     seekToCacheWindow(consumer, refresh.added(), topicEvents);
                     Map<TopicPartition, Long> addedEndOffsets = boundedEndOffsets(consumer, refresh.added());
                     // TWO barriers, deliberately not the same set.
@@ -2435,6 +2801,24 @@ public class FeedGatewayService implements ReplayRunner {
                         tapeZonesBroadcast(binding, record, json, caughtUpFlag);
                         continue;
                     }
+                    if (binding != null && footprintViews != null && isFootprintEvent(binding.event())) {
+                        // ES Footprint (G-R3/G-R9): the CACHE consumer admits keyed records into the
+                        // coordinator (never the generic cache — a footprint bar is ~64 KB) and never
+                        // broadcasts; the two live snapshots are neither cached nor retained.
+                        admitFootprintRecord(binding.event(), json, "cache");
+                        continue;
+                    }
+                    if (binding != null && "es-auction".equals(binding.event())) {
+                        // RESTART HYDRATION ONLY. The SAME keyed upsert as the live branch (latest
+                        // correctionRev per tradeDate|HH:mm wins, current + previous trade date
+                        // retention) and NO broadcast — the live consumer owns the wire, and a
+                        // second emitter would duplicate every minute on every socket. Without this
+                        // branch the record fell through updateCache's default (no generic cache
+                        // shape) and the /api/auction/minutes view stayed EMPTY after a restart
+                        // until the next live minute arrived. Fed the KAFKA KEY, like the live branch.
+                        onEsAuctionCacheRecord(record.key() == null ? null : String.valueOf(record.key()), json);
+                        continue;
+                    }
                     updateCache(binding, record, json);
                 }
                 purgeExpiredCache(System.currentTimeMillis());
@@ -2477,6 +2861,7 @@ public class FeedGatewayService implements ReplayRunner {
                     // again. Both calls are idempotent and markSelectionReady re-validates under readyLock,
                     // so this is safe and cheap.
                     markCacheCaughtUp(name, events, caughtUpFlag);
+                    tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
                     ActiveSelection liveSelection = activeSelection.get();
                     if (liveSelection != null
                             && !selectionKey(liveSelection).equals(readySelectionKey.get())) {
@@ -2567,12 +2952,20 @@ public class FeedGatewayService implements ReplayRunner {
         Set<TopicPartition> onGrownTopics = Set.copyOf(refresh.addedOnGrownTopics());
         List<TopicPartition> recoverFromBeginning = new ArrayList<>();
         List<TopicPartition> recoverDisplayWindow = new ArrayList<>();
+        List<TopicPartition> recoverEsAuction = new ArrayList<>();
         List<TopicPartition> toEnd = new ArrayList<>();
         for (TopicPartition partition : refresh.added()) {
             TopicBinding binding = topicEvents.get(partition.topic());
             boolean liveOnly = binding != null && isLiveOnlyRebuiltEvent(binding.event());
             if (liveOnly && onGrownTopics.contains(partition)) {
                 recoverFromBeginning.add(partition);
+            } else if (binding != null && "es-auction".equals(binding.event())) {
+                // The auction topic is optional and may appear (or gain a partition) after startup. END
+                // would lose every minute written before this refresh: the cache consumer hydrates them
+                // silently, and the pages already had their hello, so nothing would put them on the wire
+                // (code review round 6). Resume from this partition's own cursor when there is one, and
+                // otherwise from what the topic still retains — bounded by its seven-day retention.
+                recoverEsAuction.add(partition);
             } else if (binding != null && "drop-nowcast".equals(binding.event())) {
                 // A drop-nowcast topic that just APPEARED (the optional producer creating it
                 // mid-session) may already hold verdicts; END would lose the very first one and
@@ -2589,6 +2982,17 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (!recoverFromBeginning.isEmpty()) {
             consumer.seekToBeginning(recoverFromBeginning);
+        }
+        if (!recoverEsAuction.isEmpty()) {
+            for (TopicPartition p : recoverEsAuction) {
+                long generation = esAuctionGeneration.get();   // read BEFORE the cursor (round 21)
+                Long cursor = esAuctionNextOffset.get(p);
+                if (cursor == null) cursor = esAuctionHandoffOffset.get(p);
+                // Seeding from the retained beginning would REPLAY that history onto the wire, since
+                // hydration marks nothing as emitted. With no cursor the partition is paused, exactly as at
+                // cold start, and positioned when its handoff appears (code review round 12).
+                if (cursor == null || !seekEsAuctionWithinAt(consumer, p, cursor, generation, false)) consumer.pause(List.of(p));
+            }
         }
         if (!recoverDisplayWindow.isEmpty()) {
             long fromMs = System.currentTimeMillis() - 10 * 60_000L;
@@ -2669,22 +3073,17 @@ public class FeedGatewayService implements ReplayRunner {
             boolean retry
     ) {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
-            List<TopicPartition> partitions = partitionsFor(name, consumer, topicEvents.keySet());
-            consumer.assign(partitions);
-            if (retry) {
-                seekToCacheWindow(consumer, partitions, topicEvents);
-                resumeCvdSpxLevels(consumer, partitions);          // U16: never replay history here
-            } else {
-                consumer.seekToEnd(partitions);
-                seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
-            }
-            PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet());
+            List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
+            liveBootstrapSeek(consumer, partitions, topicEvents, retry);
+            PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             while (running.get()) {
+                pauseEsAuctionOnIncarnationChange(consumer, partitions);
+                resumeEsAuctionOnceHandoffExists(consumer, partitions);
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
-                    seekAddedLivePartitions(consumer, refresh, topicEvents);
+                    liveAdoptionSeek(consumer, refresh, topicEvents);
                 }
                 // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
                 // is only read by dumpDiagnosticState() to distinguish "consumers polling" from "forward gate stuck".
@@ -2837,6 +3236,13 @@ public class FeedGatewayService implements ReplayRunner {
                         forwardedEvents.incrementAndGet();
                         continue;
                     }
+                    if (footprintViews != null && isFootprintEvent(binding.event())) {
+                        // ES Footprint (G-R3): keyed records go to the coordinator FIRST (the backfill's
+                        // source of truth), then the VERBATIM standalone broadcast — except an oversize
+                        // record, which is dropped entirely; the two live snapshots are broadcast as-is.
+                        onFootprintLiveRecord(binding.event(), json);
+                        continue;
+                    }
                     if ("es-cvd".equals(binding.event())) {
                         // Same standalone-delivery reasoning as es-aggressor-flow below: one compacted
                         // ES.v.0 snapshot per second, no option-expiry identity, never selection-gated.
@@ -2851,6 +3257,19 @@ public class FeedGatewayService implements ReplayRunner {
                         upsertCvdBar(json);
                         broadcast(binding.event(), json);
                         forwardedEvents.incrementAndGet();
+                        continue;
+                    }
+                    if ("es-auction".equals(binding.event())) {
+                        // SPX Auction Desk minute record: same delivery class as es-cvd-bar — keyed
+                        // minute view first (the /api/auction/minutes backfill's source of truth),
+                        // then the VERBATIM standalone broadcast (raw pass-through, never
+                        // selection-gated). Clients apply the same latest-correctionRev-per-minute
+                        // rule, so at-least-once delivery is invisible downstream.
+                        // A record of a superseded incarnation is dropped whole: applying it would put an
+                        // old log's minute into the fresh view and put it on the wire (round 22). The check,
+                        // the apply and the cursor are ONE step under the incarnation lock, so an invalidation
+                        // linearizes strictly before or strictly after the whole record (round 23).
+                        applyEsAuctionRecordIfCurrent(binding, record, json);
                         continue;
                     }
                     if ("es-aggressor-flow".equals(binding.event())) {
@@ -3604,6 +4023,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final class PartitionRefresh {
         private final String name;
         private final Set<String> topics;
+        /** G-R8a: evaluated INSIDE apply() before merge/assign; discovered partitions whose topic fails are withheld. */
+        private final Predicate<String> topicAdmit;
         private long nextRefreshMs;
         /** When the topology was last observed successfully — diagnostics only, never a seek input. */
         private volatile long lastObservedMs;
@@ -3611,8 +4032,13 @@ public class FeedGatewayService implements ReplayRunner {
         private volatile int lastDiscoveredCount;
 
         PartitionRefresh(String name, Set<String> topics) {
+            this(name, topics, t -> true);
+        }
+
+        PartitionRefresh(String name, Set<String> topics, Predicate<String> topicAdmit) {
             this.name = name;
             this.topics = Set.copyOf(topics);
+            this.topicAdmit = topicAdmit;
             long nowMs = System.currentTimeMillis();
             // The caller has just completed its bootstrap partitionsFor(), so the topology is known good now.
             this.lastObservedMs = nowMs;
@@ -3670,7 +4096,12 @@ public class FeedGatewayService implements ReplayRunner {
             // Bound from the END of the attempt: a slow metadata call must not tight-loop.
             nextRefreshMs = lastObservedMs + settings.partitionMetadataRefreshMs();
 
-            List<TopicPartition> added = addedPartitions(assigned, discovered);
+            // G-R8a: a discovered partition of a topic the gate does not admit is WITHHELD here — not
+            // merged, not assigned, not in added(), hence never sought or booked — exactly like a
+            // topic that does not exist yet; it is re-discovered and re-evaluated next refresh.
+            List<TopicPartition> admitted = new ArrayList<>();
+            for (TopicPartition p : discovered) if (topicAdmit.test(p.topic())) admitted.add(p);
+            List<TopicPartition> added = addedPartitions(assigned, admitted);
             if (added.isEmpty()) {
                 return Refresh.unchanged(assigned);
             }
@@ -3722,7 +4153,7 @@ public class FeedGatewayService implements ReplayRunner {
      * @param partitions the assignment now in effect — the caller MUST adopt it before seeking, so a seek
      *                   failure cannot leave the caller tracking a stale list.
      */
-    private record Refresh(
+    record Refresh(
             List<TopicPartition> partitions,
             List<TopicPartition> added,
             List<TopicPartition> addedOnGrownTopics,
@@ -3784,6 +4215,7 @@ public class FeedGatewayService implements ReplayRunner {
                     || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
                     || "indicators".equals(binding.event())
                     || "tapeZones".equals(binding.event())
+                    || "es-auction".equals(binding.event())
                     || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 // The pre-open status/control stream is SOURCE-INDEPENDENT window state:
                 // stateCaughtUp must include its partition regardless of the active market-data
@@ -3817,7 +4249,8 @@ public class FeedGatewayService implements ReplayRunner {
             if (preOpenBinding != null && ("ibkr-preopen-status".equals(preOpenBinding.event())
                     || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
                     || "indicators".equals(preOpenBinding.event())
-                    || "tapeZones".equals(preOpenBinding.event()))) {
+                    || "tapeZones".equals(preOpenBinding.event())
+                    || "es-auction".equals(preOpenBinding.event()))) {
                 // Source-independent streams (pre-open control + shared live gex + indicators +
                 // tape-zones board) always gate mid-run barriers too (r1 finding 4).
                 selected.put(entry.getKey(), entry.getValue());
@@ -3843,6 +4276,11 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
         if (caughtUpFlag.compareAndSet(false, true)) {
+            // ONLY the state consumer hydrates the auction view. Flushing on any other cache consumer's
+            // catch-up would hand out a hello bounded by a partly hydrated view, and the records that
+            // arrive afterwards are silent by design (code review round 4).
+            // The auction hellos are NOT flushed here: they wait for a complete per-partition handoff, which
+            // only the cache consumer's own thread can capture (tryFreezeEsAuctionHandoff, driven from its loop).
             // Run the whole catch-up replay under readyLock so the active selection is STABLE across the
             // capture, the cached-batch build (cachedEvents/uiBatchEnvelopeJson re-read activeSelection),
             // and the readiness commit. Without the lock a concurrent applySelection could swap the active
@@ -6064,7 +6502,7 @@ public class FeedGatewayService implements ReplayRunner {
      * (off-hours, so the published strike structure persists) while {@code seekBackMs} keeps the Kafka
      * cache-rebuild window BOUNDED regardless — the two concerns are deliberately decoupled.
      */
-    private record CachePolicy(long ttlMs, boolean neverEvict, long seekBackMs) {
+    record CachePolicy(long ttlMs, boolean neverEvict, long seekBackMs) {   // package-private: the retention test reads it
         static CachePolicy expiring(long ttlMs) {
             return new CachePolicy(ttlMs, false, ttlMs);
         }
@@ -6102,7 +6540,16 @@ public class FeedGatewayService implements ReplayRunner {
         return override != null ? override : marketCalendar.isRegularTradingHours(Instant.ofEpochMilli(nowMs));
     }
 
-    private CachePolicy cachePolicyFor(String event, long nowMs) {
+    CachePolicy cachePolicyFor(String event, long nowMs) {   // package-private: the retention test EXECUTES it
+        if ("es-footprint-bar".equals(event) || "es-footprint-outcome".equals(event)) {
+            // ES Footprint keyed topics: the cache consumer seeks back a whole session so a restart
+            // re-fills both views from the compacted topics; the records never enter the generic cache.
+            return CachePolicy.expiring(settings.esFootprintSeekBackMs());
+        }
+        if ("es-footprint".equals(event) || "es-footprint-evidence".equals(event)) {
+            // Live snapshots are never retained: seek END (a heartbeat arrives within 5 s).
+            return CachePolicy.expiring(0L);
+        }
         if ("option-truth".equals(event)) {
             return CachePolicy.expiring(settings.optionTruthTtlMs());
         }
@@ -6277,6 +6724,15 @@ public class FeedGatewayService implements ReplayRunner {
                 return CachePolicy.expiring(settings.optionChainRthCacheTtlMs());
             }
             return CachePolicy.noEviction(settings.optionChainOffHoursSeekBackMs());
+        }
+        if ("es-auction".equals(event)) {
+            // SPX Auction Desk minutes never enter the generic cache maps (the keyed minute view
+            // applies its own current + previous trade date retention), so ONLY the seek-back
+            // matters here: the cache consumer must replay enough of the compacted topic after a
+            // restart to rebuild BOTH retained trade dates. The generic 15-min window rebuilt at
+            // most the last few minutes. Default = the topic's 7-day retention, which covers the
+            // previous trade date across any weekend/holiday gap; ~390 records per date, so cheap.
+            return CachePolicy.noEviction(settings.esAuctionSeekBackMs());
         }
         return CachePolicy.expiring(settings.cacheTtlMs());
     }
@@ -7930,6 +8386,14 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private boolean interceptSharedGexRecord(
             ConsumerRecord<String, Object> record, String rawJson, boolean liveBroadcast, long nowMs) {
+        if (!settings.ibkrPreOpenGexArbitrationEnabled()) {
+            // Value-plane kill switch (2026-09-08). Deliberately the FIRST statement in the ONE
+            // chokepoint every reader goes through, so a single test covers the live consumer, the
+            // cache consumer and any future caller — gating the call sites instead would leave the
+            // wiring untested. Returning false hands the record straight back to the existing
+            // pipeline, exactly as before slice 2, and the slice-1 status plane is untouched.
+            return false;
+        }
         boolean liveTopic = record.topic().equals(settings.databentoGexTopic());
         if (rawJson == null || rawJson.isBlank()) {
             if (liveTopic) {
@@ -8807,20 +9271,38 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** {@code IBKR_PREOPEN:<D>} -> {@code <D>} (the {@code __revocation|<D>|<gen>} key's date). */
-    /** The pinned session-id shape: IBKR_PREOPEN:&lt;yyyy-MM-dd&gt;. Anything else fails closed. */
+    /**
+     * The pinned session-id shape: IBKR_PREOPEN:&lt;yyyyMMdd&gt;. Anything else fails closed.
+     *
+     * <p>BASIC_ISO, not the dashed ISO_LOCAL_DATE this once demanded. The producer
+     * ({@code IbkrPreOpenService}) builds its trade date with
+     * {@code DateTimeFormatter.BASIC_ISO_DATE} and stamps {@code "IBKR_PREOPEN:" + tradeDate}, so
+     * the only session id that ever reaches this topic looks like {@code IBKR_PREOPEN:20260908}.
+     * Demanding {@code 2026-09-08} rejected 100% of pre-open GEX on both environments
+     * (2026-09-08: dropped_sessioned dev 23,744 / prod 54,576, candidates 0, rejected 0 — nothing
+     * survived to arbitration).
+     *
+     * <p>The dashed form was never merely "the other spelling", it was UNJOINABLE: the status
+     * plane's controls arrive as {@code __revocation|<D>|<gen>} with the producer's BASIC_ISO
+     * {@code <D>}, and {@link #ibkrPreOpenSessionDate} feeds the SAME map keys from the value
+     * plane. A dashed value-side date could not have matched a control's date even once, so
+     * revocation and generation ordering were dead too. One canonical spelling is load-bearing:
+     * accepting both would key the same session twice.
+     */
     private static final java.util.regex.Pattern IBKR_PREOPEN_SESSION_ID =
-            java.util.regex.Pattern.compile("IBKR_PREOPEN:\\d{4}-\\d{2}-\\d{2}");
+            java.util.regex.Pattern.compile("IBKR_PREOPEN:\\d{8}");
 
     /**
-     * The pinned session id: IBKR_PREOPEN:&lt;yyyy-MM-dd&gt; where the date is a REAL calendar date.
-     * The regex alone admits 2026-99-99, which is not a session and must not key a plane.
+     * The pinned session id: IBKR_PREOPEN:&lt;yyyyMMdd&gt; where the date is a REAL calendar date.
+     * The regex alone admits 20269999, which is not a session and must not key a plane.
      */
     private static boolean isIbkrPreOpenSessionId(String sessionId) {
         if (!IBKR_PREOPEN_SESSION_ID.matcher(sessionId).matches()) {
             return false;
         }
         try {
-            java.time.LocalDate.parse(sessionId.substring("IBKR_PREOPEN:".length()));
+            java.time.LocalDate.parse(sessionId.substring("IBKR_PREOPEN:".length()),
+                    java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
             return true;
         } catch (java.time.format.DateTimeParseException e) {
             return false;
@@ -8985,7 +9467,9 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private static boolean isRawPassThroughEvent(String event) {
         return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
-                || "es-cvd-spx-levels".equals(event);
+                || "es-cvd-spx-levels".equals(event)
+                || "es-auction".equals(event)
+                || isFootprintEvent(event);
     }
 
     /**
@@ -9759,6 +10243,323 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    // ---- SPX Auction Desk minute view (es-auction) ------------------------------------------
+
+    /**
+     * Keyed view of the SPX Auction Desk minute records — {@code tradeDate|HH:mm} -> record JSON
+     * (verbatim). String order IS (tradeDate, minute) order because both components are
+     * fixed-width and {@code '|'} sorts above every digit, so a per-trade-date sub-map is a plain
+     * prefix range and pages come out in minute order for free.
+     */
+    private final java.util.TreeMap<String, String> esAuctionMinutes = new java.util.TreeMap<>();
+    /** minute key -> the highest correctionRev already BROADCAST for it. Separate from the view on purpose:
+     *  the cache consumer fills the view without emitting, so "is it in the view" cannot answer "have the
+     *  clients seen it". Pruned to the view's own keys, so it is bounded by the same retention. */
+    private final java.util.HashMap<String, Long> esAuctionEmitted = new java.util.HashMap<>();
+    /** The newest trade date the view has seen (the "current" one); null until the first record. */
+    private volatile String esAuctionTradeDate;
+    /** The trade date the current one rolled forward FROM; retained so late corrections still land. */
+    private volatile String esAuctionPrevTradeDate;
+    private final AtomicLong esAuctionRecords = new AtomicLong();
+    private final AtomicLong esAuctionBackfillRequests = new AtomicLong();
+    /** Envelopes that arrived with no minute to correct: counted, never stored (the view holds MINUTES). */
+    private final AtomicLong esAuctionOrphanEnvelopes = new AtomicLong();
+
+    /**
+     * Live-path handler for one es-auction Kafka record: keyed upsert, then the VERBATIM
+     * standalone broadcast. A record the view refuses (stale trade date, superseded
+     * correctionRev, foreign shape) is still broadcast — clients apply the same keyed rule — so
+     * the view and the wire can never disagree on what "latest" means.
+     */
+    void onEsAuctionRecord(String key, String json) {
+        esAuctionRecords.incrementAndGet();
+        // IDEMPOTENT wire, decided by what the CLIENTS have been sent — not by what the view happens
+        // to hold. The cache consumer keeps polling after hydration and races this path on every new
+        // offset (code review round 2): if it upserts a minute first, the view calls the live copy a
+        // DUPLICATE, and gating the broadcast on the view outcome would silently drop that minute
+        // from every connected page. The emitted ledger is the gate instead: a record goes out once
+        // per (minute, correctionRev), so a consumer retry's replay is still silent, while a minute
+        // the cache consumer happened to see first is still delivered.
+        if (upsertEsAuctionMinuteOutcome(key, json, true)) {
+            broadcast("es-auction", json);
+            forwardedEvents.incrementAndGet();
+        }
+    }
+
+    /** What the keyed upsert did with a record; only NEW and REPLACED reach the wire. */
+    enum EsAuctionUpsert { NEW, REPLACED, DUPLICATE, DROPPED }
+
+    /**
+     * Cache-consumer (restart hydration) handler for one es-auction Kafka record: the SAME keyed
+     * upsert as {@link #onEsAuctionRecord} — latest correctionRev wins, current + previous trade
+     * date retention — and NOTHING else. No broadcast (the live consumer owns the wire) and no
+     * forwarded/records counters (those count what reached the wire), so a restart's replay of
+     * the compacted topic rebuilds the {@code /api/auction/minutes} view and the connect hello
+     * silently. Order-independent with the live path by construction: both feed one keyed rule.
+     */
+    void onEsAuctionCacheRecord(String key, String json) {
+        upsertEsAuctionMinuteOutcome(key, json, false);   // hydration only: never emits, never marks a record as emitted
+    }
+
+    /**
+     * At-least-once keyed upsert: the latest {@code correctionRev} per {@code tradeDate|HH:mm}
+     * wins (an equal rev overwrites, so a restart's re-emission replaces rather than duplicates).
+     * Retention is the CURRENT trade date plus the PREVIOUS one: a newer date rolls the view
+     * forward and evicts everything older than the date it rolled from; a record older than the
+     * previous date is a replay from a dead session and is dropped, never resurrected.
+     *
+     * @return true when the record now sits in the view
+     */
+    boolean upsertEsAuctionMinute(String key, String json) {
+        EsAuctionUpsert o = upsertEsAuctionMinuteOutcome(key, json);
+        return o == EsAuctionUpsert.NEW || o == EsAuctionUpsert.REPLACED || o == EsAuctionUpsert.DUPLICATE;
+    }
+
+    /** Applies the record to the view without touching the emitted ledger (the tests' plain entry point). */
+    EsAuctionUpsert upsertEsAuctionMinuteOutcome(String key, String json) {
+        EsAuctionUpsert[] seen = new EsAuctionUpsert[1];
+        upsertEsAuctionMinuteOutcome(key, json, false, seen);
+        return seen[0];
+    }
+
+    /** @return true when this record must reach the wire: it is the view's current copy of its minute
+     *  AND no record for that minute at this correctionRev has been broadcast yet. */
+    boolean upsertEsAuctionMinuteOutcome(String key, String json, boolean live) {
+        return upsertEsAuctionMinuteOutcome(key, json, live, new EsAuctionUpsert[1]);
+    }
+
+    private boolean upsertEsAuctionMinuteOutcome(String key, String json, boolean live, EsAuctionUpsert[] outcome) {
+        String tradeDate = null;
+        String minute = null;
+        long rev = 0L;
+        try {
+            JsonNode root = mapper.readTree(json);
+            if (root == null || !root.isObject()) { outcome[0] = EsAuctionUpsert.DROPPED; return false; }
+            tradeDate = text(root, "tradeDate");
+            minute = text(root, "minute");
+            rev = longField(root, "correctionRev", 0L);
+        } catch (JsonProcessingException e) {
+            outcome[0] = EsAuctionUpsert.DROPPED;
+            return false;
+        }
+        if (key != null) {
+            // The Kafka key is the contract's identity; the payload fields are only a fallback
+            // for a record produced without one.
+            int sep = key.indexOf('|');
+            if (sep > 0 && sep < key.length() - 1) {
+                tradeDate = key.substring(0, sep).trim();
+                minute = key.substring(sep + 1).trim();
+            }
+        }
+        if (tradeDate == null || tradeDate.isEmpty() || minute == null || minute.isEmpty()) { outcome[0] = EsAuctionUpsert.DROPPED; return false; }
+        String viewKey = tradeDate + "|" + minute;
+        // A §7b CorrectionEnvelope is a SPARSE PATCH, not a minute. /api/auction/minutes promises MINUTES,
+        // and a page loading cold cannot reconstruct one from a patch whose base it never receives, so the
+        // view stores the MATERIALIZED record: the envelope applied to the minute it corrects (code review
+        // round 3). The wire still carries the envelope verbatim; the page applies the same operations.
+        boolean envelope = esAuctionIsEnvelope(json);
+        synchronized (esAuctionMinutes) {
+            // ORDER-INDEPENDENT retention: the view holds the two GREATEST trade dates it has seen,
+            // whatever order they arrived in (a restart's replay is not sorted across partitions,
+            // and live ingestion can race the hydration). A record older than the second-greatest
+            // retained date is a dead-session record and is dropped, never resurrected.
+            String prev = esAuctionPrevTradeDate;
+            if (prev != null && tradeDate.compareTo(prev) < 0) {
+                outcome[0] = EsAuctionUpsert.DROPPED;
+                return false;                                                  // dead-session record
+            }
+            String existing = esAuctionMinutes.get(viewKey);
+            boolean duplicate = false;
+            if (existing != null) {
+                long existingRev = esAuctionCorrectionRev(existing);
+                if (existingRev > rev) { outcome[0] = EsAuctionUpsert.DROPPED; return false; }   // superseded correction
+                duplicate = existingRev == rev && existing.equals(json);
+            }
+            String stored = json;
+            if (envelope) {
+                if (existing == null) { outcome[0] = EsAuctionUpsert.DROPPED; esAuctionOrphanEnvelopes.incrementAndGet(); return live; }
+                stored = esAuctionMaterialize(existing, json);
+                duplicate = stored.equals(existing);
+            }
+            if (!duplicate) {
+                esAuctionMinutes.put(viewKey, stored);
+                esAuctionRecomputeRetentionLocked();
+            }
+            outcome[0] = duplicate ? EsAuctionUpsert.DUPLICATE : existing == null ? EsAuctionUpsert.NEW : EsAuctionUpsert.REPLACED;
+            if (!live) return false;
+            Long emitted = esAuctionEmitted.get(viewKey);
+            if (emitted != null && emitted >= rev) return false;               // already on the wire at this revision
+            esAuctionEmitted.put(viewKey, rev);
+            esAuctionEmitted.keySet().retainAll(esAuctionMinutes.keySet());    // the ledger follows the view's retention
+            return true;
+        }
+    }
+
+    /** Derives current/previous from the dates held and evicts every older date (lock held). */
+    private void esAuctionRecomputeRetentionLocked() {
+        java.util.TreeSet<String> dates = new java.util.TreeSet<>();
+        for (String k : esAuctionMinutes.keySet()) {
+            int sep = k.indexOf('|');
+            if (sep > 0) dates.add(k.substring(0, sep));
+        }
+        if (dates.isEmpty()) { esAuctionTradeDate = null; esAuctionPrevTradeDate = null; return; }
+        String current = dates.last();
+        String prev = dates.lower(current);
+        if (prev != null) {
+            esAuctionMinutes.headMap(prev + "|", false).clear();   // everything below the previous date
+        }
+        esAuctionTradeDate = current;
+        esAuctionPrevTradeDate = prev;
+    }
+
+    /** §7b: correctionRev >= 1 carrying callOmitted or corrected[] and no call — a patch, not a minute. */
+    static boolean esAuctionIsEnvelope(String json) {
+        try {
+            JsonNode n = new ObjectMapper().readTree(json);
+            if (n == null || !n.isObject()) return false;
+            if (n.path("correctionRev").asLong(0L) < 1L) return false;
+            if (n.has("call") && !n.path("call").isNull()) return false;
+            return n.path("callOmitted").asBoolean(false) || n.path("corrected").isArray();
+        } catch (JsonProcessingException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Applies an envelope's typed patch to the minute it corrects and returns the MATERIALIZED record.
+     * §7b: a path segment landing on an array addresses an element by its IDENTITY key (eventId / refId),
+     * never by index. The envelope's own header fields replace the base's; everything else survives, and
+     * the call, traderLine and policy stand as published (§8.10). On any malformed input the base is kept.
+     */
+    String esAuctionMaterialize(String base, String envelope) {
+        try {
+            ObjectMapper m = new ObjectMapper();
+            JsonNode baseNode = m.readTree(base), envNode = m.readTree(envelope);
+            if (!(baseNode instanceof com.fasterxml.jackson.databind.node.ObjectNode out) || !envNode.isObject()) return base;
+            for (JsonNode op : envNode.path("corrected")) {
+                String path = op.path("path").asText("");
+                if (path.isEmpty()) continue;
+                java.util.List<String> parts = new java.util.ArrayList<>();
+                for (String seg : path.split("/")) if (!seg.isEmpty()) parts.add(seg);
+                if (parts.isEmpty()) continue;
+                String last = parts.remove(parts.size() - 1);
+                JsonNode node = out;
+                for (String seg : parts) { node = esAuctionStep(node, seg); if (node == null) break; }
+                if (node == null) continue;
+                boolean delete = "DELETE".equals(op.path("op").asText(""));
+                if (node instanceof com.fasterxml.jackson.databind.node.ArrayNode arr) {
+                    int at = esAuctionIndexOfIdentity(arr, last);
+                    if (at < 0) { if (!delete && op.has("value")) arr.add(op.get("value")); continue; }
+                    if (delete) arr.remove(at); else arr.set(at, op.get("value"));
+                } else if (node instanceof com.fasterxml.jackson.databind.node.ObjectNode obj) {
+                    if (delete) obj.remove(last); else obj.set(last, op.get("value"));
+                }
+            }
+            for (String f : new String[]{"schemaVersion", "requirementsRevision", "effectiveTs", "publishTs", "emittedBy",
+                    "correctionRev", "correctionCause", "supersedes", "receivedTs", "provenance", "dataQuality"}) {
+                if (envNode.has(f)) out.set(f, envNode.get(f));
+            }
+            return m.writeValueAsString(out);
+        } catch (RuntimeException | JsonProcessingException e) {
+            return base;
+        }
+    }
+
+    private static JsonNode esAuctionStep(JsonNode node, String seg) {
+        if (node instanceof com.fasterxml.jackson.databind.node.ArrayNode arr) {
+            int at = esAuctionIndexOfIdentity(arr, seg);
+            return at < 0 ? null : arr.get(at);
+        }
+        return node != null && node.isObject() ? node.get(seg) : null;
+    }
+
+    private static int esAuctionIndexOfIdentity(com.fasterxml.jackson.databind.node.ArrayNode arr, String seg) {
+        String want = seg.indexOf('=') > 0 ? seg.substring(seg.indexOf('=') + 1) : seg;
+        for (int i = 0; i < arr.size(); i++) {
+            JsonNode e = arr.get(i);
+            if (e != null && e.isObject()
+                    && (want.equals(e.path("eventId").asText(null)) || want.equals(e.path("refId").asText(null)) || want.equals(e.path("id").asText(null)))) return i;
+        }
+        return -1;
+    }
+
+    private long esAuctionCorrectionRev(String json) {
+        try {
+            return longField(mapper.readTree(json), "correctionRev", 0L);
+        } catch (JsonProcessingException e) {
+            return 0L;
+        }
+    }
+
+    /** Hello payload: {"tradeDate":...,"minutes":<count for that date>,"lastMinute":"HH:mm"|null}. */
+    String esAuctionHelloJson() {
+        synchronized (esAuctionMinutes) {
+            String td = esAuctionTradeDate;
+            StringBuilder sb = new StringBuilder("{\"tradeDate\":");
+            sb.append(td == null ? "null" : "\"" + escapeJson(td) + "\"");
+            java.util.NavigableMap<String, String> day = td == null
+                    ? java.util.Collections.emptyNavigableMap() : esAuctionDayLocked(td);
+            sb.append(",\"minutes\":").append(day.size());
+            String last = day.isEmpty() ? null : day.lastKey().substring(td.length() + 1);
+            sb.append(",\"lastMinute\":").append(last == null ? "null" : "\"" + escapeJson(last) + "\"");
+            return sb.append('}').toString();
+        }
+    }
+
+    /** The prefix range of one trade date; caller holds the view lock. */
+    private java.util.NavigableMap<String, String> esAuctionDayLocked(String tradeDate) {
+        // '|' + 1 == '}' — every "tradeDate|HH:mm" key sorts inside [tradeDate|, tradeDate}).
+        return esAuctionMinutes.subMap(tradeDate + "|", true, tradeDate + "}", false);
+    }
+
+    /** One ATOMIC backfill page: trade date, rows and cursor under one lock (the cvdBarsPage rule). */
+    public record EsAuctionMinutesPage(String tradeDate, java.util.List<String> minutes, String nextCursor) { }
+
+    /**
+     * Minute records for one trade date in minute order, starting at {@code fromMinuteInclusive}
+     * (null/blank = the first held minute), at most {@code limit} rows. {@code nextCursor} is the
+     * first minute NOT returned (feed it back as {@code from}) or null when the page reached the end
+     * — so a client never has to issue a trailing empty page to learn it is done. A null/blank
+     * {@code tradeDate} means the current one; a date the view does not hold answers an empty page
+     * labelled with the requested date.
+     */
+    public EsAuctionMinutesPage auctionMinutesPage(String tradeDate, String fromMinuteInclusive, int limit) {
+        esAuctionBackfillRequests.incrementAndGet();
+        synchronized (esAuctionMinutes) {
+            String td = tradeDate == null || tradeDate.isBlank() ? esAuctionTradeDate : tradeDate.trim();
+            if (td == null) {
+                return new EsAuctionMinutesPage(null, java.util.List.of(), null);
+            }
+            java.util.NavigableMap<String, String> day = esAuctionDayLocked(td);
+            if (fromMinuteInclusive != null && !fromMinuteInclusive.isBlank()) {
+                day = day.tailMap(td + "|" + fromMinuteInclusive.trim(), true);
+            }
+            java.util.List<String> out = new java.util.ArrayList<>();
+            String next = null;
+            for (java.util.Map.Entry<String, String> e : day.entrySet()) {
+                if (out.size() >= limit) {
+                    next = e.getKey().substring(td.length() + 1);
+                    break;
+                }
+                out.add(e.getValue());
+            }
+            return new EsAuctionMinutesPage(td, out, next);
+        }
+    }
+
+    public String esAuctionTradeDate() { return esAuctionTradeDate; }
+
+    /** Records held across both retained trade dates (the gateway_es_auction_minutes_cached gauge). */
+    int esAuctionMinutesCached() {
+        synchronized (esAuctionMinutes) {
+            return esAuctionMinutes.size();
+        }
+    }
+
+    long esAuctionRecordsForTest() { return esAuctionRecords.get(); }
+
+    long esAuctionBackfillRequestsForTest() { return esAuctionBackfillRequests.get(); }
+
     /** U16 boundary cap: one levels record may never exceed the design's 64 KiB record bound. */
     static final int CVD_SPX_LEVELS_MAX_BYTES = 65536;
 
@@ -10092,10 +10893,63 @@ public class FeedGatewayService implements ReplayRunner {
         seekCvdSpxLevelsWithin(consumer, owned, handoff, null);
     }
 
+    /**
+     * Applies ONE live auction record, but only while its partition is still reading the incarnation it was
+     * positioned under — and the check, the keyed upsert, the broadcast and the cursor are one step under
+     * `esAuctionIncarnationLock`, the monitor an invalidation also holds for its whole body. Checked and then
+     * applied separately, an invalidation could land in between and this already-polled record of the OLD log
+     * would be inserted into the FRESH view and broadcast (code review round 23).
+     */
+    private void applyEsAuctionRecordIfCurrent(TopicBinding binding, ConsumerRecord<String, Object> record, String json) {
+        TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+        synchronized (esAuctionIncarnationLock) {
+            Long positionedUnder = esAuctionCursorGeneration.get(tp);
+            if (positionedUnder == null || positionedUnder != esAuctionGeneration.get()) return;
+            onEsAuctionRecord(record.key() == null ? null : String.valueOf(record.key()), json);
+            noteCvdSpxLevelsProgress(binding, record);   // the cursor a retry resumes from
+        }
+    }
+
+    /**
+     * Stops consuming any auction partition whose incarnation is gone. The invalidation runs on the CACHE
+     * thread and only ever cleared cursors; an ACTIVE live partition kept polling the old numeric position
+     * — or reset to `latest` — straight through the recreation, because the resume path only ever looked at
+     * partitions that were ALREADY paused (code review round 22). Pausing here is what makes the rest of the
+     * live path converge: `resumeEsAuctionOnceHandoffExists` repositions it once a fresh handoff exists.
+     */
+    private void pauseEsAuctionOnIncarnationChange(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        java.util.Set<TopicPartition> paused = consumer.paused();
+        List<TopicPartition> drop = new java.util.ArrayList<>();
+        synchronized (esAuctionIncarnationLock) {
+            long generation = esAuctionGeneration.get();
+            for (TopicPartition tp : partitions) {
+                if (!tp.topic().equals(topic) || paused.contains(tp)) continue;
+                Long positionedUnder = esAuctionCursorGeneration.get(tp);
+                if (positionedUnder == null || positionedUnder != generation) { drop.add(tp); esAuctionCursorGeneration.remove(tp); esAuctionNextOffset.remove(tp); }
+            }
+            if (!drop.isEmpty()) consumer.pause(drop);
+        }
+        if (!drop.isEmpty()) System.out.println("es-auction: " + drop + " paused — the incarnation they were reading is gone; waiting for a fresh handoff");
+    }
+
     /** Remember where this partition got to, so a retry resumes rather than replays. */
     private void noteCvdSpxLevelsProgress(TopicBinding binding, ConsumerRecord<String, ?> record) {
         if (binding != null && "es-cvd-spx-levels".equals(binding.event())) {
             cvdSpxLevelsNextOffset.set(record.offset() + 1);
+        }
+        if (binding != null && "es-auction".equals(binding.event())) {
+            TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+            /* Only while this partition is still reading the incarnation it was positioned under. A record
+               from a batch polled before an invalidation would otherwise repopulate the cleared map with an
+               offset from the OLD log, and that cursor then outranks the fresh handoff (round 22). */
+            /* The caller already holds `esAuctionIncarnationLock` on the live path (the lock is reentrant),
+               which is what makes the check and this write one step with the apply. */
+            synchronized (esAuctionIncarnationLock) {
+                Long positionedUnder = esAuctionCursorGeneration.get(tp);
+                if (positionedUnder != null && positionedUnder == esAuctionGeneration.get()) esAuctionNextOffset.put(tp, record.offset() + 1);
+            }
         }
     }
 
@@ -10121,6 +10975,89 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (owned == null) return;
         seekCvdSpxLevelsWithin(consumer, owned, cvdSpxLevelsNextOffset.get(), cvdSpxLevelsNextOffset);
+    }
+
+    /**
+     * The ONE rule for positioning the auction on the live path, cold start and retry alike: resume where the
+     * LIVE path last was; failing that, where hydration froze; and failing both, do not guess — PAUSE the
+     * partition and let `resumeEsAuctionOnceHandoffExists` position it the moment the handoff appears.
+     * `seekToEnd` is lazy and would otherwise win, skipping whatever was produced in between (round 11).
+     */
+    private void positionEsAuction(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        List<TopicPartition> pause = new java.util.ArrayList<>();
+        for (TopicPartition tp : partitions) {
+            if (!tp.topic().equals(topic)) continue;
+            // The generation is read BEFORE the cursor, never after: read after, an invalidation in between
+            // would hand a cursor from the OLD log to a check that sees the NEW generation (round 21).
+            long generation = esAuctionGeneration.get();
+            Long cursor = esAuctionNextOffset.get(tp);
+            if (cursor == null) cursor = esAuctionHandoffOffset.get(tp);
+            if (cursor == null || !seekEsAuctionWithinAt(consumer, tp, cursor, generation, false)) { pause.add(tp); continue; }
+        }
+        if (!pause.isEmpty()) consumer.pause(pause);
+    }
+
+    /** Positions and resumes each paused auction partition the moment its frozen handoff appears. */
+    private void resumeEsAuctionOnceHandoffExists(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        java.util.Set<TopicPartition> paused = consumer.paused();
+        if (paused.isEmpty()) return;
+        for (TopicPartition tp : partitions) {
+            if (!tp.topic().equals(topic) || !paused.contains(tp)) continue;
+            long generation = esAuctionGeneration.get();
+            Long handoff = esAuctionHandoffOffset.get(tp);
+            if (handoff == null) continue;                                 // still paused; resumed the moment it appears
+            // The RESUME belongs inside the same generation-checked step as the seek: an invalidation between
+            // the two would leave the partition resumed on a cursor from the old log (round 21).
+            seekEsAuctionWithinAt(consumer, tp, handoff, generation, true);
+        }
+    }
+
+    /** Seeks to {@code cursor}, clamped to what the partition retains. A failed RANGE QUERY does NOT mean
+     *  "skip to the end": the cursor was valid when it was recorded, so it is used as it stands and only a
+     *  failed SEEK falls back to END (code review round 7). */
+    boolean seekEsAuctionWithinAt(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, TopicPartition owned, long cursor,
+                                 long generation, boolean resumeAfterSeek) {
+        List<TopicPartition> one = List.of(owned);
+        /* IDENTITY FIRST, and it must be KNOWN. Offsets cannot see a recreation that has already grown past
+           the old cursor: `cursor <= end` would look valid and the consumer would seek into the NEW log,
+           silently skipping everything before the cursor while hydration stays non-broadcasting (round 15).
+           An id that is unknown or unreadable is the same case unverified, so both fail CLOSED — the partition
+           stays paused until the incarnation can be named (rounds 20, 21). */
+        org.apache.kafka.common.Uuid known = esAuctionTopicId;
+        if (known == null) { System.out.println("es-auction: no incarnation is on record for " + owned + "; the partition stays paused until a handoff is captured"); return false; }
+        org.apache.kafka.common.Uuid now = esAuctionTopicIdReader.apply(owned.topic());
+        if (now == null) { System.out.println("es-auction: the topic id of " + owned + " cannot be read; the partition stays paused rather than trust a cursor on an unnamed log"); return false; }
+        if (!now.equals(known)) { esAuctionForgetIncarnation("topic " + owned.topic() + " was recreated (" + known + " -> " + now + ")"); return false; }
+        long target;
+        try {
+            long beginning = consumer.beginningOffsets(one, Duration.ofSeconds(10)).get(owned);
+            long end = consumer.endOffsets(one, Duration.ofSeconds(10)).get(owned);
+            if (cursor > end) {
+                // Belt and braces for what the ID check cannot cover: a cursor beyond the log end is not a
+                // position on this log at all.
+                esAuctionForgetIncarnation("cursor " + cursor + " is beyond the log end of " + owned);
+                return false;
+            }
+            target = Math.max(cursor, beginning);   // aged out: take what is left
+        } catch (RuntimeException rangeUnknown) {
+            /* A failed RANGE QUERY does NOT mean "skip to the end": the cursor was valid when it was
+               recorded, so it is used as it stands and only a failed SEEK gives up (round 7). */
+            target = cursor;
+        }
+        /* The seek AND the resume happen under the incarnation lock with the generation confirmed: an
+           invalidation between the identity check and either of them would otherwise leave this partition
+           consuming a recreated log from a cursor that belongs to the old one (round 21). */
+        synchronized (esAuctionIncarnationLock) {
+            if (esAuctionGeneration.get() != generation) return false;
+            try { consumer.seek(owned, target); } catch (RuntimeException seekFailed) { return false; }
+            esAuctionCursorGeneration.put(owned, generation);   // what this partition is now reading
+            if (resumeAfterSeek) consumer.resume(one);
+            return true;
+        }
     }
 
     /** What is left of the hydration budget; never negative, so a blown budget stops immediately. */
@@ -10286,6 +11223,11 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** R46 hello payload: {"sessionDate":...,"hwm":{"30s":<lastBarStartMs>,...}}. */
+    /** G-R6: the cvd-hello frame is sent whenever CVD, SPX levels OR footprint is enabled. */
+    boolean sendsCvdHello() {
+        return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || footprintViews != null;
+    }
+
     String cvdHelloJson() {
         StringBuilder sb = new StringBuilder("{\"sessionDate\":");
         String sd = cvdBarsSessionDate;
@@ -10301,6 +11243,11 @@ public class FeedGatewayService implements ReplayRunner {
             // Verbatim record or an explicit null — the FIELD's presence is the completion signal.
             String levels = cvdSpxLevelsLatest.get();
             sb.append(",\"levels\":").append(levels == null ? "null" : levels);
+        }
+        if (footprintViews != null) {
+            // G-R6: ONE atomic snapshot of the footprint coordinator rides the SAME hello; the field's
+            // ABSENCE (flag off) tells the page this gateway has no footprint stream.
+            sb.append(",\"footprint\":").append(footprintViews.helloField());
         }
         return sb.append('}').toString();
     }
@@ -11343,7 +12290,11 @@ public class FeedGatewayService implements ReplayRunner {
             // UNKNOWN_SESSIONED tuples fail closed exactly like the live reader. All three drop
             // here (counted), so no sessioned record is ever relabelled with Databento
             // provenance by the generic enrichment below. Flag OFF -> byte-identical behavior (O7).
-            if (settings.ibkrPreOpenEnabled() && source == MarketDataSource.DATABENTO
+            // Same kill switch as the live/cache readers (2026-09-08): replay must apply the SAME
+            // classification the live path does, so when the value plane is off a sessioned record
+            // stays on the ordinary replay plane instead of being dropped here.
+            if (settings.ibkrPreOpenEnabled() && settings.ibkrPreOpenGexArbitrationEnabled()
+                    && source == MarketDataSource.DATABENTO
                     && "gex-by-strike".equals(r.event()) && isSessionedSharedGexJson(raw)) {
                 ibkrPreOpenGexDroppedSessioned.incrementAndGet();
                 return false;
@@ -11562,6 +12513,12 @@ public class FeedGatewayService implements ReplayRunner {
             // es-cvd/es-cvd-bar frame as non-routable.
             "es-cvd",
             "es-cvd-bar",
+            // ES Footprint (G-R3, D5): ES-global market microstructure, identical for every
+            // authenticated socket — the same class as es-cvd; the only gate is authentication.
+            "es-footprint",
+            "es-footprint-evidence",
+            "es-footprint-bar",
+            "es-footprint-outcome",
             // Server-rated Δ-flow acceleration: chain-global advisory; a non-allowlisted event is
             // dropped as non-routable in per-session (auth) mode.
             "delta-flow-accel",
@@ -11576,7 +12533,10 @@ public class FeedGatewayService implements ReplayRunner {
             // A4 push state / alert / scorecard: same class.
             "direction-push", "direction-alert", "direction-scorecard",
             // A5.7 calibration progress: same class again — one statement about the corpus, for everyone.
-            "direction-progress");
+            "direction-progress",
+            // SPX Auction Desk minute records: ES-global, no option-expiry identity — the same
+            // allowlist rule as es-cvd, or per-session (auth) mode drops every frame as non-routable.
+            "es-auction");
 
     static boolean isGlobalBroadcastEvent(String event) {
         return GLOBAL_BROADCAST_EVENTS.contains(event);
@@ -12385,6 +13345,351 @@ public class FeedGatewayService implements ReplayRunner {
         settings.applyKafkaSecurity(properties); // TLS/SASL when configured (required under auth — P0)
         return properties;
     }
+
+    /**
+     * Records the cache consumer's ACTUAL position on every auction partition, so the freeze has a value for
+     * each of them — including a partition on which no record has been processed. Without it the cold-start
+     * live seek fell through to END, and a minute produced between the cache barrier and that seek was
+     * skipped on the wire while the cache swallowed it silently (code review round 9).
+     */
+    /**
+     * Captures the cache consumer's ACTUAL position on every auction partition, once per partition, and
+     * releases the held hellos only when EVERY one of them has a value. A swallowed `position()` failure
+     * used to leave a partition without a handoff, and the cold-start live seek then fell back to END —
+     * exactly the silent loss the handoff exists to prevent (code review round 10). So a failure is not
+     * swallowed: the hello stays held and the next loop iteration tries again.
+     *
+     * <p>Called from the cache consumer's own thread, which is the only thread that may touch its consumer.
+     */
+    void tryFreezeEsAuctionHandoff(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions, boolean ownsAuction) {
+        /* `ownsAuction` is the consumer's own binding, not its current assignment: the vacuous freeze on an
+           EMPTY partition set (round 13) is right only for the consumer that WOULD carry the topic. Any other
+           cache consumer reaching here would freeze a handoff it never captured (round 32). */
+        if (!ownsAuction || !settings.esAuctionEnabled() || !stateCaughtUp.get()) return;
+        long generation = esAuctionGeneration.get();
+        String topic = settings.esAuctionTopic();
+        /* The latch is not permanent: an auction partition ADDED after the freeze has no handoff, so readiness
+           no longer covers every current partition. Reopen it and hold new sockets until the added partition
+           has been captured too (round 12) — UNDER the incarnation lock, the same monitor connect and flush
+           decide on, so a hello can never be sent on a latch this thread is in the middle of reopening
+           (code review round 19). */
+        boolean frozen;
+        synchronized (esAuctionIncarnationLock) {
+            for (TopicPartition tp : partitions) {
+                if (tp.topic().equals(topic) && !esAuctionHandoffOffset.containsKey(tp)) { esAuctionHandoffFrozen.set(false); break; }
+            }
+            frozen = esAuctionHandoffFrozen.get();
+        }
+        // The identity round trip stays OUTSIDE the lock: an invalidation must never wait on a broker call.
+        if (frozen) { verifyFrozenEsAuctionIncarnation(topic); return; }
+        if (!esAuctionRehydrated(consumer, partitions, generation)) return;
+        /* IDENTITY FIRST: a position is meaningless without knowing which LOG it is a position on (round 16). */
+        org.apache.kafka.common.Uuid id = esAuctionTopicIdReader.apply(topic);
+        if (id == null) { System.out.println("es-auction: cannot read the topic id; nothing is captured and the hello stays held"); return; }
+        org.apache.kafka.common.Uuid known = esAuctionTopicId;
+        if (known != null && !known.equals(id)) { esAuctionForgetIncarnation("topic " + topic + " was recreated (" + known + " -> " + id + ")"); return; }
+        /* Captured LOCALLY and committed only under the lock. Written straight into the shared map, a position
+           read while an invalidation was clearing that map would be reinserted after the clear; this pass would
+           then notice the generation and give up, but the stale cursor would stay, and the next pass would see
+           the partition as already captured and freeze on it — seeking past records of the new log
+           (code review round 19). Nothing captured is shared until it has been validated. */
+        Map<TopicPartition, Long> captured = new LinkedHashMap<>();
+        boolean complete = true;
+        for (TopicPartition tp : partitions) {
+            if (!tp.topic().equals(topic)) continue;
+            if (esAuctionHandoffOffset.containsKey(tp)) continue;
+            Long at = null;
+            for (int attempt = 0; attempt < 3 && at == null; attempt++) {
+                try { at = consumer.position(tp); } catch (RuntimeException retryable) { at = null; }
+            }
+            if (at == null) { complete = false; System.out.println("es-auction: cannot read the cache position for " + tp + "; the hello stays held until it can"); continue; }
+            captured.put(tp, at);
+        }
+        /* An enabled topic with NO partitions right now satisfies "every current partition has a handoff"
+           vacuously, so the empty set FREEZES: otherwise every socket would wait for a hello for ever. The
+           missing-handoff check above reopens the latch the moment a partition appears (round 13). */
+        if (!complete) return;
+        // ...and confirmed unchanged after: a capture that straddled a recreation belongs to neither log.
+        // Read OUTSIDE the lock — it is a broker round trip, and an invalidation must never wait on one.
+        org.apache.kafka.common.Uuid after = esAuctionTopicIdReader.apply(topic);
+        synchronized (esAuctionIncarnationLock) {
+            if (esAuctionGeneration.get() != generation) { System.out.println("es-auction: the incarnation was invalidated while the handoff was being captured; nothing is frozen"); return; }
+            if (after == null || !after.equals(id)) { esAuctionForgetIncarnation("the topic id changed while the handoff was being captured"); return; }
+            esAuctionTopicId = id;
+            for (Map.Entry<TopicPartition, Long> e : captured.entrySet()) esAuctionHandoffOffset.putIfAbsent(e.getKey(), e.getValue());
+            esAuctionHandoffFrozen.set(true);
+        }
+        flushEsAuctionHellos();   // re-checks the latch under the same lock
+    }
+
+    /** Sends the auction hello to every socket that connected before the view had hydrated. */
+    /**
+     * True once the auction view is trustworthy again. A recreation drops the view and the emission ledger,
+     * so the gateway holds nothing for the new incarnation; it then re-reads that log from its BEGINNING and
+     * refuses the freeze until every auction partition has reached the end offset captured at the moment of
+     * the re-seek. Without this the hello would go out over an empty view a moment after the drop (round 16).
+     * Runs on the cache consumer's own thread, the only one that may touch its consumer.
+     */
+    private boolean esAuctionRehydrated(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions, long generation) {
+        String topic = settings.esAuctionTopic();
+        List<TopicPartition> owned = partitions.stream().filter(tp -> tp.topic().equals(topic)).toList();
+        if (esAuctionRehydrate.get()) {
+            if (owned.isEmpty()) { esAuctionRehydrateBarrier.clear(); return clearRehydrateIfCurrent(generation); }
+            /* NAMED FIRST, before a single offset is read. Bound after the seek, a recreation landing between
+               the range query and the bind would associate OLD-log offsets with the NEW id, and every later
+               identity check would agree while the barrier pointed into a log that no longer exists
+               (code review round 28). The same id is confirmed again once the boundary is established. */
+            if (!bindEsAuctionIncarnation(owned)) return false;
+            org.apache.kafka.common.Uuid startingOn = esAuctionTopicId;
+            try {
+                Map<TopicPartition, Long> beginning = consumer.beginningOffsets(owned, Duration.ofSeconds(10));
+                Map<TopicPartition, Long> end = consumer.endOffsets(owned, Duration.ofSeconds(10));
+                esAuctionRehydrateBarrier.clear();
+                for (TopicPartition tp : owned) { consumer.seek(tp, beginning.get(tp)); esAuctionRehydrateBarrier.put(tp, end.get(tp)); }
+                /* THE REPLAY BOUNDARY. The invalidation runs on the LIVE thread and can land while this thread
+                   is still applying an already-polled batch of the OLD log; those rows would be written back
+                   after that clear and would then survive the new log's replay, where a stale correctionRev can
+                   supersede a valid new record. The seek is the first instant at which no old-log record can
+                   still arrive on this thread, so the view is dropped again HERE (code review round 17). */
+                synchronized (esAuctionMinutes) { esAuctionDropViewLocked(); }
+                /* Generation-aware: an invalidation that landed WHILE this pass was seeking has already asked
+                   for its own replay, and clearing the request unconditionally would erase it — the next pass
+                   would then see nothing pending and could freeze without ever replaying the newest log
+                   (round 18). Its own barrier and view drop still stand; this pass simply ends. */
+                /* CONFIRMED unchanged now that the boundary stands. A recreation between the bind above and
+                   this point would have left the barrier offsets belonging to the previous log; the request
+                   is left standing so the next pass starts the replay over (rounds 26, 28). */
+                if (!startingOn.equals(esAuctionTopicIdReader.apply(topic))) {
+                    esAuctionForgetIncarnation("the topic was recreated while the replay boundary was being established");
+                    return false;
+                }
+                esAuctionReplayTopicId = startingOn;
+                if (!clearRehydrateIfCurrent(generation)) return false;
+                System.out.println("es-auction: re-reading the retained log of the new incarnation before any hello");
+            } catch (RuntimeException retryable) {
+                return false;   // the hello stays held; the next loop iteration tries again
+            }
+        }
+        if (esAuctionRehydrateBarrier.isEmpty()) return true;
+        // The replay must FINISH on the incarnation it started on. A recreation part-way through leaves the
+        // view holding rows of two different logs, and the barrier offsets belong to neither (round 25).
+        org.apache.kafka.common.Uuid startedOn = esAuctionReplayTopicId;
+        if (startedOn != null && !startedOn.equals(esAuctionTopicIdReader.apply(topic))) {
+            esAuctionForgetIncarnation("the topic was recreated again while its retained log was being replayed");
+            return false;
+        }
+        for (Map.Entry<TopicPartition, Long> e : esAuctionRehydrateBarrier.entrySet()) {
+            long at;
+            try { at = consumer.position(e.getKey()); } catch (RuntimeException retryable) { return false; }
+            if (at < e.getValue()) return false;
+            esAuctionRehydrateBarrier.remove(e.getKey());
+        }
+        return esAuctionRehydrateBarrier.isEmpty();
+    }
+
+    /**
+     * Re-reads the identity of an ALREADY FROZEN topic, on a slow cadence. While the latch is closed the
+     * capture path returns immediately and nothing else looks at the topic's identity, so a recreation whose
+     * new log has the same partition count would be served from the OLD view indefinitely — until the live
+     * consumer happened to seek (code review round 20). A mismatch invalidates. An UNREADABLE id does not: a
+     * transient admin failure is not evidence of a recreation, and dropping a working view on one would be a
+     * self-inflicted outage.
+     */
+    void verifyFrozenEsAuctionIncarnation(String topic) {
+        long now = System.currentTimeMillis();
+        boolean due = esAuctionIdCheckDue.get();
+        if (!due && now - esAuctionLastIdCheckMs < ES_AUCTION_ID_CHECK_MS) return;
+        org.apache.kafka.common.Uuid known = esAuctionTopicId;
+        if (known == null) { esAuctionIdCheckDue.set(false); esAuctionLastIdCheckMs = now; return; }
+        org.apache.kafka.common.Uuid seen = esAuctionTopicIdReader.apply(topic);
+        /* A FORCED check that could not read STAYS DUE, and does not arm the throttle. Consumed on the
+           attempt rather than on the answer, one transient admin failure would leave a hydration whose ending
+           incarnation was never verified — with the old handoff still frozen and the possibly mixed view
+           still answering /api/auction/minutes — until the cadence came round thirty seconds later
+           (code review round 31). */
+        if (seen == null) {
+            System.out.println("es-auction: the topic id cannot be read; the frozen handoff stands until it can" + (due ? " (the post-hydration check stays due)" : ""));
+            if (!due) esAuctionLastIdCheckMs = now;
+            return;
+        }
+        esAuctionIdCheckDue.set(false);
+        esAuctionLastIdCheckMs = now;
+        if (!seen.equals(known)) esAuctionForgetIncarnation("topic " + topic + " was recreated (" + known + " -> " + seen + ")");
+    }
+
+    /**
+     * Names the auction topic's incarnation if it is not on record, BEFORE anything reads it. Hydration and
+     * the post-invalidation replay both take real time, and until round 25 the id was first sampled only
+     * after they finished — so a recreation during either could be missed entirely and the freeze would
+     * release hellos over a view holding rows of two logs. Returns false when the id cannot be read, which
+     * holds the hello exactly as an unreadable id does everywhere else.
+     */
+    /**
+     * Names the incarnation before a hydration that this thread cannot abandon — the cache consumer serves
+     * every topic, so an unreadable auction id must not stop it. When the id cannot be read, the auction view
+     * is dropped and a REPLAY is demanded instead: the freeze path then re-reads that log from its beginning,
+     * names it there, and only then may release a hello. Nothing is served from a hydration whose incarnation
+     * was never established (code review round 26).
+     */
+    private void bindEsAuctionIncarnationOrReplay(List<TopicPartition> partitions) {
+        if (bindEsAuctionIncarnation(partitions)) return;
+        esAuctionForgetIncarnation("the incarnation could not be named before hydrating");
+    }
+
+    /**
+     * Like {@link #bindEsAuctionIncarnationOrReplay}, but for partitions discovered AFTER an incarnation is
+     * already on record: it VERIFIES instead of skipping. A delete/recreate keeps the topic's name and
+     * partition count, so "we already have an id" proves nothing about the log about to be hydrated — the
+     * cache would otherwise pour the new log into the old view and keep serving the frozen hello until the
+     * 30 s identity cadence happened to fire (code review round 27).
+     */
+    private void verifyOrBindEsAuctionIncarnation(List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        if (partitions.stream().noneMatch(tp -> tp.topic().equals(topic))) return;
+        org.apache.kafka.common.Uuid known = esAuctionTopicId;
+        if (known == null) { bindEsAuctionIncarnationOrReplay(partitions); return; }
+        org.apache.kafka.common.Uuid now = esAuctionTopicIdReader.apply(topic);
+        if (now == null) { esAuctionForgetIncarnation("the incarnation could not be read before hydrating a newly discovered " + topic); return; }
+        if (!now.equals(known)) esAuctionForgetIncarnation("topic " + topic + " was recreated (" + known + " -> " + now + ")");
+    }
+
+    /**
+     * Reopens the hello latch the moment an auction partition APPEARS, not when the next capture pass
+     * notices. Discovered after the handoff froze, the latch stayed closed for the whole of that partition's
+     * bootstrap hydration, and every socket connecting in that window got a hello promising a view whose
+     * newest partition had no handoff at all (code review round 27).
+     */
+    private void reopenEsAuctionLatchForNewPartitions(List<TopicPartition> added) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        synchronized (esAuctionIncarnationLock) {
+            for (TopicPartition tp : added) {
+                if (tp.topic().equals(topic) && !esAuctionHandoffOffset.containsKey(tp)) {
+                    if (esAuctionHandoffFrozen.compareAndSet(true, false)) System.out.println("es-auction: " + tp + " appeared with no handoff — the hello is held again until it has one");
+                    return;
+                }
+            }
+        }
+    }
+
+    private boolean bindEsAuctionIncarnation(List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return true;
+        String topic = settings.esAuctionTopic();
+        if (partitions.stream().noneMatch(tp -> tp.topic().equals(topic))) return true;
+        if (esAuctionTopicId != null) return true;
+        org.apache.kafka.common.Uuid id = esAuctionTopicIdReader.apply(topic);
+        if (id == null) { System.out.println("es-auction: cannot name the incarnation before hydrating " + topic + "; the hello stays held"); return false; }
+        synchronized (esAuctionIncarnationLock) {
+            if (esAuctionTopicId == null) esAuctionTopicId = id;
+        }
+        return true;
+    }
+
+    /** Clears the replay request only while {@code generation} is still the current incarnation. */
+    private boolean clearRehydrateIfCurrent(long generation) {
+        synchronized (esAuctionIncarnationLock) {
+            if (esAuctionGeneration.get() != generation) return false;
+            esAuctionRehydrate.set(false);
+            return true;
+        }
+    }
+
+    /** {@code AdminClient.describeTopics(topic).topicId()}, or null when it cannot be read. */
+    private org.apache.kafka.common.Uuid describeTopicId(String topic) {
+        java.util.Properties props = new java.util.Properties();
+        props.put(org.apache.kafka.clients.admin.AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, settings.bootstrapServers());
+        props.put(org.apache.kafka.clients.admin.AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, "10000");
+        props.put(org.apache.kafka.clients.admin.AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, "10000");
+        // TLS/SASL when configured, exactly as every other client here. Without it the id lookup fails on
+        // every secured deployment, and since an unreadable id fails CLOSED the auction would never leave
+        // its paused, hello-held state at all (code review round 28).
+        settings.applyKafkaSecurity(props);
+        try (org.apache.kafka.clients.admin.AdminClient admin = org.apache.kafka.clients.admin.AdminClient.create(props)) {
+            var d = admin.describeTopics(List.of(topic)).allTopicNames().get(10, TimeUnit.SECONDS).get(topic);
+            return d == null ? null : d.topicId();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Invalidates every auction cursor and reopens the latch: the topic this gateway knew is gone. */
+    void esAuctionForgetIncarnation(String why) {
+        synchronized (esAuctionIncarnationLock) {
+        esAuctionGeneration.incrementAndGet();
+        esAuctionNextOffset.clear();
+        esAuctionCursorGeneration.clear();
+        esAuctionHandoffOffset.clear();
+        esAuctionTopicId = null;
+        esAuctionHandoffFrozen.set(false);
+        /* The VIEW and the emission ledger belong to the old log too. Kept, its rows would still be served by
+           backfill as if they were this incarnation's, and a key the new log reuses at the same or a lower
+           correctionRev would be suppressed as already broadcast — the row would never reach a socket
+           (round 16). The whole retained log is re-read before the hello is released again. */
+        synchronized (esAuctionMinutes) { esAuctionDropViewLocked(); }
+        esAuctionRehydrate.set(true);
+        esAuctionRehydrateBarrier.clear();
+        esAuctionReplayTopicId = null;
+        /* Already-connected clients are RE-ARMED. They were told what the OLD log held, and the new log's
+           retained prefix is hydrated silently while live resumes at the fresh handoff — so without this a
+           connected page keeps the old incarnation's rows and never learns of any minute before that handoff
+           (code review round 24). A second hello on one connection only ever happens here, and the page
+           treats it as a reset: it drops what it holds and re-runs its backfill. */
+        if (settings.esAuctionEnabled()) esAuctionHelloPending.addAll(clients);
+        System.out.println("es-auction: " + why + " — every cursor dropped, " + esAuctionHelloPending.size() + " socket(s) waiting for a fresh hello");
+        }
+    }
+
+    /** Empties the view, the emission ledger AND the retention labels (caller holds the view lock). Leaving
+     *  the trade dates behind would make an empty new incarnation advertise the OLD date in its hello, and a
+     *  stale `prev` would reject retained records of the new log as dead-session replays (round 17). */
+    private void esAuctionDropViewLocked() {
+        esAuctionMinutes.clear();
+        esAuctionEmitted.clear();
+        esAuctionTradeDate = null;
+        esAuctionPrevTradeDate = null;
+    }
+
+    void flushEsAuctionHellos() {
+        if (!settings.esAuctionEnabled()) return;
+        /* Under the incarnation lock, so the latch cannot be reopened between the check and the send: a hello
+           released after an invalidation would promise a view that had just been dropped (round 18). An
+           invalidation waits on a slow socket here, which is the correct trade — it costs a pause, while the
+           other order costs a wrong promise. */
+        synchronized (esAuctionIncarnationLock) {
+            if (!esAuctionHandoffFrozen.get() || esAuctionHelloPending.isEmpty()) return;
+            String hello = esAuctionHelloJson();
+            for (WebSocketSession held : esAuctionHelloPending) {
+                if (esAuctionHelloPending.remove(held)) send(held, "es-auction-hello", hello);   // the remover owns the send: exactly once
+            }
+        }
+    }
+
+    /** True once the auction view has hydrated AND every auction partition has a handoff: only then can a
+     *  hello promise a view the live stream will actually continue from. */
+    boolean esAuctionHelloReady() { return esAuctionHandoffFrozen.get(); }
+
+    int esAuctionHelloPendingForTest() { return esAuctionHelloPending.size(); }
+
+    /** Test seam: marks the auction view hydrated and releases every held hello, as markCacheCaughtUp does. */
+    void markStateCaughtUpForTest() { stateCaughtUp.set(true); esAuctionHandoffFrozen.set(true); flushEsAuctionHellos(); }
+
+    /** Test seam: the view has hydrated but NO handoff has been captured — the state tryFreeze is asked from. */
+    void markStateCaughtUpWithoutHandoffForTest() { stateCaughtUp.set(true); }
+
+    /** Test seams for the two discovery-path steps, which the cache loop calls from inside a live consumer. */
+    void reopenEsAuctionLatchForNewPartitionsForTest(List<TopicPartition> added) { reopenEsAuctionLatchForNewPartitions(added); }
+
+    void verifyOrBindEsAuctionIncarnationForTest(List<TopicPartition> partitions) { verifyOrBindEsAuctionIncarnation(partitions); }
+
+    /** Test seam: makes the next identity check of a frozen topic due, instead of waiting out the cadence. */
+    void expireEsAuctionIdCheckForTest() { esAuctionLastIdCheckMs = 0L; }
+
+    /** Test seam: how many auction partitions currently hold a frozen handoff. */
+    int esAuctionHandoffCountForTest() { return esAuctionHandoffOffset.size(); }
 
     private static String escapeJson(String value) {
         StringBuilder escaped = new StringBuilder();
