@@ -576,12 +576,12 @@ class EsAuctionWiringTest {
         var consumer = mockAuctionConsumer(0L, 0L);
         s.esAuctionTopicIdReader = t -> null;
         s.markStateCaughtUpWithoutHandoffForTest();
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertEquals(0, s.esAuctionHandoffCountForTest(), "an unnameable incarnation captures nothing");
         assertFalse(s.esAuctionHelloReady(), "and the hello stays held");
         org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
         s.esAuctionTopicIdReader = t -> id;
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertEquals(1, s.esAuctionHandoffCountForTest(), "once the id reads, the handoff is captured under it");
         assertTrue(s.esAuctionHelloReady());
     }
@@ -595,7 +595,7 @@ class EsAuctionWiringTest {
         var ids = new java.util.ArrayDeque<>(List.of(org.apache.kafka.common.Uuid.randomUuid(), org.apache.kafka.common.Uuid.randomUuid()));
         s.esAuctionTopicIdReader = t -> ids.poll();
         s.markStateCaughtUpWithoutHandoffForTest();
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertFalse(s.esAuctionHelloReady(), "the id changed between the read before and the read after");
         assertEquals(0, s.esAuctionHandoffCountForTest(), "and the straddling capture is not kept");
     }
@@ -628,12 +628,12 @@ class EsAuctionWiringTest {
         s.markStateCaughtUpForTest();
         s.esAuctionForgetIncarnation("the topic was recreated");
         consumer.seek(tp, 2L);                       // wherever the cache consumer happened to be
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertEquals(0L, consumer.position(tp), "the re-seek takes the cache back to the beginning of the new log");
         assertFalse(s.esAuctionHelloReady(), "and the hello waits while the log is re-read");
         for (long o = 0; o < 3; o++) consumer.addRecord(new org.apache.kafka.clients.consumer.ConsumerRecord<>(tp.topic(), tp.partition(), o, key("2026-09-08", "09:3" + o), (Object) minute("2026-09-08", "09:3" + o, 0, "r" + o)));
         consumer.poll(java.time.Duration.ZERO);
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertTrue(s.esAuctionHelloReady(), "once the retained log has been re-read the hello is released");
         assertEquals(1, s.esAuctionHandoffCountForTest());
     }
@@ -652,7 +652,7 @@ class EsAuctionWiringTest {
         // The SECOND read is the one taken after the capture: the live thread invalidates exactly there.
         s.esAuctionTopicIdReader = t -> { if (calls.incrementAndGet() == 2) s.esAuctionForgetIncarnation("the live thread saw a recreation"); return id; };
         s.markStateCaughtUpWithoutHandoffForTest();
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertFalse(s.esAuctionHelloReady(), "the latch stays open: the generation moved under the capture");
     }
 
@@ -671,7 +671,7 @@ class EsAuctionWiringTest {
         // the tail of the old batch, applied after the clear but before the seek
         assertTrue(s.upsertEsAuctionMinute(key("2026-09-08", "09:31"), minute("2026-09-08", "09:31", 7, "old")));
         assertEquals(1, s.esAuctionMinutesCached());
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertEquals(0, s.esAuctionMinutesCached(), "the seek drops the view again, so no old row can outlive the replay");
         assertFalse(s.esAuctionHelloReady());
     }
@@ -743,10 +743,10 @@ class EsAuctionWiringTest {
                 });
         s.markStateCaughtUpForTest();
         s.esAuctionForgetIncarnation("the topic was recreated");
-        s.tryFreezeEsAuctionHandoff(racing, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(racing, List.of(tp), true);
         assertFalse(s.esAuctionHelloReady(), "the interrupted pass froze nothing");
         // The newer invalidation's replay request survived: the next pass still re-seeks and still refuses.
-        s.tryFreezeEsAuctionHandoff(mock, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(mock, List.of(tp), true);
         assertEquals(0L, mock.position(tp), "the pending replay was honoured, not erased");
         assertFalse(s.esAuctionHelloReady(), "and the hello still waits for the retained log");
     }
@@ -768,7 +768,7 @@ class EsAuctionWiringTest {
                     return method.invoke(mock, args);
                 });
         s.markStateCaughtUpWithoutHandoffForTest();
-        s.tryFreezeEsAuctionHandoff(racing, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(racing, List.of(tp), true);
         assertFalse(s.esAuctionHelloReady(), "the interrupted pass froze nothing");
         assertEquals(0, s.esAuctionHandoffCountForTest(), "and left no cursor from the old incarnation behind");
     }
@@ -784,18 +784,18 @@ class EsAuctionWiringTest {
         var current = new java.util.concurrent.atomic.AtomicReference<>(first);
         s.esAuctionTopicIdReader = t -> current.get();
         s.markStateCaughtUpWithoutHandoffForTest();
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertTrue(s.esAuctionHelloReady());
         s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "a"));
 
         // Nothing changed: an already-frozen latch stays frozen.
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertTrue(s.esAuctionHelloReady());
         assertEquals(1, s.esAuctionMinutesCached());
 
         current.set(org.apache.kafka.common.Uuid.randomUuid());
         s.expireEsAuctionIdCheckForTest();      // the cadence is a throttle, not the rule
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertFalse(s.esAuctionHelloReady(), "the recreation is noticed without waiting for a live seek");
         assertEquals(0, s.esAuctionMinutesCached(), "and the old log's view goes with it");
     }
@@ -810,7 +810,7 @@ class EsAuctionWiringTest {
         org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
         s.esAuctionTopicIdReader = t -> id;
         s.markStateCaughtUpWithoutHandoffForTest();
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));   // records the incarnation
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);   // records the incarnation
         long gen = 0L;   // no invalidation has happened in this test
         assertTrue(s.seekEsAuctionWithinAt(consumer, tp, 12L, gen, false), "a named, unchanged incarnation seeks normally");
         assertEquals(12L, consumer.position(tp));
@@ -856,12 +856,12 @@ class EsAuctionWiringTest {
         s.esAuctionTopicIdReader = t -> current.get();
         s.markStateCaughtUpForTest();
         s.esAuctionForgetIncarnation("the topic was recreated");
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));       // starts the replay, names the new incarnation
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);       // starts the replay, names the new incarnation
         assertEquals(0L, consumer.position(tp), "seeked back to the beginning of the new log");
         assertFalse(s.esAuctionHelloReady(), "the replay is not finished");
 
         current.set(org.apache.kafka.common.Uuid.randomUuid());   // recreated AGAIN, mid-replay
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         assertFalse(s.esAuctionHelloReady(), "the interrupted replay is abandoned, not completed");
         assertEquals(0, s.esAuctionMinutesCached(), "and its half-read view goes with it");
     }
@@ -878,7 +878,7 @@ class EsAuctionWiringTest {
         org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
         s.esAuctionTopicIdReader = t -> id;
         s.markStateCaughtUpWithoutHandoffForTest();
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp0));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp0), true);
         assertTrue(s.esAuctionHelloReady(), "one partition, captured, frozen");
 
         var tp1 = new TopicPartition("es.futures.auction", 1);
@@ -899,7 +899,7 @@ class EsAuctionWiringTest {
         var current = new java.util.concurrent.atomic.AtomicReference<>(org.apache.kafka.common.Uuid.randomUuid());
         s.esAuctionTopicIdReader = t -> current.get();
         s.markStateCaughtUpWithoutHandoffForTest();
-        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
         s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "old"));
         assertTrue(s.esAuctionHelloReady());
 
@@ -907,6 +907,27 @@ class EsAuctionWiringTest {
         s.verifyOrBindEsAuctionIncarnationForTest(List.of(tp));
         assertFalse(s.esAuctionHelloReady(), "the recreation is seen at discovery, not 30 s later");
         assertEquals(0, s.esAuctionMinutesCached(), "and the old view is not hydrated into");
+    }
+
+    /** Every assigned cache consumer runs the freeze loop. One that does not carry the auction topic must
+     *  touch none of it — an empty auction set is "complete" only for the consumer that WOULD carry it. */
+    @Test void aCacheConsumerThatDoesNotCarryTheAuctionTopicFreezesNothing() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 0L);
+        org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
+        s.esAuctionTopicIdReader = t -> id;
+        s.markStateCaughtUpWithoutHandoffForTest();
+
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), false);
+        assertFalse(s.esAuctionHelloReady(), "a consumer that does not own the topic freezes nothing");
+        assertEquals(0, s.esAuctionHandoffCountForTest(), "and captures nothing");
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(), false);
+        assertFalse(s.esAuctionHelloReady(), "not even on an empty partition set, which is the vacuous-freeze case");
+
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp), true);
+        assertTrue(s.esAuctionHelloReady(), "the owning consumer still does");
     }
 
     @Test void foreignShapesNeverPoisonTheView() {

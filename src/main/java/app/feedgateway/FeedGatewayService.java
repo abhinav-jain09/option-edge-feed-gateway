@@ -2617,10 +2617,18 @@ public class FeedGatewayService implements ReplayRunner {
                record: a topic recreated while that consumer was down would otherwise be merged into the old
                view, with the old handoff still frozen, until the 30 s cadence noticed (round 29). Same call
                as the late-discovery path — there is only one rule. */
-            verifyOrBindEsAuctionIncarnation(partitions);
-            // ...and again, unconditionally, once this attempt's hydration has caught up: the check above
-            // only covers what was true BEFORE it read a record (round 30).
-            esAuctionIdCheckDue.set(true);
+            /* ONLY the consumer that actually carries the auction topic touches any of this. Every assigned
+               cache consumer runs this loop, and one that owns no auction partitions would otherwise see an
+               empty auction set as "complete": it could freeze and flush a hello without capturing anything,
+               clear a pending replay, or consume the forced identity check before the owning consumer had
+               finished hydrating (code review round 32). */
+            boolean ownsAuction = settings.esAuctionEnabled() && topicEvents.containsKey(settings.esAuctionTopic());
+            if (ownsAuction) {
+                verifyOrBindEsAuctionIncarnation(partitions);
+                // ...and again, unconditionally, once this attempt's hydration has caught up: the check above
+                // only covers what was true BEFORE it read a record (round 30).
+                esAuctionIdCheckDue.set(true);
+            }
             seekToCacheWindow(consumer, partitions, topicEvents);
             // Bootstrap gets the BOOTSTRAP budget: a broker that answers in 10s is slow, not broken, and
             // must bootstrap rather than crash-loop. The 2s refresh budget applies only inside the poll
@@ -2646,7 +2654,7 @@ public class FeedGatewayService implements ReplayRunner {
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
-                tryFreezeEsAuctionHandoff(consumer, partitions);
+                tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
             }
             while (running.get()) {
                 ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
@@ -2658,8 +2666,10 @@ public class FeedGatewayService implements ReplayRunner {
                     // guarantee: name its incarnation before a record of it is read (round 26) — and when
                     // one is already on record, VERIFY it rather than skip, because a delete/recreate keeps
                     // the topic name and partition count (round 27).
-                    reopenEsAuctionLatchForNewPartitions(refresh.added());
-                    verifyOrBindEsAuctionIncarnation(refresh.added());
+                    if (ownsAuction) {
+                        reopenEsAuctionLatchForNewPartitions(refresh.added());
+                        verifyOrBindEsAuctionIncarnation(refresh.added());
+                    }
                     seekToCacheWindow(consumer, refresh.added(), topicEvents);
                     Map<TopicPartition, Long> addedEndOffsets = boundedEndOffsets(consumer, refresh.added());
                     // TWO barriers, deliberately not the same set.
@@ -2838,7 +2848,7 @@ public class FeedGatewayService implements ReplayRunner {
                     // again. Both calls are idempotent and markSelectionReady re-validates under readyLock,
                     // so this is safe and cheap.
                     markCacheCaughtUp(name, events, caughtUpFlag);
-                    tryFreezeEsAuctionHandoff(consumer, partitions);
+                    tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
                     ActiveSelection liveSelection = activeSelection.get();
                     if (liveSelection != null
                             && !selectionKey(liveSelection).equals(readySelectionKey.get())) {
@@ -13231,8 +13241,11 @@ public class FeedGatewayService implements ReplayRunner {
      *
      * <p>Called from the cache consumer's own thread, which is the only thread that may touch its consumer.
      */
-    void tryFreezeEsAuctionHandoff(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions) {
-        if (!settings.esAuctionEnabled() || !stateCaughtUp.get()) return;
+    void tryFreezeEsAuctionHandoff(org.apache.kafka.clients.consumer.Consumer<?, ?> consumer, List<TopicPartition> partitions, boolean ownsAuction) {
+        /* `ownsAuction` is the consumer's own binding, not its current assignment: the vacuous freeze on an
+           EMPTY partition set (round 13) is right only for the consumer that WOULD carry the topic. Any other
+           cache consumer reaching here would freeze a handoff it never captured (round 32). */
+        if (!ownsAuction || !settings.esAuctionEnabled() || !stateCaughtUp.get()) return;
         long generation = esAuctionGeneration.get();
         String topic = settings.esAuctionTopic();
         /* The latch is not permanent: an auction partition ADDED after the freeze has no handoff, so readiness
