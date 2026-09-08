@@ -1,0 +1,5 @@
+MEDIUM — `scripts/footprint-mutate.py:80` — the scanner pops declarations before capturing the mutation line. For a one-line method, its opening and closing braces balance immediately, so the method is removed from the stack at line 81 before `encl` is assigned at line 83. Consequently, both clamp mutations at `GatewayController.java:130` are still mislocalised as `public class GatewayController` in `GATEWAY-FOOTPRINT-MUTATIONS.json:297` and `:317`, rather than `static int clamp(...)`. This directly falsifies the claim that zero entries are mislocalised and leaves checked-in mutation provenance inaccurate.
+
+The other two fixes are correct: the strengthened test admits an epoch-maximum record and proves both sides of the exclusive boundary; its explanation and the commit message correctly distinguish safe `EPOCH_MAX_MS + 1` from `Long.MAX_VALUE` overflow. The edge records now correctly identify `barsPage`, with guard removal KILLED and relaxation SURVIVED. I could not rerun Maven because this review environment is read-only and Maven cannot update `target/classes`.
+
+VERDICT: REQUEST_CHANGES

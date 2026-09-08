@@ -117,6 +117,53 @@ class FootprintViewsTest {
 
     // ---- G-R7 pages ------------------------------------------------------------------------------
 
+    /**
+     * G-R7's bars cursor is EXCLUSIVE, and the guard that keeps it safe at the top of the epoch
+     * domain is {@code afterMsExclusive < EPOCH_MAX_MS}. Nothing held it: no test passed a cursor
+     * anywhere near the domain edge, so deleting it changed nothing any assertion could see.
+     *
+     * <p>What it prevents is not a boundary nicety. Without it, {@code afterMs = Long.MAX_VALUE}
+     * takes the {@code + 1}, wraps to {@code Long.MIN_VALUE}, and {@code barKey}'s {@code %019d}
+     * renders a NEGATIVE cursor that sorts below every real key — so {@code lo <= hi} holds and the
+     * page returns the WHOLE VIEW instead of nothing. A client sending a nonsense cursor would be
+     * handed every bar the gateway is holding.
+     *
+     * <p>Relaxing the SAME comparison from {@code <} to {@code <=} is INERT, and that is written
+     * down here so it is not rediscovered: at {@code afterMs == EPOCH_MAX_MS} the branch is entered,
+     * but {@code from} becomes {@code EPOCH_MAX_MS + 1} — no overflow, no wrap — while {@code hi} is
+     * capped at {@code EPOCH_MAX_MS}, so {@code lo > hi} and the page is empty either way. That
+     * mutation survives and says nothing about the code. The overflow lives only at
+     * {@code Long.MAX_VALUE}.
+     */
+    @Test void theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain() {
+        FootprintViews v = views();
+        for (long s = 1000; s <= 3000; s += 1000) v.admitBar(bar("2026-08-14", "30s", s));
+        // A record AT the top of the domain, so the exclusive comparison has something to include or
+        // exclude. Without it every cursor in this test would return an empty page for any
+        // implementation, and the assertions would pin nothing.
+        v.admitBar(bar("2026-08-14", "30s", FootprintViews.EPOCH_MAX_MS));
+
+        // EXCLUSIVE: a cursor one BELOW the top must still return the record at the top.
+        FootprintViews.BarsPage below = v.barsPage("30s", Long.MAX_VALUE, FootprintViews.EPOCH_MAX_MS - 1, 10, "");
+        assertEquals(1, below.records().size(), "the record AT EPOCH_MAX_MS is after a cursor one below it");
+        assertTrue(below.records().get(0).contains("\"barStartMs\":" + FootprintViews.EPOCH_MAX_MS));
+
+        // AT the top: exclusive, so that same record is behind the cursor and the page is empty.
+        FootprintViews.BarsPage atMax = v.barsPage("30s", Long.MAX_VALUE, FootprintViews.EPOCH_MAX_MS, 10, "");
+        assertEquals(0, atMax.records().size(), "afterMs == EPOCH_MAX_MS admits nothing");
+        assertNull(atMax.nextCursor(), "and offers no cursor to continue from");
+        assertFalse(atMax.sessionMismatch(), "an empty page at the boundary is not a session mismatch");
+
+        // Long.MAX_VALUE: this is the one that kills guard deletion. Unguarded, +1 wraps negative and
+        // the whole view comes back.
+        FootprintViews.BarsPage beyond = v.barsPage("30s", Long.MAX_VALUE, Long.MAX_VALUE, 10, "");
+        assertEquals(0, beyond.records().size(), "a cursor beyond the domain admits nothing — it must not wrap");
+        assertNull(beyond.nextCursor());
+
+        // And the ordinary path is unaffected.
+        assertEquals(4, v.barsPage("30s", Long.MAX_VALUE, -1, 10, "").records().size());
+    }
+
     @Test void barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic() {
         FootprintViews v = views();
         for (long s = 1000; s <= 5000; s += 1000) v.admitBar(bar("2026-08-14", "30s", s));
