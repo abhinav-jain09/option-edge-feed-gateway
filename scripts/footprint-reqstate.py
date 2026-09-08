@@ -18,8 +18,10 @@ def main():
     # the generated block. Reading the whole file lets the previous render's own rows keep a
     # requirement alive after it has been deleted upstream, and --check would then accept it.
     text = open(docPath).read()
-    cut = text.find('<!-- BEGIN footprint-reqstate')
-    authoritative = text if cut < 0 else text[:cut]
+    # Use the SAME rule as the rewriter: the marker at LINE START. Finding the first substring
+    # anywhere lets a prose mention of the marker truncate discovery before the real block.
+    mk = re.search(r'^<!-- BEGIN footprint-reqstate', text, re.M)
+    authoritative = text if mk is None else text[:mk.start()]
     ids = []
     for line in authoritative.split('\n'):
         m = re.match(r'^\|\s*(' + idPattern + r')\s*\|', line)
@@ -39,9 +41,17 @@ def main():
         for m in ms:
             if m['status'] != 'KILLED':
                 continue
-            if not m.get('assertionFailures') and not m.get('killedByThrow'):
-                problems.append(f"{rid}: a KILLED record names no ASSERTION failure and declares no "
-                                f"matched throw ({m.get('killedBy')})")
+            if not m.get('assertionFailures'):
+                # The renderer must hold this itself: a record is a checked-in FILE, and a hand-edited
+                # or legacy one would otherwise be taken at its word.
+                t = m.get('killedByThrow')
+                lines = '\n'.join(m.get('evidence', {}).get('failureLines') or [])
+                ok = (isinstance(t, dict) and t.get('test') and t.get('throws')
+                      and t['test'].split('.')[-1] in lines and t['throws'] in lines)
+                if not ok:
+                    problems.append(f"{rid}: a KILLED record names no ASSERTION failure, and its "
+                                    f"killedByThrow does not name a test and a throw that its own "
+                                    f"failure lines carry ({m.get('killedBy')})")
             if not m.get('evidence', {}).get('failureLines'):
                 problems.append(f"{rid}: a KILLED record carries no failure lines")
             if not m.get('evidence', {}).get('treeRestoredClean', True):
@@ -76,10 +86,13 @@ def main():
             rest = ", ".join(f"{n} {st.lower()}" for st, n in sorted(by.items()))
             if rest: state += f" ({rest})"
         out.append(f"| {rid} | {state} | {gate(rid)} | {disp(rid)} |")
-    tot = collections.Counter(v['status'] for v in rec.values())
+    # Count only what the table shows. A record for a requirement the document no longer
+    # renders is omitted from the rows, and must be omitted from the totals with it.
+    rendered = [v for rid in ids for v in per.get(rid, [])]
+    tot = collections.Counter(v['status'] for v in rendered)
     out.append("")
     probed_here = len([r for r in ids if r in per])
-    out.append(f"{len(ids)} requirements; {probed_here} probed by {len(rec)} mutations "
+    out.append(f"{len(ids)} requirements; {probed_here} probed by {len(rendered)} mutations "
                f"({tot['KILLED']} killed, {tot.get('SURVIVED', 0)} surviving"
                + (", " + ", ".join(f"{n} {st.lower()}" for st, n in sorted(tot.items()) if st not in ('KILLED', 'SURVIVED')) if len(tot) > 2 else "")
                + ")."
