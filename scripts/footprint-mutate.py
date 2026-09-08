@@ -16,6 +16,13 @@ would report every clause as pinned.
 """
 import json, subprocess, sys, os, shutil, re, time, hashlib
 
+def failure_lines(out, kind):
+    """The VERBATIM lines the killedBy names were parsed from, so the record substantiates itself.
+    A tail of the output does not: Maven prints its failures well before the build summary, so the
+    last N characters of a run contain none of the names the harness reported."""
+    pat = r'^\[ERROR\]\s+[\w.$]+\.[\w$]+(?::\d+|\s+--|\s).*$' if kind == 'maven' else r'^not ok \d+ - .*$'
+    return [l.rstrip()[:400] for l in re.findall(pat, out, re.M)][:12]
+
 def failing_tests(out, kind):
     if kind == 'maven':
         # Surefire's failure lines take two shapes:
@@ -144,6 +151,7 @@ def main():
                   'evidence': {'repoCommit': commit, 'returnCode': rc,
                                'mutatedFileSha256': sha(mutated), 'originalFileSha256': sha(src),
                                'outputSha256': sha(out), 'outputTail': out[-1200:],
+                               'failureLines': failure_lines(out, kind),
                                'treeRestoredClean': not still_dirty},
                   'baseline': baseline}
         print(f"  {k:<40} {status:<13} {(failed[0][:52] if failed else '')}")
