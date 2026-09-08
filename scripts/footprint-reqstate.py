@@ -60,6 +60,20 @@ def main():
                 problems.append(f"{rid}: is not a requirement in the document")
             elif dt not in req_text[rid]:
                 problems.append(f"{rid}: the quoted obligation is not verbatim in {rid}: {dt[:70]!r}")
+            # Compare on 4-character prefixes so "dropped"/"drop" and "upserts"/"upsert" match; a
+            # short obligation ("OLDER ⇒ stale_session drop;") shares few whole words with the clause
+            # it states, and demanding whole-word equality rejects correct attributions.
+            stem = lambda t: {w.lower()[:4] for w in re.findall(r'[A-Za-z_]{4,}', t)}
+            cw, qw = stem(m.get('clause', '')), stem(dt)
+            # ONE shared stem, not two. The design states obligations in symbols as often as words
+            # ("(3) `gen++`"), so a two-word floor rejects correct attributions and would push the
+            # author to reword the clause until the tool is satisfied — which is worse than the gap
+            # it closes. This catches a quote lifted from a wholly unrelated part of the requirement;
+            # whether the quote states THE clause is a review judgement, and the preamble says so.
+            if cw and not (cw & qw):
+                problems.append(f"{rid}: the quoted obligation shares almost nothing with the clause "
+                                f"it is filed against — clause {m.get('clause','')[:60]!r} vs "
+                                f"quote {dt[:60]!r}")
             if m['status'] != 'KILLED':
                 continue
             # the named assertion failures must be the ones THIS run produced
@@ -110,7 +124,7 @@ def main():
             # site AND once for all sites together, so "n of m clauses" would triple-count it.
             # A clause probed at several SITES, or broken several WAYS (variants), is still one
             # clause; counting records as clauses triple-counts it.
-            groups = len({re.sub(r' (?:site\d+|variant\d+\S*)$', '', k) for k in keys[rid]})
+            groups = len({re.sub(r' (?:site|variant)\d+\S*$', '', k) for k in keys[rid]})
             state = f"{killed} of {len(ms)} probes pinned, over {groups} clause" + ("" if groups == 1 else "s")
             rest = ", ".join(f"{n} {st.lower()}" for st, n in sorted(by.items()))
             if rest: state += f" ({rest})"

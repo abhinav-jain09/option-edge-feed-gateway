@@ -7,3 +7,8 @@ evidence — the patch, the file, line and enclosing declaration, the command, t
 verbatim failure lines and a SHA-256 of the run output — is in `ES-FOOTPRINT-CAMPAIGN.json` beside
 this document. Regenerate this section with `scripts/footprint-reqstate.sh`, or check it against the
 record with `scripts/footprint-reqstate.sh --check`.
+
+What this table cannot do is decide whether a quoted obligation is the clause a probe exercises.
+The generator refuses a quote that is not verbatim in the requirement it sits under, and one that
+shares no vocabulary with the clause recorded against it; beyond that, attribution is a judgement
+made in review, and the merge gate for this change corrected several of them.

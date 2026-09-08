@@ -1,72 +1,4 @@
 {
- "G-R4 older-date-dropped": {
-  "status": "KILLED",
-  "clause": "an OLDER session date is dropped",
-  "requirement": "G-R4",
-  "documentText": "**Session coordinator and the bar view.** ONE `FootprintViews` object owns `footprintSessionDate` (a `LocalDate`, null before the first accepted record), the bar view `bars: TreeMap<tf\\|%019d(barStartMs), json>` and the outcome view (G-R5), all under ONE lock.",
-  "file": "src/main/java/app/feedgateway/FootprintViews.java",
-  "occurrence": 1,
-  "occurrencesInFile": 1,
-  "line": 146,
-  "enclosing": "private Boolean rollover(LocalDate date) {",
-  "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
-  "killedBy": [
-   "FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts",
-   "FootprintViewsTest.outOfOrderBootstrapAcrossTopicsInBothOrders",
-   "FootprintViewsTest.yearAndMonthBoundariesOrderCorrectly",
-   "FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules"
-  ],
-  "assertionFailures": [
-   "FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts",
-   "FootprintViewsTest.outOfOrderBootstrapAcrossTopicsInBothOrders",
-   "FootprintViewsTest.yearAndMonthBoundariesOrderCorrectly",
-   "FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules"
-  ],
-  "anyFailures": [
-   "FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts",
-   "FootprintViewsTest.outOfOrderBootstrapAcrossTopicsInBothOrders",
-   "FootprintViewsTest.yearAndMonthBoundariesOrderCorrectly",
-   "FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules"
-  ],
-  "killedByThrow": null,
-  "seconds": 9.9,
-  "patch": {
-   "old": "        if (cmp < 0) return null;",
-   "new": "        if (cmp < 0) return false;"
-  },
-  "evidence": {
-   "repoCommit": "9128e372a56912777980b1cf5948384d4fe7380d",
-   "returnCode": 1,
-   "mutatedFileSha256": "e206c3d812af8d34dafbd81072df45f86f8f9d645ac67b6d8a5dfea59112dacc",
-   "originalFileSha256": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
-   "filesSha256": {
-    "src/main/java/app/feedgateway/FootprintViews.java": {
-     "original": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
-     "mutated": "e206c3d812af8d34dafbd81072df45f86f8f9d645ac67b6d8a5dfea59112dacc"
-    }
-   },
-   "outputSha256": "f4ab8756f16dfed50301c918b25d3d79b6fbbcf6abcd9f37fb1deb649edc2547",
-   "outputTail": " described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\n",
-   "failureLines": [
-    "[ERROR] app.feedgateway.FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules -- Time elapsed: 0.160 s <<< FAILURE!",
-    "[ERROR] app.feedgateway.FootprintViewsTest.yearAndMonthBoundariesOrderCorrectly -- Time elapsed: 0.001 s <<< FAILURE!",
-    "[ERROR] app.feedgateway.FootprintViewsTest.outOfOrderBootstrapAcrossTopicsInBothOrders -- Time elapsed: 0.001 s <<< FAILURE!",
-    "[ERROR] app.feedgateway.FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts -- Time elapsed: 0.001 s <<< FAILURE!",
-    "[ERROR]   FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts:102 late record from a dead session ==> expected: <STALE_SESSION> but was: <ADMITTED>",
-    "[ERROR]   FootprintViewsTest.outOfOrderBootstrapAcrossTopicsInBothOrders:113 expected: <STALE_SESSION> but was: <ADMITTED>",
-    "[ERROR]   FootprintViewsTest.yearAndMonthBoundariesOrderCorrectly:126 expected: <STALE_SESSION> but was: <ADMITTED>",
-    "[ERROR]   FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules:169 expected: <true> but was: <false>"
-   ],
-   "treeRestoredClean": true
-  },
-  "baseline": {
-   "commit": "9128e372a56912777980b1cf5948384d4fe7380d",
-   "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
-   "returnCode": 0,
-   "outputSha256": "106958f0669e632abf5c439af8fd97a62a0d05fcb9b8e2873e441fc97cd0c5a8",
-   "outputTail": "enJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n"
-  }
- },
  "G-R4 newer-date-rolls-both": {
   "status": "KILLED",
   "clause": "a NEWER date rolls BOTH views",
@@ -109,86 +41,6 @@
    "failureLines": [
     "[ERROR] app.feedgateway.FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts -- Time elapsed: 0.003 s <<< FAILURE!",
     "[ERROR]   FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts:100 the outcomes view rolled with the bars view ==> expected: <0> but was: <1>"
-   ],
-   "treeRestoredClean": true
-  },
-  "baseline": {
-   "commit": "9128e372a56912777980b1cf5948384d4fe7380d",
-   "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
-   "returnCode": 0,
-   "outputSha256": "106958f0669e632abf5c439af8fd97a62a0d05fcb9b8e2873e441fc97cd0c5a8",
-   "outputTail": "enJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n"
-  }
- },
- "G-R4 equal-date-upserts": {
-  "status": "KILLED",
-  "clause": "an EQUAL date upserts without rolling",
-  "requirement": "G-R4",
-  "documentText": "**Session coordinator and the bar view.** ONE `FootprintViews` object owns `footprintSessionDate` (a `LocalDate`, null before the first accepted record), the bar view `bars: TreeMap<tf\\|%019d(barStartMs), json>` and the outcome view (G-R5), all under ONE lock.",
-  "file": "src/main/java/app/feedgateway/FootprintViews.java",
-  "occurrence": 1,
-  "occurrencesInFile": 1,
-  "line": 147,
-  "enclosing": "private Boolean rollover(LocalDate date) {",
-  "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
-  "killedBy": [
-   "FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit",
-   "FootprintViewsTest.barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic",
-   "FootprintViewsTest.byteBudgetEvictsUntilItFitsAndBytesAreExact",
-   "FootprintViewsTest.countBudgetEvictsTheOldestKeyPerTimeframeRoundRobin"
-  ],
-  "assertionFailures": [
-   "FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit",
-   "FootprintViewsTest.barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic",
-   "FootprintViewsTest.byteBudgetEvictsUntilItFitsAndBytesAreExact",
-   "FootprintViewsTest.countBudgetEvictsTheOldestKeyPerTimeframeRoundRobin",
-   "FootprintViewsTest.helloIsEmptyBeforeRecordsAndCarriesPerTimeframeHighWaterMarks",
-   "FootprintViewsTest.outcomesPageOrdersByNumericTimestampThenIdentityWithAnOpaqueCursor",
-   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
-  ],
-  "anyFailures": [
-   "FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit",
-   "FootprintViewsTest.barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic",
-   "FootprintViewsTest.byteBudgetEvictsUntilItFitsAndBytesAreExact",
-   "FootprintViewsTest.countBudgetEvictsTheOldestKeyPerTimeframeRoundRobin",
-   "FootprintViewsTest.helloIsEmptyBeforeRecordsAndCarriesPerTimeframeHighWaterMarks",
-   "FootprintViewsTest.outcomesPageOrdersByNumericTimestampThenIdentityWithAnOpaqueCursor",
-   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
-  ],
-  "killedByThrow": null,
-  "seconds": 9.5,
-  "patch": {
-   "old": "        if (cmp == 0) return false;",
-   "new": "        if (cmp == 0) { bars.clear(); outcomes.clear(); return false; }"
-  },
-  "evidence": {
-   "repoCommit": "9128e372a56912777980b1cf5948384d4fe7380d",
-   "returnCode": 1,
-   "mutatedFileSha256": "bb23ff808e60cdb5c05bd5e4a4f37293d5c59e413cb61374f0aec61eeab46dca",
-   "originalFileSha256": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
-   "filesSha256": {
-    "src/main/java/app/feedgateway/FootprintViews.java": {
-     "original": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
-     "mutated": "bb23ff808e60cdb5c05bd5e4a4f37293d5c59e413cb61374f0aec61eeab46dca"
-    }
-   },
-   "outputSha256": "f26d8491495969b2b8b532267b45f3799611bce6b6046220a2a02040e60890e9",
-   "outputTail": " described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\n",
-   "failureLines": [
-    "[ERROR] app.feedgateway.FootprintViewsTest.byteBudgetEvictsUntilItFitsAndBytesAreExact -- Time elapsed: 0.005 s <<< FAILURE!",
-    "[ERROR] app.feedgateway.FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain -- Time elapsed: 0.002 s <<< FAILURE!",
-    "[ERROR] app.feedgateway.FootprintViewsTest.barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic -- Time elapsed: 0.001 s <<< FAILURE!",
-    "[ERROR] app.feedgateway.FootprintViewsTest.countBudgetEvictsTheOldestKeyPerTimeframeRoundRobin -- Time elapsed: 0.001 s <<< FAILURE!",
-    "[ERROR] app.feedgateway.FootprintViewsTest.outcomesPageOrdersByNumericTimestampThenIdentityWithAnOpaqueCursor -- Time elapsed: 0.001 s <<< FAILURE!",
-    "[ERROR] app.feedgateway.FootprintViewsTest.helloIsEmptyBeforeRecordsAndCarriesPerTimeframeHighWaterMarks -- Time elapsed: 0 s <<< FAILURE!",
-    "[ERROR] app.feedgateway.FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit -- Time elapsed: 0.001 s <<< FAILURE!",
-    "[ERROR]   FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit:60 {\"sessionDate\":\"2026-08-14\",\"bars\":[{\"schemaVersion\":6,\"symbol\":\"ES.v.0\",\"timeframe\":\"30s\",\"sessionDate\":\"2026-08-14\",\"observations\":{\"barStartMs\":5000},\"tag\":\"x\"}],\"nextCursor\":null} ==> expected: <true> but was: <false>",
-    "[ERROR]   FootprintViewsTest.barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic:197 expected: <2> but was: <0>",
-    "[ERROR]   FootprintViewsTest.byteBudgetEvictsUntilItFitsAndBytesAreExact:255 expected: <2> but was: <0>",
-    "[ERROR]   FootprintViewsTest.countBudgetEvictsTheOldestKeyPerTimeframeRoundRobin:240 expected: <1> but was: <0>",
-    "[ERROR]   FootprintViewsTest.helloIsEmptyBeforeRecordsAndCarriesPerTimeframeHighWaterMarks:140 expected: <{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"30s\":2000,\"1m\":5},\"outcomeHwm\":{\"5m\":77}}> but was: <{\"sessionDate\":\"2026-08-14\",\"hwm\":{},\"outcomeHwm\":{\"5m\":70}}>",
-    "[ERROR]   FootprintViewsTest.outcomesPageOrdersByNumericTimestampThenIdentityWithAnOpaqueCursor:217 expected: <2> but was: <0>",
-    "[ERROR]   FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain:189 expected: <4> but was: <1>"
    ],
    "treeRestoredClean": true
   },
@@ -255,7 +107,7 @@
  },
  "G-R8 evict-oldest": {
   "status": "KILLED",
-  "clause": "evict the OLDEST key of the timeframe",
+  "clause": "the view byte budgets are enforced under the lock at every admission, so evicting lowers the bytes",
   "requirement": "G-R8",
   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key.",
   "file": "src/main/java/app/feedgateway/FootprintViews.java",
@@ -313,7 +165,7 @@
  },
  "G-R8 evict-rotates": {
   "status": "KILLED",
-  "clause": "eviction ROTATES across timeframes",
+  "clause": "the view byte budgets are enforced under the lock at every admission, so evicting lowers the bytes",
   "requirement": "G-R8",
   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key.",
   "file": "src/main/java/app/feedgateway/FootprintViews.java",
@@ -366,7 +218,7 @@
  },
  "G-R8 byte-budget-decremented": {
   "status": "KILLED",
-  "clause": "evicting decrements the byte total",
+  "clause": "the view byte budgets are enforced under the lock at every admission, so evicting lowers the bytes",
   "requirement": "G-R8",
   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key.",
   "file": "src/main/java/app/feedgateway/FootprintViews.java",
@@ -472,7 +324,7 @@
  },
  "G-R8 evictions-counted": {
   "status": "KILLED",
-  "clause": "evictions are counted per view",
+  "clause": "the view byte budgets are enforced under the lock at every admission, so evicting lowers the bytes",
   "requirement": "G-R8",
   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key.",
   "file": "src/main/java/app/feedgateway/FootprintViews.java",
@@ -530,7 +382,7 @@
  },
  "G-R8a ceiling-strict": {
   "status": "KILLED",
-  "clause": "the ceiling is inclusive; only ABOVE is refused",
+  "clause": "a footprint topic is VALID iff its effective max.message.bytes is at or below the ceiling",
   "requirement": "G-R8a",
   "documentText": "**Topic validation before consumption, inside the refresh (optional topics kept optional).** A footprint topic is VALID iff its effective `max.message.bytes \u2264 GATEWAY_ES_FOOTPRINT_MAX_MESSAGE_BYTES_CEILING` (default 1 048 588) and `compression.type \u2208 {producer, uncompressed}`, read via `AdminClient.describeConfigs` with the same bounded timeout as `partitionRefreshMetadataTimeoutMs`.",
   "file": "src/main/java/app/feedgateway/FootprintTopicGate.java",
@@ -873,156 +725,6 @@
     "[ERROR] app.feedgateway.FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit -- Time elapsed: 0.004 s <<< FAILURE!",
     "[ERROR]   FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit:66 expected: <100> but was: <5000>"
    ],
-   "treeRestoredClean": true
-  },
-  "baseline": {
-   "commit": "9128e372a56912777980b1cf5948384d4fe7380d",
-   "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
-   "returnCode": 0,
-   "outputSha256": "106958f0669e632abf5c439af8fd97a62a0d05fcb9b8e2873e441fc97cd0c5a8",
-   "outputTail": "enJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n"
-  }
- },
- "G-R7 the-epoch-guard variant1-guard": {
-  "status": "KILLED",
-  "clause": "an out-of-domain timestamp is refused",
-  "requirement": "G-R7",
-  "documentText": "**Backfill.** `GET /api/footprint/bars?tf&toMs&afterMs=-1&limit=100&sessionDate=` \u2192 `{sessionDate, [sessionMismatch:true], bars:[<record>\u2026], nextCursor}` with the `/api/cvd/bars` semantics (ascending `barStartMs`, exclusive `afterMs`, inclusive `toMs`, `limit` clamped to `[1, 100]`), computed as ONE snapshot under the coordinator lock with the session check (`sessionMismatch` when a non-empty `sessionDate` differs from the coordinator's).",
-  "file": "src/main/java/app/feedgateway/FootprintViews.java",
-  "occurrence": 1,
-  "occurrencesInFile": 1,
-  "line": 329,
-  "enclosing": "private static long epochField(JsonNode node, String field) {",
-  "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
-  "killedBy": [
-   "FootprintViewsTest.shapeDropsNeverMutate"
-  ],
-  "assertionFailures": [
-   "FootprintViewsTest.shapeDropsNeverMutate"
-  ],
-  "anyFailures": [
-   "FootprintViewsTest.shapeDropsNeverMutate"
-  ],
-  "killedByThrow": null,
-  "seconds": 9.3,
-  "patch": {
-   "old": "        return x < 0 || x > EPOCH_MAX_MS ? -1 : x;",
-   "new": "        return x < 0 ? -1 : x;"
-  },
-  "evidence": {
-   "repoCommit": "9128e372a56912777980b1cf5948384d4fe7380d",
-   "returnCode": 1,
-   "mutatedFileSha256": "e553a6d4e5b1827ccdc4191e78f47425f75f040f094bff517831a91eaf15a7f8",
-   "originalFileSha256": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
-   "filesSha256": {
-    "src/main/java/app/feedgateway/FootprintViews.java": {
-     "original": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
-     "mutated": "e553a6d4e5b1827ccdc4191e78f47425f75f040f094bff517831a91eaf15a7f8"
-    }
-   },
-   "outputSha256": "84109a218c15a75cf89a92f5f33501713b921b88f538a075c6afef57a5d36936",
-   "outputTail": " described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\n",
-   "failureLines": [
-    "[ERROR] app.feedgateway.FootprintViewsTest.shapeDropsNeverMutate -- Time elapsed: 0.003 s <<< FAILURE!",
-    "[ERROR]   FootprintViewsTest.shapeDropsNeverMutate:36 {\"timeframe\":\"1m\",\"sessionDate\":\"2026-08-14\",\"observations\":{\"barStartMs\":253402300800000}} ==> expected: <SHAPE> but was: <ADMITTED>"
-   ],
-   "treeRestoredClean": true
-  },
-  "baseline": {
-   "commit": "9128e372a56912777980b1cf5948384d4fe7380d",
-   "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
-   "returnCode": 0,
-   "outputSha256": "106958f0669e632abf5c439af8fd97a62a0d05fcb9b8e2873e441fc97cd0c5a8",
-   "outputTail": "enJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n"
-  }
- },
- "G-R7 the-epoch-guard variant2-removed": {
-  "status": "KILLED",
-  "clause": "a cursor at or past the last epoch value can have nothing after it, and the increment is taken only inside the domain",
-  "requirement": "G-R7",
-  "documentText": "**Backfill.** `GET /api/footprint/bars?tf&toMs&afterMs=-1&limit=100&sessionDate=` \u2192 `{sessionDate, [sessionMismatch:true], bars:[<record>\u2026], nextCursor}` with the `/api/cvd/bars` semantics (ascending `barStartMs`, exclusive `afterMs`, inclusive `toMs`, `limit` clamped to `[1, 100]`), computed as ONE snapshot under the coordinator lock with the session check (`sessionMismatch` when a non-empty `sessionDate` differs from the coordinator's).",
-  "file": "src/main/java/app/feedgateway/FootprintViews.java",
-  "occurrence": 1,
-  "occurrencesInFile": 1,
-  "line": 226,
-  "enclosing": "BarsPage barsPage(String tf, long toMsInclusive, long afterMsExclusive, int limit, String expectedSessionDate) {",
-  "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
-  "killedBy": [
-   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
-  ],
-  "assertionFailures": [
-   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
-  ],
-  "anyFailures": [
-   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
-  ],
-  "killedByThrow": null,
-  "seconds": 8.2,
-  "patch": {
-   "old": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive < EPOCH_MAX_MS) {",
-   "new": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0) {"
-  },
-  "evidence": {
-   "repoCommit": "9128e372a56912777980b1cf5948384d4fe7380d",
-   "returnCode": 1,
-   "mutatedFileSha256": "bcdfcc3334a5212551a86cd937777facd6b5915b9f634abbb7a9a99469c0add6",
-   "originalFileSha256": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
-   "filesSha256": {
-    "src/main/java/app/feedgateway/FootprintViews.java": {
-     "original": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
-     "mutated": "bcdfcc3334a5212551a86cd937777facd6b5915b9f634abbb7a9a99469c0add6"
-    }
-   },
-   "outputSha256": "fb1d4803500c116b623b7e9c6d2baf6d811f760c434751b8935812d4a9ed126d",
-   "outputTail": " described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\n",
-   "failureLines": [
-    "[ERROR] app.feedgateway.FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain -- Time elapsed: 0.019 s <<< FAILURE!",
-    "[ERROR]   FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain:185 a cursor beyond the domain admits nothing \u2014 it must not wrap ==> expected: <0> but was: <4>"
-   ],
-   "treeRestoredClean": true
-  },
-  "baseline": {
-   "commit": "9128e372a56912777980b1cf5948384d4fe7380d",
-   "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
-   "returnCode": 0,
-   "outputSha256": "106958f0669e632abf5c439af8fd97a62a0d05fcb9b8e2873e441fc97cd0c5a8",
-   "outputTail": "enJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n"
-  }
- },
- "G-R7 the-epoch-guard variant3-relaxed": {
-  "status": "SURVIVED",
-  "clause": "the same guard relaxed from < to <= \u2014 recorded because it is INERT: at afterMs == EPOCH_MAX_MS the +1 is safe and hi is capped, so lo > hi either way",
-  "requirement": "G-R7",
-  "documentText": "**Backfill.** `GET /api/footprint/bars?tf&toMs&afterMs=-1&limit=100&sessionDate=` \u2192 `{sessionDate, [sessionMismatch:true], bars:[<record>\u2026], nextCursor}` with the `/api/cvd/bars` semantics (ascending `barStartMs`, exclusive `afterMs`, inclusive `toMs`, `limit` clamped to `[1, 100]`), computed as ONE snapshot under the coordinator lock with the session check (`sessionMismatch` when a non-empty `sessionDate` differs from the coordinator's).",
-  "file": "src/main/java/app/feedgateway/FootprintViews.java",
-  "occurrence": 1,
-  "occurrencesInFile": 1,
-  "line": 226,
-  "enclosing": "BarsPage barsPage(String tf, long toMsInclusive, long afterMsExclusive, int limit, String expectedSessionDate) {",
-  "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
-  "killedBy": [],
-  "assertionFailures": [],
-  "anyFailures": [],
-  "killedByThrow": null,
-  "seconds": 10.8,
-  "patch": {
-   "old": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive < EPOCH_MAX_MS) {",
-   "new": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive <= EPOCH_MAX_MS) {"
-  },
-  "evidence": {
-   "repoCommit": "9128e372a56912777980b1cf5948384d4fe7380d",
-   "returnCode": 0,
-   "mutatedFileSha256": "1805041d85205e5bad948989b9f83b1f4d321c9f9322dd96226cf8761ffb8058",
-   "originalFileSha256": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
-   "filesSha256": {
-    "src/main/java/app/feedgateway/FootprintViews.java": {
-     "original": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
-     "mutated": "1805041d85205e5bad948989b9f83b1f4d321c9f9322dd96226cf8761ffb8058"
-    }
-   },
-   "outputSha256": "8bc34cd70bbee8d0320e948ae2325884ce13359266e15fd9cb2fc6f7bd6b78f3",
-   "outputTail": "tures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n",
-   "failureLines": [],
    "treeRestoredClean": true
   },
   "baseline": {
@@ -1961,6 +1663,304 @@
     "[ERROR]   FootprintSeamTest.everyAuthenticatedSocketReceivesAllFourEventsAndAnOversizeRecordReachesNone:193 four events + the stale bar, never the oversize one: [{\"type\":\"es-footprint\",\"data\":{\"schemaVersion\":6,\"live\":true}}, {\"type\":\"es-footprint-evidence\",\"data\":{\"schemaVersion\":6,\"ev\":true}}, {\"type\":\"es-footprint-bar\",\"data\":{\"schemaVersion\":6,\"symbol\":\"ES.v.0\",\"timeframe\":\"1m\",\"sessionDate\":\"",
     "[ERROR]   FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules:171 expected: <true> but was: <false>"
    ],
+   "treeRestoredClean": true
+  },
+  "baseline": {
+   "commit": "9128e372a56912777980b1cf5948384d4fe7380d",
+   "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
+   "returnCode": 0,
+   "outputSha256": "106958f0669e632abf5c439af8fd97a62a0d05fcb9b8e2873e441fc97cd0c5a8",
+   "outputTail": "enJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n"
+  }
+ },
+ "G-R4 older-date-dropped": {
+  "status": "KILLED",
+  "clause": "an OLDER session date is dropped",
+  "requirement": "G-R4",
+  "documentText": "OLDER \u21d2 `stale_session` drop;",
+  "file": "src/main/java/app/feedgateway/FootprintViews.java",
+  "occurrence": 1,
+  "occurrencesInFile": 1,
+  "line": 146,
+  "enclosing": "private Boolean rollover(LocalDate date) {",
+  "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
+  "killedBy": [
+   "FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts",
+   "FootprintViewsTest.outOfOrderBootstrapAcrossTopicsInBothOrders",
+   "FootprintViewsTest.yearAndMonthBoundariesOrderCorrectly",
+   "FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules"
+  ],
+  "assertionFailures": [
+   "FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts",
+   "FootprintViewsTest.outOfOrderBootstrapAcrossTopicsInBothOrders",
+   "FootprintViewsTest.yearAndMonthBoundariesOrderCorrectly",
+   "FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules"
+  ],
+  "anyFailures": [
+   "FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts",
+   "FootprintViewsTest.outOfOrderBootstrapAcrossTopicsInBothOrders",
+   "FootprintViewsTest.yearAndMonthBoundariesOrderCorrectly",
+   "FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules"
+  ],
+  "killedByThrow": null,
+  "seconds": 9.9,
+  "patch": {
+   "old": "        if (cmp < 0) return null;",
+   "new": "        if (cmp < 0) return false;"
+  },
+  "evidence": {
+   "repoCommit": "9128e372a56912777980b1cf5948384d4fe7380d",
+   "returnCode": 1,
+   "mutatedFileSha256": "e206c3d812af8d34dafbd81072df45f86f8f9d645ac67b6d8a5dfea59112dacc",
+   "originalFileSha256": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
+   "filesSha256": {
+    "src/main/java/app/feedgateway/FootprintViews.java": {
+     "original": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
+     "mutated": "e206c3d812af8d34dafbd81072df45f86f8f9d645ac67b6d8a5dfea59112dacc"
+    }
+   },
+   "outputSha256": "f4ab8756f16dfed50301c918b25d3d79b6fbbcf6abcd9f37fb1deb649edc2547",
+   "outputTail": " described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\n",
+   "failureLines": [
+    "[ERROR] app.feedgateway.FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules -- Time elapsed: 0.160 s <<< FAILURE!",
+    "[ERROR] app.feedgateway.FootprintViewsTest.yearAndMonthBoundariesOrderCorrectly -- Time elapsed: 0.001 s <<< FAILURE!",
+    "[ERROR] app.feedgateway.FootprintViewsTest.outOfOrderBootstrapAcrossTopicsInBothOrders -- Time elapsed: 0.001 s <<< FAILURE!",
+    "[ERROR] app.feedgateway.FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts -- Time elapsed: 0.001 s <<< FAILURE!",
+    "[ERROR]   FootprintViewsTest.aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts:102 late record from a dead session ==> expected: <STALE_SESSION> but was: <ADMITTED>",
+    "[ERROR]   FootprintViewsTest.outOfOrderBootstrapAcrossTopicsInBothOrders:113 expected: <STALE_SESSION> but was: <ADMITTED>",
+    "[ERROR]   FootprintViewsTest.yearAndMonthBoundariesOrderCorrectly:126 expected: <STALE_SESSION> but was: <ADMITTED>",
+    "[ERROR]   FootprintWiringTest.admissionCountsAndBroadcastDecisionsFollowTheOverlapRules:169 expected: <true> but was: <false>"
+   ],
+   "treeRestoredClean": true
+  },
+  "baseline": {
+   "commit": "9128e372a56912777980b1cf5948384d4fe7380d",
+   "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
+   "returnCode": 0,
+   "outputSha256": "106958f0669e632abf5c439af8fd97a62a0d05fcb9b8e2873e441fc97cd0c5a8",
+   "outputTail": "enJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n"
+  }
+ },
+ "G-R4 equal-date-upserts": {
+  "status": "KILLED",
+  "clause": "an EQUAL date upserts without rolling",
+  "requirement": "G-R4",
+  "documentText": "EQUAL (or first) \u21d2 upsert (last write per key wins).",
+  "file": "src/main/java/app/feedgateway/FootprintViews.java",
+  "occurrence": 1,
+  "occurrencesInFile": 1,
+  "line": 147,
+  "enclosing": "private Boolean rollover(LocalDate date) {",
+  "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
+  "killedBy": [
+   "FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit",
+   "FootprintViewsTest.barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic",
+   "FootprintViewsTest.byteBudgetEvictsUntilItFitsAndBytesAreExact",
+   "FootprintViewsTest.countBudgetEvictsTheOldestKeyPerTimeframeRoundRobin"
+  ],
+  "assertionFailures": [
+   "FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit",
+   "FootprintViewsTest.barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic",
+   "FootprintViewsTest.byteBudgetEvictsUntilItFitsAndBytesAreExact",
+   "FootprintViewsTest.countBudgetEvictsTheOldestKeyPerTimeframeRoundRobin",
+   "FootprintViewsTest.helloIsEmptyBeforeRecordsAndCarriesPerTimeframeHighWaterMarks",
+   "FootprintViewsTest.outcomesPageOrdersByNumericTimestampThenIdentityWithAnOpaqueCursor",
+   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
+  ],
+  "anyFailures": [
+   "FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit",
+   "FootprintViewsTest.barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic",
+   "FootprintViewsTest.byteBudgetEvictsUntilItFitsAndBytesAreExact",
+   "FootprintViewsTest.countBudgetEvictsTheOldestKeyPerTimeframeRoundRobin",
+   "FootprintViewsTest.helloIsEmptyBeforeRecordsAndCarriesPerTimeframeHighWaterMarks",
+   "FootprintViewsTest.outcomesPageOrdersByNumericTimestampThenIdentityWithAnOpaqueCursor",
+   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
+  ],
+  "killedByThrow": null,
+  "seconds": 9.5,
+  "patch": {
+   "old": "        if (cmp == 0) return false;",
+   "new": "        if (cmp == 0) { bars.clear(); outcomes.clear(); return false; }"
+  },
+  "evidence": {
+   "repoCommit": "9128e372a56912777980b1cf5948384d4fe7380d",
+   "returnCode": 1,
+   "mutatedFileSha256": "bb23ff808e60cdb5c05bd5e4a4f37293d5c59e413cb61374f0aec61eeab46dca",
+   "originalFileSha256": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
+   "filesSha256": {
+    "src/main/java/app/feedgateway/FootprintViews.java": {
+     "original": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
+     "mutated": "bb23ff808e60cdb5c05bd5e4a4f37293d5c59e413cb61374f0aec61eeab46dca"
+    }
+   },
+   "outputSha256": "f26d8491495969b2b8b532267b45f3799611bce6b6046220a2a02040e60890e9",
+   "outputTail": " described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\n",
+   "failureLines": [
+    "[ERROR] app.feedgateway.FootprintViewsTest.byteBudgetEvictsUntilItFitsAndBytesAreExact -- Time elapsed: 0.005 s <<< FAILURE!",
+    "[ERROR] app.feedgateway.FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain -- Time elapsed: 0.002 s <<< FAILURE!",
+    "[ERROR] app.feedgateway.FootprintViewsTest.barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic -- Time elapsed: 0.001 s <<< FAILURE!",
+    "[ERROR] app.feedgateway.FootprintViewsTest.countBudgetEvictsTheOldestKeyPerTimeframeRoundRobin -- Time elapsed: 0.001 s <<< FAILURE!",
+    "[ERROR] app.feedgateway.FootprintViewsTest.outcomesPageOrdersByNumericTimestampThenIdentityWithAnOpaqueCursor -- Time elapsed: 0.001 s <<< FAILURE!",
+    "[ERROR] app.feedgateway.FootprintViewsTest.helloIsEmptyBeforeRecordsAndCarriesPerTimeframeHighWaterMarks -- Time elapsed: 0 s <<< FAILURE!",
+    "[ERROR] app.feedgateway.FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit -- Time elapsed: 0.001 s <<< FAILURE!",
+    "[ERROR]   FootprintBackfillControllerTest.barsPageIsStreamedWithTheEnvelopeAndClampedLimit:60 {\"sessionDate\":\"2026-08-14\",\"bars\":[{\"schemaVersion\":6,\"symbol\":\"ES.v.0\",\"timeframe\":\"30s\",\"sessionDate\":\"2026-08-14\",\"observations\":{\"barStartMs\":5000},\"tag\":\"x\"}],\"nextCursor\":null} ==> expected: <true> but was: <false>",
+    "[ERROR]   FootprintViewsTest.barsPageIsAscendingExclusiveCursorInclusiveBoundAndAtomic:197 expected: <2> but was: <0>",
+    "[ERROR]   FootprintViewsTest.byteBudgetEvictsUntilItFitsAndBytesAreExact:255 expected: <2> but was: <0>",
+    "[ERROR]   FootprintViewsTest.countBudgetEvictsTheOldestKeyPerTimeframeRoundRobin:240 expected: <1> but was: <0>",
+    "[ERROR]   FootprintViewsTest.helloIsEmptyBeforeRecordsAndCarriesPerTimeframeHighWaterMarks:140 expected: <{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"30s\":2000,\"1m\":5},\"outcomeHwm\":{\"5m\":77}}> but was: <{\"sessionDate\":\"2026-08-14\",\"hwm\":{},\"outcomeHwm\":{\"5m\":70}}>",
+    "[ERROR]   FootprintViewsTest.outcomesPageOrdersByNumericTimestampThenIdentityWithAnOpaqueCursor:217 expected: <2> but was: <0>",
+    "[ERROR]   FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain:189 expected: <4> but was: <1>"
+   ],
+   "treeRestoredClean": true
+  },
+  "baseline": {
+   "commit": "9128e372a56912777980b1cf5948384d4fe7380d",
+   "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
+   "returnCode": 0,
+   "outputSha256": "106958f0669e632abf5c439af8fd97a62a0d05fcb9b8e2873e441fc97cd0c5a8",
+   "outputTail": "enJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n"
+  }
+ },
+ "G-R4 key-fields-must-be-in-the-epoch-domain": {
+  "status": "KILLED",
+  "clause": "an out-of-domain timestamp is refused",
+  "requirement": "G-R4",
+  "documentText": "`timeframe` must be one of the seven keys; the key fields must be present integers in the epoch domain; otherwise `shape` drop (never mutates).",
+  "file": "src/main/java/app/feedgateway/FootprintViews.java",
+  "occurrence": 1,
+  "occurrencesInFile": 1,
+  "line": 329,
+  "enclosing": "private static long epochField(JsonNode node, String field) {",
+  "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
+  "killedBy": [
+   "FootprintViewsTest.shapeDropsNeverMutate"
+  ],
+  "assertionFailures": [
+   "FootprintViewsTest.shapeDropsNeverMutate"
+  ],
+  "anyFailures": [
+   "FootprintViewsTest.shapeDropsNeverMutate"
+  ],
+  "killedByThrow": null,
+  "seconds": 9.3,
+  "patch": {
+   "old": "        return x < 0 || x > EPOCH_MAX_MS ? -1 : x;",
+   "new": "        return x < 0 ? -1 : x;"
+  },
+  "evidence": {
+   "repoCommit": "9128e372a56912777980b1cf5948384d4fe7380d",
+   "returnCode": 1,
+   "mutatedFileSha256": "e553a6d4e5b1827ccdc4191e78f47425f75f040f094bff517831a91eaf15a7f8",
+   "originalFileSha256": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
+   "filesSha256": {
+    "src/main/java/app/feedgateway/FootprintViews.java": {
+     "original": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
+     "mutated": "e553a6d4e5b1827ccdc4191e78f47425f75f040f094bff517831a91eaf15a7f8"
+    }
+   },
+   "outputSha256": "84109a218c15a75cf89a92f5f33501713b921b88f538a075c6afef57a5d36936",
+   "outputTail": " described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\n",
+   "failureLines": [
+    "[ERROR] app.feedgateway.FootprintViewsTest.shapeDropsNeverMutate -- Time elapsed: 0.003 s <<< FAILURE!",
+    "[ERROR]   FootprintViewsTest.shapeDropsNeverMutate:36 {\"timeframe\":\"1m\",\"sessionDate\":\"2026-08-14\",\"observations\":{\"barStartMs\":253402300800000}} ==> expected: <SHAPE> but was: <ADMITTED>"
+   ],
+   "treeRestoredClean": true
+  },
+  "baseline": {
+   "commit": "9128e372a56912777980b1cf5948384d4fe7380d",
+   "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
+   "returnCode": 0,
+   "outputSha256": "106958f0669e632abf5c439af8fd97a62a0d05fcb9b8e2873e441fc97cd0c5a8",
+   "outputTail": "enJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n"
+  }
+ },
+ "G-R7 the-exclusive-cursor-at-the-domain-edge site1-removed": {
+  "status": "KILLED",
+  "clause": "the afterMs lower bound stays exclusive at the top of the epoch domain",
+  "requirement": "G-R7",
+  "documentText": "**Backfill.** `GET /api/footprint/bars?tf&toMs&afterMs=-1&limit=100&sessionDate=` \u2192 `{sessionDate, [sessionMismatch:true], bars:[<record>\u2026], nextCursor}` with the `/api/cvd/bars` semantics (ascending `barStartMs`, exclusive `afterMs`, inclusive `toMs`, `limit` clamped to `[1, 100]`), computed as ONE snapshot under the coordinator lock with the session check (`sessionMismatch` when a non-empty `sessionDate` differs from the coordinator's).",
+  "file": "src/main/java/app/feedgateway/FootprintViews.java",
+  "occurrence": 1,
+  "occurrencesInFile": 1,
+  "line": 226,
+  "enclosing": "BarsPage barsPage(String tf, long toMsInclusive, long afterMsExclusive, int limit, String expectedSessionDate) {",
+  "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
+  "killedBy": [
+   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
+  ],
+  "assertionFailures": [
+   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
+  ],
+  "anyFailures": [
+   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
+  ],
+  "killedByThrow": null,
+  "seconds": 8.2,
+  "patch": {
+   "old": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive < EPOCH_MAX_MS) {",
+   "new": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0) {"
+  },
+  "evidence": {
+   "repoCommit": "9128e372a56912777980b1cf5948384d4fe7380d",
+   "returnCode": 1,
+   "mutatedFileSha256": "bcdfcc3334a5212551a86cd937777facd6b5915b9f634abbb7a9a99469c0add6",
+   "originalFileSha256": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
+   "filesSha256": {
+    "src/main/java/app/feedgateway/FootprintViews.java": {
+     "original": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
+     "mutated": "bcdfcc3334a5212551a86cd937777facd6b5915b9f634abbb7a9a99469c0add6"
+    }
+   },
+   "outputSha256": "fb1d4803500c116b623b7e9c6d2baf6d811f760c434751b8935812d4a9ed126d",
+   "outputTail": " described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\n",
+   "failureLines": [
+    "[ERROR] app.feedgateway.FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain -- Time elapsed: 0.019 s <<< FAILURE!",
+    "[ERROR]   FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain:185 a cursor beyond the domain admits nothing \u2014 it must not wrap ==> expected: <0> but was: <4>"
+   ],
+   "treeRestoredClean": true
+  },
+  "baseline": {
+   "commit": "9128e372a56912777980b1cf5948384d4fe7380d",
+   "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
+   "returnCode": 0,
+   "outputSha256": "106958f0669e632abf5c439af8fd97a62a0d05fcb9b8e2873e441fc97cd0c5a8",
+   "outputTail": "enJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n"
+  }
+ },
+ "G-R7 the-exclusive-cursor-at-the-domain-edge site2-relaxed": {
+  "status": "SURVIVED",
+  "clause": "the same guard relaxed from < to <= \u2014 recorded because it is INERT: at afterMs == EPOCH_MAX_MS the +1 is safe and hi is capped, so lo > hi either way",
+  "requirement": "G-R7",
+  "documentText": "**Backfill.** `GET /api/footprint/bars?tf&toMs&afterMs=-1&limit=100&sessionDate=` \u2192 `{sessionDate, [sessionMismatch:true], bars:[<record>\u2026], nextCursor}` with the `/api/cvd/bars` semantics (ascending `barStartMs`, exclusive `afterMs`, inclusive `toMs`, `limit` clamped to `[1, 100]`), computed as ONE snapshot under the coordinator lock with the session check (`sessionMismatch` when a non-empty `sessionDate` differs from the coordinator's).",
+  "file": "src/main/java/app/feedgateway/FootprintViews.java",
+  "occurrence": 1,
+  "occurrencesInFile": 1,
+  "line": 226,
+  "enclosing": "BarsPage barsPage(String tf, long toMsInclusive, long afterMsExclusive, int limit, String expectedSessionDate) {",
+  "command": "mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false",
+  "killedBy": [],
+  "assertionFailures": [],
+  "anyFailures": [],
+  "killedByThrow": null,
+  "seconds": 10.8,
+  "patch": {
+   "old": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive < EPOCH_MAX_MS) {",
+   "new": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive <= EPOCH_MAX_MS) {"
+  },
+  "evidence": {
+   "repoCommit": "9128e372a56912777980b1cf5948384d4fe7380d",
+   "returnCode": 0,
+   "mutatedFileSha256": "1805041d85205e5bad948989b9f83b1f4d321c9f9322dd96226cf8761ffb8058",
+   "originalFileSha256": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
+   "filesSha256": {
+    "src/main/java/app/feedgateway/FootprintViews.java": {
+     "original": "915d37cc20d21609a16608dc1cf7b72bbe42e7b152c08c456ff509aafafd4f96",
+     "mutated": "1805041d85205e5bad948989b9f83b1f4d321c9f9322dd96226cf8761ffb8058"
+    }
+   },
+   "outputSha256": "8bc34cd70bbee8d0320e948ae2325884ce13359266e15fd9cb2fc6f7bd6b78f3",
+   "outputTail": "tures.footprint.bars ceiling max.message.bytes=1048589 > 1048588\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.bars unknown unknown topic futures.footprint.bars\nRGW_ALERT GATEWAY_FOOTPRINT_TOPIC_NOT_ADMITTED futures.footprint.outcomes unknown unknown topic futures.footprint.outcomes\nMockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build as described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org.mockito/org/mockito/Mockito.html#0.3\nOpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended\nWARNING: A Java agent has been loaded dynamically (/Users/abhinav/.m2/repository/net/bytebuddy/byte-buddy-agent/1.17.5/byte-buddy-agent-1.17.5.jar)\nWARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning\nWARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information\nWARNING: Dynamic loading of agents will be disallowed by default in a future release\n",
+   "failureLines": [],
    "treeRestoredClean": true
   },
   "baseline": {

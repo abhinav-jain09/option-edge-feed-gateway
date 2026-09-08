@@ -175,15 +175,20 @@ verbatim failure lines and a SHA-256 of the run output — is in `ES-FOOTPRINT-C
 this document. Regenerate this section with `scripts/footprint-reqstate.sh`, or check it against the
 record with `scripts/footprint-reqstate.sh --check`.
 
+What this table cannot do is decide whether a quoted obligation is the clause a probe exercises.
+The generator refuses a quote that is not verbatim in the requirement it sits under, and one that
+shares no vocabulary with the clause recorded against it; beyond that, attribution is a judgement
+made in review, and the merge gate for this change corrected several of them.
+
 | id | Conformance | Gate | Disposition |
 |----|-------------|------|-------------|
 | G-R1 | 1 of 1 probes pinned, over 1 clause | 2 | Flag and wiring |
 | G-R2 | 2 of 2 probes pinned, over 2 clauses | 2 | Flag and wiring |
 | G-R3 | 3 of 3 probes pinned, over 3 clauses | 2 | Delivery and views |
-| G-R4 | 3 of 3 probes pinned, over 3 clauses | 2 | Delivery and views |
+| G-R4 | 4 of 4 probes pinned, over 4 clauses | 2 | Delivery and views |
 | G-R5 | 4 of 4 probes pinned, over 4 clauses | 2 | Delivery and views |
 | G-R6 | 3 of 3 probes pinned, over 3 clauses | 2 | Hello |
-| G-R7 | 5 of 6 probes pinned, over 4 clauses (1 survived) | 2 | Backfill routes |
+| G-R7 | 4 of 5 probes pinned, over 4 clauses (1 survived) | 2 | Backfill routes |
 | G-R8 | 5 of 5 probes pinned, over 5 clauses | 2 | Deployment contingency |
 | G-R9 | 3 of 3 probes pinned, over 3 clauses | 2 | Metrics |
 | G-R10 | 2 of 2 probes pinned, over 2 clauses | 2 | Non-interference |
