@@ -816,7 +816,7 @@
  },
  "G-R2.1 one-wiring-method-binds-all-four": {
   "status": "KILLED",
-  "clause": "ONE wiring method addEsFootprintTopics(topicEvents) called from BOTH consumers",
+  "clause": "addEsFootprintTopics binds all four topics, each to its own event",
   "requirement": "G-R2",
   "documentText": "ONE wiring method `addEsFootprintTopics(topicEvents)` called from BOTH the state cache consumer and the state live consumer (the `addEsCvdTopics` rule), pinned by a source test exactly like `CvdBarViewTest.bootstrapAndLiveConsumersShareOneCvdTopicWiringPath`.",
   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
