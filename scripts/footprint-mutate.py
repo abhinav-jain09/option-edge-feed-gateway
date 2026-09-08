@@ -79,14 +79,30 @@ def main():
 
     for m in spec['mutations']:
         k = m['key']
-        if k in res: continue
-        f = os.path.join(root, m['file'])
+        # Resume only when the stored record was produced by THIS patch at THIS commit. Keying the
+        # skip on the name alone silently reuses a record for a patch that has since been edited,
+        # and the campaign then reports a result no run ever produced.
+        prev = res.get(k)
+        # A clause may be implemented at SEVERAL sites (a guard duplicated for defence in depth). One
+        # clause is still ONE mutation: `sites` breaks every site of the clause together, because
+        # breaking one site of a duplicated guard changes no behaviour and would be recorded as a
+        # survivor of a test that is in fact perfectly capable of catching the clause's removal.
+        sites = m.get('sites') or [{'file': m['file'], 'old': m['old'], 'new': m['new'],
+                                    'occurrence': m.get('occurrence', 1)}]
+        patch = {'sites': sites} if m.get('sites') else {'old': m['old'], 'new': m['new']}
+        if prev is not None and prev.get('patch') == patch \
+                and prev.get('evidence', {}).get('repoCommit') == commit:
+            continue
+        res.pop(k, None)
+        f = os.path.join(root, sites[0]['file'])
         src = open(f).read()
-        n = src.count(m['old'])
-        if n == 0:
-            res[k] = {'status': 'ANCHOR-MISSING', 'file': m['file']}
+        missing = [s0 for s0 in sites if open(os.path.join(root, s0['file'])).read().count(s0['old']) == 0]
+        if missing:
+            res[k] = {'status': 'ANCHOR-MISSING', 'file': missing[0]['file']}
             print(f"  {k:<40} ANCHOR-MISSING"); json.dump(res, open(outp,'w'), indent=1); continue
-        occ = m.get('occurrence', 1)
+        m = dict(m, old=sites[0]['old'], new=sites[0]['new'])
+        n = src.count(sites[0]['old'])
+        occ = sites[0].get('occurrence', 1)
         # locate the chosen occurrence
         pos, seen = -1, 0
         start = 0
@@ -121,19 +137,45 @@ def main():
             while stack and depth <= stack[-1][0]:
                 stack.pop()
 
-        shutil.copy(f, f + '.bak')
-        mutated = src[:pos] + m['new'] + src[pos+len(m['old']):]
+        touched = sorted({os.path.join(root, s0['file']) for s0 in sites})
+        originals, mutants = {}, {}
+        for path in touched:
+            shutil.copy(path, path + '.bak')
         t0 = time.time()
         try:
-            open(f, 'w').write(mutated)
+            for s0 in sites:
+                path = os.path.join(root, s0['file'])
+                text = open(path).read()
+                originals.setdefault(s0['file'], sha(text))
+                at, seen2, start2 = -1, 0, 0
+                while True:
+                    j = text.find(s0['old'], start2)
+                    if j < 0: break
+                    seen2 += 1
+                    if seen2 == s0.get('occurrence', 1): at = j; break
+                    start2 = j + 1
+                open(path, 'w').write(text[:at] + s0['new'] + text[at+len(s0['old']):])
+            for s0 in sites:
+                path = os.path.join(root, s0['file'])
+                mutants[s0['file']] = sha(open(path).read())
             rc, out = run(cmd, root)
         finally:
             # UNCONDITIONAL. A timeout, an interrupt or a crash between the write and the restore
             # would otherwise leave the tree mutated and poison every later mutation AND the baseline.
-            shutil.move(f + '.bak', f)
-            os.utime(f, None)   # mv restores the ORIGINAL mtime; Maven's incremental compiler would skip it
+            for path in touched:
+                shutil.move(path + '.bak', path)
+                os.utime(path, None)   # mv restores the ORIGINAL mtime; Maven would skip recompiling
         still_dirty = tree_dirty(root)
         failed = failing_tests(out, kind)
+        # A `kind` that does not match the runner parses no failure names, and every kill is then
+        # recorded as BUILD-FAILED — silently, because the run really did exit non-zero. Refuse
+        # instead: the output plainly names failing tests in the other runner's shape.
+        if rc != 0 and not failed:
+            other = failing_tests(out, 'node' if kind == 'maven' else 'maven')
+            if other:
+                print(f"KIND MISMATCH: kind={kind!r} parsed no failures, but the output names {other[:3]}")
+                print("  the spec's `kind` does not match the test runner; refusing to record a wrong verdict")
+                sys.exit(4)
         if build_failed(out, kind) and not failed:
             status = 'BUILD-FAILED'
         elif rc != 0 and failed:
@@ -147,9 +189,10 @@ def main():
                   'file': m['file'], 'occurrence': occ, 'occurrencesInFile': n, 'line': line,
                   'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': failed[:4],
                   'seconds': round(time.time()-t0, 1),
-                  'patch': {'old': m['old'], 'new': m['new']},
+                  'patch': patch,
                   'evidence': {'repoCommit': commit, 'returnCode': rc,
-                               'mutatedFileSha256': sha(mutated), 'originalFileSha256': sha(src),
+                               'mutatedFileSha256': mutants.get(sites[0]['file']), 'originalFileSha256': originals.get(sites[0]['file']),
+                               'filesSha256': {p: {'original': originals[p], 'mutated': mutants.get(p)} for p in originals},
                                'outputSha256': sha(out), 'outputTail': out[-1200:],
                                'failureLines': failure_lines(out, kind),
                                'treeRestoredClean': not still_dirty},
