@@ -8353,6 +8353,14 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private boolean interceptSharedGexRecord(
             ConsumerRecord<String, Object> record, String rawJson, boolean liveBroadcast, long nowMs) {
+        if (!settings.ibkrPreOpenGexArbitrationEnabled()) {
+            // Value-plane kill switch (2026-09-08). Deliberately the FIRST statement in the ONE
+            // chokepoint every reader goes through, so a single test covers the live consumer, the
+            // cache consumer and any future caller — gating the call sites instead would leave the
+            // wiring untested. Returning false hands the record straight back to the existing
+            // pipeline, exactly as before slice 2, and the slice-1 status plane is untouched.
+            return false;
+        }
         boolean liveTopic = record.topic().equals(settings.databentoGexTopic());
         if (rawJson == null || rawJson.isBlank()) {
             if (liveTopic) {
@@ -12207,7 +12215,11 @@ public class FeedGatewayService implements ReplayRunner {
             // UNKNOWN_SESSIONED tuples fail closed exactly like the live reader. All three drop
             // here (counted), so no sessioned record is ever relabelled with Databento
             // provenance by the generic enrichment below. Flag OFF -> byte-identical behavior (O7).
-            if (settings.ibkrPreOpenEnabled() && source == MarketDataSource.DATABENTO
+            // Same kill switch as the live/cache readers (2026-09-08): replay must apply the SAME
+            // classification the live path does, so when the value plane is off a sessioned record
+            // stays on the ordinary replay plane instead of being dropped here.
+            if (settings.ibkrPreOpenEnabled() && settings.ibkrPreOpenGexArbitrationEnabled()
+                    && source == MarketDataSource.DATABENTO
                     && "gex-by-strike".equals(r.event()) && isSessionedSharedGexJson(raw)) {
                 ibkrPreOpenGexDroppedSessioned.incrementAndGet();
                 return false;
