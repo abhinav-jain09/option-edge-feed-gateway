@@ -13292,6 +13292,12 @@ public class FeedGatewayService implements ReplayRunner {
         List<TopicPartition> owned = partitions.stream().filter(tp -> tp.topic().equals(topic)).toList();
         if (esAuctionRehydrate.get()) {
             if (owned.isEmpty()) { esAuctionRehydrateBarrier.clear(); return clearRehydrateIfCurrent(generation); }
+            /* NAMED FIRST, before a single offset is read. Bound after the seek, a recreation landing between
+               the range query and the bind would associate OLD-log offsets with the NEW id, and every later
+               identity check would agree while the barrier pointed into a log that no longer exists
+               (code review round 28). The same id is confirmed again once the boundary is established. */
+            if (!bindEsAuctionIncarnation(owned)) return false;
+            org.apache.kafka.common.Uuid startingOn = esAuctionTopicId;
             try {
                 Map<TopicPartition, Long> beginning = consumer.beginningOffsets(owned, Duration.ofSeconds(10));
                 Map<TopicPartition, Long> end = consumer.endOffsets(owned, Duration.ofSeconds(10));
@@ -13307,12 +13313,14 @@ public class FeedGatewayService implements ReplayRunner {
                    for its own replay, and clearing the request unconditionally would erase it — the next pass
                    would then see nothing pending and could freeze without ever replaying the newest log
                    (round 18). Its own barrier and view drop still stand; this pass simply ends. */
-                /* NAMED BEFORE the request is cleared. Clearing first and failing to bind left later passes
-                   able to complete the barrier with `esAuctionReplayTopicId == null` and then freeze once an
-                   id became readable — a recreation during that unnamed replay would be undetectable
-                   (round 26). A failed bind leaves the request standing and the pass simply ends. */
-                if (!bindEsAuctionIncarnation(owned)) return false;
-                esAuctionReplayTopicId = esAuctionTopicId;
+                /* CONFIRMED unchanged now that the boundary stands. A recreation between the bind above and
+                   this point would have left the barrier offsets belonging to the previous log; the request
+                   is left standing so the next pass starts the replay over (rounds 26, 28). */
+                if (!startingOn.equals(esAuctionTopicIdReader.apply(topic))) {
+                    esAuctionForgetIncarnation("the topic was recreated while the replay boundary was being established");
+                    return false;
+                }
+                esAuctionReplayTopicId = startingOn;
                 if (!clearRehydrateIfCurrent(generation)) return false;
                 System.out.println("es-auction: re-reading the retained log of the new incarnation before any hello");
             } catch (RuntimeException retryable) {
@@ -13439,6 +13447,10 @@ public class FeedGatewayService implements ReplayRunner {
         props.put(org.apache.kafka.clients.admin.AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, settings.bootstrapServers());
         props.put(org.apache.kafka.clients.admin.AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, "10000");
         props.put(org.apache.kafka.clients.admin.AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, "10000");
+        // TLS/SASL when configured, exactly as every other client here. Without it the id lookup fails on
+        // every secured deployment, and since an unreadable id fails CLOSED the auction would never leave
+        // its paused, hello-held state at all (code review round 28).
+        settings.applyKafkaSecurity(props);
         try (org.apache.kafka.clients.admin.AdminClient admin = org.apache.kafka.clients.admin.AdminClient.create(props)) {
             var d = admin.describeTopics(List.of(topic)).allTopicNames().get(10, TimeUnit.SECONDS).get(topic);
             return d == null ? null : d.topicId();
