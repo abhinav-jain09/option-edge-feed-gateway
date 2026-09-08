@@ -236,9 +236,14 @@ def main():
             status = 'BUILD-FAILED'
         elif rc != 0 and asserted:
             status = 'KILLED'
+        elif rc != 0 and failed and m.get('killedByThrow'):
+            # The clause under test IS "this must not throw", so a test that propagates the throw is
+            # detecting exactly the right thing. The spec must SAY so in advance — declaring the
+            # detection mode after seeing the result is how a fixture blow-up gets read as a kill.
+            status = 'KILLED'
         elif rc != 0 and failed:
-            # the right test failed, but on a THROW rather than an assertion: the mutation broke the
-            # fixture, not the behaviour under test, so this is not evidence the clause is held
+            # the right test failed, but on a THROW rather than an assertion, and the spec did not
+            # declare that mode: the mutation may have broken the fixture rather than the behaviour
             status = 'KILLED-BY-ERROR'
         elif rc != 0:
             status = 'BUILD-FAILED'
@@ -248,6 +253,7 @@ def main():
                   'documentText': m.get('documentText'),
                   'file': m['file'], 'occurrence': occ, 'occurrencesInFile': n, 'line': line,
                   'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': asserted[:4] or failed[:4], 'assertionFailures': asserted[:4], 'anyFailures': failed[:4],
+                  'killedByThrow': bool(m.get('killedByThrow')),
                   'seconds': round(time.time()-t0, 1),
                   'patch': patch,
                   'evidence': {'repoCommit': commit, 'returnCode': rc,
