@@ -866,6 +866,49 @@ class EsAuctionWiringTest {
         assertEquals(0, s.esAuctionMinutesCached(), "and its half-read view goes with it");
     }
 
+    /** A partition that APPEARS after the handoff froze must hold the hello from the moment it appears, not
+     *  from whenever the next capture pass notices — every socket connecting during its hydration would
+     *  otherwise be promised a view whose newest partition has no handoff at all. */
+    @Test void anAuctionPartitionAppearingAfterTheFreezeHoldsTheHelloAtOnce() throws Exception {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        s.runOutboundWritesInline();
+        var tp0 = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 0L);
+        org.apache.kafka.common.Uuid id = org.apache.kafka.common.Uuid.randomUuid();
+        s.esAuctionTopicIdReader = t -> id;
+        s.markStateCaughtUpWithoutHandoffForTest();
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp0));
+        assertTrue(s.esAuctionHelloReady(), "one partition, captured, frozen");
+
+        var tp1 = new TopicPartition("es.futures.auction", 1);
+        s.reopenEsAuctionLatchForNewPartitionsForTest(List.of(tp1));
+        assertFalse(s.esAuctionHelloReady(), "the new partition holds the hello from the moment it appears");
+        List<String> sink = new ArrayList<>();
+        s.addClient(socket("during-hydration", sink));
+        assertFalse(sink.stream().anyMatch(m -> m.contains("\"es-auction-hello\"")), "and a socket connecting now is held, not promised");
+    }
+
+    /** "We already have an id" proves nothing about a newly discovered partition's log: a delete/recreate
+     *  keeps the topic's name and partition count. */
+    @Test void aPartitionDiscoveredOnARecreatedTopicIsNotHydratedIntoTheOldView() {
+        System.setProperty("GATEWAY_ES_AUCTION_ENABLED", "true");
+        var s = service();
+        var tp = new TopicPartition("es.futures.auction", 0);
+        var consumer = mockAuctionConsumer(0L, 0L);
+        var current = new java.util.concurrent.atomic.AtomicReference<>(org.apache.kafka.common.Uuid.randomUuid());
+        s.esAuctionTopicIdReader = t -> current.get();
+        s.markStateCaughtUpWithoutHandoffForTest();
+        s.tryFreezeEsAuctionHandoff(consumer, List.of(tp));
+        s.upsertEsAuctionMinute(key("2026-09-08", "09:30"), minute("2026-09-08", "09:30", 0, "old"));
+        assertTrue(s.esAuctionHelloReady());
+
+        current.set(org.apache.kafka.common.Uuid.randomUuid());
+        s.verifyOrBindEsAuctionIncarnationForTest(List.of(tp));
+        assertFalse(s.esAuctionHelloReady(), "the recreation is seen at discovery, not 30 s later");
+        assertEquals(0, s.esAuctionMinutesCached(), "and the old view is not hydrated into");
+    }
+
     @Test void foreignShapesNeverPoisonTheView() {
         var s = service();
         assertFalse(s.upsertEsAuctionMinute(null, "{\"unrelated\":true}"));

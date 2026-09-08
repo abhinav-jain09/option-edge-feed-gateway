@@ -2645,8 +2645,11 @@ public class FeedGatewayService implements ReplayRunner {
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
                     // A topic discovered AFTER startup is hydrated by the same path and needs the same
-                    // guarantee: name its incarnation before a record of it is read (round 26).
-                    bindEsAuctionIncarnationOrReplay(refresh.added());
+                    // guarantee: name its incarnation before a record of it is read (round 26) — and when
+                    // one is already on record, VERIFY it rather than skip, because a delete/recreate keeps
+                    // the topic name and partition count (round 27).
+                    reopenEsAuctionLatchForNewPartitions(refresh.added());
+                    verifyOrBindEsAuctionIncarnation(refresh.added());
                     seekToCacheWindow(consumer, refresh.added(), topicEvents);
                     Map<TopicPartition, Long> addedEndOffsets = boundedEndOffsets(consumer, refresh.added());
                     // TWO barriers, deliberately not the same set.
@@ -13371,6 +13374,43 @@ public class FeedGatewayService implements ReplayRunner {
         esAuctionForgetIncarnation("the incarnation could not be named before hydrating");
     }
 
+    /**
+     * Like {@link #bindEsAuctionIncarnationOrReplay}, but for partitions discovered AFTER an incarnation is
+     * already on record: it VERIFIES instead of skipping. A delete/recreate keeps the topic's name and
+     * partition count, so "we already have an id" proves nothing about the log about to be hydrated — the
+     * cache would otherwise pour the new log into the old view and keep serving the frozen hello until the
+     * 30 s identity cadence happened to fire (code review round 27).
+     */
+    private void verifyOrBindEsAuctionIncarnation(List<TopicPartition> partitions) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        if (partitions.stream().noneMatch(tp -> tp.topic().equals(topic))) return;
+        org.apache.kafka.common.Uuid known = esAuctionTopicId;
+        if (known == null) { bindEsAuctionIncarnationOrReplay(partitions); return; }
+        org.apache.kafka.common.Uuid now = esAuctionTopicIdReader.apply(topic);
+        if (now == null) { esAuctionForgetIncarnation("the incarnation could not be read before hydrating a newly discovered " + topic); return; }
+        if (!now.equals(known)) esAuctionForgetIncarnation("topic " + topic + " was recreated (" + known + " -> " + now + ")");
+    }
+
+    /**
+     * Reopens the hello latch the moment an auction partition APPEARS, not when the next capture pass
+     * notices. Discovered after the handoff froze, the latch stayed closed for the whole of that partition's
+     * bootstrap hydration, and every socket connecting in that window got a hello promising a view whose
+     * newest partition had no handoff at all (code review round 27).
+     */
+    private void reopenEsAuctionLatchForNewPartitions(List<TopicPartition> added) {
+        if (!settings.esAuctionEnabled()) return;
+        String topic = settings.esAuctionTopic();
+        synchronized (esAuctionIncarnationLock) {
+            for (TopicPartition tp : added) {
+                if (tp.topic().equals(topic) && !esAuctionHandoffOffset.containsKey(tp)) {
+                    if (esAuctionHandoffFrozen.compareAndSet(true, false)) System.out.println("es-auction: " + tp + " appeared with no handoff — the hello is held again until it has one");
+                    return;
+                }
+            }
+        }
+    }
+
     private boolean bindEsAuctionIncarnation(List<TopicPartition> partitions) {
         if (!settings.esAuctionEnabled()) return true;
         String topic = settings.esAuctionTopic();
@@ -13473,6 +13513,11 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** Test seam: the view has hydrated but NO handoff has been captured — the state tryFreeze is asked from. */
     void markStateCaughtUpWithoutHandoffForTest() { stateCaughtUp.set(true); }
+
+    /** Test seams for the two discovery-path steps, which the cache loop calls from inside a live consumer. */
+    void reopenEsAuctionLatchForNewPartitionsForTest(List<TopicPartition> added) { reopenEsAuctionLatchForNewPartitions(added); }
+
+    void verifyOrBindEsAuctionIncarnationForTest(List<TopicPartition> partitions) { verifyOrBindEsAuctionIncarnation(partitions); }
 
     /** Test seam: makes the next identity check of a frozen topic due, instead of waiting out the cadence. */
     void expireEsAuctionIdCheckForTest() { esAuctionLastIdCheckMs = 0L; }
