@@ -79,8 +79,13 @@ class FootprintViewsTest {
     /** G-R10: no admission failure escapes the consumer loop — a null payload is a counted drop. */
     @Test void aNullPayloadIsARefusalNotAThrow() {
         FootprintViews v = views();
-        assertEquals(FootprintViews.Reason.SHAPE, v.admitBar(null).reason());
-        assertEquals(FootprintViews.Reason.SHAPE, v.admitOutcome(null).reason());
+        // State the clause the way it is written: the call must RETURN. Letting the throw propagate
+        // would also fail this test, but as an ERROR — and an error under the right test's name is
+        // not evidence of anything, since a broken fixture produces the same shape.
+        FootprintViews.Admission bar = assertDoesNotThrow(() -> v.admitBar(null), "a null bar payload must not throw");
+        FootprintViews.Admission out = assertDoesNotThrow(() -> v.admitOutcome(null), "a null outcome payload must not throw");
+        assertEquals(FootprintViews.Reason.SHAPE, bar.reason());
+        assertEquals(FootprintViews.Reason.SHAPE, out.reason());
         assertEquals(0, v.barsInView());
         assertEquals(0, v.outcomesInView());
     }
