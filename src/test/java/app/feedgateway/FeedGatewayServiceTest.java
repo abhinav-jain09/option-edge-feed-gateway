@@ -6138,7 +6138,14 @@ class FeedGatewayServiceTest {
     // frozen-projection cache.
     // ==============================================================================
 
-    private static final String IBKR_SESSION = "IBKR_PREOPEN:2026-08-04";
+    // The PRODUCER's real spelling. IbkrPreOpenService formats its trade date with
+// DateTimeFormatter.BASIC_ISO_DATE and stamps "IBKR_PREOPEN:" + tradeDate, so this is the
+// only session id that ever reaches the shared topic. The dashed "IBKR_PREOPEN:2026-08-04"
+// this constant used to hold appears nowhere on the wire — and because every control fixture
+// below was dashed too, the suite agreed with itself while production dropped 100% of records
+// (2026-09-08). Pinned against the producer's own formatter by
+// theSessionIdContractIsTheProducersOwnFormat().
+private static final String IBKR_SESSION = "IBKR_PREOPEN:20260804";
 
     private static String ibkrGexJson(String sessionId, long gen, long epoch, long rev, long validUntil) {
         return "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6300.0,\"netGex\":1.23E9,"
@@ -6652,7 +6659,7 @@ class FeedGatewayServiceTest {
         assertNotNull(ingestIbkrGex(service, gexRecord(5L, "SPX|20260804|6300", gen3, now), gen3, now));
         assertEquals(1, planeMap(service, "ibkrPreOpenGexCandidates").size());
         // The __revocation control arrives on the status stream (slice-1 ingest path).
-        seedIbkrStatus(service, "__revocation|2026-08-04|3", 9L, "{\"revoked\":true}");
+        seedIbkrStatus(service, "__revocation|20260804|3", 9L, "{\"revoked\":true}");
         assertTrue(planeMap(service, "ibkrPreOpenGexCandidates").isEmpty());
         // Stragglers of the revoked generation can never re-enter; a NEWER generation can.
         assertNull(ingestIbkrGex(service, gexRecord(6L, "SPX|20260804|6300", gen3, now), gen3, now));
@@ -6864,7 +6871,7 @@ class FeedGatewayServiceTest {
         assertNotNull(ingestIbkrGex(service, gexRecord(5L, "SPX|20260804|6300", gen1, now), gen1, now));
         assertEquals(1, planeMap(service, "ibkrPreOpenGexCandidates").size());
         // The generation control arrives on the status stream — no gen-2 value anywhere yet.
-        seedIbkrStatus(service, "__generation|2026-08-04|2", 9L, "{\"outputGeneration\":2}");
+        seedIbkrStatus(service, "__generation|20260804|2", 9L, "{\"outputGeneration\":2}");
         assertTrue(planeMap(service, "ibkrPreOpenGexCandidates").isEmpty(),
                 "superseded live candidate survived the __generation control");
         // A delayed gen-1 straggler is rejected on the control's authority alone.
@@ -6980,7 +6987,7 @@ class FeedGatewayServiceTest {
         long fence = now - 60_000L;
         List<String> sink = servingServiceWithFrozenProjection(service, fence, now);
         markRecovering(service, "stateCaughtUp");
-        seedIbkrStatus(service, "__revocation|2026-08-04|3", 9L, "{\"revoked\":true}");
+        seedIbkrStatus(service, "__revocation|20260804|3", 9L, "{\"revoked\":true}");
         assertTrue(planeMap(service, "ibkrPreOpenFrozenProjections").isEmpty());
         assertTrue(sink.stream().anyMatch(m -> m.contains("REVOKED")),
                 "revocation eviction lost during state recovery: " + sink);
@@ -7057,7 +7064,7 @@ class FeedGatewayServiceTest {
     @Test
     void sessionIdAndKeyReconciliationAreExactNotMerelyWellShaped() throws Exception {
         // Round-6 finding 4: text() trims before the regex, so a PADDED session id was accepted;
-        // the regex alone admits impossible dates like 2026-99-99; and key reconciliation compared
+        // the regex alone admits impossible dates like 20269999; and key reconciliation compared
         // only the first three components case-insensitively, so an over-long or mis-cased key
         // passed. All four are the same contract: EXACT, or fail closed.
         long now = System.currentTimeMillis();
@@ -7075,7 +7082,7 @@ class FeedGatewayServiceTest {
         // (b) impossible calendar date
         FeedGatewayService badDate = service();
         seedIbkrStatus(badDate, "SPX|20260804|6300", 1L, now - 10_000L, status);
-        String d = ibkrGexJson("IBKR_PREOPEN:2026-99-99", 3, 2, 7, fence);
+        String d = ibkrGexJson("IBKR_PREOPEN:20269999", 3, 2, 7, fence);
         assertNull(ingestIbkrGex(badDate, gexRecord(5L, "SPX|20260804|6300", d, now - 5_000L), d, now),
                 "the shape alone is not enough — the date must be real");
 
@@ -7090,6 +7097,56 @@ class FeedGatewayServiceTest {
         FeedGatewayService ok = service();
         seedIbkrStatus(ok, "SPX|20260804|6300", 1L, now - 10_000L, status);
         assertNotNull(ingestIbkrGex(ok, gexRecord(5L, "SPX|20260804|6300", j, now - 5_000L), j, now));
+    }
+
+    @Test
+    void theSessionIdContractIsTheProducersOwnFormat() throws Exception {
+        // 2026-09-08. The validator demanded IBKR_PREOPEN:<yyyy-MM-dd> while the producer has
+        // always written IBKR_PREOPEN:<yyyyMMdd>, so EVERY pre-open GEX record failed closed:
+        // measured on the running systems, dropped_sessioned dev 23,744 / prod 54,576 with
+        // candidates 0 and rejected 0 — nothing reached arbitration at all. The old suite could
+        // not see it because every fixture, on BOTH planes, used the dashed spelling: the tests
+        // agreed with the validator instead of with the wire.
+        //
+        // So this test does not restate the literal. It BUILDS the session id the way
+        // IbkrPreOpenService builds it — LocalDate.format(BASIC_ISO_DATE) — and then drives the
+        // real ingest path with it. If either side's format moves, this fails.
+        long now = System.currentTimeMillis();
+        long fence = now + 60_000L;
+        java.time.LocalDate tradeDate = java.time.LocalDate.of(2026, 8, 4);
+        String producerTradeDate =
+                tradeDate.format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
+        String producerSessionId = "IBKR_PREOPEN:" + producerTradeDate;
+
+        assertEquals(IBKR_SESSION, producerSessionId,
+                "the fixture must BE the producer's string, not a hand-typed lookalike");
+
+        String status = "{\"state\":\"FRESH\",\"sessionId\":\"" + producerSessionId
+                + "\",\"outputGeneration\":3,\"baselineEpoch\":2,\"recordRevision\":7}";
+
+        // (a) The producer's own spelling is ADMITTED — the case that was 100% broken in prod.
+        FeedGatewayService real = service();
+        seedIbkrStatus(real, "SPX|20260804|6300", 1L, now - 10_000L, status);
+        String producerJson = ibkrGexJson(producerSessionId, 3, 2, 7, fence);
+        assertNotNull(
+                ingestIbkrGex(real, gexRecord(5L, "SPX|20260804|6300", producerJson, now - 5_000L),
+                        producerJson, now),
+                "the session id the producer actually writes must be admitted");
+
+        // (b) The dashed spelling is REJECTED. One canonical form is load-bearing: the control
+        // plane's __revocation|<D>|<gen> and __generation|<D>|<gen> keys carry the producer's
+        // BASIC_ISO <D>, and the value plane keys the same maps through
+        // ibkrPreOpenSessionDate(sessionId). Two accepted spellings of one date would key one
+        // session twice, and revocation would silently stop reaching half its candidates.
+        FeedGatewayService dashed = service();
+        String dashedSessionId = "IBKR_PREOPEN:" + tradeDate; // LocalDate.toString() == ISO_LOCAL_DATE
+        seedIbkrStatus(dashed, "SPX|20260804|6300", 1L, now - 10_000L,
+                status.replace(producerSessionId, dashedSessionId));
+        String dashedJson = ibkrGexJson(dashedSessionId, 3, 2, 7, fence);
+        assertNull(
+                ingestIbkrGex(dashed, gexRecord(5L, "SPX|20260804|6300", dashedJson, now - 5_000L),
+                        dashedJson, now),
+                "the dashed spelling appears nowhere on the wire and must not be a second key");
     }
 
     @Test

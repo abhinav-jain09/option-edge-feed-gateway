@@ -9230,20 +9230,38 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** {@code IBKR_PREOPEN:<D>} -> {@code <D>} (the {@code __revocation|<D>|<gen>} key's date). */
-    /** The pinned session-id shape: IBKR_PREOPEN:&lt;yyyy-MM-dd&gt;. Anything else fails closed. */
+    /**
+     * The pinned session-id shape: IBKR_PREOPEN:&lt;yyyyMMdd&gt;. Anything else fails closed.
+     *
+     * <p>BASIC_ISO, not the dashed ISO_LOCAL_DATE this once demanded. The producer
+     * ({@code IbkrPreOpenService}) builds its trade date with
+     * {@code DateTimeFormatter.BASIC_ISO_DATE} and stamps {@code "IBKR_PREOPEN:" + tradeDate}, so
+     * the only session id that ever reaches this topic looks like {@code IBKR_PREOPEN:20260908}.
+     * Demanding {@code 2026-09-08} rejected 100% of pre-open GEX on both environments
+     * (2026-09-08: dropped_sessioned dev 23,744 / prod 54,576, candidates 0, rejected 0 — nothing
+     * survived to arbitration).
+     *
+     * <p>The dashed form was never merely "the other spelling", it was UNJOINABLE: the status
+     * plane's controls arrive as {@code __revocation|<D>|<gen>} with the producer's BASIC_ISO
+     * {@code <D>}, and {@link #ibkrPreOpenSessionDate} feeds the SAME map keys from the value
+     * plane. A dashed value-side date could not have matched a control's date even once, so
+     * revocation and generation ordering were dead too. One canonical spelling is load-bearing:
+     * accepting both would key the same session twice.
+     */
     private static final java.util.regex.Pattern IBKR_PREOPEN_SESSION_ID =
-            java.util.regex.Pattern.compile("IBKR_PREOPEN:\\d{4}-\\d{2}-\\d{2}");
+            java.util.regex.Pattern.compile("IBKR_PREOPEN:\\d{8}");
 
     /**
-     * The pinned session id: IBKR_PREOPEN:&lt;yyyy-MM-dd&gt; where the date is a REAL calendar date.
-     * The regex alone admits 2026-99-99, which is not a session and must not key a plane.
+     * The pinned session id: IBKR_PREOPEN:&lt;yyyyMMdd&gt; where the date is a REAL calendar date.
+     * The regex alone admits 20269999, which is not a session and must not key a plane.
      */
     private static boolean isIbkrPreOpenSessionId(String sessionId) {
         if (!IBKR_PREOPEN_SESSION_ID.matcher(sessionId).matches()) {
             return false;
         }
         try {
-            java.time.LocalDate.parse(sessionId.substring("IBKR_PREOPEN:".length()));
+            java.time.LocalDate.parse(sessionId.substring("IBKR_PREOPEN:".length()),
+                    java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
             return true;
         } catch (java.time.format.DateTimeParseException e) {
             return false;
