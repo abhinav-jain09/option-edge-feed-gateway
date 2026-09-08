@@ -161,6 +161,7 @@ public class FeedGatewayService implements ReplayRunner {
             "direction",
             "direction-push",
             "direction-scorecard",
+            "direction-progress",
             "vol-premium-ivrv",
             "indicators",
             "tapeZones",
@@ -439,6 +440,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> directionPush = new ConcurrentHashMap<>();
     private final Map<String, String> directionAlert = new ConcurrentHashMap<>();
     private final Map<String, String> directionScorecard = new ConcurrentHashMap<>();
+    // A5.7: the calibration progress record, one per environment. Produced once an evening, not per tick.
+    private final Map<String, String> directionProgress = new ConcurrentHashMap<>();
     // Indicator CURRENT snapshots: ONE per canonical symbol (ES|SPX), per-symbol
     // cache + (runId, revision) supersession (rev 14 §6.9/§8): a new runId is
     // accepted in arrival(=offset) order on the single-partition compacted topic and
@@ -1660,6 +1663,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"directionPush\":" + directionPush.size() + ","
                 + "\"directionAlert\":" + directionAlert.size() + ","
                 + "\"directionScorecard\":" + directionScorecard.size() + ","
+                + "\"directionProgress\":" + directionProgress.size() + ","
                 // Pre-open IBKR plane counters appear ONLY with the feature flag ON: O7
                 // (feature-off identity) pins every OFF-state observable — this /health payload
                 // included — equivalent to a build without the feature (round-2 finding 5).
@@ -1842,6 +1846,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_direction_scorecard Cached Candle Direction scorecards.\n"
                 + "# TYPE options_edge_feed_gateway_direction_scorecard gauge\n"
                 + "options_edge_feed_gateway_direction_scorecard " + directionScorecard.size() + "\n"
+                + "options_edge_feed_gateway_direction_progress " + directionProgress.size() + "\n"
                 + "# HELP options_edge_feed_gateway_strike_sr Cached unified support/resistance level count.\n"
                 + "# TYPE options_edge_feed_gateway_strike_sr gauge\n"
                 + "options_edge_feed_gateway_strike_sr " + strikeSr.size() + "\n"
@@ -2203,6 +2208,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.directionPushTopic(), new TopicBinding("DATABENTO", "direction-push"));
         topicEvents.put(settings.directionAlertTopic(), new TopicBinding("DATABENTO", "direction-alert"));
         topicEvents.put(settings.directionScorecardTopic(), new TopicBinding("DATABENTO", "direction-scorecard"));
+        topicEvents.put(settings.directionProgressTopic(), new TopicBinding("DATABENTO", "direction-progress"));
         // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
         // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
         for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
@@ -2342,6 +2348,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.directionPushTopic(), new TopicBinding("DATABENTO", "direction-push"));
         topicEvents.put(settings.directionAlertTopic(), new TopicBinding("DATABENTO", "direction-alert"));
         topicEvents.put(settings.directionScorecardTopic(), new TopicBinding("DATABENTO", "direction-scorecard"));
+        topicEvents.put(settings.directionProgressTopic(), new TopicBinding("DATABENTO", "direction-progress"));
         // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
         // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
         for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
@@ -3420,7 +3427,8 @@ public class FeedGatewayService implements ReplayRunner {
                         continue;
                     }
                     if ("direction-push".equals(binding.event()) || "direction-alert".equals(binding.event())
-                            || "direction-scorecard".equals(binding.event())) {
+                            || "direction-scorecard".equals(binding.event())
+                            || "direction-progress".equals(binding.event())) {
                         // A4 push/alert/scorecard: the same GLOBAL advisory class; freshness fail-closed on their own windows
                         if (cacheKey != null && cacheCaughtUpFlag.get()) {
                             broadcast(binding.event(), forwardJson);
@@ -4320,7 +4328,8 @@ public class FeedGatewayService implements ReplayRunner {
                     replayDirectionCached(client);
                 }
             }
-            if (events.contains("direction-push") || events.contains("direction-alert") || events.contains("direction-scorecard")) {
+            if (events.contains("direction-push") || events.contains("direction-alert")
+                    || events.contains("direction-scorecard") || events.contains("direction-progress")) {
                 for (WebSocketSession client : clients) {
                     replayDirectionPushCached(client);
                 }
@@ -5348,6 +5357,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = directionCacheKey(json, key);
         } else if ("direction-alert".equals(event)) {
             key = directionAlertCacheKey(json, key);
+        } else if ("direction-progress".equals(event)) {
+            key = directionProgressCacheKey(json, key);
         } else if ("spot-vol-regime".equals(event)) {
             key = spotVolRegimeCacheKey(json, key);
         } else if ("vol-premium-ivrv".equals(event)) {
@@ -5661,6 +5672,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 directionScorecard.put(key, json);
+                return key;
+            }
+            case "direction-progress" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                directionProgress.put(key, json);
                 return key;
             }
             case "spot-vol-regime" -> {
@@ -6592,6 +6609,10 @@ public class FeedGatewayService implements ReplayRunner {
         if ("direction-scorecard".equals(event)) {
             return CachePolicy.expiring(settings.directionScorecardTtlMs());
         }
+        if ("direction-progress".equals(event)) {
+            // One record an evening, so the window is a DAY rather than a tick window (A5.7).
+            return CachePolicy.expiring(settings.directionProgressTtlMs());
+        }
         if ("spot-vol-regime".equals(event)) {
             // Spot-vol regime CURRENT snapshot: SHORT window (default 5 min, the greek-move-auth /
             // es-open-direction STATUS freshness class) — a regime is only meaningful while CURRENT.
@@ -6838,6 +6859,9 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if ("direction".equals(event) || "direction-scorecard".equals(event)) {
             return directionTimestamp(json);
+        }
+        if ("direction-progress".equals(event)) {
+            return directionProgressTimestamp(json);
         }
         if ("direction-push".equals(event) || "direction-alert".equals(event)) {
             return directionPushTimestamp(json);   // both stamps: an alert with a fresh publish stamp on an old event is a backlog (r11 #1)
@@ -7163,6 +7187,8 @@ public class FeedGatewayService implements ReplayRunner {
             directionAlert.remove(versionKey.substring("direction-alert:".length()));   // an expired alert leaves the cache (r11 #7)
         } else if (versionKey.startsWith("direction-scorecard:")) {
             directionScorecard.remove(versionKey.substring("direction-scorecard:".length()));
+        } else if (versionKey.startsWith("direction-progress:")) {
+            directionProgress.remove(versionKey.substring("direction-progress:".length()));
         } else if (versionKey.startsWith("vol-premium-ivrv:")) {
             String ivrvKey = versionKey.substring("vol-premium-ivrv:".length());
             volPremiumIvrv.remove(ivrvKey);
@@ -7983,6 +8009,13 @@ public class FeedGatewayService implements ReplayRunner {
         for (Map.Entry<String, String> entry : directionScorecard.entrySet()) {
             if (entry.getValue() != null && !entry.getValue().isBlank() && isCacheFresh("direction-scorecard:" + entry.getKey(), nowMs)) {
                 send(session, "direction-scorecard", entry.getValue());
+            }
+        }
+        // The progress record IS replayed, unlike an alert: it is a standing statement about the corpus,
+        // not a spoken event, and a client that connects at noon has no other way to learn last night's.
+        for (Map.Entry<String, String> entry : directionProgress.entrySet()) {
+            if (entry.getValue() != null && !entry.getValue().isBlank() && isCacheFresh("direction-progress:" + entry.getKey(), nowMs)) {
+                send(session, "direction-progress", entry.getValue());
             }
         }
         // alerts are NOT replayed (A4.10): an alert is a spoken event, and a replayed one could be spoken again by a late
@@ -10038,6 +10071,43 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** One current decision per symbol (the producer keys its compacted topic by symbol; no expiry in the record). */
+    /**
+     * A5.7: one progress record per ENVIRONMENT, which is how the reporter keys it. Not per symbol —
+     * the record is a statement about a corpus, and a corpus belongs to an environment.
+     */
+    private String directionProgressCacheKey(String json, String fallback) {
+        try {
+            String env = text(mapper.readTree(json), "env").toUpperCase();
+            if (!env.isBlank()) {
+                return env;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Malformed payloads expire immediately via directionProgressTimestamp.
+        }
+        return fallback;
+    }
+
+    /**
+     * Freshness for a record produced once an evening. {@code generatedAt} is an ISO-8601 UTC instant,
+     * not an epoch — a record without a parseable one fails CLOSED rather than defaulting to now, or a
+     * malformed payload would read as the freshest thing the panel has.
+     */
+    private long directionProgressTimestamp(String json) {
+        try {
+            String at = text(mapper.readTree(json), "generatedAt");
+            if (at.isBlank()) {
+                return -1L;
+            }
+            long ms = java.time.Instant.parse(at).toEpochMilli();
+            if (ms > System.currentTimeMillis()) {
+                return -1L;   // a FUTURE stamp is never fresh — fail closed, never cache or replay
+            }
+            return ms;
+        } catch (JsonProcessingException | java.time.format.DateTimeParseException ignored) {
+            return -1L;
+        }
+    }
+
     private String directionCacheKey(String json, String fallback) {
         try {
             String symbol = text(mapper.readTree(json), "symbol").toUpperCase();
@@ -12462,6 +12532,8 @@ public class FeedGatewayService implements ReplayRunner {
             "direction",
             // A4 push state / alert / scorecard: same class.
             "direction-push", "direction-alert", "direction-scorecard",
+            // A5.7 calibration progress: same class again — one statement about the corpus, for everyone.
+            "direction-progress",
             // SPX Auction Desk minute records: ES-global, no option-expiry identity — the same
             // allowlist rule as es-cvd, or per-session (auth) mode drops every frame as non-routable.
             "es-auction");
@@ -12566,6 +12638,13 @@ public class FeedGatewayService implements ReplayRunner {
         try {
             JsonNode root = mapper.readTree(json);
             String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
+            if ("direction-progress".equals(event)) {
+                // A5.7: one report per ENVIRONMENT. The default key is event|symbol|expiry|strike and a
+                // progress record has no symbol, so both environments collapsed to
+                // "direction-progress||||" and a latest-wins queue could replace PROD's report with
+                // DEV's for a slow or joining client (r8 #9). The identity is the environment.
+                return event + "|" + root.path("env").asText("").toUpperCase();
+            }
             if ("indicators".equals(event)) {
                 // r3 finding 3: the frozen key is literally `indicators|symbol` —
                 // additive fields must never split the coalescing identity.
