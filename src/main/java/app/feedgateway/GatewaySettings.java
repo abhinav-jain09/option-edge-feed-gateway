@@ -276,6 +276,29 @@ public final class GatewaySettings {
     }
 
     /**
+     * SPX Auction Desk minute records (JSON, key {@code tradeDate|HH:mm}; one record per RTH minute,
+     * re-keyed corrections carry a higher {@code correctionRev}). Forwarded VERBATIM as the standalone
+     * {@code es-auction} event and held in a keyed minute view for the connect backfill.
+     */
+    public String esAuctionTopic() {
+        return value("KAFKA_ES_AUCTION_TOPIC", "es.futures.auction");
+    }
+
+    /** Opt-in for the same reason as es-cvd: the ES-only topic does not exist on every cluster. */
+    public boolean esAuctionEnabled() {
+        return boolValue("GATEWAY_ES_AUCTION_ENABLED", false);
+    }
+
+    /**
+     * How far back the CACHE consumer replays the es-auction topic on (re)start to rebuild the keyed
+     * minute view (current + previous trade date). Default 7 days = the topic's retention, so the
+     * previous trade date is recovered across any weekend/holiday gap; NOT the generic 15-min TTL.
+     */
+    public long esAuctionSeekBackMs() {
+        return longValue("GATEWAY_ES_AUCTION_SEEK_BACK_MS", 604_800_000L, 0L);
+    }
+
+    /**
      * U16: SPX-translated CVD structure levels from es-spx-align (JSON, compacted, single
      * partition, transactional producer — read_committed everywhere). OFF by default: the flag is
      * the LAST rollout step (ES-CVD-SPX-LEVELS-DESIGN.md CL-R11) and also the paging-alert gate.
