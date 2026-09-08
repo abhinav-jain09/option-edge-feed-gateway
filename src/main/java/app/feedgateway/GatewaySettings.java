@@ -975,6 +975,27 @@ public final class GatewaySettings {
         return "true".equalsIgnoreCase(value("GATEWAY_IBKR_PREOPEN_ENABLED", "false"));
     }
 
+    /**
+     * Kill switch for the pre-open GEX VALUE plane only (slice 2's {@code interceptSharedGexRecord}).
+     * The slice-1 status plane is unaffected and keeps flowing while this is false.
+     *
+     * <p>Why it exists (2026-09-08): slice 2 diverts every IBKR_PREOPEN value off the ordinary
+     * {@code gex-by-strike} delivery and publishes it as {@code ibkr-preopen-gex} instead. No web
+     * client consumes that event — the string appears zero times in options-edge-web main — so
+     * since slice 2 shipped, the pre-open board has had a status plane and no numbers: measured on
+     * dev, the browser reads the row as numberless (preOpenRowNumberless=true).
+     *
+     * <p>With this false the gateway behaves as it did before slice 2: pre-open values reach the
+     * browser as ordinary gex-by-strike rows, which is the delivery the UI is actually built on.
+     * Set it back to true once the web grows an {@code ibkr-preopen-gex} consumer — that is the
+     * real fix, and it is the one that keeps the arbitration guarantees AND honest provenance.
+     *
+     * <p>Default TRUE: nothing changes for anyone who does not deliberately turn it off.
+     */
+    public boolean ibkrPreOpenGexArbitrationEnabled() {
+        return boolValue("GATEWAY_IBKR_PREOPEN_GEX_ARBITRATION_ENABLED", true);
+    }
+
     public String ibkrPreOpenStatusTopic() {
         return value("KAFKA_IBKR_GEX_STATUS_TOPIC", "options.ibkr.gex.status");
     }

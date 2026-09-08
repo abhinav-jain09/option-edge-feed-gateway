@@ -6333,6 +6333,49 @@ private static final String IBKR_SESSION = "IBKR_PREOPEN:20260804";
     }
 
     @Test
+    void theValuePlaneKillSwitchHandsPreOpenRecordsBackToTheOrdinaryPipeline() throws Exception {
+        // 2026-09-08. Slice 2 diverts every IBKR_PREOPEN value off gex-by-strike and publishes it
+        // as "ibkr-preopen-gex". No web client consumes that event — the string appears zero times
+        // in options-edge-web main — so since slice 2 shipped the pre-open board has had a status
+        // plane and no numbers (measured on dev: the browser reads the row as numberless).
+        // The switch restores the pre-slice-2 delivery until the web grows that consumer.
+        //
+        // Asserted through interceptSharedGexRecord itself — the ONE chokepoint both the live and
+        // the cache consumer call — so this covers the wiring, not just the settings getter.
+        long now = System.currentTimeMillis();
+        String json = ibkrGexJson(IBKR_SESSION, 3, 2, 7, now + 600_000L);
+
+        // Default ON: unchanged, the plane still owns the record.
+        FeedGatewayService on = service();
+        assertTrue(interceptSharedGex(on, gexRecord(5L, "SPX|20260804|6300", json, now),
+                        json, false, now),
+                "with the switch at its default the pre-open plane still claims the record");
+
+        System.setProperty("GATEWAY_IBKR_PREOPEN_GEX_ARBITRATION_ENABLED", "false");
+        try {
+            FeedGatewayService off = service();
+            assertFalse(interceptSharedGex(off, gexRecord(5L, "SPX|20260804|6300", json, now),
+                            json, false, now),
+                    "with the value plane off the record must go back to the ordinary pipeline");
+            assertEquals(0L, planeCounter(off, "ibkrPreOpenGexDroppedSessioned"),
+                    "handing a record back is not a fail-closed drop and must not be counted as one");
+            assertTrue(planeMap(off, "ibkrPreOpenGexCandidates").isEmpty(),
+                    "the plane is OFF: it must not accumulate candidates either");
+
+            // A conflicting PREOPEN tuple is handed back too — the plane is off, so it has no
+            // opinion at all. It is the pre-slice-2 world, not a half-on one.
+            String preopen = "{\"symbol\":\"SPX\",\"expiry\":\"20260804\",\"strike\":6300.0,"
+                    + "\"source\":\"PREOPEN\",\"timeframe\":\"PREOPEN\","
+                    + "\"sessionId\":\"PREOPEN:20260804\"}";
+            assertFalse(interceptSharedGex(off, gexRecord(6L, "SPX|20260804|6300", preopen, now),
+                            preopen, false, now),
+                    "with the plane off nothing is arbitrated, including conflicting tuples");
+        } finally {
+            System.clearProperty("GATEWAY_IBKR_PREOPEN_GEX_ARBITRATION_ENABLED");
+        }
+    }
+
+    @Test
     void ibkrPreOpenValueNeverEntersDatabentoPlaneAndIsNeverRelabelled() throws Exception {
         FeedGatewayService service = service();
         long now = System.currentTimeMillis();
