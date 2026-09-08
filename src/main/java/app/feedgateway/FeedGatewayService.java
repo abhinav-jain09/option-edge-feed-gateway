@@ -2608,9 +2608,12 @@ public class FeedGatewayService implements ReplayRunner {
         // position()), which would withhold readiness for that source forever.
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
             List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
-            // The incarnation is named BEFORE the hydration reads a single record, so a recreation DURING
-            // hydration is seen: every later step compares against this id (round 25).
-            bindEsAuctionIncarnationOrReplay(partitions);
+            /* VERIFIED, not merely bound, before the hydration reads a single record. This runs on every
+               cache-consumer attempt including RETRIES, and an id from a previous attempt is already on
+               record: a topic recreated while that consumer was down would otherwise be merged into the old
+               view, with the old handoff still frozen, until the 30 s cadence noticed (round 29). Same call
+               as the late-discovery path — there is only one rule. */
+            verifyOrBindEsAuctionIncarnation(partitions);
             seekToCacheWindow(consumer, partitions, topicEvents);
             // Bootstrap gets the BOOTSTRAP budget: a broker that answers in 10s is slow, not broken, and
             // must bootstrap rather than crash-loop. The 2s refresh budget applies only inside the poll
