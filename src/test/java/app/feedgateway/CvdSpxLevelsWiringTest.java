@@ -329,8 +329,11 @@ class CvdSpxLevelsWiringTest {
         int addClient = source.indexOf("public void addClient(WebSocketSession session)");
         int replayEnd = source.indexOf("if (perSessionRouting())", addClient);
         String head = source.substring(addClient, replayEnd);
-        assertTrue(head.contains("esCvdSpxLevelsEnabled()") && head.contains("send(session, \"cvd-hello\""),
-                "the hello is sent when EITHER CVD flag is on, for both routing modes");
+        assertTrue(head.contains("sendsCvdHello()") && head.contains("send(session, \"cvd-hello\""),
+                "the hello send is guarded by the ONE predicate, for both routing modes");
+        int pred = source.indexOf("boolean sendsCvdHello() {");
+        assertTrue(pred > 0 && source.substring(pred, source.indexOf("\n    }", pred)).contains("esCvdSpxLevelsEnabled()"),
+                "and that predicate still admits the SPX-levels flag");
         assertFalse(head.contains("send(session, \"es-cvd-spx-levels\""),
                 "a separate connect frame would reintroduce the ambiguity G19 forbids");
     }

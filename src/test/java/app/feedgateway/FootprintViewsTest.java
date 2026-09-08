@@ -65,6 +65,31 @@ class FootprintViewsTest {
                 FootprintViews.outcomeKey("1m", 5, "ES.v.0|1m|1|BUYERS|LEVEL|650000|650000"));
     }
 
+    /** G-R5: an identity resolves exactly once upstream, so a redelivery must OVERWRITE in place. */
+    @Test void anOutcomeRedeliveryOverwritesItsKeyInPlace() {
+        FootprintViews v = views();
+        String id = "ES.v.0|1m|1|BUYERS|LEVEL|650000|650000";
+        assertEquals(FootprintViews.Reason.ADMITTED, v.admitOutcome(outcome("2026-08-14", "1m", 5, id, "first")).reason());
+        assertEquals(FootprintViews.Reason.ADMITTED, v.admitOutcome(outcome("2026-08-14", "1m", 5, id, "second")).reason());
+        assertEquals(1, v.outcomesInView(), "one identity, one row");
+        assertTrue(v.outcomesPage("1m", Long.MAX_VALUE, "", 10, "").records().get(0).contains("\"tag\":\"second\""),
+                "the redelivery is the row that survives");
+    }
+
+    /** G-R10: no admission failure escapes the consumer loop — a null payload is a counted drop. */
+    @Test void aNullPayloadIsARefusalNotAThrow() {
+        FootprintViews v = views();
+        // State the clause the way it is written: the call must RETURN. Letting the throw propagate
+        // would also fail this test, but as an ERROR — and an error under the right test's name is
+        // not evidence of anything, since a broken fixture produces the same shape.
+        FootprintViews.Admission bar = assertDoesNotThrow(() -> v.admitBar(null), "a null bar payload must not throw");
+        FootprintViews.Admission out = assertDoesNotThrow(() -> v.admitOutcome(null), "a null outcome payload must not throw");
+        assertEquals(FootprintViews.Reason.SHAPE, bar.reason());
+        assertEquals(FootprintViews.Reason.SHAPE, out.reason());
+        assertEquals(0, v.barsInView());
+        assertEquals(0, v.outcomesInView());
+    }
+
     // ---- G-R4 rollover: one coordinator, both views, strict dates ------------------------------
 
     @Test void aNewerDateRollsBothViewsAnOlderDateIsDroppedAndEqualUpserts() {
