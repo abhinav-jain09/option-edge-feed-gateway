@@ -3261,6 +3261,59 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void calibrationProgressIsKeyedByEnvironment_repliedToJoiners_andFailsClosedOnAStampItCannotRead() throws Exception {
+        // A5.7: the progress record is the panel's ONLY view of how far calibration has got, and it is
+        // produced once an evening rather than per tick — so its window is a day, it is keyed by
+        // ENVIRONMENT (a corpus belongs to one), and unlike an alert it IS replayed: a client that
+        // connects at noon has no other way to learn last night's report.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("context-tape.direction.progress", settings.directionProgressTopic());
+        assertEquals(93_600_000L, settings.directionProgressTtlMs(), "26 h: one report an evening, absent within a day if one is missed");
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("direction-progress"));
+
+        long now = System.currentTimeMillis();
+        String at = java.time.Instant.ofEpochMilli(now - 3_600_000L).toString();
+        String progress = "{\"env\":\"prod\",\"generatedAt\":\"" + at + "\",\"actionable\":false,"
+                + "\"slice\":\"COMMISSIONING_SHADOW\",\"reportDate\":\"2026-09-08\","
+                + "\"cohorts\":[{\"phase\":\"CALIBRATION\",\"evaluationDecision\":\"NOT_RUN\"}]}";
+        ConsumerRecord<String, String> rec = recordAt(settings.directionProgressTopic(), 0, 1L, "prod", progress, now);
+        assertEquals(now - 3_600_000L, eventCacheTimestamp(service, "direction-progress", rec),
+                "freshness tracks generatedAt, which is an ISO instant rather than an epoch");
+        assertEquals("DATABENTO|PROD", updateCache(service, topicBinding("DATABENTO", "direction-progress"), rec, progress),
+                "one record per ENVIRONMENT — not per symbol");
+        assertFalse(isExpired(service, "direction-progress", now - 20L * 3_600_000L, now), "last night's report is still current");
+        assertTrue(isExpired(service, "direction-progress", now - 27L * 3_600_000L, now), "a report older than a day is ABSENT, not stale-but-shown");
+
+        // a stamp that cannot be read fails CLOSED — defaulting to now would make a malformed payload
+        // the freshest thing the panel has
+        for (String broken : java.util.List.of("{\"env\":\"prod\"}",
+                                               "{\"env\":\"prod\",\"generatedAt\":\"not-an-instant\"}",
+                                               "{\"env\":\"prod\",\"generatedAt\":\""
+                                                   + java.time.Instant.ofEpochMilli(now + 600_000L) + "\"}")) {
+            assertEquals(-1L, eventCacheTimestamp(service, "direction-progress",
+                    recordAt(settings.directionProgressTopic(), 0, 9L, "prod", broken, now)),
+                    "a missing, unparseable or FUTURE generatedAt must fail closed: " + broken);
+        }
+
+        for (String path : java.util.List.of("replayDirectionPushCached", "replayCachedToSocket")) {
+            List<String> sink = new ArrayList<>();
+            Method replay = FeedGatewayService.class.getDeclaredMethod(path, WebSocketSession.class);
+            replay.setAccessible(true);
+            replay.invoke(service, recordingSession(sink));
+            assertTrue(sink.stream().anyMatch(m -> m.contains("\"type\":\"direction-progress\"")),
+                    path + " must deliver the progress record to a joining client; got: " + sink);
+        }
+
+        assertTrue(service.healthJson().contains("\"directionProgress\":1"), service.healthJson());
+        Method remove = FeedGatewayService.class.getDeclaredMethod("removeCacheEntry", String.class);
+        remove.setAccessible(true);
+        remove.invoke(service, "direction-progress:DATABENTO|PROD");
+        assertTrue(service.healthJson().contains("\"directionProgress\":0"),
+                "expiry must evict the payload, not only its clock: " + service.healthJson());
+    }
+
+    @Test
     void directionAlertsAreNeverReplayedToAJoiningClient_butThePushStateIs() throws Exception {
         // A4.10: an alert is a SPOKEN event. A late joiner must see the push state and the scorecard, and must NOT be
         // handed alerts it never lived through — that is what would let a browser speak history as if it were now.

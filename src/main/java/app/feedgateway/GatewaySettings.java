@@ -1308,6 +1308,27 @@ public final class GatewaySettings {
     }
 
     /**
+     * A5.7: the calibration PROGRESS record — one per environment, written and published by
+     * {@code oe-calibration-progress.sh} on the archive host at 20:30 ET and again at 21:00 ET. The
+     * panel has no other way to see how far calibration has got, since the gateway otherwise knows
+     * only push, alert and scorecard.
+     */
+    public String directionProgressTopic() {
+        return value("KAFKA_DIRECTION_PROGRESS_TOPIC", "context-tape.direction.progress");
+    }
+
+    /**
+     * 26 hours, and the number is the point: this record is produced ONCE an evening, so anything
+     * shorter would make last night's report read as absent all day, and anything much longer would
+     * let a missed evening keep showing a stale one as current. A report that stops arriving must go
+     * ABSENT on the panel within a day — that is exactly the condition the independent watchdog exists
+     * to catch, and the panel should not disagree with it.
+     */
+    public long directionProgressTtlMs() {
+        return longValue("GATEWAY_DIRECTION_PROGRESS_TTL_MS", 93_600_000L, 0L);
+    }
+
+    /**
      * Compacted IV-vs-realised topic of the standalone vol-premium service (JSON
      * {@code IvRvReading} &mdash; see {@link VolPremiumTopics#IVRV}). One record per
      * {@code SYMBOL|sessionDate}, published every frame. Resolved through the platform topic-prefix
