@@ -14,7 +14,7 @@ how a campaign starts lying:
 A clean baseline is proven before any mutation is applied — a campaign against an already-red suite
 would report every clause as pinned.
 """
-import json, subprocess, sys, os, shutil, re, time
+import json, subprocess, sys, os, shutil, re, time, hashlib
 
 def failing_tests(out, kind):
     if kind == 'maven':
@@ -40,15 +40,33 @@ def run(cmd, cwd):
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=3600)
     return p.returncode, p.stdout + p.stderr
 
+def sha(text):
+    return hashlib.sha256(text.encode('utf-8', 'replace')).hexdigest()
+
+def head_commit(root):
+    rc, out = run(['git', 'rev-parse', 'HEAD'], root)
+    return out.strip() if rc == 0 else None
+
+def tree_dirty(root):
+    rc, out = run(['git', 'status', '--porcelain'], root)
+    return [l for l in out.split('\n') if l.strip()]
+
 def main():
     spec = json.load(open(sys.argv[1]))
     outp = sys.argv[2]
     root, cmd, kind = spec['root'], spec['command'], spec['kind']
     res = json.load(open(outp)) if os.path.exists(outp) else {}
 
+    dirty = tree_dirty(root)
+    if dirty:
+        print("TREE IS DIRTY — a campaign must run against a committed tree, or its record names a state"); 
+        print("nobody can return to:"); [print("  ", d) for d in dirty[:10]]; sys.exit(3)
+    commit = head_commit(root)
     rc, out = run(cmd, root)
     if rc != 0:
         print("BASELINE IS RED — refusing to run a campaign against a failing suite"); print(out[-3000:]); sys.exit(2)
+    baseline = {'commit': commit, 'command': ' '.join(cmd), 'returnCode': rc,
+                'outputSha256': sha(out), 'outputTail': out[-1500:]}
     base_tests = re.search(r'Tests run: (\d+)', out) or re.search(r'# pass (\d+)', out)
     print(f"baseline GREEN ({base_tests.group(1) if base_tests else '?'} tests) — {' '.join(cmd)}\n")
 
@@ -97,10 +115,17 @@ def main():
                 stack.pop()
 
         shutil.copy(f, f + '.bak')
-        open(f, 'w').write(src[:pos] + m['new'] + src[pos+len(m['old']):])
+        mutated = src[:pos] + m['new'] + src[pos+len(m['old']):]
         t0 = time.time()
-        rc, out = run(cmd, root)
-        shutil.move(f + '.bak', f); os.utime(f, None)   # mv restores the ORIGINAL mtime; Maven would skip it
+        try:
+            open(f, 'w').write(mutated)
+            rc, out = run(cmd, root)
+        finally:
+            # UNCONDITIONAL. A timeout, an interrupt or a crash between the write and the restore
+            # would otherwise leave the tree mutated and poison every later mutation AND the baseline.
+            shutil.move(f + '.bak', f)
+            os.utime(f, None)   # mv restores the ORIGINAL mtime; Maven's incremental compiler would skip it
+        still_dirty = tree_dirty(root)
         failed = failing_tests(out, kind)
         if build_failed(out, kind) and not failed:
             status = 'BUILD-FAILED'
@@ -111,10 +136,16 @@ def main():
         else:
             status = 'SURVIVED'
         res[k] = {'status': status, 'clause': m.get('clause',''), 'requirement': m.get('requirement', k.split()[0]),
+                  'documentText': m.get('documentText'),
                   'file': m['file'], 'occurrence': occ, 'occurrencesInFile': n, 'line': line,
                   'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': failed[:4],
                   'seconds': round(time.time()-t0, 1),
-                  'patch': {'old': m['old'], 'new': m['new']}}
+                  'patch': {'old': m['old'], 'new': m['new']},
+                  'evidence': {'repoCommit': commit, 'returnCode': rc,
+                               'mutatedFileSha256': sha(mutated), 'originalFileSha256': sha(src),
+                               'outputSha256': sha(out), 'outputTail': out[-1200:],
+                               'treeRestoredClean': not still_dirty},
+                  'baseline': baseline}
         print(f"  {k:<40} {status:<13} {(failed[0][:52] if failed else '')}")
         json.dump(res, open(outp,'w'), indent=1)
     from collections import Counter
