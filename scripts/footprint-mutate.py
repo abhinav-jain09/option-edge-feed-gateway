@@ -21,7 +21,13 @@ def failure_lines(out, kind):
     A tail of the output does not: Maven prints its failures well before the build summary, so the
     last N characters of a run contain none of the names the harness reported."""
     pat = r'^\[ERROR\]\s+[\w.$]+\.[\w$]+(?::\d+|\s+--|\s).*$' if kind == 'maven' else r'^not ok \d+ - .*$'
-    return [l.rstrip()[:400] for l in re.findall(pat, out, re.M)][:12]
+    lines = [l.rstrip()[:400] for l in re.findall(pat, out, re.M)]
+    # The cap must not cut the record loose from its own names: a truncated list left a record naming
+    # four failing tests whose lines were not in it, which a reader cannot check and a generator that
+    # correlates the two will (correctly) refuse.
+    if kind != 'maven':
+        return lines[:40]
+    return lines[:40]
 
 def assertion_failures(out, kind):
     """Failures that are an ASSERTION, not an infrastructure error.
@@ -262,7 +268,8 @@ def main():
         res[k] = {'status': status, 'clause': m.get('clause',''), 'requirement': m.get('requirement', k.split()[0]),
                   'documentText': m.get('documentText'),
                   'file': m['file'], 'occurrence': occ, 'occurrencesInFile': n, 'line': line,
-                  'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': asserted[:4] or failed[:4], 'assertionFailures': asserted[:4], 'anyFailures': failed[:4],
+                  'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': (asserted or failed)[:4], 'assertionFailures': [n for n in asserted if any(n.split('.')[-1] in l for l in failure_lines(out, kind))][:8],
+                  'anyFailures': failed[:8],
                   'killedByThrow': (m.get('killedByThrow') if throw_kill_ok else None),
                   'seconds': round(time.time()-t0, 1),
                   'patch': patch,

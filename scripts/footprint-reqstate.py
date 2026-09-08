@@ -36,18 +36,45 @@ def main():
     # failure naming a test, and the verbatim failure lines that name was parsed from. A record that
     # merely says KILLED is a claim, not evidence — and one kill in this campaign turned out to be a
     # format-string error under the right test's name, which is exactly what this refuses.
+    # The requirement text as the DOCUMENT states it, so an obligation can be checked against the
+    # requirement it is filed under rather than trusted.
+    req_text = {}
+    for line in authoritative.split('\n'):
+        mm = re.match(r'^\|\s*(' + idPattern + r')\s*\|\s*(.*)$', line)
+        if mm:
+            t = mm.group(2).rstrip()
+            if t.endswith('|'): t = t[:-1].rstrip()
+            if len(t) > len(req_text.get(mm.group(1), '')): req_text[mm.group(1)] = t
+
     problems = []
     for rid, ms in per.items():
         for m in ms:
+            # ATTRIBUTION, for every record whatever its status: the obligation a row quotes must be
+            # verbatim in the requirement the row sits under. `requirement` is an editable field in a
+            # checked-in file, and filing a probe under the wrong requirement is how a table comes to
+            # over-count one requirement and under-count another while every individual cell looks fine.
+            dt = (m.get('documentText') or '').strip()
+            if not dt:
+                problems.append(f"{rid}: a record quotes no obligation")
+            elif rid not in req_text:
+                problems.append(f"{rid}: is not a requirement in the document")
+            elif dt not in req_text[rid]:
+                problems.append(f"{rid}: the quoted obligation is not verbatim in {rid}: {dt[:70]!r}")
             if m['status'] != 'KILLED':
                 continue
+            # the named assertion failures must be the ones THIS run produced
+            fl = '\n'.join(m.get('evidence', {}).get('failureLines') or [])
+            for name in (m.get('assertionFailures') or []):
+                if name.split('.')[-1] not in fl:
+                    problems.append(f"{rid}: names assertion failure {name} that its own failure lines do not carry")
             if not m.get('assertionFailures'):
                 # The renderer must hold this itself: a record is a checked-in FILE, and a hand-edited
                 # or legacy one would otherwise be taken at its word.
                 t = m.get('killedByThrow')
                 lines = '\n'.join(m.get('evidence', {}).get('failureLines') or [])
                 ok = (isinstance(t, dict) and t.get('test') and t.get('throws')
-                      and t['test'].split('.')[-1] in lines and t['throws'] in lines)
+                      and t['test'].split('.')[-1] in lines and t['throws'] in lines
+                      and all(part in lines for part in [t['test'].split('.')[-1]]))
                 if not ok:
                     problems.append(f"{rid}: a KILLED record names no ASSERTION failure, and its "
                                     f"killedByThrow does not name a test and a throw that its own "
@@ -81,7 +108,9 @@ def main():
             killed = by.pop('KILLED', 0)
             # Count PROBES, not clauses: a clause implemented at several sites is probed once per
             # site AND once for all sites together, so "n of m clauses" would triple-count it.
-            groups = len({re.sub(r' site\d+$', '', k) for k in keys[rid]})
+            # A clause probed at several SITES, or broken several WAYS (variants), is still one
+            # clause; counting records as clauses triple-counts it.
+            groups = len({re.sub(r' (?:site\d+|variant\d+\S*)$', '', k) for k in keys[rid]})
             state = f"{killed} of {len(ms)} probes pinned, over {groups} clause" + ("" if groups == 1 else "s")
             rest = ", ".join(f"{n} {st.lower()}" for st, n in sorted(by.items()))
             if rest: state += f" ({rest})"
