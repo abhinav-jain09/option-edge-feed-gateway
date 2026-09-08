@@ -2609,8 +2609,8 @@ public class FeedGatewayService implements ReplayRunner {
         try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
             List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
             // The incarnation is named BEFORE the hydration reads a single record, so a recreation DURING
-            // hydration is seen: every later step compares against this id (code review round 25).
-            bindEsAuctionIncarnation(partitions);
+            // hydration is seen: every later step compares against this id (round 25).
+            bindEsAuctionIncarnationOrReplay(partitions);
             seekToCacheWindow(consumer, partitions, topicEvents);
             // Bootstrap gets the BOOTSTRAP budget: a broker that answers in 10s is slow, not broken, and
             // must bootstrap rather than crash-loop. The 2s refresh budget applies only inside the poll
@@ -2644,6 +2644,9 @@ public class FeedGatewayService implements ReplayRunner {
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
+                    // A topic discovered AFTER startup is hydrated by the same path and needs the same
+                    // guarantee: name its incarnation before a record of it is read (round 26).
+                    bindEsAuctionIncarnationOrReplay(refresh.added());
                     seekToCacheWindow(consumer, refresh.added(), topicEvents);
                     Map<TopicPartition, Long> addedEndOffsets = boundedEndOffsets(consumer, refresh.added());
                     // TWO barriers, deliberately not the same set.
@@ -13301,12 +13304,13 @@ public class FeedGatewayService implements ReplayRunner {
                    for its own replay, and clearing the request unconditionally would erase it — the next pass
                    would then see nothing pending and could freeze without ever replaying the newest log
                    (round 18). Its own barrier and view drop still stand; this pass simply ends. */
-                if (!clearRehydrateIfCurrent(generation)) return false;
-                // The replay reads the NEW log, so it is named before it starts, for the same reason the
-                // bootstrap hydration is: without it both the barrier and the freeze could sample an id
-                // only after a second recreation had already mixed the view (round 25).
+                /* NAMED BEFORE the request is cleared. Clearing first and failing to bind left later passes
+                   able to complete the barrier with `esAuctionReplayTopicId == null` and then freeze once an
+                   id became readable — a recreation during that unnamed replay would be undetectable
+                   (round 26). A failed bind leaves the request standing and the pass simply ends. */
                 if (!bindEsAuctionIncarnation(owned)) return false;
                 esAuctionReplayTopicId = esAuctionTopicId;
+                if (!clearRehydrateIfCurrent(generation)) return false;
                 System.out.println("es-auction: re-reading the retained log of the new incarnation before any hello");
             } catch (RuntimeException retryable) {
                 return false;   // the hello stays held; the next loop iteration tries again
@@ -13355,6 +13359,18 @@ public class FeedGatewayService implements ReplayRunner {
      * release hellos over a view holding rows of two logs. Returns false when the id cannot be read, which
      * holds the hello exactly as an unreadable id does everywhere else.
      */
+    /**
+     * Names the incarnation before a hydration that this thread cannot abandon — the cache consumer serves
+     * every topic, so an unreadable auction id must not stop it. When the id cannot be read, the auction view
+     * is dropped and a REPLAY is demanded instead: the freeze path then re-reads that log from its beginning,
+     * names it there, and only then may release a hello. Nothing is served from a hydration whose incarnation
+     * was never established (code review round 26).
+     */
+    private void bindEsAuctionIncarnationOrReplay(List<TopicPartition> partitions) {
+        if (bindEsAuctionIncarnation(partitions)) return;
+        esAuctionForgetIncarnation("the incarnation could not be named before hydrating");
+    }
+
     private boolean bindEsAuctionIncarnation(List<TopicPartition> partitions) {
         if (!settings.esAuctionEnabled()) return true;
         String topic = settings.esAuctionTopic();
