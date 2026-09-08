@@ -42,7 +42,7 @@ class FootprintWiringTest {
         String src = Files.readString(SERVICE);
         assertEquals(2, occurrences(src, "addEsFootprintTopics(topicEvents);"), "called from the state cache AND the state live consumer");
         assertEquals(2, occurrences(src, "addEsCvdTopics(topicEvents);\n        addEsFootprintTopics(topicEvents);"), "right after the CVD wiring at both sites");
-        int start = src.indexOf("private void addEsFootprintTopics(");
+        int start = src.indexOf("void addEsFootprintTopics(Map<String, TopicBinding> topicEvents) {");
         String body = src.substring(start, src.indexOf("\n    }", start));
         assertTrue(body.contains("if (footprintViews == null) return;"), "flag off adds nothing");
         for (String e : new String[]{"es-footprint\"", "es-footprint-evidence\"", "es-footprint-bar\"", "es-footprint-outcome\""}) {
@@ -98,6 +98,51 @@ class FootprintWiringTest {
         assertTrue(m.endsWith("gateway_footprint_enabled 0\n"));
         assertEquals(1, m.lines().filter(l -> !l.startsWith("#")).count(), "exactly one footprint series flag-off");
         assertTrue(s.metrics().contains("gateway_footprint_enabled 0\n"));
+    }
+
+    /**
+     * G-R2: the four bindings are asserted by EXECUTING the wiring, not by reading its source. A
+     * source assertion counts the text of a {@code TopicBinding} that a surrounding {@code if (false)}
+     * has made unreachable; only running the method can tell the two apart.
+     */
+    @Test void theWiringMethodPutsAllFourBindingsInTheMapItIsGiven() {
+        java.util.Map<String, FeedGatewayService.TopicBinding> wired = new java.util.LinkedHashMap<>();
+        on().addEsFootprintTopics(wired);
+        GatewaySettings g = new GatewaySettings();
+        assertEquals(java.util.Map.of(
+                g.esFootprintTopic(), "es-footprint",
+                g.esFootprintEvidenceTopic(), "es-footprint-evidence",
+                g.esFootprintBarsTopic(), "es-footprint-bar",
+                g.esFootprintOutcomesTopic(), "es-footprint-outcome"),
+                wired.entrySet().stream().collect(java.util.stream.Collectors.toMap(
+                        java.util.Map.Entry::getKey, e -> e.getValue().event())),
+                "every topic is bound, to its own event");
+        wired.values().forEach(b -> assertEquals("DATABENTO", b.source()));
+        java.util.Map<String, FeedGatewayService.TopicBinding> none = new java.util.LinkedHashMap<>();
+        off().addEsFootprintTopics(none);
+        assertTrue(none.isEmpty(), "flag off adds nothing");
+    }
+
+    /** G-R3: the two live snapshot topics are never retained; the two keyed topics seek back a session. */
+    @Test void liveSnapshotsAreNeverRetainedAndTheKeyedTopicsSeekBackASession() {
+        FeedGatewayService s = on();
+        long back = new GatewaySettings().esFootprintSeekBackMs();
+        assertTrue(back > 0, "the keyed seek-back is a real window");
+        for (String live : new String[]{"es-footprint", "es-footprint-evidence"}) {
+            assertEquals(0L, s.cachePolicyFor(live, 0L).ttlMs(), live + " is never retained");
+        }
+        for (String keyed : new String[]{"es-footprint-bar", "es-footprint-outcome"}) {
+            assertEquals(back, s.cachePolicyFor(keyed, 0L).ttlMs(), keyed + " re-fills from the compacted topic");
+        }
+    }
+
+    /** G-R6: footprint alone is enough to send the hello — the page needs the handshake either way. */
+    @Test void theHelloIsSentWhenFootprintAloneIsEnabled() {
+        GatewaySettings g = new GatewaySettings();
+        assertFalse(g.esCvdEnabled(), "the fixture isolates the footprint disjunct");
+        assertFalse(g.esCvdSpxLevelsEnabled());
+        assertTrue(on().sendsCvdHello(), "footprint alone still sends cvd-hello");
+        assertFalse(off().sendsCvdHello(), "and nothing enabled sends none");
     }
 
     // ---- G-R6 hello ---------------------------------------------------------------------------------
