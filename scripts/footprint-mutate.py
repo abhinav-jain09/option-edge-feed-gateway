@@ -14,7 +14,7 @@ how a campaign starts lying:
 A clean baseline is proven before any mutation is applied — a campaign against an already-red suite
 would report every clause as pinned.
 """
-import json, subprocess, sys, os, shutil, re, time, hashlib
+import json, subprocess, sys, os, shutil, signal, re, time, hashlib
 
 def failure_lines(out, kind):
     """The VERBATIM lines the killedBy names were parsed from, so the record substantiates itself.
@@ -22,6 +22,37 @@ def failure_lines(out, kind):
     last N characters of a run contain none of the names the harness reported."""
     pat = r'^\[ERROR\]\s+[\w.$]+\.[\w$]+(?::\d+|\s+--|\s).*$' if kind == 'maven' else r'^not ok \d+ - .*$'
     return [l.rstrip()[:400] for l in re.findall(pat, out, re.M)][:12]
+
+def assertion_failures(out, kind):
+    """Failures that are an ASSERTION, not an infrastructure error.
+
+    A mutation that makes the test class fail to construct, a format string blow up, or a fixture
+    throw, produces a non-zero exit and names the right test — and is NOT evidence that the clause
+    is held. One recorded kill in this campaign was exactly that: adding a `%s` to a format template
+    failed with MissingFormatArgument under the very test whose assertion was supposed to catch the
+    shared module. Surefire distinguishes `<<< FAILURE!` (assertion) from `<<< ERROR!` (threw);
+    node's TAP reports `code: 'ERR_ASSERTION'` for an assert and something else for a throw.
+    """
+    if kind == 'maven':
+        # the summary lines under "[ERROR] Failures:" are assertions; those under "[ERROR] Errors:"
+        # are throws. Walk the trailing summary and attribute each name to the section it is under.
+        names, section = set(), None
+        for line in out.split('\n'):
+            if re.match(r'^\[ERROR\]\s+Failures:\s*$', line): section = 'assert'; continue
+            if re.match(r'^\[ERROR\]\s+Errors:\s*$', line): section = 'error'; continue
+            if re.match(r'^\[ERROR\]\s+Tests run:', line): section = None; continue
+            m = re.match(r'^\[ERROR\]\s{2,}([\w.$]+\.[\w$]+)[:\s]', line)
+            if m and section == 'assert':
+                names.add('.'.join(m.group(1).split('.')[-2:]))
+        return sorted(names)
+    # node --test: a failing subtest block carries `code: 'ERR_ASSERTION'` for an assertion
+    names = set()
+    for block in re.split(r'^not ok \d+ - ', out, flags=re.M)[1:]:
+        head, rest = block.split('\n', 1) if '\n' in block else (block, '')
+        body = rest.split('\nnot ok ')[0].split('\nok ')[0]
+        if "ERR_ASSERTION" in body or "AssertionError" in body:
+            names.add(head.strip())
+    return sorted(names)
 
 def failing_tests(out, kind):
     if kind == 'maven':
@@ -58,10 +89,32 @@ def tree_dirty(root):
     rc, out = run(['git', 'status', '--porcelain'], root)
     return [l for l in out.split('\n') if l.strip()]
 
+# A campaign that is killed between the write and the restore leaves the tree mutated AND leaves
+# compiled classes built from the mutation. Restoring the source is not enough: `mv` puts back the
+# ORIGINAL mtime, so an incremental build keeps testing the mutant. Handle the signal, restore, and
+# discard the compiled output so the next run cannot inherit a mutant.
+_ACTIVE = {'paths': [], 'root': None}
+
+def _restore_and_exit(signum, frame):
+    for path in _ACTIVE['paths']:
+        if os.path.exists(path + '.bak'):
+            shutil.move(path + '.bak', path)
+            os.utime(path, None)
+    root = _ACTIVE['root']
+    if root:
+        for d, _, _ in list(os.walk(root)):
+            if os.path.basename(d) == 'classes' and os.path.basename(os.path.dirname(d)) == 'target':
+                shutil.rmtree(d, ignore_errors=True)
+    print(f"\ninterrupted by signal {signum}: tree restored and compiled classes discarded")
+    sys.exit(130)
+
 def main():
     spec = json.load(open(sys.argv[1]))
     outp = sys.argv[2]
     root, cmd, kind = spec['root'], spec['command'], spec['kind']
+    _ACTIVE['root'] = root
+    signal.signal(signal.SIGTERM, _restore_and_exit)
+    signal.signal(signal.SIGINT, _restore_and_exit)
     res = json.load(open(outp)) if os.path.exists(outp) else {}
 
     dirty = tree_dirty(root)
@@ -138,6 +191,7 @@ def main():
                 stack.pop()
 
         touched = sorted({os.path.join(root, s0['file']) for s0 in sites})
+        _ACTIVE['paths'] = touched
         originals, mutants = {}, {}
         for path in touched:
             shutil.copy(path, path + '.bak')
@@ -165,8 +219,10 @@ def main():
             for path in touched:
                 shutil.move(path + '.bak', path)
                 os.utime(path, None)   # mv restores the ORIGINAL mtime; Maven would skip recompiling
+            _ACTIVE['paths'] = []
         still_dirty = tree_dirty(root)
         failed = failing_tests(out, kind)
+        asserted = assertion_failures(out, kind)
         # A `kind` that does not match the runner parses no failure names, and every kill is then
         # recorded as BUILD-FAILED — silently, because the run really did exit non-zero. Refuse
         # instead: the output plainly names failing tests in the other runner's shape.
@@ -178,8 +234,12 @@ def main():
                 sys.exit(4)
         if build_failed(out, kind) and not failed:
             status = 'BUILD-FAILED'
-        elif rc != 0 and failed:
+        elif rc != 0 and asserted:
             status = 'KILLED'
+        elif rc != 0 and failed:
+            # the right test failed, but on a THROW rather than an assertion: the mutation broke the
+            # fixture, not the behaviour under test, so this is not evidence the clause is held
+            status = 'KILLED-BY-ERROR'
         elif rc != 0:
             status = 'BUILD-FAILED'
         else:
@@ -187,7 +247,7 @@ def main():
         res[k] = {'status': status, 'clause': m.get('clause',''), 'requirement': m.get('requirement', k.split()[0]),
                   'documentText': m.get('documentText'),
                   'file': m['file'], 'occurrence': occ, 'occurrencesInFile': n, 'line': line,
-                  'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': failed[:4],
+                  'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': asserted[:4] or failed[:4], 'assertionFailures': asserted[:4], 'anyFailures': failed[:4],
                   'seconds': round(time.time()-t0, 1),
                   'patch': patch,
                   'evidence': {'repoCommit': commit, 'returnCode': rc,

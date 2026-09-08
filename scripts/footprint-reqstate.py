@@ -21,6 +21,26 @@ def main():
     per = collections.defaultdict(list)
     for k, v in rec.items():
         per[v.get('requirement') or re.match(r'((?:F|G|P)-(?:R|E)?\d+[a-z]?)', k).group(1)].append(v)
+    # A record is only allowed to say "pinned" when it carries the evidence for it: an assertion
+    # failure naming a test, and the verbatim failure lines that name was parsed from. A record that
+    # merely says KILLED is a claim, not evidence — and one kill in this campaign turned out to be a
+    # format-string error under the right test's name, which is exactly what this refuses.
+    problems = []
+    for rid, ms in per.items():
+        for m in ms:
+            if m['status'] != 'KILLED':
+                continue
+            if not m.get('assertionFailures') and not m.get('killedBy'):
+                problems.append(f"{rid}: a KILLED record names no failing test")
+            if not m.get('evidence', {}).get('failureLines'):
+                problems.append(f"{rid}: a KILLED record carries no failure lines")
+            if not m.get('evidence', {}).get('treeRestoredClean', True):
+                problems.append(f"{rid}: a KILLED record ran against a tree it did not restore")
+    if problems:
+        print("REFUSING TO EMIT:", file=sys.stderr)
+        for p in problems: print("  ", p, file=sys.stderr)
+        sys.exit(1)
+
     def gate(rid):
         for pat, g in gates.items():
             if re.fullmatch('(?:' + pat + ')', rid): return g
@@ -33,18 +53,33 @@ def main():
     for rid in sorted(ids, key=lambda x: (re.sub(r'\d', '', x), int(re.search(r'\d+', x).group()), x)):
         ms = per.get(rid, [])
         if not ms:
-            state = notes.get(rid, "NOT PROBED")
+            # A note is EDITORIAL: it says why this requirement has no mutations, and is marked as
+            # such so it can never be read as a campaign result.
+            state = (notes[rid] + " (not probed)") if rid in notes else "NOT PROBED"
         else:
-            killed = sum(1 for m in ms if m['status'] == 'KILLED')
-            state = f"{killed}/{len(ms)} pinned" + ("" if killed == len(ms) else f" — {len(ms)-killed} characterised")
+            by = collections.Counter(m['status'] for m in ms)
+            killed = by.pop('KILLED', 0)
+            state = f"{killed} of {len(ms)} clauses probed here are pinned"
+            rest = ", ".join(f"{n} {st.lower()}" for st, n in sorted(by.items()))
+            if rest: state += f" ({rest})"
         out.append(f"| {rid} | {state} | {gate(rid)} | {disp(rid)} |")
     tot = collections.Counter(v['status'] for v in rec.values())
     out.append("")
-    out.append(f"{len(ids)} requirements; {len(per)} probed by {len(rec)} mutations "
-               f"({tot['KILLED']} killed, {tot.get('SURVIVED', 0)} surviving). "
-               "\"n/n pinned\" means every clause this campaign broke in that requirement made a NAMED "
-               "test fail. \"NOT PROBED\" means this campaign did not test it and claims nothing "
-               "either way. Evidence, per mutation, is in the campaign record beside this document.")
+    probed_here = len([r for r in ids if r in per])
+    out.append(f"{len(ids)} requirements; {probed_here} probed by {len(rec)} mutations "
+               f"({tot['KILLED']} killed, {tot.get('SURVIVED', 0)} surviving"
+               + (", " + ", ".join(f"{n} {st.lower()}" for st, n in sorted(tot.items()) if st not in ('KILLED', 'SURVIVED')) if len(tot) > 2 else "")
+               + ")."
+               "\n\nRead the state column narrowly. \"n of m clauses probed here are pinned\" says that "
+               "breaking those clauses in the production source made a NAMED test fail an ASSERTION — "
+               "it does NOT say the requirement as a whole is held, because a requirement usually has "
+               "more clauses than this campaign broke. \"NOT PROBED\" means this campaign did not test "
+               "it and claims nothing either way; where a note appears beside it, that note is "
+               "editorial and is not a campaign result. Evidence, per mutation — the patch, the file, "
+               "line and enclosing declaration, the command, the exit code, the verbatim failure "
+               "lines and a SHA-256 of the run output — is in the campaign record beside this "
+               "document, and this table refuses to render a \"pinned\" cell for any record that does "
+               "not carry it.")
     print("\n".join(out))
 
 main()
