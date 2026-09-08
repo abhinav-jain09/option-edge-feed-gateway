@@ -185,8 +185,8 @@ record with `scripts/footprint-reqstate.sh --check`.
 | G-R6 | 3 of 3 probes pinned, over 3 clauses | 2 | Hello |
 | G-R7 | 5 of 6 probes pinned, over 6 clauses (1 survived) | 2 | Backfill routes |
 | G-R8 | 5 of 5 probes pinned, over 5 clauses | 2 | Deployment contingency |
-| G-R9 | 1 of 1 probes pinned, over 1 clause | 2 | Metrics |
-| G-R10 | 3 of 3 probes pinned, over 3 clauses | 2 | Non-interference |
+| G-R9 | 2 of 2 probes pinned, over 2 clauses | 2 | Metrics |
+| G-R10 | 2 of 2 probes pinned, over 2 clauses | 2 | Non-interference |
 | G-R11 | TEST INVENTORY: this requirement lists the tests the others are held by, so it has no production clause a mutation could break (not probed) | 2 | Tests |
 | G-R8a | 2 of 2 probes pinned, over 2 clauses | 2 | Deployment contingency |
 
