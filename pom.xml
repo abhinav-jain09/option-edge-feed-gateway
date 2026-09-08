@@ -147,14 +147,29 @@
                       GatewayContextSmokeTest asserts both values in @BeforeAll, before the Spring
                       extension builds the context, so removing this execution fails the test rather
                       than quietly connecting to a broker.
+
+                      Routing is NOT by filename pattern. `-Dtest=` overrides an execution's includes
+                      AND excludes, so with pattern-based routing every `-Dtest=Something` ran
+                      Something TWICE — the second time inside the pinned execution with
+                      KAFKA_ENABLED=false, which fails any test that needs Kafka enabled;
+                      FootprintSeamTest.aPreflightRefusalLeavesRunningFalse is the one that surfaced
+                      it. Instead the pinned execution names its own <test>, which an explicit plugin
+                      configuration wins over the user property, and default-test excludes the class
+                      by JUnit tag.
+
+                      That claim is about `-Dtest=` and nothing wider. `-Dgroups` and
+                      `-DexcludedGroups` are user properties too and can push the smoke test OUT of
+                      the pinned execution, and `mvn surefire:test` bypasses both executions through
+                      default-cli. None of them can pull an arbitrary class IN — the explicit <test>
+                      prevents that — and in each of those cases the class's own @BeforeAll
+                      assertions stop it before any context exists.
                     -->
                     <execution>
                         <id>default-test</id>
                         <goals><goal>test</goal></goals>
                         <configuration>
-                            <excludes>
-                                <exclude>**/GatewayContextSmokeTest.java</exclude>
-                            </excludes>
+                            <!-- Untouched by `-Dtest=`, unlike an exclude pattern. -->
+                            <excludedGroups>context-boot</excludedGroups>
                         </configuration>
                     </execution>
                     <execution>
@@ -162,9 +177,19 @@
                         <phase>test</phase>
                         <goals><goal>test</goal></goals>
                         <configuration>
-                            <includes>
-                                <include>**/GatewayContextSmokeTest.java</include>
-                            </includes>
+                            <!--
+                              <test> is set HERE, in the POM, precisely so `-Dtest=` cannot redirect
+                              this execution: an explicit plugin configuration beats the user
+                              property, while default-test leaves <test> unset so `-Dtest=` still
+                              selects normally there. Include/exclude PATTERNS did not hold — `-Dtest=`
+                              overrides those in EVERY execution, so every `-Dtest=Something` ran
+                              Something twice, the second time with KAFKA_ENABLED=false. That is how
+                              FootprintSeamTest.aPreflightRefusalLeavesRunningFalse started failing:
+                              with Kafka off, start() returns before the preflight and the refusal it
+                              asserts never happens.
+                            -->
+                            <test>GatewayContextSmokeTest</test>
+                            <failIfNoTests>false</failIfNoTests>
                             <!--
                               Explicit, so `-DforkCount=0` cannot reach it: environmentVariables are
                               applied to the FORKED process, and with forking off the execution would

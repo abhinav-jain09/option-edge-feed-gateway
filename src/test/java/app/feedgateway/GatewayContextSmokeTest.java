@@ -1,6 +1,7 @@
 package app.feedgateway;
 
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -52,12 +53,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * start-up" case, which is how the first attempt at this was caught. Every other test keeps the
  * environment it was written against.
  *
- * <p>Two Maven invocations are worth knowing about. {@code -DforkCount=0} would run this execution
- * inside Maven's own JVM, where surefire's {@code environmentVariables} do not apply — the execution
- * therefore pins {@code forkCount} explicitly, which the user property cannot override.
- * {@code -Dtest=} overrides the includes AND excludes of BOTH executions, so this class becomes
- * eligible in the unpinned {@code default-test} run as well; there the assertions below stop it
- * before any context is built, which is a red test and not a connection. Run plain {@code mvn test}.
+ * <p>Two Maven user properties would otherwise reach past the pin, and the POM closes both by
+ * setting the value explicitly — POM configuration beats a user property. {@code -DforkCount=0}
+ * would run this execution inside Maven's own JVM, where surefire's {@code environmentVariables}
+ * do not apply, so the execution pins {@code forkCount}. {@code -Dtest=} overrides an execution's
+ * include and exclude PATTERNS, so the execution pins {@code test} instead of matching a filename:
+ * routing by pattern made every {@code -Dtest=Something} run Something TWICE, the second time with
+ * {@code KAFKA_ENABLED=false} — which is how
+ * {@code FootprintSeamTest.aPreflightRefusalLeavesRunningFalse} began failing, since with Kafka
+ * off {@code start()} returns before the preflight and the refusal it asserts never happens.
  *
  * <p>With {@code KAFKA_ENABLED=false}, {@link FeedGatewayService#start()} returns before opening a
  * consumer and {@code LiquidityHistoryStore.start()} is a no-op. With {@code GATEWAY_AUTH_ENABLED=false}
@@ -75,7 +79,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * flag-gated auth wiring, which genuinely needs Keycloak and Redis.
  */
 @SpringBootTest
+// The tag EXCLUDES this class from default-test. Selecting it INTO the pinned execution is done by
+// that execution's own <test> entry in pom.xml — the tag does not do that. The two together are what
+// keep the class in exactly one execution under `-Dtest=`: without the tag,
+// `-Dtest=GatewayContextSmokeTest` would also run it in the unpinned default-test.
+@Tag(GatewayContextSmokeTest.TAG)
 class GatewayContextSmokeTest {
+
+    /** Excludes this class from the default-test execution; see the excludedGroups entry in pom.xml. */
+    static final String TAG = "context-boot";
 
     @BeforeAll
     static void isolationIsInPlaceBeforeTheContextIsBuilt() {
@@ -84,13 +96,11 @@ class GatewayContextSmokeTest {
         assertFalse(GatewaySettings.boolValue("KAFKA_ENABLED", true),
                 "KAFKA_ENABLED is not false in the test JVM. The surefire 'context-smoke' execution "
                         + "in pom.xml is what pins it; without that pin this test would open real Kafka "
-                        + "consumers against the configured broker. If you ran with -Dtest=, that "
-                        + "overrides both executions' includes/excludes and the test lands in the "
-                        + "unpinned default-test fork — run plain `mvn test` instead.");
+                        + "consumers against the configured broker.");
         assertFalse(GatewaySettings.boolValue("GATEWAY_AUTH_ENABLED", false),
                 "GATEWAY_AUTH_ENABLED is not false in the test JVM. The surefire 'context-smoke' "
                         + "execution in pom.xml is what pins it; without that pin this test would need "
-                        + "Keycloak and Redis. If you ran with -Dtest=, run plain `mvn test` instead.");
+                        + "Keycloak and Redis.");
     }
 
     @Autowired
