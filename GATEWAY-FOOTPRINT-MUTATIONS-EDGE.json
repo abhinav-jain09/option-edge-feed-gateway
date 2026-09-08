@@ -1,0 +1,38 @@
+{
+ "G-R7 epoch-guard-removed": {
+  "status": "KILLED",
+  "clause": "a cursor at or past the last epoch value can have nothing after it, and the increment is taken only inside the domain",
+  "requirement": "G-R7",
+  "file": "src/main/java/app/feedgateway/FootprintViews.java",
+  "occurrence": 1,
+  "occurrencesInFile": 1,
+  "line": 226,
+  "enclosing": "BarsPage barsPage(String tf, long toMsInclusive, long afterMsExclusive, int limit, String expectedSessionDate) {",
+  "command": "mvn -B test -Dtest=Footprint* -DfailIfNoTests=false",
+  "killedBy": [
+   "FootprintViewsTest.theBarsCursorIsExclusiveAtTheTopOfTheEpochDomain"
+  ],
+  "seconds": 5.7,
+  "patch": {
+   "old": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive < EPOCH_MAX_MS) {",
+   "new": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0) {"
+  }
+ },
+ "G-R7 epoch-guard-relaxed": {
+  "status": "SURVIVED",
+  "clause": "the same guard, relaxed from < to <= (expected INERT: lo > hi keeps the page empty either way)",
+  "requirement": "G-R7",
+  "file": "src/main/java/app/feedgateway/FootprintViews.java",
+  "occurrence": 1,
+  "occurrencesInFile": 1,
+  "line": 226,
+  "enclosing": "BarsPage barsPage(String tf, long toMsInclusive, long afterMsExclusive, int limit, String expectedSessionDate) {",
+  "command": "mvn -B test -Dtest=Footprint* -DfailIfNoTests=false",
+  "killedBy": [],
+  "seconds": 7.6,
+  "patch": {
+   "old": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive < EPOCH_MAX_MS) {",
+   "new": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive <= EPOCH_MAX_MS) {"
+  }
+ }
+}
