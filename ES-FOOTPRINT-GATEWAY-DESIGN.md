@@ -165,29 +165,34 @@ under last-write-per-key. Epoch-ms values lie in `[0, 253402300799999]` (§5 tim
 
 ## 2a. Conformance — what a test actually holds
 
-Every requirement above, and what this repository's mutation campaign established about it. A clause
-is "pinned" when breaking it in the production source made a NAMED test fail; the campaign refuses to
-start against a dirty tree or a red baseline, and each row's evidence — the patch, the file, line and
-enclosing declaration, the command, the exit code, the failing test names and a SHA-256 of the run
-output — is in `ES-FOOTPRINT-CAMPAIGN.json` beside this document. Regenerate with
-`scripts/footprint-reqstate.sh`; the full per-clause matrix is `ES-FOOTPRINT-CONFORMANCE.md`.
+Every requirement above, and what this repository's mutation campaign established about it. The
+campaign refuses to start against a dirty tree or a red baseline; a kill must be an ASSERTION
+failure naming a test — or, where the clause under test IS "this must not throw", a propagated throw
+the spec declared in advance — never an incidental error under the right test's name; and the table
+below refuses to render a "pinned" cell for any record that does not carry its evidence. That
+evidence — the patch, the file, line and enclosing declaration, the command, the exit code, the
+verbatim failure lines and a SHA-256 of the run output — is in `ES-FOOTPRINT-CAMPAIGN.json` beside
+this document. Regenerate this section with `scripts/footprint-reqstate.sh`, or check it against the
+record with `scripts/footprint-reqstate.sh --check`.
 
 | id | Conformance | Gate | Disposition |
 |----|-------------|------|-------------|
-| G-R1 | 1/1 pinned | 2 | Flag and wiring |
-| G-R2 | 2/2 pinned | 2 | Flag and wiring |
-| G-R3 | 3/3 pinned | 2 | Delivery and views |
-| G-R4 | 4/4 pinned | 2 | Delivery and views |
-| G-R5 | 4/4 pinned | 2 | Delivery and views |
-| G-R6 | 3/3 pinned | 2 | Hello |
-| G-R7 | 5/6 pinned — 1 characterised | 2 | Backfill routes |
-| G-R8 | 5/5 pinned | 2 | Deployment contingency |
-| G-R9 | 1/1 pinned | 2 | Metrics |
-| G-R10 | 1/1 pinned | 2 | Non-interference |
-| G-R11 | TEST INVENTORY — its items are the tests named in the rows above | 2 | Tests |
-| G-R8a | 2/2 pinned | 2 | Deployment contingency |
+| G-R1 | 1 of 1 clauses probed here are pinned | 2 | Flag and wiring |
+| G-R2 | 2 of 2 clauses probed here are pinned | 2 | Flag and wiring |
+| G-R3 | 3 of 3 clauses probed here are pinned | 2 | Delivery and views |
+| G-R4 | 4 of 4 clauses probed here are pinned | 2 | Delivery and views |
+| G-R5 | 4 of 4 clauses probed here are pinned | 2 | Delivery and views |
+| G-R6 | 3 of 3 clauses probed here are pinned | 2 | Hello |
+| G-R7 | 5 of 6 clauses probed here are pinned (1 survived) | 2 | Backfill routes |
+| G-R8 | 5 of 5 clauses probed here are pinned | 2 | Deployment contingency |
+| G-R9 | 1 of 1 clauses probed here are pinned | 2 | Metrics |
+| G-R10 | 3 of 3 clauses probed here are pinned | 2 | Non-interference |
+| G-R11 | TEST INVENTORY: this requirement lists the tests the others are held by, so it has no production clause a mutation could break (not probed) | 2 | Tests |
+| G-R8a | 2 of 2 clauses probed here are pinned | 2 | Deployment contingency |
 
-12 requirements; 11 probed by 32 mutations (31 killed, 1 surviving). "n/n pinned" means every clause this campaign broke in that requirement made a NAMED test fail. "NOT PROBED" means this campaign did not test it and claims nothing either way. Evidence, per mutation, is in the campaign record beside this document.
+12 requirements; 11 probed by 34 mutations (33 killed, 1 surviving).
+
+Read the state column narrowly. "n of m clauses probed here are pinned" says that breaking those clauses in the production source made a NAMED test fail an ASSERTION — it does NOT say the requirement as a whole is held, because a requirement usually has more clauses than this campaign broke. "NOT PROBED" means this campaign did not test it and claims nothing either way; where a note appears beside it, that note is editorial and is not a campaign result. Evidence, per mutation — the patch, the file, line and enclosing declaration, the command, the exit code, the verbatim failure lines and a SHA-256 of the run output — is in the campaign record beside this document, and this table refuses to render a "pinned" cell for any record that does not carry it.
 
 <!-- END footprint-reqstate -->
 
