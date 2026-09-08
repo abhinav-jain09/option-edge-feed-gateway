@@ -11678,6 +11678,13 @@ public class FeedGatewayService implements ReplayRunner {
         try {
             JsonNode root = mapper.readTree(json);
             String symbol = root.hasNonNull("symbol") ? root.get("symbol").asText("") : "";
+            if ("direction-progress".equals(event)) {
+                // A5.7: one report per ENVIRONMENT. The default key is event|symbol|expiry|strike and a
+                // progress record has no symbol, so both environments collapsed to
+                // "direction-progress||||" and a latest-wins queue could replace PROD's report with
+                // DEV's for a slow or joining client (r8 #9). The identity is the environment.
+                return event + "|" + root.path("env").asText("").toUpperCase();
+            }
             if ("indicators".equals(event)) {
                 // r3 finding 3: the frozen key is literally `indicators|symbol` —
                 // additive fields must never split the coalescing identity.

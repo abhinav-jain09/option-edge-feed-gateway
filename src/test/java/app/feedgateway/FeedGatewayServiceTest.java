@@ -3305,6 +3305,17 @@ class FeedGatewayServiceTest {
                     path + " must deliver the progress record to a joining client; got: " + sink);
         }
 
+        // COALESCING IS PER ENVIRONMENT. The default key is event|symbol|expiry|strike, and a progress
+        // record has no symbol — so without its own case both environments collapse to one key and a
+        // latest-wins queue can hand a client the wrong environment's report.
+        Method coalesceKey = FeedGatewayService.class.getDeclaredMethod("coalesceKeyFor", String.class, String.class);
+        coalesceKey.setAccessible(true);
+        String devProgress = progress.replace("\"env\":\"prod\"", "\"env\":\"dev\"");
+        Object prodKey = coalesceKey.invoke(service, "direction-progress", progress);
+        Object devKey = coalesceKey.invoke(service, "direction-progress", devProgress);
+        assertEquals("direction-progress|PROD", prodKey);
+        assertNotEquals(prodKey, devKey, "PROD and DEV reports must never share a coalescing key");
+
         assertTrue(service.healthJson().contains("\"directionProgress\":1"), service.healthJson());
         Method remove = FeedGatewayService.class.getDeclaredMethod("removeCacheEntry", String.class);
         remove.setAccessible(true);
