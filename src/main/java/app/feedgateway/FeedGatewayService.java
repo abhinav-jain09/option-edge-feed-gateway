@@ -13364,13 +13364,23 @@ public class FeedGatewayService implements ReplayRunner {
      */
     void verifyFrozenEsAuctionIncarnation(String topic) {
         long now = System.currentTimeMillis();
-        boolean due = esAuctionIdCheckDue.compareAndSet(true, false);
+        boolean due = esAuctionIdCheckDue.get();
         if (!due && now - esAuctionLastIdCheckMs < ES_AUCTION_ID_CHECK_MS) return;
-        esAuctionLastIdCheckMs = now;
         org.apache.kafka.common.Uuid known = esAuctionTopicId;
-        if (known == null) return;
+        if (known == null) { esAuctionIdCheckDue.set(false); esAuctionLastIdCheckMs = now; return; }
         org.apache.kafka.common.Uuid seen = esAuctionTopicIdReader.apply(topic);
-        if (seen == null) { System.out.println("es-auction: the topic id cannot be read; the frozen handoff stands until it can"); return; }
+        /* A FORCED check that could not read STAYS DUE, and does not arm the throttle. Consumed on the
+           attempt rather than on the answer, one transient admin failure would leave a hydration whose ending
+           incarnation was never verified — with the old handoff still frozen and the possibly mixed view
+           still answering /api/auction/minutes — until the cadence came round thirty seconds later
+           (code review round 31). */
+        if (seen == null) {
+            System.out.println("es-auction: the topic id cannot be read; the frozen handoff stands until it can" + (due ? " (the post-hydration check stays due)" : ""));
+            if (!due) esAuctionLastIdCheckMs = now;
+            return;
+        }
+        esAuctionIdCheckDue.set(false);
+        esAuctionLastIdCheckMs = now;
         if (!seen.equals(known)) esAuctionForgetIncarnation("topic " + topic + " was recreated (" + known + " -> " + seen + ")");
     }
 
