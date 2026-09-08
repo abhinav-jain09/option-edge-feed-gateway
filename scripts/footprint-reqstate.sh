@@ -24,14 +24,24 @@ table() {
     '{"G-R11":"TEST INVENTORY: this requirement lists the tests the others are held by, so it has no production clause a mutation could break"}'
 }
 
-grep -qF "$BEGIN" "$DOC" || { echo "FATAL: $DOC has no $BEGIN marker" >&2; exit 1; }
-grep -qF "$END"   "$DOC" || { echo "FATAL: $DOC has no $END marker" >&2; exit 1; }
+# EXACTLY one marker pair, BEGIN before END, each at the start of its own line. A second pair, a
+# reversed pair, or a marker mentioned inside prose would let the rewrite duplicate the generated
+# block or swallow an unrelated section of the document.
+nb=$(grep -cE "^${BEGIN}" "$DOC" || true)
+ne=$(grep -cE "^${END}$"  "$DOC" || true)
+[ "$nb" = "1" ] || { echo "FATAL: $DOC has $nb BEGIN markers at line start; exactly one is required" >&2; exit 1; }
+[ "$ne" = "1" ] || { echo "FATAL: $DOC has $ne END markers at line start; exactly one is required" >&2; exit 1; }
+lb=$(grep -nE "^${BEGIN}" "$DOC" | cut -d: -f1)
+le=$(grep -nE "^${END}$"  "$DOC" | cut -d: -f1)
+[ "$lb" -lt "$le" ] || { echo "FATAL: in $DOC the END marker (line $le) precedes BEGIN (line $lb)" >&2; exit 1; }
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 table > "$tmp/table.md"
 
-# Rebuild the document: everything before the marker, the fixed prose, the generated table, the
-# fixed trailer, everything after. The prose lives HERE so the generated part is only the table.
+# Rebuild the document: everything before the marker, then the section heading, then the prose from
+# scripts/footprint-reqstate.preamble (hand-maintained — it explains the table and is reviewed like
+# any other prose), then the generated table, then everything from the END marker on. Only the table
+# is derived from the record; the preamble is not, and is kept in its own file so that is visible.
 awk -v tablefile="$tmp/table.md" -v begin="$BEGIN" -v end="$END" '
   index($0, begin) == 1 { skipping = 1; print; print ""; print "## 2a. Conformance — what a test actually holds"; print "";
       while ((getline line < "scripts/footprint-reqstate.preamble") > 0) print line

@@ -223,6 +223,15 @@ def main():
         still_dirty = tree_dirty(root)
         failed = failing_tests(out, kind)
         asserted = assertion_failures(out, kind)
+        # A declared throw-kill must name BOTH the test that should propagate it and a signature of
+        # the throw itself, and both must appear in the run's own failure lines. `killedByThrow:
+        # true` alone would accept any error under any failing test.
+        want = m.get('killedByThrow') or {}
+        throw_kill_ok = False
+        if isinstance(want, dict) and want.get('test') and want.get('throws'):
+            lines = '\n'.join(failure_lines(out, kind))
+            throw_kill_ok = (want['test'] in failed or any(want['test'] in f2 for f2 in failed)) \
+                and want['throws'] in lines
         # A `kind` that does not match the runner parses no failure names, and every kill is then
         # recorded as BUILD-FAILED — silently, because the run really did exit non-zero. Refuse
         # instead: the output plainly names failing tests in the other runner's shape.
@@ -236,10 +245,11 @@ def main():
             status = 'BUILD-FAILED'
         elif rc != 0 and asserted:
             status = 'KILLED'
-        elif rc != 0 and failed and m.get('killedByThrow'):
+        elif rc != 0 and failed and throw_kill_ok:
             # The clause under test IS "this must not throw", so a test that propagates the throw is
-            # detecting exactly the right thing. The spec must SAY so in advance — declaring the
-            # detection mode after seeing the result is how a fixture blow-up gets read as a kill.
+            # detecting exactly the right thing. The spec must SAY so in advance AND name the throw
+            # it expects — a bare boolean would accept any incidental error under any failing test,
+            # which is the laundering this whole distinction exists to prevent.
             status = 'KILLED'
         elif rc != 0 and failed:
             # the right test failed, but on a THROW rather than an assertion, and the spec did not
@@ -253,7 +263,7 @@ def main():
                   'documentText': m.get('documentText'),
                   'file': m['file'], 'occurrence': occ, 'occurrencesInFile': n, 'line': line,
                   'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': asserted[:4] or failed[:4], 'assertionFailures': asserted[:4], 'anyFailures': failed[:4],
-                  'killedByThrow': bool(m.get('killedByThrow')),
+                  'killedByThrow': (m.get('killedByThrow') if throw_kill_ok else None),
                   'seconds': round(time.time()-t0, 1),
                   'patch': patch,
                   'evidence': {'repoCommit': commit, 'returnCode': rc,

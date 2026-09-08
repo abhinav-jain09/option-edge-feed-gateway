@@ -177,22 +177,22 @@ record with `scripts/footprint-reqstate.sh --check`.
 
 | id | Conformance | Gate | Disposition |
 |----|-------------|------|-------------|
-| G-R1 | 1 of 1 clauses probed here are pinned | 2 | Flag and wiring |
-| G-R2 | 2 of 2 clauses probed here are pinned | 2 | Flag and wiring |
-| G-R3 | 3 of 3 clauses probed here are pinned | 2 | Delivery and views |
-| G-R4 | 4 of 4 clauses probed here are pinned | 2 | Delivery and views |
-| G-R5 | 4 of 4 clauses probed here are pinned | 2 | Delivery and views |
-| G-R6 | 3 of 3 clauses probed here are pinned | 2 | Hello |
-| G-R7 | 5 of 6 clauses probed here are pinned (1 survived) | 2 | Backfill routes |
-| G-R8 | 5 of 5 clauses probed here are pinned | 2 | Deployment contingency |
-| G-R9 | 1 of 1 clauses probed here are pinned | 2 | Metrics |
-| G-R10 | 3 of 3 clauses probed here are pinned | 2 | Non-interference |
+| G-R1 | 1 of 1 probes pinned, over 1 clause | 2 | Flag and wiring |
+| G-R2 | 2 of 2 probes pinned, over 2 clauses | 2 | Flag and wiring |
+| G-R3 | 3 of 3 probes pinned, over 3 clauses | 2 | Delivery and views |
+| G-R4 | 4 of 4 probes pinned, over 4 clauses | 2 | Delivery and views |
+| G-R5 | 4 of 4 probes pinned, over 4 clauses | 2 | Delivery and views |
+| G-R6 | 3 of 3 probes pinned, over 3 clauses | 2 | Hello |
+| G-R7 | 5 of 6 probes pinned, over 6 clauses (1 survived) | 2 | Backfill routes |
+| G-R8 | 5 of 5 probes pinned, over 5 clauses | 2 | Deployment contingency |
+| G-R9 | 1 of 1 probes pinned, over 1 clause | 2 | Metrics |
+| G-R10 | 3 of 3 probes pinned, over 3 clauses | 2 | Non-interference |
 | G-R11 | TEST INVENTORY: this requirement lists the tests the others are held by, so it has no production clause a mutation could break (not probed) | 2 | Tests |
-| G-R8a | 2 of 2 clauses probed here are pinned | 2 | Deployment contingency |
+| G-R8a | 2 of 2 probes pinned, over 2 clauses | 2 | Deployment contingency |
 
 12 requirements; 11 probed by 34 mutations (33 killed, 1 surviving).
 
-Read the state column narrowly. "n of m clauses probed here are pinned" says that breaking those clauses in the production source made a NAMED test fail an ASSERTION — it does NOT say the requirement as a whole is held, because a requirement usually has more clauses than this campaign broke. "NOT PROBED" means this campaign did not test it and claims nothing either way; where a note appears beside it, that note is editorial and is not a campaign result. Evidence, per mutation — the patch, the file, line and enclosing declaration, the command, the exit code, the verbatim failure lines and a SHA-256 of the run output — is in the campaign record beside this document, and this table refuses to render a "pinned" cell for any record that does not carry it.
+Read the state column narrowly. "n of m probes pinned" says that breaking those clauses in the production source made a NAMED test fail an ASSERTION (or propagate a throw the spec declared and the run matched) — it does NOT say the requirement as a whole is held, because a requirement usually has more clauses than this campaign broke. "NOT PROBED" means this campaign did not test it and claims nothing either way; where a note appears beside it, that note is editorial and is not a campaign result. Evidence, per mutation — the patch, the file, line and enclosing declaration, the command, the exit code, the verbatim failure lines and a SHA-256 of the run output — is in the campaign record beside this document, and this table refuses to render a "pinned" cell for any record that does not carry it.
 
 <!-- END footprint-reqstate -->
 
