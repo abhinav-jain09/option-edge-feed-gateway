@@ -107,7 +107,7 @@
  },
  "G-R8 evict-oldest": {
   "status": "KILLED",
-  "clause": "the view byte budgets are enforced under the lock at every admission, so evicting lowers the bytes",
+  "clause": "eviction takes the OLDEST key of the timeframe it is evicting from",
   "requirement": "G-R8",
   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key.",
   "file": "src/main/java/app/feedgateway/FootprintViews.java",
@@ -165,7 +165,7 @@
  },
  "G-R8 evict-rotates": {
   "status": "KILLED",
-  "clause": "the view byte budgets are enforced under the lock at every admission, so evicting lowers the bytes",
+  "clause": "eviction rotates round-robin across the timeframes rather than draining one",
   "requirement": "G-R8",
   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key.",
   "file": "src/main/java/app/feedgateway/FootprintViews.java",
@@ -218,7 +218,7 @@
  },
  "G-R8 byte-budget-decremented": {
   "status": "KILLED",
-  "clause": "the view byte budgets are enforced under the lock at every admission, so evicting lowers the bytes",
+  "clause": "evicting a record decrements the view byte total by that record length",
   "requirement": "G-R8",
   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key.",
   "file": "src/main/java/app/feedgateway/FootprintViews.java",
@@ -324,7 +324,7 @@
  },
  "G-R8 evictions-counted": {
   "status": "KILLED",
-  "clause": "the view byte budgets are enforced under the lock at every admission, so evicting lowers the bytes",
+  "clause": "every eviction is counted in the view eviction counter",
   "requirement": "G-R8",
   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key.",
   "file": "src/main/java/app/feedgateway/FootprintViews.java",
