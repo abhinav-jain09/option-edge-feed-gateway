@@ -673,6 +673,10 @@ public class FeedGatewayService implements ReplayRunner {
      *  until the live consumer happened to seek (code review round 20). */
     private static final long ES_AUCTION_ID_CHECK_MS = 30_000L;
     private volatile long esAuctionLastIdCheckMs;
+    /** Forces the NEXT identity check of a frozen topic to actually read, cadence or not. Set at the start of
+     *  every cache-consumer attempt: a retry re-hydrates with the old handoff still frozen, and a recreation
+     *  DURING that hydration would otherwise wait out the throttle before anyone looked (round 30). */
+    private final AtomicBoolean esAuctionIdCheckDue = new AtomicBoolean(false);
     private final java.util.concurrent.atomic.AtomicLong esAuctionGeneration = new java.util.concurrent.atomic.AtomicLong();
     /** The incarnation each LIVE partition was positioned under. A record from a batch polled before an
      *  invalidation must not write a cursor, be applied to the fresh view, or keep the partition consuming
@@ -2614,6 +2618,9 @@ public class FeedGatewayService implements ReplayRunner {
                view, with the old handoff still frozen, until the 30 s cadence noticed (round 29). Same call
                as the late-discovery path — there is only one rule. */
             verifyOrBindEsAuctionIncarnation(partitions);
+            // ...and again, unconditionally, once this attempt's hydration has caught up: the check above
+            // only covers what was true BEFORE it read a record (round 30).
+            esAuctionIdCheckDue.set(true);
             seekToCacheWindow(consumer, partitions, topicEvents);
             // Bootstrap gets the BOOTSTRAP budget: a broker that answers in 10s is slow, not broken, and
             // must bootstrap rather than crash-loop. The 2s refresh budget applies only inside the poll
@@ -13357,7 +13364,8 @@ public class FeedGatewayService implements ReplayRunner {
      */
     void verifyFrozenEsAuctionIncarnation(String topic) {
         long now = System.currentTimeMillis();
-        if (now - esAuctionLastIdCheckMs < ES_AUCTION_ID_CHECK_MS) return;
+        boolean due = esAuctionIdCheckDue.compareAndSet(true, false);
+        if (!due && now - esAuctionLastIdCheckMs < ES_AUCTION_ID_CHECK_MS) return;
         esAuctionLastIdCheckMs = now;
         org.apache.kafka.common.Uuid known = esAuctionTopicId;
         if (known == null) return;
