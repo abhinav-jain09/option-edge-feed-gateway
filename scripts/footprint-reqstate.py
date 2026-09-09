@@ -97,15 +97,23 @@ def main():
     # the record says. A fabricated record now has to be fabricated against real source — and if it
     # is, the thing it names is real.
     _blob = {}
-    def commit_of(rid, m):
-        """The record's commit, resolved — or a refusal saying which of four things went wrong.
+    # Every git call this generator makes runs with replacement objects DISABLED. `refs/replace/*`
+    # rewrites what git reports for an object id — `cat-file -t`, `rev-parse` and `show` all honour
+    # it — so a blob or tag id replaced by a commit would answer "commit" and then read the
+    # replacement's tree. A record's commit must be the object it names, not one substituted for it.
+    def git(args, repo):
+        env = dict(os.environ, GIT_NO_REPLACE_OBJECTS='1')
+        return subprocess.run(['git', '--no-replace-objects'] + args,
+                              capture_output=True, text=True, cwd=repo, env=env)
 
-        A silent "does not resolve to a commit" is not one answer but three: a copy that does not
-        have it (a shallow checkout, which CI makes by default), an id that names some other kind of
-        object, and a string that is not an id at all. Only the first is fixed by fetching history,
-        so prescribing that for the others sends the reader somewhere useless. And git itself may be
-        unable to answer — no repository, no git — which is a fifth thing, and reported as such
-        rather than as a traceback.
+    def commit_of(rid, m):
+        """The record's commit, resolved — or a refusal naming which thing went wrong.
+
+        `cat-file -t` is the single authority here, and it is asked for the object's OWN type. The
+        peeling forms are avoided deliberately: `<id>^{commit}` resolves an annotated tag to the
+        commit it points at, so a record could name a tag and every later check would agree with
+        it. `rev-parse --verify` is no use for existence either — for a full-length id it validates
+        the shape and returns success for an object the copy does not have.
         """
         commit = m.get('evidence', {}).get('repoCommit')
         if not commit:
@@ -116,43 +124,26 @@ def main():
             problems.append(f"{rid}: the record names {commit!r} as its commit, which is not an "
                             f"object id")
             return None
-        # `rev-parse --verify --quiet`, not `cat-file -e`: cat-file prints "fatal: Not a valid
-        # object name" for a commit the copy does not have, so its stderr cannot separate absence
-        # from trouble. rev-parse --quiet exits 1 SILENTLY for a name it cannot resolve and keeps
-        # stderr for the real thing.
-        #
-        # `^{commit}` PEELS, though, and an annotated tag peels to the commit it points at — so a
-        # tag's own object id would resolve here, and `git show <tag>:<path>` peels it again, and
-        # the record would name an object that is not the commit its evidence came from. The
-        # record must name the commit itself, so the object's own type is asked for first.
         try:
-            direct = subprocess.run(['git', 'cat-file', '-t', commit],
-                                    capture_output=True, text=True, cwd=repo)
-            if direct.returncode == 0 and direct.stdout.strip() != 'commit':
-                problems.append(f"{rid}: the record's commit {commit[:12]} is a "
-                                f"{direct.stdout.strip()} in this repository, not a commit")
-                return None
-            probe = subprocess.run(['git', 'rev-parse', '--verify', '--quiet', f'{commit}^{{commit}}'],
-                                   capture_output=True, text=True, cwd=repo)
+            probe = git(['cat-file', '-t', commit], repo)
         except Exception as exc:
             problems.append(f"{rid}: git could not be asked about commit {commit[:12]} "
                             f"({type(exc).__name__}: {exc}), so the clause this mutation broke "
                             f"cannot be looked up")
             return None
-        if probe.returncode == 0 and not probe.stderr.strip():
-            return commit
-        stderr = (probe.stderr.strip().splitlines() or [f'exit {probe.returncode}'])[0]
-        # An id the copy HAS that is not a commit: rev-parse says so loudly and names the type.
-        mismatch = re.search(r'dereferences to (\w+) type', stderr)
-        if mismatch:
-            problems.append(f"{rid}: the record's commit {commit[:12]} is a {mismatch.group(1)} in "
-                            f"this repository, not a commit")
-        elif probe.returncode == 1 and not probe.stderr.strip():
+        kind, stderr = probe.stdout.strip(), probe.stderr.strip()
+        if probe.returncode == 0 and not stderr:
+            if kind == 'commit':
+                return commit
+            problems.append(f"{rid}: the record's commit {commit[:12]} is a {kind} in this "
+                            f"repository, not a commit")
+        elif re.search(r'could not get object info|Not a valid object name|bad file', stderr):
             problems.append(f"{rid}: commit {commit[:12]} is not in this copy of the repository, so "
                             f"the clause this mutation broke cannot be looked up — check out with "
                             f"full history (fetch-depth: 0)")
         else:
-            problems.append(f"{rid}: git could not resolve commit {commit[:12]} ({stderr}), so the "
+            first = (stderr.splitlines() or [f'exit {probe.returncode}'])[0]
+            problems.append(f"{rid}: git could not resolve commit {commit[:12]} ({first}), so the "
                             f"clause this mutation broke cannot be looked up")
         return None
 
@@ -173,8 +164,7 @@ def main():
             key = (commit, path)
             if key not in _blob:
                 try:
-                    _blob[key] = subprocess.run(['git', 'show', f'{commit}:{path}'],
-                                                capture_output=True, text=True, cwd=repo).stdout
+                    _blob[key] = git(['show', f'{commit}:{path}'], repo).stdout
                 except Exception:
                     _blob[key] = ''
             blob = _blob[key]
