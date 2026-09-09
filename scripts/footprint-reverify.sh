@@ -69,12 +69,8 @@ if [ -n "$AS_THE_GATE" ]; then
     for spec in "${SPECS[@]}"; do
         [ -r "$spec" ] || { echo "scripts/footprint-gated-specs names $spec, which does not exist" >&2; exit 2; }
     done
-    # FULL, always: the gate's declared set IS the whole of what it covers, so a record row that no
-    # declared spec accounts for is a row nothing re-runs.
-    FULL=full
 else
-    FULL=full
-    if [ $# -gt 0 ]; then SPECS=("$1"); FULL=partial; [ $# -gt 1 ] && RECORD="$2"; fi
+    if [ $# -gt 0 ]; then SPECS=("$1"); [ $# -gt 1 ] && RECORD="$2"; fi
     if [ $# -eq 0 ]; then
         # Every committed spec, discovered rather than listed: a hard-coded pair was copied into a
         # repository that has one spec, and named a file that does not exist there.
@@ -103,10 +99,10 @@ for p in sorted(glob.glob(tmpd + '/part-*.json')):
 json.dump(merged, open(out, 'w'), indent=1)
 MERGE
 
-python3 - "$RECORD" "$OUT" "$FULL" "${SPECS[@]}" <<'COMPARE'
+python3 - "$RECORD" "$OUT" "${SPECS[@]}" <<'COMPARE'
 import glob, json, sys
-record, rerun, full = sys.argv[1], sys.argv[2], sys.argv[3] == 'full'
-specs = sys.argv[4:]
+record, rerun = sys.argv[1], sys.argv[2]
+specs = sys.argv[3:]
 was, now = json.load(open(record)), json.load(open(rerun))
 # Only the mutations the specs just re-ran are compared. Naming one spec of a repository whose
 # campaign is two runs would otherwise report the other run's mutations as missing from the re-run.

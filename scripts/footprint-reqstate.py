@@ -21,6 +21,8 @@ def gate_covers(repo):
     specs it just ran are exactly these. The claim is made here, deterministically, and checked
     where it can actually be known, which is inside the run.
 
+    The value is the set of mutation KEYS those specs declare.
+
     Returns None when no gate is declared: "nothing here re-runs this" is a different statement from
     "this gate covers nothing".
     """
@@ -41,7 +43,11 @@ def gate_covers(repo):
         if line.startswith('label:'):
             continue
         try:
-            covered.add(' '.join(json.load(open(os.path.join(repo, line)))['command']))
+            # KEYS, not the spec's command. Two specs can share a command — the same Maven
+            # invocation over different mutations — and coverage taken from the command then
+            # labelled an ungated spec's rows "re-run by the gate" because they happened to run the
+            # same way. What the gate re-runs is a set of mutations, so that is what is recorded.
+            covered.update(m['key'] for m in json.load(open(os.path.join(repo, line)))['mutations'])
         except Exception as exc:
             print(f"note: scripts/footprint-gated-specs names {line}, which could not be read "
                   f"({type(exc).__name__}) — its probes count as not re-run", file=sys.stderr)
@@ -474,7 +480,7 @@ def main():
     if covered is None:
         _ungated = set()          # nothing in this repository invokes reverify; the prose says so
     else:
-        _ungated = {v['requirement'] for v in rec.values() if (v.get('command') or '') not in covered}
+        _ungated = {v['requirement'] for k, v in rec.items() if k not in covered}
 
     # The hand-maintained preamble sits INSIDE the generated block, so a stale sentence in it
     # survives regeneration and --check. Hold it to the record: every probe key it names must exist,
@@ -570,6 +576,8 @@ def main():
         if not ms:
             cover = "—"
         elif rid in _ungated:
+            # ANY probe of the requirement outside the gate's key set puts the whole row here: a
+            # requirement is only re-run if all of it is.
             cover = "recorded, not re-run here"
         elif covered is None:
             cover = "recorded"
