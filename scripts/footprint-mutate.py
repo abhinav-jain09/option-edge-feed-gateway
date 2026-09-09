@@ -16,6 +16,20 @@ would report every clause as pinned.
 """
 import json, subprocess, sys, os, shutil, signal, re, time, hashlib
 
+def assertion_line(line):
+    """Is this surefire line an ASSERTION failure rather than a thrown exception?
+
+    `<<< FAILURE!` says so outright. The numbered summary is NOT enough on its own: surefire prints
+    `Class.method:123 » RuntimeException boom` for a THROW in exactly the same shape, and accepting
+    any `:LINE ` let a forged record pair one `<<< ERROR!` line with an error summary and pass as an
+    assertion kill. So take the summary only when it is not the ` » Exception` form.
+    """
+    if '<<< ERROR!' in line:
+        return False
+    if '<<< FAILURE!' in line:
+        return True
+    return bool(re.search(r':\d+ ', line)) and ' » ' not in line
+
 def failure_lines(out, kind):
     """The VERBATIM lines the killedBy names were parsed from, so the record substantiates itself.
     A tail of the output does not: Maven prints its failures well before the build summary, so the
@@ -114,10 +128,46 @@ def _restore_and_exit(signum, frame):
     print(f"\ninterrupted by signal {signum}: tree restored and compiled classes discarded")
     sys.exit(130)
 
+
+def occurrences(text, needle):
+    """How many times `needle` appears, counted the way the splice locator scans.
+
+    The locator advances by ONE character, so it finds overlapping matches; str.count does not.
+    Counting differently from the locator refuses a legal occurrence.
+    """
+    n, at = 0, 0
+    while True:
+        i = text.find(needle, at)
+        if i < 0: return n
+        n += 1; at = i + 1
+
+
+def result_lines(out, kind):
+    """The runner's own verdict lines, from the complete output.
+
+    Maven: the surefire per-module totals and the reactor's BUILD SUCCESS/FAILURE.
+    Node:  the TAP plan totals.
+    """
+    if kind == 'maven':
+        pat = re.compile(r'^(?:\[INFO\] |\[ERROR\] )?(?:Tests run: \d+, Failures: \d+, Errors: \d+.*'
+                         r'|BUILD SUCCESS|BUILD FAILURE)$')
+    else:
+        pat = re.compile(r'^# (?:tests|pass|fail|skipped|todo) \d+$')
+    seen, keep = set(), []
+    for line in out.splitlines():
+        l = line.strip()
+        if pat.match(l) and l not in seen:
+            seen.add(l); keep.append(l)
+    return keep
+
 def main():
     spec = json.load(open(sys.argv[1]))
     outp = sys.argv[2]
-    root, cmd, kind = spec['root'], spec['command'], spec['kind']
+    # The recorded root is where the campaign was run; anyone re-running it has their own checkout.
+    # Without this the spec is only re-runnable on the machine that wrote it, which makes
+    # "reproduce it yourself" an instruction nobody can follow.
+    root = os.environ.get('FOOTPRINT_ROOT') or spec['root']
+    cmd, kind = spec['command'], spec['kind']
     _ACTIVE['root'] = root
     signal.signal(signal.SIGTERM, _restore_and_exit)
     signal.signal(signal.SIGINT, _restore_and_exit)
@@ -131,8 +181,14 @@ def main():
     rc, out = run(cmd, root)
     if rc != 0:
         print("BASELINE IS RED — refusing to run a campaign against a failing suite"); print(out[-3000:]); sys.exit(2)
+    # A 1500-character tail of a suite's stdout is whatever the last test happened to log — for the
+    # footprint suites that is a wall of violation traces, not the runner's verdict. The verdict is
+    # what a baseline has to carry: pull the runner's own result lines out of the WHOLE output so a
+    # record states, in the runner's words, that it passed. Without this the only thing standing
+    # behind "the baseline was green" is a hand-editable returnCode.
     baseline = {'commit': commit, 'command': ' '.join(cmd), 'returnCode': rc,
-                'outputSha256': sha(out), 'outputTail': out[-1500:]}
+                'outputSha256': sha(out), 'outputTail': out[-1500:],
+                'resultLines': result_lines(out, kind)}
     base_tests = re.search(r'Tests run: (\d+)', out) or re.search(r'# pass (\d+)', out)
     print(f"baseline GREEN ({base_tests.group(1) if base_tests else '?'} tests) — {' '.join(cmd)}\n")
 
@@ -148,19 +204,77 @@ def main():
         # survivor of a test that is in fact perfectly capable of catching the clause's removal.
         sites = m.get('sites') or [{'file': m['file'], 'old': m['old'], 'new': m['new'],
                                     'occurrence': m.get('occurrence', 1)}]
-        patch = {'sites': sites} if m.get('sites') else {'old': m['old'], 'new': m['new']}
-        if prev is not None and prev.get('patch') == patch \
-                and prev.get('evidence', {}).get('repoCommit') == commit:
+        # Every site carries how many times its clause occurs in its file. Recording the count for
+        # the first site only left a multi-site record's other sites with no count at all, and a
+        # check that skips when the field is absent is not a check. Computed here, before the
+        # resume comparison, so a resumed record is compared against the same patch shape it stores.
+        sites = [dict(s0, occurrencesInFile=occurrences(
+                     open(os.path.join(root, s0['file'])).read(), s0['old']))
+                 for s0 in sites]
+        patch = ({'sites': sites} if m.get('sites')
+                 else {'old': sites[0]['old'], 'new': sites[0]['new'],
+                       'occurrencesInFile': sites[0]['occurrencesInFile']})
+        def resumable(p):
+            # A stored record is only reusable if it is internally consistent: a KILLED entry must
+            # carry a non-zero exit, named assertion failures, and the verbatim lines those names
+            # came from. Matching the patch and the commit says nothing about the rest of the file.
+            if p is None or p.get('patch') != patch: return False
+            e, b = p.get('evidence', {}), p.get('baseline', {})
+            if e.get('repoCommit') != commit: return False
+            if e.get('treeRestoredClean') is not True: return False   # missing is not clean
+            if not e.get('outputSha256') or b.get('returnCode') != 0: return False
+            if b.get('command') != p.get('command') or not p.get('command'): return False
+            # The baseline's own run evidence, for the same reason the renderer demands it: commit,
+            # command and return code are three fields a hand-edit can make agree, and a record
+            # whose baseline block carries no output is a record that proves nothing about what ran.
+            if not b.get('outputSha256') or not b.get('outputTail'): return False
+            if b.get('outputSha256') == e.get('outputSha256'): return False
+            if not b.get('resultLines'): return False
+            if b.get('resultLines') != baseline.get('resultLines'): return False
+            if b.get('commit') != commit: return False   # missing is not a match
+            lines = e.get('failureLines') or []
+            if p.get('status') == 'KILLED':
+                if not e.get('returnCode'): return False
+                names = p.get('assertionFailures') or []
+                t = p.get('killedByThrow')
+                if names:
+                    # every name must sit on a line of this record, on an assertion line
+                    for n in names:
+                        short = n.split('.')[-1]
+                        carrying = [l for l in lines if short in l]
+                        if not carrying: return False
+                        if kind == 'maven' and not any(assertion_line(l) for l in carrying):
+                            return False
+                elif isinstance(t, dict) and t.get('test') and t.get('throws'):
+                    joined = '\n'.join(lines)
+                    if t['test'].split('.')[-1] not in joined or t['throws'] not in joined: return False
+                else:
+                    return False
+            elif p.get('status') == 'SURVIVED':
+                # `!= 0`, not `if`: a MISSING return code was reading as success, so a forged
+                # survivor was resumed rather than re-run. Retained failure evidence disqualifies it
+                # too — the renderer refuses such a record, and resume should not hand it one.
+                if e.get('returnCode') != 0: return False
+                if (p.get('assertionFailures') or p.get('killedBy') or p.get('anyFailures')
+                        or p.get('failureCount') or lines): return False
+            else:
+                if not e.get('returnCode'): return False   # every other status means the run failed
+            return True
+        if resumable(prev):
             continue
         res.pop(k, None)
         f = os.path.join(root, sites[0]['file'])
         src = open(f).read()
-        missing = [s0 for s0 in sites if open(os.path.join(root, s0['file'])).read().count(s0['old']) == 0]
+        # The requested OCCURRENCE must exist, not merely the anchor: an out-of-range occurrence
+        # left the splice index at -1, applied a different edit, and recorded its verdict as though
+        # the requested mutation had run.
+        missing = [s0 for s0 in sites
+                   if occurrences(open(os.path.join(root, s0['file'])).read(), s0['old']) < s0.get('occurrence', 1)]
         if missing:
             res[k] = {'status': 'ANCHOR-MISSING', 'file': missing[0]['file']}
             print(f"  {k:<40} ANCHOR-MISSING"); json.dump(res, open(outp,'w'), indent=1); continue
         m = dict(m, old=sites[0]['old'], new=sites[0]['new'])
-        n = src.count(sites[0]['old'])
+        n = sites[0]['occurrencesInFile']
         occ = sites[0].get('occurrence', 1)
         # locate the chosen occurrence
         pos, seen = -1, 0
@@ -214,6 +328,8 @@ def main():
                     seen2 += 1
                     if seen2 == s0.get('occurrence', 1): at = j; break
                     start2 = j + 1
+                if at < 0:
+                    raise RuntimeError(f"occurrence {s0.get('occurrence', 1)} of the anchor is not in {s0['file']}")
                 open(path, 'w').write(text[:at] + s0['new'] + text[at+len(s0['old']):])
             for s0 in sites:
                 path = os.path.join(root, s0['file'])
@@ -251,6 +367,10 @@ def main():
             status = 'BUILD-FAILED'
         elif rc != 0 and asserted:
             status = 'KILLED'
+            want_test = m.get('expectTest')
+            if want_test and not any(want_test in a for a in asserted):
+                # the suite went red, but not at the test this clause is supposed to be held by
+                status = 'KILLED-BY-ANOTHER-TEST'
         elif rc != 0 and failed and throw_kill_ok:
             # The clause under test IS "this must not throw", so a test that propagates the throw is
             # detecting exactly the right thing. The spec must SAY so in advance AND name the throw
@@ -268,8 +388,8 @@ def main():
         res[k] = {'status': status, 'clause': m.get('clause',''), 'requirement': m.get('requirement', k.split()[0]),
                   'documentText': m.get('documentText'),
                   'file': m['file'], 'occurrence': occ, 'occurrencesInFile': n, 'line': line,
-                  'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': (asserted or failed)[:4], 'assertionFailures': [n for n in asserted if any(n.split('.')[-1] in l for l in failure_lines(out, kind))][:8],
-                  'anyFailures': failed[:8],
+                  'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': (asserted or failed)[:4], 'failureCount': len(failed), 'assertionFailures': [n for n in asserted if any(n.split('.')[-1] in l for l in failure_lines(out, kind))],
+                  'anyFailures': failed,
                   'killedByThrow': (m.get('killedByThrow') if throw_kill_ok else None),
                   'seconds': round(time.time()-t0, 1),
                   'patch': patch,

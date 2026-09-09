@@ -180,6 +180,14 @@ The generator refuses a quote that is not verbatim in the requirement it sits un
 shares no vocabulary with the clause recorded against it; beyond that, attribution is a judgement
 made in review, and the merge gate for this change corrected several of them.
 
+**What backs this table.** The record is a file. Every refusal above checks it against itself or
+against the source it names — the clause a mutation claims to have broken must be in the repository
+at the commit the record names, exactly as many times as the record says — and no amount of that
+makes a file tamper-evident: a baseline block invented wholesale is internally consistent and always
+will be. What cannot be invented is the run. Re-run every mutation against your own checkout with
+`scripts/footprint-reverify.sh`, which compares status and the named kill for each one and fails on
+any difference. That, and not the record's internal shape, is what this table rests on.
+
 | id | Conformance | Gate | Disposition |
 |----|-------------|------|-------------|
 | G-R1 | 1 of 1 probes pinned, over 1 clause | 2 | Flag and wiring |
