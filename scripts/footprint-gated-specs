@@ -4,8 +4,4 @@
 # cannot drift away from what the pipeline does without the gate itself going red. The generator
 # reads it to decide which rows the conformance table may call re-run.
 #
-# The label is the Coverage cell's wording. The Jenkinsfile runs this stage on every build of
-# this repository — it cannot run in a GitHub check, because the build needs options-edge-contracts
-# installed from source and no hosted runner has it.
-label: re-run on every build
 scripts/footprint-campaign.spec.json

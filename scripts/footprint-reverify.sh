@@ -44,13 +44,22 @@ if [ "${1:-}" = "--not-the-gate" ]; then
 fi
 FULL=full
 if [ $# -gt 0 ]; then SPECS=("$1"); FULL=partial; [ $# -gt 1 ] && RECORD="$2"
-else SPECS=(scripts/footprint-campaign.spec.json scripts/footprint-campaign-java.spec.json); fi
+else
+    # Every committed spec, discovered rather than listed: a hard-coded pair was copied into a
+    # repository that has one spec, and named a file that does not exist there.
+    SPECS=()
+    for s in scripts/footprint-campaign*.json; do [ -r "$s" ] && SPECS+=("$s"); done
+    [ ${#SPECS[@]} -gt 0 ] || { echo "no scripts/footprint-campaign*.json to re-run" >&2; exit 2; }
+fi
 if [ -n "$AS_THE_GATE" ]; then
     [ -r scripts/footprint-gated-specs ] || {
         echo "scripts/footprint-gated-specs does not exist, so nothing says what this gate covers." >&2
         echo "Create it, or pass --not-the-gate if this is a person re-running by hand." >&2
         exit 2; }
-    declared=$(sed 's/#.*//' scripts/footprint-gated-specs | tr -d '[:blank:]' | grep -v '^$' | sort)
+    # `grep -v '^label:'`: the declaration also carries metadata, and comparing that against the
+    # spec list made the gate fail before it ran a single mutation.
+    declared=$(sed 's/#.*//' scripts/footprint-gated-specs | tr -d '[:blank:]' \
+               | grep -v '^$' | grep -v '^label:' | sort)
     running=$(printf '%s\n' "${SPECS[@]}" | sort)
     if [ "$declared" != "$running" ]; then
         echo "the gate ran specs the declaration does not name, or the other way round:" >&2

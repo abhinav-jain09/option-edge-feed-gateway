@@ -27,24 +27,25 @@ def gate_covers(repo):
     declared = os.path.join(repo, 'scripts/footprint-gated-specs')
     if not os.path.exists(declared):
         return None, None
-    covered, label = set(), None
+    covered = set()
     for line in open(declared):
         line = line.split('#', 1)[0].strip()
         if not line:
             continue
-        # `label:` says WHEN the gate runs, in the Coverage cell's own words. "re-run on every
-        # build" is true where CI re-runs on every commit and false where the pipeline re-runs only
-        # when a particular target is built, and a cell that overstates that is the same defect as
-        # a cell that overstates the campaign.
+        # A `label:` line used to give the Coverage cell free-text wording — "re-run on every
+        # build", "re-run when es-cvd is built". It came out again: nothing could check it, so it
+        # was a claim about CI sitting in the one column that is supposed to be derived. The cell
+        # now says only what the tooling guarantees — that this row is in the gate's spec set, and
+        # the gate cannot run anything else — and WHEN the gate runs is prose, where a claim that
+        # needs a human to keep it true belongs. The line is still tolerated and ignored.
         if line.startswith('label:'):
-            label = line.split(':', 1)[1].strip()
             continue
         try:
             covered.add(' '.join(json.load(open(os.path.join(repo, line)))['command']))
         except Exception as exc:
             print(f"note: scripts/footprint-gated-specs names {line}, which could not be read "
                   f"({type(exc).__name__}) — its probes count as not re-run", file=sys.stderr)
-    return covered, (label or 're-run on every build')
+    return covered, None
 
 
 def occurrences(text, needle):
@@ -573,7 +574,7 @@ def main():
         elif covered is None:
             cover = "recorded"
         else:
-            cover = covered_label
+            cover = "re-run by the gate"
         out.append(f"| {rid} | {state} | {gate(rid)} | {cover} | {disp(rid)} |")
     # Count only what the table shows. A record for a requirement the document no longer
     # renders is omitted from the rows, and must be omitted from the totals with it.

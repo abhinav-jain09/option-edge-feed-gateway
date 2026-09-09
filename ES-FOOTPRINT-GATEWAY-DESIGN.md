@@ -199,18 +199,18 @@ exactly the ones that file declares, so the column cannot drift from what the bu
 
 | id | Conformance | Gate | Coverage | Disposition |
 |----|-------------|------|----------|-------------|
-| G-R1 | 1 of 1 probes pinned, over 1 clause | 2 | re-run on every build | Flag and wiring |
-| G-R2 | 2 of 2 probes pinned, over 2 clauses | 2 | re-run on every build | Flag and wiring |
-| G-R3 | 3 of 3 probes pinned, over 3 clauses | 2 | re-run on every build | Delivery and views |
-| G-R4 | 4 of 4 probes pinned, over 4 clauses | 2 | re-run on every build | Delivery and views |
-| G-R5 | 4 of 4 probes pinned, over 4 clauses | 2 | re-run on every build | Delivery and views |
-| G-R6 | 3 of 3 probes pinned, over 3 clauses | 2 | re-run on every build | Hello |
-| G-R7 | 4 of 5 probes pinned, over 4 clauses (1 survived) | 2 | re-run on every build | Backfill routes |
-| G-R8 | 5 of 5 probes pinned, over 5 clauses | 2 | re-run on every build | Deployment contingency |
-| G-R9 | 3 of 3 probes pinned, over 3 clauses | 2 | re-run on every build | Metrics |
-| G-R10 | 2 of 2 probes pinned, over 2 clauses | 2 | re-run on every build | Non-interference |
+| G-R1 | 1 of 1 probes pinned, over 1 clause | 2 | re-run by the gate | Flag and wiring |
+| G-R2 | 2 of 2 probes pinned, over 2 clauses | 2 | re-run by the gate | Flag and wiring |
+| G-R3 | 3 of 3 probes pinned, over 3 clauses | 2 | re-run by the gate | Delivery and views |
+| G-R4 | 4 of 4 probes pinned, over 4 clauses | 2 | re-run by the gate | Delivery and views |
+| G-R5 | 4 of 4 probes pinned, over 4 clauses | 2 | re-run by the gate | Delivery and views |
+| G-R6 | 3 of 3 probes pinned, over 3 clauses | 2 | re-run by the gate | Hello |
+| G-R7 | 4 of 5 probes pinned, over 4 clauses (1 survived) | 2 | re-run by the gate | Backfill routes |
+| G-R8 | 5 of 5 probes pinned, over 5 clauses | 2 | re-run by the gate | Deployment contingency |
+| G-R9 | 3 of 3 probes pinned, over 3 clauses | 2 | re-run by the gate | Metrics |
+| G-R10 | 2 of 2 probes pinned, over 2 clauses | 2 | re-run by the gate | Non-interference |
 | G-R11 | TEST INVENTORY: this requirement lists the tests the others are held by, so it has no production clause a mutation could break (not probed) | 2 | — | Tests |
-| G-R8a | 2 of 2 probes pinned, over 2 clauses | 2 | re-run on every build | Deployment contingency |
+| G-R8a | 2 of 2 probes pinned, over 2 clauses | 2 | re-run by the gate | Deployment contingency |
 
 12 requirements; 11 probed by 34 mutations (33 killed, 1 surviving).
 
