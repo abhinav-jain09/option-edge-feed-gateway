@@ -16,6 +16,20 @@ would report every clause as pinned.
 """
 import json, subprocess, sys, os, shutil, signal, re, time, hashlib
 
+def assertion_line(line):
+    """Is this surefire line an ASSERTION failure rather than a thrown exception?
+
+    `<<< FAILURE!` says so outright. The numbered summary is NOT enough on its own: surefire prints
+    `Class.method:123 » RuntimeException boom` for a THROW in exactly the same shape, and accepting
+    any `:LINE ` let a forged record pair one `<<< ERROR!` line with an error summary and pass as an
+    assertion kill. So take the summary only when it is not the ` » Exception` form.
+    """
+    if '<<< ERROR!' in line:
+        return False
+    if '<<< FAILURE!' in line:
+        return True
+    return bool(re.search(r':\d+ ', line)) and ' » ' not in line
+
 def failure_lines(out, kind):
     """The VERBATIM lines the killedBy names were parsed from, so the record substantiates itself.
     A tail of the output does not: Maven prints its failures well before the build summary, so the
@@ -170,8 +184,7 @@ def main():
                         short = n.split('.')[-1]
                         carrying = [l for l in lines if short in l]
                         if not carrying: return False
-                        if kind == 'maven' and not any('<<< FAILURE!' in l or re.search(r':\d+ ', l)
-                                                       for l in carrying):
+                        if kind == 'maven' and not any(assertion_line(l) for l in carrying):
                             return False
                 elif isinstance(t, dict) and t.get('test') and t.get('throws'):
                     joined = '\n'.join(lines)

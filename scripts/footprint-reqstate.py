@@ -7,6 +7,20 @@ this replaces is a hand-maintained table drifting away from the code it claims t
 """
 import json, os, re, sys, collections
 
+def assertion_line(line):
+    """Is this surefire line an ASSERTION failure rather than a thrown exception?
+
+    `<<< FAILURE!` says so outright. The numbered summary is NOT enough on its own: surefire prints
+    `Class.method:123 » RuntimeException boom` for a THROW in exactly the same shape, and accepting
+    any `:LINE ` let a forged record pair one `<<< ERROR!` line with an error summary and pass as an
+    assertion kill. So take the summary only when it is not the ` » Exception` form.
+    """
+    if '<<< ERROR!' in line:
+        return False
+    if '<<< FAILURE!' in line:
+        return True
+    return bool(re.search(r':\d+ ', line)) and ' » ' not in line
+
 def main():
     recordPath, docPath, idPattern, gates, dispositions = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4]), json.loads(sys.argv[5])
     # Requirements whose subject is not production behaviour (a test inventory) or whose behaviour
@@ -109,7 +123,7 @@ def main():
                 carrying = [l for l in lines if short in l]
                 if not carrying:
                     problems.append(f"{rid}: names assertion failure {name} that its own failure lines do not carry")
-                elif kind == 'maven' and not any('<<< FAILURE!' in l or re.search(r':\d+ ', l) for l in carrying):
+                elif kind == 'maven' and not any(assertion_line(l) for l in carrying):
                     # Surefire marks a THROW as ERROR and an assertion as FAILURE, and prints the
                     # assertion's own `Class.method:LINE message` summary. Requiring the ABSENCE of
                     # ERROR was not enough: adding the ordinary summary line to an ERROR record
