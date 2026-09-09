@@ -11,3 +11,9 @@ target/
 
 # Build provenance written by the contracts install stage — never committed.
 .contracts-sha
+
+# The contracts checkout the Install Contracts stage clones into the workspace. Untracked and
+# unignored, it made `git status --porcelain` non-empty for the rest of the build — which the
+# footprint reverification reads as a dirty tree and refuses to run against. The gate would have
+# failed on every Jenkins build, for a directory the build itself creates.
+.deps/
