@@ -5,7 +5,7 @@ The state column is derived, never typed: a requirement is what its mutations sa
 requirement the campaign did not probe says exactly that, and claims nothing else — the failure mode
 this replaces is a hand-maintained table drifting away from the code it claims to describe.
 """
-import json, os, re, sys, collections
+import hashlib, json, os, re, sys, collections
 
 def assertion_line(line):
     """Is this surefire line an ASSERTION failure rather than a thrown exception?
@@ -70,6 +70,66 @@ def main():
         if line.strip(): req_text[cur] += '\n' + line.rstrip()
 
     problems = []
+
+    # The whole pinned column rests on the baseline: the claim is "this failure came from the
+    # mutation, because the same command passed on the same tree without it". Commit, command and
+    # returnCode are three hand-editable fields, and matching them establishes only that someone
+    # wrote them consistently — a baseline block reduced to {commit, command, returnCode: 0} carries
+    # no evidence that any run happened at all. Demand the run's own output, and demand that it say
+    # what the record claims it said.
+    BASELINE_TAIL_CAP = 1500     # what the harness records; a SHORTER tail is the whole output
+
+    def baseline_ran(rid, m, base, ev):
+        tail = base.get('outputTail')
+        if not base.get('outputSha256'):
+            problems.append(f"{rid}: the baseline carries no hash of its output, so nothing says "
+                            f"the green run it claims ever happened")
+            return
+        if not tail:
+            problems.append(f"{rid}: the baseline carries no output, so nothing says what it "
+                            f"actually reported")
+            return
+        if base.get('outputSha256') == ev.get('outputSha256'):
+            problems.append(f"{rid}: the baseline and the mutation record the SAME output hash; "
+                            f"a passing run and a failing one are not the same run")
+        # A tail shorter than the cap is the COMPLETE output, so its hash is checkable. This is the
+        # only place the recorded hash can be verified rather than trusted, and short suites — the
+        # node ones — land here.
+        if len(tail) < BASELINE_TAIL_CAP:
+            if hashlib.sha256(tail.encode()).hexdigest() != base.get('outputSha256'):
+                problems.append(f"{rid}: the baseline's output hash is not the hash of the output "
+                                f"it recorded")
+        # And it must SAY it passed, in the idiom of the runner that produced it. `returnCode: 0` is
+        # one editable integer; the runner's own verdict lines are the thing that has to agree with
+        # it. They are pulled from the WHOLE baseline output, not the tail — the tail of these
+        # suites is whatever the last test logged.
+        verdict = base.get('resultLines')
+        if not verdict:
+            problems.append(f"{rid}: the baseline records no verdict from its runner, so the only "
+                            f"thing saying it passed is its own return code")
+        elif runner_of(m) == 'maven':
+            if not any('BUILD SUCCESS' in l for l in verdict):
+                problems.append(f"{rid}: the baseline claims to have passed, but its runner did not "
+                                f"report BUILD SUCCESS ({verdict!r})")
+            for l in verdict:
+                hit = re.search(r'Tests run: \d+, Failures: (\d+), Errors: (\d+)', l)
+                if hit and (hit.group(1) != '0' or hit.group(2) != '0'):
+                    problems.append(f"{rid}: the baseline claims to have passed, but its runner "
+                                    f"reported {hit.group(1)} failures and {hit.group(2)} errors")
+                    break
+        else:
+            if not any(l.strip() == '# fail 0' for l in verdict):
+                problems.append(f"{rid}: the baseline claims to have passed, but its runner did not "
+                                f"report zero failures ({verdict!r})")
+        # The baseline is the run WITHOUT the mutation. Its output carrying this record's own
+        # failures would mean the tree was already red, which is the one thing the baseline exists
+        # to rule out.
+        for l in (ev.get('failureLines') or []):
+            if l.strip() and l.strip() in tail:
+                problems.append(f"{rid}: the baseline's own output carries this record's failure "
+                                f"{l.strip()[:60]!r}, so the tree was red before the mutation")
+                break
+
     # The runner is whatever the recorded COMMAND ran, not whatever its lines look like. Inferring
     # it from failureLines let a single forged `not ok …` line switch the whole record into node
     # mode and skip the surefire assertion check entirely.
@@ -167,6 +227,7 @@ def main():
                                 f"(returnCode {base.get('returnCode')})")
             if not ev.get('outputSha256'):
                 problems.append(f"{rid}: a KILLED record carries no hash of its run output")
+            baseline_ran(rid, m, base, ev)
             # the named assertion failures must be the ones THIS run produced
             lines = m.get('evidence', {}).get('failureLines') or []
             runner_of(m)   # cross-check command against evidence for EVERY kill, not only the

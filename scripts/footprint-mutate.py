@@ -128,6 +128,25 @@ def _restore_and_exit(signum, frame):
     print(f"\ninterrupted by signal {signum}: tree restored and compiled classes discarded")
     sys.exit(130)
 
+
+def result_lines(out, kind):
+    """The runner's own verdict lines, from the complete output.
+
+    Maven: the surefire per-module totals and the reactor's BUILD SUCCESS/FAILURE.
+    Node:  the TAP plan totals.
+    """
+    if kind == 'maven':
+        pat = re.compile(r'^(?:\[INFO\] |\[ERROR\] )?(?:Tests run: \d+, Failures: \d+, Errors: \d+.*'
+                         r'|BUILD SUCCESS|BUILD FAILURE)$')
+    else:
+        pat = re.compile(r'^# (?:tests|pass|fail|skipped|todo) \d+$')
+    seen, keep = set(), []
+    for line in out.splitlines():
+        l = line.strip()
+        if pat.match(l) and l not in seen:
+            seen.add(l); keep.append(l)
+    return keep
+
 def main():
     spec = json.load(open(sys.argv[1]))
     outp = sys.argv[2]
@@ -145,8 +164,14 @@ def main():
     rc, out = run(cmd, root)
     if rc != 0:
         print("BASELINE IS RED — refusing to run a campaign against a failing suite"); print(out[-3000:]); sys.exit(2)
+    # A 1500-character tail of a suite's stdout is whatever the last test happened to log — for the
+    # footprint suites that is a wall of violation traces, not the runner's verdict. The verdict is
+    # what a baseline has to carry: pull the runner's own result lines out of the WHOLE output so a
+    # record states, in the runner's words, that it passed. Without this the only thing standing
+    # behind "the baseline was green" is a hand-editable returnCode.
     baseline = {'commit': commit, 'command': ' '.join(cmd), 'returnCode': rc,
-                'outputSha256': sha(out), 'outputTail': out[-1500:]}
+                'outputSha256': sha(out), 'outputTail': out[-1500:],
+                'resultLines': result_lines(out, kind)}
     base_tests = re.search(r'Tests run: (\d+)', out) or re.search(r'# pass (\d+)', out)
     print(f"baseline GREEN ({base_tests.group(1) if base_tests else '?'} tests) — {' '.join(cmd)}\n")
 
@@ -173,6 +198,13 @@ def main():
             if e.get('treeRestoredClean') is not True: return False   # missing is not clean
             if not e.get('outputSha256') or b.get('returnCode') != 0: return False
             if b.get('command') != p.get('command') or not p.get('command'): return False
+            # The baseline's own run evidence, for the same reason the renderer demands it: commit,
+            # command and return code are three fields a hand-edit can make agree, and a record
+            # whose baseline block carries no output is a record that proves nothing about what ran.
+            if not b.get('outputSha256') or not b.get('outputTail'): return False
+            if b.get('outputSha256') == e.get('outputSha256'): return False
+            if not b.get('resultLines'): return False
+            if b.get('resultLines') != baseline.get('resultLines'): return False
             if b.get('commit') != commit: return False   # missing is not a match
             lines = e.get('failureLines') or []
             if p.get('status') == 'KILLED':
