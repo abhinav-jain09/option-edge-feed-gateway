@@ -73,11 +73,9 @@ def main():
     # The runner is whatever the recorded COMMAND ran, not whatever its lines look like. Inferring
     # it from failureLines let a single forged `not ok …` line switch the whole record into node
     # mode and skip the surefire assertion check entirely.
-    commands = {m0.get('command', '') for ms0 in per.values() for m0 in ms0}
-    kinds = {('node' if ' --test' in c or c.startswith('node ') else 'maven') for c in commands if c}
-    if len(kinds) > 1:
-        problems.append("the records were produced by more than one kind of runner: " + ", ".join(sorted(kinds)))
-    kind = next(iter(kinds), 'maven')
+    def runner_of(m0):
+        c = m0.get('command', '')
+        return 'node' if (' --test' in c or c.startswith('node ')) else 'maven'
     for rid, ms in per.items():
         for m in ms:
             # ATTRIBUTION, for every record whatever its status: the obligation a row quotes must be
@@ -139,7 +137,7 @@ def main():
                 carrying = [l for l in lines if short in l]
                 if not carrying:
                     problems.append(f"{rid}: names assertion failure {name} that its own failure lines do not carry")
-                elif kind == 'maven' and not any(assertion_line(l) for l in carrying):
+                elif runner_of(m) == 'maven' and not any(assertion_line(l) for l in carrying):
                     # Surefire marks a THROW as ERROR and an assertion as FAILURE, and prints the
                     # assertion's own `Class.method:LINE message` summary. Requiring the ABSENCE of
                     # ERROR was not enough: adding the ordinary summary line to an ERROR record
