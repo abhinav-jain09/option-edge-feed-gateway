@@ -129,6 +129,19 @@ def _restore_and_exit(signum, frame):
     sys.exit(130)
 
 
+def occurrences(text, needle):
+    """How many times `needle` appears, counted the way the splice locator scans.
+
+    The locator advances by ONE character, so it finds overlapping matches; str.count does not.
+    Counting differently from the locator refuses a legal occurrence.
+    """
+    n, at = 0, 0
+    while True:
+        i = text.find(needle, at)
+        if i < 0: return n
+        n += 1; at = i + 1
+
+
 def result_lines(out, kind):
     """The runner's own verdict lines, from the complete output.
 
@@ -191,7 +204,16 @@ def main():
         # survivor of a test that is in fact perfectly capable of catching the clause's removal.
         sites = m.get('sites') or [{'file': m['file'], 'old': m['old'], 'new': m['new'],
                                     'occurrence': m.get('occurrence', 1)}]
-        patch = {'sites': sites} if m.get('sites') else {'old': m['old'], 'new': m['new']}
+        # Every site carries how many times its clause occurs in its file. Recording the count for
+        # the first site only left a multi-site record's other sites with no count at all, and a
+        # check that skips when the field is absent is not a check. Computed here, before the
+        # resume comparison, so a resumed record is compared against the same patch shape it stores.
+        sites = [dict(s0, occurrencesInFile=occurrences(
+                     open(os.path.join(root, s0['file'])).read(), s0['old']))
+                 for s0 in sites]
+        patch = ({'sites': sites} if m.get('sites')
+                 else {'old': sites[0]['old'], 'new': sites[0]['new'],
+                       'occurrencesInFile': sites[0]['occurrencesInFile']})
         def resumable(p):
             # A stored record is only reusable if it is internally consistent: a KILLED entry must
             # carry a non-zero exit, named assertion failures, and the verbatim lines those names
@@ -246,21 +268,13 @@ def main():
         # The requested OCCURRENCE must exist, not merely the anchor: an out-of-range occurrence
         # left the splice index at -1, applied a different edit, and recorded its verdict as though
         # the requested mutation had run.
-        def occurrences(text, needle):
-            # The splice locator advances by ONE character, so it finds overlapping matches; str.count
-            # does not. Counting differently from the locator refuses a legal occurrence.
-            n, at = 0, 0
-            while True:
-                i = text.find(needle, at)
-                if i < 0: return n
-                n += 1; at = i + 1
         missing = [s0 for s0 in sites
                    if occurrences(open(os.path.join(root, s0['file'])).read(), s0['old']) < s0.get('occurrence', 1)]
         if missing:
             res[k] = {'status': 'ANCHOR-MISSING', 'file': missing[0]['file']}
             print(f"  {k:<40} ANCHOR-MISSING"); json.dump(res, open(outp,'w'), indent=1); continue
         m = dict(m, old=sites[0]['old'], new=sites[0]['new'])
-        n = src.count(sites[0]['old'])
+        n = sites[0]['occurrencesInFile']
         occ = sites[0].get('occurrence', 1)
         # locate the chosen occurrence
         pos, seen = -1, 0

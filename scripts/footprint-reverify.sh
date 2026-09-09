@@ -7,9 +7,11 @@
 # invented wholesale is internally consistent and always will be. What cannot be invented is the
 # run — so the record's authority is that anyone can reproduce it, and this script is how.
 #
-# Re-runs every mutation in the spec against THIS checkout, then compares status, the assertion
-# failures each kill names, and the throw a killedByThrow record names. Any difference is reported
-# and fails; timings, hashes and output tails are expected to differ and are not compared.
+# Re-runs every mutation in the spec against THIS checkout and compares two things: WHAT each row
+# claims — its requirement, quoted obligation, file, occurrence and patch, all of which come from
+# the committed spec — and WHETHER the outcome reproduces: the status, the assertion failures each
+# kill names, and the throw a killedByThrow record names. Any difference is reported and fails.
+# Timings, hashes, output tails and source positions are expected to differ and are not compared.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -33,7 +35,21 @@ for k in sorted(set(was) | set(now)):
     if k not in was: bad.append(f"{k}: the re-run produced a mutation the record does not have"); continue
     if k not in now: bad.append(f"{k}: the record has a mutation the re-run did not produce"); continue
     a, b = was[k], now[k]
-    if a['status'] != b['status']:
+    # WHAT the row claims, before whether the outcome reproduces. Comparing only status and kill let
+    # a record keep a genuine key and a genuine failure while its requirement, quoted obligation,
+    # file or patch were re-pointed at something else: the re-run reproduces the spec's mutation and
+    # agrees about the outcome, and the table then attributes that outcome to a clause nobody broke.
+    # These fields all come from the committed spec, so the spec is what each row is held to.
+    #
+    # `line` and `enclosing` are deliberately NOT compared: they are positions in the source, and
+    # this script is meant to be run against a later checkout where they legitimately move.
+    identity = ('requirement', 'clause', 'documentText', 'file', 'occurrence',
+                'occurrencesInFile', 'command', 'patch')
+    differing = [fld for fld in identity if a.get(fld) != b.get(fld)]
+    if differing:
+        for fld in differing:
+            bad.append(f"{k}: the record's {fld} is not the spec's ({a.get(fld)!r} vs {b.get(fld)!r})")
+    elif a['status'] != b['status']:
         bad.append(f"{k}: recorded {a['status']}, re-ran {b['status']}")
     elif sorted(a.get('assertionFailures') or []) != sorted(b.get('assertionFailures') or []):
         bad.append(f"{k}: recorded kills {a.get('assertionFailures')}, re-ran {b.get('assertionFailures')}")

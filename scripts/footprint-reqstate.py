@@ -7,6 +7,17 @@ this replaces is a hand-maintained table drifting away from the code it claims t
 """
 import hashlib, json, os, re, subprocess, sys, collections
 
+def occurrences(text, needle):
+    """Counted the way the harness's splice locator scans: advancing by one character, so
+    overlapping matches are found. str.count does not, and counting differently from the locator
+    would report drift where there is none."""
+    n, at = 0, 0
+    while True:
+        i = text.find(needle, at)
+        if i < 0: return n
+        n += 1; at = i + 1
+
+
 def assertion_line(line):
     """Is this surefire line an ASSERTION failure rather than a thrown exception?
 
@@ -93,7 +104,7 @@ def main():
         patch = m.get('patch') or {}
         sites = patch.get('sites') or [{'file': m.get('file'), 'old': patch.get('old'),
                                         'occurrence': m.get('occurrence', 1),
-                                        'occurrencesInFile': m.get('occurrencesInFile')}]
+                                        'occurrencesInFile': patch.get('occurrencesInFile')}]
         for site in sites:
             path, old = site.get('file'), site.get('old')
             if not path or not old:
@@ -113,13 +124,20 @@ def main():
                 problems.append(f"{rid}: {path} cannot be read at {commit[:12]}, so nothing says "
                                 f"the clause this mutation broke was ever there")
                 continue
-            n = blob.count(old)
+            n = occurrences(blob, old)
+            said = site.get('occurrencesInFile')
             if n == 0:
                 problems.append(f"{rid}: the clause this mutation claims to have broken is not in "
                                 f"{path} at {commit[:12]}")
-            elif site.get('occurrencesInFile') is not None and n != site['occurrencesInFile']:
-                problems.append(f"{rid}: the record says the clause occurs {site['occurrencesInFile']} "
-                                f"time(s) in {path}; at {commit[:12]} it occurs {n}")
+            # `is None` is not the same as "absent is fine": a site that states no count states
+            # nothing, and skipping the comparison when the field is missing made the check optional
+            # — a fabricated site had only to omit it.
+            elif not isinstance(said, int) or said < 1:
+                problems.append(f"{rid}: a mutation site in {path} states no occurrence count, so "
+                                f"there is nothing to compare against the {n} in the tree")
+            elif n != said:
+                problems.append(f"{rid}: the record says the clause occurs {said} time(s) in "
+                                f"{path}; at {commit[:12]} it occurs {n}")
             elif n < (site.get('occurrence') or 1):
                 problems.append(f"{rid}: the record mutates occurrence {site.get('occurrence')} of a "
                                 f"clause that occurs {n} time(s) in {path}")
