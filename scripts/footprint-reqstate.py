@@ -124,9 +124,32 @@ def main():
                 # the reader looking for a deleted file when the truth is a shallow checkout. CI
                 # clones at depth 1, so a record's commit — an ancestor — is simply not in the copy.
                 # Either way this fails: a check that cannot run is not a check that passed.
-                have = subprocess.run(['git', 'cat-file', '-e', f'{commit}^{{commit}}'],
-                                      capture_output=True, text=True, cwd=repo).returncode == 0
-                if not have:
+                # `git cat-file -e` exits 1 for a commit this copy does not have — but it also
+                # exits non-zero when git cannot run at all, when the directory is not a repository,
+                # and when the name is malformed, and prescribing `fetch-depth: 0` for any of those
+                # sends the reader somewhere useless. Only exit 1 with nothing on stderr is the
+                # absent-commit answer; everything else is reported as git's own failure, in git's
+                # own words. And the call is inside the try, so a git that cannot be executed at all
+                # produces this refusal rather than a traceback.
+                try:
+                    # `rev-parse --verify --quiet`, not `cat-file -e`: cat-file prints
+                    # "fatal: Not a valid object name" for a commit the copy does not have, so its
+                    # stderr cannot separate "absent" from "git is unhappy". rev-parse --quiet exits
+                    # 1 SILENTLY for a name it cannot resolve and keeps stderr for real trouble —
+                    # not a repository, an unreadable object database, git missing entirely.
+                    probe = subprocess.run(['git', 'rev-parse', '--verify', '--quiet',
+                                            f'{commit}^{{commit}}'],
+                                           capture_output=True, text=True, cwd=repo)
+                    absent = probe.returncode == 1 and not probe.stderr.strip()
+                    trouble = None if (probe.returncode in (0, 1) and not probe.stderr.strip()) \
+                              else (probe.stderr.strip().splitlines() or [f'exit {probe.returncode}'])[0]
+                except Exception as exc:
+                    absent, trouble = False, f'{type(exc).__name__}: {exc}'
+                if trouble:
+                    problems.append(f"{rid}: git could not be asked whether commit {commit[:12]} is "
+                                    f"in this copy of the repository ({trouble}), so the clause this "
+                                    f"mutation broke cannot be looked up")
+                elif absent:
                     problems.append(f"{rid}: commit {commit[:12]} is not in this copy of the "
                                     f"repository, so the clause this mutation broke cannot be "
                                     f"looked up — check out with full history (fetch-depth: 0)")
