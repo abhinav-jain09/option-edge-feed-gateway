@@ -149,13 +149,30 @@ def main():
         sites = m.get('sites') or [{'file': m['file'], 'old': m['old'], 'new': m['new'],
                                     'occurrence': m.get('occurrence', 1)}]
         patch = {'sites': sites} if m.get('sites') else {'old': m['old'], 'new': m['new']}
-        if prev is not None and prev.get('patch') == patch \
-                and prev.get('evidence', {}).get('repoCommit') == commit:
+        def resumable(p):
+            # A stored record is only reusable if it is internally consistent: a KILLED entry must
+            # carry a non-zero exit, named assertion failures, and the verbatim lines those names
+            # came from. Matching the patch and the commit says nothing about the rest of the file.
+            if p is None or p.get('patch') != patch: return False
+            e = p.get('evidence', {})
+            if e.get('repoCommit') != commit: return False
+            if e.get('treeRestoredClean') is False: return False
+            if p.get('status') == 'KILLED':
+                if not e.get('returnCode'): return False
+                if not (p.get('assertionFailures') or p.get('killedByThrow')): return False
+                if not e.get('failureLines'): return False
+            if p.get('status') == 'SURVIVED' and e.get('returnCode'): return False
+            return True
+        if resumable(prev):
             continue
         res.pop(k, None)
         f = os.path.join(root, sites[0]['file'])
         src = open(f).read()
-        missing = [s0 for s0 in sites if open(os.path.join(root, s0['file'])).read().count(s0['old']) == 0]
+        # The requested OCCURRENCE must exist, not merely the anchor: an out-of-range occurrence
+        # left the splice index at -1, applied a different edit, and recorded its verdict as though
+        # the requested mutation had run.
+        missing = [s0 for s0 in sites
+                   if open(os.path.join(root, s0['file'])).read().count(s0['old']) < s0.get('occurrence', 1)]
         if missing:
             res[k] = {'status': 'ANCHOR-MISSING', 'file': missing[0]['file']}
             print(f"  {k:<40} ANCHOR-MISSING"); json.dump(res, open(outp,'w'), indent=1); continue
@@ -214,6 +231,8 @@ def main():
                     seen2 += 1
                     if seen2 == s0.get('occurrence', 1): at = j; break
                     start2 = j + 1
+                if at < 0:
+                    raise RuntimeError(f"occurrence {s0.get('occurrence', 1)} of the anchor is not in {s0['file']}")
                 open(path, 'w').write(text[:at] + s0['new'] + text[at+len(s0['old']):])
             for s0 in sites:
                 path = os.path.join(root, s0['file'])
@@ -251,6 +270,10 @@ def main():
             status = 'BUILD-FAILED'
         elif rc != 0 and asserted:
             status = 'KILLED'
+            want_test = m.get('expectTest')
+            if want_test and not any(want_test in a for a in asserted):
+                # the suite went red, but not at the test this clause is supposed to be held by
+                status = 'KILLED-BY-ANOTHER-TEST'
         elif rc != 0 and failed and throw_kill_ok:
             # The clause under test IS "this must not throw", so a test that propagates the throw is
             # detecting exactly the right thing. The spec must SAY so in advance AND name the throw
@@ -268,8 +291,8 @@ def main():
         res[k] = {'status': status, 'clause': m.get('clause',''), 'requirement': m.get('requirement', k.split()[0]),
                   'documentText': m.get('documentText'),
                   'file': m['file'], 'occurrence': occ, 'occurrencesInFile': n, 'line': line,
-                  'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': (asserted or failed)[:4], 'assertionFailures': [n for n in asserted if any(n.split('.')[-1] in l for l in failure_lines(out, kind))][:8],
-                  'anyFailures': failed[:8],
+                  'enclosing': encl, 'command': ' '.join(cmd), 'killedBy': (asserted or failed)[:4], 'failureCount': len(failed), 'assertionFailures': [n for n in asserted if any(n.split('.')[-1] in l for l in failure_lines(out, kind))],
+                  'anyFailures': failed,
                   'killedByThrow': (m.get('killedByThrow') if throw_kill_ok else None),
                   'seconds': round(time.time()-t0, 1),
                   'patch': patch,

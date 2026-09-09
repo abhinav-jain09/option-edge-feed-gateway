@@ -5,7 +5,7 @@ The state column is derived, never typed: a requirement is what its mutations sa
 requirement the campaign did not probe says exactly that, and claims nothing else — the failure mode
 this replaces is a hand-maintained table drifting away from the code it claims to describe.
 """
-import json, re, sys, collections
+import json, os, re, sys, collections
 
 def main():
     recordPath, docPath, idPattern, gates, dispositions = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4]), json.loads(sys.argv[5])
@@ -38,13 +38,22 @@ def main():
     # format-string error under the right test's name, which is exactly what this refuses.
     # The requirement text as the DOCUMENT states it, so an obligation can be checked against the
     # requirement it is filed under rather than trusted.
-    req_text = {}
+    # A requirement's normative text is its table ROW plus any continuation lines that follow it —
+    # the state tables in these documents live below their row, and an obligation stated there is
+    # still that requirement's obligation. Reading the row alone made those unquotable.
+    req_text, cur = {}, None
     for line in authoritative.split('\n'):
         mm = re.match(r'^\|\s*(' + idPattern + r')\s*\|\s*(.*)$', line)
         if mm:
             t = mm.group(2).rstrip()
             if t.endswith('|'): t = t[:-1].rstrip()
-            if len(t) > len(req_text.get(mm.group(1), '')): req_text[mm.group(1)] = t
+            cur = mm.group(1)
+            if len(t) > len(req_text.get(cur, '')): req_text[cur] = t
+            continue
+        if cur is None: continue
+        if re.match(r'^(#{1,6} |\||---)', line):     # a new section, a new table row, or a rule
+            cur = None; continue
+        if line.strip(): req_text[cur] += '\n' + line.rstrip()
 
     problems = []
     for rid, ms in per.items():
@@ -76,6 +85,20 @@ def main():
                                 f"quote {dt[:60]!r}")
             if m['status'] != 'KILLED':
                 continue
+            # The run must have actually failed, and against the baseline this campaign proved
+            # green. A record is an editable file: without these, a hand-edited entry with
+            # returnCode 0 renders as pinned.
+            ev = m.get('evidence', {})
+            if ev.get('returnCode') in (None, 0):
+                problems.append(f"{rid}: a KILLED record whose run exited {ev.get('returnCode')}")
+            if not ev.get('repoCommit'):
+                problems.append(f"{rid}: a KILLED record names no repository commit")
+            base = m.get('baseline', {})
+            if base.get('returnCode') not in (0,):
+                problems.append(f"{rid}: a KILLED record whose baseline did not pass "
+                                f"(returnCode {base.get('returnCode')})")
+            if not ev.get('outputSha256'):
+                problems.append(f"{rid}: a KILLED record carries no hash of its run output")
             # the named assertion failures must be the ones THIS run produced
             fl = '\n'.join(m.get('evidence', {}).get('failureLines') or [])
             for name in (m.get('assertionFailures') or []):
@@ -97,6 +120,35 @@ def main():
                 problems.append(f"{rid}: a KILLED record carries no failure lines")
             if not m.get('evidence', {}).get('treeRestoredClean', True):
                 problems.append(f"{rid}: a KILLED record ran against a tree it did not restore")
+    # The hand-maintained preamble sits INSIDE the generated block, so a stale sentence in it
+    # survives regeneration and --check. Hold it to the record: every probe key it names must exist,
+    # and it may not state a survivor count that the record contradicts.
+    pre = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'footprint-reqstate.preamble')
+    if os.path.exists(pre):
+        text_pre = open(pre).read()
+        # Take every backticked span that BEGINS with a requirement id and compare the WHOLE span
+        # against the record's keys. Constraining the clause part to a shape is how the guard
+        # skipped `F-R9 line50: delta ` — the one name that was actually stale.
+        for named in set(re.findall(r'`((?:F|G|P)-(?:R|E)?\d+[a-z]?(?:\.\d+)?[^`]*)`', text_pre)):
+            if ' ' not in named.strip():
+                continue                      # a bare requirement id, not a probe reference
+            if named not in rec:
+                problems.append(f"the preamble names `{named}`, which is not in the record")
+        surv = sum(1 for v in rec.values() if v['status'] == 'SURVIVED')
+        words = {'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,'seven':7,'eight':8,'nine':9,'ten':10}
+        # Any spelt or digit count next to the word "surviv" must agree with the record, in whatever
+        # phrasing: pinning one sentence shape leaves every other phrasing unchecked.
+        for m2 in re.finditer(r'\b(\d+|' + '|'.join(words) + r')\b(?=[^.]{0,60}surviv)', text_pre, re.I):
+            tok = m2.group(1).lower()
+            n = int(tok) if tok.isdigit() else words[tok]
+            if n != surv:
+                problems.append(f"the preamble says {tok} where the record has {surv} surviving")
+
+    commits = {m.get('evidence', {}).get('repoCommit') for ms in per.values() for m in ms}
+    commits.discard(None)
+    if len(commits) > 1:
+        problems.append("the records come from " + str(len(commits)) + " different commits; a table "
+                        "that mixes them is not one campaign: " + ", ".join(sorted(c[:12] for c in commits)))
     if problems:
         print("REFUSING TO EMIT:", file=sys.stderr)
         for p in problems: print("  ", p, file=sys.stderr)
