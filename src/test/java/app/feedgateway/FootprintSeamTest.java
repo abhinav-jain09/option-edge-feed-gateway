@@ -190,13 +190,23 @@ class FootprintSeamTest {
         // total frame count that also includes whatever else the session was sent. A two-second
         // budget on a loaded machine expired with four of the five delivered, and the assertion
         // then reported a delivery defect that did not exist.
-        java.util.function.Function<List<String>, Long> footprintFrames =
-                sink -> sink.stream().filter(m -> m.contains("es-footprint")).count();
+        // Collections.synchronizedList guards each METHOD, not an iteration: streaming it while the
+        // delivery threads append is undefined. Count under the list's own monitor, which is the
+        // lock those methods take.
+        java.util.function.Function<List<String>, Long> footprintFrames = sink -> {
+            synchronized (sink) {
+                long n = 0;
+                for (String m : sink) if (m.contains("es-footprint")) n++;
+                return n;
+            }
+        };
         long deadline = System.currentTimeMillis() + 30_000;
         while ((footprintFrames.apply(a) < 5 || footprintFrames.apply(b) < 5)
                 && System.currentTimeMillis() < deadline) Thread.sleep(5);
         for (List<String> sink : List.of(a, b)) {
-            List<String> footprint = sink.stream().filter(m -> m.contains("es-footprint")).toList();
+            List<String> snapshot;
+            synchronized (sink) { snapshot = List.copyOf(sink); }
+            List<String> footprint = snapshot.stream().filter(m -> m.contains("es-footprint")).toList();
             assertEquals(5, footprint.size(), "four events + the stale bar, never the oversize one: " + footprint);
             assertTrue(footprint.stream().anyMatch(m -> m.contains("\"es-footprint\"") && m.contains("\"live\":true")));
             assertTrue(footprint.stream().anyMatch(m -> m.contains("es-footprint-evidence")));

@@ -153,36 +153,64 @@ class FootprintWiringTest {
      * {@code max_over_time(jvm_memory_bytes_used{area="heap"}[8h])} over a full session.
      */
     @Test void theMetricsCarryTheJvmMemorySeriesTheContingencyIsStatedOver() {
-        String m = on().metrics();
-        for (String series : new String[]{"jvm_memory_bytes_used", "jvm_memory_bytes_committed", "jvm_memory_bytes_max"}) {
-            assertTrue(m.contains("# TYPE " + series + " gauge\n"), series + " is typed");
-            for (String area : new String[]{"heap", "nonheap"}) {
-                assertTrue(m.contains(series + "{area=\"" + area + "\"} "), series + "{" + area + "} is present");
+        // Drive the exposition from a STUB MXBean, so the assertion is on exact values rather than
+        // on whatever the real heap happened to be doing. An earlier version allocated ballast and
+        // asserted the reading had not fallen by more than 64 MiB — which a constant exporter
+        // passes, and so does almost anything else.
+        var prior = FeedGatewayService.memoryMxBean;
+        try {
+            FeedGatewayService.memoryMxBean = () -> stubMemory(
+                    new java.lang.management.MemoryUsage(1L, 111L, 222L, 333L),      // heap
+                    new java.lang.management.MemoryUsage(2L, 444L, 555L, -1L));      // non-heap, unbounded
+            String m = FeedGatewayService.jvmMemorySeries();
+            for (String series : new String[]{"jvm_memory_bytes_used", "jvm_memory_bytes_committed", "jvm_memory_bytes_max"}) {
+                assertTrue(m.contains("# TYPE " + series + " gauge\n"), series + " is typed");
             }
+            assertTrue(m.contains("jvm_memory_bytes_used{area=\"heap\"} 111\n"), m);
+            assertTrue(m.contains("jvm_memory_bytes_committed{area=\"heap\"} 222\n"), m);
+            assertTrue(m.contains("jvm_memory_bytes_max{area=\"heap\"} 333\n"), m);
+            assertTrue(m.contains("jvm_memory_bytes_used{area=\"nonheap\"} 444\n"), m);
+            assertTrue(m.contains("jvm_memory_bytes_committed{area=\"nonheap\"} 555\n"), m);
+            assertTrue(m.contains("jvm_memory_bytes_max{area=\"nonheap\"} -1\n"),
+                    "an unbounded area is -1, so 'unbounded' and 'exporter absent' stay distinct: " + m);
+
+            // a SECOND reading reports the new numbers: a value captured once would not
+            FeedGatewayService.memoryMxBean = () -> stubMemory(
+                    new java.lang.management.MemoryUsage(1L, 999L, 1000L, 1001L),
+                    new java.lang.management.MemoryUsage(2L, 7L, 8L, 9L));
+            String again = FeedGatewayService.jvmMemorySeries();
+            assertTrue(again.contains("jvm_memory_bytes_used{area=\"heap\"} 999\n"), again);
+            assertTrue(again.contains("jvm_memory_bytes_max{area=\"nonheap\"} 9\n"), again);
+            assertFalse(again.contains(" 111\n"), "the first reading is not cached: " + again);
+        } finally {
+            FeedGatewayService.memoryMxBean = prior;
         }
-        // the values are the JVM's own, not constants: used heap is positive and no larger than
-        // committed, which is the relationship every heap satisfies at any instant
-        java.util.function.BiFunction<String, String, Long> read = (series, area) -> {
-            java.util.regex.Matcher mm = java.util.regex.Pattern
-                    .compile(java.util.regex.Pattern.quote(series + "{area=\"" + area + "\"} ") + "(-?\\d+)").matcher(m);
-            assertTrue(mm.find(), series + "{" + area + "} has a numeric value");
-            return Long.parseLong(mm.group(1));
-        };
-        long used = read.apply("jvm_memory_bytes_used", "heap");
-        long committed = read.apply("jvm_memory_bytes_committed", "heap");
-        assertTrue(used > 0, "a running JVM has used heap: " + used);
-        assertTrue(used <= committed, "used " + used + " must not exceed committed " + committed);
-        assertTrue(read.apply("jvm_memory_bytes_used", "nonheap") > 0, "and non-heap is in use too");
-        // and they MOVE with the heap, so the series is the JVM's and not a snapshot taken once
-        long before = read.apply("jvm_memory_bytes_used", "heap");
-        byte[] ballast = new byte[8 * 1024 * 1024];
-        ballast[0] = 1; ballast[ballast.length - 1] = 1;
-        java.util.regex.Matcher after = java.util.regex.Pattern
-                .compile("jvm_memory_bytes_used\\{area=\"heap\"\\} (\\d+)").matcher(on().metrics());
-        assertTrue(after.find());
-        assertTrue(Long.parseLong(after.group(1)) >= before - (64L * 1024 * 1024),
-                "the reading tracks the live heap rather than a captured constant");
-        assertEquals(1, ballast[0], "the ballast is not optimised away");
+        // and the live endpoint carries them, with the real JVM's own numbers
+        String live = on().metrics();
+        assertTrue(live.contains("jvm_memory_bytes_used{area=\"heap\"} "), live.substring(0, 200));
+        java.util.regex.Matcher used = java.util.regex.Pattern
+                .compile("jvm_memory_bytes_used\\{area=\"heap\"\\} (\\d+)").matcher(live);
+        java.util.regex.Matcher committed = java.util.regex.Pattern
+                .compile("jvm_memory_bytes_committed\\{area=\"heap\"\\} (\\d+)").matcher(live);
+        assertTrue(used.find() && committed.find());
+        long u = Long.parseLong(used.group(1)), c = Long.parseLong(committed.group(1));
+        assertTrue(u > 0 && u <= c, "used " + u + " must be positive and within committed " + c);
+    }
+
+    /** A MemoryMXBean that reports exactly what it is given; every other method is unused here. */
+    private static java.lang.management.MemoryMXBean stubMemory(java.lang.management.MemoryUsage heap,
+                                                                java.lang.management.MemoryUsage nonHeap) {
+        return (java.lang.management.MemoryMXBean) java.lang.reflect.Proxy.newProxyInstance(
+                FootprintWiringTest.class.getClassLoader(),
+                new Class<?>[]{java.lang.management.MemoryMXBean.class},
+                (proxy, method, args) -> switch (method.getName()) {
+                    case "getHeapMemoryUsage" -> heap;
+                    case "getNonHeapMemoryUsage" -> nonHeap;
+                    case "toString" -> "stubMemory";
+                    case "hashCode" -> System.identityHashCode(proxy);
+                    case "equals" -> proxy == args[0];
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
     }
 
     // ---- G-R6 hello ---------------------------------------------------------------------------------

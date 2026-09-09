@@ -1717,11 +1717,24 @@ public class FeedGatewayService implements ReplayRunner {
     /**
      * JVM memory, in the standard {@code jvm_memory_bytes_*} shape. Recorded because the G-R8
      * contingency is an inequality over the PEAK heap, and a peak is only measurable if the series
-     * exists for the whole session: {@code max_over_time(jvm_memory_bytes_used{area="heap"}[8h])}.
-     * Read from the platform MXBeans on the scrape thread; both reads are cheap and neither blocks.
+     * exists for the whole session: {@code max_over_time(jvm_memory_bytes_used{area="heap"}[8h])} —
+     * a SAMPLED peak, only as good as the scrape interval and the retention behind it.
+     *
+     * <p>This endpoint supplies H_peak alone. G-R8's other two inequalities need the container
+     * working set and the memory limit, which come from cAdvisor/Kubernetes, and the effective
+     * {@code -Xmx}, which comes from the deployment manifest.
+     *
+     * <p>Read from the platform MXBeans on the scrape thread. The reads are cheap and request no
+     * collection, but they carry no latency guarantee: a stop-the-world pause suspends this thread
+     * with every other, and under a concurrent collector the value is a snapshot that may precede or
+     * follow reclamation. {@code used} includes uncollected garbage as well as live objects.
      */
-    private static String jvmMemorySeries() {
-        java.lang.management.MemoryMXBean mem = java.lang.management.ManagementFactory.getMemoryMXBean();
+    /** Test seam: the MXBean the exposition reads. Package-private so a test can supply a stub. */
+    static java.util.function.Supplier<java.lang.management.MemoryMXBean> memoryMxBean =
+            java.lang.management.ManagementFactory::getMemoryMXBean;
+
+    static String jvmMemorySeries() {
+        java.lang.management.MemoryMXBean mem = memoryMxBean.get();
         java.lang.management.MemoryUsage heap = mem.getHeapMemoryUsage();
         java.lang.management.MemoryUsage nonHeap = mem.getNonHeapMemoryUsage();
         StringBuilder b = new StringBuilder(512);
@@ -2006,9 +2019,10 @@ public class FeedGatewayService implements ReplayRunner {
                 + "options_edge_feed_gateway_uptime_seconds " + uptimeSeconds + "\n"
                 // ---- JVM memory (G-R8) ------------------------------------------------------
                 // The ES Footprint deployment contingency is stated as inequalities over the peak
-                // HEAP and the peak container working set. Neither is derivable from what this
-                // process published before: the cgroup's memory.peak bounds the working set from
-                // above but says nothing about the heap inside it, so H_peak had to be guessed.
+                // HEAP and the peak container working set. The heap half was not derivable from
+                // anything this process published: the cgroup's memory.peak bounds the working set
+                // from above but says nothing about the heap inside it, so H_peak had to be
+                // guessed. The working-set half still comes from cAdvisor.
                 // These are the standard Prometheus JVM names, so the existing scrape reads them
                 // without a dashboard change.
                 + jvmMemorySeries()
