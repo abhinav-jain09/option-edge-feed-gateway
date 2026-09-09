@@ -136,9 +136,12 @@ def main():
                 problems.append(f"the preamble names `{named}`, which is not in the record")
         surv = sum(1 for v in rec.values() if v['status'] == 'SURVIVED')
         words = {'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,'seven':7,'eight':8,'nine':9,'ten':10}
-        # Any spelt or digit count next to the word "surviv" must agree with the record, in whatever
-        # phrasing: pinning one sentence shape leaves every other phrasing unchecked.
-        for m2 in re.finditer(r'\b(\d+|' + '|'.join(words) + r')\b(?=[^.]{0,60}surviv)', text_pre, re.I):
+        # A COUNT of survivors — "seven mutations survive", "3 probes survived" — must agree with the
+        # record. Only a number that quantifies the survivors counts: a probe named `P-R3.6`, a site
+        # number, a requirement id are not counts, and an earlier version of this check read them as
+        # such and refused a correct preamble.
+        for m2 in re.finditer(r'(?<![\w.-])(\d+|' + '|'.join(words) + r')\s+(?:\w+\s+){0,2}?'
+                              r'(?:mutations?|probes?|sites?)\s+(?:\w+\s+){0,2}?surviv\w*', text_pre, re.I):
             tok = m2.group(1).lower()
             n = int(tok) if tok.isdigit() else words[tok]
             if n != surv:
