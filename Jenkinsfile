@@ -137,6 +137,35 @@ pipeline {
         '''
       }
     }
+    stage('Footprint reverification') {
+      steps {
+        sh '''
+          set -eu
+          if [ -x "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java" ]; then
+            export JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
+          elif [ -x /usr/lib/jvm/java-21/bin/java ]; then
+            export JAVA_HOME=/usr/lib/jvm/java-21
+          elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+            export JAVA_HOME="$JAVA_HOME"
+          else
+            echo "Java 21 was not found on this Jenkins agent" >&2
+            exit 1
+          fi
+          export MAVEN_SKIP_RC=true
+          export PATH="$JAVA_HOME/bin:$PATH"
+          # The pinned column of ES-FOOTPRINT-GATEWAY-DESIGN.md rests on ES-FOOTPRINT-CAMPAIGN.json,
+          # and that is a file: the generator's refusals compare the record against itself and
+          # against the source it names, which a self-consistent forgery satisfies. Only re-running
+          # the campaign settles it, so it runs HERE, where this repository is actually built. It
+          # cannot run in a GitHub check: this build needs options-edge-contracts installed from
+          # source (see the Install Contracts stage), which no hosted runner has.
+          #
+          # Unconditionally, not on a changeset predicate: a gate that decides for itself when to
+          # run is a gate that stops running.
+          scripts/footprint-reverify.sh
+        '''
+      }
+    }
     stage('Package') {
       steps {
         sh '''
