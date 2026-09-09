@@ -97,10 +97,61 @@ def main():
     # the record says. A fabricated record now has to be fabricated against real source — and if it
     # is, the thing it names is real.
     _blob = {}
-    def clause_is_in_the_tree(rid, m):
+    # Every git call this generator makes runs with replacement objects DISABLED. `refs/replace/*`
+    # rewrites what git reports for an object id — `cat-file -t`, `rev-parse` and `show` all honour
+    # it — so a blob or tag id replaced by a commit would answer "commit" and then read the
+    # replacement's tree. A record's commit must be the object it names, not one substituted for it.
+    def git(args, repo):
+        env = dict(os.environ, GIT_NO_REPLACE_OBJECTS='1')
+        return subprocess.run(['git', '--no-replace-objects'] + args,
+                              capture_output=True, text=True, cwd=repo, env=env)
+
+    def commit_of(rid, m):
+        """The record's commit, resolved — or a refusal naming which thing went wrong.
+
+        `cat-file -t` is the single authority here, and it is asked for the object's OWN type. The
+        peeling forms are avoided deliberately: `<id>^{commit}` resolves an annotated tag to the
+        commit it points at, so a record could name a tag and every later check would agree with
+        it. `rev-parse --verify` is no use for existence either — for a full-length id it validates
+        the shape and returns success for an object the copy does not have.
+        """
         commit = m.get('evidence', {}).get('repoCommit')
         if not commit:
-            return                      # already reported by the commit checks
+            return None                 # already reported by the commit checks
+        repo = os.path.dirname(os.path.abspath(sys.argv[2])) or '.'
+        # The shape settles the malformed case without asking git anything.
+        if not re.fullmatch(r'[0-9a-f]{7,40}', commit):
+            problems.append(f"{rid}: the record names {commit!r} as its commit, which is not an "
+                            f"object id")
+            return None
+        try:
+            probe = git(['cat-file', '-t', commit], repo)
+        except Exception as exc:
+            problems.append(f"{rid}: git could not be asked about commit {commit[:12]} "
+                            f"({type(exc).__name__}: {exc}), so the clause this mutation broke "
+                            f"cannot be looked up")
+            return None
+        kind, stderr = probe.stdout.strip(), probe.stderr.strip()
+        if probe.returncode == 0 and not stderr:
+            if kind == 'commit':
+                return commit
+            problems.append(f"{rid}: the record's commit {commit[:12]} is a {kind} in this "
+                            f"repository, not a commit")
+        elif re.search(r'could not get object info|Not a valid object name|bad file', stderr):
+            problems.append(f"{rid}: commit {commit[:12]} is not in this copy of the repository, so "
+                            f"the clause this mutation broke cannot be looked up — check out with "
+                            f"full history (fetch-depth: 0)")
+        else:
+            first = (stderr.splitlines() or [f'exit {probe.returncode}'])[0]
+            problems.append(f"{rid}: git could not resolve commit {commit[:12]} ({first}), so the "
+                            f"clause this mutation broke cannot be looked up")
+        return None
+
+    def clause_is_in_the_tree(rid, m):
+        commit = commit_of(rid, m)
+        if commit is None:
+            return
+        repo = os.path.dirname(os.path.abspath(sys.argv[2])) or '.'
         patch = m.get('patch') or {}
         sites = patch.get('sites') or [{'file': m.get('file'), 'old': patch.get('old'),
                                         'occurrence': m.get('occurrence', 1),
@@ -113,14 +164,12 @@ def main():
             key = (commit, path)
             if key not in _blob:
                 try:
-                    _blob[key] = subprocess.run(['git', 'show', f'{commit}:{path}'],
-                                                capture_output=True, text=True,
-                                                cwd=os.path.dirname(os.path.abspath(sys.argv[2])) or '.'
-                                                ).stdout
+                    _blob[key] = git(['show', f'{commit}:{path}'], repo).stdout
                 except Exception:
                     _blob[key] = ''
             blob = _blob[key]
             if not blob:
+                # The commit resolved, so this is the file's own absence, not a shallow clone.
                 problems.append(f"{rid}: {path} cannot be read at {commit[:12]}, so nothing says "
                                 f"the clause this mutation broke was ever there")
                 continue
