@@ -100,10 +100,18 @@ def main():
             if not ev.get('outputSha256'):
                 problems.append(f"{rid}: a KILLED record carries no hash of its run output")
             # the named assertion failures must be the ones THIS run produced
-            fl = '\n'.join(m.get('evidence', {}).get('failureLines') or [])
+            lines = m.get('evidence', {}).get('failureLines') or []
             for name in (m.get('assertionFailures') or []):
-                if name.split('.')[-1] not in fl:
+                short = name.split('.')[-1]
+                carrying = [l for l in lines if short in l]
+                if not carrying:
                     problems.append(f"{rid}: names assertion failure {name} that its own failure lines do not carry")
+                elif all('<<< ERROR!' in l for l in carrying):
+                    # surefire marks a THROW as ERROR and an assertion as FAILURE. A record whose
+                    # only line for this name is an ERROR is not evidence of an assertion, whatever
+                    # the field it is stored in says.
+                    problems.append(f"{rid}: names {name} as an assertion failure, but every line it "
+                                    f"carries for that name is an ERROR (a throw), not a FAILURE")
             if not m.get('assertionFailures'):
                 # The renderer must hold this itself: a record is a checked-in FILE, and a hand-edited
                 # or legacy one would otherwise be taken at its word.
@@ -147,8 +155,18 @@ def main():
             if n != surv:
                 problems.append(f"the preamble says {tok} where the record has {surv} surviving")
 
-    commits = {m.get('evidence', {}).get('repoCommit') for ms in per.values() for m in ms}
-    commits.discard(None)
+    commits = set()
+    for ms in per.values():
+        for m in ms:
+            c = m.get('evidence', {}).get('repoCommit')
+            b = m.get('baseline', {}).get('commit')
+            if not c:
+                problems.append(f"{m.get('requirement')}: a record names no repository commit")
+                continue
+            if b and b != c:
+                problems.append(f"{m.get('requirement')}: the record's commit {c[:12]} is not the "
+                                f"commit its baseline ran at ({b[:12]})")
+            commits.add(c)
     if len(commits) > 1:
         problems.append("the records come from " + str(len(commits)) + " different commits; a table "
                         "that mixes them is not one campaign: " + ", ".join(sorted(c[:12] for c in commits)))

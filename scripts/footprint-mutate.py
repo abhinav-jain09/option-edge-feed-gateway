@@ -154,14 +154,31 @@ def main():
             # carry a non-zero exit, named assertion failures, and the verbatim lines those names
             # came from. Matching the patch and the commit says nothing about the rest of the file.
             if p is None or p.get('patch') != patch: return False
-            e = p.get('evidence', {})
+            e, b = p.get('evidence', {}), p.get('baseline', {})
             if e.get('repoCommit') != commit: return False
-            if e.get('treeRestoredClean') is False: return False
+            if e.get('treeRestoredClean') is not True: return False   # missing is not clean
+            if not e.get('outputSha256') or b.get('returnCode') != 0: return False
+            if b.get('commit') and b.get('commit') != commit: return False
+            lines = e.get('failureLines') or []
             if p.get('status') == 'KILLED':
                 if not e.get('returnCode'): return False
-                if not (p.get('assertionFailures') or p.get('killedByThrow')): return False
-                if not e.get('failureLines'): return False
-            if p.get('status') == 'SURVIVED' and e.get('returnCode'): return False
+                names = p.get('assertionFailures') or []
+                t = p.get('killedByThrow')
+                if names:
+                    # every name must sit on a line of this record, on an assertion line
+                    for n in names:
+                        short = n.split('.')[-1]
+                        carrying = [l for l in lines if short in l]
+                        if not carrying or all('<<< ERROR!' in l for l in carrying): return False
+                elif isinstance(t, dict) and t.get('test') and t.get('throws'):
+                    joined = '\n'.join(lines)
+                    if t['test'].split('.')[-1] not in joined or t['throws'] not in joined: return False
+                else:
+                    return False
+            elif p.get('status') == 'SURVIVED':
+                if e.get('returnCode'): return False
+            else:
+                if not e.get('returnCode'): return False   # every other status means the run failed
             return True
         if resumable(prev):
             continue
@@ -171,8 +188,16 @@ def main():
         # The requested OCCURRENCE must exist, not merely the anchor: an out-of-range occurrence
         # left the splice index at -1, applied a different edit, and recorded its verdict as though
         # the requested mutation had run.
+        def occurrences(text, needle):
+            # The splice locator advances by ONE character, so it finds overlapping matches; str.count
+            # does not. Counting differently from the locator refuses a legal occurrence.
+            n, at = 0, 0
+            while True:
+                i = text.find(needle, at)
+                if i < 0: return n
+                n += 1; at = i + 1
         missing = [s0 for s0 in sites
-                   if open(os.path.join(root, s0['file'])).read().count(s0['old']) < s0.get('occurrence', 1)]
+                   if occurrences(open(os.path.join(root, s0['file'])).read(), s0['old']) < s0.get('occurrence', 1)]
         if missing:
             res[k] = {'status': 'ANCHOR-MISSING', 'file': missing[0]['file']}
             print(f"  {k:<40} ANCHOR-MISSING"); json.dump(res, open(outp,'w'), indent=1); continue
