@@ -31,10 +31,10 @@ RECORD="ES-FOOTPRINT-CAMPAIGN.json"
 AS_THE_GATE=1
 if [ "${1:-}" = "--as-the-gate" ]; then shift; fi
 if [ "${1:-}" = "--not-the-gate" ]; then
-    # ...but not in CI. The opt-out exists for a person re-running one spec on their own machine,
-    # and a CI job that used it would be the whole drift this check exists to stop, wearing the
-    # gate's name: the document would go on saying "re-run on every build" while the build re-ran
-    # something else. Automation does not get the manual escape hatch.
+    # ...but not in CI. The opt-out exists for a person re-running by hand, and a CI job that used
+    # it would be the whole drift this check exists to stop, wearing the gate's name: the document
+    # would go on claiming a coverage while the build re-ran something else. Automation does not
+    # get the manual escape hatch.
     if [ -n "${GITHUB_ACTIONS:-}" ] || [ -n "${JENKINS_URL:-}" ] || [ "${CI:-}" = "true" ]; then
         echo "--not-the-gate is for a person re-running by hand; this is CI, where the run IS the gate." >&2
         echo "Change scripts/footprint-gated-specs if the coverage is meant to be different." >&2
@@ -42,32 +42,45 @@ if [ "${1:-}" = "--not-the-gate" ]; then
     fi
     AS_THE_GATE=; shift
 fi
-FULL=full
-if [ $# -gt 0 ]; then SPECS=("$1"); FULL=partial; [ $# -gt 1 ] && RECORD="$2"
-else
-    # Every committed spec, discovered rather than listed: a hard-coded pair was copied into a
-    # repository that has one spec, and named a file that does not exist there.
-    SPECS=()
-    for s in scripts/footprint-campaign*.json; do [ -r "$s" ] && SPECS+=("$s"); done
-    [ ${#SPECS[@]} -gt 0 ] || { echo "no scripts/footprint-campaign*.json to re-run" >&2; exit 2; }
-fi
+
 if [ -n "$AS_THE_GATE" ]; then
+    # The gate takes NO arguments. Its scope is scripts/footprint-gated-specs and nothing else.
+    #
+    # Letting it name a spec was a hole in two directions. A run naming the declared spec passed the
+    # spec-set check but became a PARTIAL run, which stops asking whether the record holds rows no
+    # spec declares — and a row sharing a gated command would then render as re-run by the gate
+    # while appearing in no spec at all. A second argument could point the run at a different
+    # record, so the gate would reverify one file while `--check` rendered another.
+    [ $# -eq 0 ] || {
+        echo "the gate takes no arguments: it re-runs exactly what scripts/footprint-gated-specs" >&2
+        echo "declares, against $RECORD. Pass --not-the-gate to re-run a single spec by hand." >&2
+        exit 2; }
     [ -r scripts/footprint-gated-specs ] || {
         echo "scripts/footprint-gated-specs does not exist, so nothing says what this gate covers." >&2
         echo "Create it, or pass --not-the-gate if this is a person re-running by hand." >&2
         exit 2; }
-    # `grep -v '^label:'`: the declaration also carries metadata, and comparing that against the
-    # spec list made the gate fail before it ran a single mutation.
-    declared=$(sed 's/#.*//' scripts/footprint-gated-specs | tr -d '[:blank:]' \
-               | grep -v '^$' | grep -v '^label:' | sort)
-    running=$(printf '%s\n' "${SPECS[@]}" | sort)
-    if [ "$declared" != "$running" ]; then
-        echo "the gate ran specs the declaration does not name, or the other way round:" >&2
-        echo "  declared: $(printf '%s' "$declared" | tr '\n' ' ')" >&2
-        echo "  ran:      $(printf '%s' "$running" | tr '\n' ' ')" >&2
-        echo "Either fix the CI invocation or scripts/footprint-gated-specs — the conformance table's" >&2
-        echo "Coverage column is derived from that file, and it must be what this gate actually does." >&2
-        exit 1
+    # `grep -v '^label:'`: the declaration may carry metadata, and comparing that against the spec
+    # list made the gate fail before it ran a single mutation.
+    SPECS=()
+    while IFS= read -r spec; do [ -n "$spec" ] && SPECS+=("$spec"); done < <(
+        sed 's/#.*//' scripts/footprint-gated-specs | tr -d '[:blank:]' \
+        | grep -v '^$' | grep -v '^label:' | sort)
+    [ ${#SPECS[@]} -gt 0 ] || { echo "scripts/footprint-gated-specs declares no spec" >&2; exit 2; }
+    for spec in "${SPECS[@]}"; do
+        [ -r "$spec" ] || { echo "scripts/footprint-gated-specs names $spec, which does not exist" >&2; exit 2; }
+    done
+    # FULL, always: the gate's declared set IS the whole of what it covers, so a record row that no
+    # declared spec accounts for is a row nothing re-runs.
+    FULL=full
+else
+    FULL=full
+    if [ $# -gt 0 ]; then SPECS=("$1"); FULL=partial; [ $# -gt 1 ] && RECORD="$2"; fi
+    if [ $# -eq 0 ]; then
+        # Every committed spec, discovered rather than listed: a hard-coded pair was copied into a
+        # repository that has one spec, and named a file that does not exist there.
+        SPECS=()
+        for s in scripts/footprint-campaign*.json; do [ -r "$s" ] && SPECS+=("$s"); done
+        [ ${#SPECS[@]} -gt 0 ] || { echo "no scripts/footprint-campaign*.json to re-run" >&2; exit 2; }
     fi
 fi
 for s in "${SPECS[@]}"; do [ -r "$s" ] || { echo "no campaign spec at $s" >&2; exit 2; }; done
@@ -91,7 +104,7 @@ json.dump(merged, open(out, 'w'), indent=1)
 MERGE
 
 python3 - "$RECORD" "$OUT" "$FULL" "${SPECS[@]}" <<'COMPARE'
-import json, sys
+import glob, json, sys
 record, rerun, full = sys.argv[1], sys.argv[2], sys.argv[3] == 'full'
 specs = sys.argv[4:]
 was, now = json.load(open(record)), json.load(open(rerun))
@@ -101,10 +114,19 @@ was, now = json.load(open(record)), json.load(open(rerun))
 expected = set()
 for p in specs:
     expected |= {m['key'] for m in json.load(open(p))['mutations']}
+# A row the record holds that NO committed spec declares is a row nothing can ever re-run, and that
+# is true whatever this invocation happened to run. Checked against every spec in the repository,
+# not against the ones just run — otherwise a gate whose declared set is one of two specs reports
+# the other spec's rows as undeclared, which they are not.
+everywhere = set()
+for p in sorted(glob.glob('scripts/footprint-campaign*.json')):
+    try:
+        everywhere |= {m['key'] for m in json.load(open(p))['mutations']}
+    except Exception:
+        pass
 bad = []
-if full:
-    for k in sorted(set(was) - expected):
-        bad.append(f"{k}: the record holds a mutation no committed spec declares")
+for k in sorted(set(was) - everywhere):
+    bad.append(f"{k}: the record holds a mutation no committed spec declares")
 for k in sorted(expected):
     if k not in was:
         bad.append(f"{k}: the spec declares a mutation the record does not have"); continue
