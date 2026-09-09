@@ -111,18 +111,28 @@ def main():
                 problems.append(f"{rid}: a mutation site names no file or no clause")
                 continue
             key = (commit, path)
+            repo = os.path.dirname(os.path.abspath(sys.argv[2])) or '.'
             if key not in _blob:
                 try:
                     _blob[key] = subprocess.run(['git', 'show', f'{commit}:{path}'],
-                                                capture_output=True, text=True,
-                                                cwd=os.path.dirname(os.path.abspath(sys.argv[2])) or '.'
-                                                ).stdout
+                                                capture_output=True, text=True, cwd=repo).stdout
                 except Exception:
                     _blob[key] = ''
             blob = _blob[key]
             if not blob:
-                problems.append(f"{rid}: {path} cannot be read at {commit[:12]}, so nothing says "
-                                f"the clause this mutation broke was ever there")
+                # Two very different reasons the blob is unreadable, and saying the wrong one sends
+                # the reader looking for a deleted file when the truth is a shallow checkout. CI
+                # clones at depth 1, so a record's commit — an ancestor — is simply not in the copy.
+                # Either way this fails: a check that cannot run is not a check that passed.
+                have = subprocess.run(['git', 'cat-file', '-e', f'{commit}^{{commit}}'],
+                                      capture_output=True, text=True, cwd=repo).returncode == 0
+                if not have:
+                    problems.append(f"{rid}: commit {commit[:12]} is not in this copy of the "
+                                    f"repository, so the clause this mutation broke cannot be "
+                                    f"looked up — check out with full history (fetch-depth: 0)")
+                else:
+                    problems.append(f"{rid}: {path} cannot be read at {commit[:12]}, so nothing says "
+                                    f"the clause this mutation broke was ever there")
                 continue
             n = occurrences(blob, old)
             said = site.get('occurrencesInFile')
