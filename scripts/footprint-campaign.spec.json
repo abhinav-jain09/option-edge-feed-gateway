@@ -1,0 +1,319 @@
+{
+ "root": "/private/tmp/oe-conf-gw",
+ "command": [
+  "mvn",
+  "-B",
+  "test",
+  "-Dtest=Footprint*,CvdSpxLevelsWiringTest",
+  "-DfailIfNoTests=false"
+ ],
+ "kind": "maven",
+ "mutations": [
+  {
+   "key": "G-R4 older-date-dropped",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "an OLDER session date is dropped",
+   "old": "        if (cmp < 0) return null;",
+   "new": "        if (cmp < 0) return false;",
+   "requirement": "G-R4",
+   "documentText": "OLDER \u21d2 `stale_session` drop;"
+  },
+  {
+   "key": "G-R4 newer-date-rolls-both",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "a NEWER date rolls BOTH views",
+   "old": "        bars.clear(); outcomes.clear(); barsBytes = 0; outcomesBytes = 0;",
+   "new": "        bars.clear(); barsBytes = 0;",
+   "requirement": "G-R4",
+   "documentText": "Rollover is MONOTONIC on the parsed date: NEWER than current \u21d2 BOTH views are cleared and the date advances;"
+  },
+  {
+   "key": "G-R4 equal-date-upserts",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "an EQUAL date upserts without rolling",
+   "old": "        if (cmp == 0) return false;",
+   "new": "        if (cmp == 0) { bars.clear(); outcomes.clear(); return false; }",
+   "requirement": "G-R4",
+   "documentText": "EQUAL (or first) \u21d2 upsert (last write per key wins)."
+  },
+  {
+   "key": "G-R9.3 a-rollover-is-counted",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "rollover clears are counted in gateway_footprint_rollovers_total, one per date advance",
+   "old": "        rollovers.incrementAndGet();",
+   "new": "        if (false) rollovers.incrementAndGet();",
+   "requirement": "G-R9",
+   "documentText": "`gateway_footprint_evictions_total{view}` \u2014 records removed by the byte/count budgets (never by rollover; rollover clears are counted in `gateway_footprint_rollovers_total`, one per date advance)."
+  },
+  {
+   "key": "G-R8 evict-oldest",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "eviction takes the OLDEST key of the timeframe it is evicting from",
+   "old": "            String oldest = view.ceilingKey(tf + \"|\");",
+   "new": "            String oldest = view.floorKey(tf + \"|~\");",
+   "requirement": "G-R8",
+   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key."
+  },
+  {
+   "key": "G-R8 evict-rotates",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "eviction rotates round-robin across the timeframes rather than draining one",
+   "old": "            if (isBars) barsEvictCursor = cursor + 1; else outcomesEvictCursor = cursor + 1;",
+   "new": "            if (isBars) barsEvictCursor = cursor; else outcomesEvictCursor = cursor;",
+   "requirement": "G-R8",
+   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key."
+  },
+  {
+   "key": "G-R8 byte-budget-decremented",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "evicting a record decrements the view byte total by that record length",
+   "old": "            if (isBars) barsBytes -= len; else outcomesBytes -= len;",
+   "new": "            if (isBars) barsBytes -= 0; else outcomesBytes -= 0;",
+   "requirement": "G-R8",
+   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key."
+  },
+  {
+   "key": "G-R8 both-budgets-enforced",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "both the count AND byte budgets are enforced",
+   "old": "        while (view.size() > maxCount || (isBars ? barsBytes : outcomesBytes) > maxBytes) {",
+   "new": "        while (view.size() > maxCount) {",
+   "requirement": "G-R8",
+   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key."
+  },
+  {
+   "key": "G-R8 evictions-counted",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "every eviction is counted in the view eviction counter",
+   "old": "        if (evicted > 0) (isBars ? barsEvictions : outcomesEvictions).addAndGet(evicted);",
+   "new": "        if (false) (isBars ? barsEvictions : outcomesEvictions).addAndGet(evicted);",
+   "requirement": "G-R8",
+   "documentText": "View budgets, enforced under the lock at every admission: bars `B_bytes` \u2264 `GATEWAY_ES_FOOTPRINT_BARS_MAX_BYTES` (default 128 MiB, summed JSON `String.length()`) and `B_count` \u2264 12 000; outcomes `O_bytes` \u2264 16 MiB and `O_count` \u2264 20 000; when a budget would be exceeded the OLDEST keys of that view (smallest key per timeframe, round-robin across timeframes so no timeframe is starved) are evicted until it fits, counted in `gateway_footprint_evictions_total{view}`; the hello HWM still reports the newest key."
+  },
+  {
+   "key": "G-R8a ceiling-strict",
+   "file": "src/main/java/app/feedgateway/FootprintTopicGate.java",
+   "clause": "a footprint topic is VALID iff its effective max.message.bytes is at or below the ceiling",
+   "old": "            else if (cfg.maxMessageBytes() > ceiling) o = new Outcome(false, Reason.ceiling,",
+   "new": "            else if (cfg.maxMessageBytes() >= ceiling) o = new Outcome(false, Reason.ceiling,",
+   "requirement": "G-R8a",
+   "documentText": "**Topic validation before consumption, inside the refresh (optional topics kept optional).** A footprint topic is VALID iff its effective `max.message.bytes \u2264 GATEWAY_ES_FOOTPRINT_MAX_MESSAGE_BYTES_CEILING` (default 1 048 588) and `compression.type \u2208 {producer, uncompressed}`, read via `AdminClient.describeConfigs` with the same bounded timeout as `partitionRefreshMetadataTimeoutMs`."
+  },
+  {
+   "key": "G-R8a codec-allowlist",
+   "file": "src/main/java/app/feedgateway/FootprintTopicGate.java",
+   "clause": "only producer/uncompressed are accepted",
+   "old": "            else if (cfg.compressionType() == null || !UNCOMPRESSED.contains(cfg.compressionType().trim().toLowerCase())) o = new Outcome(false, Reason.compression,",
+   "new": "            else if (false) o = new Outcome(false, Reason.compression,",
+   "requirement": "G-R8a",
+   "documentText": "**Topic validation before consumption, inside the refresh (optional topics kept optional).** A footprint topic is VALID iff its effective `max.message.bytes \u2264 GATEWAY_ES_FOOTPRINT_MAX_MESSAGE_BYTES_CEILING` (default 1 048 588) and `compression.type \u2208 {producer, uncompressed}`, read via `AdminClient.describeConfigs` with the same bounded timeout as `partitionRefreshMetadataTimeoutMs`."
+  },
+  {
+   "key": "G-R9 ceiling-precedence",
+   "file": "src/main/java/app/feedgateway/FootprintTopicGate.java",
+   "clause": "ceiling takes precedence over compression",
+   "old": "            if (cfg == null) o = new Outcome(false, Reason.admin, \"no config returned\");",
+   "new": "            if (cfg == null) o = new Outcome(false, Reason.admin, \"no config returned\");\n            else if (cfg.compressionType() == null || !UNCOMPRESSED.contains(cfg.compressionType().trim().toLowerCase())) o = new Outcome(false, Reason.compression, \"compression.type=\" + cfg.compressionType());",
+   "requirement": "G-R9",
+   "documentText": "`gateway_footprint_topic_validation_failures_total{topic,reason}` \u2014 `reason \u2208 {ceiling, compression, admin, unknown}`; incremented once per validation ATTEMPT that does not yield VALID: `ceiling` (exists, `max.message.bytes` above the ceiling), `compression` (exists, codec policy), `admin` (describeConfigs failed for a reason other than unknown topic \u2014 timeout included), `unknown` (topic does not exist yet); exactly one reason per failed attempt, decided in the order admin \u2192 unknown \u2192 ceiling \u2192 compression (a topic that is both over the ceiling and compressed counts `ceiling`); the start-up attempt counts too (an existing invalid topic increments `ceiling`/`compression` once before the refusal)."
+  },
+  {
+   "key": "G-R7 to-is-inclusive",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "toMs is INCLUSIVE",
+   "old": "            String hi = barKey(tf, Math.min(toMsInclusive, EPOCH_MAX_MS));",
+   "new": "            String hi = barKey(tf, Math.min(toMsInclusive - 1, EPOCH_MAX_MS));",
+   "requirement": "G-R7",
+   "documentText": "**Backfill.** `GET /api/footprint/bars?tf&toMs&afterMs=-1&limit=100&sessionDate=` \u2192 `{sessionDate, [sessionMismatch:true], bars:[<record>\u2026], nextCursor}` with the `/api/cvd/bars` semantics (ascending `barStartMs`, exclusive `afterMs`, inclusive `toMs`, `limit` clamped to `[1, 100]`), computed as ONE snapshot under the coordinator lock with the session check (`sessionMismatch` when a non-empty `sessionDate` differs from the coordinator's)."
+  },
+  {
+   "key": "G-R7 limit-clamped-low",
+   "file": "src/main/java/app/feedgateway/GatewayController.java",
+   "clause": "the forwarded limit is clamped to at least 1",
+   "old": "    static int clamp(int limit) { return Math.max(1, Math.min(limit, FOOTPRINT_LIMIT_MAX)); }",
+   "new": "    static int clamp(int limit) { return Math.min(limit, FOOTPRINT_LIMIT_MAX); }",
+   "requirement": "G-R7",
+   "documentText": "**Backfill.** `GET /api/footprint/bars?tf&toMs&afterMs=-1&limit=100&sessionDate=` \u2192 `{sessionDate, [sessionMismatch:true], bars:[<record>\u2026], nextCursor}` with the `/api/cvd/bars` semantics (ascending `barStartMs`, exclusive `afterMs`, inclusive `toMs`, `limit` clamped to `[1, 100]`), computed as ONE snapshot under the coordinator lock with the session check (`sessionMismatch` when a non-empty `sessionDate` differs from the coordinator's)."
+  },
+  {
+   "key": "G-R7 limit-clamped-high",
+   "file": "src/main/java/app/feedgateway/GatewayController.java",
+   "clause": "the forwarded limit is clamped to the ceiling",
+   "old": "    static int clamp(int limit) { return Math.max(1, Math.min(limit, FOOTPRINT_LIMIT_MAX)); }",
+   "new": "    static int clamp(int limit) { return Math.max(1, limit); }",
+   "requirement": "G-R7",
+   "documentText": "`limit` clamped to `[1, 100]` for both routes: with the producer ceiling 262 144 B a full page is \u2264 25 MiB + envelope (G-R8), the number the page proxy's byte ceiling is derived from."
+  },
+  {
+   "key": "G-R4 key-fields-must-be-in-the-epoch-domain",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "clause": "an out-of-domain timestamp is refused",
+   "old": "        return x < 0 || x > EPOCH_MAX_MS ? -1 : x;",
+   "new": "        return x < 0 ? -1 : x;",
+   "requirement": "G-R4",
+   "documentText": "`timeframe` must be one of the seven keys; the key fields must be present integers in the epoch domain; otherwise `shape` drop (never mutates)."
+  },
+  {
+   "key": "G-R7 the-exclusive-cursor-at-the-domain-edge site1-removed",
+   "requirement": "G-R7",
+   "clause": "the afterMs lower bound stays exclusive at the top of the epoch domain",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "old": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive < EPOCH_MAX_MS) {",
+   "new": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0) {",
+   "documentText": "**Backfill.** `GET /api/footprint/bars?tf&toMs&afterMs=-1&limit=100&sessionDate=` \u2192 `{sessionDate, [sessionMismatch:true], bars:[<record>\u2026], nextCursor}` with the `/api/cvd/bars` semantics (ascending `barStartMs`, exclusive `afterMs`, inclusive `toMs`, `limit` clamped to `[1, 100]`), computed as ONE snapshot under the coordinator lock with the session check (`sessionMismatch` when a non-empty `sessionDate` differs from the coordinator's)."
+  },
+  {
+   "key": "G-R7 the-exclusive-cursor-at-the-domain-edge site2-relaxed",
+   "requirement": "G-R7",
+   "clause": "the same guard relaxed from < to <= \u2014 recorded because it is INERT: at afterMs == EPOCH_MAX_MS the +1 is safe and hi is capped, so lo > hi either way",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "old": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive < EPOCH_MAX_MS) {",
+   "new": "            if (TIMEFRAME_KEY.matcher(tf == null ? \"\" : tf).matches() && toMsInclusive >= 0 && afterMsExclusive <= EPOCH_MAX_MS) {",
+   "documentText": "**Backfill.** `GET /api/footprint/bars?tf&toMs&afterMs=-1&limit=100&sessionDate=` \u2192 `{sessionDate, [sessionMismatch:true], bars:[<record>\u2026], nextCursor}` with the `/api/cvd/bars` semantics (ascending `barStartMs`, exclusive `afterMs`, inclusive `toMs`, `limit` clamped to `[1, 100]`), computed as ONE snapshot under the coordinator lock with the session check (`sessionMismatch` when a non-empty `sessionDate` differs from the coordinator's)."
+  },
+  {
+   "key": "G-R1.1 the-flag-gates-every-footprint-object",
+   "requirement": "G-R1",
+   "clause": "Flag off: the views are never instantiated",
+   "documentText": "Flag off: no footprint topic is subscribed by any consumer, the views are never instantiated, the hello carries no `footprint` field (byte-identical to today's hello), both backfill routes answer HTTP 404 with body `{\"enabled\":false}`, and the ONLY footprint metric exported is `gateway_footprint_enabled 0`.",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "        if (settings.esFootprintEnabled()) {",
+   "new": "        if (true) {"
+  },
+  {
+   "key": "G-R2.1 one-wiring-method-binds-all-four",
+   "requirement": "G-R2",
+   "clause": "addEsFootprintTopics binds all four topics, each to its own event",
+   "documentText": "ONE wiring method `addEsFootprintTopics(topicEvents)` called from BOTH the state cache consumer and the state live consumer (the `addEsCvdTopics` rule), pinned by a source test exactly like `CvdBarViewTest.bootstrapAndLiveConsumersShareOneCvdTopicWiringPath`.",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "        topicEvents.put(settings.esFootprintOutcomesTopic(), new TopicBinding(\"DATABENTO\", \"es-footprint-outcome\"));",
+   "new": "        if (false) topicEvents.put(settings.esFootprintOutcomesTopic(), new TopicBinding(\"DATABENTO\", \"es-footprint-outcome\"));"
+  },
+  {
+   "key": "G-R2.2 the-evidence-binding",
+   "requirement": "G-R2",
+   "clause": "KAFKA_ES_FOOTPRINT_EVIDENCE_TOPIC -> futures.footprint.evidence (es-footprint-evidence)",
+   "documentText": "**Topics and bindings.** Four settings resolved like `esCvdTopic()` (the gateway's `*_TOPIC` prefixing): `KAFKA_ES_FOOTPRINT_TOPIC` \u2192 `futures.footprint` (event `es-footprint`), `KAFKA_ES_FOOTPRINT_EVIDENCE_TOPIC` \u2192 `futures.footprint.evidence` (`es-footprint-evidence`), `KAFKA_ES_FOOTPRINT_BARS_TOPIC` \u2192 `futures.footprint.bars` (`es-footprint-bar`), `KAFKA_ES_FOOTPRINT_OUTCOMES_TOPIC` \u2192 `futures.footprint.outcomes` (`es-footprint-outcome`).",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "        topicEvents.put(settings.esFootprintEvidenceTopic(), new TopicBinding(\"DATABENTO\", \"es-footprint-evidence\"));",
+   "new": "        topicEvents.put(settings.esFootprintEvidenceTopic(), new TopicBinding(\"DATABENTO\", \"es-footprint\"));"
+  },
+  {
+   "key": "G-R3.1 an-oversize-record-is-dropped-not-broadcast",
+   "requirement": "G-R3",
+   "clause": "a record the view REJECTS is still broadcast, except an OVERSIZE record, which is dropped",
+   "documentText": "`es-footprint-bar` and `es-footprint-outcome`: keyed view FIRST, then standalone VERBATIM broadcast (the `es-cvd-bar` class) \u2014 a record the view REJECTS for shape, session or size (G-R4, G-R8) is still broadcast, except an OVERSIZE record, which is dropped entirely (a record over the producer's own ceiling is corrupt).",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "        return a.reason() != FootprintViews.Reason.OVERSIZE;",
+   "new": "        return true;"
+  },
+  {
+   "key": "G-R3.2 a-rejected-record-is-still-broadcast",
+   "requirement": "G-R3",
+   "clause": "a record the view REJECTS for shape or session is still broadcast",
+   "documentText": "`es-footprint-bar` and `es-footprint-outcome`: keyed view FIRST, then standalone VERBATIM broadcast (the `es-cvd-bar` class) \u2014 a record the view REJECTS for shape, session or size (G-R4, G-R8) is still broadcast, except an OVERSIZE record, which is dropped entirely (a record over the producer's own ceiling is corrupt).",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "        return a.reason() != FootprintViews.Reason.OVERSIZE;",
+   "new": "        return a.reason() == FootprintViews.Reason.ADMITTED;"
+  },
+  {
+   "key": "G-R3.3 live-snapshots-are-never-retained",
+   "requirement": "G-R3",
+   "clause": "never cached, never retained",
+   "documentText": "**Delivery classes.** `es-footprint` and `es-footprint-evidence`: standalone broadcast, VERBATIM, never selection-gated, never cached, never retained (the producer heartbeats every \u2264 5 s \u2014 F-R15 \u2014 so a new client waits at most one heartbeat; the same class as `es-cvd`).",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "            return CachePolicy.expiring(0L);",
+   "new": "            return CachePolicy.expiring(settings.esFootprintSeekBackMs());"
+  },
+  {
+   "key": "G-R5.1 the-outcome-key-orders-numerically",
+   "requirement": "G-R5",
+   "clause": "the zero-padded 19-digit encoding makes string order equal to (timeframe, resolvedAtBarStartMs numeric, identity)",
+   "documentText": "The zero-padded 19-digit encoding makes string order equal to `(timeframe, resolvedAtBarStartMs numeric, identity)` over the whole epoch domain;",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "old": "        return tf + \"|\" + String.format(\"%019d\", resolvedAtBarStartMs) + \"|\" + identity;",
+   "new": "        return tf + \"|\" + resolvedAtBarStartMs + \"|\" + identity;"
+  },
+  {
+   "key": "G-R5.2 the-identity-is-the-last-component",
+   "requirement": "G-R5",
+   "clause": "identity CONTAINS |, which is why it is the LAST component",
+   "documentText": "`identity` is ASCII `[A-Za-z0-9_.:|-]` (it CONTAINS `|`, which is why it is the LAST component).",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "old": "        return tf + \"|\" + String.format(\"%019d\", resolvedAtBarStartMs) + \"|\" + identity;",
+   "new": "        return tf + \"|\" + identity + \"|\" + String.format(\"%019d\", resolvedAtBarStartMs);"
+  },
+  {
+   "key": "G-R5.3 a-foreign-identity-is-refused",
+   "requirement": "G-R5",
+   "clause": "a foreign shape (missing identity/timeframe/resolvedAtBarStartMs, non-canonical identity alphabet)",
+   "documentText": "Last write per full key wins; an identity resolves EXACTLY ONCE upstream (F-E6), so a redelivery carries the same key and overwrites in place; a foreign shape (missing `identity`/`timeframe`/`resolvedAtBarStartMs`, non-canonical identity alphabet or > 128 bytes) is a `shape` drop but still broadcast.",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "old": "                || !IDENTITY.matcher(identity).matches() || identity.getBytes(StandardCharsets.UTF_8).length > IDENTITY_MAX_BYTES) {",
+   "new": "                || identity.getBytes(StandardCharsets.UTF_8).length > IDENTITY_MAX_BYTES) {"
+  },
+  {
+   "key": "G-R5.4 last-write-per-key-wins",
+   "requirement": "G-R5",
+   "clause": "Last write per full key wins; a redelivery carries the same key and overwrites in place",
+   "documentText": "Last write per full key wins; an identity resolves EXACTLY ONCE upstream (F-E6), so a redelivery carries the same key and overwrites in place; a foreign shape (missing `identity`/`timeframe`/`resolvedAtBarStartMs`, non-canonical identity alphabet or > 128 bytes) is a `shape` drop but still broadcast.",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "old": "            String previous = outcomes.put(key, json);",
+   "new": "            String previous = outcomes.putIfAbsent(key, json);"
+  },
+  {
+   "key": "G-R6.1 the-hello-carries-the-footprint-field",
+   "requirement": "G-R6",
+   "clause": "the existing cvd-hello frame gains ONE field footprint",
+   "documentText": "**Hello.** When the flag is on, the existing `cvd-hello` frame gains ONE field `footprint: {sessionDate, hwm:{tf: maxBarStartMs}, outcomeHwm:{tf: maxResolvedAtBarStartMs}}` built as ONE snapshot under the coordinator lock (`sessionDate` null and both maps empty before the first accepted record; a timeframe absent from a map = nothing held).",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "            sb.append(\",\\\"footprint\\\":\").append(footprintViews.helloField());",
+   "new": "            sb.append(\",\\\"footprintX\\\":\").append(footprintViews.helloField());"
+  },
+  {
+   "key": "G-R6.2 the-hello-is-sent-when-footprint-alone-is-on",
+   "requirement": "G-R6",
+   "clause": "cvd-hello is sent whenever CVD, SPX-levels OR footprint is enabled",
+   "documentText": "`cvd-hello` is sent whenever CVD, SPX-levels OR footprint is enabled.",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "        return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || footprintViews != null;",
+   "new": "        return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled();"
+  },
+  {
+   "key": "G-R6.3 the-hello-carries-the-outcome-high-water-mark",
+   "requirement": "G-R6",
+   "clause": "outcomeHwm:{tf: maxResolvedAtBarStartMs}",
+   "documentText": "**Hello.** When the flag is on, the existing `cvd-hello` frame gains ONE field `footprint: {sessionDate, hwm:{tf: maxBarStartMs}, outcomeHwm:{tf: maxResolvedAtBarStartMs}}` built as ONE snapshot under the coordinator lock (`sessionDate` null and both maps empty before the first accepted record; a timeframe absent from a map = nothing held).",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "old": "            sb.append(\",\\\"outcomeHwm\\\":\"); appendHwm(sb, outcomes, true);",
+   "new": "            sb.append(\",\\\"outcomeHwm\\\":\"); appendHwm(sb, bars, true);"
+  },
+  {
+   "key": "G-R10.1 a-footprint-record-never-escapes-the-consumer-loop",
+   "requirement": "G-R10",
+   "clause": "a footprint record can never throw out of the consumer loop \u2014 the mutation makes it throw, and the test that calls it propagates that throw",
+   "documentText": "A footprint record can never throw out of the consumer loop (every admission failure is a counted drop); the coordinator lock is never held while sending.",
+   "file": "src/main/java/app/feedgateway/FootprintViews.java",
+   "old": "        if (json == null) return Admission.SHAPE;",
+   "new": "        if (json == null) throw new IllegalArgumentException(\"json\");"
+  },
+  {
+   "key": "G-R10.2 every-admission-failure-is-a-counted-drop",
+   "requirement": "G-R10",
+   "clause": "every admission failure is a counted drop",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "            footprintCounter(\"drops_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\",reason=\\\"\" + a.reason().name().toLowerCase() + \"\\\"}\").incrementAndGet();",
+   "new": "            if (a.reason() != FootprintViews.Reason.SHAPE) footprintCounter(\"drops_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\",reason=\\\"\" + a.reason().name().toLowerCase() + \"\\\"}\").incrementAndGet();",
+   "documentText": "A footprint record can never throw out of the consumer loop (every admission failure is a counted drop); the coordinator lock is never held while sending."
+  },
+  {
+   "key": "G-R9.2 every-record-is-counted-before-admission",
+   "requirement": "G-R9",
+   "clause": "records_total is incremented BEFORE admission, so it counts oversize/shape/stale records too",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "        footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n        if (!\"es-footprint-bar\".equals(event) && !\"es-footprint-outcome\".equals(event)) {\n            return true;                                            // live snapshots: never admitted to a view\n        }\n        FootprintViews.Admission a = \"es-footprint-bar\".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);\n        if (a.reason() != FootprintViews.Reason.ADMITTED) {",
+   "new": "        if (!\"es-footprint-bar\".equals(event) && !\"es-footprint-outcome\".equals(event)) {\n            footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n            return true;                                            // live snapshots: never admitted to a view\n        }\n        FootprintViews.Admission a = \"es-footprint-bar\".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);\n        if (a.reason() == FootprintViews.Reason.OVERSIZE) return false;   // MUTATION: counted only AFTER admission\n        footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n        if (a.reason() != FootprintViews.Reason.ADMITTED) {",
+   "documentText": "`gateway_footprint_records_total{event,consumer}` \u2014 every Kafka record of that event polled by that consumer, incremented BEFORE admission (so it counts oversize/shape/stale records too)."
+  }
+ ]
+}

@@ -150,7 +150,11 @@ def result_lines(out, kind):
 def main():
     spec = json.load(open(sys.argv[1]))
     outp = sys.argv[2]
-    root, cmd, kind = spec['root'], spec['command'], spec['kind']
+    # The recorded root is where the campaign was run; anyone re-running it has their own checkout.
+    # Without this the spec is only re-runnable on the machine that wrote it, which makes
+    # "reproduce it yourself" an instruction nobody can follow.
+    root = os.environ.get('FOOTPRINT_ROOT') or spec['root']
+    cmd, kind = spec['command'], spec['kind']
     _ACTIVE['root'] = root
     signal.signal(signal.SIGTERM, _restore_and_exit)
     signal.signal(signal.SIGINT, _restore_and_exit)

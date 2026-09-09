@@ -5,7 +5,7 @@ The state column is derived, never typed: a requirement is what its mutations sa
 requirement the campaign did not probe says exactly that, and claims nothing else — the failure mode
 this replaces is a hand-maintained table drifting away from the code it claims to describe.
 """
-import hashlib, json, os, re, sys, collections
+import hashlib, json, os, re, subprocess, sys, collections
 
 def assertion_line(line):
     """Is this surefire line an ASSERTION failure rather than a thrown exception?
@@ -78,6 +78,51 @@ def main():
     # no evidence that any run happened at all. Demand the run's own output, and demand that it say
     # what the record claims it said.
     BASELINE_TAIL_CAP = 1500     # what the harness records; a SHORTER tail is the whole output
+
+
+    # Everything above checks the record against itself, and a record is a file someone can write.
+    # This is the one check that reaches OUTSIDE it: the clause the mutation claims to have broken
+    # must actually be in the repository, at the commit the record names, exactly as many times as
+    # the record says. A fabricated record now has to be fabricated against real source — and if it
+    # is, the thing it names is real.
+    _blob = {}
+    def clause_is_in_the_tree(rid, m):
+        commit = m.get('evidence', {}).get('repoCommit')
+        if not commit:
+            return                      # already reported by the commit checks
+        patch = m.get('patch') or {}
+        sites = patch.get('sites') or [{'file': m.get('file'), 'old': patch.get('old'),
+                                        'occurrence': m.get('occurrence', 1),
+                                        'occurrencesInFile': m.get('occurrencesInFile')}]
+        for site in sites:
+            path, old = site.get('file'), site.get('old')
+            if not path or not old:
+                problems.append(f"{rid}: a mutation site names no file or no clause")
+                continue
+            key = (commit, path)
+            if key not in _blob:
+                try:
+                    _blob[key] = subprocess.run(['git', 'show', f'{commit}:{path}'],
+                                                capture_output=True, text=True,
+                                                cwd=os.path.dirname(os.path.abspath(sys.argv[2])) or '.'
+                                                ).stdout
+                except Exception:
+                    _blob[key] = ''
+            blob = _blob[key]
+            if not blob:
+                problems.append(f"{rid}: {path} cannot be read at {commit[:12]}, so nothing says "
+                                f"the clause this mutation broke was ever there")
+                continue
+            n = blob.count(old)
+            if n == 0:
+                problems.append(f"{rid}: the clause this mutation claims to have broken is not in "
+                                f"{path} at {commit[:12]}")
+            elif site.get('occurrencesInFile') is not None and n != site['occurrencesInFile']:
+                problems.append(f"{rid}: the record says the clause occurs {site['occurrencesInFile']} "
+                                f"time(s) in {path}; at {commit[:12]} it occurs {n}")
+            elif n < (site.get('occurrence') or 1):
+                problems.append(f"{rid}: the record mutates occurrence {site.get('occurrence')} of a "
+                                f"clause that occurs {n} time(s) in {path}")
 
     def baseline_ran(rid, m, base, ev):
         tail = base.get('outputTail')
@@ -228,6 +273,7 @@ def main():
             if not ev.get('outputSha256'):
                 problems.append(f"{rid}: a KILLED record carries no hash of its run output")
             baseline_ran(rid, m, base, ev)
+            clause_is_in_the_tree(rid, m)
             # the named assertion failures must be the ones THIS run produced
             lines = m.get('evidence', {}).get('failureLines') or []
             runner_of(m)   # cross-check command against evidence for EVERY kill, not only the
