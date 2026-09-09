@@ -120,7 +120,18 @@ def main():
         # object name" for a commit the copy does not have, so its stderr cannot separate absence
         # from trouble. rev-parse --quiet exits 1 SILENTLY for a name it cannot resolve and keeps
         # stderr for the real thing.
+        #
+        # `^{commit}` PEELS, though, and an annotated tag peels to the commit it points at — so a
+        # tag's own object id would resolve here, and `git show <tag>:<path>` peels it again, and
+        # the record would name an object that is not the commit its evidence came from. The
+        # record must name the commit itself, so the object's own type is asked for first.
         try:
+            direct = subprocess.run(['git', 'cat-file', '-t', commit],
+                                    capture_output=True, text=True, cwd=repo)
+            if direct.returncode == 0 and direct.stdout.strip() != 'commit':
+                problems.append(f"{rid}: the record's commit {commit[:12]} is a "
+                                f"{direct.stdout.strip()} in this repository, not a commit")
+                return None
             probe = subprocess.run(['git', 'rev-parse', '--verify', '--quiet', f'{commit}^{{commit}}'],
                                    capture_output=True, text=True, cwd=repo)
         except Exception as exc:
