@@ -74,8 +74,24 @@ def main():
     # it from failureLines let a single forged `not ok …` line switch the whole record into node
     # mode and skip the surefire assertion check entirely.
     def runner_of(m0):
+        """The runner, taken from the command AND cross-checked against the lines it produced.
+
+        Neither field alone is enough: inferring from the lines let one forged `not ok` line switch
+        a Maven record into node mode, and trusting the command let a forged `node --test` command do
+        the same. A record whose command and evidence disagree is refused rather than guessed at.
+        """
         c = m0.get('command', '')
-        return 'node' if (' --test' in c or c.startswith('node ')) else 'maven'
+        by_command = 'node' if (' --test' in c or c.startswith('node ')) else 'maven'
+        lines = m0.get('evidence', {}).get('failureLines') or []
+        looks_maven = any(l.startswith('[ERROR]') for l in lines)
+        looks_node = any(l.startswith('not ok ') for l in lines)
+        if lines and looks_maven and by_command != 'maven':
+            problems.append(f"{m0.get('requirement')}: the command says node but the failure lines are surefire's")
+            return 'maven'
+        if lines and looks_node and not looks_maven and by_command != 'node':
+            problems.append(f"{m0.get('requirement')}: the command says maven but the failure lines are node's")
+            return 'maven'
+        return by_command
     for rid, ms in per.items():
         for m in ms:
             # ATTRIBUTION, for every record whatever its status: the obligation a row quotes must be
@@ -108,13 +124,18 @@ def main():
                 # non-zero exit left in place, was rendered as a survivor — so validate the other
                 # statuses against their own evidence too.
                 rc = m.get('evidence', {}).get('returnCode')
-                if m['status'] == 'SURVIVED' and rc:
-                    problems.append(f"{rid}: a SURVIVED record whose run exited {rc}")
-                elif m['status'] != 'SURVIVED' and not rc:
+                if m['status'] == 'SURVIVED':
+                    if rc != 0:
+                        # `!= 0` and not `if rc`: a MISSING return code was reading as success, so a
+                        # kill relabelled SURVIVED with its exit code deleted rendered as a survivor.
+                        problems.append(f"{rid}: a SURVIVED record whose run exited {rc!r}")
+                    evidence_of_failure = (m.get('assertionFailures') or m.get('killedBy')
+                                           or m.get('anyFailures') or m.get('failureCount')
+                                           or m.get('evidence', {}).get('failureLines'))
+                    if evidence_of_failure:
+                        problems.append(f"{rid}: a SURVIVED record that carries failure evidence")
+                elif not rc:
                     problems.append(f"{rid}: a {m['status']} record whose run exited 0")
-                if m['status'] == 'SURVIVED' and (m.get('assertionFailures') or m.get('killedBy')):
-                    problems.append(f"{rid}: a SURVIVED record that names failing tests "
-                                    f"({(m.get('assertionFailures') or m.get('killedBy'))[:2]})")
                 continue
             # The run must have actually failed, and against the baseline this campaign proved
             # green. A record is an editable file: without these, a hand-edited entry with
