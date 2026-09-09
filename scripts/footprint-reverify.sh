@@ -15,11 +15,52 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-# Naming a spec restricts the comparison to the mutations that spec declares; with no argument
-# every committed spec runs and the record may hold nothing beyond them.
-SPECS=("${1:-scripts/footprint-campaign.spec.json}")
-RECORD="${2:-ES-FOOTPRINT-CAMPAIGN.json}"
+# This repository's campaign is TWO runs with two different runners — the page's node suite and
+# the Java proxies/nav tests — and the record is their union. Re-running only one of them would
+# report every mutation of the other as missing, so both specs run unless one is named.
+RECORD="ES-FOOTPRINT-CAMPAIGN.json"
+# Every run is the gate unless it says otherwise. The document's Coverage column and its list of
+# not-re-run requirements come from scripts/footprint-gated-specs, and a committed file cannot know
+# what CI actually does — so the check happens HERE, in the run: the specs this invocation ran must
+# be exactly the ones that file declares.
+#
+# The default is deliberately this way round. Making it opt-in put the enforcement behind a flag,
+# and deleting a flag from a workflow is the easiest way for the declaration and the real gate to
+# drift apart with nothing going red. `--not-the-gate` is for a person re-running one spec by hand,
+# and it says so at the point of use.
+AS_THE_GATE=1
+if [ "${1:-}" = "--as-the-gate" ]; then shift; fi
+if [ "${1:-}" = "--not-the-gate" ]; then
+    # ...but not in CI. The opt-out exists for a person re-running one spec on their own machine,
+    # and a CI job that used it would be the whole drift this check exists to stop, wearing the
+    # gate's name: the document would go on saying "re-run on every build" while the build re-ran
+    # something else. Automation does not get the manual escape hatch.
+    if [ -n "${GITHUB_ACTIONS:-}" ] || [ -n "${JENKINS_URL:-}" ] || [ "${CI:-}" = "true" ]; then
+        echo "--not-the-gate is for a person re-running by hand; this is CI, where the run IS the gate." >&2
+        echo "Change scripts/footprint-gated-specs if the coverage is meant to be different." >&2
+        exit 2
+    fi
+    AS_THE_GATE=; shift
+fi
 FULL=full
+if [ $# -gt 0 ]; then SPECS=("$1"); FULL=partial; [ $# -gt 1 ] && RECORD="$2"
+else SPECS=(scripts/footprint-campaign.spec.json scripts/footprint-campaign-java.spec.json); fi
+if [ -n "$AS_THE_GATE" ]; then
+    [ -r scripts/footprint-gated-specs ] || {
+        echo "scripts/footprint-gated-specs does not exist, so nothing says what this gate covers." >&2
+        echo "Create it, or pass --not-the-gate if this is a person re-running by hand." >&2
+        exit 2; }
+    declared=$(sed 's/#.*//' scripts/footprint-gated-specs | tr -d '[:blank:]' | grep -v '^$' | sort)
+    running=$(printf '%s\n' "${SPECS[@]}" | sort)
+    if [ "$declared" != "$running" ]; then
+        echo "the gate ran specs the declaration does not name, or the other way round:" >&2
+        echo "  declared: $(printf '%s' "$declared" | tr '\n' ' ')" >&2
+        echo "  ran:      $(printf '%s' "$running" | tr '\n' ' ')" >&2
+        echo "Either fix the CI invocation or scripts/footprint-gated-specs — the conformance table's" >&2
+        echo "Coverage column is derived from that file, and it must be what this gate actually does." >&2
+        exit 1
+    fi
+fi
 for s in "${SPECS[@]}"; do [ -r "$s" ] || { echo "no campaign spec at $s" >&2; exit 2; }; done
 [ -r "$RECORD" ] || { echo "no campaign record at $RECORD" >&2; exit 2; }
 

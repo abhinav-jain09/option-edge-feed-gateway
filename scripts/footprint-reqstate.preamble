@@ -18,5 +18,14 @@ against the source it names — the clause a mutation claims to have broken must
 at the commit the record names, exactly as many times as the record says — and no amount of that
 makes a file tamper-evident: a baseline block invented wholesale is internally consistent and always
 will be. What cannot be invented is the run. Re-run every mutation against your own checkout with
-`scripts/footprint-reverify.sh`, which compares status and the named kill for each one and fails on
-any difference. That, and not the record's internal shape, is what this table rests on.
+`scripts/footprint-reverify.sh`, which compares what each row claims — its requirement, quoted
+obligation, file, occurrence and patch, all taken from the committed spec — and then whether the
+outcome reproduces, failing on any difference. That, and not the record's internal shape, is what
+this table rests on.
+
+The Jenkinsfile runs it on every build, in its own stage, along with
+`scripts/footprint-reqstate.sh --check`: reverification proves the record, and only `--check` proves
+that this section is the one that record produces. It cannot run in a GitHub check — this build
+needs options-edge-contracts installed from source, which no hosted runner has. The Coverage column
+comes from `scripts/footprint-gated-specs`, and reverify fails unless the specs it just ran are
+exactly the ones that file declares, so the column cannot drift from what the build does.

@@ -185,23 +185,32 @@ against the source it names — the clause a mutation claims to have broken must
 at the commit the record names, exactly as many times as the record says — and no amount of that
 makes a file tamper-evident: a baseline block invented wholesale is internally consistent and always
 will be. What cannot be invented is the run. Re-run every mutation against your own checkout with
-`scripts/footprint-reverify.sh`, which compares status and the named kill for each one and fails on
-any difference. That, and not the record's internal shape, is what this table rests on.
+`scripts/footprint-reverify.sh`, which compares what each row claims — its requirement, quoted
+obligation, file, occurrence and patch, all taken from the committed spec — and then whether the
+outcome reproduces, failing on any difference. That, and not the record's internal shape, is what
+this table rests on.
 
-| id | Conformance | Gate | Disposition |
-|----|-------------|------|-------------|
-| G-R1 | 1 of 1 probes pinned, over 1 clause | 2 | Flag and wiring |
-| G-R2 | 2 of 2 probes pinned, over 2 clauses | 2 | Flag and wiring |
-| G-R3 | 3 of 3 probes pinned, over 3 clauses | 2 | Delivery and views |
-| G-R4 | 4 of 4 probes pinned, over 4 clauses | 2 | Delivery and views |
-| G-R5 | 4 of 4 probes pinned, over 4 clauses | 2 | Delivery and views |
-| G-R6 | 3 of 3 probes pinned, over 3 clauses | 2 | Hello |
-| G-R7 | 4 of 5 probes pinned, over 4 clauses (1 survived) | 2 | Backfill routes |
-| G-R8 | 5 of 5 probes pinned, over 5 clauses | 2 | Deployment contingency |
-| G-R9 | 3 of 3 probes pinned, over 3 clauses | 2 | Metrics |
-| G-R10 | 2 of 2 probes pinned, over 2 clauses | 2 | Non-interference |
-| G-R11 | TEST INVENTORY: this requirement lists the tests the others are held by, so it has no production clause a mutation could break (not probed) | 2 | Tests |
-| G-R8a | 2 of 2 probes pinned, over 2 clauses | 2 | Deployment contingency |
+The Jenkinsfile runs it on every build, in its own stage, along with
+`scripts/footprint-reqstate.sh --check`: reverification proves the record, and only `--check` proves
+that this section is the one that record produces. It cannot run in a GitHub check — this build
+needs options-edge-contracts installed from source, which no hosted runner has. The Coverage column
+comes from `scripts/footprint-gated-specs`, and reverify fails unless the specs it just ran are
+exactly the ones that file declares, so the column cannot drift from what the build does.
+
+| id | Conformance | Gate | Coverage | Disposition |
+|----|-------------|------|----------|-------------|
+| G-R1 | 1 of 1 probes pinned, over 1 clause | 2 | re-run on every build | Flag and wiring |
+| G-R2 | 2 of 2 probes pinned, over 2 clauses | 2 | re-run on every build | Flag and wiring |
+| G-R3 | 3 of 3 probes pinned, over 3 clauses | 2 | re-run on every build | Delivery and views |
+| G-R4 | 4 of 4 probes pinned, over 4 clauses | 2 | re-run on every build | Delivery and views |
+| G-R5 | 4 of 4 probes pinned, over 4 clauses | 2 | re-run on every build | Delivery and views |
+| G-R6 | 3 of 3 probes pinned, over 3 clauses | 2 | re-run on every build | Hello |
+| G-R7 | 4 of 5 probes pinned, over 4 clauses (1 survived) | 2 | re-run on every build | Backfill routes |
+| G-R8 | 5 of 5 probes pinned, over 5 clauses | 2 | re-run on every build | Deployment contingency |
+| G-R9 | 3 of 3 probes pinned, over 3 clauses | 2 | re-run on every build | Metrics |
+| G-R10 | 2 of 2 probes pinned, over 2 clauses | 2 | re-run on every build | Non-interference |
+| G-R11 | TEST INVENTORY: this requirement lists the tests the others are held by, so it has no production clause a mutation could break (not probed) | 2 | — | Tests |
+| G-R8a | 2 of 2 probes pinned, over 2 clauses | 2 | re-run on every build | Deployment contingency |
 
 12 requirements; 11 probed by 34 mutations (33 killed, 1 surviving).
 
