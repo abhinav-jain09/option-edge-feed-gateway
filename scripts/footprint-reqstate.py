@@ -70,9 +70,14 @@ def main():
         if line.strip(): req_text[cur] += '\n' + line.rstrip()
 
     problems = []
-    kind = 'node' if any('not ok ' in (l or '')
-                       for ms0 in per.values() for m0 in ms0
-                       for l in (m0.get('evidence', {}).get('failureLines') or [])) else 'maven'
+    # The runner is whatever the recorded COMMAND ran, not whatever its lines look like. Inferring
+    # it from failureLines let a single forged `not ok …` line switch the whole record into node
+    # mode and skip the surefire assertion check entirely.
+    commands = {m0.get('command', '') for ms0 in per.values() for m0 in ms0}
+    kinds = {('node' if ' --test' in c or c.startswith('node ') else 'maven') for c in commands if c}
+    if len(kinds) > 1:
+        problems.append("the records were produced by more than one kind of runner: " + ", ".join(sorted(kinds)))
+    kind = next(iter(kinds), 'maven')
     for rid, ms in per.items():
         for m in ms:
             # ATTRIBUTION, for every record whatever its status: the obligation a row quotes must be
@@ -101,6 +106,17 @@ def main():
                                 f"it is filed against — clause {m.get('clause','')[:60]!r} vs "
                                 f"quote {dt[:60]!r}")
             if m['status'] != 'KILLED':
+                # `status` is an editable field. A genuine kill relabelled SURVIVED, with its
+                # non-zero exit left in place, was rendered as a survivor — so validate the other
+                # statuses against their own evidence too.
+                rc = m.get('evidence', {}).get('returnCode')
+                if m['status'] == 'SURVIVED' and rc:
+                    problems.append(f"{rid}: a SURVIVED record whose run exited {rc}")
+                elif m['status'] != 'SURVIVED' and not rc:
+                    problems.append(f"{rid}: a {m['status']} record whose run exited 0")
+                if m['status'] == 'SURVIVED' and (m.get('assertionFailures') or m.get('killedBy')):
+                    problems.append(f"{rid}: a SURVIVED record that names failing tests "
+                                    f"({(m.get('assertionFailures') or m.get('killedBy'))[:2]})")
                 continue
             # The run must have actually failed, and against the baseline this campaign proved
             # green. A record is an editable file: without these, a hand-edited entry with
