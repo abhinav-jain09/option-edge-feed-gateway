@@ -1714,6 +1714,33 @@ public class FeedGatewayService implements ReplayRunner {
                 + "}";
     }
 
+    /**
+     * JVM memory, in the standard {@code jvm_memory_bytes_*} shape. Recorded because the G-R8
+     * contingency is an inequality over the PEAK heap, and a peak is only measurable if the series
+     * exists for the whole session: {@code max_over_time(jvm_memory_bytes_used{area="heap"}[8h])}.
+     * Read from the platform MXBeans on the scrape thread; both reads are cheap and neither blocks.
+     */
+    private static String jvmMemorySeries() {
+        java.lang.management.MemoryMXBean mem = java.lang.management.ManagementFactory.getMemoryMXBean();
+        java.lang.management.MemoryUsage heap = mem.getHeapMemoryUsage();
+        java.lang.management.MemoryUsage nonHeap = mem.getNonHeapMemoryUsage();
+        StringBuilder b = new StringBuilder(512);
+        b.append("# HELP jvm_memory_bytes_used Used bytes of a given JVM memory area.\n")
+         .append("# TYPE jvm_memory_bytes_used gauge\n")
+         .append("jvm_memory_bytes_used{area=\"heap\"} ").append(heap.getUsed()).append('\n')
+         .append("jvm_memory_bytes_used{area=\"nonheap\"} ").append(nonHeap.getUsed()).append('\n')
+         .append("# HELP jvm_memory_bytes_committed Committed bytes of a given JVM memory area.\n")
+         .append("# TYPE jvm_memory_bytes_committed gauge\n")
+         .append("jvm_memory_bytes_committed{area=\"heap\"} ").append(heap.getCommitted()).append('\n')
+         .append("jvm_memory_bytes_committed{area=\"nonheap\"} ").append(nonHeap.getCommitted()).append('\n')
+         // -1 when the area is unbounded; emitted verbatim so absence and "no limit" stay distinct
+         .append("# HELP jvm_memory_bytes_max Maximum bytes of a given JVM memory area, or -1 when unbounded.\n")
+         .append("# TYPE jvm_memory_bytes_max gauge\n")
+         .append("jvm_memory_bytes_max{area=\"heap\"} ").append(heap.getMax()).append('\n')
+         .append("jvm_memory_bytes_max{area=\"nonheap\"} ").append(nonHeap.getMax()).append('\n');
+        return b.toString();
+    }
+
     public String metrics() {
         purgeExpiredCache(System.currentTimeMillis());
         long uptimeSeconds = Math.max(0, Duration.between(startedAt, Instant.now()).toSeconds());
@@ -1977,6 +2004,14 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_uptime_seconds Seconds since the feed gateway service object was created.\n"
                 + "# TYPE options_edge_feed_gateway_uptime_seconds gauge\n"
                 + "options_edge_feed_gateway_uptime_seconds " + uptimeSeconds + "\n"
+                // ---- JVM memory (G-R8) ------------------------------------------------------
+                // The ES Footprint deployment contingency is stated as inequalities over the peak
+                // HEAP and the peak container working set. Neither is derivable from what this
+                // process published before: the cgroup's memory.peak bounds the working set from
+                // above but says nothing about the heap inside it, so H_peak had to be guessed.
+                // These are the standard Prometheus JVM names, so the existing scrape reads them
+                // without a dashboard change.
+                + jvmMemorySeries()
                 // ---- Rollover-diagnostics counters/gauges (additive; see dumpDiagnosticState). ----
                 + "# HELP options_edge_feed_gateway_forward_stalled_flag_avro_caught_up Whether the Avro live-consumer cache-caught-up gate is TRUE.\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_flag_avro_caught_up gauge\n"

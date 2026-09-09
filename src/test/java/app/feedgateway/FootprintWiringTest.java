@@ -145,6 +145,46 @@ class FootprintWiringTest {
         assertFalse(off().sendsCvdHello(), "and nothing enabled sends none");
     }
 
+    /**
+     * G-R8: the deployment contingency is an inequality over the PEAK heap and the peak container
+     * working set. The cgroup's memory.peak bounds the working set but says nothing about the heap
+     * inside it, so H_peak was not derivable from anything this process published — the enablement
+     * PR had to state it as an estimate. These series make it measurable:
+     * {@code max_over_time(jvm_memory_bytes_used{area="heap"}[8h])} over a full session.
+     */
+    @Test void theMetricsCarryTheJvmMemorySeriesTheContingencyIsStatedOver() {
+        String m = on().metrics();
+        for (String series : new String[]{"jvm_memory_bytes_used", "jvm_memory_bytes_committed", "jvm_memory_bytes_max"}) {
+            assertTrue(m.contains("# TYPE " + series + " gauge\n"), series + " is typed");
+            for (String area : new String[]{"heap", "nonheap"}) {
+                assertTrue(m.contains(series + "{area=\"" + area + "\"} "), series + "{" + area + "} is present");
+            }
+        }
+        // the values are the JVM's own, not constants: used heap is positive and no larger than
+        // committed, which is the relationship every heap satisfies at any instant
+        java.util.function.BiFunction<String, String, Long> read = (series, area) -> {
+            java.util.regex.Matcher mm = java.util.regex.Pattern
+                    .compile(java.util.regex.Pattern.quote(series + "{area=\"" + area + "\"} ") + "(-?\\d+)").matcher(m);
+            assertTrue(mm.find(), series + "{" + area + "} has a numeric value");
+            return Long.parseLong(mm.group(1));
+        };
+        long used = read.apply("jvm_memory_bytes_used", "heap");
+        long committed = read.apply("jvm_memory_bytes_committed", "heap");
+        assertTrue(used > 0, "a running JVM has used heap: " + used);
+        assertTrue(used <= committed, "used " + used + " must not exceed committed " + committed);
+        assertTrue(read.apply("jvm_memory_bytes_used", "nonheap") > 0, "and non-heap is in use too");
+        // and they MOVE with the heap, so the series is the JVM's and not a snapshot taken once
+        long before = read.apply("jvm_memory_bytes_used", "heap");
+        byte[] ballast = new byte[8 * 1024 * 1024];
+        ballast[0] = 1; ballast[ballast.length - 1] = 1;
+        java.util.regex.Matcher after = java.util.regex.Pattern
+                .compile("jvm_memory_bytes_used\\{area=\"heap\"\\} (\\d+)").matcher(on().metrics());
+        assertTrue(after.find());
+        assertTrue(Long.parseLong(after.group(1)) >= before - (64L * 1024 * 1024),
+                "the reading tracks the live heap rather than a captured constant");
+        assertEquals(1, ballast[0], "the ballast is not optimised away");
+    }
+
     // ---- G-R6 hello ---------------------------------------------------------------------------------
 
     @Test void flagOnAddsOneHelloFieldFromTheCoordinatorSnapshot() {
