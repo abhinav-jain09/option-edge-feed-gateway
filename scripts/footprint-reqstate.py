@@ -154,6 +154,14 @@ def main():
             if not ev.get('repoCommit'):
                 problems.append(f"{rid}: a KILLED record names no repository commit")
             base = m.get('baseline', {})
+            # The baseline must be the baseline OF THIS RUN. Both fields are editable, so a record
+            # could otherwise pair a green run of an unrelated command with failing evidence from
+            # another runner and still render as pinned.
+            if not m.get('command'):
+                problems.append(f"{rid}: a KILLED record names no command")
+            elif base.get('command') != m.get('command'):
+                problems.append(f"{rid}: the baseline ran a different command than the mutation "
+                                f"({base.get('command')!r} vs {m.get('command')!r})")
             if base.get('returnCode') not in (0,):
                 problems.append(f"{rid}: a KILLED record whose baseline did not pass "
                                 f"(returnCode {base.get('returnCode')})")

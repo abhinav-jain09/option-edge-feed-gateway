@@ -172,6 +172,7 @@ def main():
             if e.get('repoCommit') != commit: return False
             if e.get('treeRestoredClean') is not True: return False   # missing is not clean
             if not e.get('outputSha256') or b.get('returnCode') != 0: return False
+            if b.get('command') != p.get('command') or not p.get('command'): return False
             if b.get('commit') != commit: return False   # missing is not a match
             lines = e.get('failureLines') or []
             if p.get('status') == 'KILLED':
