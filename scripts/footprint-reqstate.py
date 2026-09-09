@@ -7,6 +7,53 @@ this replaces is a hand-maintained table drifting away from the code it claims t
 """
 import hashlib, json, os, re, subprocess, sys, collections
 
+def gate_covers(repo):
+    """Which recorded commands the repository's automatic gate re-runs, from scripts/footprint-gated-specs.
+
+    An earlier version read this out of the CI files by looking for lines mentioning
+    footprint-reverify.sh. That is not a parser, it is a grep, and it was wrong in both directions:
+    `echo scripts/footprint-reverify.sh`, a step behind `if: false`, or an invocation continued onto
+    the next line with a backslash would each have been read as a gate that covers everything. A
+    text search cannot decide whether CI runs something.
+
+    So the declaration is a committed FILE — one spec path per line — and it is not trusted on its
+    own either: scripts/footprint-reverify.sh, run as the gate (--as-the-gate), fails unless the
+    specs it just ran are exactly these. The claim is made here, deterministically, and checked
+    where it can actually be known, which is inside the run.
+
+    The value is the set of mutation KEYS those specs declare.
+
+    Returns None when no gate is declared: "nothing here re-runs this" is a different statement from
+    "this gate covers nothing".
+    """
+    declared = os.path.join(repo, 'scripts/footprint-gated-specs')
+    if not os.path.exists(declared):
+        return None, None
+    covered = set()
+    for line in open(declared):
+        line = line.split('#', 1)[0].strip()
+        if not line:
+            continue
+        # A `label:` line used to give the Coverage cell free-text wording — "re-run on every
+        # build", "re-run when es-cvd is built". It came out again: nothing could check it, so it
+        # was a claim about CI sitting in the one column that is supposed to be derived. The cell
+        # now says only what the tooling guarantees — that this row is in the gate's spec set, and
+        # the gate cannot run anything else — and WHEN the gate runs is prose, where a claim that
+        # needs a human to keep it true belongs. The line is still tolerated and ignored.
+        if line.startswith('label:'):
+            continue
+        try:
+            # KEYS, not the spec's command. Two specs can share a command — the same Maven
+            # invocation over different mutations — and coverage taken from the command then
+            # labelled an ungated spec's rows "re-run by the gate" because they happened to run the
+            # same way. What the gate re-runs is a set of mutations, so that is what is recorded.
+            covered.update(m['key'] for m in json.load(open(os.path.join(repo, line)))['mutations'])
+        except Exception as exc:
+            print(f"note: scripts/footprint-gated-specs names {line}, which could not be read "
+                  f"({type(exc).__name__}) — its probes count as not re-run", file=sys.stderr)
+    return covered, None
+
+
 def occurrences(text, needle):
     """Counted the way the harness's splice locator scans: advancing by one character, so
     overlapping matches are found. str.count does not, and counting differently from the locator
@@ -132,25 +179,47 @@ def main():
                             f"cannot be looked up")
             return None
         kind, stderr = probe.stdout.strip(), probe.stderr.strip()
-        if probe.returncode == 0 and not stderr:
+        # Success is the EXIT STATUS and the type on stdout. Requiring an empty stderr made every
+        # record fail on a machine where git prints a harmless cache warning while answering
+        # correctly — stderr diagnoses a call that failed, it does not invalidate one that did not.
+        if probe.returncode == 0:
             if kind == 'commit':
                 return commit
             problems.append(f"{rid}: the record's commit {commit[:12]} is a {kind} in this "
                             f"repository, not a commit")
-        elif re.search(r'could not get object info|Not a valid object name|bad file', stderr):
-            problems.append(f"{rid}: commit {commit[:12]} is not in this copy of the repository, so "
-                            f"the clause this mutation broke cannot be looked up — check out with "
-                            f"full history (fetch-depth: 0)")
-        else:
-            first = (stderr.splitlines() or [f'exit {probe.returncode}'])[0]
-            problems.append(f"{rid}: git could not resolve commit {commit[:12]} ({first}), so the "
-                            f"clause this mutation broke cannot be looked up")
+            return None
+        if re.search(r'could not get object info|Not a valid object name|bad file', stderr):
+            # The copy does not have it, and after a SQUASH merge that is the normal state: the
+            # campaign runs on a branch, the branch's commits do not survive the squash, and the
+            # record on main then names a commit main's history never contained. That is not a
+            # reason to refuse — the clause check below still runs, against HEAD, which is what
+            # actually binds the record to real source. Note it and carry on.
+            print(f"note: {rid} names commit {commit[:12]}, which this copy of the repository "
+                  f"does not have — the usual reason is that its own change was squashed into "
+                  f"main. Its files are checked by content against HEAD instead. What binds the "
+                  f"WHOLE tree the campaign ran in — tests, build configuration, everything the "
+                  f"command read — is not this check but scripts/footprint-reverify.sh, which "
+                  f"re-runs the campaign here.", file=sys.stderr)
+            return 'HEAD'
+        first = (stderr.splitlines() or [f'exit {probe.returncode}'])[0]
+        problems.append(f"{rid}: git could not resolve commit {commit[:12]} ({first}), so the "
+                        f"clause this mutation broke cannot be looked up")
         return None
 
     def clause_is_in_the_tree(rid, m):
-        commit = commit_of(rid, m)
-        if commit is None:
-            return
+        # The clause is looked up at HEAD. ALWAYS at HEAD — not at the commit the record names,
+        # even when this copy still has it. Reading the historical commit is how a stale record
+        # passes: the mutation site's file changes, the old object is still in the object store (a
+        # reused CI workspace, an ordinary clone with the branch still fetched), and the check
+        # happily verifies the campaign against source nobody runs any more. What the table claims
+        # is about THIS repository, so the check has to be too — and a record whose clause has since
+        # been edited must fail, because the campaign no longer describes the code.
+        #
+        # commit_of still runs: it refuses a record whose commit is a tree, a tag, a blob, or not an
+        # object id at all, and notes the one benign case — the commit missing because the record's
+        # own change was squashed into main. It no longer decides where to look.
+        commit_of(rid, m)
+        commit = 'HEAD'
         repo = os.path.dirname(os.path.abspath(sys.argv[2])) or '.'
         patch = m.get('patch') or {}
         sites = patch.get('sites') or [{'file': m.get('file'), 'old': patch.get('old'),
@@ -168,6 +237,31 @@ def main():
                 except Exception:
                     _blob[key] = ''
             blob = _blob[key]
+            # The record's own hash of the file it mutated, checked against the file that is here.
+            # This authenticates the mutation SITES, not the whole tree the tests ran in — a record
+            # could carry honest hashes for its sites and evidence produced in a tree whose tests or
+            # build configuration differed. That gap is not closed here and is not meant to be: the
+            # thing that binds every input of a campaign together is running it, and
+            # scripts/footprint-reverify.sh is how. What that buys is exactly as wide as the run:
+            # a row an automatic gate does not re-run is bound only when someone runs reverify over
+            # the spec that covers it. Where a repository's gate covers part of the campaign, the
+            # generated section names the rows it does not cover, and the check below holds that
+            # naming to the record.
+            # This is the durable identity a commit id cannot be: a squash merge destroys the
+            # branch commit, but the CONTENT the campaign ran against either is what this
+            # repository holds or it is not. A matching hash says the campaign's snapshot of this
+            # file is this file, byte for byte — the clause and its count follow from that, and a
+            # fabricated or mistyped commit no longer buys anything.
+            said_sha = ((m.get('evidence', {}).get('filesSha256') or {}).get(path) or {}).get('original')
+            if blob and not said_sha:
+                problems.append(f"{rid}: the record carries no hash of {path} as it stood before "
+                                f"the mutation, so nothing ties it to this repository's source")
+            elif blob:
+                here = hashlib.sha256(blob.encode()).hexdigest()
+                if here != said_sha:
+                    problems.append(f"{rid}: {path} at HEAD is not the file the campaign mutated "
+                                    f"(sha256 {here[:12]}, the record says {said_sha[:12]}) — the "
+                                    f"source has moved and the campaign has to be re-run")
             if not blob:
                 # The commit resolved, so this is the file's own absence, not a shallow clone.
                 problems.append(f"{rid}: {path} cannot be read at {commit[:12]}, so nothing says "
@@ -299,6 +393,15 @@ def main():
                 problems.append(f"{rid}: the quoted obligation shares almost nothing with the clause "
                                 f"it is filed against — clause {m.get('clause','')[:60]!r} vs "
                                 f"quote {dt[:60]!r}")
+            # PROVENANCE, for every record whatever its status. These used to run for kills only,
+            # so a forged SURVIVED row needed nothing but `returnCode: 0` and no failure fields: no
+            # baseline verdict, no output hash, no source hash, no occurrence count, no evidence
+            # that the tree was restored — and the table counted and characterised it as a probe
+            # that ran. A survivor is a claim about a run exactly as much as a kill is.
+            baseline_ran(rid, m, m.get('baseline', {}), m.get('evidence', {}))
+            clause_is_in_the_tree(rid, m)
+            if m.get('evidence', {}).get('treeRestoredClean') is not True:
+                problems.append(f"{rid}: a record that ran against a tree it did not restore")
             if m['status'] != 'KILLED':
                 # `status` is an editable field. A genuine kill relabelled SURVIVED, with its
                 # non-zero exit left in place, was rendered as a survivor — so validate the other
@@ -339,8 +442,6 @@ def main():
                                 f"(returnCode {base.get('returnCode')})")
             if not ev.get('outputSha256'):
                 problems.append(f"{rid}: a KILLED record carries no hash of its run output")
-            baseline_ran(rid, m, base, ev)
-            clause_is_in_the_tree(rid, m)
             # the named assertion failures must be the ones THIS run produced
             lines = m.get('evidence', {}).get('failureLines') or []
             runner_of(m)   # cross-check command against evidence for EVERY kill, not only the
@@ -372,8 +473,15 @@ def main():
                                     f"failure lines carry ({m.get('killedBy')})")
             if not m.get('evidence', {}).get('failureLines'):
                 problems.append(f"{rid}: a KILLED record carries no failure lines")
-            if m.get('evidence', {}).get('treeRestoredClean') is not True:
-                problems.append(f"{rid}: a KILLED record ran against a tree it did not restore")
+    # A requirement is ungated if ANY of its probes is. Subtracting the requirements that have a
+    # gated probe hid the mixed case: one Java probe under an otherwise node-backed requirement was
+    # never re-run and the requirement read as fully covered.
+    covered, covered_label = gate_covers(os.path.dirname(os.path.abspath(sys.argv[2])) or '.')
+    if covered is None:
+        _ungated = set()          # nothing in this repository invokes reverify; the prose says so
+    else:
+        _ungated = {v['requirement'] for k, v in rec.items() if k not in covered}
+
     # The hand-maintained preamble sits INSIDE the generated block, so a stale sentence in it
     # survives regeneration and --check. Hold it to the record: every probe key it names must exist,
     # and it may not state a survivor count that the record contradicts.
@@ -388,6 +496,17 @@ def main():
                 continue                      # a bare requirement id, not a probe reference
             if named not in rec:
                 problems.append(f"the preamble names `{named}`, which is not in the record")
+        # A preamble that names requirements as NOT automatically re-run must name exactly the
+        # right ones. The claim is worth nothing if it drifts — and it drifts silently, because
+        # nothing else in this document mentions which runner a probe used. The list is derived
+        # from the record: every requirement all of whose probes ran under a command other than the
+        # one the repository's automatic gate re-runs.
+        claim = re.search(r'not (?:automatically )?re-run(?: automatically)? here: ([^.]+)\.', text_pre)
+        if claim is not None or _ungated:
+            named_reqs = set(re.findall(r'`((?:F|G|P)-(?:R|E)?\d+[a-z]?)`', claim.group(1))) if claim else set()
+            if named_reqs != _ungated:
+                problems.append(f"the preamble names {sorted(named_reqs)} as not re-run here; the "
+                                f"repository's own gate covers {sorted(_ungated)} no better")
         surv = sum(1 for v in rec.values() if v['status'] == 'SURVIVED')
         words = {'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,'seven':7,'eight':8,'nine':9,'ten':10}
         # A COUNT of survivors — "seven mutations survive", "3 probes survived" — must agree with the
@@ -432,7 +551,8 @@ def main():
         for pat, d in dispositions.items():
             if re.fullmatch('(?:' + pat + ')', rid): return d
         return ''
-    out = ["| id | Conformance | Gate | Disposition |", "|----|-------------|------|-------------|"]
+    out = ["| id | Conformance | Gate | Coverage | Disposition |",
+           "|----|-------------|------|----------|-------------|"]
     for rid in sorted(ids, key=lambda x: (re.sub(r'\d', '', x), int(re.search(r'\d+', x).group()), x)):
         ms = per.get(rid, [])
         if not ms:
@@ -450,7 +570,20 @@ def main():
             state = f"{killed} of {len(ms)} probes pinned, over {groups} clause" + ("" if groups == 1 else "s")
             rest = ", ".join(f"{n} {st.lower()}" for st, n in sorted(by.items()))
             if rest: state += f" ({rest})"
-        out.append(f"| {rid} | {state} | {gate(rid)} | {disp(rid)} |")
+        # The table has to carry the boundary too. Prose above it does not protect a reader who
+        # consumes only the rows, and a pinned cell nothing re-runs reads exactly like one that is
+        # re-run on every commit.
+        if not ms:
+            cover = "—"
+        elif rid in _ungated:
+            # ANY probe of the requirement outside the gate's key set puts the whole row here: a
+            # requirement is only re-run if all of it is.
+            cover = "recorded, not re-run here"
+        elif covered is None:
+            cover = "recorded"
+        else:
+            cover = "re-run by the gate"
+        out.append(f"| {rid} | {state} | {gate(rid)} | {cover} | {disp(rid)} |")
     # Count only what the table shows. A record for a requirement the document no longer
     # renders is omitted from the rows, and must be omitted from the totals with it.
     rendered = [v for rid in ids for v in per.get(rid, [])]

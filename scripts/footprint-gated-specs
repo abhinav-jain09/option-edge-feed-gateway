@@ -1,0 +1,7 @@
+# The specs this repository's AUTOMATIC gate re-runs, one per line.
+#
+# scripts/footprint-reverify.sh fails unless the specs it ran are exactly these, so this file
+# cannot drift away from what the pipeline does without the gate itself going red. The generator
+# reads it to decide which rows the conformance table may call re-run.
+#
+scripts/footprint-campaign.spec.json

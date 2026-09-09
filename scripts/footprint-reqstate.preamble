@@ -14,9 +14,21 @@ shares no vocabulary with the clause recorded against it; beyond that, attributi
 made in review, and the merge gate for this change corrected several of them.
 
 **What backs this table.** The record is a file. Every refusal above checks it against itself or
-against the source it names — the clause a mutation claims to have broken must be in the repository
-at the commit the record names, exactly as many times as the record says — and no amount of that
+against the source it names — the clause a mutation claims to have broken must be in this
+repository at HEAD, exactly as many times as the record says, and every file it mutated must hash to
+what the record says it was — and no amount of that
 makes a file tamper-evident: a baseline block invented wholesale is internally consistent and always
 will be. What cannot be invented is the run. Re-run every mutation against your own checkout with
-`scripts/footprint-reverify.sh`, which compares status and the named kill for each one and fails on
-any difference. That, and not the record's internal shape, is what this table rests on.
+`scripts/footprint-reverify.sh`, which compares what each row claims — its requirement, quoted
+obligation, file, occurrence and patch, all taken from the committed spec — and then whether the
+outcome reproduces, failing on any difference. That, and not the record's internal shape, is what
+this table rests on.
+
+The Jenkinsfile runs it on every build, in its own stage, along with
+`scripts/footprint-reqstate.sh --check`: reverification proves the record, and only `--check` proves
+that this section is the one that record produces. It cannot run in a GitHub check — this build
+needs options-edge-contracts installed from source, which no hosted runner has. The Coverage column
+says only what the tooling can check: whether a row is in the set of specs
+`scripts/footprint-gated-specs` declares, and reverify fails unless the specs it just ran are exactly
+those — so the column cannot drift from what the build does. WHEN the gate runs is this paragraph's
+job, not the table's: it is every build of this repository.
