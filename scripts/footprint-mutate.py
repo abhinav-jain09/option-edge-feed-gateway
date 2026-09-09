@@ -158,7 +158,7 @@ def main():
             if e.get('repoCommit') != commit: return False
             if e.get('treeRestoredClean') is not True: return False   # missing is not clean
             if not e.get('outputSha256') or b.get('returnCode') != 0: return False
-            if b.get('commit') and b.get('commit') != commit: return False
+            if b.get('commit') != commit: return False   # missing is not a match
             lines = e.get('failureLines') or []
             if p.get('status') == 'KILLED':
                 if not e.get('returnCode'): return False
@@ -169,7 +169,10 @@ def main():
                     for n in names:
                         short = n.split('.')[-1]
                         carrying = [l for l in lines if short in l]
-                        if not carrying or all('<<< ERROR!' in l for l in carrying): return False
+                        if not carrying: return False
+                        if kind == 'maven' and not any('<<< FAILURE!' in l or re.search(r':\d+ ', l)
+                                                       for l in carrying):
+                            return False
                 elif isinstance(t, dict) and t.get('test') and t.get('throws'):
                     joined = '\n'.join(lines)
                     if t['test'].split('.')[-1] not in joined or t['throws'] not in joined: return False

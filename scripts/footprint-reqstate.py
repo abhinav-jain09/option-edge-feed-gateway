@@ -56,6 +56,9 @@ def main():
         if line.strip(): req_text[cur] += '\n' + line.rstrip()
 
     problems = []
+    kind = 'node' if any('not ok ' in (l or '')
+                       for ms0 in per.values() for m0 in ms0
+                       for l in (m0.get('evidence', {}).get('failureLines') or [])) else 'maven'
     for rid, ms in per.items():
         for m in ms:
             # ATTRIBUTION, for every record whatever its status: the obligation a row quotes must be
@@ -106,12 +109,14 @@ def main():
                 carrying = [l for l in lines if short in l]
                 if not carrying:
                     problems.append(f"{rid}: names assertion failure {name} that its own failure lines do not carry")
-                elif all('<<< ERROR!' in l for l in carrying):
-                    # surefire marks a THROW as ERROR and an assertion as FAILURE. A record whose
-                    # only line for this name is an ERROR is not evidence of an assertion, whatever
-                    # the field it is stored in says.
-                    problems.append(f"{rid}: names {name} as an assertion failure, but every line it "
-                                    f"carries for that name is an ERROR (a throw), not a FAILURE")
+                elif kind == 'maven' and not any('<<< FAILURE!' in l or re.search(r':\d+ ', l) for l in carrying):
+                    # Surefire marks a THROW as ERROR and an assertion as FAILURE, and prints the
+                    # assertion's own `Class.method:LINE message` summary. Requiring the ABSENCE of
+                    # ERROR was not enough: adding the ordinary summary line to an ERROR record
+                    # satisfied it. Require a line that positively says FAILURE, or the numbered
+                    # assertion summary.
+                    problems.append(f"{rid}: names {name} as an assertion failure, but no line it "
+                                    f"carries for that name is a FAILURE or an assertion summary")
             if not m.get('assertionFailures'):
                 # The renderer must hold this itself: a record is a checked-in FILE, and a hand-edited
                 # or legacy one would otherwise be taken at its word.
@@ -126,7 +131,7 @@ def main():
                                     f"failure lines carry ({m.get('killedBy')})")
             if not m.get('evidence', {}).get('failureLines'):
                 problems.append(f"{rid}: a KILLED record carries no failure lines")
-            if not m.get('evidence', {}).get('treeRestoredClean', True):
+            if m.get('evidence', {}).get('treeRestoredClean') is not True:
                 problems.append(f"{rid}: a KILLED record ran against a tree it did not restore")
     # The hand-maintained preamble sits INSIDE the generated block, so a stale sentence in it
     # survives regeneration and --check. Hold it to the record: every probe key it names must exist,
@@ -163,7 +168,10 @@ def main():
             if not c:
                 problems.append(f"{m.get('requirement')}: a record names no repository commit")
                 continue
-            if b and b != c:
+            if not b:
+                problems.append(f"{m.get('requirement')}: a record names no baseline commit, so "
+                                f"nothing says its baseline ran at the commit it claims")
+            elif b != c:
                 problems.append(f"{m.get('requirement')}: the record's commit {c[:12]} is not the "
                                 f"commit its baseline ran at ({b[:12]})")
             commits.add(c)
