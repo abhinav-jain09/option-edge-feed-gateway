@@ -192,7 +192,12 @@ def main():
                 else:
                     return False
             elif p.get('status') == 'SURVIVED':
-                if e.get('returnCode'): return False
+                # `!= 0`, not `if`: a MISSING return code was reading as success, so a forged
+                # survivor was resumed rather than re-run. Retained failure evidence disqualifies it
+                # too — the renderer refuses such a record, and resume should not hand it one.
+                if e.get('returnCode') != 0: return False
+                if (p.get('assertionFailures') or p.get('killedBy') or p.get('anyFailures')
+                        or p.get('failureCount') or lines): return False
             else:
                 if not e.get('returnCode'): return False   # every other status means the run failed
             return True

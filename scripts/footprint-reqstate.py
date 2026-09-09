@@ -81,14 +81,22 @@ def main():
         the same. A record whose command and evidence disagree is refused rather than guessed at.
         """
         c = m0.get('command', '')
-        by_command = 'node' if (' --test' in c or c.startswith('node ')) else 'maven'
+        # `npm test`, `npm run test:js`, `yarn test` and `pnpm test` are node runners too; matching
+        # only `node ` / ` --test` classified them as maven and then refused their valid `not ok`
+        # evidence.
+        by_command = 'node' if (' --test' in c or re.match(r'^(node|npm|yarn|pnpm|npx)\b', c)) else 'maven'
         lines = m0.get('evidence', {}).get('failureLines') or []
         looks_maven = any(l.startswith('[ERROR]') for l in lines)
         looks_node = any(l.startswith('not ok ') for l in lines)
+        if lines and looks_maven and looks_node:
+            # both shapes in one record is not a runner this campaign ran; refuse rather than pick
+            problems.append(f"{m0.get('requirement')}: the failure lines carry BOTH surefire and node "
+                            f"shapes, so nothing says which runner produced them")
+            return 'maven'
         if lines and looks_maven and by_command != 'maven':
             problems.append(f"{m0.get('requirement')}: the command says node but the failure lines are surefire's")
             return 'maven'
-        if lines and looks_node and not looks_maven and by_command != 'node':
+        if lines and looks_node and by_command != 'node':
             problems.append(f"{m0.get('requirement')}: the command says maven but the failure lines are node's")
             return 'maven'
         return by_command
@@ -153,6 +161,8 @@ def main():
                 problems.append(f"{rid}: a KILLED record carries no hash of its run output")
             # the named assertion failures must be the ones THIS run produced
             lines = m.get('evidence', {}).get('failureLines') or []
+            runner_of(m)   # cross-check command against evidence for EVERY kill, not only the
+                           # ones that name an assertion — a killedByThrow record was never checked
             for name in (m.get('assertionFailures') or []):
                 short = name.split('.')[-1]
                 carrying = [l for l in lines if short in l]
