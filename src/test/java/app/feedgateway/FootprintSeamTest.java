@@ -114,9 +114,9 @@ class FootprintSeamTest {
     void theLiveConsumerSeeksFootprintPartitionsToEndAndOnlyThose() {
         FeedGatewayService s = FootprintWiringTest.on();
         KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
-        List<TopicPartition> partitions = List.of(tp("futures.cvd.bars"), tp("futures.footprint.bars"), tp("futures.footprint"), tp("futures.footprint.outcomes"));
+        List<TopicPartition> partitions = List.of(tp("futures.cvd.bars"), tp("futures.footprint.bars"), tp("futures.footprint"), tp("futures.footprint.outcomes"), tp("futures.footprint.strike"));
         s.seekFootprintToEnd(consumer, partitions);
-        verify(consumer).seekToEnd(List.of(tp("futures.footprint.bars"), tp("futures.footprint"), tp("futures.footprint.outcomes")));
+        verify(consumer).seekToEnd(List.of(tp("futures.footprint.bars"), tp("futures.footprint"), tp("futures.footprint.outcomes"), tp("futures.footprint.strike")));
         FeedGatewayService off = new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
         KafkaConsumer<String, Object> untouched = mock(KafkaConsumer.class);
         off.seekFootprintToEnd(untouched, partitions);

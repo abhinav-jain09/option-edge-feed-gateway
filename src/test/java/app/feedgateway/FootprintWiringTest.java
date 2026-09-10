@@ -26,7 +26,7 @@ class FootprintWiringTest {
 
     static FeedGatewayService on() {
         FootprintTopicGateTest.FakeReader r = new FootprintTopicGateTest.FakeReader();
-        for (String t : List.of("futures.footprint", "futures.footprint.evidence", "futures.footprint.bars", "futures.footprint.outcomes")) r.valid(t);
+        for (String t : List.of("futures.footprint", "futures.footprint.evidence", "futures.footprint.bars", "futures.footprint.outcomes", "futures.footprint.strike")) r.valid(t);
         return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null, r);
     }
 
@@ -45,7 +45,7 @@ class FootprintWiringTest {
         int start = src.indexOf("void addEsFootprintTopics(Map<String, TopicBinding> topicEvents) {");
         String body = src.substring(start, src.indexOf("\n    }", start));
         assertTrue(body.contains("if (footprintViews == null) return;"), "flag off adds nothing");
-        for (String e : new String[]{"es-footprint\"", "es-footprint-evidence\"", "es-footprint-bar\"", "es-footprint-outcome\""}) {
+        for (String e : new String[]{"es-footprint\"", "es-footprint-evidence\"", "es-footprint-bar\"", "es-footprint-outcome\"", "es-footprint-strike\""}) {
             assertEquals(1, occurrences(body, "new TopicBinding(\"DATABENTO\", \"" + e + ")"), e);
         }
         assertFalse(body.contains("admit("), "the topic SET is unconditional; admission gates consumption, not discovery");
@@ -76,7 +76,8 @@ class FootprintWiringTest {
         assertTrue(branch.contains("onFootprintLiveRecord(binding.event(), json);"), "the live branch delegates to the one admit-then-broadcast method");
         int method = src.indexOf("boolean onFootprintLiveRecord(String event, String json) {");
         String body = src.substring(method, src.indexOf("\n    }", method));
-        assertTrue(body.indexOf("admitFootprintRecord(event, json, \"live\")") < body.indexOf("broadcast(event, json);"), "view first, then broadcast");
+        assertTrue(body.indexOf("admitFootprintRecord(event, json, \"live\")") < body.indexOf("broadcast(event, "), "view first, then broadcast");
+        assertTrue(body.contains("FootprintStrikeView.quoted(json)"), "the strike record rides the frame as a JSON string literal: the page folds the bytes the relay folded");
         assertTrue(body.contains("if (!admitFootprintRecord(event, json, \"live\")) return false;"), "an oversize record is never broadcast");
         int cache = src.indexOf("admitFootprintRecord(binding.event(), json, \"cache\");");
         assertTrue(cache > 0 && cache < src.indexOf("updateCache(binding, record, json);", cache), "the cache consumer admits before the generic cache and never broadcasts");
@@ -84,7 +85,7 @@ class FootprintWiringTest {
         assertTrue(src.substring(raw, src.indexOf("}", raw)).contains("isFootprintEvent(event)"), "verbatim: never enriched");
         int allow = src.indexOf("\"es-cvd-bar\",");
         String after = src.substring(allow, allow + 600);
-        for (String e : new String[]{"\"es-footprint\",", "\"es-footprint-evidence\",", "\"es-footprint-bar\",", "\"es-footprint-outcome\","}) assertTrue(after.contains(e), e + " allowlisted");
+        for (String e : new String[]{"\"es-footprint\",", "\"es-footprint-evidence\",", "\"es-footprint-bar\",", "\"es-footprint-outcome\",", "\"es-footprint-strike\","}) assertTrue(after.contains(e), e + " allowlisted");
     }
 
     // ---- G-R1/G-R10: flag off is byte-identical ----------------------------------------------------
@@ -113,7 +114,8 @@ class FootprintWiringTest {
                 g.esFootprintTopic(), "es-footprint",
                 g.esFootprintEvidenceTopic(), "es-footprint-evidence",
                 g.esFootprintBarsTopic(), "es-footprint-bar",
-                g.esFootprintOutcomesTopic(), "es-footprint-outcome"),
+                g.esFootprintOutcomesTopic(), "es-footprint-outcome",
+                g.esFootprintStrikeTopic(), "es-footprint-strike"),
                 wired.entrySet().stream().collect(java.util.stream.Collectors.toMap(
                         java.util.Map.Entry::getKey, e -> e.getValue().event())),
                 "every topic is bound, to its own event");
@@ -134,6 +136,8 @@ class FootprintWiringTest {
         for (String keyed : new String[]{"es-footprint-bar", "es-footprint-outcome"}) {
             assertEquals(back, s.cachePolicyFor(keyed, 0L).ttlMs(), keyed + " re-fills from the compacted topic");
         }
+        assertEquals(new GatewaySettings().esFootprintStrikeSeekBackMs(), s.cachePolicyFor("es-footprint-strike", 0L).ttlMs(), "the strike log's history crosses sessions: a week");
+        assertTrue(new GatewaySettings().esFootprintStrikeSeekBackMs() > back);
     }
 
     /** G-R6: footprint alone is enough to send the hello — the page needs the handshake either way. */
@@ -217,9 +221,13 @@ class FootprintWiringTest {
 
     @Test void flagOnAddsOneHelloFieldFromTheCoordinatorSnapshot() {
         FeedGatewayService s = on();
-        assertEquals("{\"sessionDate\":null,\"hwm\":{},\"footprint\":{\"sessionDate\":null,\"hwm\":{},\"outcomeHwm\":{}}}", s.cvdHelloJson());
+        assertEquals("{\"sessionDate\":null,\"hwm\":{},\"footprint\":{\"sessionDate\":null,\"hwm\":{},\"outcomeHwm\":{}},"
+                + "\"footprintStrike\":{\"authority\":0,\"symbol\":\"ES.v.0\",\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}}", s.cvdHelloJson());
         assertTrue(s.admitFootprintRecord("es-footprint-bar", FootprintViewsTest.bar("2026-08-14", "1m", 60_000), "live"));
-        assertTrue(s.cvdHelloJson().endsWith("\"footprint\":{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"outcomeHwm\":{}}}"));
+        assertTrue(s.cvdHelloJson().contains("\"footprint\":{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"outcomeHwm\":{}}"));
+        assertTrue(s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.checkpoint("2026-08-14", "1m", 60_000), "cache"));
+        assertTrue(s.cvdHelloJson().endsWith("\"footprintStrike\":{\"authority\":0,\"symbol\":\"ES.v.0\",\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}}"),
+                "the episode high-water mark rides the SAME hello (R14)");
     }
 
     // ---- G-R3/G-R9: the shared admission path and overlap identities --------------------------------
@@ -259,21 +267,44 @@ class FootprintWiringTest {
 
     // ---- G-R9/G-R11 (12): the exact contract flag-on at start-up -----------------------------------
 
+    @Test void theStrikeStreamBroadcastsONLYWhatTheFoldAdmitted() throws Exception {
+        // Every other footprint stream broadcasts what it drops (G-R3). The strike page folds by identity
+        // and revision against the relay's own fold, so a refused, evicted or shape-dropped record
+        // reaching it is evidence the relay has already decided is not part of the authority — and the
+        // page had no way to know (gateway round-3 #3/#4).
+        String src = Files.readString(SERVICE);
+        int at = src.indexOf("boolean admitFootprintRecord(");
+        String body = src.substring(at, src.indexOf("\n    }", at));
+        assertTrue(body.contains("return sa.reason() == FootprintStrikeView.Reason.ADMITTED;"),
+                "the strike branch forwards only ADMITTED");
+        assertTrue(body.contains("return a.reason() != FootprintViews.Reason.OVERSIZE;"),
+                "and the bars/outcomes branch keeps its own rule");
+    }
+
     @Test void everyMetricsSeriesIsExportedWithEveryLabelValueAtZeroAtStartUp() {
         String m = on().footprintMetricsText();
-        String[] events = {"es-footprint", "es-footprint-evidence", "es-footprint-bar", "es-footprint-outcome"};
-        String[] topics = {"futures.footprint", "futures.footprint.evidence", "futures.footprint.bars", "futures.footprint.outcomes"};
+        String[] events = {"es-footprint", "es-footprint-evidence", "es-footprint-bar", "es-footprint-outcome", "es-footprint-strike"};
+        String[] topics = {"futures.footprint", "futures.footprint.evidence", "futures.footprint.bars", "futures.footprint.outcomes", "futures.footprint.strike"};
         java.util.List<String> expect = new java.util.ArrayList<>();
         expect.add("gateway_footprint_enabled 1");
         for (String e : events) for (String c : new String[]{"cache", "live"}) expect.add("gateway_footprint_records_total{event=\"" + e + "\",consumer=\"" + c + "\"} 0");
-        for (String e : new String[]{"es-footprint-bar", "es-footprint-outcome"}) for (String c : new String[]{"cache", "live"}) for (String r : new String[]{"oversize", "shape", "stale_session"})
+        for (String e : new String[]{"es-footprint-bar", "es-footprint-outcome", "es-footprint-strike"}) for (String c : new String[]{"cache", "live"}) for (String r : new String[]{"oversize", "shape", "stale_session", "collision", "refused", "evicted", "unavailable"})
             expect.add("gateway_footprint_drops_total{event=\"" + e + "\",consumer=\"" + c + "\",reason=\"" + r + "\"} 0");
+        // the broadcast domain is the five evidence events PLUS the strike authority frame, which is
+        // broadcast but is not a Kafka topic and belongs to no record or drop domain (round-3 #8)
         for (String e : events) expect.add("gateway_footprint_broadcast_total{event=\"" + e + "\"} 0");
+        expect.add("gateway_footprint_broadcast_total{event=\"es-footprint-strike-control\"} 0");
         expect.add("gateway_footprint_evictions_total{view=\"bars\"} 0"); expect.add("gateway_footprint_evictions_total{view=\"outcomes\"} 0");
         expect.add("gateway_footprint_rollovers_total 0"); expect.add("gateway_footprint_bars_in_view 0"); expect.add("gateway_footprint_outcomes_in_view 0");
         expect.add("gateway_footprint_view_bytes{view=\"bars\"} 0"); expect.add("gateway_footprint_view_bytes{view=\"outcomes\"} 0");
-        for (String r : new String[]{"bars", "outcomes"}) expect.add("gateway_footprint_backfill_requests_total{route=\"" + r + "\"} 0");
-        for (String r : new String[]{"bars", "outcomes"}) for (String x : new String[]{"busy", "bad_cursor", "session_mismatch"}) expect.add("gateway_footprint_backfill_rejected_total{route=\"" + r + "\",reason=\"" + x + "\"} 0");
+        for (String r : new String[]{"bars", "outcomes", "strike_latest", "strike_history"}) expect.add("gateway_footprint_backfill_requests_total{route=\"" + r + "\"} 0");
+        for (String r : new String[]{"bars", "outcomes", "strike_latest", "strike_history"}) for (String x : new String[]{"busy", "bad_cursor", "session_mismatch", "unavailable"}) expect.add("gateway_footprint_backfill_rejected_total{route=\"" + r + "\",reason=\"" + x + "\"} 0");
+        expect.add("gateway_footprint_strike_episodes_in_view 0"); expect.add("gateway_footprint_strike_view_bytes 0");
+        // what the revision ledgers, identities and tombstones cost, and whether the cache replay has
+        // crossed its bootstrap boundary — both budgeted/published since code round 2 (#1, #3)
+        expect.add("gateway_footprint_strike_view_metadata_bytes 0"); expect.add("gateway_footprint_strike_loading 1");
+        expect.add("gateway_footprint_strike_evictions_total 0");
+        expect.add("gateway_footprint_strike_collisions_total 0"); expect.add("gateway_footprint_strike_refused_identities 0"); expect.add("gateway_footprint_strike_unavailable 0");
         for (String t : topics) expect.add("gateway_footprint_topic_validated{topic=\"" + t + "\"} 0");
         for (String t : topics) for (String r : new String[]{"admin", "unknown", "ceiling", "compression"}) expect.add("gateway_footprint_topic_validation_failures_total{topic=\"" + t + "\",reason=\"" + r + "\"} 0");
         List<String> actual = m.lines().filter(l -> !l.startsWith("#")).toList();
@@ -281,6 +312,9 @@ class FootprintWiringTest {
         for (String name : List.of("gateway_footprint_enabled", "gateway_footprint_records_total", "gateway_footprint_drops_total", "gateway_footprint_broadcast_total",
                 "gateway_footprint_evictions_total", "gateway_footprint_rollovers_total", "gateway_footprint_bars_in_view", "gateway_footprint_outcomes_in_view",
                 "gateway_footprint_view_bytes", "gateway_footprint_backfill_requests_total", "gateway_footprint_backfill_rejected_total",
+                "gateway_footprint_strike_episodes_in_view", "gateway_footprint_strike_view_bytes",
+                "gateway_footprint_strike_view_metadata_bytes", "gateway_footprint_strike_loading", "gateway_footprint_strike_evictions_total",
+                "gateway_footprint_strike_collisions_total", "gateway_footprint_strike_refused_identities", "gateway_footprint_strike_unavailable",
                 "gateway_footprint_topic_validated", "gateway_footprint_topic_validation_failures_total")) {
             assertEquals(1, occurrences(m, "# TYPE " + name + " "), name + " typed once");
         }
@@ -306,6 +340,9 @@ class FootprintWiringTest {
         assertEquals(262_144L, g.esFootprintMaxRecordBytes()); assertEquals(128L << 20, g.esFootprintBarsMaxBytes()); assertEquals(12_000, g.esFootprintBarsMaxCount());
         assertEquals(16L << 20, g.esFootprintOutcomesMaxBytes()); assertEquals(20_000, g.esFootprintOutcomesMaxCount());
         assertEquals(4, g.esFootprintBackfillConcurrency()); assertEquals(1_048_588L, g.esFootprintMaxMessageBytesCeiling()); assertEquals(24L * 3_600_000L, g.esFootprintSeekBackMs());
+        assertEquals("futures.footprint.strike", g.esFootprintStrikeTopic()); assertEquals(64L << 20, g.esFootprintStrikeMaxBytes());
+        assertEquals(50_000, g.esFootprintStrikeMaxEpisodes()); assertEquals(7L * 24 * 3_600_000L, g.esFootprintStrikeSeekBackMs());
+        assertEquals(10_000, g.esFootprintStrikeMaxRefusedIdentities()); assertEquals("ES.v.0", g.esFootprintStrikeSymbol());
     }
 
     @Test void theControllerOrderIsBindingFlagAuthPermitCursorSnapshotWrite() throws Exception {
