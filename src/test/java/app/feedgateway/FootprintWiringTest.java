@@ -222,11 +222,11 @@ class FootprintWiringTest {
     @Test void flagOnAddsOneHelloFieldFromTheCoordinatorSnapshot() {
         FeedGatewayService s = on();
         assertEquals("{\"sessionDate\":null,\"hwm\":{},\"footprint\":{\"sessionDate\":null,\"hwm\":{},\"outcomeHwm\":{}},"
-                + "\"footprintStrike\":{\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}}", s.cvdHelloJson());
+                + "\"footprintStrike\":{\"symbol\":\"ES.v.0\",\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}}", s.cvdHelloJson());
         assertTrue(s.admitFootprintRecord("es-footprint-bar", FootprintViewsTest.bar("2026-08-14", "1m", 60_000), "live"));
         assertTrue(s.cvdHelloJson().contains("\"footprint\":{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"outcomeHwm\":{}}"));
         assertTrue(s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.checkpoint("2026-08-14", "1m", 60_000), "cache"));
-        assertTrue(s.cvdHelloJson().endsWith("\"footprintStrike\":{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}}"),
+        assertTrue(s.cvdHelloJson().endsWith("\"footprintStrike\":{\"symbol\":\"ES.v.0\",\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}}"),
                 "the episode high-water mark rides the SAME hello (R14)");
     }
 

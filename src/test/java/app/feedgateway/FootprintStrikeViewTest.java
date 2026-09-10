@@ -119,13 +119,13 @@ class FootprintStrikeViewTest {
 
     @Test void checkpointsAdvanceTheHelloHighWaterMarkAndCarryNoEpisode() {
         FootprintStrikeView v = view();
-        assertEquals("{\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"symbol\":\"\",\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
         assertTrue(v.admit(checkpoint("2026-09-10", "1m", 500)).checkpoint());
         assertTrue(v.admit(checkpoint(null, "30s", 7)).checkpoint(), "a genuine JSON null session date is the producer's 'nothing seen yet'");
         assertEquals(0, v.episodesInView());
         v.admit(episode("OPEN", "2026-09-10", "5m", 680_000, 300, 0, 300, "x"));
         v.admit(checkpoint("2026-09-10", "1m", 400));                          // older watermark: never regresses
-        assertEquals("{\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":500,\"30s\":7,\"5m\":300},\"historyBeginsAtMs\":300,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"symbol\":\"\",\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":500,\"30s\":7,\"5m\":300},\"historyBeginsAtMs\":300,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
     }
 
     @Test void theBudgetsEvictTheOldestIdentitiesAndTheBoundaryIsMonotonic() {
@@ -170,7 +170,7 @@ class FootprintStrikeViewTest {
         assertEquals(FootprintStrikeView.Reason.SHAPE, v.admit(e(100, 0, "x").replace("\"sessionDate\":\"2026-09-10\"", "\"sessionDate\":\"2026-09-1\"")).reason());
         assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(episode("UPDATE", "2026-09-10", "1m", 680_000, 100, 253_402_300_800_000L, 100, "big")).reason(), "a revision is a count, not an epoch");
         assertEquals(FootprintStrikeView.Reason.SHAPE, v.admit(e(100, 0, "x").replace("\"openBarStartMs\":100", "\"openBarStartMs\":253402300800000")).reason(), "an epoch outside the domain is a shape drop");
-        assertEquals("{\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":100},\"historyBeginsAtMs\":100,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"symbol\":\"\",\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":100},\"historyBeginsAtMs\":100,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
         assertEquals(1, v.episodesInView());
     }
 

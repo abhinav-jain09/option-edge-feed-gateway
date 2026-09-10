@@ -100,6 +100,8 @@ final class FootprintStrikeView {
     private final ObjectMapper mapper;
     private final long maxRecordBytes, maxBytes;
     private final int maxEpisodes, maxRefused;
+    /** The symbol the ROUTES scope to. Published in the hello so a live reader scopes exactly as REST does. */
+    private volatile String scopeSymbol = "";
 
     private final Object lock = new Object();
     private final Map<String, Head> heads = new HashMap<>();
@@ -124,6 +126,9 @@ final class FootprintStrikeView {
         if (maxRecordBytes <= 0 || maxBytes <= 0 || maxEpisodes <= 0 || maxRefused <= 0) throw new IllegalArgumentException("strike view budgets must be positive");
         this.mapper = mapper; this.maxRecordBytes = maxRecordBytes; this.maxBytes = maxBytes; this.maxEpisodes = maxEpisodes; this.maxRefused = maxRefused;
     }
+
+    /** The symbol every route defaults to; a reader that folds live records must use the same one. */
+    void scopeSymbol(String symbol) { this.scopeSymbol = symbol == null ? "" : symbol; }
 
     /** What the service does when the authority the readers hold has changed (refusal, unavailable, replay complete). */
     void onAuthorityChange(Runnable listener) { this.onAuthorityChange = listener == null ? () -> {} : listener; }
@@ -297,11 +302,12 @@ final class FootprintStrikeView {
 
     /**
      * The hello field:
-     * {@code {"sessionDate":..,"hwm":{tf:seenMax},"historyBeginsAtMs":..,"replayBeginsAtMs":..,"loading":bool,"refused":n,"unavailable":bool}}.
+     * {@code {"symbol":..,"sessionDate":..,"hwm":{tf:seenMax},"historyBeginsAtMs":..,"replayBeginsAtMs":..,"loading":bool,"refused":n,"unavailable":bool}}.
      */
     String helloField() {
         synchronized (lock) {
-            StringBuilder sb = new StringBuilder("{\"sessionDate\":").append(sessionDate == null ? "null" : "\"" + sessionDate + "\"").append(",\"hwm\":{");
+            StringBuilder sb = new StringBuilder("{\"symbol\":\"").append(scopeSymbol).append("\",\"sessionDate\":")
+                    .append(sessionDate == null ? "null" : "\"" + sessionDate + "\"").append(",\"hwm\":{");
             boolean first = true;
             for (Map.Entry<String, Long> e : hwm.entrySet()) { if (!first) sb.append(','); sb.append('"').append(e.getKey()).append("\":").append(e.getValue()); first = false; }
             sb.append("},\"historyBeginsAtMs\":").append(historyBeginsAtLocked() == null ? "null" : historyBeginsAtLocked());

@@ -818,6 +818,8 @@ public class FeedGatewayService implements ReplayRunner {
             this.footprintStrikeView = new FootprintStrikeView(mapper, settings.esFootprintMaxRecordBytes(),
                     settings.esFootprintStrikeMaxBytes(), settings.esFootprintStrikeMaxEpisodes(), settings.esFootprintStrikeMaxRefusedIdentities());
             this.footprintStrikeView.onAuthorityChange(this::broadcastFootprintStrikeControl);
+        this.footprintStrikeView.scopeSymbol(settings.esFootprintStrikeSymbol());
+            this.footprintStrikeView.scopeSymbol(settings.esFootprintStrikeSymbol());
             this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(),
                     FootprintTopicGate.adminReader(settings.bootstrapServers(), settings.partitionRefreshMetadataTimeoutMs()));
             this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
@@ -845,6 +847,7 @@ public class FeedGatewayService implements ReplayRunner {
         this.footprintStrikeView = new FootprintStrikeView(mapper, settings.esFootprintMaxRecordBytes(),
                 settings.esFootprintStrikeMaxBytes(), settings.esFootprintStrikeMaxEpisodes(), settings.esFootprintStrikeMaxRefusedIdentities());
         this.footprintStrikeView.onAuthorityChange(this::broadcastFootprintStrikeControl);
+        this.footprintStrikeView.scopeSymbol(settings.esFootprintStrikeSymbol());
         this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(), footprintReader);
         this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
     }
