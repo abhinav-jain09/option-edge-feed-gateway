@@ -263,3 +263,28 @@ own, so the PR changes the limit (or `-Xmx`) whatever the measurements say.
 
 Check the round-9 disposition (the two validation series in G-R9's contract and G-R11's pins);
 verdict `APPROVE` or `REQUEST_CHANGES` with numbered findings.
+
+
+## As-built amendment — the fifth stream (ES-FOOTPRINT-STRIKE-INTERACTION.md R3/R14, 2026-09-10)
+
+The strike-interaction log `es.futures.footprint.strike` rides the SAME relay path under the SAME flag
+(`GATEWAY_ES_FOOTPRINT_ENABLED`), topic env `KAFKA_ES_FOOTPRINT_STRIKE_TOPIC`, event `es-footprint-strike`:
+
+- **Wiring (G-R2)**: `addEsFootprintTopics` binds FIVE topics; the G-R8a gate validates all five; the live
+  consumer seeks the fifth to END like the other four; the cache consumer seeks back
+  `GATEWAY_ES_FOOTPRINT_STRIKE_SEEK_BACK_MS` (default 7 days — history crosses sessions, R18).
+- **Fold (R14)**: `FootprintStrikeView` folds by identity to the greatest revision; two records sharing an
+  identity and a revision must be identical bytes, else the identity is REFUSED for the incarnation
+  (drop reason `collision`, later revisions `refused`) and counted. CHECKPOINT records carry no episode and
+  only advance the per-timeframe high-water mark. Budgets (`GATEWAY_ES_FOOTPRINT_STRIKE_MAX_BYTES`,
+  `_MAX_EPISODES`) evict the OLDEST identities and the boundary is published as `historyBeginsAtMs` (R20).
+  No session rollover: `latest` is scoped by the reader.
+- **Hello (G-R6)**: one more field on `cvd-hello`, `footprintStrike:{sessionDate,hwm{tf:seenMaxBarStartMs},historyBeginsAtMs,refused}`.
+- **Backfill (G-R7)**: `GET /api/footprint/strike/latest?tf&sessionDate&afterStrike&limit≤200` (one folded
+  record per strike for ONE session and ONE timeframe, ascending strike, exclusive strike cursor) and
+  `GET /api/footprint/strike/history?tf&strikeCents&before&limit≤100` (newest first, across sessions, opaque
+  exclusive cursor `sessionDate|%019d(openBarStartMs)`). Same flag → auth → permit → cursor → snapshot →
+  streamed write order; the envelope adds `historyBeginsAtMs` and `refused`.
+- **Metrics (G-R9)**: the existing series gain the fifth event / third keyed event / two new routes / two new
+  drop reasons, plus `gateway_footprint_strike_{episodes_in_view,view_bytes,evictions_total,collisions_total,refused_identities}`.
+- **R21**: the relay adds no field to a record; the page's chip words are the page's business.

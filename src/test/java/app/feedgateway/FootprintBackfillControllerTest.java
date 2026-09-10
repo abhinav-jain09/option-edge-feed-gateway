@@ -68,6 +68,54 @@ class FootprintBackfillControllerTest {
         assertTrue(s.footprintMetricsText().contains("gateway_footprint_backfill_requests_total{route=\"bars\"} 2\n"));
     }
 
+    // ---- ES-FOOTPRINT-STRIKE-INTERACTION.md R14/R18/R20: the strike routes -----------------------------
+
+    @Test void strikeLatestStreamsOneFoldedRecordPerStrikeForOneSessionWithTheBoundaryEnvelope() throws Exception {
+        FeedGatewayService s = FootprintWiringTest.on();
+        s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.episode("CLOSE", "2026-09-09", "1m", 680_000, 10, 2, 20, "old"), "cache");
+        s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.episode("OPEN", "2026-09-10", "1m", 680_000, 300, 0, 300, "now"), "cache");
+        s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.episode("OPEN", "2026-09-10", "1m", 685_000, 300, 0, 300, "up"), "live");
+        MockHttpServletResponse r = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeLatest("1m", "2026-09-10", -1, 1, "Bearer x", r);
+        assertEquals(200, r.getStatus());
+        String b = body(r);
+        assertTrue(b.startsWith("{\"sessionDate\":\"2026-09-10\",\"historyBeginsAtMs\":10,\"refused\":0,\"episodes\":[{\"kind\":\"OPEN\""), b);
+        assertTrue(b.contains("\"now\"") && !b.contains("\"old\""), "latest is THIS session's, not yesterday's");
+        assertTrue(b.endsWith("],\"nextCursor\":680000}"), b);
+        MockHttpServletResponse r2 = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeLatest("1m", "2026-09-10", 680_000, 200, "Bearer x", r2);
+        assertTrue(body(r2).contains("\"up\"") && body(r2).endsWith("],\"nextCursor\":null}"));
+        MockHttpServletResponse bad = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeLatest("1m", "20260910", -1, 200, "Bearer x", bad);
+        assertEquals(400, bad.getStatus(), "a non-canonical session date is refused");
+        MockHttpServletResponse off = new MockHttpServletResponse();
+        FeedGatewayService none = new FeedGatewayService(new GatewaySettings(), new com.fasterxml.jackson.databind.ObjectMapper(), new HpsfGatewayViewMapper(), null);
+        controller(none, 200).footprintStrikeLatest("1m", "2026-09-10", -1, 200, "Bearer x", off);
+        assertEquals(404, off.getStatus());
+        assertTrue(s.footprintMetricsText().contains("gateway_footprint_backfill_requests_total{route=\"strike_latest\"} 3\n"));
+        assertTrue(s.footprintMetricsText().contains("gateway_footprint_backfill_rejected_total{route=\"strike_latest\",reason=\"bad_cursor\"} 1\n"));
+    }
+
+    @Test void strikeHistoryIsNewestFirstAcrossSessionsWithAnOpaqueExclusiveCursor() throws Exception {
+        FeedGatewayService s = FootprintWiringTest.on();
+        s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.episode("CLOSE", "2026-09-09", "1m", 680_000, 10, 2, 20, "old"), "cache");
+        s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.episode("OPEN", "2026-09-10", "1m", 680_000, 300, 0, 300, "now"), "cache");
+        MockHttpServletResponse r = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeHistory("1m", 680_000, "", 1, "Bearer x", r);
+        String b = body(r);
+        assertTrue(b.contains("\"now\"") && b.endsWith("],\"nextCursor\":\"2026-09-10|0000000000000000300\"}"), b);
+        MockHttpServletResponse r2 = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeHistory("1m", 680_000, "2026-09-10|0000000000000000300", 5, "Bearer x", r2);
+        assertTrue(body(r2).contains("\"old\"") && !body(r2).contains("\"now\"") && body(r2).endsWith("],\"nextCursor\":null}"), "exclusive cursor; a short page ends pagination: " + body(r2));
+        MockHttpServletResponse bad = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeHistory("1m", 680_000, "garbage", 1, "Bearer x", bad);
+        assertEquals(400, bad.getStatus()); assertEquals("{\"error\":\"bad cursor\"}", body(bad));
+        MockHttpServletResponse unauth = new MockHttpServletResponse();
+        controller(s, 401).footprintStrikeHistory("1m", 680_000, "", 1, null, unauth);
+        assertEquals(401, unauth.getStatus());
+        assertEquals(4, s.footprintBackfillPermits().availablePermits(), "permits are released after the write");
+    }
+
     @Test void sessionMismatchIsA200WithTheFlagAndCountsOnce() throws Exception {
         FeedGatewayService s = FootprintWiringTest.on();
         s.admitFootprintRecord("es-footprint-bar", FootprintViewsTest.bar("2026-08-17", "30s", 9000), "cache");

@@ -338,6 +338,25 @@ public final class GatewaySettings {
         return value("KAFKA_ES_FOOTPRINT_OUTCOMES_TOPIC", "futures.footprint.outcomes");
     }
 
+    /** ES-FOOTPRINT-STRIKE-INTERACTION.md R13: the strike-interaction episode log (event {@code es-footprint-strike}), single partition, retention -1. */
+    public String esFootprintStrikeTopic() {
+        return value("KAFKA_ES_FOOTPRINT_STRIKE_TOPIC", "futures.footprint.strike");
+    }
+
+    /** Strike view byte and episode budgets (R14/R20: the oldest identities are evicted first and the boundary is published). */
+    public long esFootprintStrikeMaxBytes() {
+        return longValue("GATEWAY_ES_FOOTPRINT_STRIKE_MAX_BYTES", 64L * 1024 * 1024, 1L);
+    }
+
+    public int esFootprintStrikeMaxEpisodes() {
+        return intValue("GATEWAY_ES_FOOTPRINT_STRIKE_MAX_EPISODES", 50_000, 1);
+    }
+
+    /** Seek-back for the strike log on the cache consumer: history crosses sessions (R18), so a week rather than a session. */
+    public long esFootprintStrikeSeekBackMs() {
+        return longValue("GATEWAY_ES_FOOTPRINT_STRIKE_SEEK_BACK_MS", 7L * 24 * 3_600_000L, 1L);
+    }
+
     /** G-R8: accepted-record ceiling — MUST equal the producer's FOOTPRINT_MAX_RECORD_BYTES (one value, set together). */
     public long esFootprintMaxRecordBytes() {
         return longValue("GATEWAY_ES_FOOTPRINT_MAX_RECORD_BYTES", 262_144L, 1L);

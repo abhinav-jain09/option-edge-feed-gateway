@@ -103,6 +103,90 @@ public class GatewayController {
         }
     }
 
+    /**
+     * {@code GET /api/footprint/strike/latest?tf&sessionDate&afterStrike=-1&limit=200} — ES-FOOTPRINT-STRIKE-INTERACTION.md
+     * R14 {@code latest}: one folded record per strike for ONE timeframe and ONE session (R19), ascending by
+     * strike, exclusive strike cursor. The same processing order as the bars route; {@code historyBeginsAtMs}
+     * and {@code refused} ride the envelope so the page can say LOADING / NO DATA / boundary exactly (R20).
+     */
+    @GetMapping(value = "/api/footprint/strike/latest", produces = MediaType.APPLICATION_JSON_VALUE)
+    public void footprintStrikeLatest(@org.springframework.web.bind.annotation.RequestParam("tf") String tf,
+                                      @org.springframework.web.bind.annotation.RequestParam("sessionDate") String sessionDate,
+                                      @org.springframework.web.bind.annotation.RequestParam(value = "afterStrike", defaultValue = "-1") long afterStrike,
+                                      @org.springframework.web.bind.annotation.RequestParam(value = "limit", defaultValue = "200") int limit,
+                                      @org.springframework.web.bind.annotation.RequestHeader(value = "Authorization", required = false) String authorization,
+                                      jakarta.servlet.http.HttpServletResponse response) throws java.io.IOException {
+        if (!footprintGate(response, "strike_latest", authorization)) return;
+        java.util.concurrent.Semaphore permits = service.footprintBackfillPermits();
+        if (!permits.tryAcquire()) { reject(response, "strike_latest", "busy", 503, "{\"error\":\"busy\"}", true); return; }
+        try {
+            if (FootprintViews.parseCanonicalDate(sessionDate) == null) { reject(response, "strike_latest", "bad_cursor", 400, "{\"error\":\"bad sessionDate\"}", false); return; }
+            FootprintStrikeView.Page page = service.footprintStrikeView().latest(tf, sessionDate, afterStrike,
+                    Math.max(1, Math.min(limit, FootprintStrikeView.LATEST_LIMIT_MAX)));
+            writeStrikePage(response, page, "episodes", page.nextCursor() == null ? "null" : page.nextCursor());
+        } finally {
+            permits.release();
+        }
+    }
+
+    /**
+     * {@code GET /api/footprint/strike/history?tf&strikeCents&before=&limit=100} — R14 {@code history}: every
+     * folded episode of one strike, NEWEST first, ACROSS sessions (R18), with an opaque exclusive cursor
+     * {@code sessionDate|%019d(openBarStartMs)} (400 {@code bad cursor} otherwise).
+     */
+    @GetMapping(value = "/api/footprint/strike/history", produces = MediaType.APPLICATION_JSON_VALUE)
+    public void footprintStrikeHistory(@org.springframework.web.bind.annotation.RequestParam("tf") String tf,
+                                       @org.springframework.web.bind.annotation.RequestParam("strikeCents") long strikeCents,
+                                       @org.springframework.web.bind.annotation.RequestParam(value = "before", defaultValue = "") String before,
+                                       @org.springframework.web.bind.annotation.RequestParam(value = "limit", defaultValue = "100") int limit,
+                                       @org.springframework.web.bind.annotation.RequestHeader(value = "Authorization", required = false) String authorization,
+                                       jakarta.servlet.http.HttpServletResponse response) throws java.io.IOException {
+        if (!footprintGate(response, "strike_history", authorization)) return;
+        java.util.concurrent.Semaphore permits = service.footprintBackfillPermits();
+        if (!permits.tryAcquire()) { reject(response, "strike_history", "busy", 503, "{\"error\":\"busy\"}", true); return; }
+        try {
+            if (!before.isEmpty() && !FootprintStrikeView.validHistoryCursor(before)) { reject(response, "strike_history", "bad_cursor", 400, "{\"error\":\"bad cursor\"}", false); return; }
+            FootprintStrikeView.Page page = service.footprintStrikeView().history(tf, strikeCents, before,
+                    Math.max(1, Math.min(limit, FootprintStrikeView.HISTORY_LIMIT_MAX)));
+            writeStrikePage(response, page, "episodes", page.nextCursor() == null ? "null" : "\"" + page.nextCursor() + "\"");
+        } finally {
+            permits.release();
+        }
+    }
+
+    /** The strike routes' envelope: {@code {"sessionDate":..,"historyBeginsAtMs":..,"refused":n,"episodes":[..],"nextCursor":..}}, streamed like {@link #writePage}. */
+    private static void writeStrikePage(jakarta.servlet.http.HttpServletResponse response, FootprintStrikeView.Page page,
+                                        String field, String cursorJson) throws java.io.IOException {
+        try { response.setBufferSize(FOOTPRINT_WRITE_BUFFER); } catch (IllegalStateException alreadyCommitted) { /* verified below */ }
+        int buffer = response.getBufferSize();
+        if (buffer > FOOTPRINT_WRITE_BUFFER) {
+            response.setStatus(503);
+            response.setHeader("Retry-After", "5");
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.getOutputStream().write(("{\"error\":\"response buffer " + buffer + " exceeds " + FOOTPRINT_WRITE_BUFFER + "\"}")
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            response.flushBuffer();
+            return;
+        }
+        response.setStatus(200);
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        java.io.OutputStream out = response.getOutputStream();
+        StringBuilder head = new StringBuilder("{\"sessionDate\":");
+        head.append(page.sessionDate() == null ? "null" : "\"" + page.sessionDate() + "\"");
+        head.append(",\"historyBeginsAtMs\":").append(page.historyBeginsAtMs() == null ? "null" : page.historyBeginsAtMs());
+        head.append(",\"refused\":").append(page.refused());
+        head.append(",\"").append(field).append("\":[");
+        out.write(head.toString().getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        java.util.List<String> records = page.records();
+        for (int i = 0; i < records.size(); i++) {
+            if (i > 0) out.write(',');
+            out.write(records.get(i).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        out.write(("],\"nextCursor\":" + cursorJson + "}").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        out.flush();
+        response.flushBuffer();
+    }
+
     /** Steps (2) flag and (3) authentication; counts the request at the flag check (G-R9). */
     private boolean footprintGate(jakarta.servlet.http.HttpServletResponse response, String route, String authorization) throws java.io.IOException {
         if (!service.footprintEnabled()) {
