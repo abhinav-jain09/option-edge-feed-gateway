@@ -80,7 +80,7 @@ class FootprintBackfillControllerTest {
         controller(s, 200).footprintStrikeLatest("1m", "2026-09-10", "", -1, 1, "Bearer x", r);
         assertEquals(200, r.getStatus());
         String b = body(r);
-        assertTrue(b.startsWith("{\"sessionDate\":\"2026-09-10\",\"historyBeginsAtMs\":10,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"episodes\":[\"{\\\"kind\\\":\\\"OPEN\\\""), b);
+        assertTrue(b.startsWith("{\"sessionDate\":\"2026-09-10\",\"historyBeginsAtMs\":10,\"replayBeginsAtMs\":null,\"loading\":true,\"authority\":0,\"refused\":0,\"episodes\":[\"{\\\"kind\\\":\\\"OPEN\\\""), b);
         assertTrue(b.contains("now") && !b.contains("old"), "latest is THIS session's, not yesterday's");
         assertTrue(b.endsWith("],\"nextCursor\":680000}"), b);
         // each record is a JSON STRING carrying the producer's bytes verbatim (R14: the page folds the same bytes)

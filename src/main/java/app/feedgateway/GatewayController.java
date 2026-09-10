@@ -187,6 +187,7 @@ public class GatewayController {
         // completed empty page (code round-2 #3, #6)
         head.append(",\"replayBeginsAtMs\":").append(page.replayBeginsAtMs() == null ? "null" : page.replayBeginsAtMs());
         head.append(",\"loading\":").append(page.loading());
+        head.append(",\"authority\":").append(page.authority());
         head.append(",\"refused\":").append(page.refused());
         head.append(",\"").append(field).append("\":[");
         out.write(head.toString().getBytes(java.nio.charset.StandardCharsets.US_ASCII));

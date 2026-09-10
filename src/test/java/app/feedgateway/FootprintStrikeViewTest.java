@@ -119,13 +119,13 @@ class FootprintStrikeViewTest {
 
     @Test void checkpointsAdvanceTheHelloHighWaterMarkAndCarryNoEpisode() {
         FootprintStrikeView v = view();
-        assertEquals("{\"symbol\":\"\",\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"authority\":0,\"symbol\":\"\",\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
         assertTrue(v.admit(checkpoint("2026-09-10", "1m", 500)).checkpoint());
         assertTrue(v.admit(checkpoint(null, "30s", 7)).checkpoint(), "a genuine JSON null session date is the producer's 'nothing seen yet'");
         assertEquals(0, v.episodesInView());
         v.admit(episode("OPEN", "2026-09-10", "5m", 680_000, 300, 0, 300, "x"));
         v.admit(checkpoint("2026-09-10", "1m", 400));                          // older watermark: never regresses
-        assertEquals("{\"symbol\":\"\",\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":500,\"30s\":7,\"5m\":300},\"historyBeginsAtMs\":300,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"authority\":0,\"symbol\":\"\",\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":500,\"30s\":7,\"5m\":300},\"historyBeginsAtMs\":300,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
     }
 
     @Test void theBudgetsEvictTheOldestIdentitiesAndTheBoundaryIsMonotonic() {
@@ -140,10 +140,10 @@ class FootprintStrikeViewTest {
         v.admit(episode("OPEN", "2026-09-10", "1m", 682_500, 500, 0, 500, "A")); v.admit(episode("OPEN", "2026-09-10", "1m", 682_500, 500, 0, 500, "B"));   // a refusal frees a slot
         assertTrue(v.historyBeginsAtMs() >= boundary, "the boundary never retreats: " + v.historyBeginsAtMs());
         // the byte budget counts EVERY retained byte — payload, identity and revision ledger (round-2 #1)
-        FootprintStrikeView small = new FootprintStrikeView(new ObjectMapper(), 262_144, 1_000, 1000, 1000);
+        FootprintStrikeView small = new FootprintStrikeView(new ObjectMapper(), 262_144, 2_000, 1000, 1000);
         small.admit(e(100, 0, "one")); small.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 200, 0, 200, "two"));
         assertEquals(1, small.episodesInView(), "the byte budget evicts too");
-        assertTrue(small.bytesInView() + small.metadataBytesInView() <= 1_000, "and it is the budget that holds");
+        assertTrue(small.bytesInView() + small.metadataBytesInView() <= 2_000, "and it is the budget that holds");
         assertEquals(List.of("two"), tags(latest(small, "1m", "2026-09-10")), "the survivor is the newer identity");
     }
 
@@ -170,7 +170,7 @@ class FootprintStrikeViewTest {
         assertEquals(FootprintStrikeView.Reason.SHAPE, v.admit(e(100, 0, "x").replace("\"sessionDate\":\"2026-09-10\"", "\"sessionDate\":\"2026-09-1\"")).reason());
         assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(episode("UPDATE", "2026-09-10", "1m", 680_000, 100, 253_402_300_800_000L, 100, "big")).reason(), "a revision is a count, not an epoch");
         assertEquals(FootprintStrikeView.Reason.SHAPE, v.admit(e(100, 0, "x").replace("\"openBarStartMs\":100", "\"openBarStartMs\":253402300800000")).reason(), "an epoch outside the domain is a shape drop");
-        assertEquals("{\"symbol\":\"\",\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":100},\"historyBeginsAtMs\":100,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"authority\":0,\"symbol\":\"\",\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":100},\"historyBeginsAtMs\":100,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
         assertEquals(1, v.episodesInView());
     }
 
@@ -275,6 +275,88 @@ class FootprintStrikeViewTest {
         assertEquals(FootprintStrikeView.Reason.UNAVAILABLE, v.admit(e(200, 0, "d")).reason(), "the refusal that overflows the ledger reports the state it left behind");
         assertTrue(v.unavailable());
         assertTrue(control.get(control.size() - 1).contains("\"unavailable\":true"));
+    }
+
+    // ---- round 3: an authority generation, eviction as an authority change, an honest replay ----------
+
+    @Test void everyAuthorityChangeBumpsAGenerationThatTheHelloAndEveryPageCarry() {
+        // A count-only notice could not be ordered against a hello captured before it, so readers could
+        // apply an OLDER authority last and stay loading for ever (gateway round-3 #3).
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1000, 1);
+        List<Long> seen = new ArrayList<>();
+        v.onAuthorityChange(() -> seen.add(v.authority()));
+        assertEquals(0, v.authority());
+        assertTrue(v.helloField().startsWith("{\"authority\":0,"));
+        assertEquals(0, latest(v, "1m", "2026-09-10").authority());
+        v.admit(e(100, 0, "a"));
+        assertEquals(0, v.authority(), "an ordinary admission is not an authority change");
+        v.replay(1_000, true);
+        assertEquals(1, v.authority(), "completing the replay is");
+        v.admit(e(100, 0, "b"));                                       // collision
+        assertEquals(2, v.authority(), "and so is a refusal");
+        assertEquals(List.of(1L, 2L), seen, "each one notified exactly once, with its own generation");
+        assertTrue(latest(v, "1m", "2026-09-10").authority() >= 2);
+        assertTrue(v.helloField().contains("\"authority\":2,"));
+    }
+
+    @Test void evictionIsAnAuthorityChangeAndAdmissionSaysWhetherTheIdentitySurvivedIt() {
+        // The boundary moving changes what every reader may hold, and enforcement can evict the very
+        // identity just inserted — reporting that as ADMITTED told the caller (and the page) the
+        // opposite of the truth (gateway round-3 #4).
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1, 1000);
+        List<Long> control = new ArrayList<>();
+        v.onAuthorityChange(() -> control.add(v.authority()));
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(episode("OPEN", "2026-09-10", "1m", 680_000, 100, 0, 100, "a")).reason());
+        assertTrue(control.isEmpty());
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 200, 0, 200, "b")).reason());
+        assertEquals(1, control.size(), "the eviction moved the boundary: connected readers must be told");
+        assertNotNull(v.historyBeginsAtMs());
+        // an identity that enforcement evicts on the way in is reported EVICTED, not ADMITTED
+        FootprintStrikeView w = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1, 1000);
+        w.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 500, 0, 500, "newer"));
+        assertEquals(FootprintStrikeView.Reason.EVICTED, w.admit(episode("OPEN", "2026-09-10", "1m", 680_000, 100, 0, 100, "older")).reason(),
+                "it opened before the boundary the newer head established");
+    }
+
+    @Test void aReplayThatRestartsReopensLOADING_andTheWindowNamesTheSeekNotTheClock() {
+        FootprintStrikeView v = view();
+        List<Long> control = new ArrayList<>();
+        v.onAuthorityChange(() -> control.add(v.authority()));
+        v.replayRestarted(1_000);
+        assertTrue(v.loading()); assertEquals(1_000L, latest(v, "1m", "2026-09-10").replayBeginsAtMs().longValue());
+        assertTrue(control.isEmpty(), "it was already loading");
+        v.replay(9_999, true);
+        assertFalse(v.loading());
+        assertEquals(1_000L, latest(v, "1m", "2026-09-10").replayBeginsAtMs().longValue(),
+                "the window is the one that was SEEKED, not the clock at completion (round-3 #5)");
+        assertEquals(1, control.size());
+        v.replay(12_345, true);
+        assertEquals(1_000L, latest(v, "1m", "2026-09-10").replayBeginsAtMs().longValue(), "a repeated caught-up poll moves nothing");
+        assertEquals(1, control.size());
+        // a new consumer attempt or a late adoption reopens it, and says so
+        v.replayRestarted(50_000);
+        assertTrue(v.loading()); assertEquals(2, control.size());
+        assertEquals(50_000L, latest(v, "1m", "2026-09-10").replayBeginsAtMs().longValue());
+    }
+
+    @Test void theConfiguredSymbolCanNeverCorruptTheSharedHello() throws Exception {
+        FootprintStrikeView v = view();
+        v.scopeSymbol("ES\"X\\Y");
+        assertEquals("ES\"X\\Y", new ObjectMapper().readTree(v.helloField()).get("symbol").asText(),
+                "the shared cvd-hello must stay parseable whatever the configuration says (round-3 #6)");
+        assertThrows(IllegalArgumentException.class, () -> v.scopeSymbol("S".repeat(FootprintStrikeView.MAX_SYMBOL_CHARS + 1)));
+        assertThrows(IllegalArgumentException.class, () -> v.scopeSymbol("ES\nX"));
+    }
+
+    @Test void prunedTombstonesStopCountingAsIndexed() {
+        // The guard that skips the full index scan meant "a refusal has ever happened", so one historic
+        // collision made every future eviction scan the whole index under the lock (round-3 #7).
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 2, 1000);
+        v.admit(e(100, 0, "a")); v.admit(e(100, 0, "b"));               // collision at open 100 -> tombstone
+        assertEquals(1, v.indexedTombstones());
+        for (int i = 1; i <= 4; i++) v.admit(episode("OPEN", "2026-09-10", "1m", 680_000 + i * 500, 1000L * i, 0, 1000L * i, "x" + i));
+        assertEquals(0, v.indexedTombstones(), "the boundary moved past it: it is no longer in the index");
+        assertEquals(1, v.refusedIdentities(), "the refusal itself is still remembered for the incarnation");
     }
 
     @Test void quotedEscapesEveryControlCharacterAndItsWorstCaseIsWhatTheProxyMustSizeFor() throws Exception {

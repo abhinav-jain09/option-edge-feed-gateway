@@ -316,8 +316,22 @@ The strike-interaction log `es.futures.footprint.strike` rides the SAME relay pa
 - **Bytes to the reader (R14)**: the strike record rides the live frame and the backfill pages as a JSON STRING
   LITERAL (`FootprintStrikeView.quoted`), so a page folds exactly the bytes this relay folded, not a
   re-serialisation.
-- **Hello (G-R6)**: `footprintStrike:{sessionDate,hwm{tf:seenMaxBarStartMs},historyBeginsAtMs,replayBeginsAtMs,loading,refused,unavailable}`,
+- **Hello (G-R6)**: `footprintStrike:{authority,symbol,sessionDate,hwm{tf:seenMaxBarStartMs},historyBeginsAtMs,replayBeginsAtMs,loading,refused,unavailable}`,
   and the same fields ride every backfill page envelope and the `es-footprint-strike-control` frame.
+  `authority` is monotonic and bumps on every authority change (a refusal, an eviction that moves the
+  boundary, failing closed, a replay completing or restarting), so a reader can discard an older
+  authority that arrives after a newer one — the ordering hole where a hello captured before a
+  completion could be applied after it (round-3 #3). `symbol` is JSON-escaped and the configured value
+  is refused if it could not be a symbol: it is written into the SHARED hello (round-3 #6).
+- **The strike stream forwards ONLY what the fold admitted (round-3 #3/#4).** Every other footprint
+  stream broadcasts what it drops (G-R3), because those pages do not fold against the relay's own
+  decision. The strike page does, so a refused, evicted or shape-dropped record reaching it would be
+  evidence the relay has already excluded from the authority — with no way for the page to know.
+- **Replay completion is strike-specific (round-3 #2).** It is declared only when the cache consumer's
+  own strike partitions have crossed the end offsets captured at ITS bootstrap — not when another
+  source's barriers retire — and a new consumer attempt or a late adoption reopens it. The published
+  `replayBeginsAtMs` is the window that was actually seeked, recorded once per replay rather than
+  recomputed from the clock on every caught-up poll (round-3 #5).
 - **Backfill (G-R7)**: `GET /api/footprint/strike/latest?tf&sessionDate&symbol=&afterStrike&limit≤200` (one folded
   record per strike for ONE symbol, ONE session and ONE timeframe, ascending strike, exclusive strike cursor; the
   envelope's `sessionDate` is the REQUESTED session) and `GET /api/footprint/strike/history?tf&strikeCents&symbol=&before&limit≤100`

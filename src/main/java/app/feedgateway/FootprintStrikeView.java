@@ -34,10 +34,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * coordinator this view never rolls a session away: history crosses sessions ("6800 may behave
  * differently on every visit"), and {@code latest} is scoped to ONE session by the reader.
  *
- * <p><b>Every retained byte is budgeted, and the boundary is published.</b> The view charges what it
- * actually holds: each head's payload, its identity string, 40 bytes per observed revision (the
- * revision and its digest, packed), and each tombstone's identity (code round-2 #1 — the digest
- * ledger and the refusal identities used to grow outside every budget). Budgets evict the OLDEST
+ * <p><b>Every retained thing is charged, conservatively, and the boundary is published.</b> The view
+ * charges each head's payload, its identity strings, {@link #REVISION_BYTES} per observed revision and
+ * {@link #TOMBSTONE_OVERHEAD} per tombstone — deliberate over-estimates of an object graph, since what
+ * the JVM holds is a map of boxed keys and arrays, not packed bytes (round-2 #1, round-3 #1). The
+ * figure is therefore an ACCOUNTING bound on what the view may retain, not a measured heap bound; the
+ * deployment record says which measurement settles the latter. Budgets evict the OLDEST
  * identities by {@code openBarStartMs}, and always the WHOLE equal-opening-time bucket, so a
  * monotonic boundary can be published that is strictly above every retained head: records opening
  * before it are dropped rather than re-admitted, so an evicted identity can never return at a lower
@@ -85,16 +87,25 @@ final class FootprintStrikeView {
 
     /** One page of folded records: ascending by strike for {@code latest}, newest first for {@code history}. */
     record Page(String sessionDate, List<String> records, String nextCursor, Long historyBeginsAtMs, long refused,
-                boolean unavailable, boolean loading, Long replayBeginsAtMs) {}
+                boolean unavailable, boolean loading, Long replayBeginsAtMs, long authority) {}
 
     static final long EPOCH_MAX_MS = 253_402_300_799_999L;
     static final int LATEST_LIMIT_MAX = 200, HISTORY_LIMIT_MAX = 100;
     /** A symbol longer than this is not a symbol: refusing it keeps one record from charging arbitrary metadata (round-2 #1). */
     static final int MAX_SYMBOL_CHARS = 64;
-    /** What one retained revision costs the ledger: the revision (8) plus its digest (32). */
-    static final int REVISION_BYTES = 40;
-    /** Per-entry structural overhead charged so a million tiny heads cannot pass an untracked cost. */
-    static final int HEAD_OVERHEAD = 128, TOMBSTONE_OVERHEAD = 64;
+    /**
+     * What one retained revision is CHARGED. The ledger is a {@code HashMap<Long, byte[]>}, so an entry
+     * is a boxed key (16), a node (32), an array header plus the digest (16 + 32) and its share of the
+     * bucket table (~16) — charged at 128 rather than the 40 packed bytes, because what the JVM holds is
+     * an object graph and the budget has to be conservative against THAT (gateway round-3 #1).
+     */
+    static final int REVISION_BYTES = 128;
+    /**
+     * Per-entry structural overhead: the head object and its strings, the three index nodes (scope tree,
+     * strike tree, open-key tree), the age-key string and node, and their table shares. A tombstone keeps
+     * its index node and its ledger identity. Both are deliberate over-estimates.
+     */
+    static final int HEAD_OVERHEAD = 512, TOMBSTONE_OVERHEAD = 256;
     private static final Set<String> EPISODE_KINDS = Set.of("OPEN", "UPDATE", "CLOSE");
 
     private final ObjectMapper mapper;
@@ -118,6 +129,13 @@ final class FootprintStrikeView {
     private Long boundaryMs;                                    // monotonic: nothing that opened before it is admitted or retained
     private Long replayBeginsAtMs;
     private boolean replayComplete;
+    /**
+     * Monotonic. Every authority change bumps it, and it rides the hello, the control frame and every
+     * page, so a reader can discard an OLDER authority that arrives after a newer one — the ordering
+     * hole where a stale `loading:true` hello enqueued before a completion control left readers loading
+     * for ever (gateway round-3 #3).
+     */
+    private long authority;
     private boolean unavailable;
     private volatile Runnable onAuthorityChange = () -> {};
     private final AtomicLong evictions = new AtomicLong(), collisions = new AtomicLong();
@@ -127,22 +145,45 @@ final class FootprintStrikeView {
         this.mapper = mapper; this.maxRecordBytes = maxRecordBytes; this.maxBytes = maxBytes; this.maxEpisodes = maxEpisodes; this.maxRefused = maxRefused;
     }
 
-    /** The symbol every route defaults to; a reader that folds live records must use the same one. */
-    void scopeSymbol(String symbol) { this.scopeSymbol = symbol == null ? "" : symbol; }
+    /**
+     * The symbol every route defaults to; a reader that folds live records must use the same one. It is
+     * CONFIGURATION, so it is escaped where it is written (round-3 #6: a value carrying a quote broke the
+     * whole shared cvd-hello, not only this field) and refused outright when it cannot be a symbol.
+     */
+    void scopeSymbol(String symbol) {
+        String s = symbol == null ? "" : symbol;
+        if (s.length() > MAX_SYMBOL_CHARS) throw new IllegalArgumentException("GATEWAY_ES_FOOTPRINT_STRIKE_SYMBOL is longer than " + MAX_SYMBOL_CHARS + " characters");
+        for (int i = 0; i < s.length(); i++) if (s.charAt(i) < 0x20) throw new IllegalArgumentException("GATEWAY_ES_FOOTPRINT_STRIKE_SYMBOL contains a control character");
+        this.scopeSymbol = s;
+    }
 
     /** What the service does when the authority the readers hold has changed (refusal, unavailable, replay complete). */
     void onAuthorityChange(Runnable listener) { this.onAuthorityChange = listener == null ? () -> {} : listener; }
 
     /**
-     * The cache consumer's replay: the window it sought back to, and whether it has crossed the end
-     * offsets captured at its bootstrap. Until it has, every reader is told the fold is still loading.
+     * The cache consumer's replay for the STRIKE partitions: the window it actually sought back to, and
+     * whether those partitions have crossed the end offsets captured at that consumer's bootstrap.
+     *
+     * <p>{@code beginsAtMs} is recorded ONCE per replay — a later call with the same generation cannot
+     * move it, because the field names the window that was seeked, not the current clock (round-3 #5).
+     * {@link #replayRestarted} reopens it when a new consumer attempt or a late adoption means the
+     * strike partitions must be replayed again (round-3 #2).
      */
     void replay(long beginsAtMs, boolean complete) {
-        boolean notify;
+        boolean notify = false;
+        synchronized (lock) {
+            if (replayBeginsAtMs == null) replayBeginsAtMs = beginsAtMs;
+            if (complete && !replayComplete) { replayComplete = true; authority++; notify = true; }
+        }
+        if (notify) onAuthorityChange.run();
+    }
+
+    /** A new replay of the strike partitions has begun: readers are loading again until it completes. */
+    void replayRestarted(long beginsAtMs) {
+        boolean notify = false;
         synchronized (lock) {
             replayBeginsAtMs = beginsAtMs;
-            notify = complete && !replayComplete;
-            if (complete) replayComplete = true;
+            if (replayComplete) { replayComplete = false; authority++; notify = true; }
         }
         if (notify) onAuthorityChange.run();
     }
@@ -186,6 +227,7 @@ final class FootprintStrikeView {
                     if (Arrays.equals(prior, digest)) return Admission.EPISODE;   // a bar colliding with itself (R6)
                     refuse(h);                                                     // R14: a fault, not a tie to break
                     collisions.incrementAndGet();
+                    authority++;
                     outcome = unavailable ? Admission.UNAVAILABLE : Admission.COLLISION;
                     notify = true;                                                 // the readers hold a value this fold has just withdrawn
                 } else {
@@ -196,7 +238,7 @@ final class FootprintStrikeView {
                     }
                     // an older revision after a newer one keeps its digest (R14) and nothing else
                     notify = enforce();
-                    outcome = Admission.EPISODE;
+                    outcome = heads.containsKey(identity) ? Admission.EPISODE : Admission.EVICTED;
                 }
             } else {
                 h = new Head(identity, symbol, date.toString(), tf, strike, open);
@@ -206,7 +248,9 @@ final class FootprintStrikeView {
                 byAge.put(ageKey(open, identity), identity);
                 bytes += len; meta += headMeta(h);
                 notify = enforce();
-                outcome = Admission.EPISODE;
+                // enforcement can evict the very identity just inserted: say so rather than reporting it
+                // admitted while the fold no longer holds it (round-3 #4)
+                outcome = heads.containsKey(identity) ? Admission.EPISODE : Admission.EVICTED;
             }
         }
         if (notify) onAuthorityChange.run();
@@ -230,7 +274,7 @@ final class FootprintStrikeView {
         h.json = null; h.digests.clear();
         heads.remove(h.identity);
         byAge.remove(ageKey(h.openBarStartMs, h.identity));
-        if (refused.add(h.identity)) { meta += TOMBSTONE_OVERHEAD + h.identity.length(); tombstones++; }
+        if (refused.add(h.identity)) { meta += TOMBSTONE_OVERHEAD + 2L * h.identity.length(); tombstones++; }
         if (refused.size() > maxRefused) unavailable = true;    // the ledger would have to forget a refusal: fail closed instead
     }
 
@@ -254,6 +298,7 @@ final class FootprintStrikeView {
      */
     private boolean enforce() {
         int evicted = 0;
+        Long boundaryBefore = boundaryMs;
         while (!byAge.isEmpty() && overBudget()) {
             Head oldest = heads.get(byAge.firstEntry().getValue());
             long bucket = oldest.openBarStartMs;
@@ -280,18 +325,27 @@ final class FootprintStrikeView {
             // nothing left to evict and still over: the alternative is silently holding more than the
             // deployment allowed, which is the failure this budget exists to prevent
             unavailable = true;
+            authority++;
             return true;
         }
+        // an eviction MOVES the boundary, which changes what every reader may hold: that is an authority
+        // change too, not merely bookkeeping (round-3 #4)
+        if (!java.util.Objects.equals(boundaryBefore, boundaryMs)) { authority++; return true; }
         return false;
     }
 
     private boolean overBudget() { return heads.size() > maxEpisodes || bytes + meta > maxBytes; }
 
+    /** Drops unreachable tombstones and DECREMENTS the indexed count, so the guard means "there are some". */
     private void pruneTombstonesBefore(long ms) {
         for (var scopeEntry : new ArrayList<>(index.entrySet())) {
             for (var strikeEntry : new ArrayList<>(scopeEntry.getValue().entrySet())) {
                 TreeMap<String, String> per = strikeEntry.getValue();
-                per.entrySet().removeIf(e -> !heads.containsKey(e.getValue()) && openMsOf(e.getKey()) < ms);
+                per.entrySet().removeIf(e -> {
+                    boolean drop = !heads.containsKey(e.getValue()) && openMsOf(e.getKey()) < ms;
+                    if (drop) tombstones--;                       // round-3 #7: it was only ever incremented
+                    return drop;
+                });
                 if (per.isEmpty()) scopeEntry.getValue().remove(strikeEntry.getKey());
             }
             if (scopeEntry.getValue().isEmpty()) index.remove(scopeEntry.getKey());
@@ -306,7 +360,8 @@ final class FootprintStrikeView {
      */
     String helloField() {
         synchronized (lock) {
-            StringBuilder sb = new StringBuilder("{\"symbol\":\"").append(scopeSymbol).append("\",\"sessionDate\":")
+            StringBuilder sb = new StringBuilder("{\"authority\":").append(authority)
+                    .append(",\"symbol\":").append(quoted(scopeSymbol)).append(",\"sessionDate\":")
                     .append(sessionDate == null ? "null" : "\"" + sessionDate + "\"").append(",\"hwm\":{");
             boolean first = true;
             for (Map.Entry<String, Long> e : hwm.entrySet()) { if (!first) sb.append(','); sb.append('"').append(e.getKey()).append("\":").append(e.getValue()); first = false; }
@@ -369,9 +424,9 @@ final class FootprintStrikeView {
         }
     }
 
-    /** Every page states the same authority the hello does: the boundary, the replay window, and whether it is still loading. */
+    /** Every page states the same authority the hello does, including its GENERATION. */
     private Page page(String session, List<String> records, String cursor) {
-        return new Page(session, records, cursor, historyBeginsAtLocked(), refused.size(), unavailable, !replayComplete, replayBeginsAtMs);
+        return new Page(session, records, cursor, historyBeginsAtLocked(), refused.size(), unavailable, !replayComplete, replayBeginsAtMs, authority);
     }
 
     /** The cursor grammar, and the domain: a canonical calendar date and an epoch inside the domain. */
@@ -396,6 +451,8 @@ final class FootprintStrikeView {
     int refusedIdentities() { synchronized (lock) { return refused.size(); } }
     boolean unavailable() { synchronized (lock) { return unavailable; } }
     boolean loading() { synchronized (lock) { return !replayComplete; } }
+    long authority() { synchronized (lock) { return authority; } }
+    int indexedTombstones() { synchronized (lock) { return tombstones; } }
     long evictions() { return evictions.get(); }
     long collisions() { return collisions.get(); }
 

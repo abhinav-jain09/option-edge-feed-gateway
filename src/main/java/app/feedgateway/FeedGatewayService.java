@@ -893,6 +893,9 @@ public class FeedGatewayService implements ReplayRunner {
 
     private static final String[] FOOTPRINT_EVENTS = {"es-footprint", "es-footprint-evidence", "es-footprint-bar", "es-footprint-outcome", "es-footprint-strike"};
     private static final String[] FOOTPRINT_KEYED_EVENTS = {"es-footprint-bar", "es-footprint-outcome", "es-footprint-strike"};
+    /** What the live consumer may hand to broadcast: the five evidence events and the strike authority frame. */
+    static final String[] FOOTPRINT_BROADCAST_EVENTS = {"es-footprint", "es-footprint-evidence", "es-footprint-bar",
+            "es-footprint-outcome", "es-footprint-strike", "es-footprint-strike-control"};
 
     static boolean isFootprintEvent(String event) {
         return "es-footprint".equals(event) || "es-footprint-evidence".equals(event)
@@ -920,7 +923,12 @@ public class FeedGatewayService implements ReplayRunner {
             if (sa.reason() != FootprintStrikeView.Reason.ADMITTED) {
                 footprintCounter("drops_total{event=\"" + event + "\",consumer=\"" + consumer + "\",reason=\"" + sa.reason().name().toLowerCase(java.util.Locale.ROOT) + "\"}").incrementAndGet();
             }
-            return sa.reason() != FootprintStrikeView.Reason.OVERSIZE;
+            // The strike stream forwards ONLY what the fold ADMITTED. Every other footprint stream
+            // broadcasts what it drops (G-R3: the page can still render a record the view would not
+            // keep), but the strike page folds by identity and revision against this very fold, so a
+            // refused, evicted or shape-dropped record reaching it is a record the relay has already
+            // decided is not part of the authority — and the page had no way to know (round-3 #3/#4).
+            return sa.reason() == FootprintStrikeView.Reason.ADMITTED;
         }
         if (!"es-footprint-bar".equals(event) && !"es-footprint-outcome".equals(event)) {
             return true;                                            // live snapshots: never admitted to a view
@@ -1042,7 +1050,9 @@ public class FeedGatewayService implements ReplayRunner {
         sb.append("# HELP gateway_footprint_drops_total Keyed footprint records not admitted to a view (oversize records are also not broadcast).\n# TYPE gateway_footprint_drops_total counter\n");
         for (String e : FOOTPRINT_KEYED_EVENTS) for (String c : consumers) for (String r : reasons) line(sb, "gateway_footprint_drops_total", "{event=\"" + e + "\",consumer=\"" + c + "\",reason=\"" + r + "\"}", footprintCounter("drops_total{event=\"" + e + "\",consumer=\"" + c + "\",reason=\"" + r + "\"}").get());
         sb.append("# HELP gateway_footprint_broadcast_total Footprint frames handed to broadcast by the live consumer.\n# TYPE gateway_footprint_broadcast_total counter\n");
-        for (String e : events) line(sb, "gateway_footprint_broadcast_total", "{event=\"" + e + "\"}", footprintCounter("broadcast_total{event=\"" + e + "\"}").get());
+        // the broadcast domain is the five evidence events PLUS the strike authority frame, which is
+        // broadcast but is not a Kafka topic and belongs to no record or drop domain (round-3 #8)
+        for (String e : FOOTPRINT_BROADCAST_EVENTS) line(sb, "gateway_footprint_broadcast_total", "{event=\"" + e + "\"}", footprintCounter("broadcast_total{event=\"" + e + "\"}").get());
         sb.append("# HELP gateway_footprint_evictions_total Records evicted by the view byte/count budgets.\n# TYPE gateway_footprint_evictions_total counter\n");
         line(sb, "gateway_footprint_evictions_total", "{view=\"bars\"}", footprintViews.barsEvictions());
         line(sb, "gateway_footprint_evictions_total", "{view=\"outcomes\"}", footprintViews.outcomesEvictions());
@@ -2768,11 +2778,17 @@ public class FeedGatewayService implements ReplayRunner {
             // by this attempt, retire per partition at barrier, SURVIVE the attempt's death (failing
             // closed), and are superseded here by the next attempt.
             supersedeBootstrapEntries(name, bootstrapEndOffsets, topicEvents);
+            // R14 (round-2 #3, round-3 #2/#5): this consumer is about to replay the strike partitions it
+            // owns, so readers are LOADING until THOSE partitions cross the end offsets captured here —
+            // not until some other source's barriers retire, and not merely because a poll came back
+            // caught up. The window published is the one actually sought, recorded once per replay.
+            noteFootprintStrikeReplayStart(bootstrapEndOffsets);
             Map<TopicPartition, Long> catchUpEndOffsets =
                     new LinkedHashMap<>(catchUpEndOffsets(bootstrapEndOffsets, topicEvents));
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
             boolean live = caughtUp(consumer, catchUpEndOffsets);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
+            noteFootprintStrikeReplayProgress(consumer, bootstrapEndOffsets);
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
                 tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
@@ -2969,6 +2985,7 @@ public class FeedGatewayService implements ReplayRunner {
                     // again. Both calls are idempotent and markSelectionReady re-validates under readyLock,
                     // so this is safe and cheap.
                     markCacheCaughtUp(name, events, caughtUpFlag);
+                    noteFootprintStrikeReplayProgress(consumer, bootstrapEndOffsets);
                     tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
                     ActiveSelection liveSelection = activeSelection.get();
                     if (liveSelection != null
@@ -4382,13 +4399,38 @@ public class FeedGatewayService implements ReplayRunner {
         return settings.ibkrPreOpenEnabled() && topic.equals(settings.databentoGexTopic());
     }
 
+    /**
+     * The strike partitions this cache consumer is about to replay, and the window it will seek back to.
+     * Called before the replay so a reader is LOADING for it, and again on adoption, so a partition that
+     * appears late reopens the replay rather than inheriting a completion it was never part of.
+     */
+    private void noteFootprintStrikeReplayStart(Map<TopicPartition, Long> bootstrapEndOffsets) {
+        if (footprintStrikeView == null) return;
+        if (bootstrapEndOffsets.keySet().stream().noneMatch(p -> p.topic().equals(settings.esFootprintStrikeTopic()))) return;
+        footprintStrikeView.replayRestarted(System.currentTimeMillis() - settings.esFootprintStrikeSeekBackMs());
+    }
+
+    /**
+     * Completion for the STRIKE partitions ALONE: every assigned strike partition must have reached the
+     * end offset captured at this consumer's bootstrap. Before this the flag came from the shared
+     * catch-up barriers, which exclude other sources' partitions and could declare completion while the
+     * strike partition was still at position zero (round-3 #2).
+     */
+    private void noteFootprintStrikeReplayProgress(KafkaConsumer<?, ?> consumer, Map<TopicPartition, Long> bootstrapEndOffsets) {
+        if (footprintStrikeView == null) return;
+        List<TopicPartition> strike = bootstrapEndOffsets.keySet().stream()
+                .filter(p -> p.topic().equals(settings.esFootprintStrikeTopic())).toList();
+        if (strike.isEmpty()) return;                       // this consumer carries none: it says nothing
+        for (TopicPartition p : strike) {
+            long end = bootstrapEndOffsets.getOrDefault(p, 0L);
+            long at;
+            try { at = consumer.position(p); } catch (RuntimeException notAssigned) { return; }
+            if (at < end) return;                           // still replaying: readers stay loading
+        }
+        footprintStrikeView.replay(System.currentTimeMillis() - settings.esFootprintStrikeSeekBackMs(), true);
+    }
+
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
-        // R14 code round-2 #3: the strike fold is LOADING until the consumer that carries its topic has
-        // crossed the end offsets captured at its bootstrap. Published so a reader can never turn an
-        // unfinished replay into a completed NO DATA. Recorded before the readiness work below, and
-        // idempotent, so a later catch-up on another consumer cannot un-complete it.
-        if (footprintStrikeView != null && events.contains("es-footprint-strike"))
-            footprintStrikeView.replay(System.currentTimeMillis() - settings.esFootprintStrikeSeekBackMs(), true);
         if (caughtUpFlag.compareAndSet(false, true)) {
             // ONLY the state consumer hydrates the auction view. Flushing on any other cache consumer's
             // catch-up would hand out a hello bounded by a partly hydrated view, and the records that
