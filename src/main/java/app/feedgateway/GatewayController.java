@@ -112,6 +112,7 @@ public class GatewayController {
     @GetMapping(value = "/api/footprint/strike/latest", produces = MediaType.APPLICATION_JSON_VALUE)
     public void footprintStrikeLatest(@org.springframework.web.bind.annotation.RequestParam("tf") String tf,
                                       @org.springframework.web.bind.annotation.RequestParam("sessionDate") String sessionDate,
+                                      @org.springframework.web.bind.annotation.RequestParam(value = "symbol", defaultValue = "") String symbol,
                                       @org.springframework.web.bind.annotation.RequestParam(value = "afterStrike", defaultValue = "-1") long afterStrike,
                                       @org.springframework.web.bind.annotation.RequestParam(value = "limit", defaultValue = "200") int limit,
                                       @org.springframework.web.bind.annotation.RequestHeader(value = "Authorization", required = false) String authorization,
@@ -121,8 +122,9 @@ public class GatewayController {
         if (!permits.tryAcquire()) { reject(response, "strike_latest", "busy", 503, "{\"error\":\"busy\"}", true); return; }
         try {
             if (FootprintViews.parseCanonicalDate(sessionDate) == null) { reject(response, "strike_latest", "bad_cursor", 400, "{\"error\":\"bad sessionDate\"}", false); return; }
-            FootprintStrikeView.Page page = service.footprintStrikeView().latest(tf, sessionDate, afterStrike,
+            FootprintStrikeView.Page page = service.footprintStrikeView().latest(symbol.isEmpty() ? service.footprintStrikeSymbol() : symbol, tf, sessionDate, afterStrike,
                     Math.max(1, Math.min(limit, FootprintStrikeView.LATEST_LIMIT_MAX)));
+            if (page.unavailable()) { reject(response, "strike_latest", "unavailable", 503, "{\"error\":\"unavailable\"}", true); return; }
             writeStrikePage(response, page, "episodes", page.nextCursor() == null ? "null" : page.nextCursor());
         } finally {
             permits.release();
@@ -137,6 +139,7 @@ public class GatewayController {
     @GetMapping(value = "/api/footprint/strike/history", produces = MediaType.APPLICATION_JSON_VALUE)
     public void footprintStrikeHistory(@org.springframework.web.bind.annotation.RequestParam("tf") String tf,
                                        @org.springframework.web.bind.annotation.RequestParam("strikeCents") long strikeCents,
+                                       @org.springframework.web.bind.annotation.RequestParam(value = "symbol", defaultValue = "") String symbol,
                                        @org.springframework.web.bind.annotation.RequestParam(value = "before", defaultValue = "") String before,
                                        @org.springframework.web.bind.annotation.RequestParam(value = "limit", defaultValue = "100") int limit,
                                        @org.springframework.web.bind.annotation.RequestHeader(value = "Authorization", required = false) String authorization,
@@ -146,15 +149,20 @@ public class GatewayController {
         if (!permits.tryAcquire()) { reject(response, "strike_history", "busy", 503, "{\"error\":\"busy\"}", true); return; }
         try {
             if (!before.isEmpty() && !FootprintStrikeView.validHistoryCursor(before)) { reject(response, "strike_history", "bad_cursor", 400, "{\"error\":\"bad cursor\"}", false); return; }
-            FootprintStrikeView.Page page = service.footprintStrikeView().history(tf, strikeCents, before,
+            FootprintStrikeView.Page page = service.footprintStrikeView().history(symbol.isEmpty() ? service.footprintStrikeSymbol() : symbol, tf, strikeCents, before,
                     Math.max(1, Math.min(limit, FootprintStrikeView.HISTORY_LIMIT_MAX)));
+            if (page.unavailable()) { reject(response, "strike_history", "unavailable", 503, "{\"error\":\"unavailable\"}", true); return; }
             writeStrikePage(response, page, "episodes", page.nextCursor() == null ? "null" : "\"" + page.nextCursor() + "\"");
         } finally {
             permits.release();
         }
     }
 
-    /** The strike routes' envelope: {@code {"sessionDate":..,"historyBeginsAtMs":..,"refused":n,"episodes":[..],"nextCursor":..}}, streamed like {@link #writePage}. */
+    /**
+     * The strike routes' envelope: {@code {"sessionDate":..,"historyBeginsAtMs":..,"refused":n,"episodes":["<record>",..],"nextCursor":..}},
+     * streamed like {@link #writePage}. Each record is a JSON STRING LITERAL carrying the producer's bytes verbatim, so the page
+     * folds the same bytes the relay folded (R14) — the same shape the live frame uses.
+     */
     private static void writeStrikePage(jakarta.servlet.http.HttpServletResponse response, FootprintStrikeView.Page page,
                                         String field, String cursorJson) throws java.io.IOException {
         try { response.setBufferSize(FOOTPRINT_WRITE_BUFFER); } catch (IllegalStateException alreadyCommitted) { /* verified below */ }
@@ -180,7 +188,7 @@ public class GatewayController {
         java.util.List<String> records = page.records();
         for (int i = 0; i < records.size(); i++) {
             if (i > 0) out.write(',');
-            out.write(records.get(i).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            out.write(FootprintStrikeView.quoted(records.get(i)).getBytes(java.nio.charset.StandardCharsets.UTF_8));
         }
         out.write(("],\"nextCursor\":" + cursorJson + "}").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
         out.flush();

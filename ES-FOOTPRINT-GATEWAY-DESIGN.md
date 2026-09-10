@@ -265,7 +265,7 @@ Check the round-9 disposition (the two validation series in G-R9's contract and 
 verdict `APPROVE` or `REQUEST_CHANGES` with numbered findings.
 
 
-## As-built amendment — the fifth stream (ES-FOOTPRINT-STRIKE-INTERACTION.md R3/R14, 2026-09-10)
+## As-built amendment — the fifth stream (ES-FOOTPRINT-STRIKE-INTERACTION.md R3/R14, 2026-09-10; code Codex round 1 folded)
 
 The strike-interaction log `es.futures.footprint.strike` rides the SAME relay path under the SAME flag
 (`GATEWAY_ES_FOOTPRINT_ENABLED`), topic env `KAFKA_ES_FOOTPRINT_STRIKE_TOPIC`, event `es-footprint-strike`:
@@ -273,18 +273,34 @@ The strike-interaction log `es.futures.footprint.strike` rides the SAME relay pa
 - **Wiring (G-R2)**: `addEsFootprintTopics` binds FIVE topics; the G-R8a gate validates all five; the live
   consumer seeks the fifth to END like the other four; the cache consumer seeks back
   `GATEWAY_ES_FOOTPRINT_STRIKE_SEEK_BACK_MS` (default 7 days — history crosses sessions, R18).
-- **Fold (R14)**: `FootprintStrikeView` folds by identity to the greatest revision; two records sharing an
-  identity and a revision must be identical bytes, else the identity is REFUSED for the incarnation
-  (drop reason `collision`, later revisions `refused`) and counted. CHECKPOINT records carry no episode and
-  only advance the per-timeframe high-water mark. Budgets (`GATEWAY_ES_FOOTPRINT_STRIKE_MAX_BYTES`,
-  `_MAX_EPISODES`) evict the OLDEST identities and the boundary is published as `historyBeginsAtMs` (R20).
-  No session rollover: `latest` is scoped by the reader.
-- **Hello (G-R6)**: one more field on `cvd-hello`, `footprintStrike:{sessionDate,hwm{tf:seenMaxBarStartMs},historyBeginsAtMs,refused}`.
-- **Backfill (G-R7)**: `GET /api/footprint/strike/latest?tf&sessionDate&afterStrike&limit≤200` (one folded
-  record per strike for ONE session and ONE timeframe, ascending strike, exclusive strike cursor) and
-  `GET /api/footprint/strike/history?tf&strikeCents&before&limit≤100` (newest first, across sessions, opaque
-  exclusive cursor `sessionDate|%019d(openBarStartMs)`). Same flag → auth → permit → cursor → snapshot →
-  streamed write order; the envelope adds `historyBeginsAtMs` and `refused`.
-- **Metrics (G-R9)**: the existing series gain the fifth event / third keyed event / two new routes / two new
-  drop reasons, plus `gateway_footprint_strike_{episodes_in_view,view_bytes,evictions_total,collisions_total,refused_identities}`.
+- **Fold (R14)**: `FootprintStrikeView` folds by identity to the greatest revision. Two records sharing an
+  identity and a revision must be identical bytes — checked for EVERY observed revision of an identity, with a
+  32-byte digest per revision kept with the identity — else the identity is REFUSED for the incarnation (drop
+  reason `collision`, later revisions `refused`, counted). A refused identity stays in the ordering as a
+  TOMBSTONE: if it is a strike's newest episode, `latest` has no row for that strike (NO DATA), never an older
+  episode; history omits it and keeps the older ones. Scope is symbol AND timeframe. CHECKPOINT records carry no
+  episode and only advance the per-timeframe high-water mark (a JSON-null session date is accepted; an invalid
+  one is a shape drop, as is any timeframe outside the producer's vocabulary — nothing unescaped can reach the hello).
+- **Bounds (R20/G-R8)**: `GATEWAY_ES_FOOTPRINT_STRIKE_MAX_BYTES` (64 MiB) and `_MAX_EPISODES` (50 000) evict the
+  OLDEST identities; every eviction advances a MONOTONIC boundary below which records are dropped (`evicted`)
+  rather than re-admitted, and `historyBeginsAtMs` reports that boundary (or, before any eviction, the oldest
+  retained open). The refusal ledger is bounded by `GATEWAY_ES_FOOTPRINT_STRIKE_MAX_REFUSED_IDENTITIES`
+  (10 000): beyond it the view is UNAVAILABLE for the incarnation — routes answer 503 + Retry-After, the hello
+  says `"unavailable":true`, the gauge `gateway_footprint_strike_unavailable` is 1 — rather than forgetting a
+  refusal. The G-R8 arithmetic gains at most 64 MiB of retained bytes plus the index and digests; the deployed
+  heap/limit headroom (es4 1024 MiB, dev/prod 2560 MiB) absorbs it.
+- **Bytes to the reader (R14)**: the strike record rides the live frame and the backfill pages as a JSON STRING
+  LITERAL (`FootprintStrikeView.quoted`), so a page folds exactly the bytes this relay folded, not a
+  re-serialisation.
+- **Hello (G-R6)**: `footprintStrike:{sessionDate,hwm{tf:seenMaxBarStartMs},historyBeginsAtMs,refused,unavailable}`.
+- **Backfill (G-R7)**: `GET /api/footprint/strike/latest?tf&sessionDate&symbol=&afterStrike&limit≤200` (one folded
+  record per strike for ONE symbol, ONE session and ONE timeframe, ascending strike, exclusive strike cursor; the
+  envelope's `sessionDate` is the REQUESTED session) and `GET /api/footprint/strike/history?tf&strikeCents&symbol=&before&limit≤100`
+  (newest first, across sessions, opaque exclusive cursor `sessionDate|%019d(openBarStartMs)`, validated as a
+  canonical date and an in-domain epoch). `symbol` defaults to `GATEWAY_ES_FOOTPRINT_STRIKE_SYMBOL` (`ES.v.0`).
+  Same flag → auth → permit → cursor → snapshot → streamed write order; `unavailable` → 503.
+- **Locale**: fixed-width keys, cursors and drop labels are formatted under `Locale.ROOT`.
+- **Metrics (G-R9)**: the fifth event / third keyed event / two new routes / drop reasons `collision`, `refused`,
+  `evicted`, `unavailable` / reject reason `unavailable`, plus
+  `gateway_footprint_strike_{episodes_in_view,view_bytes,evictions_total,collisions_total,refused_identities,unavailable}`.
 - **R21**: the relay adds no field to a record; the page's chip words are the page's business.

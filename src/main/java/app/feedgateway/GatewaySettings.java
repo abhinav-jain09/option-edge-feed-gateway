@@ -352,6 +352,16 @@ public final class GatewaySettings {
         return intValue("GATEWAY_ES_FOOTPRINT_STRIKE_MAX_EPISODES", 50_000, 1);
     }
 
+    /** The refusal ledger bound: beyond it the view fails closed (UNAVAILABLE) rather than forgetting a refusal (R14). */
+    public int esFootprintStrikeMaxRefusedIdentities() {
+        return intValue("GATEWAY_ES_FOOTPRINT_STRIKE_MAX_REFUSED_IDENTITIES", 10_000, 1);
+    }
+
+    /** The symbol the strike routes scope to by default (R14 scopes latest/history by symbol; the producer publishes one). */
+    public String esFootprintStrikeSymbol() {
+        return value("GATEWAY_ES_FOOTPRINT_STRIKE_SYMBOL", "ES.v.0");
+    }
+
     /** Seek-back for the strike log on the cache consumer: history crosses sessions (R18), so a week rather than a session. */
     public long esFootprintStrikeSeekBackMs() {
         return longValue("GATEWAY_ES_FOOTPRINT_STRIKE_SEEK_BACK_MS", 7L * 24 * 3_600_000L, 1L);

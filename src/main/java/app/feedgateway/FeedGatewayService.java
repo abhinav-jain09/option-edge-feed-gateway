@@ -816,7 +816,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.esFootprintBarsMaxBytes(), settings.esFootprintBarsMaxCount(),
                     settings.esFootprintOutcomesMaxBytes(), settings.esFootprintOutcomesMaxCount());
             this.footprintStrikeView = new FootprintStrikeView(mapper, settings.esFootprintMaxRecordBytes(),
-                    settings.esFootprintStrikeMaxBytes(), settings.esFootprintStrikeMaxEpisodes());
+                    settings.esFootprintStrikeMaxBytes(), settings.esFootprintStrikeMaxEpisodes(), settings.esFootprintStrikeMaxRefusedIdentities());
             this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(),
                     FootprintTopicGate.adminReader(settings.bootstrapServers(), settings.partitionRefreshMetadataTimeoutMs()));
             this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
@@ -842,7 +842,7 @@ public class FeedGatewayService implements ReplayRunner {
                 settings.esFootprintBarsMaxBytes(), settings.esFootprintBarsMaxCount(),
                 settings.esFootprintOutcomesMaxBytes(), settings.esFootprintOutcomesMaxCount());
         this.footprintStrikeView = new FootprintStrikeView(mapper, settings.esFootprintMaxRecordBytes(),
-                settings.esFootprintStrikeMaxBytes(), settings.esFootprintStrikeMaxEpisodes());
+                settings.esFootprintStrikeMaxBytes(), settings.esFootprintStrikeMaxEpisodes(), settings.esFootprintStrikeMaxRefusedIdentities());
         this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(), footprintReader);
         this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
     }
@@ -881,6 +881,8 @@ public class FeedGatewayService implements ReplayRunner {
     }
     FootprintViews footprintViews() { return footprintViews; }
     FootprintStrikeView footprintStrikeView() { return footprintStrikeView; }
+    /** The symbol the strike routes scope to when the request names none (R14 scopes by symbol; the producer runs one). */
+    String footprintStrikeSymbol() { return settings.esFootprintStrikeSymbol(); }
     FootprintTopicGate footprintGate() { return footprintGate; }
     java.util.concurrent.Semaphore footprintBackfillPermits() { return footprintBackfillPermits; }
 
@@ -911,7 +913,7 @@ public class FeedGatewayService implements ReplayRunner {
             // (colliding) identity is a drop the page sees as NO DATA, and is counted here.
             FootprintStrikeView.Admission sa = footprintStrikeView.admit(json);
             if (sa.reason() != FootprintStrikeView.Reason.ADMITTED) {
-                footprintCounter("drops_total{event=\"" + event + "\",consumer=\"" + consumer + "\",reason=\"" + sa.reason().name().toLowerCase() + "\"}").incrementAndGet();
+                footprintCounter("drops_total{event=\"" + event + "\",consumer=\"" + consumer + "\",reason=\"" + sa.reason().name().toLowerCase(java.util.Locale.ROOT) + "\"}").incrementAndGet();
             }
             return sa.reason() != FootprintStrikeView.Reason.OVERSIZE;
         }
@@ -920,7 +922,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         FootprintViews.Admission a = "es-footprint-bar".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);
         if (a.reason() != FootprintViews.Reason.ADMITTED) {
-            footprintCounter("drops_total{event=\"" + event + "\",consumer=\"" + consumer + "\",reason=\"" + a.reason().name().toLowerCase() + "\"}").incrementAndGet();
+            footprintCounter("drops_total{event=\"" + event + "\",consumer=\"" + consumer + "\",reason=\"" + a.reason().name().toLowerCase(java.util.Locale.ROOT) + "\"}").incrementAndGet();
         }
         return a.reason() != FootprintViews.Reason.OVERSIZE;
     }
@@ -983,7 +985,9 @@ public class FeedGatewayService implements ReplayRunner {
     /** The live consumer's footprint branch (G-R3/G-R9): admit, then broadcast unless oversize. Package-private for the fan-out tests. */
     boolean onFootprintLiveRecord(String event, String json) {
         if (!admitFootprintRecord(event, json, "live")) return false;
-        broadcast(event, json);
+        // The strike log's readers fold by BYTES (R14): the record rides the frame as a JSON string
+        // literal so a page receives exactly the bytes this relay compared, not a re-serialisation.
+        broadcast(event, "es-footprint-strike".equals(event) ? FootprintStrikeView.quoted(json) : json);
         footprintCounter("broadcast_total{event=\"" + event + "\"}").incrementAndGet();
         forwardedEvents.incrementAndGet();
         return true;
@@ -1010,9 +1014,9 @@ public class FeedGatewayService implements ReplayRunner {
         }
         String[] events = FOOTPRINT_EVENTS;
         String[] consumers = {"cache", "live"};
-        String[] reasons = {"oversize", "shape", "stale_session", "collision", "refused"};
+        String[] reasons = {"oversize", "shape", "stale_session", "collision", "refused", "evicted", "unavailable"};
         String[] routes = {"bars", "outcomes", "strike_latest", "strike_history"};
-        String[] rejectReasons = {"busy", "bad_cursor", "session_mismatch"};
+        String[] rejectReasons = {"busy", "bad_cursor", "session_mismatch", "unavailable"};
         StringBuilder sb = new StringBuilder();
         sb.append("# HELP gateway_footprint_enabled Whether the ES Footprint relay is enabled.\n# TYPE gateway_footprint_enabled gauge\ngateway_footprint_enabled 1\n");
         sb.append("# HELP gateway_footprint_records_total Footprint Kafka records polled, before admission.\n# TYPE gateway_footprint_records_total counter\n");
@@ -1047,6 +1051,8 @@ public class FeedGatewayService implements ReplayRunner {
         line(sb, "gateway_footprint_strike_collisions_total", "", footprintStrikeView.collisions());
         sb.append("# HELP gateway_footprint_strike_refused_identities Identities currently refused by the fold.\n# TYPE gateway_footprint_strike_refused_identities gauge\n");
         line(sb, "gateway_footprint_strike_refused_identities", "", footprintStrikeView.refusedIdentities());
+        sb.append("# HELP gateway_footprint_strike_unavailable Whether the strike view has failed closed for this incarnation (its refusal ledger overflowed).\n# TYPE gateway_footprint_strike_unavailable gauge\n");
+        line(sb, "gateway_footprint_strike_unavailable", "", footprintStrikeView.unavailable() ? 1 : 0);
         sb.append("# HELP gateway_footprint_topic_validated Whether the footprint topic passed G-R8a validation this incarnation.\n# TYPE gateway_footprint_topic_validated gauge\n");
         for (String t : footprintTopics()) line(sb, "gateway_footprint_topic_validated", "{topic=\"" + t + "\"}", footprintGate.validated(t) ? 1 : 0);
         sb.append("# HELP gateway_footprint_topic_validation_failures_total Validation attempts that did not yield VALID, one reason each.\n# TYPE gateway_footprint_topic_validation_failures_total counter\n");

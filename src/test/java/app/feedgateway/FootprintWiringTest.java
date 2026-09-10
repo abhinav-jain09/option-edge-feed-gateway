@@ -76,7 +76,8 @@ class FootprintWiringTest {
         assertTrue(branch.contains("onFootprintLiveRecord(binding.event(), json);"), "the live branch delegates to the one admit-then-broadcast method");
         int method = src.indexOf("boolean onFootprintLiveRecord(String event, String json) {");
         String body = src.substring(method, src.indexOf("\n    }", method));
-        assertTrue(body.indexOf("admitFootprintRecord(event, json, \"live\")") < body.indexOf("broadcast(event, json);"), "view first, then broadcast");
+        assertTrue(body.indexOf("admitFootprintRecord(event, json, \"live\")") < body.indexOf("broadcast(event, "), "view first, then broadcast");
+        assertTrue(body.contains("FootprintStrikeView.quoted(json)"), "the strike record rides the frame as a JSON string literal: the page folds the bytes the relay folded");
         assertTrue(body.contains("if (!admitFootprintRecord(event, json, \"live\")) return false;"), "an oversize record is never broadcast");
         int cache = src.indexOf("admitFootprintRecord(binding.event(), json, \"cache\");");
         assertTrue(cache > 0 && cache < src.indexOf("updateCache(binding, record, json);", cache), "the cache consumer admits before the generic cache and never broadcasts");
@@ -221,11 +222,11 @@ class FootprintWiringTest {
     @Test void flagOnAddsOneHelloFieldFromTheCoordinatorSnapshot() {
         FeedGatewayService s = on();
         assertEquals("{\"sessionDate\":null,\"hwm\":{},\"footprint\":{\"sessionDate\":null,\"hwm\":{},\"outcomeHwm\":{}},"
-                + "\"footprintStrike\":{\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"refused\":0}}", s.cvdHelloJson());
+                + "\"footprintStrike\":{\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"refused\":0,\"unavailable\":false}}", s.cvdHelloJson());
         assertTrue(s.admitFootprintRecord("es-footprint-bar", FootprintViewsTest.bar("2026-08-14", "1m", 60_000), "live"));
         assertTrue(s.cvdHelloJson().contains("\"footprint\":{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"outcomeHwm\":{}}"));
         assertTrue(s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.checkpoint("2026-08-14", "1m", 60_000), "cache"));
-        assertTrue(s.cvdHelloJson().endsWith("\"footprintStrike\":{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"historyBeginsAtMs\":null,\"refused\":0}}"),
+        assertTrue(s.cvdHelloJson().endsWith("\"footprintStrike\":{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"historyBeginsAtMs\":null,\"refused\":0,\"unavailable\":false}}"),
                 "the episode high-water mark rides the SAME hello (R14)");
     }
 
@@ -273,16 +274,16 @@ class FootprintWiringTest {
         java.util.List<String> expect = new java.util.ArrayList<>();
         expect.add("gateway_footprint_enabled 1");
         for (String e : events) for (String c : new String[]{"cache", "live"}) expect.add("gateway_footprint_records_total{event=\"" + e + "\",consumer=\"" + c + "\"} 0");
-        for (String e : new String[]{"es-footprint-bar", "es-footprint-outcome", "es-footprint-strike"}) for (String c : new String[]{"cache", "live"}) for (String r : new String[]{"oversize", "shape", "stale_session", "collision", "refused"})
+        for (String e : new String[]{"es-footprint-bar", "es-footprint-outcome", "es-footprint-strike"}) for (String c : new String[]{"cache", "live"}) for (String r : new String[]{"oversize", "shape", "stale_session", "collision", "refused", "evicted", "unavailable"})
             expect.add("gateway_footprint_drops_total{event=\"" + e + "\",consumer=\"" + c + "\",reason=\"" + r + "\"} 0");
         for (String e : events) expect.add("gateway_footprint_broadcast_total{event=\"" + e + "\"} 0");
         expect.add("gateway_footprint_evictions_total{view=\"bars\"} 0"); expect.add("gateway_footprint_evictions_total{view=\"outcomes\"} 0");
         expect.add("gateway_footprint_rollovers_total 0"); expect.add("gateway_footprint_bars_in_view 0"); expect.add("gateway_footprint_outcomes_in_view 0");
         expect.add("gateway_footprint_view_bytes{view=\"bars\"} 0"); expect.add("gateway_footprint_view_bytes{view=\"outcomes\"} 0");
         for (String r : new String[]{"bars", "outcomes", "strike_latest", "strike_history"}) expect.add("gateway_footprint_backfill_requests_total{route=\"" + r + "\"} 0");
-        for (String r : new String[]{"bars", "outcomes", "strike_latest", "strike_history"}) for (String x : new String[]{"busy", "bad_cursor", "session_mismatch"}) expect.add("gateway_footprint_backfill_rejected_total{route=\"" + r + "\",reason=\"" + x + "\"} 0");
+        for (String r : new String[]{"bars", "outcomes", "strike_latest", "strike_history"}) for (String x : new String[]{"busy", "bad_cursor", "session_mismatch", "unavailable"}) expect.add("gateway_footprint_backfill_rejected_total{route=\"" + r + "\",reason=\"" + x + "\"} 0");
         expect.add("gateway_footprint_strike_episodes_in_view 0"); expect.add("gateway_footprint_strike_view_bytes 0"); expect.add("gateway_footprint_strike_evictions_total 0");
-        expect.add("gateway_footprint_strike_collisions_total 0"); expect.add("gateway_footprint_strike_refused_identities 0");
+        expect.add("gateway_footprint_strike_collisions_total 0"); expect.add("gateway_footprint_strike_refused_identities 0"); expect.add("gateway_footprint_strike_unavailable 0");
         for (String t : topics) expect.add("gateway_footprint_topic_validated{topic=\"" + t + "\"} 0");
         for (String t : topics) for (String r : new String[]{"admin", "unknown", "ceiling", "compression"}) expect.add("gateway_footprint_topic_validation_failures_total{topic=\"" + t + "\",reason=\"" + r + "\"} 0");
         List<String> actual = m.lines().filter(l -> !l.startsWith("#")).toList();
@@ -291,7 +292,7 @@ class FootprintWiringTest {
                 "gateway_footprint_evictions_total", "gateway_footprint_rollovers_total", "gateway_footprint_bars_in_view", "gateway_footprint_outcomes_in_view",
                 "gateway_footprint_view_bytes", "gateway_footprint_backfill_requests_total", "gateway_footprint_backfill_rejected_total",
                 "gateway_footprint_strike_episodes_in_view", "gateway_footprint_strike_view_bytes", "gateway_footprint_strike_evictions_total",
-                "gateway_footprint_strike_collisions_total", "gateway_footprint_strike_refused_identities",
+                "gateway_footprint_strike_collisions_total", "gateway_footprint_strike_refused_identities", "gateway_footprint_strike_unavailable",
                 "gateway_footprint_topic_validated", "gateway_footprint_topic_validation_failures_total")) {
             assertEquals(1, occurrences(m, "# TYPE " + name + " "), name + " typed once");
         }
@@ -319,6 +320,7 @@ class FootprintWiringTest {
         assertEquals(4, g.esFootprintBackfillConcurrency()); assertEquals(1_048_588L, g.esFootprintMaxMessageBytesCeiling()); assertEquals(24L * 3_600_000L, g.esFootprintSeekBackMs());
         assertEquals("futures.footprint.strike", g.esFootprintStrikeTopic()); assertEquals(64L << 20, g.esFootprintStrikeMaxBytes());
         assertEquals(50_000, g.esFootprintStrikeMaxEpisodes()); assertEquals(7L * 24 * 3_600_000L, g.esFootprintStrikeSeekBackMs());
+        assertEquals(10_000, g.esFootprintStrikeMaxRefusedIdentities()); assertEquals("ES.v.0", g.esFootprintStrikeSymbol());
     }
 
     @Test void theControllerOrderIsBindingFlagAuthPermitCursorSnapshotWrite() throws Exception {
