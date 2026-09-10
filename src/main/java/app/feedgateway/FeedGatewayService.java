@@ -817,6 +817,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.esFootprintOutcomesMaxBytes(), settings.esFootprintOutcomesMaxCount());
             this.footprintStrikeView = new FootprintStrikeView(mapper, settings.esFootprintMaxRecordBytes(),
                     settings.esFootprintStrikeMaxBytes(), settings.esFootprintStrikeMaxEpisodes(), settings.esFootprintStrikeMaxRefusedIdentities());
+            this.footprintStrikeView.onAuthorityChange(this::broadcastFootprintStrikeControl);
             this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(),
                     FootprintTopicGate.adminReader(settings.bootstrapServers(), settings.partitionRefreshMetadataTimeoutMs()));
             this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
@@ -843,6 +844,7 @@ public class FeedGatewayService implements ReplayRunner {
                 settings.esFootprintOutcomesMaxBytes(), settings.esFootprintOutcomesMaxCount());
         this.footprintStrikeView = new FootprintStrikeView(mapper, settings.esFootprintMaxRecordBytes(),
                 settings.esFootprintStrikeMaxBytes(), settings.esFootprintStrikeMaxEpisodes(), settings.esFootprintStrikeMaxRefusedIdentities());
+        this.footprintStrikeView.onAuthorityChange(this::broadcastFootprintStrikeControl);
         this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(), footprintReader);
         this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
     }
@@ -982,6 +984,19 @@ public class FeedGatewayService implements ReplayRunner {
         if (!footprint.isEmpty()) consumer.seekToEnd(footprint);
     }
 
+    /**
+     * ES-FOOTPRINT-STRIKE-INTERACTION.md R14, code round-2 #4: an authority change — a collision refusal,
+     * the view failing closed, or the cache replay completing — reaches ALREADY-CONNECTED readers as its
+     * own control frame carrying the same field the hello carries. Without it a page that was READY kept
+     * displaying a value this fold had withdrawn, because the producer record it holds is unchanged and
+     * nothing else told it otherwise. The frame carries no evidence: it says what the authority now is.
+     */
+    void broadcastFootprintStrikeControl() {
+        if (footprintStrikeView == null) return;
+        broadcast("es-footprint-strike-control", footprintStrikeView.helloField());
+        footprintCounter("broadcast_total{event=\"es-footprint-strike-control\"}").incrementAndGet();
+    }
+
     /** The live consumer's footprint branch (G-R3/G-R9): admit, then broadcast unless oversize. Package-private for the fan-out tests. */
     boolean onFootprintLiveRecord(String event, String json) {
         if (!admitFootprintRecord(event, json, "live")) return false;
@@ -1045,6 +1060,12 @@ public class FeedGatewayService implements ReplayRunner {
         line(sb, "gateway_footprint_strike_episodes_in_view", "", footprintStrikeView.episodesInView());
         sb.append("# HELP gateway_footprint_strike_view_bytes Summed record lengths held by the strike view.\n# TYPE gateway_footprint_strike_view_bytes gauge\n");
         line(sb, "gateway_footprint_strike_view_bytes", "", footprintStrikeView.bytesInView());
+        // what the revision ledgers, identities and tombstones cost, apart from the payloads: BOTH are
+        // charged to the same budget (code round-2 #1), so both are published
+        sb.append("# HELP gateway_footprint_strike_view_metadata_bytes Identity, revision-ledger and tombstone bytes held by the strike view — charged to the same budget as the payloads.\n# TYPE gateway_footprint_strike_view_metadata_bytes gauge\n");
+        line(sb, "gateway_footprint_strike_view_metadata_bytes", "", footprintStrikeView.metadataBytesInView());
+        sb.append("# HELP gateway_footprint_strike_loading 1 while the cache consumer has not crossed the end offsets captured at its bootstrap: an empty page is not a completed NO DATA.\n# TYPE gateway_footprint_strike_loading gauge\n");
+        line(sb, "gateway_footprint_strike_loading", "", footprintStrikeView.loading() ? 1 : 0);
         sb.append("# HELP gateway_footprint_strike_evictions_total Strike episodes evicted by the view budgets (the history boundary moved).\n# TYPE gateway_footprint_strike_evictions_total counter\n");
         line(sb, "gateway_footprint_strike_evictions_total", "", footprintStrikeView.evictions());
         sb.append("# HELP gateway_footprint_strike_collisions_total Identities refused because two records shared a revision with different bytes (R14).\n# TYPE gateway_footprint_strike_collisions_total counter\n");
@@ -4359,6 +4380,12 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
+        // R14 code round-2 #3: the strike fold is LOADING until the consumer that carries its topic has
+        // crossed the end offsets captured at its bootstrap. Published so a reader can never turn an
+        // unfinished replay into a completed NO DATA. Recorded before the readiness work below, and
+        // idempotent, so a later catch-up on another consumer cannot un-complete it.
+        if (footprintStrikeView != null && events.contains("es-footprint-strike"))
+            footprintStrikeView.replay(System.currentTimeMillis() - settings.esFootprintStrikeSeekBackMs(), true);
         if (caughtUpFlag.compareAndSet(false, true)) {
             // ONLY the state consumer hydrates the auction view. Flushing on any other cache consumer's
             // catch-up would hand out a hello bounded by a partly hydrated view, and the records that
@@ -12611,6 +12638,9 @@ public class FeedGatewayService implements ReplayRunner {
             "es-footprint-bar",
             "es-footprint-outcome",
             "es-footprint-strike",
+            // ...and the strike fold's own authority frame (R14, code round-2 #4): a refusal, the view
+            // failing closed, or the replay completing. Same class, same gate; it carries no evidence.
+            "es-footprint-strike-control",
             // Server-rated Δ-flow acceleration: chain-global advisory; a non-allowlisted event is
             // dropped as non-routable in per-session (auth) mode.
             "delta-flow-accel",

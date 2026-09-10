@@ -182,6 +182,11 @@ public class GatewayController {
         StringBuilder head = new StringBuilder("{\"sessionDate\":");
         head.append(page.sessionDate() == null ? "null" : "\"" + page.sessionDate() + "\"");
         head.append(",\"historyBeginsAtMs\":").append(page.historyBeginsAtMs() == null ? "null" : page.historyBeginsAtMs());
+        // the SAME authority the hello states: retained inventory, the replay window that was actually
+        // covered, and whether the fold is still loading — so an unfinished replay can never read as a
+        // completed empty page (code round-2 #3, #6)
+        head.append(",\"replayBeginsAtMs\":").append(page.replayBeginsAtMs() == null ? "null" : page.replayBeginsAtMs());
+        head.append(",\"loading\":").append(page.loading());
         head.append(",\"refused\":").append(page.refused());
         head.append(",\"").append(field).append("\":[");
         out.write(head.toString().getBytes(java.nio.charset.StandardCharsets.US_ASCII));

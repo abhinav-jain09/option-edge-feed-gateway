@@ -3,6 +3,7 @@ package app.feedgateway;
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import org.junit.jupiter.api.Test;
@@ -50,7 +51,7 @@ class FootprintStrikeViewTest {
         assertEquals(1, v.collisions()); assertEquals(1, v.refusedIdentities());
         assertTrue(latest(v, "1m", "2026-09-10").records().isEmpty(), "the chip renders NO DATA, not one of two contradictory records");
         assertEquals(FootprintStrikeView.Reason.REFUSED, v.admit(e(100, 1, "c")).reason(), "refused for the incarnation");
-        assertTrue(v.helloField().endsWith(",\"refused\":1,\"unavailable\":false}"));
+        assertTrue(v.helloField().endsWith(",\"loading\":true,\"refused\":1,\"unavailable\":false}"));
         // superseded revisions are still checked, in BOTH arrival orders
         for (boolean newerFirst : List.of(false, true)) {
             FootprintStrikeView w = view();
@@ -118,13 +119,13 @@ class FootprintStrikeViewTest {
 
     @Test void checkpointsAdvanceTheHelloHighWaterMarkAndCarryNoEpisode() {
         FootprintStrikeView v = view();
-        assertEquals("{\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
         assertTrue(v.admit(checkpoint("2026-09-10", "1m", 500)).checkpoint());
         assertTrue(v.admit(checkpoint(null, "30s", 7)).checkpoint(), "a genuine JSON null session date is the producer's 'nothing seen yet'");
         assertEquals(0, v.episodesInView());
         v.admit(episode("OPEN", "2026-09-10", "5m", 680_000, 300, 0, 300, "x"));
         v.admit(checkpoint("2026-09-10", "1m", 400));                          // older watermark: never regresses
-        assertEquals("{\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":500,\"30s\":7,\"5m\":300},\"historyBeginsAtMs\":300,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":500,\"30s\":7,\"5m\":300},\"historyBeginsAtMs\":300,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
     }
 
     @Test void theBudgetsEvictTheOldestIdentitiesAndTheBoundaryIsMonotonic() {
@@ -138,9 +139,11 @@ class FootprintStrikeViewTest {
         long boundary = v.historyBeginsAtMs();
         v.admit(episode("OPEN", "2026-09-10", "1m", 682_500, 500, 0, 500, "A")); v.admit(episode("OPEN", "2026-09-10", "1m", 682_500, 500, 0, 500, "B"));   // a refusal frees a slot
         assertTrue(v.historyBeginsAtMs() >= boundary, "the boundary never retreats: " + v.historyBeginsAtMs());
-        FootprintStrikeView small = new FootprintStrikeView(new ObjectMapper(), 262_144, 600, 1000, 1000);
+        // the byte budget counts EVERY retained byte — payload, identity and revision ledger (round-2 #1)
+        FootprintStrikeView small = new FootprintStrikeView(new ObjectMapper(), 262_144, 1_000, 1000, 1000);
         small.admit(e(100, 0, "one")); small.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 200, 0, 200, "two"));
-        assertEquals(1, small.episodesInView(), "the byte budget evicts too"); assertTrue(small.bytesInView() <= 600);
+        assertEquals(1, small.episodesInView(), "the byte budget evicts too");
+        assertTrue(small.bytesInView() + small.metadataBytesInView() <= 1_000, "and it is the budget that holds");
         assertEquals(List.of("two"), tags(latest(small, "1m", "2026-09-10")), "the survivor is the newer identity");
     }
 
@@ -167,7 +170,7 @@ class FootprintStrikeViewTest {
         assertEquals(FootprintStrikeView.Reason.SHAPE, v.admit(e(100, 0, "x").replace("\"sessionDate\":\"2026-09-10\"", "\"sessionDate\":\"2026-09-1\"")).reason());
         assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(episode("UPDATE", "2026-09-10", "1m", 680_000, 100, 253_402_300_800_000L, 100, "big")).reason(), "a revision is a count, not an epoch");
         assertEquals(FootprintStrikeView.Reason.SHAPE, v.admit(e(100, 0, "x").replace("\"openBarStartMs\":100", "\"openBarStartMs\":253402300800000")).reason(), "an epoch outside the domain is a shape drop");
-        assertEquals("{\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":100},\"historyBeginsAtMs\":100,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":100},\"historyBeginsAtMs\":100,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
         assertEquals(1, v.episodesInView());
     }
 
@@ -183,6 +186,111 @@ class FootprintStrikeViewTest {
             assertTrue(FootprintStrikeView.validHistoryCursor(h1.nextCursor()));
             assertEquals(List.of("a"), tags(v.history("ES.v.0", "1m", 680_000, h1.nextCursor(), 1)));
         } finally { Locale.setDefault(prior); }
+    }
+
+    // ---- code round-2: every retained byte budgeted, the boundary honest, loading distinguishable -----
+
+    @Test void theRevisionLedgerAndRefusedIdentitiesCannotOutgrowTheBudget() {
+        // ONE identity, ten thousand revisions: the digests ARE the growth, and they are charged, so the
+        // budget acts on them. Before this the ledger grew without limit inside a view reporting 460 bytes.
+        long budget = 200_000;
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, budget, 1000, 1000);
+        long chargedAtPeak = 0;
+        FootprintStrikeView.Reason last = null;
+        for (long r = 0; r < 10_000; r++) {
+            last = v.admit(e(100, r, "r" + r)).reason();
+            chargedAtPeak = Math.max(chargedAtPeak, v.metadataBytesInView());
+            assertTrue(v.bytesInView() + v.metadataBytesInView() <= budget, "the budget holds at revision " + r);
+        }
+        assertTrue(chargedAtPeak > 100L * FootprintStrikeView.REVISION_BYTES, "the revisions are actually charged: " + chargedAtPeak);
+        assertEquals(FootprintStrikeView.Reason.EVICTED, last, "the identity leaves through the published boundary, honestly");
+        assertNotNull(v.historyBeginsAtMs());
+        assertTrue(latest(v, "1m", "2026-09-10").records().isEmpty(), "and the chip reads NO DATA, not a stale head");
+        // a LARGE identity is refused before it can charge arbitrary metadata: the symbol is bounded
+        FootprintStrikeView w = view();
+        String huge = "S".repeat(FootprintStrikeView.MAX_SYMBOL_CHARS + 1);
+        assertEquals(FootprintStrikeView.Reason.SHAPE, w.admit(episode("OPEN", huge, "2026-09-10", "1m", 680_000, 100, 0, 100, "x")).reason());
+        assertEquals(0, w.episodesInView()); assertEquals(0, w.metadataBytesInView());
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, w.admit(episode("OPEN", "S".repeat(FootprintStrikeView.MAX_SYMBOL_CHARS), "2026-09-10", "1m", 680_000, 100, 0, 100, "x")).reason());
+        // refusal tombstones are charged too, and their bound still fails closed
+        FootprintStrikeView t = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1000, 2);
+        for (int i = 0; i < 3; i++) { t.admit(e(1000 + i, 0, "a" + i)); t.admit(e(1000 + i, 0, "b" + i)); }
+        assertTrue(t.metadataBytesInView() > 0 && t.unavailable());
+    }
+
+    @Test void everyRetainedHeadOpensAtOrAfterTheBoundary_evenWhenManyOpenInTheSameMillisecond() {
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1, 1000);
+        // two strikes opening at the SAME instant, with room for one head: the whole bucket must go
+        v.admit(episode("OPEN", "2026-09-10", "1m", 680_000, 100, 0, 100, "a"));
+        v.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 100, 0, 100, "b"));
+        Long boundary = v.historyBeginsAtMs();
+        assertNotNull(boundary);
+        assertEquals(0, v.episodesInView(), "no survivor may sit behind the published boundary");
+        assertEquals(101L, boundary.longValue());
+        assertTrue(latest(v, "1m", "2026-09-10").records().isEmpty());
+        // and neither identity can come back, at any revision — the boundary is the whole rule
+        assertEquals(FootprintStrikeView.Reason.EVICTED, v.admit(episode("UPDATE", "2026-09-10", "1m", 680_500, 100, 1, 101, "b2")).reason());
+        assertEquals(FootprintStrikeView.Reason.EVICTED, v.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 100, 0, 101, "conflict")).reason());
+        assertEquals(0, v.collisions(), "an evicted identity is not a collision — it is gone");
+        // a head that opens AT the boundary or later is admitted and keeps updating
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(episode("OPEN", "2026-09-10", "1m", 681_000, 101, 0, 101, "c")).reason());
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(episode("UPDATE", "2026-09-10", "1m", 681_000, 101, 1, 102, "c2")).reason());
+        assertEquals(List.of("c2"), tags(latest(v, "1m", "2026-09-10")));
+        for (String rec : latest(v, "1m", "2026-09-10").records())
+            assertTrue(rec.contains("\"openBarStartMs\":101"), "every returned record opens at or after historyBeginsAtMs");
+    }
+
+    @Test void anUnfinishedReplayIsLOADING_neverACompletedEmptyPage_andCompletionReachesTheReaders() {
+        FootprintStrikeView v = view();
+        List<String> control = new ArrayList<>();
+        v.onAuthorityChange(() -> control.add(v.helloField()));
+        assertTrue(v.loading(), "nothing has replayed yet");
+        assertTrue(v.helloField().contains("\"loading\":true") && v.helloField().contains("\"replayBeginsAtMs\":null"));
+        assertTrue(latest(v, "1m", "2026-09-10").loading(), "an empty page while loading is NOT a completed NO DATA");
+        assertTrue(history(v, 680_000).loading());
+        // a live CHECKPOINT can advance the high-water mark long before the cache has finished replaying
+        v.admit(checkpoint("2026-09-10", "1m", 5_000));
+        assertTrue(v.loading() && latest(v, "1m", "2026-09-10").loading());
+        assertTrue(control.isEmpty(), "no authority change yet");
+        v.replay(1_000, true);
+        assertFalse(v.loading());
+        assertEquals(1, control.size(), "completing the replay reaches already-connected readers");
+        assertTrue(control.get(0).contains("\"loading\":false") && control.get(0).contains("\"replayBeginsAtMs\":1000"));
+        assertFalse(latest(v, "1m", "2026-09-10").loading());
+        assertEquals(1_000L, latest(v, "1m", "2026-09-10").replayBeginsAtMs().longValue());
+        v.replay(1_000, true);
+        assertEquals(1, control.size(), "completion is idempotent and does not re-notify");
+    }
+
+    @Test void aRefusalAndFailingClosedBothReachAlreadyConnectedReaders() {
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1000, 1);
+        List<String> control = new ArrayList<>();
+        v.onAuthorityChange(() -> control.add(v.helloField()));
+        v.admit(e(100, 0, "a"));
+        assertTrue(control.isEmpty(), "an ordinary admission is not an authority change");
+        assertEquals(FootprintStrikeView.Reason.COLLISION, v.admit(e(100, 0, "b")).reason());
+        assertEquals(1, control.size(), "the readers hold a value this fold has just withdrawn");
+        assertTrue(control.get(0).contains("\"refused\":1"));
+        v.admit(e(200, 0, "c"));
+        assertEquals(FootprintStrikeView.Reason.UNAVAILABLE, v.admit(e(200, 0, "d")).reason(), "the refusal that overflows the ledger reports the state it left behind");
+        assertTrue(v.unavailable());
+        assertTrue(control.get(control.size() - 1).contains("\"unavailable\":true"));
+    }
+
+    @Test void quotedEscapesEveryControlCharacterAndItsWorstCaseIsWhatTheProxyMustSizeFor() throws Exception {
+        StringBuilder all = new StringBuilder();
+        for (char c = 0; c < 0x20; c++) all.append(c);
+        String json = "{\"a\":\"" + all + "\\u0000\"}";
+        String q = FootprintStrikeView.quoted(json);
+        assertEquals(json, new ObjectMapper().readTree(q).asText(), "every control character survives the round trip");
+        for (char c = 0; c < 0x20; c++) {
+            if (c == '\n' || c == '\r' || c == '\t') continue;
+            assertTrue(q.contains(String.format(Locale.ROOT, "\\u%04x", (int) c)), "lower-case hex escape for " + (int) c);
+        }
+        assertTrue(FootprintStrikeView.quoted("\u0000").length() == 8, "one NUL is six escape characters plus two quotes");
+        assertEquals(6L * 10 + 3, FootprintStrikeView.quotedBoundBytes(10));
+        String worst = "\u0000".repeat(1000);
+        assertTrue(FootprintStrikeView.quoted(worst).length() <= FootprintStrikeView.quotedBoundBytes(1000), "the bound holds for the worst case");
     }
 
     @Test void quotedCarriesTheBytesVerbatim() throws Exception {

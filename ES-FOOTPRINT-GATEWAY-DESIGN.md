@@ -282,17 +282,42 @@ The strike-interaction log `es.futures.footprint.strike` rides the SAME relay pa
   episode and only advance the per-timeframe high-water mark (a JSON-null session date is accepted; an invalid
   one is a shape drop, as is any timeframe outside the producer's vocabulary — nothing unescaped can reach the hello).
 - **Bounds (R20/G-R8)**: `GATEWAY_ES_FOOTPRINT_STRIKE_MAX_BYTES` (64 MiB) and `_MAX_EPISODES` (50 000) evict the
-  OLDEST identities; every eviction advances a MONOTONIC boundary below which records are dropped (`evicted`)
-  rather than re-admitted, and `historyBeginsAtMs` reports that boundary (or, before any eviction, the oldest
-  retained open). The refusal ledger is bounded by `GATEWAY_ES_FOOTPRINT_STRIKE_MAX_REFUSED_IDENTITIES`
-  (10 000): beyond it the view is UNAVAILABLE for the incarnation — routes answer 503 + Retry-After, the hello
-  says `"unavailable":true`, the gauge `gateway_footprint_strike_unavailable` is 1 — rather than forgetting a
-  refusal. The G-R8 arithmetic gains at most 64 MiB of retained bytes plus the index and digests; the deployed
-  heap/limit headroom (es4 1024 MiB, dev/prod 2560 MiB) absorbs it.
+  OLDEST identities, and always the WHOLE equal-opening-time bucket, so the MONOTONIC boundary that follows is
+  strictly above every retained head: records opening before it are dropped (`evicted`) rather than re-admitted,
+  and no survivor can sit behind it with its own updates refused (code round-2 #2). `historyBeginsAtMs` reports
+  that boundary (or, before any eviction, the oldest retained open) and is retained INVENTORY;
+  `replayBeginsAtMs` reports the window the cache consumer's replay actually covered, and the two are published
+  separately because neither implies the other (code round-2 #6). The byte budget charges EVERY retained byte,
+  not only the payloads: each head's identity, 40 bytes per observed revision (the revision and its digest,
+  packed) and each tombstone's identity, published as `gateway_footprint_strike_view_metadata_bytes` — the
+  revision ledger and the refusal identities previously grew outside every budget (code round-2 #1). A symbol
+  longer than 64 characters is a shape drop for the same reason. The refusal ledger is bounded by
+  `GATEWAY_ES_FOOTPRINT_STRIKE_MAX_REFUSED_IDENTITIES` (10 000), and eviction that cannot bring the view inside
+  its budget is the same fail-closed case: the view is UNAVAILABLE for the incarnation — routes answer 503 +
+  Retry-After, the hello says `"unavailable":true`, the gauge `gateway_footprint_strike_unavailable` is 1 —
+  rather than forgetting evidence.
+- **Loading is not empty (R14, code round-2 #3)**: the fold is LOADING until the cache consumer that carries the
+  strike topic has crossed the end offsets captured at its bootstrap; until then the hello and every page carry
+  `"loading":true` and `gateway_footprint_strike_loading` is 1, so a live CHECKPOINT that raises the high-water
+  mark ahead of an unfinished replay can never let a reader render a completed NO DATA.
+- **Authority reaches connected readers (code round-2 #4)**: a collision refusal, the view failing closed, or the
+  replay completing broadcasts `es-footprint-strike-control` carrying the same field the hello carries — no
+  evidence, only the authority. Without it a page that was already READY kept displaying a value the fold had
+  withdrawn, because the producer record it holds is unchanged and nothing else told it otherwise.
+- **Resources — NOT a proof, and not claimed as one.** The earlier claim that "the deployed heap/limit headroom
+  (es4 1024 MiB) absorbs it" was `limit − Xmx`, which is native-memory margin, not free Java heap, and the
+  round-2 review was right to reject it. What can be stated: the retained bytes are now BOUNDED by
+  `_MAX_BYTES` (64 MiB) because every retained byte is charged to it, and the two-consumer Kafka allowance in
+  G-R8 rises from ~25 MiB to ~31 MiB with a fifth topic. What is NOT established: the `Xmx − H_peak` and
+  `limit − W_peak` inequalities for the strike stream, which need the measurement G-R8's deployment contingency
+  already requires. The rollout runs the gateway with the flag on in dev first and records both peaks; the
+  strike view's own contribution is observable as `gateway_footprint_strike_view_bytes` +
+  `_view_metadata_bytes`.
 - **Bytes to the reader (R14)**: the strike record rides the live frame and the backfill pages as a JSON STRING
   LITERAL (`FootprintStrikeView.quoted`), so a page folds exactly the bytes this relay folded, not a
   re-serialisation.
-- **Hello (G-R6)**: `footprintStrike:{sessionDate,hwm{tf:seenMaxBarStartMs},historyBeginsAtMs,refused,unavailable}`.
+- **Hello (G-R6)**: `footprintStrike:{sessionDate,hwm{tf:seenMaxBarStartMs},historyBeginsAtMs,replayBeginsAtMs,loading,refused,unavailable}`,
+  and the same fields ride every backfill page envelope and the `es-footprint-strike-control` frame.
 - **Backfill (G-R7)**: `GET /api/footprint/strike/latest?tf&sessionDate&symbol=&afterStrike&limit≤200` (one folded
   record per strike for ONE symbol, ONE session and ONE timeframe, ascending strike, exclusive strike cursor; the
   envelope's `sessionDate` is the REQUESTED session) and `GET /api/footprint/strike/history?tf&strikeCents&symbol=&before&limit≤100`
