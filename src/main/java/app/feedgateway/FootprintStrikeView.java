@@ -205,7 +205,7 @@ final class FootprintStrikeView {
         if ("CHECKPOINT".equals(kind)) {
             // the session date may be a genuine JSON null (nothing seen yet); an invalid non-null one is a shape drop
             if (dateNode == null || (!dateNode.isNull() && date == null)) return Admission.SHAPE;
-            synchronized (lock) { if (unavailable) return Admission.UNAVAILABLE; advance(tf, seen, date); }
+            synchronized (lock) { if (unavailable) return Admission.UNAVAILABLE; advance(symbol, tf, seen, date); }
             return Admission.CHECKPOINT;
         }
         if (!EPISODE_KINDS.contains(kind)) return Admission.SHAPE;
@@ -217,7 +217,7 @@ final class FootprintStrikeView {
         boolean notify = false;
         synchronized (lock) {
             if (unavailable) return Admission.UNAVAILABLE;
-            advance(tf, seen, date);
+            advance(symbol, tf, seen, date);
             if (boundaryMs != null && open < boundaryMs) return Admission.EVICTED;   // before the published boundary: never re-admitted
             if (refused.contains(identity)) return Admission.REFUSED;
             Head h = heads.get(identity);
@@ -257,7 +257,15 @@ final class FootprintStrikeView {
         return outcome;
     }
 
-    private void advance(String tf, long seen, LocalDate date) {
+    /**
+     * The high-water mark and the session the HELLO reports belong to the symbol the routes answer for
+     * (round-3 #8): a foreign symbol's CHECKPOINT could otherwise advance a hello labelled with the
+     * configured one, and the reader would install that session over its own — bypassing the very
+     * symbol filter the live path enforces. A record of another symbol still folds into the index and
+     * is still served by an explicit `symbol=` request; it just does not speak for this hello.
+     */
+    private void advance(String symbol, String tf, long seen, LocalDate date) {
+        if (!scopeSymbol.isEmpty() && !scopeSymbol.equals(symbol)) return;
         Long h = hwm.get(tf);
         if (h == null || seen > h) hwm.put(tf, seen);
         if (date != null && (sessionDate == null || date.toString().compareTo(sessionDate) > 0)) sessionDate = date.toString();
