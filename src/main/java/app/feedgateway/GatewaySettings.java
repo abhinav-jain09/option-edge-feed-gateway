@@ -1471,7 +1471,7 @@ public final class GatewaySettings {
 
     /**
      * Compacted IV-vs-realised topic of the standalone vol-premium service (JSON
-     * {@code IvRvReading} &mdash; see {@link VolPremiumTopics#IVRV}). One record per
+     * {@code IvRvReadingV1} &mdash; see {@link VolPremiumTopics#IVRV}). One record per
      * {@code SYMBOL|sessionDate}, published every frame. Resolved through the platform topic-prefix
      * helper at deploy time, matching the spot-vol-regime sibling above.
      */

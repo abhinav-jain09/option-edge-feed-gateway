@@ -3067,7 +3067,7 @@ class FeedGatewayServiceTest {
     // The vol-premium fixtures must remain valid on any day this suite is run.
     void volPremiumFixturesAreNotDateBombed() {
         // These fixtures pair wall-clock event times with a session date. Hardcode the date and the
-        // pairing expires: IvRvReading refuses a frame whose session lags its event time by more
+        // pairing expires: IvRvReadingV1 refuses a frame whose session lags its event time by more
         // than a day, so the whole group starts failing two days after it was written for a reason
         // that has nothing to do with the gateway. Asserted against the CONTRACT rather than
         // against a string, so it fails the same way the suite would.
@@ -3077,7 +3077,7 @@ class FeedGatewayServiceTest {
             String payload = volPremiumPayload(eventTimeMs);
             try {
                 new com.fasterxml.jackson.databind.ObjectMapper().readValue(payload,
-                        com.optionsedge.contracts.volpremium.IvRvReading.class);
+                        com.optionsedge.contracts.volpremium.IvRvReadingV1.class);
             } catch (Exception refused) {
                 throw new AssertionError("fixture must satisfy the contract at event time "
                         + eventTimeMs + ": " + refused.getMessage(), refused);
@@ -3095,7 +3095,7 @@ class FeedGatewayServiceTest {
      *
      * <p>The vol-premium tests build event times from the wall clock, because that is what the
      * gateway's own freshness gate compares against. Pairing those with a hardcoded session date
-     * is a date bomb: IvRvReading refuses a frame whose session lags its event time by more than
+     * is a date bomb: IvRvReadingV1 refuses a frame whose session lags its event time by more than
      * one day, so a fixed date makes the whole group start failing two days after it was written,
      * for a reason that has nothing to do with the gateway.
      *

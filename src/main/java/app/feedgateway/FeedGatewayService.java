@@ -10255,10 +10255,10 @@ public class FeedGatewayService implements ReplayRunner {
                             .FAIL_ON_MISSING_CREATOR_PROPERTIES)
                     .enable(com.fasterxml.jackson.databind.DeserializationFeature
                             .FAIL_ON_NULL_FOR_PRIMITIVES)
-                    .readerFor(com.optionsedge.contracts.volpremium.IvRvReading.class);
+                    .readerFor(com.optionsedge.contracts.volpremium.IvRvReadingV1.class);
 
     private String volPremiumIvrvCacheKey(String json, String fallback) {
-        com.optionsedge.contracts.volpremium.IvRvReading reading;
+        com.optionsedge.contracts.volpremium.IvRvReadingV1 reading;
         try {
             // The WHOLE contract, not the two fields the key is built from.
             //
