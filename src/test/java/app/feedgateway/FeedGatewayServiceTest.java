@@ -2707,12 +2707,12 @@ class FeedGatewayServiceTest {
     @Test
     void theGatewayHoldsVolPremiumUnderTheDeclaredProductionBudget() throws Exception {
         VolPremiumSessionStore store = service().volPremiumStoreForTest();
-        assertEquals(VolPremiumSessionStore.SERIES_BUDGET_BYTES, store.seriesBudgetBytes());
+        assertEquals(VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES, store.seriesBudgetBytes());
         Field held = VolPremiumSessionStore.class.getDeclaredField("maxSymbols");
         held.setAccessible(true);
         assertEquals(VolPremiumSessionStore.MAX_SYMBOLS, held.get(store));
         assertTrue(service().metrics().contains("gateway_vol_premium_series_budget_bytes "
-                + VolPremiumSessionStore.SERIES_BUDGET_BYTES + "\n"), "the budget is exported");
+                + VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES + "\n"), "the budget is exported");
     }
 
     @Test
@@ -3183,6 +3183,104 @@ class FeedGatewayServiceTest {
                 return new org.apache.kafka.clients.consumer.ConsumerRecords<>(batch, Map.of());
             });
             return c;
+        }
+    }
+
+    @Test
+    void closingTheGatewayDeletesItsVolPremiumSessionLogs() throws Exception {
+        // The log is a cache of this process: the gateway's shutdown removes it, as it removes the seller-activity store.
+        FeedGatewayService service = vpService();
+        VolPremiumSessionStore store = service.volPremiumStoreForTest();
+        VolPremiumFixtures.Row row = VolPremiumFixtures.readings().get(0);
+        assertTrue(store.acceptObservation(FeedGatewayService.VOL_PREMIUM_SOURCE, row.key(), 0, 0, row.json(),
+                VolPremiumFixtures.FIXTURE_NOW_MS).admitted());
+        Path directory = store.directoryForTest();
+        assertTrue(Files.isDirectory(directory));
+        service.stop();
+        assertFalse(Files.exists(directory), "the session log directory is deleted at shutdown");
+    }
+
+    @Test
+    void aFailingVolPremiumDiskLogNeverStopsTheCacheConsumerLoop() throws Exception {
+        // Codex gateway r3: the session store's disk log fails CLOSED — the session is refused, counted and marked
+        // incomplete — and nothing is thrown into the cache-consumer loop, which carries every other state stream too.
+        // Here the disk is full from the first byte: every record of the engine's session meets the failed log.
+        FeedGatewayService service = vpService();
+        GatewaySettings settings = new GatewaySettings();
+        VolPremiumSessionStore store = service.volPremiumStoreForTest();
+        store.ioForTest(new VolPremiumSessionLog.Io() {
+            @Override
+            public Path createDirectory(Path root, String prefix) throws java.io.IOException {
+                return VolPremiumSessionLog.FILES.createDirectory(root, prefix);
+            }
+
+            @Override
+            public VolPremiumSessionLog.LogFile create(Path file) throws java.io.IOException {
+                VolPremiumSessionLog.LogFile real = VolPremiumSessionLog.FILES.create(file);
+                return new VolPremiumSessionLog.LogFile() {
+                    @Override
+                    public int write(java.nio.ByteBuffer source, long position) throws java.io.IOException {
+                        throw new java.io.IOException("No space left on device (injected)");
+                    }
+
+                    @Override
+                    public int read(java.nio.ByteBuffer target, long position) throws java.io.IOException {
+                        return real.read(target, position);
+                    }
+
+                    @Override
+                    public void close() throws java.io.IOException {
+                        real.close();
+                    }
+                };
+            }
+
+            @Override
+            public void delete(Path file) throws java.io.IOException {
+                VolPremiumSessionLog.FILES.delete(file);
+            }
+
+            @Override
+            public void deleteTree(Path dir) throws java.io.IOException {
+                VolPremiumSessionLog.FILES.deleteTree(dir);
+            }
+
+            @Override
+            public List<Path> children(Path root, String prefix) throws java.io.IOException {
+                return VolPremiumSessionLog.FILES.children(root, prefix);
+            }
+        });
+        VpBroker broker = new VpBroker()
+                .topic(settings.volPremiumIvrvTopic(), VolPremiumFixtures.readings())
+                .topic(settings.volPremiumWarningsTopic(), VolPremiumFixtures.warnings());
+        java.util.concurrent.atomic.AtomicInteger polls = new java.util.concurrent.atomic.AtomicInteger();
+        broker.onPoll = n -> {
+            polls.set(n);
+            if (n >= 4) {
+                service.setRunningForTest(false);
+            }
+        };
+        Map<String, FeedGatewayService.TopicBinding> events = Map.of(
+                settings.volPremiumIvrvTopic(), new FeedGatewayService.TopicBinding(FeedGatewayService.VOL_PREMIUM_SOURCE, VP_OBS),
+                settings.volPremiumWarningsTopic(), new FeedGatewayService.TopicBinding(FeedGatewayService.VOL_PREMIUM_SOURCE, VP_WARN));
+        service.setRunningForTest(true);
+        try {
+            service.runCacheConsumerAttemptForTest("state", events, new java.util.concurrent.atomic.AtomicBoolean(),
+                    broker.consumer());
+            assertTrue(polls.get() >= 4, "the loop kept polling past every failed record: " + polls.get() + " polls");
+            assertEquals(0, store.heldObservations(), "nothing is held that the log did not take");
+            assertEquals(0, store.heldWarnings());
+            assertEquals(371L, store.refusals(VolPremiumSessionStore.Stream.OBSERVATION,
+                    VolPremiumSessionStore.Refusal.DISK_FAILURE), "every observation refused, counted");
+            assertEquals(15L, store.refusals(VolPremiumSessionStore.Stream.WARNING,
+                    VolPremiumSessionStore.Refusal.DISK_FAILURE), "every transition refused, counted");
+            assertEquals(1L, store.diskErrors(VolPremiumSessionStore.DiskOp.WRITE), "one failure: the session failed closed");
+            VolPremiumSessionStore.Snapshot rest = service.volPremiumSession("SPX");
+            assertFalse(rest.complete(), "and the page says so");
+            assertEquals(386L, rest.refusedForDisk());
+            assertTrue(service.metrics().contains("gateway_vol_premium_sessions_disk_failed 1\n"));
+        } finally {
+            store.close();
         }
     }
 

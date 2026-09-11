@@ -76,6 +76,13 @@ class VolPremiumControllerTest {
         return rows.stream().map(Row::json).toList();
     }
 
+    private static String retention(boolean complete, long refusedForBudget, long refusedForDisk, long retained,
+                                    long budget) {
+        return "\"retention\":{\"complete\":" + complete + ",\"refusedForBudget\":" + refusedForBudget
+                + ",\"refusedForDisk\":" + refusedForDisk + ",\"retainedBytes\":" + retained + ",\"budgetBytes\":"
+                + budget + "}}";
+    }
+
     @Test
     void servesTheCurrentSessionVerbatimInReplayOrder() throws Exception {
         List<Row> observations = readings().subList(295, 305);
@@ -89,17 +96,54 @@ class VolPremiumControllerTest {
         assertTrue(response.getContentType().startsWith("application/json"), response.getContentType());
         List<Row> byEpisode = new ArrayList<>(transitions);   // all three open at ordinal 7141
         byEpisode.sort(Comparator.comparing(Row::key));
-        // EXACT bytes: the producer's records, unreshaped, in (frameSeq, epoch) then (frameSeq, episodeId)
-        // order — nothing coalesced, nothing recomputed.
+        // EXACT bytes: the producer's records, read back from the store's disk log unreshaped, in (frameSeq, epoch)
+        // then (frameSeq, episodeId) order — nothing coalesced, nothing recomputed.
         long retained = controllerService.volPremiumSession("SPX").retainedBytes();
+        long expectedBytes = 0;
+        for (Row row : observations) {
+            expectedBytes += row.json().getBytes(StandardCharsets.UTF_8).length;
+        }
+        for (Row row : transitions) {
+            expectedBytes += row.json().getBytes(StandardCharsets.UTF_8).length;
+        }
+        assertEquals(expectedBytes, retained, "the live bytes are the records' own bytes");
         String expected = "{\"symbol\":\"SPX\",\"sessionDate\":\"2026-08-27\",\"observations\":["
                 + String.join(",", json(observations)) + "],\"warnings\":["
-                + String.join(",", json(byEpisode)) + "],\"retention\":{\"complete\":true,\"refusedForBudget\":0,"
-                + "\"retainedBytes\":" + retained + ",\"budgetBytes\":" + VolPremiumSessionStore.SERIES_BUDGET_BYTES + "}}";
+                + String.join(",", json(byEpisode)) + "],"
+                + retention(true, 0, 0, retained, VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES);
         assertEquals(expected, response.getContentAsString(StandardCharsets.UTF_8));
         JsonNode parsed = new ObjectMapper().readTree(response.getContentAsString(StandardCharsets.UTF_8));
         assertEquals(10, parsed.get("observations").size(), "and it is JSON a machine can read");
         assertEquals(3, parsed.get("warnings").size());
+    }
+
+    @Test
+    void aSessionLargerThanOnePageChunkIsStreamedWholeAndInOrder() throws Exception {
+        // A whole regular session is ~26 MB, a hundred of the store's read chunks: the page is every record, in
+        // order, verbatim, however many chunks it takes.
+        List<Row> session = VolPremiumFixtures.referenceSession();
+        long nowMs = VolPremiumFixtures.longField(session.get(session.size() - 1).json(), "eventTimeMs") + 1_000L;
+        FeedGatewayService service = new FeedGatewayService(new GatewaySettings(), new ObjectMapper(),
+                new HpsfGatewayViewMapper(), null);
+        service.volPremiumClockForTest(() -> nowMs);
+        VolPremiumSessionStore store = service.volPremiumStoreForTest();
+        long offset = 0;
+        long bytes = 0;
+        for (Row row : session) {
+            assertTrue(store.acceptObservation(FeedGatewayService.VOL_PREMIUM_SOURCE, row.key(), 0, offset++,
+                    row.json(), nowMs).admitted(), row.key());
+            bytes += row.json().getBytes(StandardCharsets.UTF_8).length;
+        }
+        assertTrue(bytes > 20L * VolPremiumSessionStore.PAGE_CHUNK_BYTES, "precondition: many chunks, " + bytes);
+        try {
+            String body = get(new VolPremiumController(service, auth(200)), "SPX", "Bearer t")
+                    .getContentAsString(StandardCharsets.UTF_8);
+            assertEquals("{\"symbol\":\"SPX\",\"sessionDate\":\"2026-08-27\",\"observations\":["
+                    + String.join(",", json(session)) + "],\"warnings\":[],"
+                    + retention(true, 0, 0, bytes, VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES), body);
+        } finally {
+            store.close();
+        }
     }
 
     @Test
@@ -113,9 +157,9 @@ class VolPremiumControllerTest {
         MockHttpServletResponse response = get(new VolPremiumController(v1Only, auth(200)), "SPX", "Bearer t");
         assertEquals(200, response.getStatus());
         assertEquals("{\"symbol\":\"SPX\",\"sessionDate\":\"2026-08-27\",\"observations\":["
-                + String.join(",", json(v1)) + "],\"warnings\":[],\"retention\":{\"complete\":true,\"refusedForBudget\":0,"
-                + "\"retainedBytes\":" + v1Only.volPremiumSession("SPX").retainedBytes() + ",\"budgetBytes\":"
-                + VolPremiumSessionStore.SERIES_BUDGET_BYTES + "}}", response.getContentAsString(StandardCharsets.UTF_8));
+                + String.join(",", json(v1)) + "],\"warnings\":[],"
+                + retention(true, 0, 0, v1Only.volPremiumSession("SPX").retainedBytes(),
+                        VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES), response.getContentAsString(StandardCharsets.UTF_8));
 
         // Mixed: the v1 run, then the engine from an ordinal the v1 run also holds — both points, v1's epoch first.
         List<Row> mixed = new ArrayList<>(v1);
@@ -127,9 +171,9 @@ class VolPremiumControllerTest {
         String body = get(new VolPremiumController(service, auth(200)), "SPX", "Bearer t")
                 .getContentAsString(StandardCharsets.UTF_8);
         assertEquals("{\"symbol\":\"SPX\",\"sessionDate\":\"2026-08-27\",\"observations\":["
-                + String.join(",", json(mixed)) + "],\"warnings\":[" + warning.json() + "],\"retention\":{\"complete\":true,"
-                + "\"refusedForBudget\":0,\"retainedBytes\":" + service.volPremiumSession("SPX").retainedBytes()
-                + ",\"budgetBytes\":" + VolPremiumSessionStore.SERIES_BUDGET_BYTES + "}}", body);
+                + String.join(",", json(mixed)) + "],\"warnings\":[" + warning.json() + "],"
+                + retention(true, 0, 0, service.volPremiumSession("SPX").retainedBytes(),
+                        VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES), body);
         JsonNode page = new ObjectMapper().readTree(body);
         List<Integer> versions = new ArrayList<>();
         page.get("observations").forEach(o -> versions.add(o.get("schemaVersion").intValue()));
@@ -142,14 +186,14 @@ class VolPremiumControllerTest {
         MockHttpServletResponse response = get(new VolPremiumController(service, auth(401)), "SPX", null);
         assertEquals(401, response.getStatus());
         assertEquals("", response.getContentAsString());
-        verify(service, never()).volPremiumSession(any());
+        verify(service, never()).volPremiumPage(any());
     }
 
     @Test
     void anUnentitledCallerIs403AndNothingIsRead() throws Exception {
         FeedGatewayService service = mock(FeedGatewayService.class);
         assertEquals(403, get(new VolPremiumController(service, auth(403)), "SPX", "Bearer t").getStatus());
-        verify(service, never()).volPremiumSession(any());
+        verify(service, never()).volPremiumPage(any());
     }
 
     @Test
@@ -160,25 +204,35 @@ class VolPremiumControllerTest {
         MockHttpServletResponse response = get(controller, "NDX", "Bearer t");
         assertEquals(200, response.getStatus());
         assertEquals("{\"symbol\":\"NDX\",\"sessionDate\":null,\"observations\":[],\"warnings\":[],"
-                        + "\"retention\":{\"complete\":true,\"refusedForBudget\":0,\"retainedBytes\":0,"
-                        + "\"budgetBytes\":" + VolPremiumSessionStore.SERIES_BUDGET_BYTES + "}}",
+                        + retention(true, 0, 0, 0, VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES),
                 response.getContentAsString(StandardCharsets.UTF_8));
     }
 
     @Test
     void aSessionPastItsBudgetSaysSoOnThePageItServes() throws Exception {
         // A machine must never read a held prefix as the whole session (VolPremiumSessionStore's
-        // SERIES_BUDGET_BYTES): the page carries the store's own verdict.
+        // SERIES_DISK_BUDGET_BYTES): the page carries the store's own verdict.
         FeedGatewayService service = mock(FeedGatewayService.class);
         String reading = readings().get(0).json();
-        when(service.volPremiumSession(any())).thenReturn(new VolPremiumSessionStore.Snapshot(
-                "2026-08-27", List.of(reading), List.of(), false, 3L, 7_000L, 8_000L));
+        when(service.volPremiumPage(any())).thenReturn(VolPremiumSessionStore.Page.of(new VolPremiumSessionStore.Snapshot(
+                "2026-08-27", List.of(reading), List.of(), false, 3L, 0L, 7_000L, 8_000L)));
         MockHttpServletResponse response = get(new VolPremiumController(service, auth(200)), "SPX", "Bearer t");
         assertEquals(200, response.getStatus());
         String body = response.getContentAsString(StandardCharsets.UTF_8);
-        assertTrue(body.endsWith("],\"warnings\":[],\"retention\":{\"complete\":false,\"refusedForBudget\":3,"
-                + "\"retainedBytes\":7000,\"budgetBytes\":8000}}"), body);
+        assertTrue(body.endsWith("],\"warnings\":[]," + retention(false, 3, 0, 7_000, 8_000)), body);
         assertEquals(false, new ObjectMapper().readTree(body).get("retention").get("complete").asBoolean(true));
+    }
+
+    @Test
+    void aSessionWhoseDiskLogFailedSaysSoOnThePageItServes() throws Exception {
+        // A failed log (the store's DISK_FAILURE) is the other way a session stops being whole: the page says how
+        // many records it refused for it, and that the session is incomplete.
+        FeedGatewayService service = mock(FeedGatewayService.class);
+        when(service.volPremiumPage(any())).thenReturn(VolPremiumSessionStore.Page.of(new VolPremiumSessionStore.Snapshot(
+                "2026-08-27", List.of(), List.of(), false, 0L, 2L, 0L, 8_000L)));
+        String body = get(new VolPremiumController(service, auth(200)), "SPX", "Bearer t")
+                .getContentAsString(StandardCharsets.UTF_8);
+        assertTrue(body.endsWith("\"warnings\":[]," + retention(false, 0, 2, 0, 8_000)), body);
     }
 
     @Test
@@ -192,7 +246,7 @@ class VolPremiumControllerTest {
             assertEquals(400, response.getStatus(), "symbol '" + bad + "'");
             assertTrue(response.getContentAsString().contains("\"error\""));
         }
-        verify(service, never()).volPremiumSession(any());
+        verify(service, never()).volPremiumPage(any());
     }
 
     @Test
@@ -200,10 +254,10 @@ class VolPremiumControllerTest {
         FeedGatewayService service = mock(FeedGatewayService.class);
         CountDownLatch entered = new CountDownLatch(VolPremiumController.MAX_CONCURRENT_RESPONSES);
         CountDownLatch release = new CountDownLatch(1);
-        when(service.volPremiumSession(any())).thenAnswer(inv -> {
+        when(service.volPremiumPage(any())).thenAnswer(inv -> {
             entered.countDown();
             release.await(5, TimeUnit.SECONDS);
-            return new VolPremiumSessionStore.Snapshot(null, List.of(), List.of());
+            return VolPremiumSessionStore.Page.of(new VolPremiumSessionStore.Snapshot(null, List.of(), List.of()));
         });
         VolPremiumController controller = new VolPremiumController(service, auth(200));
         ExecutorService pool = Executors.newFixedThreadPool(VolPremiumController.MAX_CONCURRENT_RESPONSES);
@@ -235,8 +289,8 @@ class VolPremiumControllerTest {
         // four such failures would otherwise exhaust the endpoint for good, and every later caller would
         // be told 503 with nothing actually being written.
         FeedGatewayService service = mock(FeedGatewayService.class);
-        when(service.volPremiumSession(any())).thenReturn(
-                new VolPremiumSessionStore.Snapshot("2026-08-27", List.of(readings().get(0).json()), List.of()));
+        when(service.volPremiumPage(any())).thenAnswer(inv -> VolPremiumSessionStore.Page.of(
+                new VolPremiumSessionStore.Snapshot("2026-08-27", List.of(readings().get(0).json()), List.of())));
         VolPremiumController controller = new VolPremiumController(service, auth(200));
         for (int i = 0; i < VolPremiumController.MAX_CONCURRENT_RESPONSES + 2; i++) {
             MockHttpServletResponse broken = new MockHttpServletResponse() {
@@ -270,7 +324,7 @@ class VolPremiumControllerTest {
         MockHttpServletResponse healthy = get(controller, "SPX", "Bearer t");
         assertEquals(200, healthy.getStatus(), "every permit came back from the failed writes");
         verify(service, org.mockito.Mockito.times(VolPremiumController.MAX_CONCURRENT_RESPONSES + 3))
-                .volPremiumSession(any());
+                .volPremiumPage(any());
     }
 
     @Test

@@ -13,7 +13,6 @@ import org.springframework.web.bind.annotation.RestController;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.List;
 import java.util.concurrent.Semaphore;
 import java.util.regex.Pattern;
 
@@ -25,7 +24,7 @@ import java.util.regex.Pattern;
  * <p>Response, always a JSON object:
  * <pre>{"symbol":"SPX","sessionDate":"2026-08-27"|null,
  *  "observations":[&lt;IvRvReading v2 or IvRvReadingV1&gt;,...],"warnings":[&lt;EarlyWarning v1&gt;,...],
- *  "retention":{"complete":true,"refusedForBudget":0,"retainedBytes":N,"budgetBytes":M}}</pre>
+ *  "retention":{"complete":true,"refusedForBudget":0,"refusedForDisk":0,"retainedBytes":N,"budgetBytes":M}}</pre>
  * Through the v1-to-v2 rollout (runbook "Rollout sequence", step 2 to step 6), {@code observations} may hold
  * records of either wire version, each exactly as its producer wrote it. A reader tells them apart by each
  * record's own {@code schemaVersion}. See VolPremiumSessionStore#acceptObservation for the admission rules and
@@ -45,9 +44,12 @@ import java.util.regex.Pattern;
  * the fail-closed one of {@code /api/pin-flow}: these records are already broadcast to every socket the
  * handshake admits, so the route is exactly as open as the socket and never more.
  *
- * <p>A whole session can be tens of megabytes, so the page is STREAMED record by record from a
- * snapshot of references — no copy of the response is ever built — and at most
- * {@link #MAX_CONCURRENT_RESPONSES} are written at once; the rest get 503 with Retry-After.
+ * <p>A whole session can be tens of megabytes (its supported envelope, over a gigabyte), so the page is
+ * STREAMED from the store's disk log in chunks of at most {@link VolPremiumSessionStore#PAGE_CHUNK_BYTES}: each
+ * chunk is read under the store's lock and written out after it is released, and no copy of the response is ever
+ * built. The retention verdict comes last and is read after the records, so a session that ended or failed while
+ * it was being read says {@code complete:false}. At most {@link #MAX_CONCURRENT_RESPONSES} are written at once;
+ * the rest get 503 with Retry-After.
  */
 @RestController
 public class VolPremiumController {
@@ -93,38 +95,32 @@ public class VolPremiumController {
             return;
         }
         try {
-            VolPremiumSessionStore.Snapshot snapshot = service.volPremiumSession(symbol);
+            VolPremiumSessionStore.Page page = service.volPremiumPage(symbol);
             response.setStatus(200);
             response.setContentType(MediaType.APPLICATION_JSON_VALUE);
             response.setCharacterEncoding(StandardCharsets.UTF_8.name());
             OutputStream out = response.getOutputStream();
             // symbol matched SYMBOL and sessionDate is the contract's yyyy-MM-dd: both are safe to echo.
             out.write(("{\"symbol\":\"" + symbol + "\",\"sessionDate\":"
-                    + (snapshot.sessionDate() == null ? "null" : "\"" + snapshot.sessionDate() + "\"")
+                    + (page.sessionDate() == null ? "null" : "\"" + page.sessionDate() + "\"")
                     + ",\"observations\":[").getBytes(StandardCharsets.UTF_8));
-            writeRecords(out, snapshot.observations());
+            // Each record is contract-validated JSON admitted with no trailing tokens, so it is written as is.
+            page.writeObservations(out);
             out.write("],\"warnings\":[".getBytes(StandardCharsets.UTF_8));
-            writeRecords(out, snapshot.warnings());
-            // Whether the arrays above are the WHOLE session: false from the first record the store
-            // refused for its retention budget, so a machine can never read a held prefix as a session.
-            out.write(("],\"retention\":{\"complete\":" + snapshot.complete()
-                    + ",\"refusedForBudget\":" + snapshot.refusedForBudget()
-                    + ",\"retainedBytes\":" + snapshot.retainedBytes()
-                    + ",\"budgetBytes\":" + snapshot.budgetBytes() + "}}").getBytes(StandardCharsets.UTF_8));
+            page.writeWarnings(out);
+            // Whether the arrays above are the WHOLE session: false from the first record the store refused (its
+            // envelope or a failed disk log), and false if the session ended or failed while being read, so a
+            // machine can never read a held prefix as a session.
+            VolPremiumSessionStore.Retention retention = page.retention();
+            out.write(("],\"retention\":{\"complete\":" + retention.complete()
+                    + ",\"refusedForBudget\":" + retention.refusedForBudget()
+                    + ",\"refusedForDisk\":" + retention.refusedForDisk()
+                    + ",\"retainedBytes\":" + retention.retainedBytes()
+                    + ",\"budgetBytes\":" + retention.budgetBytes() + "}}").getBytes(StandardCharsets.UTF_8));
             out.flush();
             response.flushBuffer();
         } finally {
             permits.release();
-        }
-    }
-
-    /** Each record is contract-validated JSON admitted with no trailing tokens, so it is written as is. */
-    private static void writeRecords(OutputStream out, List<String> records) throws IOException {
-        for (int i = 0; i < records.size(); i++) {
-            if (i > 0) {
-                out.write(',');
-            }
-            out.write(records.get(i).getBytes(StandardCharsets.UTF_8));
         }
     }
 

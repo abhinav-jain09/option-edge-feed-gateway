@@ -1377,6 +1377,7 @@ public class FeedGatewayService implements ReplayRunner {
         outbound.clear();
         shutdownExecutorGracefully(outboundWriters);
         sellerActivityStore.close();
+        volPremiumStore.close();
     }
 
     static void shutdownExecutorGracefully(ExecutorService executor) {
@@ -8554,9 +8555,17 @@ public class FeedGatewayService implements ReplayRunner {
                         + p.episodeId() + "|" + p.transition();
     }
 
-    /** One symbol's current session, verbatim and in replay order, for GET /api/vol-premium/ivrv. */
+    /**
+     * One symbol's current session, verbatim and in replay order, MATERIALISED. Tests and diagnostics only: GET
+     * /api/vol-premium/ivrv streams {@link #volPremiumPage} instead, so a session's bytes are never all on the heap.
+     */
     public VolPremiumSessionStore.Snapshot volPremiumSession(String symbol) {
         return volPremiumStore.snapshot(VOL_PREMIUM_SOURCE + "|" + symbol, volPremiumNow());
+    }
+
+    /** One symbol's current session for GET /api/vol-premium/ivrv, streamed from the store's log in bounded chunks. */
+    public VolPremiumSessionStore.Page volPremiumPage(String symbol) {
+        return volPremiumStore.page(VOL_PREMIUM_SOURCE + "|" + symbol, this::volPremiumNow);
     }
 
     private void replayDirectionPushCached(WebSocketSession session) {
