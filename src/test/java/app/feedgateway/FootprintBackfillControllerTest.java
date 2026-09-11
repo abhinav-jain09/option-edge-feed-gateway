@@ -80,7 +80,8 @@ class FootprintBackfillControllerTest {
         controller(s, 200).footprintStrikeLatest("1m", "2026-09-10", "", -1, 1, "Bearer x", r);
         assertEquals(200, r.getStatus());
         String b = body(r);
-        assertTrue(b.startsWith("{\"sessionDate\":\"2026-09-10\",\"historyBeginsAtMs\":10,\"replayBeginsAtMs\":null,\"loading\":true,\"authority\":0,\"refused\":0,\"episodes\":[\"{\\\"kind\\\":\\\"OPEN\\\""), b);
+        assertTrue(b.startsWith("{\"sessionDate\":\"2026-09-10\",\"historyBeginsAtMs\":10,\"replayBeginsAtMs\":null,\"loading\":true,\"authority\":0,\"incarnation\":\""
+                + s.footprintStrikeView().incarnation() + "\",\"refused\":0,\"tombstones\":[],\"episodes\":[\"{\\\"kind\\\":\\\"OPEN\\\""), b);
         assertTrue(b.contains("now") && !b.contains("old"), "latest is THIS session's, not yesterday's");
         assertTrue(b.endsWith("],\"nextCursor\":680000}"), b);
         // each record is a JSON STRING carrying the producer's bytes verbatim (R14: the page folds the same bytes)
@@ -111,6 +112,8 @@ class FootprintBackfillControllerTest {
         controller(s, 200).footprintStrikeHistory("1m", 680_000, "", "", 1, "Bearer x", r);
         String b = body(r);
         assertTrue(b.contains("now") && b.endsWith("],\"nextCursor\":\"2026-09-10|0000000000000000300\"}"), b);
+        assertTrue(b.contains(",\"incarnation\":\"" + s.footprintStrikeView().incarnation() + "\","), b);
+        assertFalse(b.contains("tombstones"), "history pages keep omitting refused identities and carry no tombstone field");
         MockHttpServletResponse r2 = new MockHttpServletResponse();
         controller(s, 200).footprintStrikeHistory("1m", 680_000, "", "2026-09-10|0000000000000000300", 5, "Bearer x", r2);
         assertTrue(body(r2).contains("old") && !body(r2).contains("now") && body(r2).endsWith("],\"nextCursor\":null}"), "exclusive cursor; a short page ends pagination: " + body(r2));
@@ -169,6 +172,54 @@ class FootprintBackfillControllerTest {
             assertTrue(m.contains("gateway_footprint_drops_total{event=\"es-footprint-strike\",consumer=\"cache\",reason=\"unavailable\"} 1\n"));
             assertEquals(4, s.footprintBackfillPermits().availablePermits());
         } finally { if (prior == null) System.clearProperty(key); else System.setProperty(key, prior); }
+    }
+
+    @Test void strikeRoutesClampLimitsAcceptANonexistentValidCursorAndReleaseThePermitOnAWriteFailure() throws Exception {
+        // final review, remaining obligations: maximum/negative limits, a valid cursor naming no retained episode,
+        // and a client that goes away mid-page on the STRIKE routes (the bars route had these; the strike routes did not)
+        FeedGatewayService s = FootprintWiringTest.on();
+        com.fasterxml.jackson.databind.ObjectMapper m = new com.fasterxml.jackson.databind.ObjectMapper();
+        for (int i = 0; i < 3; i++)
+            s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.episode("OPEN", "2026-09-10", "1m", 680_000 + i * 500, 100 + i, 0, 100 + i, "k" + i), "cache");
+        s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.episode("CLOSE", "2026-09-09", "1m", 680_000, 10, 1, 10, "old"), "cache");
+        MockHttpServletResponse negative = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeLatest("1m", "2026-09-10", "", -1, -5, null, negative);
+        com.fasterxml.jackson.databind.JsonNode n = m.readTree(negative.getContentAsByteArray());
+        assertEquals(1, n.get("episodes").size(), "a negative limit is clamped to one");
+        assertEquals(680_000, n.get("nextCursor").asLong());
+        MockHttpServletResponse huge = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeLatest("1m", "2026-09-10", "", -1, 1_000_000, null, huge);
+        n = m.readTree(huge.getContentAsByteArray());
+        assertEquals(3, n.get("episodes").size(), "a huge limit is clamped to the route maximum, not refused");
+        assertTrue(n.get("nextCursor").isNull());
+        MockHttpServletResponse historyNegative = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeHistory("1m", 680_000, "", "", -1, null, historyNegative);
+        n = m.readTree(historyNegative.getContentAsByteArray());
+        assertEquals(1, n.get("episodes").size());
+        assertEquals("2026-09-10|0000000000000000100", n.get("nextCursor").asText());
+        MockHttpServletResponse gap = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeHistory("1m", 680_000, "", "2026-09-09|0000000000000000050", 100, null, gap);
+        assertEquals(200, gap.getStatus(), "a valid cursor naming no retained episode is a legal exclusive bound");
+        n = m.readTree(gap.getContentAsByteArray());
+        assertEquals(1, n.get("episodes").size());
+        assertTrue(n.get("episodes").get(0).asText().contains("\"tag\":\"old\""));
+        MockHttpServletResponse future = new MockHttpServletResponse();
+        controller(s, 200).footprintStrikeHistory("1m", 680_000, "", "2099-01-01|0000000000000000000", 100, null, future);
+        assertEquals(2, m.readTree(future.getContentAsByteArray()).get("episodes").size());
+        for (boolean latest : List.of(true, false)) {
+            MockHttpServletResponse broken = new MockHttpServletResponse() {
+                @Override public jakarta.servlet.ServletOutputStream getOutputStream() {
+                    return new jakarta.servlet.ServletOutputStream() {
+                        @Override public boolean isReady() { return true; }
+                        @Override public void setWriteListener(jakarta.servlet.WriteListener l) { }
+                        @Override public void write(int b) throws java.io.IOException { throw new java.io.IOException("client went away"); }
+                    };
+                }
+            };
+            if (latest) assertThrows(java.io.IOException.class, () -> controller(s, 200).footprintStrikeLatest("1m", "2026-09-10", "", -1, 200, null, broken));
+            else assertThrows(java.io.IOException.class, () -> controller(s, 200).footprintStrikeHistory("1m", 680_000, "", "", 100, null, broken));
+            assertEquals(4, s.footprintBackfillPermits().availablePermits(), (latest ? "latest" : "history") + ": the permit is released when the write fails");
+        }
     }
 
     @Test void sessionMismatchIsA200WithTheFlagAndCountsOnce() throws Exception {

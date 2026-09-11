@@ -77,7 +77,12 @@ class FootprintWiringTest {
         int method = src.indexOf("boolean onFootprintLiveRecord(String event, String json) {");
         String body = src.substring(method, src.indexOf("\n    }", method));
         assertTrue(body.indexOf("admitFootprintRecord(event, json, \"live\")") < body.indexOf("broadcast(event, "), "view first, then broadcast");
-        assertTrue(body.contains("FootprintStrikeView.quoted(json)"), "the strike record rides the frame as a JSON string literal: the page folds the bytes the relay folded");
+        assertTrue(body.indexOf("if (\"es-footprint-strike\".equals(event)) return true;") > 0
+                        && body.indexOf("if (\"es-footprint-strike\".equals(event)) return true;") < body.indexOf("broadcast(event, "),
+                "the strike record is never broadcast after its admission returned: the fold sequenced its evidence with the decision (final review #1)");
+        int sink = src.indexOf("void deliverFootprintStrikeFrame(FootprintStrikeView.Frame frame) {");
+        assertTrue(sink > 0 && src.substring(sink, src.indexOf("\n    }", sink)).contains("FootprintStrikeView.quoted(frame.body())"),
+                "the strike record rides the frame as a JSON string literal: the page folds the bytes the relay folded");
         assertTrue(body.contains("if (!admitFootprintRecord(event, json, \"live\")) return false;"), "an oversize record is never broadcast");
         int cache = src.indexOf("admitFootprintRecord(binding.event(), json, \"cache\");");
         assertTrue(cache > 0 && cache < src.indexOf("updateCache(binding, record, json);", cache), "the cache consumer admits before the generic cache and never broadcasts");
@@ -222,11 +227,11 @@ class FootprintWiringTest {
     @Test void flagOnAddsOneHelloFieldFromTheCoordinatorSnapshot() {
         FeedGatewayService s = on();
         assertEquals("{\"sessionDate\":null,\"hwm\":{},\"footprint\":{\"sessionDate\":null,\"hwm\":{},\"outcomeHwm\":{}},"
-                + "\"footprintStrike\":{\"authority\":0,\"symbol\":\"ES.v.0\",\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}}", s.cvdHelloJson());
+                + "\"footprintStrike\":{\"authority\":0,\"incarnation\":\"" + s.footprintStrikeView().incarnation() + "\",\"symbol\":\"ES.v.0\",\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}}", s.cvdHelloJson());
         assertTrue(s.admitFootprintRecord("es-footprint-bar", FootprintViewsTest.bar("2026-08-14", "1m", 60_000), "live"));
         assertTrue(s.cvdHelloJson().contains("\"footprint\":{\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"outcomeHwm\":{}}"));
         assertTrue(s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.checkpoint("2026-08-14", "1m", 60_000), "cache"));
-        assertTrue(s.cvdHelloJson().endsWith("\"footprintStrike\":{\"authority\":0,\"symbol\":\"ES.v.0\",\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}}"),
+        assertTrue(s.cvdHelloJson().endsWith("\"footprintStrike\":{\"authority\":0,\"incarnation\":\"" + s.footprintStrikeView().incarnation() + "\",\"symbol\":\"ES.v.0\",\"sessionDate\":\"2026-08-14\",\"hwm\":{\"1m\":60000},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}}"),
                 "the episode high-water mark rides the SAME hello (R14)");
     }
 
@@ -300,6 +305,8 @@ class FootprintWiringTest {
         for (String r : new String[]{"bars", "outcomes", "strike_latest", "strike_history"}) expect.add("gateway_footprint_backfill_requests_total{route=\"" + r + "\"} 0");
         for (String r : new String[]{"bars", "outcomes", "strike_latest", "strike_history"}) for (String x : new String[]{"busy", "bad_cursor", "session_mismatch", "unavailable"}) expect.add("gateway_footprint_backfill_rejected_total{route=\"" + r + "\",reason=\"" + x + "\"} 0");
         expect.add("gateway_footprint_strike_episodes_in_view 0"); expect.add("gateway_footprint_strike_view_bytes 0");
+        // what is retained is published apart from what is sent (final review #3)
+        expect.add("gateway_footprint_strike_view_retained_bytes 0");
         // what the revision ledgers, identities and tombstones cost, and whether the cache replay has
         // crossed its bootstrap boundary — both budgeted/published since code round 2 (#1, #3)
         expect.add("gateway_footprint_strike_view_metadata_bytes 0"); expect.add("gateway_footprint_strike_loading 1");
@@ -312,7 +319,7 @@ class FootprintWiringTest {
         for (String name : List.of("gateway_footprint_enabled", "gateway_footprint_records_total", "gateway_footprint_drops_total", "gateway_footprint_broadcast_total",
                 "gateway_footprint_evictions_total", "gateway_footprint_rollovers_total", "gateway_footprint_bars_in_view", "gateway_footprint_outcomes_in_view",
                 "gateway_footprint_view_bytes", "gateway_footprint_backfill_requests_total", "gateway_footprint_backfill_rejected_total",
-                "gateway_footprint_strike_episodes_in_view", "gateway_footprint_strike_view_bytes",
+                "gateway_footprint_strike_episodes_in_view", "gateway_footprint_strike_view_bytes", "gateway_footprint_strike_view_retained_bytes",
                 "gateway_footprint_strike_view_metadata_bytes", "gateway_footprint_strike_loading", "gateway_footprint_strike_evictions_total",
                 "gateway_footprint_strike_collisions_total", "gateway_footprint_strike_refused_identities", "gateway_footprint_strike_unavailable",
                 "gateway_footprint_topic_validated", "gateway_footprint_topic_validation_failures_total")) {

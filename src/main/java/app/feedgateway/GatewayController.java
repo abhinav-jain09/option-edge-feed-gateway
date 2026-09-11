@@ -159,9 +159,12 @@ public class GatewayController {
     }
 
     /**
-     * The strike routes' envelope: {@code {"sessionDate":..,"historyBeginsAtMs":..,"refused":n,"episodes":["<record>",..],"nextCursor":..}},
-     * streamed like {@link #writePage}. Each record is a JSON STRING LITERAL carrying the producer's bytes verbatim, so the page
-     * folds the same bytes the relay folded (R14) — the same shape the live frame uses.
+     * The strike routes' envelope, streamed like {@link #writePage}:
+     * {@code {"sessionDate":..,"historyBeginsAtMs":..,"replayBeginsAtMs":..,"loading":bool,"authority":n,"incarnation":"..","refused":n,
+     * ["tombstones":[{"strikeCents":n,"openBarStartMs":n},..],]"episodes":["<record>",..],"nextCursor":..}} — {@code tombstones} on
+     * {@code latest} pages only. Each record is a JSON STRING LITERAL carrying the producer's bytes verbatim, written straight
+     * from the UTF-8 array the fold retains, so the page folds the same bytes the relay folded (R14) — the same shape the live
+     * frame uses.
      */
     private static void writeStrikePage(jakarta.servlet.http.HttpServletResponse response, FootprintStrikeView.Page page,
                                         String field, String cursorJson) throws java.io.IOException {
@@ -188,13 +191,26 @@ public class GatewayController {
         head.append(",\"replayBeginsAtMs\":").append(page.replayBeginsAtMs() == null ? "null" : page.replayBeginsAtMs());
         head.append(",\"loading\":").append(page.loading());
         head.append(",\"authority\":").append(page.authority());
+        // the process the authority belongs to: a reader that meets another one resets its comparison
+        head.append(",\"incarnation\":\"").append(page.incarnation()).append('"');
         head.append(",\"refused\":").append(page.refused());
+        if (page.tombstones() != null) {
+            // latest only: the strikes whose newest episode in this session is refused — NO DATA, said
+            // explicitly, so a reader holding a live value for one of them drops it (the cursor counts them)
+            head.append(",\"tombstones\":[");
+            for (int i = 0; i < page.tombstones().size(); i++) {
+                FootprintStrikeView.Tombstone t = page.tombstones().get(i);
+                if (i > 0) head.append(',');
+                head.append("{\"strikeCents\":").append(t.strikeCents()).append(",\"openBarStartMs\":").append(t.openBarStartMs()).append('}');
+            }
+            head.append(']');
+        }
         head.append(",\"").append(field).append("\":[");
         out.write(head.toString().getBytes(java.nio.charset.StandardCharsets.US_ASCII));
-        java.util.List<String> records = page.records();
-        for (int i = 0; i < records.size(); i++) {
+        java.util.List<byte[]> payloads = page.payloads();
+        for (int i = 0; i < payloads.size(); i++) {
             if (i > 0) out.write(',');
-            out.write(FootprintStrikeView.quoted(records.get(i)).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            FootprintStrikeView.writeQuoted(out, payloads.get(i));
         }
         out.write(("],\"nextCursor\":" + cursorJson + "}").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
         out.flush();

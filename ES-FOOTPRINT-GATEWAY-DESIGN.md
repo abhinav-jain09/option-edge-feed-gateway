@@ -265,73 +265,110 @@ Check the round-9 disposition (the two validation series in G-R9's contract and 
 verdict `APPROVE` or `REQUEST_CHANGES` with numbered findings.
 
 
-## As-built amendment — the fifth stream (ES-FOOTPRINT-STRIKE-INTERACTION.md R3/R14, 2026-09-10; code Codex round 1 folded)
+## As-built amendment — the fifth stream (ES-FOOTPRINT-STRIKE-INTERACTION.md R3/R14, 2026-09-10; code Codex rounds 1–3 folded; final review folded 2026-09-11)
 
 The strike-interaction log `es.futures.footprint.strike` rides the SAME relay path under the SAME flag
 (`GATEWAY_ES_FOOTPRINT_ENABLED`), topic env `KAFKA_ES_FOOTPRINT_STRIKE_TOPIC`, event `es-footprint-strike`:
 
 - **Wiring (G-R2)**: `addEsFootprintTopics` binds FIVE topics; the G-R8a gate validates all five; the live
-  consumer seeks the fifth to END like the other four; the cache consumer seeks back
-  `GATEWAY_ES_FOOTPRINT_STRIKE_SEEK_BACK_MS` (default 7 days — history crosses sessions, R18).
+  consumer seeks the fifth to END like the other four, on bootstrap, retry and adoption alike; the cache
+  consumer seeks back `GATEWAY_ES_FOOTPRINT_STRIKE_SEEK_BACK_MS` (default 7 days — history crosses sessions, R18).
 - **Fold (R14)**: `FootprintStrikeView` folds by identity to the greatest revision. Two records sharing an
   identity and a revision must be identical bytes — checked for EVERY observed revision of an identity, with a
   32-byte digest per revision kept with the identity — else the identity is REFUSED for the incarnation (drop
   reason `collision`, later revisions `refused`, counted). A refused identity stays in the ordering as a
   TOMBSTONE: if it is a strike's newest episode, `latest` has no row for that strike (NO DATA), never an older
-  episode; history omits it and keeps the older ones. Scope is symbol AND timeframe. CHECKPOINT records carry no
-  episode and only advance the per-timeframe high-water mark (a JSON-null session date is accepted; an invalid
-  one is a shape drop, as is any timeframe outside the producer's vocabulary — nothing unescaped can reach the hello).
-- **Bounds (R20/G-R8)**: `GATEWAY_ES_FOOTPRINT_STRIKE_MAX_BYTES` (64 MiB) and `_MAX_EPISODES` (50 000) evict the
-  OLDEST identities, and always the WHOLE equal-opening-time bucket, so the MONOTONIC boundary that follows is
-  strictly above every retained head: records opening before it are dropped (`evicted`) rather than re-admitted,
-  and no survivor can sit behind it with its own updates refused (code round-2 #2). `historyBeginsAtMs` reports
-  that boundary (or, before any eviction, the oldest retained open) and is retained INVENTORY;
-  `replayBeginsAtMs` reports the window the cache consumer's replay actually covered, and the two are published
-  separately because neither implies the other (code round-2 #6). The byte budget charges EVERY retained byte,
-  not only the payloads: each head's identity, 40 bytes per observed revision (the revision and its digest,
-  packed) and each tombstone's identity, published as `gateway_footprint_strike_view_metadata_bytes` — the
-  revision ledger and the refusal identities previously grew outside every budget (code round-2 #1). A symbol
-  longer than 64 characters is a shape drop for the same reason. The refusal ledger is bounded by
+  episode, and names the strike in the page's `tombstones`; history omits it and keeps the older ones. Scope is
+  symbol AND timeframe. CHECKPOINT records carry no episode and only advance the per-timeframe high-water mark (a
+  JSON-null session date is accepted; an invalid one is a shape drop, as is any timeframe outside the producer's
+  vocabulary — nothing unescaped can reach the hello).
+- **Bounds and the boundary (R20/G-R8)**: `GATEWAY_ES_FOOTPRINT_STRIKE_MAX_BYTES` (64 MiB) and `_MAX_EPISODES`
+  (50 000) evict the OLDEST identities, and always the WHOLE equal-opening-time bucket, so the MONOTONIC boundary
+  that follows is strictly above evicted openings and at or below retained openings: records opening before it
+  are dropped (`evicted`) rather than re-admitted, and no survivor can sit behind it with its own updates refused
+  (code round-2 #2). `historyBeginsAtMs` reports that boundary (or, before any eviction, the oldest retained
+  open) and is retained INVENTORY; `replayBeginsAtMs` reports the cutoff the cache consumer's replay actually
+  sought, and the two are published separately because neither implies the other (code round-2 #6). A symbol
+  longer than 64 characters is a shape drop. The refusal ledger is bounded by
   `GATEWAY_ES_FOOTPRINT_STRIKE_MAX_REFUSED_IDENTITIES` (10 000), and eviction that cannot bring the view inside
   its budget is the same fail-closed case: the view is UNAVAILABLE for the incarnation — routes answer 503 +
   Retry-After, the hello says `"unavailable":true`, the gauge `gateway_footprint_strike_unavailable` is 1 —
   rather than forgetting evidence.
-- **Loading is not empty (R14, code round-2 #3)**: the fold is LOADING until the cache consumer that carries the
-  strike topic has crossed the end offsets captured at its bootstrap; until then the hello and every page carry
-  `"loading":true` and `gateway_footprint_strike_loading` is 1, so a live CHECKPOINT that raises the high-water
-  mark ahead of an unfinished replay can never let a reader render a completed NO DATA.
-- **Authority reaches connected readers (code round-2 #4)**: a collision refusal, the view failing closed, or the
-  replay completing broadcasts `es-footprint-strike-control` carrying the same field the hello carries — no
-  evidence, only the authority. Without it a page that was already READY kept displaying a value the fold had
-  withdrawn, because the producer record it holds is unchanged and nothing else told it otherwise.
-- **Resources — NOT a proof, and not claimed as one.** The earlier claim that "the deployed heap/limit headroom
-  (es4 1024 MiB) absorbs it" was `limit − Xmx`, which is native-memory margin, not free Java heap, and the
-  round-2 review was right to reject it. What can be stated: the retained bytes are now BOUNDED by
-  `_MAX_BYTES` (64 MiB) because every retained byte is charged to it, and the two-consumer Kafka allowance in
-  G-R8 rises from ~25 MiB to ~31 MiB with a fifth topic. What is NOT established: the `Xmx − H_peak` and
-  `limit − W_peak` inequalities for the strike stream, which need the measurement G-R8's deployment contingency
-  already requires. The rollout runs the gateway with the flag on in dev first and records both peaks; the
-  strike view's own contribution is observable as `gateway_footprint_strike_view_bytes` +
-  `_view_metadata_bytes`.
+- **What the byte budget charges (final review #3).** The budget acts on RETAINED STORAGE, estimated from the
+  objects the view keeps — not on the bytes it sends. A head's payload is retained as the record's UTF-8
+  `byte[]` and charged that array's heap size (16-byte header, 8-byte alignment). It is never retained as a
+  `String`: a String's backing array switches to two bytes per char as soon as ONE char is above U+00FF, and the
+  final review's executed counterexample was exactly that — an admitted ~200 KB record held in a 400,906-byte
+  array against a 201,157-byte charge under a 300,000-byte budget. Every string the view keeps (identity,
+  symbol, session date, timeframe, open key, age key) is charged its storage under compact strings — the object
+  plus one byte per char when every char is Latin-1, two otherwise. On top of that: 512 B of node overhead per
+  head (the head object, its map node and table share, three index nodes, the age-tree node, the revision
+  map), 128 B per observed revision (a boxed key, a node, the 32-byte digest array, a table share), and per
+  tombstone 256 B plus its identity and open-key strings. The per-node constants are deliberate over-estimates
+  of a compressed-oops HotSpot layout (G-R8's preflight refuses a JVM without compressed oops, compressed class
+  pointers or compact strings); they are ESTIMATES, not measurements. Three gauges keep what is sent apart from
+  what is retained: `gateway_footprint_strike_view_bytes` (the heads' UTF-8 record bytes — what a reader
+  receives before quoting, NOT the budget), `gateway_footprint_strike_view_retained_bytes` (the payload arrays
+  as held) and `gateway_footprint_strike_view_metadata_bytes` (everything else charged); the budget acts on the
+  sum of the last two.
+- **Resources — NOT a proof, and not claimed as one.** The accounting above bounds what the view's own charged
+  structures may hold; it is not a measured heap ceiling, and no heap-headroom claim is made for this stream.
+  Transient allocations — Jackson's parse tree per admission, the quoted copy of a record written to a socket,
+  the per-socket outbound queues, the short-lived frame queue below — are outside it. What is NOT established:
+  the `Xmx − H_peak` and `limit − W_peak` inequalities for the strike stream, which need the full-session
+  measurement G-R8's deployment contingency already requires
+  (`max_over_time(jvm_memory_bytes_used{area="heap"}[8h])` with the flag on and the strike view near its
+  budget). Until that is recorded, 64 MiB is an accounting budget, not a demonstrated fit. The two-consumer
+  Kafka allowance in G-R8 rises from ~25 MiB to ~31 MiB with a fifth topic.
+- **Loading is not empty — the replay lifecycle (R14, code round-2 #3, round-3 #2/#5, final review #2).** The
+  fold is LOADING until the cache consumer's STRIKE replay completes; until then the hello, every page and every
+  control carry `"loading":true` and `gateway_footprint_strike_loading` is 1, so a live CHECKPOINT that raises
+  the high-water mark ahead of an unfinished replay can never let a reader render a completed NO DATA. The
+  replay belongs to one cache-consumer ATTEMPT and covers every strike partition that attempt seeks by cache
+  window — at bootstrap AND at every late adoption (a strike topic absent at start-up and created later). Each
+  such seek (re)opens the replay: the cutoff that seek actually used is captured once and published as
+  `replayBeginsAtMs` (with several strike partitions, the latest cutoff — the window every one of them covers),
+  and the end offsets captured right after the seek become that partition's barrier. Completion is evaluated
+  after each poll's records are APPLIED, on every poll, independently of the shared readiness flag, and is
+  declared when every partition of the open replay has reached its barrier. A retry is a new attempt: its
+  bootstrap reopens a completed replay — an authority change, so connected readers receive a control with
+  `"loading":true` — and completes it again. A strike partition the consumer no longer assigns keeps the replay
+  open (fail closed); an empty strike partition completes at bootstrap. The live consumer never opens or
+  completes the replay.
+- **Ordered delivery (final review #1).** Every strike mutation — an admission from EITHER consumer, a refusal,
+  an eviction that moves the boundary, failing closed, the replay completing or reopening — decides its outcome
+  AND queues the frames it causes under the one view lock: the admitted record's `es-footprint-strike` evidence
+  (live consumer only), then an `es-footprint-strike-control` frame when the authority moved. A connecting
+  socket's hello is captured and queued the same way. The queue is drained outside the view lock, by one
+  drainer at a time, into the non-blocking per-socket channels, in queue order. So a record admitted before a
+  refusal or eviction reaches every socket before that change's control frame, never after it; a socket never
+  receives a hello whose authority is older than a control it already holds; and a REST page read after a
+  control reflects at least that control's state. Only ADMITTED strike evidence is forwarded: a refused,
+  evicted, unavailable or shape-dropped record reaches no socket (every other footprint stream keeps G-R3's
+  rule, because those pages do not fold against the relay's own decision).
+- **Authority and incarnation.** `authority` is monotonic WITHIN a gateway process and bumps on every authority
+  change. `incarnation` is a random UUID fixed when the process builds its strike view; it rides beside
+  `authority` on the hello, every control frame and every page. A reader that meets a different `incarnation`
+  resets its authority comparison (a restarted gateway starts again at 0); within one incarnation it discards
+  an older authority that arrives after a newer one (round-3 #3).
+- **Hello and control schema (G-R6).** The `cvd-hello` field `footprintStrike` and the body of every
+  `es-footprint-strike-control` frame are the SAME object:
+  `{"authority":n,"incarnation":"<uuid>","symbol":"<configured symbol>","sessionDate":"YYYY-MM-DD"|null,"hwm":{"<tf>":seenMaxBarStartMs,…},"historyBeginsAtMs":n|null,"replayBeginsAtMs":n|null,"loading":bool,"refused":n,"unavailable":bool}`.
+  `symbol` is JSON-escaped and a configured value that could not be a symbol is refused at start-up (round-3
+  #6); `sessionDate` and `hwm` advance only for the configured symbol (round-3 #8).
+- **Page schema (G-R7)** — a DIFFERENT object: it carries no `symbol`, `hwm` or `unavailable` (an unavailable view
+  answers 503 instead of a page).
+  `latest`: `{"sessionDate":"<the requested session>","historyBeginsAtMs":n|null,"replayBeginsAtMs":n|null,"loading":bool,"authority":n,"incarnation":"<uuid>","refused":n,"tombstones":[{"strikeCents":n,"openBarStartMs":n},…],"episodes":["<record>",…],"nextCursor":n|null}`.
+  `history`: the same fields without `tombstones`; its `sessionDate` is the newest session the view holds for the
+  configured symbol, and `nextCursor` is the opaque string cursor or null.
+  `tombstones` names each strike the page visited whose NEWEST episode in the requested session is refused —
+  the strikes `latest` shows no row for. Cursor semantics are unchanged: a tombstone strike counts as visited.
+  History pages keep omitting refused identities.
 - **Bytes to the reader (R14)**: the strike record rides the live frame and the backfill pages as a JSON STRING
-  LITERAL (`FootprintStrikeView.quoted`), so a page folds exactly the bytes this relay folded, not a
-  re-serialisation.
-- **Hello (G-R6)**: `footprintStrike:{authority,symbol,sessionDate,hwm{tf:seenMaxBarStartMs},historyBeginsAtMs,replayBeginsAtMs,loading,refused,unavailable}`,
-  and the same fields ride every backfill page envelope and the `es-footprint-strike-control` frame.
-  `authority` is monotonic and bumps on every authority change (a refusal, an eviction that moves the
-  boundary, failing closed, a replay completing or restarting), so a reader can discard an older
-  authority that arrives after a newer one — the ordering hole where a hello captured before a
-  completion could be applied after it (round-3 #3). `symbol` is JSON-escaped and the configured value
-  is refused if it could not be a symbol: it is written into the SHARED hello (round-3 #6).
-- **The strike stream forwards ONLY what the fold admitted (round-3 #3/#4).** Every other footprint
-  stream broadcasts what it drops (G-R3), because those pages do not fold against the relay's own
-  decision. The strike page does, so a refused, evicted or shape-dropped record reaching it would be
-  evidence the relay has already excluded from the authority — with no way for the page to know.
-- **Replay completion is strike-specific (round-3 #2).** It is declared only when the cache consumer's
-  own strike partitions have crossed the end offsets captured at ITS bootstrap — not when another
-  source's barriers retire — and a new consumer attempt or a late adoption reopens it. The published
-  `replayBeginsAtMs` is the window that was actually seeked, recorded once per replay rather than
-  recomputed from the clock on every caught-up poll (round-3 #5).
+  LITERAL. The live frame quotes the record as consumed; a page writes it straight from the retained UTF-8 array,
+  escaping byte by byte (`FootprintStrikeView.writeQuoted`) — byte-identical to quoting the decoded String,
+  because every escaped byte is ASCII and every byte of a multi-byte character is ≥ 0x80. A page therefore folds
+  exactly the bytes this relay folded, not a re-serialisation.
 - **Backfill (G-R7)**: `GET /api/footprint/strike/latest?tf&sessionDate&symbol=&afterStrike&limit≤200` (one folded
   record per strike for ONE symbol, ONE session and ONE timeframe, ascending strike, exclusive strike cursor; the
   envelope's `sessionDate` is the REQUESTED session) and `GET /api/footprint/strike/history?tf&strikeCents&symbol=&before&limit≤100`
@@ -340,6 +377,20 @@ The strike-interaction log `es.futures.footprint.strike` rides the SAME relay pa
   Same flag → auth → permit → cursor → snapshot → streamed write order; `unavailable` → 503.
 - **Locale**: fixed-width keys, cursors and drop labels are formatted under `Locale.ROOT`.
 - **Metrics (G-R9)**: the fifth event / third keyed event / two new routes / drop reasons `collision`, `refused`,
-  `evicted`, `unavailable` / reject reason `unavailable`, plus
-  `gateway_footprint_strike_{episodes_in_view,view_bytes,evictions_total,collisions_total,refused_identities,unavailable}`.
+  `evicted`, `unavailable` / reject reason `unavailable`; the broadcast domain is the five evidence events plus
+  `es-footprint-strike-control`; and
+  `gateway_footprint_strike_{episodes_in_view,view_bytes,view_retained_bytes,view_metadata_bytes,loading,evictions_total,collisions_total,refused_identities,unavailable}`.
 - **R21**: the relay adds no field to a record; the page's chip words are the page's business.
+- **Deployment coupling (protocol v2).** `incarnation` (hello, control, pages) and `tombstones` (latest pages) are
+  additive: a reader that ignores unknown fields keeps working. The options-edge web change that consumes them —
+  resetting its authority comparison on a new incarnation, and dropping a held value for a tombstone strike —
+  deploys together with this gateway change.
+- **Pinned by** `FootprintStrikeViewTest` (fold, bounds, tombstones, retained-storage accounting incl. the final
+  review's Unicode case, byte-exact quoting, latch-controlled refusal/eviction ordering, hello sequencing,
+  incarnation), `FootprintStrikeDeliveryTest` (the same orderings through real socket channels with REST reads
+  interleaved, fifth-event fan-out in authenticated mode with rejection suppression, a producer-shaped record
+  byte-exact through live/latest/history, and the replay lifecycle — absent→adopted, exact cutoff, completion
+  after application and without shared readiness, retry reopen — driven through the production cache-consumer
+  loop against a scripted broker), `FootprintSeamTest` (the live consumer's END seeks include the strike topic on
+  retry and adoption and never touch the replay) and `FootprintBackfillControllerTest`. What those tests do not
+  establish is listed in ES-FOOTPRINT-STRIKE-GATEWAY-CODEX-FINAL.md.
