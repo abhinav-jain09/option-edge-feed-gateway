@@ -312,6 +312,8 @@ class FootprintWiringTest {
         expect.add("gateway_footprint_strike_view_metadata_bytes 0"); expect.add("gateway_footprint_strike_loading 1");
         expect.add("gateway_footprint_strike_evictions_total 0");
         expect.add("gateway_footprint_strike_collisions_total 0"); expect.add("gateway_footprint_strike_refused_identities 0"); expect.add("gateway_footprint_strike_unavailable 0");
+        // the eviction-marker ledger (strike re-review #3): what latest still names, and what it forgot
+        expect.add("gateway_footprint_strike_eviction_markers 0"); expect.add("gateway_footprint_strike_eviction_marker_drops_total 0");
         for (String t : topics) expect.add("gateway_footprint_topic_validated{topic=\"" + t + "\"} 0");
         for (String t : topics) for (String r : new String[]{"admin", "unknown", "ceiling", "compression"}) expect.add("gateway_footprint_topic_validation_failures_total{topic=\"" + t + "\",reason=\"" + r + "\"} 0");
         List<String> actual = m.lines().filter(l -> !l.startsWith("#")).toList();
@@ -322,6 +324,7 @@ class FootprintWiringTest {
                 "gateway_footprint_strike_episodes_in_view", "gateway_footprint_strike_view_bytes", "gateway_footprint_strike_view_retained_bytes",
                 "gateway_footprint_strike_view_metadata_bytes", "gateway_footprint_strike_loading", "gateway_footprint_strike_evictions_total",
                 "gateway_footprint_strike_collisions_total", "gateway_footprint_strike_refused_identities", "gateway_footprint_strike_unavailable",
+                "gateway_footprint_strike_eviction_markers", "gateway_footprint_strike_eviction_marker_drops_total",
                 "gateway_footprint_topic_validated", "gateway_footprint_topic_validation_failures_total")) {
             assertEquals(1, occurrences(m, "# TYPE " + name + " "), name + " typed once");
         }

@@ -7,6 +7,8 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import app.feedgateway.liquidityhistory.LiquidityHistoryAuth;
@@ -30,6 +32,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntConsumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -494,5 +497,134 @@ class FootprintStrikeDeliveryTest {
         s.setRunningForTest(true);
         s.runCacheConsumerAttemptForTest("state", events(), new AtomicBoolean(), empty.consumer());
         assertEquals(List.of(false), emptyLoading, "an empty strike partition is complete at bootstrap, before any poll");
+    }
+
+    // ---- strike re-review (round 2) -----------------------------------------------------------------------
+
+    /** Waits until the socket's strike frames are exactly {@code want} (by type), or fails with what it has. */
+    private static List<JsonNode> awaitStrikeTypes(List<String> sink, List<String> want) throws Exception {
+        long deadline = System.currentTimeMillis() + 10_000;
+        List<JsonNode> frames = strikeFrames(sink);
+        while (!types(frames).equals(want) && System.currentTimeMillis() < deadline) { Thread.sleep(10); frames = strikeFrames(sink); }
+        assertEquals(want, types(frames));
+        return frames;
+    }
+
+    /**
+     * The reviewer's reproduction of #1, on the production path with REAL asynchronous writers: the strike
+     * fold's drainer fans each frame out while it holds the stream's delivery order; one socket stops
+     * reading, overflows on that drainer, and closing it BLOCKS — behind its own outstanding write. Before:
+     * the live consumer waited inside that close, the cache consumer waited for the drainer, its refusal
+     * control stayed queued and every healthy socket waited with it (the watchdog skipped the channel: it
+     * was already marked closed). Now the channel is marked closed at once and its session is closed on a
+     * teardown thread of its own.
+     */
+    @Test void aSlowSocketWhoseCloseBlocksStallsNeitherConsumerNorAnyHealthySocket() throws Exception {
+        FeedGatewayService s = FootprintWiringTest.on();                        // no runOutboundWritesInline: the production writer pool
+        List<String> a = sink(), b = sink(), slowGot = sink();
+        s.addClient(socket("a", a)); s.addClient(socket("b", b));
+        CountDownLatch sendRelease = new CountDownLatch(1), closeEntered = new CountDownLatch(1), closeRelease = new CountDownLatch(1), closeReturned = new CountDownLatch(1);
+        AtomicReference<String> closedOn = new AtomicReference<>();
+        WebSocketSession slow = mock(WebSocketSession.class);
+        when(slow.getId()).thenReturn("slow");
+        when(slow.isOpen()).thenReturn(true);
+        doAnswer(inv -> {
+            String p = ((TextMessage) inv.getArgument(0)).getPayload();
+            slowGot.add(p);
+            if (p.startsWith("{\"type\":\"es-footprint-strike")) sendRelease.await(30, TimeUnit.SECONDS);   // its reader stops reading
+            return null;
+        }).when(slow).sendMessage(any());
+        doAnswer(inv -> {                                                            // …and closing it waits behind that write
+            closedOn.set(Thread.currentThread().getName());
+            closeEntered.countDown();
+            closeRelease.await(30, TimeUnit.SECONDS);
+            closeReturned.countDown();
+            return null;
+        }).when(slow).close();
+        withProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "50", () -> { s.addClient(slow); return null; });
+        int n = 80;
+        List<String> records = new ArrayList<>();
+        for (int i = 0; i < n; i++) records.add(FootprintStrikeViewTest.episode("OPEN", "2026-09-10", "1m", 680_000 + i * 500L, 100, 0, 100, "s" + i));
+        String conflict = FootprintStrikeViewTest.episode("OPEN", "2026-09-10", "1m", 680_000, 100, 0, 100, "conflict");
+        Thread live = new Thread(() -> { for (String r : records) s.onFootprintLiveRecord("es-footprint-strike", r); }, "state-live");
+        Thread cache = new Thread(() -> s.admitFootprintRecord("es-footprint-strike", conflict, "cache"), "state-cache");
+        try {
+            live.start();
+            assertTrue(closeEntered.await(10, TimeUnit.SECONDS), "the slow socket overflowed and its close began");
+            live.join(5_000);
+            cache.start();                                                       // the cache consumer's refusal, while that close is still blocked
+            cache.join(5_000);
+            assertFalse(live.isAlive(), "the live consumer is not waiting inside the slow socket's close");
+            assertFalse(cache.isAlive(), "the cache consumer is not waiting for a drainer stuck in that close");
+            assertEquals(1, closeReturned.getCount(), "…and the close is STILL blocked: nothing above waited for it");
+            assertEquals("options-edge-ws-closer", closedOn.get(), "the close runs on a teardown thread of its own");
+            List<String> want = new ArrayList<>(Collections.nCopies(n, "es-footprint-strike"));
+            want.add("es-footprint-strike-control");
+            for (List<String> healthy : List.of(a, b)) {
+                List<JsonNode> frames = awaitStrikeTypes(healthy, want);
+                assertEquals(records.get(n - 1), frames.get(n - 1).get("data").asText(), "every record, in order, then the refusal's control");
+                assertEquals(1, frames.get(n).get("data").get("refused").asLong());
+            }
+            assertEquals(0, s.footprintStrikeView().queuedFrames());
+        } finally {
+            closeRelease.countDown();
+            sendRelease.countDown();
+            live.join(10_000);
+            cache.join(10_000);
+        }
+        assertTrue(closeReturned.await(10, TimeUnit.SECONDS), "the teardown finished once the close could");
+        verify(slow, times(1)).close();
+        assertTrue(slowGot.stream().filter(p -> p.startsWith("{\"type\":\"es-footprint-strike")).count() <= 1,
+                "the slow socket got at most the frame it was stuck on: its queue was dropped when it was marked closed");
+    }
+
+    /**
+     * The reviewer's production scenario for #2: the live consumer misses an update (it re-sought END on a
+     * reconnect), and the continuing cache consumer folds it after the replay completed. Before, every
+     * connected browser kept the superseded revision until some unrelated authority change. Now the change
+     * reaches every socket as the admitted record, in order; the live consumer's later copy adds nothing.
+     */
+    @Test void anUpdateOnlyTheCacheConsumerFoldedAfterTheReplayCompletedReachesEverySocket() throws Exception {
+        FeedGatewayService s = FootprintWiringTest.on();
+        s.runOutboundWritesInline();
+        List<String> a = sink(), b = sink();
+        s.addClient(socket("a", a)); s.addClient(socket("b", b));
+        String r0 = FootprintStrikeViewTest.e(100, 0, "r0"), r1 = FootprintStrikeViewTest.e(100, 1, "r1");
+        assertTrue(s.admitFootprintRecord("es-footprint-strike", r0, "cache"), "replayed");
+        s.footprintStrikeView().replayCompleted();
+        assertTrue(s.admitFootprintRecord("es-footprint-strike", r1, "cache"), "revision 1: the live consumer never saw it");
+        for (List<String> sk : List.of(a, b)) {
+            List<JsonNode> frames = strikeFrames(sk);
+            assertEquals(List.of("es-footprint-strike-control", "es-footprint-strike"), types(frames), "the completion, then the change");
+            assertFalse(frames.get(0).get("data").get("loading").asBoolean());
+            assertEquals(r1, frames.get(1).get("data").asText(), "revision 1, byte for byte");
+        }
+        MockHttpServletResponse rest = new MockHttpServletResponse();
+        controller(s).footprintStrikeLatest("1m", "2026-09-10", "", -1, 200, "Bearer x", rest);
+        JsonNode page = M.readTree(rest.getContentAsByteArray());
+        assertEquals(r1, page.get("episodes").get(0).asText(), "REST and the sockets agree");
+        assertEquals(1, page.get("authority").asLong(), "an additive change: readers fold it, nothing is invalidated");
+        assertTrue(s.onFootprintLiveRecord("es-footprint-strike", r1), "the live consumer's copy is admitted…");
+        assertEquals(2, strikeFrames(a).size(), "…and changes nothing, so it is not sent twice");
+        String m = s.footprintMetricsText();
+        assertTrue(m.contains("gateway_footprint_broadcast_total{event=\"es-footprint-strike\"} 1\n"), m);
+        assertTrue(m.contains("gateway_footprint_broadcast_total{event=\"es-footprint-strike-control\"} 1\n"), m);
+    }
+
+    /** The reviewer's reproduction of #3 on the wire: maxEpisodes = 1, 680000/100 then 681000/200. */
+    @Test void latestNamesAnEvictedNewestEpisodeOnTheWire() throws Exception {
+        FeedGatewayService s = withProperty("GATEWAY_ES_FOOTPRINT_STRIKE_MAX_EPISODES", "1", FootprintWiringTest::on);
+        s.footprintStrikeView().replayCompleted();
+        String second = FootprintStrikeViewTest.episode("OPEN", "2026-09-10", "1m", 681_000, 200, 0, 200, "second");
+        assertTrue(s.admitFootprintRecord("es-footprint-strike", FootprintStrikeViewTest.episode("OPEN", "2026-09-10", "1m", 680_000, 100, 0, 100, "first"), "cache"));
+        assertTrue(s.admitFootprintRecord("es-footprint-strike", second, "cache"));
+        MockHttpServletResponse rest = new MockHttpServletResponse();
+        controller(s).footprintStrikeLatest("1m", "2026-09-10", "", -1, 200, "Bearer x", rest);
+        JsonNode page = M.readTree(rest.getContentAsByteArray());
+        assertEquals(1, page.get("episodes").size());
+        assertEquals(second, page.get("episodes").get(0).asText());
+        assertEquals(200, page.get("historyBeginsAtMs").asLong());
+        assertEquals(M.readTree("[{\"strikeCents\":680000,\"openBarStartMs\":100}]"), page.get("tombstones"), "the evicted newest episode is named");
+        assertTrue(s.footprintMetricsText().contains("gateway_footprint_strike_eviction_markers 1\n"));
     }
 }

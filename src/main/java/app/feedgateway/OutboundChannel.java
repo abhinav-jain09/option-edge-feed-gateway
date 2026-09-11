@@ -27,12 +27,32 @@ import java.util.function.Consumer;
  *       key — replaceable market snapshots collapse to latest-wins instead of piling up;</li>
  *   <li><b>Write deadline</b>: a send in flight longer than the deadline is force-closed by an external
  *       watchdog ({@link #enforceWriteDeadline}), freeing the writer-pool thread;</li>
- *   <li><b>Deterministic disconnection</b>: breaching any limit (or a write error/timeout) closes the
- *       socket and invokes {@code onClose} exactly once;</li>
+ *   <li><b>Deterministic disconnection</b>: breaching any limit (or a write error/timeout) marks the
+ *       channel closed at once — every later enqueue is refused and the queue is dropped — and then closes
+ *       the socket and invokes {@code onClose} exactly once, OFF the calling thread (see below);</li>
  *   <li><b>Metrics</b>: every enqueue/coalesce/disconnect/error is reported.</li>
  * </ul>
+ *
+ * <p><b>Teardown never runs on the thread that detected the breach</b> (ES footprint strike re-review #1).
+ * Closing a WebSocket session can block behind a write still in flight on it — the very write that made the
+ * client slow. The thread that sees an overflow is an ENQUEUER: a Kafka consumer, or the strike fold's
+ * drainer, which holds that stream's delivery order while it fans a frame out to every socket; the thread
+ * that sees a deadline is the write watchdog. Blocking either on one slow socket's close stalled both strike
+ * consumers and every healthy socket behind it. So {@link #close} only marks, drops and counts; the session
+ * close and then {@code onClose} run on the {@code closers} executor. The default runs each teardown on its
+ * own daemon thread: at most one per channel (the close is exactly-once), ending when the session close
+ * returns — which the container's blocking-send timeout bounds even when the write it waits behind never
+ * completes. Until then the channel stays registered, closed, so nothing can fall back to writing to its
+ * session directly.
  */
 final class OutboundChannel {
+
+    /** The default teardown executor: each channel's teardown on its own short-lived daemon thread. */
+    static final Executor TEARDOWN_ON_OWN_THREAD = task -> {
+        Thread t = new Thread(task, "options-edge-ws-closer");
+        t.setDaemon(true);
+        t.start();
+    };
 
     /** Slow-client / throughput metrics sink (implemented by the gateway over atomic counters). */
     interface Metrics {
@@ -52,6 +72,7 @@ final class OutboundChannel {
     private final String socketId;
     private final WebSocketSession session;
     private final Executor writers;
+    private final Executor closers;
     private final int maxMessages;
     private final long maxBytes;
     private final Metrics metrics;
@@ -68,9 +89,16 @@ final class OutboundChannel {
 
     OutboundChannel(WebSocketSession session, Executor writers, int maxMessages, long maxBytes,
                     Metrics metrics, Consumer<OutboundChannel> onClose) {
+        this(session, writers, TEARDOWN_ON_OWN_THREAD, maxMessages, maxBytes, metrics, onClose);
+    }
+
+    /** {@code closers} runs each teardown (session close, then {@code onClose}); it must not be the caller's thread in production. */
+    OutboundChannel(WebSocketSession session, Executor writers, Executor closers, int maxMessages, long maxBytes,
+                    Metrics metrics, Consumer<OutboundChannel> onClose) {
         this.socketId = session.getId();
         this.session = session;
         this.writers = writers;
+        this.closers = closers;
         this.maxMessages = Math.max(1, maxMessages);
         this.maxBytes = Math.max(1L, maxBytes);
         this.metrics = metrics;
@@ -133,7 +161,8 @@ final class OutboundChannel {
             }
         }
         if (overflow) {
-            // The client cannot keep up even after coalescing — disconnect it deterministically.
+            // The client cannot keep up even after coalescing — disconnect it deterministically. The close
+            // itself happens on the closers executor: this thread is an enqueuer, and must not wait on it.
             close(CloseReason.OVERFLOW);
             return false;
         }
@@ -183,7 +212,8 @@ final class OutboundChannel {
     /**
      * Watchdog hook (called periodically off the writer threads): if a send has been in flight longer than
      * {@code deadlineMs}, force-close the socket — this unblocks the stuck writer and frees its pool thread,
-     * so a few stuck clients cannot starve everyone else. Returns true if it disconnected the client.
+     * so a few stuck clients cannot starve everyone else. Returns true if it disconnected the client (the
+     * session close itself runs on the closers executor, so a close that blocks cannot stall the watchdog).
      */
     boolean enforceWriteDeadline(long nowMs, long deadlineMs) {
         long started = sendStartedAtMs;
@@ -211,8 +241,22 @@ final class OutboundChannel {
         if (dropped > 0) {
             metrics.droppedOnClose(dropped);
         }
-        closeSessionQuietly();
-        onClose.accept(this);
+        // Session close first, then onClose: until the close returns the channel stays registered (closed),
+        // so a broadcast finds it and is refused, rather than finding no channel and writing to the session.
+        Runnable teardown = () -> {
+            closeSessionQuietly();
+            try {
+                onClose.accept(this);
+            } catch (RuntimeException e) {
+                System.out.println("Feed gateway outbound teardown of socket " + socketId + " failed in onClose: "
+                        + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+        };
+        try {
+            closers.execute(teardown);
+        } catch (RuntimeException rejected) {
+            TEARDOWN_ON_OWN_THREAD.execute(teardown);           // a closers executor already shut down: still never inline
+        }
         return true;
     }
 

@@ -1113,6 +1113,11 @@ public class FeedGatewayService implements ReplayRunner {
         line(sb, "gateway_footprint_strike_refused_identities", "", footprintStrikeView.refusedIdentities());
         sb.append("# HELP gateway_footprint_strike_unavailable Whether the strike view has failed closed for this incarnation (its refusal ledger overflowed).\n# TYPE gateway_footprint_strike_unavailable gauge\n");
         line(sb, "gateway_footprint_strike_unavailable", "", footprintStrikeView.unavailable() ? 1 : 0);
+        // strike re-review #3: evicted newest episodes latest still names, and how many of those were forgotten
+        sb.append("# HELP gateway_footprint_strike_eviction_markers Evicted newest episodes the strike view still names in latest tombstones.\n# TYPE gateway_footprint_strike_eviction_markers gauge\n");
+        line(sb, "gateway_footprint_strike_eviction_markers", "", footprintStrikeView.evictionMarkers());
+        sb.append("# HELP gateway_footprint_strike_eviction_marker_drops_total Eviction markers dropped by their own bound or the byte budget; each was an authority change.\n# TYPE gateway_footprint_strike_eviction_marker_drops_total counter\n");
+        line(sb, "gateway_footprint_strike_eviction_marker_drops_total", "", footprintStrikeView.markerDrops());
         sb.append("# HELP gateway_footprint_topic_validated Whether the footprint topic passed G-R8a validation this incarnation.\n# TYPE gateway_footprint_topic_validated gauge\n");
         for (String t : footprintTopics()) line(sb, "gateway_footprint_topic_validated", "{topic=\"" + t + "\"}", footprintGate.validated(t) ? 1 : 0);
         sb.append("# HELP gateway_footprint_topic_validation_failures_total Validation attempts that did not yield VALID, one reason each.\n# TYPE gateway_footprint_topic_validation_failures_total counter\n");

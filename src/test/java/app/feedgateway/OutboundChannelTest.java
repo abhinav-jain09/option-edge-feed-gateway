@@ -170,8 +170,57 @@ class OutboundChannelTest {
         assertTrue(disconnected, "a send past the deadline is force-closed");
         assertTrue(ch.isClosed());
         assertEquals(1, writeErrors.get());
-        org.mockito.Mockito.verify(ws).close();
+        // the session close runs off the watchdog's thread (strike re-review #1): it happens, just not inline
+        org.mockito.Mockito.verify(ws, org.mockito.Mockito.timeout(2_000)).close();
         assertTrue(closedCb.await(2, TimeUnit.SECONDS));
+    }
+
+    /**
+     * ES footprint strike re-review #1: closing a session can block behind the write still in flight on it.
+     * The enqueuer that overflows must not wait for that: the channel is closed and its queue dropped at once,
+     * every later enqueue is refused, and the session close — then onClose, exactly once — runs on a teardown
+     * thread of its own, whenever the close can complete.
+     */
+    @Test
+    void anOverflowNeverWaitsForABlockedSessionClose_andTheTeardownStillHappensExactlyOnce() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        CountDownLatch closeEntered = new CountDownLatch(1), closeRelease = new CountDownLatch(1), onClosed = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<String> closeThread = new java.util.concurrent.atomic.AtomicReference<>();
+        AtomicInteger onCloseCalls = new AtomicInteger();
+        WebSocketSession ws = mock(WebSocketSession.class);
+        when(ws.getId()).thenReturn("s1");
+        when(ws.isOpen()).thenReturn(true);
+        org.mockito.Mockito.doAnswer(inv -> { entered.countDown(); release.await(10, TimeUnit.SECONDS); return null; }).when(ws).sendMessage(any());
+        org.mockito.Mockito.doAnswer(inv -> {
+            closeThread.set(Thread.currentThread().getName());
+            closeEntered.countDown();
+            closeRelease.await(10, TimeUnit.SECONDS);
+            return null;
+        }).when(ws).close();
+        OutboundChannel ch = new OutboundChannel(ws, writers, 2, 1 << 20, metrics, c -> { onCloseCalls.incrementAndGet(); onClosed.countDown(); });
+        try {
+            ch.enqueue("first", null);
+            assertTrue(entered.await(2, TimeUnit.SECONDS), "the writer is stuck in its send");
+            ch.enqueue("a", null);
+            ch.enqueue("b", null);
+            long t0 = System.nanoTime();
+            assertFalse(ch.enqueue("c", null), "the overflowing enqueue is refused");
+            assertTrue((System.nanoTime() - t0) / 1_000_000 < 1_000, "…and returns without waiting for the close");
+            assertTrue(ch.isClosed());
+            assertEquals(0, ch.queueDepth(), "its queue is dropped at once");
+            assertFalse(ch.enqueue("d", null), "every later enqueue is refused while the close is still in progress");
+            assertTrue(closeEntered.await(2, TimeUnit.SECONDS));
+            assertEquals("options-edge-ws-closer", closeThread.get(), "the close runs on its own teardown thread");
+            assertEquals(0, onCloseCalls.get(), "onClose follows the session close: until then the channel stays registered, closed");
+            assertFalse(ch.enforceWriteDeadline(System.currentTimeMillis() + 60_000, 5_000), "the watchdog cannot close it a second time");
+            assertEquals(1, slowDisconnects.get());
+        } finally {
+            closeRelease.countDown();
+            release.countDown();
+        }
+        assertTrue(onClosed.await(2, TimeUnit.SECONDS), "the teardown completes once the close returns");
+        assertEquals(1, onCloseCalls.get());
+        org.mockito.Mockito.verify(ws, org.mockito.Mockito.times(1)).close();
     }
 
     private void waitForSent(int n) throws InterruptedException {
