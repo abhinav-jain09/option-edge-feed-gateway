@@ -498,12 +498,17 @@ final class VolPremiumSessionStore {
      *   <li><b>Two producers form two runs only because their epochs differ.</b> Each producer sets
      *       measurementEpochMs to the event time of the first record ITS accumulator folds. For v1 that is the
      *       first record of the session a new processor instance sees, held in memory. For v2 it is the first
-     *       in-session spot tick of its grid, persisted. A switch therefore changes the epoch, and the two runs
-     *       stay distinct points. If both accumulators ever began on the same event-time millisecond, a v1 and
-     *       a v2 reading of one ordinal would be the SAME position: the later offset would replace the earlier,
-     *       under exactly the rules that apply within one version, and would be charged the size difference.
-     *       The vol-premium Deployment runs replicas 1 with strategy Recreate, so the two images never publish
-     *       at the same time.</li>
+     *       in-session spot tick of its grid, persisted. What keeps them apart is WHERE the replacing producer
+     *       starts reading, not that the Deployment (replicas 1, strategy Recreate) never runs both at once.
+     *       Both use the streams application id options-edge-vol-premium by default, so the replacing producer
+     *       resumes after the committed offset of the one it replaces. With a fresh id,
+     *       VOL_PREMIUM_STREAMS_AUTO_OFFSET_RESET defaults to latest. Either way its first folded record is later
+     *       than the replaced producer's first, so a switch changes the epoch and the two runs stay distinct
+     *       points. Only a replay from before the replaced producer's first record (an offset reset to
+     *       earliest) can make the epochs equal. Then a v1 and a v2 reading of one ordinal are the SAME position:
+     *       the later offset replaces the earlier, under exactly the rules that apply within one version, and
+     *       is charged the size difference. Nothing is corrupted; the newer producer's reading of the window
+     *       wins.</li>
      *   <li><b>Ordering by frameSeq assumes one cadence per session.</b> Both producers read
      *       VOL_PREMIUM_FRAME_CADENCE_MS (default 5,000). Producers publishing at different cadences in one
      *       session would number their frames on different lattices, and this store would interleave the
