@@ -12754,6 +12754,37 @@ public class FeedGatewayService implements ReplayRunner {
         broadcast(event, json);
     }
 
+    /** History travels on the authenticated socket; only registered clients can read the view. */
+    void handleFootprintBasicMessage(WebSocketSession session, String payload) {
+        if (session == null || clientsById.get(session.getId()) != session || !session.isOpen()
+                || payload == null || payload.length() > FootprintBasicHistory.MAX_REQUEST_BYTES
+                || payload.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > FootprintBasicHistory.MAX_REQUEST_BYTES) return;
+        JsonNode request;
+        try { request = mapper.readTree(payload); } catch (Exception invalid) { return; }
+        if (request == null || !FootprintBasicHistory.REQUEST.equals(request.path("type").asText())) return;
+        if (footprintViews == null) {
+            send(session, FootprintBasicHistory.RESPONSE, "{\"error\":\"unavailable\"}");
+            return;
+        }
+        if (!footprintBackfillPermits.tryAcquire()) {
+            send(session, FootprintBasicHistory.RESPONSE, "{\"error\":\"busy\"}");
+            return;
+        }
+        try {
+            long capacity = Math.min(2L * 1024 * 1024, settings.wsMaxQueuedBytes() / 2);
+            int limit = (int) Math.max(0, Math.min(FootprintBasicHistory.MAX_PAGE_RECORDS,
+                    (capacity - 4096) / settings.esFootprintMaxRecordBytes()));
+            String response = FootprintBasicHistory.reply(mapper, footprintViews, request, limit);
+            // Parsing/re-serializing can change the UTF-8 size; enforce the wire budget too.
+            if (response.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > capacity - 4096) {
+                response = "{\"error\":\"record_budget\"}";
+            }
+            send(session, FootprintBasicHistory.RESPONSE, response);
+        } finally {
+            footprintBackfillPermits.release();
+        }
+    }
+
     private void send(WebSocketSession session, String event, String json) {
         enqueueOutbound(session, envelopeJson(event, json), coalesceKeyFor(event, json));
     }
