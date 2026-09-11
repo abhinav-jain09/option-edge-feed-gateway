@@ -517,3 +517,97 @@ All clean builds, Java 21, offline Maven.
 ### Review text (verbatim)
 
 [P2] Failure logging can permanently kill the shared closer pool — OutboundChannel.java:471. When a teardown encounters heap exhaustion, formatting this log message can itself throw OutOfMemoryError, escaping the worker's catch. Workers are never replaced. Reproduced twice using the current source with a 128 MB heap: all four workers died; after releasing the heap, existing and newly submitted tasks remained queued forever. Their teardown/onClose never runs, and watchdog retries cannot recover accepted tasks. Guard failure reporting against throwing or restore worker capacity after an unexpected exit. Guarding only this log statement in memory made the same reproduction recover successfully.
+
+## Re-review (round 5) — Codex re-review of `abe0973` (2026-09-11)
+
+The re-review confirmed the round-4 fix and raised exactly one finding (verbatim below). Folded on
+`fix/footprint-strike-gw-r5` and pushed to `fix/footprint-strike-final-review` (PR #182) as a fast-forward of
+`abe0973`. That push also carries `08341cc`, a test-only commit made between the rounds. It fixes a CME flake:
+`FeedGatewayServiceTest.reconnectAfterSelectionIsReadyReceivesSourceReady` failed once on `66ac0d5` with a
+`ConcurrentModificationException` at its `sent.stream()` poll, because `stream()` over a
+`Collections.synchronizedList` takes no lock while the writer thread appends. `FeedGatewayServiceTest`'s two
+recording sinks now stream from `CopyOnWriteArrayList`s. No production file changes in it, so the campaign record,
+which hashes the sources it mutated, is unaffected. Not re-reviewed yet: no `VERDICT: APPROVE` exists for this
+change.
+
+### Disposition
+
+| # | Finding | Disposition | What changed | Pinning tests |
+|---|---|---|---|---|
+| 1 | **[P2]** A fast failed close can permanently lose its retry (`OutboundChannel.java:352`, the closer's restore, and `:305`, the hand-over's `teardownState.set(TEARDOWN_HANDED)` after `closers.execute`). Once `execute()` had published the teardown, a closer could run it, have its session close throw, and restore PENDING before the submitting thread reached `:305`. That thread then wrote HANDED over it. The watchdog skips anything not PENDING, so the session was never retried and `onClose` never ran. This hit every stream. Reviewer: 47 of 20,000 fail-once closes stranded on the unmodified four-thread pool | **FIXED** | **The lifecycle is NONE → PENDING → HANDED → DONE, with a failed close going HANDED → PENDING.** HANDING is gone. **(1) The claim comes before the publish.** `handOverTeardown` takes the CAS PENDING → HANDED before `closers.execute`, and after a successful publish it writes nothing. Only one of the close and the watchdog's retry can win that CAS, so a teardown is still never handed over twice. **(2) A failed hand-over** goes back to PENDING only by the CAS HANDED → PENDING. An executor that published the teardown and then threw may already have run it, and what that run did stands (DONE, or its own restore). **(3) The closer's restore** clears `tornDown` first and then takes the CAS HANDED → PENDING. The retry therefore finds the teardown runnable, and the restore never overwrites a run of the same teardown that has since finished. **(4) DONE** is written once the session close returned. It is terminal and the only plain write; every other write is a CAS from PENDING or HANDED, so none can leave DONE. **(5) The close** takes the CAS NONE → PENDING. Only the close that won `closed` gets there, and the CAS states that precondition. **Audit of every transition** (publish-then-write and write-write races): NONE → PENDING has one writer. PENDING → HANDED is contended by the close and the watchdog: CAS, before the publish. HANDED → PENDING after a failed hand-over is contended by a closer that ran a published task: CAS. HANDED → PENDING after a close that threw is contended by another run that finished: CAS, after `tornDown` is cleared. DONE is written only by the run whose close returned. The write that raced the closer's restore, HANDED after the publish, no longer exists. Kept unchanged: `onClose` exactly once, the bound of 4 closer threads, no thread per close, no caller-runs, the round-4 `Throwable` guards, the 30 s close deadline and the watchdog retry. | `OutboundChannelTest.aHandOverNeverOverwritesTheClosersPendingRestore_soAFastFailedCloseIsRetriedNotStranded` is the deterministic interleaving. A closers executor (`FinishBeforeReturning`) hands the teardown to a real 4-thread `TeardownPool` and returns only after the closer ran it to its end: the session close threw `OutOfMemoryError` and the teardown restored PENDING, all before the hand-over's next step. The channel is closed and PENDING. The watchdog's retry hands it over again, the second close returns, `onClose` runs exactly once, a further retry does nothing, and the closer counted one failure with 4 of 4 threads alive. `…aHandOverThatThrowsAfterItsTeardownRanNeverOverwritesWhatTheCloserDid` covers the other side: an executor that publishes, lets the closer finish, then throws `RejectedExecutionException`. A finished teardown is not made pending again; one whose close threw is pending once and torn down once by the retry. `…manyFailOnceClosesOnTheRealFourThreadPool_noneIsStranded` is the reviewer's stress: 5 rounds × 20,000 closes whose first session close throws, on a real 4-thread pool from 4 enqueuers, with a bare `Proxy` session so the closer is fast. Every teardown is pending after its failed close, none is stranded, and the retry tears each down with `onClose` once and two closes. `FootprintStrikeDeliveryTest.aSlowSocketsCloseThatFailsBeforeItsHandOverReturnsIsRetriedNotStranded` is the deterministic interleaving on the production strike drainer. Nothing is thrown at the drainer, both healthy sockets get all 80 records in order, and the slow socket stays registered, closed and pending. One watchdog tick closes and detaches it; a second tick hands nothing over. |
+
+### Do the new tests bite? (each part reverted alone, source restored, sha256 proven)
+
+Run on the committed code (`48f614d`). Each part of the fix was reverted ALONE in the working tree (an exact
+one-occurrence replacement), `mvn -B -o clean test -Dtest='OutboundChannelTest,FootprintStrikeDeliveryTest'` run, and
+the source copied back. The last row puts back the whole pre-fix file. The sha256 of `OutboundChannel.java`
+(`fde342f6cec0…`, the file at `48f614d`) was taken before the first revert and after every restore, and was identical
+every time (`RESTORED: sha256 identical`, ×4). The tree was clean before and after. Every failure below is an
+assertion failure, none an error.
+
+| Revert | Result |
+|---|---|
+| A — the hand-over writes HANDED after `execute()` again (`teardownState.set(TEARDOWN_HANDED);` after the publish: the reviewer's defect on the new structure) | 3 failures. `OutboundChannelTest.aHandOverNeverOverwrites…:755` and `FootprintStrikeDeliveryTest.aSlowSocketsCloseThatFailsBeforeItsHandOverReturns…:905`: "the closer's restore to PENDING outlived the hand-over" expected true but was **false**. `OutboundChannelTest.manyFailOnceCloses…:928`: **390 of 100,000** stranded (per round `[144, 0, 0, 0, 246]`). Four more runs of the stress test alone on revert A stranded **133, 134, 235, 197** of 100,000 |
+| B — a failed hand-over writes PENDING unconditionally (`teardownState.set(TEARDOWN_PENDING)` in the catch) | 1 failure. `OutboundChannelTest.aHandOverThatThrowsAfterItsTeardownRan…:807` "a teardown that finished is not made pending again by a hand-over that threw afterwards" expected false but was **true**. The stress test stays green, since its hand-overs never fail |
+| C — the closer's restore writes PENDING unconditionally | **GREEN: not pinned.** Telling the CAS from a plain write takes a second run of the same teardown finishing (DONE) inside the window between the restoring run's `tornDown.set(false)` and its write. No test drives that window. The CAS is there by the audit, not because a test holds it |
+| FULL — the whole pre-fix `OutboundChannel.java` (`08341cc`, sha256 `1f61fa420fb5…`) | 4 failures: A's three and B's one. The stress test stranded **454 of 100,000** (`[72, 0, 0, 0, 382]`) |
+
+**Stress-test size.** On the unfixed source, a single 20,000-close round stranded 231 on an otherwise idle machine.
+Single rounds run while a campaign was loading the machine stranded 42, 82, 2, 54 and 4 (revert A) and 8 (the pre-fix
+file). One round could therefore come up empty, so the committed test runs 5 rounds × 20,000 = 100,000 closes, in
+about 170 ms. Across the six red runs on `48f614d` above, the total ranged from 133 to 454. Rounds 2–4 stranded 0 in
+every one of them, and all the stranded closes fell in the first and last rounds. With the fix: **0 of 100,000**
+(`[0, 0, 0, 0, 0]`), and 0 of 20,000 in every single-round run.
+
+**The new clause's kill is deterministic.** With the clause's mutation applied (revert A), the round-4 delivery test
+(`…FailsUnderHeapExhaustion…`, eight fail-once closes on a real pool) was run 100 times in one JVM and **never failed**.
+The new round-5 delivery test failed 20 of 20. So the campaign's kill set for this clause does not hang on a race.
+
+### Mutation campaign
+
+- `scripts/footprint-campaign.spec.json`: no G-R10 clause was re-anchored, because none of their anchors moved.
+  `closers.execute(this::teardown);`, `queue.add(teardown);`, `} catch (RuntimeException | Error handOverFailed) {`,
+  the watchdog's `channel.retryPendingTeardown();`, the report guard, `} catch (Throwable teardownFailed) {` and
+  `if (!closeReturned) {` still occur exactly once each; only their source lines shifted. One clause was added,
+  quoting the round-5 as-built sentence now in the G-R10 row:
+  - `G-R10.10` "a hand-over never overwrites a closer's pending restore". The patch puts back the reviewer's defect on
+    the new structure: `teardownState.set(TEARDOWN_HANDED);` written after `closers.execute(this::teardown);`.
+
+  A test in the campaign's classes kills it:
+  `FootprintStrikeDeliveryTest.aSlowSocketsCloseThatFailsBeforeItsHandOverReturnsIsRetriedNotStranded`, by assertion
+  failure. The other round-5 tests (the stress and the publish-then-throw test) live in `OutboundChannelTest`, which
+  the campaign command (`-Dtest=Footprint*,CvdSpxLevelsWiringTest`) does not run. The failed hand-over's CAS (revert
+  B) therefore has no clause, for the same reason as the round-3 close-deadline interrupt and the round-4 hand-over
+  report guard: a clause for it would be a survivor that says nothing about the test that holds it. The closer's
+  restore CAS (revert C) has no clause either, because no test holds it at all.
+- Re-run per `scripts/footprint-mutate.py` in a CLEAN detached worktree at the code commit `48f614d`
+  (`git worktree add --detach`, clean before and after, removed afterwards). Baseline GREEN
+  (`mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest`, 143 tests). Result: **49 KILLED, 1 SURVIVED of 50**, the
+  same recorded inert survivor as before (`G-R7 the-exclusive-cursor-at-the-domain-edge site2-relaxed`). `G-R10.10` is
+  KILLED as above. `G-R10.3`, `G-R10.4`, `G-R10.6`, `G-R10.8` and `G-R10.9` are KILLED as before, each kill set grown
+  by the new delivery test. The other 44 clauses (`G-R10.5` and `G-R10.7` among them) changed neither status nor kill
+  set.
+- `ES-FOOTPRINT-CAMPAIGN.json` was replaced by that record (every row names `48f614d`), and §2a was regenerated from it
+  with `scripts/footprint-reqstate.sh` (G-R10 9→10 probes; 50 mutations, 49 killed, 1 surviving).
+
+### Verification
+
+All clean builds, Java 21, offline Maven.
+
+- Code, before committing: `mvn -B -o clean test` (full) gave **1197 run, 0 failures, 0 errors**, plus the context
+  smoke test 1/0. That is 1193 before this round, +4: `OutboundChannelTest` 12→15, `FootprintStrikeDeliveryTest`
+  13→14. The stress test was then enlarged to five rounds and amended into `48f614d`; the two classes re-run on the
+  commit gave 29/0, with 0 of 100,000 stranded.
+- `08341cc`'s flake fix is exercised by both full runs of the final gates (`FeedGatewayServiceTest` in each).
+- The three Jenkinsfile gates (`mvn -B -o clean test`, run twice; `scripts/footprint-reverify.sh`;
+  `scripts/footprint-reqstate.sh --check`) were run on the commit that adds this record, with a clean tree before and
+  after. Their exit codes are stated in the PR description rather than here, so recording them does not move the head
+  they were run on.
+- Not done in this round: no Codex re-review of this fix. The closer's restore CAS is not pinned by any test (revert C
+  above). No real heap exhaustion: the failing closes throw an injected `OutOfMemoryError`.
+- Adjacent and NOT changed: the round-4 list stands (an `Error` inside `onClose` is not retried; the service's
+  watchdog sweep catches only `RuntimeException` per channel; the round-3 `writers.execute` note).
+
+### Review text (verbatim)
+
+[P2] A fast failed close can permanently lose its retry — OutboundChannel.java:352. After execute() publishes the teardown, a worker can run it, encounter an error, and restore PENDING before the submitting thread reaches line 305. That thread then unconditionally overwrites PENDING with HANDED. The watchdog skips the channel forever; the session is never retried and onClose never runs. This affects non-strike streams too. Reproduced by compiling HEAD's source in memory: 47 of 20,000 fail-once closes were stranded using the unmodified four-thread pool. A controlled interleaving reproduced it deterministically. Make hand-over completion preserve a worker's pending transition and add a regression test for this ordering.
