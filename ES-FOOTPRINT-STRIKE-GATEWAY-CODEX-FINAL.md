@@ -611,3 +611,50 @@ All clean builds, Java 21, offline Maven.
 ### Review text (verbatim)
 
 [P2] A fast failed close can permanently lose its retry — OutboundChannel.java:352. After execute() publishes the teardown, a worker can run it, encounter an error, and restore PENDING before the submitting thread reaches line 305. That thread then unconditionally overwrites PENDING with HANDED. The watchdog skips the channel forever; the session is never retried and onClose never runs. This affects non-strike streams too. Reproduced by compiling HEAD's source in memory: 47 of 20,000 fail-once closes were stranded using the unmodified four-thread pool. A controlled interleaving reproduced it deterministically. Make hand-over completion preserve a worker's pending transition and add a regression test for this ordering.
+
+## Merged main (#181) — `87b2ba5` + `8229b9c` → `030705b` (2026-09-11)
+
+PR #181 ("Stream bounded footprint history to authenticated Basic clients", already deployed to production) landed on
+`main` while this branch was in review, so the PR conflicted. It was merged into this branch with a merge commit
+(first parent `87b2ba5`, second parent `8229b9c`), not a rebase, so the Codex-reviewed commits are unchanged.
+
+- **`FeedGatewayService.java`**: git merged it with no textual conflict, because the two sides touch disjoint regions.
+  #181's only hunk is the new `handleFootprintBasicMessage`, inserted just before `send()`. This branch's changes are
+  the strike relay: the view outbox and drain, adoption-aware replay, retained-storage accounting,
+  `enforceOutboundWriteDeadlines` with the closer-pool retry, and the round-4/5 guards. Both were checked in full and
+  neither lost a line: the merged file minus `87b2ba5` is exactly #181's delta, and the merged file minus `8229b9c` is
+  exactly this branch's delta.
+- **Basic replies and the teardown lifecycle.** The Basic handler sends only through
+  `send()` → `enqueueOutbound()` → `OutboundChannel.enqueue()`, the same channel every other stream uses. So an
+  overflowing Basic reply is torn down by the bounded 4-thread closer pool, through the
+  NONE → PENDING → HANDED → DONE state machine and the watchdog retry, never on the Tomcat receive thread. The only
+  path around the channel is the untracked-session direct send, which is main's, unchanged.
+- **`FeedWebSocketHandler.java`, `FootprintBasicHistory.java`, `FootprintBasicHistoryTest.java`,
+  `ES-FOOTPRINT-BASIC-STREAM.md`**: main's, unchanged (this branch never touched them).
+- **`Jenkinsfile`**: main's (this branch never changed it). It still runs `mvn -B test`,
+  `scripts/footprint-reverify.sh` and `scripts/footprint-reqstate.sh --check`.
+- **`scripts/footprint-campaign.spec.json`**: this branch's, unchanged. #181 did not touch `scripts/`, so the union
+  of clauses is this branch's 50, and no spec site moved. Every anchor has the same count and the same
+  surrounding source in the merged tree; the one multi-occurrence anchor, `G-R10.1` in `FootprintViews.java`
+  (occurrence 1 of 2), is as before.
+- **`ES-FOOTPRINT-CAMPAIGN.json`** is generated, so it was not hand-merged. It was re-recorded per
+  `scripts/footprint-mutate.py` in a CLEAN detached worktree at the merge commit `030705b` (`git worktree add
+  --detach`, clean before and after, removed afterwards). Baseline GREEN (`mvn -B test
+  -Dtest=Footprint*,CvdSpxLevelsWiringTest`, 146 tests: the 143 before, plus the 3 in `FootprintBasicHistoryTest`, which the `Footprint*` pattern now includes). Result: **49 KILLED, 1 SURVIVED of 50**, every row naming `030705b`. The survivor is the same recorded inert one (`G-R7 the-exclusive-cursor-at-the-domain-edge site2-relaxed`).
+  No status changed against either parent record. Kill sets changed only by addition, and each addition is what the
+  other parent brings:
+  - Against this branch's record (`87b2ba5`, 50 rows), two kill sets grew by #181's new tests, exactly as #181's own
+    refresh (`3029adf`) recorded them on main. `G-R4 equal-date-upserts` gained
+    `FootprintBasicHistoryTest.streamedPagesAreBoundedAscendingAndExcludeOvernight`. `G-R7 to-is-inclusive` gained that
+    test and `FootprintBasicHistoryTest.historyUsesRegisteredSocketsAndTheExistingBoundedWriter`. Both read through
+    `FootprintViews.barsPage`, which those mutations break. The other 48 are unchanged.
+  - Against main's record (`8229b9c`, 34 rows), the difference is this branch's own campaign: its 16 clauses
+    (`G-R3.4`–`3.6`, `G-R7.1`–`7.2`, `G-R8.1`–`8.3`, `G-R10.3`–`10.10`, all KILLED), and the `G-R6.2` and `G-R8a
+    ceiling-strict` kill sets grown by this branch's delivery tests. #181 adds no clause: it changed neither the spec nor
+    any anchored site.
+- §2a was regenerated from that record with `scripts/footprint-reqstate.sh`. The output is byte-identical to the committed
+  section, because the table carries statuses and counts only (50 mutations, 49 killed, 1 surviving) and neither moved.
+
+Verification: `mvn -B -o clean test` on `030705b` gave **1200 run, 0 failures, 0 errors** (1197 + the 3 in
+`FootprintBasicHistoryTest`), plus the context smoke test 1/0. The Jenkinsfile gates on the final head are stated in
+the PR description, for the same reason as in round 5.
