@@ -756,6 +756,107 @@ class FootprintStrikeDeliveryTest {
         }
     }
 
+    // ---- strike re-review (round 4): no failure ends a closer thread ------------------------------------------
+
+    /**
+     * The reviewer's round-4 finding on the production path, without exhausting the real heap: eight slow sockets
+     * overflow on the strike drainer and each one's session close runs out of heap — and so does REPORTING each
+     * failure. Before, the report escaped the closer's catch: four failures killed all four closer threads, and
+     * every teardown behind them waited forever, out of the watchdog's reach (it retries only a teardown that was
+     * never accepted). Now no closer thread dies, the eight slow sockets queued among the failures are closed and
+     * detached, each failed teardown is pending again, and the watchdog's next tick closes and detaches it, once.
+     */
+    @Test void aSlowSocketsTeardownThatFailsUnderHeapExhaustionKillsNoCloserAndIsNeverStranded() throws Exception {
+        String prefix = "strike-oom-closer-";
+        AtomicInteger reports = new AtomicInteger();
+        OutboundChannel.TeardownPool closers = new OutboundChannel.TeardownPool(OutboundChannel.CLOSER_THREADS, prefix,
+                OutboundChannel.CLOSE_DEADLINE_MS, failure -> {
+                    reports.incrementAndGet();
+                    throw new OutOfMemoryError("Java heap space");            // the report runs out of heap as well
+                });
+        try {
+            FeedGatewayService s = FootprintWiringTest.on();
+            List<String> a = sink(), b = sink();
+            WebSocketSession sa = socket("a", a), sb = socket("b", b);
+            withProperty("GATEWAY_WS_WRITER_THREADS", "32", () -> { s.addClient(sa); return null; });
+            s.addClient(sb);
+            int pairs = 8, n = 80;
+            CountDownLatch sendRelease = new CountDownLatch(1);
+            Map<String, AtomicInteger> closeCalls = new ConcurrentHashMap<>();
+            Set<String> closed = ConcurrentHashMap.newKeySet();
+            List<String> failingIds = new ArrayList<>(), fineIds = new ArrayList<>();
+            List<WebSocketSession> slow = new ArrayList<>();
+            for (int i = 0; i < 2 * pairs; i++) {
+                boolean fails = i % 2 == 0;
+                String id = (fails ? "oom-" : "fine-") + i;
+                (fails ? failingIds : fineIds).add(id);
+                WebSocketSession ws = slowSocket(id, sendRelease, inv -> {
+                    int call = closeCalls.computeIfAbsent(id, k -> new AtomicInteger()).incrementAndGet();
+                    if (fails && call == 1) throw new OutOfMemoryError("Java heap space");   // the container's close ran out of heap
+                    closed.add(id);
+                    return null;
+                });
+                // A session a close RETURNED from is closed, as a container's is: these sockets are detached while
+                // the fan-out is still running, and a detached socket's frames reach only a session still open.
+                when(ws.isOpen()).thenAnswer(inv -> !closed.contains(id));
+                slow.add(ws);
+            }
+            s.outboundClosersForTest(closers);
+            withProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "50", () -> { slow.forEach(s::addClient); return null; });
+            s.outboundClosersForTest(null);
+            List<String> records = strikeRecords(n);
+            AtomicReference<Throwable> thrown = new AtomicReference<>();
+            Thread live = new Thread(() -> {
+                try { for (String r : records) s.onFootprintLiveRecord("es-footprint-strike", r); } catch (Throwable t) { thrown.set(t); }
+            }, "state-live");
+            try {
+                live.start();
+                live.join(10_000);
+                assertFalse(live.isAlive());
+                assertNull(thrown.get(), "nothing was thrown at the drainer: " + thrown.get());
+                long deadline = System.currentTimeMillis() + 10_000;
+                while ((closers.failures() < pairs || fineIds.stream().anyMatch(id -> s.outboundChannelForTest(id) != null))
+                        && System.currentTimeMillis() < deadline) Thread.sleep(10);
+                assertEquals(OutboundChannel.CLOSER_THREADS, OutboundChannelTest.liveThreads(prefix),
+                        "a closer thread died of a failure or of its report: nothing replaces it");
+                assertEquals(pairs, closers.failures(), "every failed teardown was counted");
+                assertEquals(pairs, closers.unreported(), "…and every report that ran out of heap");
+                for (String id : fineIds) {
+                    assertNull(s.outboundChannelForTest(id), id + ", queued among the failures, was closed and detached");
+                    assertEquals(1, closeCalls.get(id).get(), "one session close for " + id);
+                }
+                for (String id : failingIds) {
+                    OutboundChannel ch = s.outboundChannelForTest(id);
+                    assertNotNull(ch, id + ": a close that threw never reaches the detach");
+                    assertTrue(ch.isClosed() && ch.teardownPending(), id + " is closed, its teardown pending again rather than stranded");
+                }
+                List<String> want = Collections.nCopies(n, "es-footprint-strike");
+                for (List<String> healthy : List.of(a, b)) {
+                    List<JsonNode> frames = awaitStrikeTypes(healthy, want);
+                    assertEquals(records.get(n - 1), frames.get(n - 1).get("data").asText(), "every record reached every healthy socket, in order");
+                }
+                s.enforceOutboundWriteDeadlines();                                // the watchdog's tick hands each failed teardown over again
+                deadline = System.currentTimeMillis() + 10_000;
+                while (failingIds.stream().anyMatch(id -> s.outboundChannelForTest(id) != null) && System.currentTimeMillis() < deadline) Thread.sleep(10);
+                for (String id : failingIds) {
+                    assertNull(s.outboundChannelForTest(id), id + " was closed and detached by the watchdog's retry");
+                    assertEquals(2, closeCalls.get(id).get(), "the close that threw, then the retry's, for " + id);
+                }
+                s.enforceOutboundWriteDeadlines();
+                Thread.sleep(50);
+                for (String id : failingIds) assertEquals(2, closeCalls.get(id).get(), "exactly once more, for " + id);
+                assertEquals(OutboundChannel.CLOSER_THREADS, OutboundChannelTest.liveThreads(prefix));
+                assertEquals(pairs, closers.failures());
+                assertEquals(pairs, reports.get());
+            } finally {
+                sendRelease.countDown();
+                live.join(10_000);
+            }
+        } finally {
+            closers.shutdownNow();
+        }
+    }
+
     /**
      * The reviewer's production scenario for #2: the live consumer misses an update (it re-sought END on a
      * reconnect), and the continuing cache consumer folds it after the replay completed. Before, every

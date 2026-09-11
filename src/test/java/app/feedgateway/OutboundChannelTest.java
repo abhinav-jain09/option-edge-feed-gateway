@@ -493,6 +493,192 @@ class OutboundChannelTest {
         }
     }
 
+    // ---- strike re-review round 4: no failure ends a closer thread ------------------------------------------
+
+    /** Live threads whose name starts with {@code prefix}. */
+    static int liveThreads(String prefix) {
+        int n = 0;
+        for (Thread t : Thread.getAllStackTraces().keySet()) {
+            if (t.isAlive() && t.getName().startsWith(prefix)) n++;
+        }
+        return n;
+    }
+
+    /** A channel on {@code pool} whose writer never runs; its session close runs out of heap on the first call if {@code closeFailsOnce}. */
+    private OutboundChannel teardownChannel(String id, OutboundChannel.TeardownPool pool, boolean closeFailsOnce,
+                                            Map<String, AtomicInteger> closeCalls, Map<String, AtomicInteger> onCloseCalls) throws Exception {
+        WebSocketSession ws = mock(WebSocketSession.class);
+        when(ws.getId()).thenReturn(id);
+        when(ws.isOpen()).thenReturn(true);
+        org.mockito.Mockito.doAnswer(inv -> {
+            int call = closeCalls.computeIfAbsent(id, k -> new AtomicInteger()).incrementAndGet();
+            if (closeFailsOnce && call == 1) throw new OutOfMemoryError("Java heap space");
+            return null;
+        }).when(ws).close();
+        return new OutboundChannel(ws, task -> { }, pool, 1, 1 << 20, metrics,
+                c -> onCloseCalls.computeIfAbsent(c.socketId(), k -> new AtomicInteger()).incrementAndGet());
+    }
+
+    private static void overflow(OutboundChannel c) {
+        c.enqueue("a", null);
+        c.enqueue("b", null);                                        // the bound is 1: this one overflows and closes it
+    }
+
+    private static void awaitTornDown(Map<String, AtomicInteger> onCloseCalls, List<OutboundChannel> channels) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (channels.stream().anyMatch(c -> !onCloseCalls.containsKey(c.socketId())) && System.currentTimeMillis() < deadline) Thread.sleep(10);
+    }
+
+    /**
+     * The reviewer's round-4 reproduction, without exhausting the real heap: teardowns fail with OutOfMemoryError
+     * (the session close runs out of heap) and REPORTING each failure throws OutOfMemoryError as well. Before, the
+     * report escaped the closer's catch: four failures killed all four closer threads, and every teardown queued
+     * behind them — and every one handed over later — waited forever, out of the watchdog's reach. Now no closer
+     * thread dies, the teardowns behind and after the failures run, and each failed teardown is pending again: the
+     * watchdog's retry tears it down. onClose exactly once for every channel.
+     */
+    @Test
+    void aFailureWhileReportingATeardownFailureNeverKillsACloser_andNoAcceptedTeardownIsStranded() throws Exception {
+        String prefix = "report-oom-closer-";
+        AtomicInteger reports = new AtomicInteger();
+        OutboundChannel.TeardownPool pool = new OutboundChannel.TeardownPool(4, prefix, 30_000, failure -> {
+            reports.incrementAndGet();
+            throw new OutOfMemoryError("Java heap space");                 // building the log line ran out of heap too
+        });
+        try {
+            assertEquals(4, liveThreads(prefix));
+            Map<String, AtomicInteger> closeCalls = new ConcurrentHashMap<>(), onCloseCalls = new ConcurrentHashMap<>();
+            List<OutboundChannel> failing = new ArrayList<>(), behind = new ArrayList<>(), later = new ArrayList<>();
+            for (int i = 0; i < 8; i++) {
+                failing.add(teardownChannel("oom-" + i, pool, true, closeCalls, onCloseCalls));
+                behind.add(teardownChannel("behind-" + i, pool, false, closeCalls, onCloseCalls));
+                later.add(teardownChannel("later-" + i, pool, false, closeCalls, onCloseCalls));
+            }
+            for (int i = 0; i < 8; i++) {                               // each healthy teardown queued behind a failing one
+                overflow(failing.get(i));
+                overflow(behind.get(i));
+            }
+            awaitTornDown(onCloseCalls, behind);
+            long deadline = System.currentTimeMillis() + 5_000;
+            while (pool.failures() < 8 && System.currentTimeMillis() < deadline) Thread.sleep(10);
+            assertEquals(4, liveThreads(prefix), "a closer thread died of a failure or of its report: nothing replaces it");
+            assertEquals(8, pool.failures(), "every failed teardown was counted");
+            assertEquals(8, reports.get(), "…every failure was offered to the report…");
+            assertEquals(8, pool.unreported(), "…and every report that ran out of heap was counted instead");
+            for (OutboundChannel c : behind) {
+                assertEquals(1, onCloseCalls.get(c.socketId()).get(), "the teardown queued behind the failures ran: " + c.socketId());
+                assertEquals(1, closeCalls.get(c.socketId()).get());
+            }
+            for (OutboundChannel c : failing) {
+                assertTrue(c.isClosed(), c.socketId());
+                assertTrue(c.teardownPending(), c.socketId() + ": a teardown whose close threw is pending again, not stranded");
+                assertFalse(onCloseCalls.containsKey(c.socketId()), "onClose follows a close that returned, never one that threw");
+            }
+            for (OutboundChannel c : later) overflow(c);                // teardowns handed over after the failures
+            awaitTornDown(onCloseCalls, later);
+            for (OutboundChannel c : later) assertEquals(1, onCloseCalls.get(c.socketId()).get(), "a later teardown ran: " + c.socketId());
+            for (OutboundChannel c : failing) assertTrue(c.retryPendingTeardown(), "the watchdog's tick hands " + c.socketId() + " over again");
+            awaitTornDown(onCloseCalls, failing);
+            for (OutboundChannel c : failing) {
+                assertFalse(c.retryPendingTeardown(), "…once");
+                assertEquals(1, onCloseCalls.get(c.socketId()).get(), "onClose exactly once for " + c.socketId());
+                assertEquals(2, closeCalls.get(c.socketId()).get(), "the close that threw, then the retry's");
+                assertFalse(c.enqueue("late", null), "and it never writes again");
+            }
+            assertEquals(4, liveThreads(prefix));
+            assertEquals(8, pool.failures());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /** A teardown that throws an Error — any Error — never ends its closer thread: the next teardown runs on it. */
+    @Test
+    void aTeardownThatThrowsAnErrorNeverEndsItsCloser_andTheNextTeardownRunsOnIt() throws Exception {
+        List<Throwable> reported = new CopyOnWriteArrayList<>();
+        OutboundChannel.TeardownPool pool = new OutboundChannel.TeardownPool(1, "error-closer-", 30_000, reported::add);
+        try {
+            CountDownLatch ran = new CountDownLatch(1);
+            AtomicReference<String> ranOn = new AtomicReference<>();
+            pool.execute(() -> { throw new OutOfMemoryError("Java heap space"); });
+            pool.execute(() -> { throw new StackOverflowError(); });
+            pool.execute(() -> { throw new AssertionError("a teardown bug"); });
+            pool.execute(() -> { ranOn.set(Thread.currentThread().getName()); ran.countDown(); });
+            assertTrue(ran.await(5, TimeUnit.SECONDS), "the teardown after three that threw an Error ran");
+            assertEquals("error-closer-1", ranOn.get(), "…on the pool's one closer thread, which outlived all three");
+            assertEquals(1, liveThreads("error-closer-"));
+            assertEquals(3, pool.failures());
+            assertEquals(0, pool.unreported());
+            assertEquals(List.of(OutOfMemoryError.class, StackOverflowError.class, AssertionError.class),
+                    reported.stream().map(Object::getClass).toList(), "each failure was reported, in order");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * Reporting a failed hand-over can itself run out of heap — the line is built on the enqueuer, or on the write
+     * watchdog. That report must not become the throw the hand-over's catch keeps from the fan-out, nor end the
+     * watchdog's scheduled sweep (an Error escaping a scheduleAtFixedRate task cancels every later run).
+     * System.out is replaced by one whose println runs out of heap.
+     */
+    @Test
+    void aFailureWhileReportingAFailedHandOverIsThrownNeitherAtTheFanOutNorAtTheWatchdog() throws Exception {
+        AtomicBoolean accept = new AtomicBoolean(false);
+        List<Runnable> accepted = new CopyOnWriteArrayList<>();
+        Executor noNativeThread = task -> {
+            if (!accept.get()) throw new OutOfMemoryError("unable to create native thread: possibly out of memory or process/resource limits reached");
+            accepted.add(task);
+        };
+        AtomicInteger onCloseCalls = new AtomicInteger(), printAttempts = new AtomicInteger();
+        WebSocketSession wsBad = mock(WebSocketSession.class);
+        when(wsBad.getId()).thenReturn("bad");
+        when(wsBad.isOpen()).thenReturn(true);
+        OutboundChannel bad = new OutboundChannel(wsBad, task -> { }, noNativeThread, 2, 1 << 20, metrics, c -> onCloseCalls.incrementAndGet());
+        List<String> got = new CopyOnWriteArrayList<>();
+        OutboundChannel healthy = new OutboundChannel(recordingSession("h", got), writers, 1000, 1 << 20, metrics, c -> { });
+        int frames = 5;
+        Throwable thrownAtFanOut = null, thrownAtWatchdog = null;
+        java.io.PrintStream out = System.out;
+        System.setOut(new java.io.PrintStream(java.io.OutputStream.nullOutputStream()) {
+            @Override public void println(String line) {
+                printAttempts.incrementAndGet();
+                throw new OutOfMemoryError("Java heap space");
+            }
+        });
+        try {
+            try {
+                for (int f = 0; f < frames; f++) {
+                    bad.enqueue("{\"f\":" + f + "}", null);
+                    healthy.enqueue("{\"f\":" + f + "}", null);
+                }
+            } catch (Throwable t) {
+                thrownAtFanOut = t;
+            }
+            try {
+                bad.retryPendingTeardown();                                // a watchdog tick while the closers still refuse
+            } catch (Throwable t) {
+                thrownAtWatchdog = t;
+            }
+        } finally {
+            System.setOut(out);
+        }
+        assertNull(thrownAtFanOut, "the failed hand-over's report was thrown at the fan-out: " + thrownAtFanOut);
+        assertNull(thrownAtWatchdog, "the failed hand-over's report was thrown at the watchdog: " + thrownAtWatchdog);
+        assertEquals(2, printAttempts.get(), "both failed hand-overs tried to report, and both reports ran out of heap");
+        awaitSize(got, frames);
+        List<String> want = new ArrayList<>();
+        for (int f = 0; f < frames; f++) want.add("{\"f\":" + f + "}");
+        assertEquals(want, got, "the channel after the failed hand-over received every frame");
+        assertTrue(bad.isClosed() && bad.teardownPending(), "closed, its teardown pending");
+        accept.set(true);
+        assertTrue(bad.retryPendingTeardown(), "the next tick hands it over");
+        assertEquals(1, accepted.size());
+        accepted.get(0).run();
+        assertEquals(1, onCloseCalls.get(), "onClose exactly once");
+        org.mockito.Mockito.verify(wsBad, org.mockito.Mockito.times(1)).close();
+    }
+
     private void waitForSent(int n) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 3000;
         while (sent.size() < n && System.currentTimeMillis() < deadline) {

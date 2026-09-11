@@ -352,6 +352,33 @@
    "new": "                // channel.retryPendingTeardown();"
   },
   {
+   "key": "G-R10.7 a-failure-while-reporting-never-kills-a-closer",
+   "requirement": "G-R10",
+   "clause": "a failure while reporting a teardown's failure never kills a closer thread: the report is guarded, so the teardowns behind it still run",
+   "documentText": "a failure while reporting that failure never kills a closer thread either",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "            try {\n                reporter.accept(failure);\n            } catch (Throwable reportFailed) {\n                unreported.incrementAndGet();\n            }",
+   "new": "            reporter.accept(failure);"
+  },
+  {
+   "key": "G-R10.8 an-error-from-a-teardown-never-ends-its-closer",
+   "requirement": "G-R10",
+   "clause": "an Error out of a teardown never ends its closer thread: each turn of the closer's loop catches every Throwable",
+   "documentText": "an `Error` out of a teardown never ends its closer thread",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "                    } catch (Throwable teardownFailed) {",
+   "new": "                    } catch (RuntimeException teardownFailed) {"
+  },
+  {
+   "key": "G-R10.9 a-teardown-whose-close-throws-is-pending-again",
+   "requirement": "G-R10",
+   "clause": "a teardown whose session close throws is pending again, so the write watchdog retries it and no accepted teardown is stranded",
+   "documentText": "A teardown whose session close throws is pending again, and the write watchdog retries it, so an accepted teardown is never stranded",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "            if (!closeReturned) {",
+   "new": "            if (false) {"
+  },
+  {
    "key": "G-R3.4 a-cache-consumer-change-after-completion-is-forwarded",
    "requirement": "G-R3",
    "clause": "the change is queued by whichever consumer made it: the cache consumer too, once its replay is complete",

@@ -12,6 +12,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
@@ -53,6 +54,12 @@ import java.util.function.Consumer;
  * teardown inline: the teardown stays PENDING and the write watchdog hands it over again
  * ({@link #retryPendingTeardown}). Until the teardown runs the channel stays registered, closed, so nothing
  * can fall back to writing to its session directly.
+ *
+ * <p><b>A closer thread outlives every failure</b> (strike re-review round 4). Nothing replaces a closer thread,
+ * so nothing a teardown throws — and nothing reporting that failure throws: under heap exhaustion building the
+ * log line can itself throw {@code OutOfMemoryError} — may end one; the failure is counted before it is reported.
+ * A teardown whose session close throws has not reached {@code onClose}: it is pending again, and the write
+ * watchdog hands it over again, so an accepted teardown is never stranded.
  */
 final class OutboundChannel {
 
@@ -299,9 +306,14 @@ final class OutboundChannel {
             return true;
         } catch (RuntimeException | Error handOverFailed) {
             teardownState.set(TEARDOWN_PENDING);
-            System.out.println("Feed gateway outbound teardown of socket " + socketId + " could not be scheduled ("
-                    + handOverFailed.getClass().getSimpleName() + ": " + handOverFailed.getMessage()
-                    + "); it stays pending for the write watchdog to retry");
+            try {
+                System.out.println("Feed gateway outbound teardown of socket " + socketId + " could not be scheduled ("
+                        + handOverFailed.getClass().getSimpleName() + ": " + handOverFailed.getMessage()
+                        + "); it stays pending for the write watchdog to retry");
+            } catch (Throwable reportFailed) {
+                // The report must not become the throw this catch keeps from the enqueuer — or from the watchdog,
+                // whose scheduled sweep an escaping Error would end: under heap exhaustion the line itself can throw.
+            }
             return false;
         }
     }
@@ -320,12 +332,26 @@ final class OutboundChannel {
         return teardownState.get() == TEARDOWN_PENDING;
     }
 
-    /** The session close, then {@code onClose} — at most once, on a closer thread. */
+    /**
+     * The session close, then {@code onClose} — at most once, on a closer thread. A session close that throws (an
+     * {@code Error}: heap exhaustion inside the container) has not reached {@code onClose}, so the teardown is not
+     * spent: it goes back to PENDING — the channel still registered and closed — and the write watchdog hands it
+     * over again. Once {@code onClose} has been called it is never called again, however it ended.
+     */
     private void teardown() {
         if (!tornDown.compareAndSet(false, true)) {
             return;
         }
-        closeSessionQuietly();
+        boolean closeReturned = false;
+        try {
+            closeSessionQuietly();
+            closeReturned = true;
+        } finally {
+            if (!closeReturned) {
+                tornDown.set(false);                     // not torn down: the retry runs it from the top
+                teardownState.set(TEARDOWN_PENDING);
+            }
+        }
         try {
             onClose.accept(this);
         } catch (RuntimeException e) {
@@ -378,15 +404,31 @@ final class OutboundChannel {
      * close attempt — and the thread takes the next. A close that ignores both its own timeout and the interrupt
      * keeps its thread for good and the pool goes on with one fewer; the queued teardowns stop only if every
      * thread were lost that way, and even then no sender, writer or watchdog waits on them.
+     *
+     * <p><b>No failure ends a closer thread</b> (strike re-review round 4). Nothing replaces one, so a thread lost
+     * to a throw is capacity lost for good — lose all of them and every accepted teardown waits forever. Each turn
+     * of a thread — the take, the bookkeeping, the teardown — is one try, and its handler cannot throw: the failure
+     * is counted first ({@link #failures}, an increment that allocates nothing), then reported, and a report that
+     * throws — under heap exhaustion building the line can — is swallowed and counted ({@link #unreported}). A
+     * thread leaves its loop only when the pool is stopped.
      */
     static final class TeardownPool implements Executor {
         private final LinkedBlockingQueue<Runnable> queue = new LinkedBlockingQueue<>();
         private final Worker[] workers;
         private final long closeDeadlineMs;
+        private final Consumer<Throwable> reporter;
+        private final AtomicLong failures = new AtomicLong();
+        private final AtomicLong unreported = new AtomicLong();
         private volatile boolean stopped;
 
         TeardownPool(int threads, String namePrefix, long closeDeadlineMs) {
+            this(threads, namePrefix, closeDeadlineMs, TeardownPool::printFailure);
+        }
+
+        /** {@code reporter} is told of every teardown that threw; it may throw itself (tests: a report that runs out of heap). */
+        TeardownPool(int threads, String namePrefix, long closeDeadlineMs, Consumer<Throwable> reporter) {
             this.closeDeadlineMs = closeDeadlineMs;
+            this.reporter = reporter;
             this.workers = new Worker[Math.max(1, threads)];
             for (int i = 0; i < workers.length; i++) {
                 Worker w = new Worker();
@@ -437,6 +479,30 @@ final class OutboundChannel {
             return queue.size();
         }
 
+        /** How many teardowns have thrown on a closer thread. */
+        long failures() {
+            return failures.get();
+        }
+
+        /** How many of those failures could not be reported — the report itself threw — so this count is their only trace. */
+        long unreported() {
+            return unreported.get();
+        }
+
+        private static void printFailure(Throwable failure) {
+            System.out.println("Feed gateway outbound teardown failed: " + failure.getClass().getSimpleName() + ": " + failure.getMessage());
+        }
+
+        /** A teardown threw: count it, then report it. Never throws — nothing would replace the closer thread it ended. */
+        private void recordFailure(Throwable failure) {
+            failures.incrementAndGet();                    // first: allocates nothing, so it survives what the report may not
+            try {
+                reporter.accept(failure);
+            } catch (Throwable reportFailed) {
+                unreported.incrementAndGet();
+            }
+        }
+
         /** Stops the threads once they finish what they are doing (tests: a private pool must not outlive them). */
         void shutdownNow() {
             stopped = true;
@@ -453,27 +519,30 @@ final class OutboundChannel {
 
             void run() {
                 while (!stopped) {
-                    Runnable task;
+                    // One try around the whole turn, and a handler that cannot throw: nothing a teardown does, and
+                    // nothing reporting its failure does, ends this thread while the pool is alive.
                     try {
-                        task = queue.take();
-                    } catch (InterruptedException stray) {
-                        continue;                          // shutdownNow, or an interrupt for a close already finished
-                    }
-                    synchronized (this) {
-                        current = task;
-                        since = System.currentTimeMillis();
-                        interrupted = false;
-                    }
-                    try {
-                        task.run();
-                    } catch (Throwable t) {
-                        // A teardown must never take its closer thread down with it.
-                        System.out.println("Feed gateway outbound teardown failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
-                    } finally {
-                        synchronized (this) {
-                            current = null;
+                        Runnable task;
+                        try {
+                            task = queue.take();
+                        } catch (InterruptedException stray) {
+                            continue;                      // shutdownNow, or an interrupt for a close already finished
                         }
-                        Thread.interrupted();               // an interrupt meant for the close just finished is not the next one's
+                        synchronized (this) {
+                            current = task;
+                            since = System.currentTimeMillis();
+                            interrupted = false;
+                        }
+                        try {
+                            task.run();
+                        } finally {
+                            synchronized (this) {
+                                current = null;
+                            }
+                            Thread.interrupted();           // an interrupt meant for the close just finished is not the next one's
+                        }
+                    } catch (Throwable teardownFailed) {
+                        recordFailure(teardownFailed);
                     }
                 }
             }
