@@ -17,7 +17,6 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.ZoneId;
@@ -25,6 +24,7 @@ import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -3380,7 +3380,9 @@ class FeedGatewayServiceTest {
                 f.setAccessible(true);
                 ((java.util.concurrent.atomic.AtomicBoolean) f.get(joined)).set(true);
             }
-            List<String> sent = Collections.synchronizedList(new ArrayList<>());
+            // Copy-on-write: the writer thread appends while this thread streams; a synchronizedList's
+            // stream() takes no lock and throws ConcurrentModificationException under that race.
+            List<String> sent = new CopyOnWriteArrayList<>();
             joined.addClient(recordingSession(sent));
             long deadline = System.currentTimeMillis() + 2_000L;
             while (sent.stream().noneMatch(m -> m.contains("\"type\":\"direction-push\""))
@@ -3883,7 +3885,7 @@ class FeedGatewayServiceTest {
         setActiveSelection(service, "DATABENTO", "SPX", "20260623");
         invokeMarkSelectionReady(service, activeSelectionOf(service));
 
-        List<String> sent = Collections.synchronizedList(new ArrayList<>());
+        List<String> sent = new CopyOnWriteArrayList<>();   // streamed while the writer appends: see above
         service.addClient(recordingSession(sent));
 
         long deadline = System.currentTimeMillis() + 1_000L;
