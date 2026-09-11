@@ -128,6 +128,17 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!--
+                      Every forked test JVM gets the PRODUCTION heap (-Xmx1536m, JAVA_TOOL_OPTIONS in every
+                      feed-gateway overlay). FeedGatewayService constructs the production VolPremiumSessionStore,
+                      whose constructor refuses a JVM that reports less than its heap floor (1,280 MiB for the
+                      160 MiB vol-premium budget). Without a pin the forked JVM takes a quarter of whatever machine
+                      runs the build, so the whole suite would pass or fail on the runner's RAM rather than on the
+                      code. With the production heap, the tests exercise the check as production runs it.
+                    -->
+                    <argLine>-Xmx1536m</argLine>
+                </configuration>
                 <executions>
                     <!--
                       GatewayContextSmokeTest refreshes the REAL Spring context, so its JVM must not
