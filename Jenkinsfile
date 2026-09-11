@@ -5,8 +5,8 @@ pipeline {
   // buildAgentLabel, which cannot be read before the pipeline starts. BOTH dev and production
   // now compile on the .74 arm64 builders so the dev Mac (.102) does no build work during
   // market hours — it runs the controller, the dev cluster, the registry and the broker.
-  // Production still builds its amd64 IMAGE natively on REMOTE_BUILD_HOST (.252); only the
-  // Maven compile/test/package moves, and the jar is architecture-independent.
+  // The architecture-independent jar and amd64 production image are both built on CI.
+  // Production receives only the pushed image through the Jenkins deployment job.
   // The Deploy stage needs no cluster access — it triggers `service-deploy`, which is
   // itself pinned to an agent on .102 that holds the kubeconfigs.
   agent none
@@ -25,8 +25,8 @@ pipeline {
     string(name: 'CONTRACTS_BRANCH', defaultValue: 'main', description: 'options-edge-contracts branch to install before building the gateway')
     booleanParam(name: 'PUSH_IMAGE', defaultValue: true, description: 'Push built image to registry')
     booleanParam(name: 'DEPLOY_AND_VERIFY', defaultValue: true, description: 'Dev only: after a successful build+push, trigger service-deploy to roll the dev pod and VERIFY it picked up the new image (fails the build if the running pod does not report the pinned digest). Closes the silent-stale-build gap. No effect on production (manual promote gate).')
-    string(name: 'REMOTE_BUILD_HOST', defaultValue: '192.168.100.252', description: 'Production only: Linux amd64 host that performs native docker build/push. Dev remains local on the Mac.')
-    string(name: 'REMOTE_BUILD_ROOT', defaultValue: '/home/abhinav/ci/remote-builds', description: 'Production only: temporary remote workspace root for native Linux image builds.')
+    string(name: 'REMOTE_BUILD_HOST', defaultValue: '192.168.100.252', description: 'Deprecated compatibility parameter; all image builds run on the resolved CI agent.')
+    string(name: 'REMOTE_BUILD_ROOT', defaultValue: '/home/abhinav/ci/remote-builds', description: 'Deprecated compatibility parameter; no remote build workspace is used.')
   }
   stages {
     stage('Resolve profile') {
@@ -200,14 +200,8 @@ pipeline {
           # Preflight: this stage may run on a builder whose Docker is not always up (the .74
           # agents use Docker Desktop, which needs a GUI session and does not survive reboot).
           # Fail here with something actionable rather than obscurely mid-buildx.
-          # ONLY for builds that actually use the local daemon: production ships the source to
-          # REMOTE_BUILD_HOST and builds there, so it must not depend on Docker being up on the
-          # agent (Codex: that would fail prod for a reason that has nothing to do with prod).
-          needs_local_docker=true
-          if [ "${ENVIRONMENT:-dev}" = "production" ] && [ "$PUSH_IMAGE" = "true" ]; then
-            needs_local_docker=false
-          fi
-          if [ "$needs_local_docker" = "true" ] && ! docker info >/dev/null 2>&1; then
+          # All environments build here on the resolved CI agent, including production.
+          if ! docker info >/dev/null 2>&1; then
             echo "Docker daemon is not reachable on this build agent ($(hostname))." >&2
             echo "If this is the .74 builder, start Docker Desktop on it and re-run." >&2
             exit 1
@@ -266,18 +260,14 @@ EOF
           else
             : > "$BUILDKITD_CONFIG"
           fi
-          # Same reasoning as the preflight: the production remote-build path never touches the
-          # local daemon, so do not create/destroy a local buildx builder for it.
-          if [ "$needs_local_docker" = "true" ]; then
+          # Own the builder explicitly so concurrent jobs cannot change our selection.
+          docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
+          docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" >/dev/null
+          # Builder now exists — widen cleanup to remove it too.
+          cleanup() {
             docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-            docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" --use >/dev/null
-            # Builder now exists — widen cleanup to remove it too. The EXIT trap already points
-            # at `cleanup`, so redefining the function is enough.
-            cleanup() {
-              docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-              rm -f "$BUILDKITD_CONFIG"
-            }
-          fi
+            rm -f "$BUILDKITD_CONFIG"
+          }
           CONTRACTS_SHA="$(cat .contracts-sha 2>/dev/null || echo unknown)"
           # A LABEL, so the revision travels with the image rather than only with the build log —
           # see the note in the contracts install stage.
@@ -289,30 +279,10 @@ EOF
           if [ "${ENVIRONMENT:-dev}" = "production" ]; then
             TAG_ARGS="$TAG_ARGS -t $PROD_IMAGE"   # prod also gets the self-documenting :prod moving tag
           fi
-          if [ "${ENVIRONMENT:-dev}" = "production" ] && [ "$PUSH_IMAGE" = "true" ]; then
-            remote_host="${REMOTE_BUILD_HOST:-192.168.100.252}"
-            remote_root="${REMOTE_BUILD_ROOT:-/home/abhinav/ci/remote-builds}"
-            remote_job="$(printf '%s' "${JOB_NAME:-options-edge-feed-gateway}" | tr '/ ' '__')"
-            remote_dir="$remote_root/$remote_job-${BUILD_NUMBER:-manual}"
-            remote="abhinav@$remote_host"
-            push_refs="$IMAGE"
-            if [ -n "${DEV_IMAGE_TAG:-}" ] && [ "${DEV_IMAGE_TAG:-}" != "$TAG" ]; then
-              push_refs="$push_refs $DEV_IMAGE"
-            fi
-            push_refs="$push_refs $PROD_IMAGE"   # push the :prod moving tag for prod
-            echo "Production image build runs natively on $remote_host ($BUILD_PLATFORM): $TAG_ARGS"
-            ssh "$remote" "rm -rf '$remote_dir' && mkdir -p '$remote_dir'"
-            rsync -az --delete \
-              --exclude '.git' \
-              --exclude '.deps/options-edge-contracts/.git' \
-              ./ "$remote:$remote_dir/"
-            push_cmd=""
-            for ref in $push_refs; do push_cmd="$push_cmd && docker push '$ref'"; done
-            ssh "$remote" "cd '$remote_dir' && docker build --no-cache $BUILD_LABELS $TAG_ARGS . $push_cmd && rm -rf '$remote_dir'"
-          elif [ "$PUSH_IMAGE" = "true" ]; then
-            docker buildx build --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS --push .
+          if [ "$PUSH_IMAGE" = "true" ]; then
+            docker buildx build --builder "$BUILDER_NAME" --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS --push .
           else
-            docker buildx build --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS --load .
+            docker buildx build --builder "$BUILDER_NAME" --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS --load .
           fi
         '''
       }

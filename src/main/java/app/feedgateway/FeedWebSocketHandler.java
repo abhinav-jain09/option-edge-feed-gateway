@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.SubProtocolCapable;
 import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.util.List;
@@ -65,6 +66,11 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
         } catch (Exception ignored) {
             // best-effort; the socket is already being torn down
         }
+    }
+
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
+        gatewayService.handleFootprintBasicMessage(session, message.getPayload());
     }
 
     @Override
