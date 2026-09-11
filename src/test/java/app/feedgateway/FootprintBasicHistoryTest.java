@@ -13,17 +13,20 @@ import org.springframework.web.socket.WebSocketSession;
 class FootprintBasicHistoryTest {
     private final ObjectMapper mapper = new ObjectMapper();
     private static final long OPEN = Instant.parse("2026-09-11T13:30:00Z").toEpochMilli();
+    private static final long SESSION_OPEN = Instant.parse("2026-09-10T22:00:00Z").toEpochMilli();
     private FootprintViews view() { return new FootprintViews(mapper, 262144, 32*1024*1024, 1000, 1024*1024, 1000); }
     private String bar(int i) { return "{\"schemaVersion\":6,\"sessionDate\":\"2026-09-11\",\"symbol\":\"ES.v.0\",\"timeframe\":\"1m\",\"observations\":{\"barStartMs\":"+(OPEN+i*60000)+"}}"; }
     private JsonNode request(long after, long to) throws Exception { return mapper.readTree("{\"type\":\"es-footprint-basic-history\",\"sessionDate\":\"2026-09-11\",\"afterMs\":"+after+",\"toMs\":"+to+"}"); }
-    @Test void streamedPagesAreBoundedAscendingAndExcludeOvernight() throws Exception {
+    @Test void streamedPagesAreBoundedAscendingAndAllowTheCurrentEsSession() throws Exception {
         FootprintViews v=view(); for(int i=-1;i<7;i++)v.admitBar(bar(i));
-        JsonNode page=mapper.readTree(FootprintBasicHistory.reply(mapper,v,request(OPEN-1,OPEN+360000),100));
-        assertEquals(4,page.path("bars").size()); assertEquals(OPEN,page.path("bars").get(0).path("observations").path("barStartMs").asLong());
-        assertEquals(OPEN+180000,page.path("nextCursor").asLong());
+        JsonNode page=mapper.readTree(FootprintBasicHistory.reply(mapper,v,request(OPEN-60001,OPEN+360000),100));
+        assertEquals(4,page.path("bars").size()); assertEquals(OPEN-60000,page.path("bars").get(0).path("observations").path("barStartMs").asLong());
+        assertEquals(OPEN+120000,page.path("nextCursor").asLong());
         JsonNode last=mapper.readTree(FootprintBasicHistory.reply(mapper,v,request(page.path("nextCursor").asLong(),OPEN+360000),4));
-        assertEquals(3,last.path("bars").size());assertTrue(last.path("nextCursor").isNull());
-        assertEquals(OPEN,page.path("sessionStartMs").asLong());
+        assertEquals(4,last.path("bars").size());
+        JsonNode terminal=mapper.readTree(FootprintBasicHistory.reply(mapper,v,request(last.path("nextCursor").asLong(),OPEN+360000),4));
+        assertTrue(terminal.path("bars").isEmpty());assertTrue(terminal.path("nextCursor").isNull());
+        assertEquals(SESSION_OPEN,page.path("sessionStartMs").asLong());
         assertEquals(Instant.parse("2026-09-11T20:00:00Z").toEpochMilli(),page.path("sessionEndMs").asLong());
     }
     @Test void badDatesCoercionsAndCrossSessionReadsFailClosed() throws Exception {
@@ -31,7 +34,7 @@ class FootprintBasicHistoryTest {
         for(String bad:new String[]{"{}","{\"sessionDate\":\"2026-02-30\",\"afterMs\":0,\"toMs\":1}",
                 "{\"sessionDate\":\"2026-09-11\",\"afterMs\":\"0\",\"toMs\":1}"})
             assertEquals("bad_request",mapper.readTree(FootprintBasicHistory.reply(mapper,v,mapper.readTree(bad),4)).path("error").asText());
-        assertEquals("bad_request",mapper.readTree(FootprintBasicHistory.reply(mapper,v,request(OPEN-60000,OPEN),4)).path("error").asText());
+        assertEquals("bad_request",mapper.readTree(FootprintBasicHistory.reply(mapper,v,request(SESSION_OPEN-60000,SESSION_OPEN),4)).path("error").asText());
         assertEquals("record_budget",mapper.readTree(FootprintBasicHistory.reply(mapper,v,request(OPEN-1,OPEN),0)).path("error").asText());
         v.admitBar(bar(0).replace("2026-09-11","2026-09-14"));
         JsonNode mismatch=mapper.readTree(FootprintBasicHistory.reply(mapper,v,request(OPEN-1,OPEN),4));

@@ -26,7 +26,7 @@ final class FootprintBasicHistory {
                 || !to.isIntegralNumber() || !to.canConvertToLong()) {
             return out.put("error", "bad_request").toString();
         }
-        long start = date.atTime(9, 30).atZone(NEW_YORK).toInstant().toEpochMilli();
+        long start = date.minusDays(1).atTime(18, 0).atZone(NEW_YORK).toInstant().toEpochMilli();
         long end = date.atTime(16, 0).atZone(NEW_YORK).toInstant().toEpochMilli();
         long cursor = after.longValue(), ceiling = to.longValue();
         if (cursor < start - 1 || cursor >= end || ceiling < start - 1 || ceiling >= end) {
