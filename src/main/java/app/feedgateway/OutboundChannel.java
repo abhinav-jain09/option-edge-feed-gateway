@@ -138,6 +138,12 @@ final class OutboundChannel {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicInteger teardownState = new AtomicInteger(TEARDOWN_NONE);
     private final AtomicBoolean tornDown = new AtomicBoolean(false);
+    /**
+     * Run each time the writer drains this queue EMPTY — the one moment a producer that paces itself
+     * against this socket's bounds knows there is room again. Set only while such a producer is active
+     * (the vol-premium session replay); null otherwise, which costs one volatile read per idle.
+     */
+    private volatile Runnable onIdle;
 
     OutboundChannel(WebSocketSession session, Executor writers, int maxMessages, long maxBytes,
                     Metrics metrics, Consumer<OutboundChannel> onClose) {
@@ -175,6 +181,22 @@ final class OutboundChannel {
         synchronized (lock) {
             return peakDepth;
         }
+    }
+
+    /** Bytes currently queued (the same char-count bound {@link #enqueue} charges against maxBytes). */
+    long queuedBytes() {
+        synchronized (lock) {
+            return queuedBytes;
+        }
+    }
+
+    /**
+     * Install (or clear, with null) the hook run each time the writer drains the queue empty. It runs on
+     * the writer thread, OUTSIDE this channel's lock, so it may enqueue again — a producer that paces a
+     * large replay against this socket's bounds refills here instead of flooding the queue at once.
+     */
+    void onIdle(Runnable hook) {
+        this.onIdle = hook;
     }
 
     /**
@@ -236,7 +258,7 @@ final class OutboundChannel {
                 Iterator<Map.Entry<String, Pending>> it = queue.entrySet().iterator();
                 if (!it.hasNext()) {
                     draining = false; // go idle; the next enqueue re-arms a drain
-                    return;
+                    break;            // ...and tell a pacing producer, outside the lock (below)
                 }
                 next = it.next().getValue();
                 it.remove();
@@ -257,6 +279,17 @@ final class OutboundChannel {
                 return;
             } finally {
                 sendStartedAtMs = 0;
+            }
+        }
+        // Idle, and outside the lock: the hook may enqueue (re-arming a drain) without deadlocking on it.
+        // A closed channel never calls it — nothing it enqueued could be delivered. A hook that throws is
+        // the hook's fault and must not unwind a writer-pool thread, which serves every other socket.
+        Runnable hook = onIdle;
+        if (hook != null && !closed.get()) {
+            try {
+                hook.run();
+            } catch (RuntimeException hookFailed) {
+                // the producer's own state decides what to do next; the socket stays healthy
             }
         }
     }

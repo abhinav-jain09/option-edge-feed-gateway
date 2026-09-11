@@ -2437,137 +2437,59 @@ class FeedGatewayServiceTest {
     }
 
     // ----- vol-premium IV-vs-realised relay ------------------------------------------------------
+    //
+    // Every payload below is REAL engine output (VolPremiumFixtures: the canonical v2 reading, the
+    // canonical v1 warning, and a full 371-observation / 15-transition session stream) or a one-field
+    // variant of it that was run through the contract before it was used. The gateway is told the time
+    // through its vol-premium clock seam, so a record is judged at the instant it describes — the fixed
+    // dates can never date-bomb this group, which the previous wall-clock fixtures had to work around.
 
-    @Test
-    void volPremiumIvrvIsOptionalGlobalAndOnTheShortFiveMinuteWindow() throws Exception {
-        // The IV/RV reading is a standalone global advisory whose only value is being CURRENT.
-        // The global-broadcast assertion is the one that matters most here: without it broadcast()
-        // drops the event whenever per-session routing is on, which is the only mode prod runs in,
-        // so the card would be permanently blank in prod while every unauthenticated test passed.
+    private static final String VP_OBS = VolPremiumSessionStore.EVENT_OBSERVATION;
+    private static final String VP_WARN = VolPremiumSessionStore.EVENT_WARNING;
+
+    /** A gateway whose vol-premium clock is one second after the fixture stream's last observation. */
+    private static FeedGatewayService vpService() {
         FeedGatewayService service = service();
-        GatewaySettings settings = new GatewaySettings();
-        assertEquals("options.spx.vol-premium.ivrv", settings.volPremiumIvrvTopic(),
-                "default topic must be the contract constant VolPremiumTopics.IVRV");
-        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("vol-premium-ivrv"),
-                "the reading must fan out in per-session (auth) mode like its advisory siblings");
-        assertEquals(300_000L, settings.volPremiumIvrvTtlMs(), "default TTL must be 5 minutes");
-        long now = System.currentTimeMillis();
-        assertFalse(isExpired(service, "vol-premium-ivrv", now - 2L * 60_000L, now),
-                "a 2-min-old reading must still be fresh");
-        assertTrue(isExpired(service, "vol-premium-ivrv", now - 6L * 60_000L, now),
-                "a 6-min-old reading must be STALE — never routed or replayed as current");
+        service.volPremiumClockForTest(() -> VolPremiumFixtures.FIXTURE_NOW_MS);
+        return service;
     }
 
-    @Test
-    void volPremiumIvrvUsesPayloadStreamTimeAndSessionScopedKey() throws Exception {
-        // Freshness tracks the PAYLOAD eventTimeMs, so a producer catching up on a backlog cannot
-        // render a stale reading as live. The key is SYMBOL|sessionDate, matching the producer's
-        // own record key, so two sessions never collide in one cache slot.
-        FeedGatewayService service = service();
-        GatewaySettings settings = new GatewaySettings();
-        long streamTime = System.currentTimeMillis() - 1_000L;
-        String payload = volPremiumPayload(streamTime);
-        ConsumerRecord<String, String> record = recordAt(settings.volPremiumIvrvTopic(), 0, 1L,
-                VOL_PREMIUM_KEY, payload, System.currentTimeMillis());
-
-        assertEquals(streamTime, eventCacheTimestamp(service, "vol-premium-ivrv", record),
-                "fresh Kafka arrival must not disguise a historical reading");
-        assertEquals("DATABENTO|" + VOL_PREMIUM_KEY,
-                updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"), record, payload),
-                "updateCache must key the reading by source|SYMBOL|sessionDate — the sessionDate "
-                        + "component is what stops two sessions sharing one cache slot");
+    /** One observation offered through updateCache — the gateway's cache seam, and the tests' way in. */
+    private static String vpOffer(FeedGatewayService service, long offset, String key, String json)
+            throws Exception {
+        return updateCache(service, topicBinding("DATABENTO", VP_OBS),
+                recordAt(new GatewaySettings().volPremiumIvrvTopic(), 0, offset, key, json,
+                        VolPremiumFixtures.FIXTURE_NOW_MS), json);
     }
 
-    @Test
-    void futureVolPremiumIvrvReadingFailsClosed() throws Exception {
-        // A clock fault is not freshness: an implausibly future-stamped reading would evade expiry
-        // and sit on the chart as the current point indefinitely.
-        FeedGatewayService service = service();
-        GatewaySettings settings = new GatewaySettings();
-        long now = System.currentTimeMillis();
-        String future = volPremiumPayload(now + 60L * 60_000L);
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 1L, VOL_PREMIUM_KEY, future,
-                                now),
-                        future),
-                "an hour-ahead reading must be dropped at ingest, never cached");
-
-        String current = volPremiumPayload(now - 5_000L);
-        assertEquals("DATABENTO|" + VOL_PREMIUM_KEY,
-                updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 2L, VOL_PREMIUM_KEY, current,
-                                now),
-                        current),
-                "a valid reading after a future one must be accepted — no poison left behind");
+    private static String vpOffer(FeedGatewayService service, long offset, VolPremiumFixtures.Row row)
+            throws Exception {
+        return vpOffer(service, offset, row.key(), row.json());
     }
 
-    @Test
-    void volPremiumIvrvReplaysTheCurrentReadingToALateJoiner() throws Exception {
-        // Behavioural, not structural: this drives the real replay method against a recording
-        // session and asserts the bytes a late joiner would actually receive.
-        FeedGatewayService service = service();
-        GatewaySettings settings = new GatewaySettings();
-        long now = System.currentTimeMillis();
-        String older = volPremiumPayload(now - 2L * 60_000L);
-        updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                recordAt(settings.volPremiumIvrvTopic(), 0, 1L, VOL_PREMIUM_KEY, older,
-                        now - 2L * 60_000L), older);
-        String current = volPremiumPayload(now - 30_000L);
-        updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                recordAt(settings.volPremiumIvrvTopic(), 0, 2L, VOL_PREMIUM_KEY, current,
-                        now - 30_000L), current);
-
-        List<String> sink = new ArrayList<>();
-        replayVolPremium(service, recordingSession(sink));
-
-        assertEquals(1, sink.size(),
-                "exactly the CURRENT reading must replay (last-value-wins); got: " + sink);
-        assertTrue(sink.get(0).contains("\"type\":\"vol-premium-ivrv\"")
-                        && sink.get(0).contains("\"frameSeq\""),
-                "the reading must replay verbatim (JSON pass-through); was: " + sink.get(0));
+    private static String vpOfferWarning(FeedGatewayService service, long offset, String key, String json)
+            throws Exception {
+        return updateCache(service, topicBinding("DATABENTO", VP_WARN),
+                recordAt(new GatewaySettings().volPremiumWarningsTopic(), 0, offset, key, json,
+                        VolPremiumFixtures.FIXTURE_NOW_MS), json);
     }
 
-    @Test
-    void staleVolPremiumIvrvReadingIsNeitherCachedNorReplayed() throws Exception {
-        // Fail-closed both ways: a reading past the window makes updateCache return null, which
-        // suppresses the live broadcast, and nothing replays — so the chart shows no current
-        // point, which is true, rather than a stale one, which is not.
-        FeedGatewayService service = service();
+    /** The consumers' own ingest path — admit, claim, forward under the emit lock — as a caught-up consumer. */
+    private static void vpRelay(FeedGatewayService service, String event, long offset, String key, String json)
+            throws Exception {
+        Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Method relay = FeedGatewayService.class.getDeclaredMethod("relayVolPremium", bindingType,
+                ConsumerRecord.class, String.class, boolean.class);
+        relay.setAccessible(true);
         GatewaySettings settings = new GatewaySettings();
-        long now = System.currentTimeMillis();
-        String stale = volPremiumPayload(now - 6L * 60_000L);
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 1L, VOL_PREMIUM_KEY, stale,
-                                now - 6L * 60_000L), stale),
-                "a 6-min-old reading must be dropped at ingest (null cacheKey = never live-routed)");
-
-        List<String> sink = new ArrayList<>();
-        replayVolPremium(service, recordingSession(sink));
-        assertTrue(sink.isEmpty(), "a stale reading must never replay to a late joiner; got: " + sink);
+        String topic = VP_WARN.equals(event) ? settings.volPremiumWarningsTopic() : settings.volPremiumIvrvTopic();
+        relay.invoke(service, topicBinding("DATABENTO", event),
+                recordAt(topic, 0, offset, key, json, VolPremiumFixtures.FIXTURE_NOW_MS), json, true);
     }
 
-    @Test
-    void volPremiumIvrvReplaysOnThePerSessionAndReturnToLivePath() throws Exception {
-        // replayCachedToSocket is the path that serves per-session (auth) connections AND
-        // return-to-live from a historical replay. It had no vol-premium call at all, so the card
-        // was permanently blank in authenticated prod — the only mode prod runs in — while every
-        // unauthenticated test passed. This drives that method itself.
-        FeedGatewayService service = service();
-        GatewaySettings settings = new GatewaySettings();
-        long now = System.currentTimeMillis();
-        String current = volPremiumPayload(now - 10_000L);
-        updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                recordAt(settings.volPremiumIvrvTopic(), 0, 1L, VOL_PREMIUM_KEY, current,
-                        now - 10_000L), current);
-
-        List<String> sink = new ArrayList<>();
-        Method replay = FeedGatewayService.class.getDeclaredMethod("replayCachedToSocket",
-                WebSocketSession.class);
-        replay.setAccessible(true);
-        replay.invoke(service, recordingSession(sink));
-
-        assertTrue(sink.stream().anyMatch(m -> m.contains("\"type\":\"vol-premium-ivrv\"")),
-                "the per-session/return-to-live path must deliver the reading; got: " + sink);
+    private static void vpRelay(FeedGatewayService service, long offset, VolPremiumFixtures.Row row)
+            throws Exception {
+        vpRelay(service, VP_OBS, offset, row.key(), row.json());
     }
 
     private static void replayVolPremium(FeedGatewayService service, WebSocketSession session)
@@ -2578,199 +2500,861 @@ class FeedGatewayServiceTest {
         replay.invoke(service, session);
     }
 
-    @Test
-    void volPremiumIvrvBroadcastsEachOffsetExactlyOnceAndNeverGoesBackwards() throws Exception {
-        // Both the cache and live consumers read the SAME single partition, so whichever wins an
-        // offset must be the one that broadcasts it — and a superseded offset must never win.
-        // The contract permits an equal-EVENT-TIME correction at a later offset, so an event-time
-        // gate alone would let offset N broadcast over the correction at N+1.
-        FeedGatewayService service = service();
-        String key = "DATABENTO|" + VOL_PREMIUM_KEY;
-        assertTrue(service.shouldBroadcastVolPremiumIvrv(key, 10L), "first offset broadcasts");
-        assertFalse(service.shouldBroadcastVolPremiumIvrv(key, 10L),
-                "the other consumer's duplicate of the SAME offset must not broadcast twice");
-        assertTrue(service.shouldBroadcastVolPremiumIvrv(key, 11L), "a later offset broadcasts");
-        assertFalse(service.shouldBroadcastVolPremiumIvrv(key, 10L),
-                "an earlier offset must never broadcast over a newer one — this is the "
-                        + "equal-event-time correction case the event-time gate cannot catch");
-        // DERIVED, not a literal. A hardcoded neighbouring date is a date bomb of exactly the kind
-        // this file already fixed once: the day the derived session becomes that date, "the other
-        // key" is the same key and the assertion inverts.
-        String otherSession = "DATABENTO|SPX|"
-                + java.time.LocalDate.parse(VOL_PREMIUM_SESSION).plusDays(1);
-        assertNotEquals(key, otherSession, "precondition: it really is a different key");
-        assertTrue(service.shouldBroadcastVolPremiumIvrv(otherSession, 1L),
-                "the gate is per session key, not global");
+    /**
+     * The {@code data} of every frame of the given vol-premium types, in arrival order, as the EXACT
+     * bytes the gateway put on the wire. The envelope is {"type":"<event>","data":<record>}, so the
+     * record is everything between the prefix and the closing brace.
+     */
+    private static List<String> vpFrames(List<String> sink, String... events) {
+        List<String> out = new ArrayList<>();
+        for (String message : sink) {
+            for (String event : events) {
+                String prefix = "{\"type\":\"" + event + "\",\"data\":";
+                if (message.startsWith(prefix)) {
+                    out.add(message.substring(prefix.length(), message.length() - 1));
+                }
+            }
+        }
+        return out;
+    }
+
+    private static List<String> vpTypes(List<String> sink) {
+        List<String> out = new ArrayList<>();
+        for (String message : sink) {
+            for (String event : List.of(VP_OBS, VP_WARN)) {
+                if (message.startsWith("{\"type\":\"" + event + "\",")) {
+                    out.add(event);
+                }
+            }
+        }
+        return out;
+    }
+
+    private static long vpRefusals(FeedGatewayService service, VolPremiumSessionStore.Stream stream,
+                                   VolPremiumSessionStore.Refusal reason) {
+        return service.volPremiumStoreForTest().refusals(stream, reason);
+    }
+
+    private static List<String> vpJson(List<VolPremiumFixtures.Row> rows) {
+        return rows.stream().map(VolPremiumFixtures.Row::json).toList();
+    }
+
+    private static List<String> vpFieldNames(String json) throws Exception {
+        List<String> names = new ArrayList<>();
+        VolPremiumFixtures.MAPPER.readTree(json).fieldNames().forEachRemaining(names::add);
+        return names;
+    }
+
+    /** A socket with its own id; with a gate, every write waits for it — a client that is not reading. */
+    private static WebSocketSession vpSession(String id, List<String> sink,
+                                              java.util.concurrent.CountDownLatch gate) {
+        return (WebSocketSession) Proxy.newProxyInstance(
+                WebSocketSession.class.getClassLoader(),
+                new Class<?>[]{WebSocketSession.class},
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "isOpen": return Boolean.TRUE;
+                        case "getId": return id;
+                        case "sendMessage":
+                            if (gate != null && !gate.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                                throw new java.io.IOException("the test never released this socket");
+                            }
+                            if (args[0] instanceof TextMessage tm) {
+                                sink.add(tm.getPayload());
+                            }
+                            return null;
+                        case "toString": return "VpSession[" + id + "]";
+                        case "hashCode": return System.identityHashCode(proxy);
+                        case "equals": return proxy == args[0];
+                        default:
+                            Class<?> rt = method.getReturnType();
+                            if (rt == boolean.class) return Boolean.FALSE;
+                            if (rt == int.class) return 0;
+                            if (rt == long.class) return 0L;
+                            return null;
+                    }
+                });
+    }
+
+    private static void vpAwait(java.util.function.BooleanSupplier done, long timeoutMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (!done.getAsBoolean() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5L);
+        }
     }
 
     @Test
-    // A TOPIC RECREATION resets offsets, and the fence must not outlive the entry it fences.
-    void volPremiumIvrvBroadcastFenceIsClearedWithItsCacheEntry() throws Exception {
-        // The fence remembers the greatest offset already broadcast, which is what lets two
-        // consumers of one topic agree on who delivers a record. Kept after the cache entry is
-        // gone, it stops being a fence and becomes a floor: a recreated topic — an operator
-        // remaking it, or the daily wipe — starts at offset zero again, and every fresh frame of
-        // the SAME session would be refused until the offset climbed back past the old
-        // incarnation's mark. The cache itself recovers, so late joiners would be served correctly
-        // while every already-open page froze. Nothing fails; the card simply stops.
-        FeedGatewayService service = service();
+    void volPremiumTopicsAreOptionalGlobalNeverCoalescedAndSeekBackTheWholeSession() throws Exception {
         GatewaySettings settings = new GatewaySettings();
-        long now = System.currentTimeMillis();
-        String cacheKey = "DATABENTO|" + VOL_PREMIUM_KEY;
-
-        String payload = volPremiumPayload(now - 5_000L);
-        assertEquals(cacheKey, updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                recordAt(settings.volPremiumIvrvTopic(), 0, 100L, VOL_PREMIUM_KEY, payload, now),
-                payload));
-        assertTrue(service.shouldBroadcastVolPremiumIvrv(cacheKey, 100L));
-        assertFalse(service.shouldBroadcastVolPremiumIvrv(cacheKey, 1L),
-                "precondition: while the entry lives, an earlier offset is correctly refused");
-
-        // The entry ages out — the same path a TTL sweep takes.
-        purgeExpiredCache(service, now + 24L * 60 * 60 * 1000);
-
-        assertTrue(service.shouldBroadcastVolPremiumIvrv(cacheKey, 1L),
-                "with the entry gone the fence must be gone too, or a recreated topic's first "
-                        + "frames are silently suppressed for every already-connected client");
-        // ...and it fences again from the new incarnation's own offsets.
-        assertFalse(service.shouldBroadcastVolPremiumIvrv(cacheKey, 1L));
-        assertTrue(service.shouldBroadcastVolPremiumIvrv(cacheKey, 2L));
+        assertEquals(com.optionsedge.contracts.volpremium.VolPremiumTopics.IVRV, settings.volPremiumIvrvTopic(),
+                "default ivrv topic must be the contract constant");
+        assertEquals(com.optionsedge.contracts.volpremium.VolPremiumTopics.WARNINGS,
+                settings.volPremiumWarningsTopic(), "default warnings topic must be the contract constant");
+        System.setProperty("KAFKA_VOL_PREMIUM_WARNINGS_TOPIC", "dev.options.spx.vol-premium.warnings");
+        try {
+            assertEquals("dev.options.spx.vol-premium.warnings", new GatewaySettings().volPremiumWarningsTopic(),
+                    "the warnings topic is env-overridable exactly like the ivrv topic");
+        } finally {
+            System.clearProperty("KAFKA_VOL_PREMIUM_WARNINGS_TOPIC");
+        }
+        // Both are GLOBAL advisories: without the allowlist broadcast() drops them whenever per-session
+        // routing is on — the only mode prod runs in.
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent(VP_OBS));
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent(VP_WARN));
+        // ...and NEVER coalesced: every observation is a point and every transition an overlay.
+        Field coalescable = FeedGatewayService.class.getDeclaredField("COALESCABLE_EVENTS");
+        coalescable.setAccessible(true);
+        Set<?> events = (Set<?>) coalescable.get(null);
+        assertFalse(events.contains(VP_OBS), "an observation must never be merged into another");
+        assertFalse(events.contains(VP_WARN), "a transition must never be merged into another");
+        // A restart re-reads the WHOLE current session, and nothing is aged out by the generic cache.
+        FeedGatewayService service = service();
+        for (String event : List.of(VP_OBS, VP_WARN)) {
+            FeedGatewayService.CachePolicy policy = service.cachePolicyFor(event, System.currentTimeMillis());
+            assertTrue(policy.neverEvict(), event + " is retained for its session, not by record age");
+            assertEquals(86_400_000L + com.optionsedge.contracts.volpremium.IvRvReading.MAX_AFTER_MIDNIGHT_MS,
+                    policy.seekBackMs(), event + " must seek back the longest span one session can cover");
+        }
+        // Both JSON-state consumers bind both topics. The maps are built inline in the two consumer
+        // methods, so this is checked where it lives: a topic bound in only one of them would starve the
+        // other's catch-up or its live broadcast.
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        assertEquals(2, source.split(java.util.regex.Pattern.quote(
+                "topicEvents.put(settings.volPremiumIvrvTopic(),"), -1).length - 1);
+        assertEquals(2, source.split(java.util.regex.Pattern.quote(
+                "topicEvents.put(settings.volPremiumWarningsTopic(),"), -1).length - 1);
     }
 
     @Test
-    // A recreated topic recovers IMMEDIATELY, not at the next TTL expiry.
-    void volPremiumIvrvRecoversFromATopicRecreationWithoutWaitingForExpiry() throws Exception {
-        // A deleted-and-remade topic starts again at offset zero while a perfectly fresh cache
-        // entry still holds the old incarnation's position. Every frame of the SAME session would
-        // be refused until the offset climbed back past it — for a mid-session recreation, the
-        // rest of the day — and nothing would report a fault: the cache simply freezes and live
-        // delivery stops.
-        //
-        // The event time is what separates a recreation from a replay. This producer stamps each
-        // reading with its own stream time, which never runs backwards, so a record BOTH behind
-        // the stored offset and strictly ahead of the stored event time is one no incarnation of
-        // this topic could have produced before.
+    void theGatewayHoldsVolPremiumUnderTheDeclaredProductionCaps() throws Exception {
+        VolPremiumSessionStore store = service().volPremiumStoreForTest();
+        for (String[] cap : new String[][] {{"maxObservations", "MAX_OBSERVATIONS_PER_SESSION"},
+                {"maxWarnings", "MAX_WARNINGS_PER_SESSION"}, {"maxSymbols", "MAX_SYMBOLS"}}) {
+            Field held = VolPremiumSessionStore.class.getDeclaredField(cap[0]);
+            held.setAccessible(true);
+            Field declared = VolPremiumSessionStore.class.getDeclaredField(cap[1]);
+            declared.setAccessible(true);
+            assertEquals(declared.get(null), held.get(store), cap[0] + " must be the declared " + cap[1]);
+        }
+    }
+
+    @Test
+    void volPremiumIvrvAdmitsAV2ObservationOnlyUnderItsExactObservationKey() throws Exception {
+        // The key is what compaction acts on. A record keyed for one observation carrying another's body
+        // takes the first one's slot on the topic while the gateway would file it under the second, and
+        // the two histories then disagree with nothing failing — so the key must be EXACTLY
+        // IvRvReading.observationKey of the parsed value.
+        FeedGatewayService service = vpService();
+        VolPremiumFixtures.Row canonical = VolPremiumFixtures.canonicalReading();
+        assertEquals("SPX|2026-08-27|7141", canonical.key(), "precondition: the engine keys by observation");
+        long offset = 1;
+        for (String wrong : new String[] {
+                "SPX|2026-08-27",          // the v1 key — one reading per session; every v2 record was refused under it
+                "SPX|2026-08-27|7140",     // another ordinal's slot
+                "spx|2026-08-27|7141",     // not the contract's spelling
+                "SPX|2026-08-27|7141 ",
+                "SPX|2026-08-28|7141",     // another session's slot
+                ""}) {
+            assertNull(vpOffer(service, offset++, wrong, canonical.json()),
+                    "key '" + wrong + "' is not this observation's key and must be refused");
+        }
+        assertNull(vpOffer(service, offset++, null, canonical.json()), "a keyless record is refused too");
+        assertEquals(7L, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.KEY_MISMATCH));
+
+        assertEquals("DATABENTO|SPX|2026-08-27|7141|1787837400000", vpOffer(service, offset++, canonical),
+                "the exact key admits it, filed under its series, session, ordinal and epoch");
+        List<String> sink = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-late", sink, null));
+        assertEquals(List.of(canonical.json()), vpFrames(sink, VP_OBS));
+    }
+
+    @Test
+    void volPremiumIvrvRefusesSchemaVersion1AndEveryContractInvalidBody() throws Exception {
+        // The WHOLE contract, through IvRvReading's own constructor. A body that the contract refuses and
+        // the gateway admitted would be cached, replayed and broadcast, and then refused by every browser:
+        // a live client keeps what it has while a late joiner is served only the broken record.
+        FeedGatewayService service = vpService();
+        VolPremiumFixtures.Row canonical = VolPremiumFixtures.canonicalReading();
+        String json = canonical.json();
+        String key = canonical.key();
+        long offset = 1;
+        String[][] broken = {
+                {"schemaVersion 1 — the producer publishes only v2 now", VolPremiumFixtures.with(json, "schemaVersion", 1)},
+                {"an ordinal that disagrees with its own timestamp", VolPremiumFixtures.with(json, "frameSeq", 7140)},
+                {"a coverage outside [0,1]", VolPremiumFixtures.with(json, "gridCoverage", 2)},
+                {"a measurement epoch from another day", VolPremiumFixtures.with(json, "measurementEpochMs",
+                        VolPremiumFixtures.longField(json, "measurementEpochMs") - 86_400_000L)},
+                {"a cadence outside the contract's bounds", VolPremiumFixtures.with(json, "frameCadenceMs", 99)},
+                {"a spread basis presented as the calibrated VRP", VolPremiumFixtures.with(json, "spreadBasis", "VRP")},
+                {"a parameter-set hash that is not the set's", VolPremiumFixtures.with(json, "parameterSetHash", "00")},
+                {"a zero implied vol — the market pricing no risk", VolPremiumFixtures.with(json, "atmIvPct", 0)},
+                {"trailing tokens after the record", json + "{}"},
+                {"not JSON at all", "not json"}};
+        for (String[] c : broken) {
+            assertNull(vpOffer(service, offset++, key, c[1]), c[0] + " must be refused");
+        }
+        long malformed = broken.length;
+
+        // EVERY field must be PRESENT, not merely valid when it is there: Jackson fills a missing
+        // component with the Java default, so a deleted count would arrive as a valid-looking zero.
+        List<String> fields = vpFieldNames(json);
+        assertEquals(28, fields.size(), "the v2 reading has 28 fields");
+        for (String field : fields) {
+            assertNull(vpOffer(service, offset++, key, VolPremiumFixtures.without(json, field)),
+                    "a reading missing " + field + " must be refused, not defaulted");
+        }
+        malformed += fields.size();
+        // ...and an EXPLICIT null for a primitive is the same hole by a different door.
+        String[] primitives = {"schemaVersion", "eventTimeMs", "gridCoverage", "maxContiguousGapSlots",
+                "returnsObserved", "measurementEpochMs", "frameSeq", "frameCadenceMs",
+                "materialChangeThresholdPct", "changeThresholdVersion", "parameterSetVersion"};
+        for (String field : primitives) {
+            assertNull(vpOffer(service, offset++, key, VolPremiumFixtures.withNull(json, field)),
+                    "an explicit null " + field + " must be refused, not defaulted");
+        }
+        malformed += primitives.length;
+        // The declared yyyy-MM-dd grammar, not merely a parseable calendar date.
+        for (String badDate : new String[] {"+10000-01-01", "-0001-01-01", "2026-8-27", "20260827"}) {
+            assertNull(vpOffer(service, offset++, key, VolPremiumFixtures.with(json, "sessionDate", badDate)),
+                    badDate + " is not the declared grammar");
+        }
+        malformed += 4;
+        assertEquals(malformed, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.MALFORMED));
+
+        // The contract's wire bound. An unknown field is IGNORED by the record, so a padded but otherwise
+        // perfect reading is refused by the byte bound alone — which is what makes the cap a memory bound.
+        String padded = VolPremiumFixtures.with(json, "pad",
+                "x".repeat(com.optionsedge.contracts.volpremium.IvRvReading.MAX_RECORD_BYTES));
+        assertNull(vpOffer(service, offset++, key, padded));
+        assertEquals(1L, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.OVERSIZE));
+
+        // A boundary, not a wall: the real record still gets through — including its realised vol of
+        // exactly 0.0, which is a measurement (the quietest tape there is) — and so does a warming-grid
+        // observation whose realised side is absent.
+        assertEquals(0.0, VolPremiumFixtures.MAPPER.readTree(json).get("realisedVolPct").asDouble(), 0.0);
+        assertNotNull(vpOffer(service, offset++, canonical));
+        VolPremiumFixtures.Row warming = VolPremiumFixtures.readingAt(6840);
+        assertTrue(warming.json().contains("\"realisedVolPct\":null"), "precondition: realised absent");
+        assertNotNull(vpOffer(service, offset++, warming));
+        List<String> sink = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-late", sink, null));
+        assertEquals(List.of(warming.json(), canonical.json()), vpFrames(sink, VP_OBS));
+    }
+
+    @Test
+    void aFutureStampedVolPremiumRecordFailsClosedAndCannotRollTheSeriesOver() throws Exception {
+        // A clock fault is not freshness: a frame stamped ahead of the gateway would sit on the chart as
+        // the newest point — and as the first record of a session it could roll the series over to a
+        // date that has not started.
         FeedGatewayService service = service();
-        GatewaySettings settings = new GatewaySettings();
-        long now = System.currentTimeMillis();
-        String cacheKey = "DATABENTO|" + VOL_PREMIUM_KEY;
+        VolPremiumFixtures.Row canonical = VolPremiumFixtures.canonicalReading();
+        long eventTime = VolPremiumFixtures.longField(canonical.json(), "eventTimeMs");
+        java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong(
+                eventTime - VolPremiumSessionStore.MAX_FUTURE_SKEW_MS - 1_000L);
+        service.volPremiumClockForTest(clock::get);
+        assertNull(vpOffer(service, 1, canonical), "stamped beyond the skew allowance: refused");
+        clock.set(eventTime - VolPremiumSessionStore.MAX_FUTURE_SKEW_MS);
+        assertNotNull(vpOffer(service, 2, canonical), "at the allowance it is admitted — no poison left behind");
 
-        String before = volPremiumPayload(now - 5_000L);
-        assertEquals(cacheKey, updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                recordAt(settings.volPremiumIvrvTopic(), 0, 100L, VOL_PREMIUM_KEY, before, now),
-                before));
-        assertTrue(service.shouldBroadcastVolPremiumIvrv(cacheKey, 100L));
+        String tomorrow = VolPremiumFixtures.shiftedDays(VolPremiumFixtures.readingAt(6841).json(), 1, "2026-08-28");
+        assertNull(vpOffer(service, 3, "SPX|2026-08-28|6841", tomorrow),
+                "a next-session frame a day ahead of the gateway is the clock fault it looks like");
+        assertEquals(2L, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.FUTURE_EVENT_TIME));
+        List<String> sink = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-late", sink, null));
+        assertEquals(List.of(canonical.json()), vpFrames(sink, VP_OBS), "the series never rolled over");
+    }
 
-        // An ordinary replay — behind the offset AND not newer — is still refused, which is the
-        // property the offset gate exists for.
-        String replay = volPremiumPayload(now - 6_000L);
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 3L, VOL_PREMIUM_KEY, replay,
-                                now), replay),
-                "an older record at a lower offset is a replay and must not be admitted");
+    @Test
+    void aRepeatedOrdinalOnTheSameEpochReplacesItsPointAndNeverRegresses() throws Exception {
+        // The contract's rule (IvRvReading's constructor): a repeated ordinal on the same epoch is a newer
+        // reading of the SAME window and replaces it. Read as a second point, it draws a zero-width
+        // segment; read as a gap, it breaks the line between two readings of one window.
+        FeedGatewayService service = vpService();
+        VolPremiumFixtures.Row canonical = VolPremiumFixtures.canonicalReading();
+        long eventTime = VolPremiumFixtures.longField(canonical.json(), "eventTimeMs");
+        String later = VolPremiumFixtures.with(canonical.json(), "eventTimeMs", eventTime + 1_000L);
 
-        long resets = FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get();
-        // The recreation: offset 0 again, and a genuinely newer reading.
-        String afterRecreation = volPremiumPayload(now - 1_000L);
-        assertEquals(cacheKey, updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 0L, VOL_PREMIUM_KEY,
-                                afterRecreation, now), afterRecreation),
-                "a recreated topic's first frame must be admitted, not held for the whole session");
-        assertEquals(resets + 1, FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get(),
-                "and counted — a recovery nobody can see is indistinguishable from the outage");
-        assertTrue(service.shouldBroadcastVolPremiumIvrv(cacheKey, 0L),
-                "the fence must reset with it, or live clients stay frozen while the cache "
-                        + "recovers and late joiners are served correctly");
+        String position = vpOffer(service, 10, canonical);
+        assertNotNull(position);
+        assertEquals(position, vpOffer(service, 11, canonical.key(), later),
+                "same ordinal, same epoch: the SAME position, replaced");
+        assertEquals(position, vpOffer(service, 12, canonical.key(), later),
+                "an equal-event-time correction at a later offset lands too");
+        assertNull(vpOffer(service, 13, canonical),
+                "a later offset carrying an EARLIER event time is a regression this producer cannot emit");
+        assertNull(vpOffer(service, 5, canonical.key(), later),
+                "a lower offset that is not newer is a replay of something already held");
+        assertEquals(1L, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.EVENT_TIME_REGRESSION));
+        assertEquals(1L, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.REPLAYED_OFFSET));
 
-        // ...and the gates work again from the new incarnation's own offsets.
-        assertFalse(service.shouldBroadcastVolPremiumIvrv(cacheKey, 0L));
-        String next = volPremiumPayload(now - 500L);
-        assertEquals(cacheKey, updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                recordAt(settings.volPremiumIvrvTopic(), 0, 1L, VOL_PREMIUM_KEY, next, now), next));
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 0L, VOL_PREMIUM_KEY, next, now),
-                        next),
-                "a repeat of the new incarnation's offset 0 is a replay again");
+        assertEquals(1, service.volPremiumStoreForTest().heldObservations(), "one window, one point");
+        List<String> sink = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-late", sink, null));
+        assertEquals(List.of(later), vpFrames(sink, VP_OBS), "and it is the newest reading of that window");
+    }
+
+    @Test
+    void aNewMeasurementEpochOnTheSameOrdinalIsASeparatePointWhereTheLineBreaks() throws Exception {
+        // The same ordinal on a DIFFERENT epoch is a different measurement — an accumulator that
+        // restarted inside one cadence window. Keyed by the ordinal alone it would overwrite a point
+        // measured on another basis and join the two with a straight line.
+        FeedGatewayService service = vpService();
+        VolPremiumFixtures.Row first = VolPremiumFixtures.readingAt(6841);
+        VolPremiumFixtures.Row next = VolPremiumFixtures.readingAt(6842);
+        long restartedAt = VolPremiumFixtures.longField(first.json(), "eventTimeMs");
+        String restarted = VolPremiumFixtures.with(first.json(), "measurementEpochMs", restartedAt);
+
+        String original = vpOffer(service, 1, first);
+        String afterRestart = vpOffer(service, 2, first.key(), restarted);
+        assertNotNull(original);
+        assertNotNull(afterRestart);
+        assertNotEquals(original, afterRestart, "two epochs are two positions");
+        assertNotNull(vpOffer(service, 3, next));
+
+        assertEquals(3, service.volPremiumStoreForTest().heldObservations());
+        List<String> sink = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-late", sink, null));
+        assertEquals(List.of(first.json(), restarted, next.json()), vpFrames(sink, VP_OBS),
+                "ordinal first, then epoch: the page sees exactly where the basis changed");
+    }
+
+    /** Row 6840 moved to 01:00 ET of the NEXT session: ordinal 720 there, every instant with it. */
+    private static String vpNextSessionObservation(long eventTimeMs) {
+        String json = VolPremiumFixtures.readingAt(6840).json();
+        json = VolPremiumFixtures.with(json, "sessionDate", "2026-08-28");
+        for (String field : new String[] {"eventTimeMs", "impliedAsOfMs", "spotAsOfMs", "measurementEpochMs"}) {
+            json = VolPremiumFixtures.with(json, field, eventTimeMs);
+        }
+        long nextMidnight = VolPremiumFixtures.SESSION_MIDNIGHT_MS + 86_400_000L;
+        return VolPremiumFixtures.with(json, "frameSeq", (eventTimeMs - nextMidnight) / 5_000L);
+    }
+
+    @Test
+    void aNewerSessionReplacesTheWholeSeriesAndAnOlderOneIsRefused() throws Exception {
+        FeedGatewayService service = service();
+        java.util.concurrent.atomic.AtomicLong clock =
+                new java.util.concurrent.atomic.AtomicLong(VolPremiumFixtures.FIXTURE_NOW_MS);
+        service.volPremiumClockForTest(clock::get);
+        assertNotNull(vpOffer(service, 1, VolPremiumFixtures.readingAt(6840)));
+        assertNotNull(vpOffer(service, 2, VolPremiumFixtures.readingAt(6841)));
+        VolPremiumFixtures.Row warning = VolPremiumFixtures.canonicalWarning();
+        assertNotNull(vpOfferWarning(service, 1, warning.key(), warning.json()));
+
+        // 01:00 ET the next day. The 2026-08-27 session is still CURRENT until 04:00 ET, so what replaces
+        // it here is the newer DATE, not an expiry.
+        long nextSessionAt = VolPremiumFixtures.SESSION_MIDNIGHT_MS + 86_400_000L + 3_600_000L;
+        clock.set(nextSessionAt + 1_000L);
+        assertTrue(VolPremiumSessionStore.sessionCurrent(VolPremiumFixtures.SESSION, clock.get()),
+                "precondition: the older session has not ended");
+        String next = vpNextSessionObservation(nextSessionAt);
+        assertEquals("DATABENTO|SPX|2026-08-28|720|" + nextSessionAt, vpOffer(service, 3, "SPX|2026-08-28|720", next));
 
         List<String> sink = new ArrayList<>();
-        replayVolPremium(service, recordingSession(sink));
-        assertEquals(1, sink.size());
+        replayVolPremium(service, vpSession("vp-late", sink, null));
+        assertEquals(List.of(next), vpFrames(sink, VP_OBS, VP_WARN),
+                "the whole series — observations AND transitions — belongs to one session");
 
-        // A REFUSED record is never a recovery. The counter's HELP text says "records admitted",
-        // and it is the one number an operator has to judge whether this detector is firing on
-        // something it should not, so a count for a record that was never cached and never
-        // broadcast would make that judgement impossible.
-        //
-        // WHAT THIS PINS AND WHAT IT DOES NOT. It pins the ordinary refusal — an older record at a
-        // lower offset advances nothing. It does NOT reach the interleaving where the shape is
-        // recognised and the record is THEN refused by the staleness gate: that needs a stored
-        // entry older than the vol-premium TTL and a candidate newer than it but still expired,
-        // and this harness cannot produce it, because expiry is measured against the wall clock
-        // rather than the injected time and a stale entry cannot be cached in the first place.
-        // The placement is what makes that case correct — both the count and the fence clear now
-        // happen at the point the record is actually admitted, not where its shape is recognised —
-        // and I would rather say that than imply a test proves it.
-        long beforeRefusal = FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get();
-        String older = volPremiumPayload(now - 30L * 60_000L);
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 0L, VOL_PREMIUM_KEY, older,
-                                now), older));
-        assertEquals(beforeRefusal, FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get(),
-                "a record that was refused is not a recovery, whatever shape it had");
+        // An older session never comes back, from either stream, although it has not ended.
+        assertNull(vpOffer(service, 4, VolPremiumFixtures.readingAt(6842)));
+        VolPremiumFixtures.Row olderWarning = VolPremiumFixtures.warnings().get(1);
+        assertNull(vpOfferWarning(service, 2, olderWarning.key(), olderWarning.json()));
+        assertEquals(1L, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.OLDER_SESSION));
+        assertEquals(1L, vpRefusals(service, VolPremiumSessionStore.Stream.WARNING,
+                VolPremiumSessionStore.Refusal.OLDER_SESSION));
 
-        // ...and the recovery is visible OUTSIDE the JVM. A counter only a unit test can read is
-        // not observability: the code's own argument is that a recovery nobody can see is
-        // indistinguishable from the outage it fixed, and an operator has no other way to tell
-        // this detector fired — recreation is inferred from a record's shape, not from an
-        // incarnation token, so an unexpected count is itself the signal that it is firing on
-        // something else.
-        String metrics = service.metrics();
-        assertTrue(metrics.contains("# TYPE gateway_vol_premium_topic_resets_total counter"),
-                "the counter must carry its HELP/TYPE metadata or Prometheus will not type it");
-        assertTrue(metrics.contains("gateway_vol_premium_topic_resets_total "
-                        + FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get()),
-                "and the exported value must be the one the recovery path just moved; got:\n"
-                        + metrics.lines()
-                                .filter(l -> l.contains("vol_premium_topic_resets"))
-                                .reduce("", (a, b) -> a + b + "\n"));
+        // The broadcast fence went with the old session's entries: it cannot outlive them as a floor.
+        VolPremiumSessionStore.Position oldPosition = new VolPremiumSessionStore.Position("DATABENTO|SPX",
+                VolPremiumFixtures.SESSION, VolPremiumSessionStore.Position.OBSERVATIONS, 6840,
+                VolPremiumFixtures.STREAM_FIRST_EVENT_MS, "");
+        assertFalse(service.shouldBroadcastVolPremium(oldPosition, 1_000L), "no entry, no broadcast");
+        VolPremiumSessionStore.Position newPosition = new VolPremiumSessionStore.Position("DATABENTO|SPX",
+                "2026-08-28", VolPremiumSessionStore.Position.OBSERVATIONS, 720, nextSessionAt, "");
+        assertTrue(service.shouldBroadcastVolPremium(newPosition, 3L), "the new session fences from its own offsets");
     }
 
     @Test
-    // A recreation where BOTH incarnations start at offset zero must recover too.
-    void volPremiumIvrvRecoversWhenTheRecreatedTopicRepeatsTheSameOffset() throws Exception {
-        // The old incarnation reached only offset 0 — a topic recreated moments after its first
-        // record, or one whose only frame was the session's first. The new incarnation's first
-        // record is offset 0 as well, so a strictly-lower comparison would drop the very frame the
-        // recovery exists to admit, and the card would stay frozen for the rest of the session.
-        // Equal offset with a strictly NEWER event time is as impossible within one incarnation as
-        // a lower one: an offset identifies a record, and this producer's event times never run
-        // backwards.
+    void anEndedVolPremiumSessionIsNeitherCachedNorReplayedAndAgeAloneRemovesNothing() throws Exception {
         FeedGatewayService service = service();
+        java.util.concurrent.atomic.AtomicLong clock =
+                new java.util.concurrent.atomic.AtomicLong(VolPremiumFixtures.FIXTURE_NOW_MS);
+        service.volPremiumClockForTest(clock::get);
+        assertNotNull(vpOffer(service, 1, VolPremiumFixtures.canonicalReading()));
+
+        // Six hours later — 16:00 ET, the close — the observation is hours old and still the session's.
+        // The old five-minute TTL would have blanked the chart five minutes after its last point.
+        clock.set(VolPremiumFixtures.FIXTURE_NOW_MS + 6L * 3_600_000L);
+        purgeExpiredCache(service, System.currentTimeMillis());
+        List<String> sink = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-close", sink, null));
+        assertEquals(1, vpFrames(sink, VP_OBS).size(), "age alone removes nothing while the session is current");
+
+        // Past the contract's after-hours allowance the session has ended: nothing replays, nothing new
+        // is admitted under it, and the purge drops what was held.
+        clock.set(VolPremiumFixtures.SESSION_LAST_INSTANT_MS + 1L);
+        List<String> late = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-overnight", late, null));
+        assertTrue(late.isEmpty(), "an ended session must never replay as current; got: " + late);
+        assertNull(vpOffer(service, 2, VolPremiumFixtures.readingAt(7142)));
+        assertEquals(1L, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.SESSION_NOT_CURRENT));
+        purgeExpiredCache(service, System.currentTimeMillis());
+        assertEquals(0, service.volPremiumStoreForTest().heldObservations());
+    }
+
+    @Test
+    void volPremiumRecordsAreJudgedOnTheVolPremiumClockNotTheWallClock() throws Exception {
+        // The fixtures are dated 2026-08-27. On the injected clock they are the session they describe; on
+        // the wall clock that session ended long ago, and the SAME record is refused — which is the
+        // gateway working, and exactly why these tests inject the clock rather than date their payloads.
+        FeedGatewayService judged = vpService();
+        assertNotNull(vpOffer(judged, 1, VolPremiumFixtures.canonicalReading()));
+        FeedGatewayService wallClock = service();
+        assertNull(vpOffer(wallClock, 1, VolPremiumFixtures.canonicalReading()));
+        assertEquals(1L, vpRefusals(wallClock, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.SESSION_NOT_CURRENT));
+    }
+
+    @Test
+    void volPremiumReplaysTheWholeSessionToALateJoinerThenItsTransitions() throws Exception {
+        // INVERTED from the one-reading era, which asserted that exactly ONE reading replays. A chart
+        // needs the session: every observation in ordinal order, then the transitions drawn over them.
+        FeedGatewayService service = vpService();
+        List<VolPremiumFixtures.Row> observations = VolPremiumFixtures.readings().subList(290, 320);
+        List<VolPremiumFixtures.Row> transitions = VolPremiumFixtures.warnings().subList(0, 6);
+        long offset = 0;
+        for (VolPremiumFixtures.Row row : observations) {
+            assertNotNull(vpOffer(service, offset++, row), row.key());
+        }
+        for (VolPremiumFixtures.Row row : transitions) {
+            assertNotNull(vpOfferWarning(service, offset++, row.key(), row.json()), row.key());
+        }
+
+        List<String> sink = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-late", sink, null));
+
+        List<String> expected = new ArrayList<>(vpJson(observations));
+        List<VolPremiumFixtures.Row> byEpisode = new ArrayList<>(transitions);   // all six open at 7141
+        byEpisode.sort(java.util.Comparator.comparing(VolPremiumFixtures.Row::key));
+        expected.addAll(vpJson(byEpisode));
+        assertEquals(expected, vpFrames(sink, VP_OBS, VP_WARN), "the WHOLE session, verbatim, in order");
+        List<String> types = new ArrayList<>(java.util.Collections.nCopies(observations.size(), VP_OBS));
+        types.addAll(java.util.Collections.nCopies(transitions.size(), VP_WARN));
+        assertEquals(types, vpTypes(sink), "observations first, then the transitions, each as its own event");
+    }
+
+    @Test
+    void volPremiumReplaysTheWholeSessionOnConnectAndOnThePerSessionReturnToLivePath() throws Exception {
+        // replayCachedToSocket serves per-session (auth) connections AND return-to-live from a historical
+        // replay; addClient serves the legacy connect. Both must deliver the session, not a reading.
+        FeedGatewayService service = vpService();
+        List<VolPremiumFixtures.Row> observations = VolPremiumFixtures.readings().subList(0, 12);
+        long offset = 0;
+        for (VolPremiumFixtures.Row row : observations) {
+            assertNotNull(vpOffer(service, offset++, row));
+        }
+        VolPremiumFixtures.Row warning = VolPremiumFixtures.canonicalWarning();
+        assertNotNull(vpOfferWarning(service, offset++, warning.key(), warning.json()));
+        List<String> expected = new ArrayList<>(vpJson(observations));
+        expected.add(warning.json());
+
+        List<String> perSession = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replayCachedToSocket", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, vpSession("vp-auth", perSession, null));
+        assertEquals(expected, vpFrames(perSession, VP_OBS, VP_WARN));
+
+        service.runOutboundWritesInline();
+        service.markStateCaughtUpWithoutHandoffForTest();
+        List<String> joined = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-legacy", joined, null));
+        assertEquals(expected, vpFrames(joined, VP_OBS, VP_WARN), "through a REAL outbound channel too");
+    }
+
+    /** One partition per topic behind a mocked KafkaConsumer, carrying KEYED records in publication order. */
+    private static final class VpBroker {
+        final Map<String, List<VolPremiumFixtures.Row>> logs = new java.util.concurrent.ConcurrentHashMap<>();
+        final Map<TopicPartition, Long> positions = new java.util.concurrent.ConcurrentHashMap<>();
+        volatile List<TopicPartition> assigned = List.of();
+        final java.util.concurrent.atomic.AtomicInteger polls = new java.util.concurrent.atomic.AtomicInteger();
+        volatile java.util.function.IntConsumer onPoll = n -> { };
+
+        VpBroker topic(String topic, List<VolPremiumFixtures.Row> rows) {
+            logs.put(topic, List.copyOf(rows));
+            return this;
+        }
+
+        long end(TopicPartition p) {
+            List<VolPremiumFixtures.Row> log = logs.get(p.topic());
+            return log == null ? 0L : log.size();
+        }
+
+        @SuppressWarnings("unchecked")
+        KafkaConsumer<String, Object> consumer() {
+            KafkaConsumer<String, Object> c = org.mockito.Mockito.mock(KafkaConsumer.class);
+            org.mockito.Mockito.when(c.listTopics(org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
+                    .thenAnswer(inv -> {
+                        Map<String, List<org.apache.kafka.common.PartitionInfo>> m = new java.util.HashMap<>();
+                        for (String t : logs.keySet()) {
+                            m.put(t, List.of(new org.apache.kafka.common.PartitionInfo(t, 0,
+                                    new org.apache.kafka.common.Node(1, "b", 9092),
+                                    new org.apache.kafka.common.Node[0], new org.apache.kafka.common.Node[0])));
+                        }
+                        return m;
+                    });
+            org.mockito.Mockito.doAnswer(inv -> {
+                assigned = List.copyOf((Collection<TopicPartition>) inv.getArgument(0));
+                return null;
+            }).when(c).assign(org.mockito.ArgumentMatchers.anyCollection());
+            org.mockito.Mockito.when(c.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap())).thenAnswer(inv -> {
+                Map<TopicPartition, Long> ts = (Map<TopicPartition, Long>) inv.getArgument(0);
+                Map<TopicPartition, org.apache.kafka.clients.consumer.OffsetAndTimestamp> out = new java.util.HashMap<>();
+                for (Map.Entry<TopicPartition, Long> e : ts.entrySet()) {
+                    if (end(e.getKey()) > 0) {
+                        out.put(e.getKey(), new org.apache.kafka.clients.consumer.OffsetAndTimestamp(0L, e.getValue()));
+                    }
+                }
+                return out;
+            });
+            org.mockito.Mockito.doAnswer(inv -> {
+                positions.put(inv.getArgument(0), inv.getArgument(1));
+                return null;
+            }).when(c).seek(org.mockito.ArgumentMatchers.any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
+            org.mockito.Mockito.doAnswer(inv -> {
+                for (TopicPartition p : (Collection<TopicPartition>) inv.getArgument(0)) {
+                    positions.put(p, end(p));
+                }
+                return null;
+            }).when(c).seekToEnd(org.mockito.ArgumentMatchers.anyCollection());
+            org.mockito.Mockito.when(c.endOffsets(org.mockito.ArgumentMatchers.anyCollection(),
+                    org.mockito.ArgumentMatchers.any(java.time.Duration.class))).thenAnswer(inv -> {
+                        Map<TopicPartition, Long> out = new java.util.HashMap<>();
+                        for (TopicPartition p : (Collection<TopicPartition>) inv.getArgument(0)) {
+                            out.put(p, end(p));
+                        }
+                        return out;
+                    });
+            org.mockito.Mockito.when(c.position(org.mockito.ArgumentMatchers.any(TopicPartition.class)))
+                    .thenAnswer(inv -> {
+                        TopicPartition p = inv.getArgument(0);
+                        if (!assigned.contains(p)) {
+                            throw new IllegalStateException("not assigned: " + p);
+                        }
+                        return positions.getOrDefault(p, 0L);
+                    });
+            org.mockito.Mockito.when(c.poll(org.mockito.ArgumentMatchers.any(java.time.Duration.class))).thenAnswer(inv -> {
+                onPoll.accept(polls.incrementAndGet());
+                Map<TopicPartition, List<ConsumerRecord<String, Object>>> batch = new java.util.HashMap<>();
+                for (TopicPartition p : assigned) {
+                    long at = positions.getOrDefault(p, 0L);
+                    List<VolPremiumFixtures.Row> log = logs.getOrDefault(p.topic(), List.of());
+                    List<ConsumerRecord<String, Object>> records = new ArrayList<>();
+                    for (long o = at; o < log.size(); o++) {
+                        VolPremiumFixtures.Row row = log.get((int) o);
+                        records.add(new ConsumerRecord<>(p.topic(), 0, o, row.key(), (Object) row.json()));
+                    }
+                    if (!records.isEmpty()) {
+                        batch.put(p, records);
+                        positions.put(p, (long) log.size());
+                    }
+                }
+                return new org.apache.kafka.clients.consumer.ConsumerRecords<>(batch, Map.of());
+            });
+            return c;
+        }
+    }
+
+    @Test
+    void theFullSessionStreamThroughTheConsumerLoopReplaysExactlyItsFinalStateToANewClient() throws Exception {
+        // The engine's whole session — 371 observations and 15 transitions, in publication order —
+        // through the PRODUCTION cache-consumer loop, then a new client. What it receives must be the
+        // stream's FINAL STATE exactly: the last record published for each position, in replay order,
+        // byte for byte (no enrichment, no re-serialisation), and the REST view must be the same state.
+        FeedGatewayService service = vpService();
         GatewaySettings settings = new GatewaySettings();
-        long now = System.currentTimeMillis();
-        String cacheKey = "DATABENTO|" + VOL_PREMIUM_KEY;
+        VpBroker broker = new VpBroker()
+                .topic(settings.volPremiumIvrvTopic(), VolPremiumFixtures.readings())
+                .topic(settings.volPremiumWarningsTopic(), VolPremiumFixtures.warnings());
+        broker.onPoll = n -> {
+            if (n >= 4) {
+                service.setRunningForTest(false);
+            }
+        };
+        Map<String, FeedGatewayService.TopicBinding> events = Map.of(
+                settings.volPremiumIvrvTopic(), new FeedGatewayService.TopicBinding(FeedGatewayService.VOL_PREMIUM_SOURCE, VP_OBS),
+                settings.volPremiumWarningsTopic(), new FeedGatewayService.TopicBinding(FeedGatewayService.VOL_PREMIUM_SOURCE, VP_WARN));
+        // A page that connected while the consumer was still catching up: nothing to replay yet, and the
+        // catch-up records are deliberately not broadcast — so it is owed the session at catch-up.
+        service.runOutboundWritesInline();
+        List<String> waiting = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-waiting", waiting, null));
+        service.setRunningForTest(true);
+        service.runCacheConsumerAttemptForTest("state", events, new java.util.concurrent.atomic.AtomicBoolean(),
+                broker.consumer());
+        assertEquals(371, service.volPremiumStoreForTest().heldObservations(), "every observation was admitted");
+        assertEquals(15, service.volPremiumStoreForTest().heldWarnings(), "every transition was admitted");
 
-        String first = volPremiumPayload(now - 5_000L);
-        assertEquals(cacheKey, updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                recordAt(settings.volPremiumIvrvTopic(), 0, 0L, VOL_PREMIUM_KEY, first, now),
-                first));
+        // The final state, computed from the STREAM alone: last value per position, positions in order.
+        java.util.TreeMap<String, String> observations = new java.util.TreeMap<>();
+        for (VolPremiumFixtures.Row row : VolPremiumFixtures.readings()) {
+            observations.put(String.format("%019d|%019d", VolPremiumFixtures.longField(row.json(), "frameSeq"),
+                    VolPremiumFixtures.longField(row.json(), "measurementEpochMs")), row.json());
+        }
+        java.util.TreeMap<String, String> transitions = new java.util.TreeMap<>();
+        for (VolPremiumFixtures.Row row : VolPremiumFixtures.warnings()) {
+            transitions.put(String.format("%019d|", VolPremiumFixtures.longField(row.json(), "frameSeq"))
+                    + row.key(), row.json());
+        }
+        List<String> expected = new ArrayList<>(observations.values());
+        expected.addAll(transitions.values());
 
-        // The same offset again, carrying an OLDER reading: an ordinary replay, still refused.
-        String replay = volPremiumPayload(now - 6_000L);
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 0L, VOL_PREMIUM_KEY, replay,
-                                now), replay),
-                "an equal offset with an older reading is a replay, not a recreation");
+        List<String> sink = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-new", sink, null));
+        assertEquals(expected, vpFrames(sink, VP_OBS, VP_WARN));
+        assertEquals(371 + 15, sink.size(), "and nothing else: no duplicate, no merged frame");
 
+        VolPremiumSessionStore.Snapshot rest = service.volPremiumSession("SPX");
+        assertEquals(VolPremiumFixtures.SESSION, rest.sessionDate());
+        assertEquals(new ArrayList<>(observations.values()), rest.observations());
+        assertEquals(new ArrayList<>(transitions.values()), rest.warnings());
+
+        // ...and the page that connected during catch-up was re-pushed the same state exactly once.
+        assertEquals(expected, vpFrames(waiting, VP_OBS, VP_WARN),
+                "a socket connected during catch-up is owed the whole session once the consumer catches up");
+    }
+
+    @Test
+    void aSlowSocketReceivesEveryVolPremiumObservationNeverACoalescedOne() throws Exception {
+        // The one-reading relay COALESCED vol-premium frames: behind a slow socket only the newest queued
+        // one survived, so the page lost every observation in between and drew a line across them.
+        FeedGatewayService service = vpService();
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        List<String> sink = new CopyOnWriteArrayList<>();
+        // The state consumer has not caught up, so there is no replay: every frame below is LIVE.
+        service.addClient(vpSession("vp-slow", sink, release));
+        List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings().subList(0, 50);
+        long offset = 0;
+        for (VolPremiumFixtures.Row row : rows) {
+            vpRelay(service, offset++, row);   // all fifty queue behind the socket's first, stuck write
+        }
+        assertTrue(service.metrics().contains("options_edge_gateway_ws_coalesced_total 0\n"),
+                "nothing may be merged while the socket is stuck");
+
+        release.countDown();
+        vpAwait(() -> vpFrames(sink, VP_OBS).size() >= rows.size(), 10_000L);
+        assertEquals(vpJson(rows), vpFrames(sink, VP_OBS), "every observation, once, in order");
+        assertTrue(service.metrics().contains("options_edge_gateway_ws_coalesced_total 0\n"));
+    }
+
+    @Test
+    void aWholeSessionReplayIsPacedAgainstTheSocketBoundsNotFloodedIntoThem() throws Exception {
+        // 371 observations against a socket bounded at 40 queued messages. Flushed at once, the replay
+        // itself would breach the bound and disconnect the joiner as a slow client — every late joiner,
+        // every reconnect, from mid-morning on.
+        System.setProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "40");
+        try {
+            FeedGatewayService service = vpService();
+            long offset = 0;
+            for (VolPremiumFixtures.Row row : VolPremiumFixtures.readings()) {
+                assertNotNull(vpOffer(service, offset++, row));
+            }
+            service.markStateCaughtUpWithoutHandoffForTest();
+            java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+            List<String> sink = new CopyOnWriteArrayList<>();
+            service.addClient(vpSession("vp-paced", sink, release));   // the writer is stuck on the first frame
+
+            OutboundChannel channel = service.outboundChannelForTest("vp-paced");
+            assertNotNull(channel);
+            assertFalse(channel.isClosed(), "the replay must not overflow the bound it paces against");
+            assertTrue(channel.queueDepth() <= 40, "queued " + channel.queueDepth());
+
+            release.countDown();
+            vpAwait(() -> vpFrames(sink, VP_OBS).size() >= 371, 20_000L);
+            assertEquals(vpJson(VolPremiumFixtures.readings()), vpFrames(sink, VP_OBS),
+                    "the whole session still arrives, in order, as the socket drains");
+            assertFalse(channel.isClosed());
+            assertTrue(service.metrics().contains("options_edge_gateway_ws_slow_disconnects_total 0\n"));
+        } finally {
+            System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
+        }
+    }
+
+    @Test
+    void liveObservationsWaitForASocketsReplayAndArriveInOrderExactlyOnce() throws Exception {
+        // A live observation for a socket still being replayed is NOT sent at once: the replay will reach
+        // it, in order. Sent now it would overtake the older points queued ahead of it and then arrive a
+        // second time. A replacement of a point the replay already handed over goes at once, after it.
+        System.setProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "40");
+        try {
+            FeedGatewayService service = vpService();
+            List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+            long offset = 0;
+            for (int i = 0; i < 100; i++) {
+                assertNotNull(vpOffer(service, offset++, rows.get(i)));
+            }
+            service.markStateCaughtUpWithoutHandoffForTest();
+            java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+            List<String> sink = new CopyOnWriteArrayList<>();
+            service.addClient(vpSession("vp-live", sink, release));   // replay held a few points in
+
+            for (int i = 100; i < 120; i++) {
+                vpRelay(service, offset++, rows.get(i));
+            }
+            VolPremiumFixtures.Row third = rows.get(3);
+            String replaced = VolPremiumFixtures.with(third.json(), "eventTimeMs",
+                    VolPremiumFixtures.longField(third.json(), "eventTimeMs") + 1_000L);
+            vpRelay(service, VP_OBS, offset++, third.key(), replaced);
+
+            release.countDown();
+            vpAwait(() -> vpFrames(sink, VP_OBS).size() >= 121, 20_000L);
+            Thread.sleep(200L);   // a duplicate, if any, would land now
+            List<String> got = vpFrames(sink, VP_OBS);
+            assertEquals(121, got.size(), "every observation exactly once, plus the one replacement");
+            int replacedAt = got.indexOf(replaced);
+            assertTrue(replacedAt > got.indexOf(third.json()), "the replacement follows the point it replaces");
+            List<String> originals = new ArrayList<>(got);
+            originals.remove(replacedAt);
+            assertEquals(vpJson(rows.subList(0, 120)), originals, "and the rest arrive in ordinal order");
+        } finally {
+            System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
+        }
+    }
+
+    @Test
+    void volPremiumWarningsAreContractValidatedCachedAndForwardedLiveAsTheirOwnEvent() throws Exception {
+        FeedGatewayService service = vpService();
+        VolPremiumFixtures.Row warning = VolPremiumFixtures.canonicalWarning();
+        String json = warning.json();
+        long offset = 1;
+        // The topic is keyed by episodeId, and the key must be EXACTLY the record's own.
+        assertNull(vpOfferWarning(service, offset++, "SPX|2026-08-27|7141", json), "an observation's key");
+        assertNull(vpOfferWarning(service, offset++, "SPX|2026-08-27|IV_EXPANSION_DEVELOPING|7142", json));
+        assertNull(vpOfferWarning(service, offset++, null, json));
+        assertEquals(3L, vpRefusals(service, VolPremiumSessionStore.Stream.WARNING,
+                VolPremiumSessionStore.Refusal.KEY_MISMATCH));
+        // EarlyWarning re-derives the strength and the state from the raw evidence under the hashed
+        // parameter set, so a record whose numbers disagree with its evidence is refused.
+        String[][] broken = {
+                {"a strength its components do not produce", VolPremiumFixtures.with(json, "strength", 1)},
+                {"a transition outside the frozen set", VolPremiumFixtures.with(json, "previousState", "STRONG")},
+                {"a foreign schema version", VolPremiumFixtures.with(json, "schemaVersion", 2)},
+                {"trailing tokens", json + "[]"}};
+        for (String[] c : broken) {
+            assertNull(vpOfferWarning(service, offset++, warning.key(), c[1]), c[0] + " must be refused");
+        }
+        List<String> fields = vpFieldNames(json);
+        for (String field : fields) {
+            assertNull(vpOfferWarning(service, offset++, warning.key(), VolPremiumFixtures.without(json, field)),
+                    "a warning missing " + field + " must be refused");
+        }
+        assertEquals(broken.length + fields.size(), vpRefusals(service, VolPremiumSessionStore.Stream.WARNING,
+                VolPremiumSessionStore.Refusal.MALFORMED));
+
+        assertEquals("DATABENTO|SPX|2026-08-27|W|7141|" + warning.key(),
+                vpOfferWarning(service, offset++, warning.key(), json));
+
+        // LIVE: its own event type, verbatim, and never coalesced — two transitions of one frame both arrive.
+        service.runOutboundWritesInline();
+        List<String> live = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-live", live, null));   // no replay: the state consumer has not caught up
+        VolPremiumFixtures.Row second = VolPremiumFixtures.warnings().get(1);
+        VolPremiumFixtures.Row third = VolPremiumFixtures.warnings().get(2);
+        vpRelay(service, VP_WARN, offset++, second.key(), second.json());
+        vpRelay(service, VP_WARN, offset++, third.key(), third.json());
+        assertEquals(List.of(second.json(), third.json()), vpFrames(live, VP_WARN));
+
+        // A late joiner gets the transitions AFTER the session's observations.
+        VolPremiumFixtures.Row reading = VolPremiumFixtures.canonicalReading();
+        assertNotNull(vpOffer(service, offset++, reading));
+        List<String> late = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-late", late, null));
+        List<VolPremiumFixtures.Row> held = new ArrayList<>(List.of(warning, second, third));
+        held.sort(java.util.Comparator.comparing(VolPremiumFixtures.Row::key));   // all at ordinal 7141
+        List<String> expected = new ArrayList<>(List.of(reading.json()));
+        expected.addAll(vpJson(held));
+        assertEquals(expected, vpFrames(late, VP_OBS, VP_WARN));
+    }
+
+    @Test
+    void aRecreatedTopicRecoversPerObservationAndNeverReplaysTheOldIncarnation() throws Exception {
+        // A deleted-and-remade topic starts again at offset zero. Per observation, a NEW ordinal needs no
+        // recovery at all — nothing fences it — and a re-published ordinal is recognised by the only shape
+        // no single incarnation can produce: at or behind the held offset, yet strictly newer.
+        FeedGatewayService service = vpService();
+        service.runOutboundWritesInline();
+        List<String> live = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-live", live, null));
+        List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+        for (int i = 0; i < 5; i++) {
+            vpRelay(service, 100 + i, rows.get(i));   // the old incarnation reached offset 104
+        }
         long resets = FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get();
-        String recreated = volPremiumPayload(now - 1_000L);
-        assertEquals(cacheKey, updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 0L, VOL_PREMIUM_KEY, recreated,
-                                now), recreated),
-                "the recreated topic's first frame is offset 0 too, and must still be admitted");
-        assertEquals(resets + 1, FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get());
-        assertTrue(service.shouldBroadcastVolPremiumIvrv(cacheKey, 0L),
-                "and the fence resets with it");
+
+        vpRelay(service, 0, rows.get(5));   // recreated: offsets restart, new ordinals flow at once
+        vpRelay(service, 1, rows.get(6));
+        VolPremiumFixtures.Row fourth = rows.get(4);
+        String republished = VolPremiumFixtures.with(fourth.json(), "eventTimeMs",
+                VolPremiumFixtures.longField(fourth.json(), "eventTimeMs") + 1_000L);
+        vpRelay(service, VP_OBS, 2, fourth.key(), republished);   // the same ordinal, newer, behind offset 104
+        assertEquals(resets + 1, FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get(), "counted: a recovery");
+
+        vpRelay(service, 3, rows.get(3));     // same content at a lower offset, not newer: a replay
+        vpRelay(service, 104, rows.get(4));   // the old incarnation's record again: an event-time regression
+        assertEquals(resets + 1, FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get(),
+                "a refused record is never a recovery, whatever its shape");
+
+        List<String> expected = new ArrayList<>(vpJson(rows.subList(0, 7)));
+        expected.add(republished);
+        assertEquals(expected, vpFrames(live, VP_OBS), "the new incarnation's frames reached the live socket");
+        assertTrue(service.metrics().contains("gateway_vol_premium_topic_resets_total "
+                + FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get() + "\n"), "and the recovery is exported");
+
+        // Both incarnations at offset 0 — a topic recreated moments after its first record.
+        FeedGatewayService equalOffsets = vpService();
+        VolPremiumFixtures.Row seventh = rows.get(7);
+        long t = VolPremiumFixtures.longField(seventh.json(), "eventTimeMs");
+        assertNotNull(vpOffer(equalOffsets, 0, seventh.key(), VolPremiumFixtures.with(seventh.json(), "eventTimeMs", t + 1_000L)));
+        assertNull(vpOffer(equalOffsets, 0, seventh), "an equal offset with an older reading is a replay");
+        long before = FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get();
+        assertNotNull(vpOffer(equalOffsets, 0, seventh.key(), VolPremiumFixtures.with(seventh.json(), "eventTimeMs", t + 2_000L)),
+                "an equal offset with a strictly newer reading is the recreated topic's first record");
+        assertEquals(before + 1, FeedGatewayService.VOL_PREMIUM_TOPIC_RESETS.get());
+
+        // The fence: exactly once per offset, per position, never backwards.
+        VolPremiumSessionStore.Position sixth = new VolPremiumSessionStore.Position("DATABENTO|SPX",
+                VolPremiumFixtures.SESSION, VolPremiumSessionStore.Position.OBSERVATIONS, 6846,
+                VolPremiumFixtures.STREAM_FIRST_EVENT_MS, "");
+        assertFalse(service.shouldBroadcastVolPremium(sixth, 1L), "offset 1 was already broadcast for it");
+        assertTrue(service.shouldBroadcastVolPremium(sixth, 7L));
+        assertFalse(service.shouldBroadcastVolPremium(sixth, 6L), "an earlier offset never after a later one");
+    }
+
+    @Test
+    void volPremiumPartitionsAreNeverLagSkipped() {
+        // The lag guard answers a backlog with seekToEnd across every selected partition. For these
+        // streams that cuts a hole in the session chart that no later record repairs.
+        TopicPartition partition = new TopicPartition(com.optionsedge.contracts.volpremium.VolPremiumTopics.IVRV, 0);
+        KafkaConsumer<?, ?> consumer = org.mockito.Mockito.mock(KafkaConsumer.class);
+        org.mockito.Mockito.when(consumer.endOffsets(org.mockito.ArgumentMatchers.anyCollection(),
+                org.mockito.ArgumentMatchers.any(java.time.Duration.class))).thenReturn(Map.of(partition, 5_000_000L));
+        org.mockito.Mockito.when(consumer.position(partition)).thenReturn(0L);
+        for (String event : List.of(VP_OBS, VP_WARN)) {
+            FeedGatewayService service = service();
+            service.applySelectionForTest("DATABENTO", "SPX", "20260827", 1L);
+            assertFalse(service.lagSkipFiredForTest(consumer, List.of(partition), "DATABENTO", event, Set.of()),
+                    event + " must never be sought to END");
+        }
+        FeedGatewayService control = service();
+        control.applySelectionForTest("DATABENTO", "SPX", "20260827", 1L);
+        assertTrue(control.lagSkipFiredForTest(consumer, List.of(partition), "DATABENTO", "snapshot", Set.of()),
+                "the same backlog does fire for an ordinary stream — the exemption is load-bearing");
     }
 
     @Test
@@ -2826,348 +3410,6 @@ class FeedGatewayServiceTest {
         assertFalse(body.contains("synchronized ("),
                 "removeCacheEntry must not acquire another lock — ingest holds the emit lock and "
                         + "then this monitor, so taking them in the other order deadlocks");
-    }
-
-    @Test
-    void volPremiumIvrvAcceptsAnEqualTimeCorrectionAndRefusesARegression() throws Exception {
-        // The two rules divide the work. The producer stamps each reading with Streams stream
-        // time, which never runs backwards, so an EQUAL event time at a later offset is the
-        // correction case and must be accepted, while a strictly EARLIER one is corrupt and must
-        // not be — which is exactly what the browser does with its own series. A gateway that
-        // accepted a regression the browser then discarded would let a live client and a late
-        // joiner diverge with nothing failing on either side.
-        FeedGatewayService service = service();
-        GatewaySettings settings = new GatewaySettings();
-        long now = System.currentTimeMillis();
-        long eventTime = now - 10_000L;
-
-        String first = volPremiumPayload(eventTime);
-        assertEquals("DATABENTO|" + VOL_PREMIUM_KEY,
-                updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 5L, VOL_PREMIUM_KEY, first,
-                                now), first));
-
-        // same event time, later offset: a correction, and it must land
-        String correction = volPremiumPayload(eventTime);
-        assertEquals("DATABENTO|" + VOL_PREMIUM_KEY,
-                updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 6L, VOL_PREMIUM_KEY,
-                                correction, now), correction),
-                "an equal-event-time correction at a later offset must be accepted");
-
-        // strictly earlier event time: impossible from this producer, so refused
-        String regressed = volPremiumPayload(eventTime - 10_000L);
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 7L, VOL_PREMIUM_KEY,
-                                regressed, now), regressed),
-                "an event-time regression cannot come from this producer and must be refused, "
-                        + "matching what the browser does with the same frame");
-    }
-
-    @Test
-    void volPremiumIvrvMalformedIdentityCannotEvictAGoodCachedReading() throws Exception {
-        // The Kafka key for this topic already IS "SPX|sessionDate", so a fallback to it handed a
-        // payload missing its own identity the SAME cache slot as the good value — at a higher
-        // offset, so it won the ordering gate, overwrote a still-fresh reading and broadcast
-        // itself. Live browsers reject it; a late joiner is served only that.
-        FeedGatewayService service = service();
-        GatewaySettings settings = new GatewaySettings();
-        long now = System.currentTimeMillis();
-        String good = volPremiumPayload(now - 5_000L);
-        assertEquals("DATABENTO|" + VOL_PREMIUM_KEY,
-                updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 1L, VOL_PREMIUM_KEY, good,
-                                now), good));
-
-        String noIdentity = "{\"schemaVersion\":1,\"eventTimeMs\":" + (now - 1_000L) + "}";
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 2L, VOL_PREMIUM_KEY,
-                                noIdentity, now), noIdentity),
-                "a payload without its own identity must be dropped, never keyed by the topic key");
-
-        List<String> sink = new ArrayList<>();
-        replayVolPremium(service, recordingSession(sink));
-        assertEquals(1, sink.size());
-        assertTrue(sink.get(0).contains("\"realisedVolPct\":12.0"),
-                "the good reading must survive for a late joiner; got: " + sink);
-    }
-
-    @Test
-    // A CONTRACT-invalid vol-premium payload cannot evict a good cached reading.
-    void volPremiumIvrvContractInvalidPayloadCannotEvictAGoodCachedReading() throws Exception {
-        // Identity alone is not enough. Each of these carries a perfectly valid symbol, session
-        // date and event time — so it passes freshness and lands on the SAME cache slot at a
-        // higher offset — while its body is one the contract refuses. Admitted, it evicts a
-        // still-fresh reading and is broadcast in its place: live browsers reject it and keep what
-        // they have, but a late joiner is served only the broken value and shows nothing.
-        FeedGatewayService service = service();
-        GatewaySettings settings = new GatewaySettings();
-        long now = System.currentTimeMillis();
-        String good = volPremiumPayload(now - 5_000L);
-        assertEquals("DATABENTO|" + VOL_PREMIUM_KEY,
-                updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, 1L, VOL_PREMIUM_KEY, good,
-                                now), good));
-
-        long offset = 2L;
-        for (String[] c : new String[][] {
-                {"a foreign schema version", "\"schemaVersion\":1", "\"schemaVersion\":2"},
-                {"an ordinal that disagrees with its own timestamp",
-                        "\"frameSeq\":" + volPremiumFrameSeq(now - 1_000L), "\"frameSeq\":1"},
-                {"a coverage outside [0,1]", "\"gridCoverage\":0.94", "\"gridCoverage\":1.4"},
-                {"a spread that disagrees with its own two lines",
-                        "\"impliedMinusRealisedPct\":6.0", "\"impliedMinusRealisedPct\":9.9"},
-                {"a measurement epoch from another day",
-                        "\"measurementEpochMs\":" + VOL_PREMIUM_EPOCH,
-                        "\"measurementEpochMs\":" + (VOL_PREMIUM_EPOCH - 86_400_000L)},
-                {"a realised vol resting on no coverage at all",
-                        "\"gridCoverage\":0.94", "\"gridCoverage\":0.0"},
-                {"a cadence outside the contract's bounds",
-                        "\"frameCadenceMs\":5000", "\"frameCadenceMs\":99"}}) {
-            String broken = volPremiumPayload(now - 1_000L).replace(c[1], c[2]);
-            assertNotEquals(volPremiumPayload(now - 1_000L), broken,
-                    "fixture must actually differ for: " + c[0]);
-            assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                            recordAt(settings.volPremiumIvrvTopic(), 0, offset++, VOL_PREMIUM_KEY,
-                                    broken, now), broken),
-                    c[0] + " must be dropped, not cached");
-        }
-
-        // EVERY required field must be PRESENT, not merely valid when it happens to be there.
-        // Jackson fills a missing record component with the Java default, so deleting an int field
-        // deserialises to a valid-looking zero while the browser refuses the payload outright —
-        // the live client keeps what it has and a late joiner is served only the broken record.
-        for (String field : new String[] {"schemaVersion", "symbol", "sessionDate", "eventTimeMs",
-                "atmIvPct", "impliedAsOfMs", "realisedVolPct", "impliedMinusRealisedPct",
-                "gridCoverage", "maxContiguousGapSlots", "returnsObserved", "measurementEpochMs",
-                "frameSeq", "frameCadenceMs", "baselineMode", "codeVersion"}) {
-            String full = volPremiumPayload(now - 1_000L);
-            String without = deleteJsonField(full, field);
-            assertNotEquals(full, without, "fixture must actually drop: " + field);
-            assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                            recordAt(settings.volPremiumIvrvTopic(), 0, offset++, VOL_PREMIUM_KEY,
-                                    without, now), without),
-                    "a payload missing " + field + " must be dropped, not defaulted");
-        }
-
-        // ...and the adjacent door: an EXPLICIT null for a PRIMITIVE component is converted to
-        // the Java default just as a missing one is, so "maxContiguousGapSlots": null arrives as a
-        // valid-looking zero by a different route while the browser refuses it outright.
-        for (String field : new String[] {"schemaVersion", "eventTimeMs", "gridCoverage",
-                "maxContiguousGapSlots", "returnsObserved", "measurementEpochMs", "frameSeq",
-                "frameCadenceMs"}) {
-            String nulled = nullJsonField(volPremiumPayload(now - 1_000L), field);
-            assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                            recordAt(settings.volPremiumIvrvTopic(), 0, offset++, VOL_PREMIUM_KEY,
-                                    nulled, now), nulled),
-                    "an explicit null " + field + " must be dropped, not defaulted");
-        }
-
-        // An ISO EXPANDED year parses as a date but is not the declared yyyy-MM-dd grammar, and
-        // the browser refuses it — so admitting it here would cache and broadcast a record that is
-        // then never drawn. The three boundaries have to agree on the grammar, not just on the
-        // calendar.
-        for (String badDate : new String[] {"+10000-01-01", "-0001-01-01", "2026-8-05",
-                "20260805"}) {
-            String odd = volPremiumPayload(now - 1_000L)
-                    .replace("\"sessionDate\":\"" + VOL_PREMIUM_SESSION + "\"",
-                            "\"sessionDate\":\"" + badDate + "\"");
-            assertNotEquals(volPremiumPayload(now - 1_000L), odd, "fixture must differ: " + badDate);
-            assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                            recordAt(settings.volPremiumIvrvTopic(), 0, offset++, VOL_PREMIUM_KEY,
-                                    odd, now), odd),
-                    badDate + " is not the declared grammar and must be dropped");
-        }
-
-        // A record whose KEY names a different session than its body is refused too: the key is
-        // what compaction and last-write-wins act on, so a mismatch lets one session's record hold
-        // another session's slot.
-        String mismatched = volPremiumPayload(now - 1_000L);
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, offset++,
-                                    "SPX|" + java.time.LocalDate.parse(VOL_PREMIUM_SESSION)
-                                            .minusDays(1),
-                                mismatched, now), mismatched),
-                "the record key must agree with the identity in the payload");
-
-        List<String> sink = new ArrayList<>();
-        replayVolPremium(service, recordingSession(sink));
-        assertEquals(1, sink.size());
-        assertTrue(sink.get(0).contains("\"realisedVolPct\":12.0"),
-                "the good reading must survive for a late joiner; got: " + sink);
-
-        // ...and a well-formed newer reading still gets through, so this is a boundary and not a
-        // wall: a validator that refused everything would pass every test above and blank the card.
-        String newer = volPremiumPayload(now - 500L);
-        assertEquals("DATABENTO|" + VOL_PREMIUM_KEY,
-                updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, offset++, VOL_PREMIUM_KEY,
-                                newer, now), newer));
-
-        // The BOXED fields are null on purpose and must still be admitted — a boundary that
-        // refused them would pass every assertion above and blank the card whenever either half of
-        // the pair went absent, which is the failure this card exists to avoid.
-        //
-        // BOTH shapes, because they are different production states and a rule that admitted one
-        // could reject the other. Implied-absent is the quiet or unprovable chain; realised-absent
-        // is the warming grid and the spot outage. The spread follows: the contract requires it
-        // present exactly when both lines are.
-        String impliedAbsent = nullJsonField(nullJsonField(nullJsonField(
-                volPremiumPayload(now - 400L), "atmIvPct"), "impliedAsOfMs"),
-                "impliedMinusRealisedPct");
-        assertEquals("DATABENTO|" + VOL_PREMIUM_KEY,
-                updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, offset++, VOL_PREMIUM_KEY,
-                                impliedAbsent, now), impliedAbsent),
-                "a reading with no implied side is ordinary, not malformed");
-
-        String realisedAbsent = nullJsonField(nullJsonField(
-                volPremiumPayload(now - 300L), "realisedVolPct"), "impliedMinusRealisedPct");
-        assertEquals("DATABENTO|" + VOL_PREMIUM_KEY,
-                updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, offset++, VOL_PREMIUM_KEY,
-                                realisedAbsent, now), realisedAbsent),
-                "nor is a warming grid or a spot outage — the realised side is absent for whole "
-                        + "minutes of an ordinary session open");
-
-        // ...and all four at once is NOT well formed, whatever a producer chooses to emit. A frame
-        // carrying neither volatility measured nothing, and the producer's own rule is that such a
-        // tick publishes nothing and leaves a gap in the ordinals. Admitted here it would take a
-        // higher offset on a compacted topic, evict the good current reading, and leave a late
-        // joiner with a card that says nothing at all — strictly worse than the gap it replaced.
-        String nothingMeasured = nullJsonField(nullJsonField(nullJsonField(nullJsonField(
-                volPremiumPayload(now - 200L), "atmIvPct"), "impliedAsOfMs"), "realisedVolPct"),
-                "impliedMinusRealisedPct");
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, offset++, VOL_PREMIUM_KEY,
-                                nothingMeasured, now), nothingMeasured),
-                "a frame that measured nothing is not a reading");
-
-        // A ZERO implied vol is refused too, while a zero REALISED vol is admitted: a session that
-        // did not move has a realised vol of exactly zero, and 0.00% implied says the market is
-        // pricing no risk at all.
-        String zeroImplied = volPremiumPayload(now - 150L)
-                .replace("\"atmIvPct\":18.0", "\"atmIvPct\":0.0")
-                .replace("\"impliedMinusRealisedPct\":6.0", "\"impliedMinusRealisedPct\":-12.0");
-        assertNull(updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, offset++, VOL_PREMIUM_KEY,
-                                zeroImplied, now), zeroImplied),
-                "a zero implied vol is the most dangerous number this card can show");
-        String zeroRealised = volPremiumPayload(now - 100L)
-                .replace("\"realisedVolPct\":12.0", "\"realisedVolPct\":0.0")
-                .replace("\"impliedMinusRealisedPct\":6.0", "\"impliedMinusRealisedPct\":18.0");
-        assertEquals("DATABENTO|" + VOL_PREMIUM_KEY,
-                updateCache(service, topicBinding("DATABENTO", "vol-premium-ivrv"),
-                        recordAt(settings.volPremiumIvrvTopic(), 0, offset++, VOL_PREMIUM_KEY,
-                                zeroRealised, now), zeroRealised),
-                "a session that did not move has a realised vol of zero, and that is a measurement");
-    }
-
-    @Test
-    // The vol-premium fixtures must remain valid on any day this suite is run.
-    void volPremiumFixturesAreNotDateBombed() {
-        // These fixtures pair wall-clock event times with a session date. Hardcode the date and the
-        // pairing expires: IvRvReading refuses a frame whose session lags its event time by more
-        // than a day, so the whole group starts failing two days after it was written for a reason
-        // that has nothing to do with the gateway. Asserted against the CONTRACT rather than
-        // against a string, so it fails the same way the suite would.
-        long now = System.currentTimeMillis();
-        for (long eventTimeMs : new long[] {now - 6L * 60_000L, now - 5_000L, now,
-                now + 60L * 60_000L}) {
-            String payload = volPremiumPayload(eventTimeMs);
-            try {
-                new com.fasterxml.jackson.databind.ObjectMapper().readValue(payload,
-                        com.optionsedge.contracts.volpremium.IvRvReading.class);
-            } catch (Exception refused) {
-                throw new AssertionError("fixture must satisfy the contract at event time "
-                        + eventTimeMs + ": " + refused.getMessage(), refused);
-            }
-        }
-        // ...and the key the tests pair with those payloads is the one the producer would use.
-        assertEquals(VOL_PREMIUM_KEY, "SPX|" + VOL_PREMIUM_SESSION);
-    }
-
-    private static final java.time.ZoneId VOL_PREMIUM_ET =
-            java.time.ZoneId.of("America/New_York");
-
-    /**
-     * The ET session these fixtures are dated to — DERIVED, never a literal.
-     *
-     * <p>The vol-premium tests build event times from the wall clock, because that is what the
-     * gateway's own freshness gate compares against. Pairing those with a hardcoded session date
-     * is a date bomb: IvRvReading refuses a frame whose session lags its event time by more than
-     * one day, so a fixed date makes the whole group start failing two days after it was written,
-     * for a reason that has nothing to do with the gateway.
-     *
-     * <p>Taken two hours BEHIND now rather than from now itself, which bounds the other direction.
-     * A session dated AFTER its own event time is refused outright, so a fixture built at 00:03 ET
-     * with an event time of "now minus six minutes" would fail — a real flake, in a two-hour
-     * window each night that nobody runs tests in and everybody's CI eventually does. Two hours
-     * back keeps every event time these tests use (from six minutes behind to an hour ahead)
-     * inside the one-day lag the contract allows.
-     */
-    private static final String VOL_PREMIUM_SESSION = java.time.LocalDate.ofInstant(
-            java.time.Instant.now().minusSeconds(7_200L), VOL_PREMIUM_ET).toString();
-
-    /** The record key the producer would use for this session: it keys by SYMBOL|sessionDate. */
-    private static final String VOL_PREMIUM_KEY = "SPX|" + VOL_PREMIUM_SESSION;
-
-    /** ET midnight of that session — the earliest value the measurement epoch may take. */
-    private static final long VOL_PREMIUM_EPOCH = java.time.LocalDate.parse(VOL_PREMIUM_SESSION)
-            .atStartOfDay(VOL_PREMIUM_ET).toInstant().toEpochMilli();
-
-    /** Sets one top-level field to an explicit JSON null. */
-    private static String nullJsonField(String json, String field) {
-        try {
-            com.fasterxml.jackson.databind.node.ObjectNode node =
-                    (com.fasterxml.jackson.databind.node.ObjectNode)
-                            new com.fasterxml.jackson.databind.ObjectMapper().readTree(json);
-            node.putNull(field);
-            return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(node);
-        } catch (Exception e) {
-            throw new AssertionError("fixture is not a flat JSON object", e);
-        }
-    }
-
-    /** Removes one top-level field from a flat JSON object, leaving the rest byte-identical. */
-    private static String deleteJsonField(String json, String field) {
-        com.fasterxml.jackson.databind.node.ObjectNode node;
-        try {
-            node = (com.fasterxml.jackson.databind.node.ObjectNode)
-                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(json);
-            node.remove(field);
-            return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(node);
-        } catch (Exception e) {
-            throw new AssertionError("fixture is not a flat JSON object", e);
-        }
-    }
-
-    private static long volPremiumFrameSeq(long eventTimeMs) {
-        return Math.floorDiv(eventTimeMs - VOL_PREMIUM_EPOCH, 5_000L);
-    }
-
-    private static String volPremiumPayload(long eventTimeMs) {
-        return "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"sessionDate\":\""
-                + VOL_PREMIUM_SESSION + "\","
-                + "\"eventTimeMs\":" + eventTimeMs + ",\"atmIvPct\":18.0,"
-                // Carried forward from the newest complete chain snapshot, so it is at or before
-                // the frame's own time — the contract requires exactly that.
-                + "\"impliedAsOfMs\":" + (eventTimeMs - 2_000L) + ","
-                + "\"realisedVolPct\":12.0,"
-                + "\"impliedMinusRealisedPct\":6.0,\"gridCoverage\":0.94,"
-                + "\"maxContiguousGapSlots\":2,\"returnsObserved\":120,"
-                // The accumulator behind the realised figure. Constant across every frame in a
-                // session by design — the field's whole job is to stay put while the frame time
-                // moves, and a fixture that moved it with the frame would model a producer
-                // restarting on every tick.
-                + "\"measurementEpochMs\":" + VOL_PREMIUM_EPOCH + ","
-                // frameSeq is DERIVED — floor((eventTimeMs - ET session midnight) / cadence) — and
-                // the contract now refuses a reading whose ordinal disagrees with its own
-                // timestamp. A hardcoded value would make this fixture invalid the moment the
-                // interpolated event time moved.
-                + "\"frameSeq\":" + volPremiumFrameSeq(eventTimeMs) + ","
-                + "\"frameCadenceMs\":5000,"
-                + "\"baselineMode\":\"UNCALIBRATED\",\"codeVersion\":\"abc1234\"}";
     }
 
     // ----- Candle Direction CURRENT decision relay ---------------------------------------------------
