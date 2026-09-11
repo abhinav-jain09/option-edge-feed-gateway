@@ -263,3 +263,95 @@ The requested bars are:
 
 VERDICT: REQUEST_CHANGES
 Main still permits withdrawn evidence after control, leaves late-adopted strike replay loading indefinitely, and understates retained storage.
+
+## Re-review (round 2) — Codex re-review of `c18c618` (2026-09-11)
+
+Verdict: **REQUEST_CHANGES**, three findings (verbatim below). Folded on `fix/footprint-strike-gw-r2` and pushed to
+`fix/footprint-strike-final-review` (PR #182) as a fast-forward of `c18c618`. Not re-reviewed yet: no `VERDICT: APPROVE`
+exists for this change.
+
+### Disposition
+
+| # | Finding | Disposition | What changed | Pinning tests |
+|---|---|---|---|---|
+| 1 | **[P1]** A slow socket can stall both strike consumers and healthy sockets (the drainer holds `drainLock` through fan-out; `OutboundChannel` closes an overflowing session synchronously, and that close can block behind the socket's outstanding write) | **FIXED** | `OutboundChannel.close` now only marks the channel closed, drops its queue and counts; the session close and then `onClose` run on a teardown executor, never on the thread that detected the breach. The default (`TEARDOWN_ON_OWN_THREAD`) runs each teardown on its own daemon thread `options-edge-ws-closer`: at most one per channel (the close is exactly-once by CAS), ending when the session close returns; an executor that rejects falls back to the same, never to inline. Order inside the teardown: session close, then `onClose` — so until the close returns the channel stays registered and CLOSED, every enqueue to it is refused at once, and no sender can find "no channel" and fall back to `enqueueOutbound`'s direct `session.sendMessage`. This is the rule for every stream the gateway serves and for all three breach paths (overflow on an enqueuer, write error on a writer, deadline on the watchdog — which could previously block the shared batch executor the same way). Kept for every user: refused enqueue, dropped queue, `disconnectedSlow`/`writeError`/`droppedOnClose` metrics (still synchronous), `onClose` exactly once, the socket always closed. Changed: the session close and `onClose` are no longer complete when `enqueue`/`enforceWriteDeadline` returns (`OutboundChannelTest.writeDeadlineForceClosesAStuckSend` now verifies the close with a timeout). No thread or permit leak: nothing is acquired per close except its one thread, which exits when the close returns — bounded by the container's blocking-send timeout even when the write it waits behind never completes; no writer-pool thread is used for teardown. | `FootprintStrikeDeliveryTest.aSlowSocketWhoseCloseBlocksStallsNeitherConsumerNorAnyHealthySocket` (the reviewer's scenario on the production path with the REAL writer pool: a socket whose strike send blocks and whose `close()` blocks on a latch; 80 live admissions overflow it on the drainer; the cache consumer's collision runs while that close is still blocked; asserts both consumer threads finish, the close is still blocked and ran on `options-edge-ws-closer`, both healthy sockets receive all 80 records then the refusal's control in order, the view's queue is empty, and after release `close()` ran exactly once), `OutboundChannelTest.anOverflowNeverWaitsForABlockedSessionClose_andTheTeardownStillHappensExactlyOnce` |
+| 2 | **[P1]** Replacing retained evidence does not advance authority or notify readers (a cache-only replacement queues neither evidence nor control; rev 0 → rev 1 left authority 1 → 1 with zero frames) | **FIXED — readers are notified, in order; the notification is the evidence, not an authority bump (a deliberate departure from the suggested fix, reasoned below)** | Every change to what the fold retains now reaches the readers. ADDITIVE changes — a new episode or a newer revision replacing a head, which covers a change of which episode is latest through a newer opening — are queued, under the view lock with the mutation, as the admitted record's `es-footprint-strike` evidence by WHICHEVER consumer made the change: the live consumer at any time, the cache consumer once its replay is complete (the reviewed gap: the live consumer re-seeks END on a reconnect, the continuing cache consumer folds the skipped update after completion). An admission that changed nothing (a redelivery, the second consumer's copy, an older revision) queues nothing, so a record reaches a socket once. While the replay is incomplete the cache consumer queues no evidence: every reader is LOADING and the completion is an authority change after which each re-walks `latest`. INVALIDATING changes (refusal, boundary-moving eviction, dropped eviction marker, failing closed, replay completion/reopen) advance the authority and queue a control after that evidence, as before. | `FootprintStrikeViewTest.aChangeTheCacheConsumerFoldsAfterTheReplayCompletedReachesTheReaders_inOrder` (the reviewer's rev 0 → rev 1 from the cache consumer after completion: REST serves rev 1 AND an evidence frame with those exact bytes follows the completion control; the live copy, a redelivery and an older revision queue nothing; a newer opening from the cache consumer is forwarded; a cache-consumer collision still advances the authority after them; a reopened replay suppresses cache evidence until it completes again), `FootprintStrikeDeliveryTest.anUpdateOnlyTheCacheConsumerFoldedAfterTheReplayCompletedReachesEverySocket` (the production scenario through the service: both sockets get control then rev 1 byte-exact; REST agrees; the live copy adds no frame; `broadcast_total` strike 1, control 1) |
+| 3 | **[P2]** Evicted newest episodes never produce the required tombstones (maxEpisodes=1: 680000/100 then 681000/200 → tombstones `[]`) | **FIXED** | Evicting a strike's NEWEST episode in its session keeps its index entry, dead, as an EVICTION MARKER, so `latest` names it in `tombstones` exactly like a refused newest episode. A marker exists only while it is its session's newest entry: a genuinely newer opening retires it; entries below it are dead and unreachable and leave when it is made (a refused tombstone included; the refusal ledger keeps the identity). A refused newest episode the boundary has passed is now KEPT and named (it is still its session's newest entry) — the whole-index prune that dropped it, and its round-3 #7 guard, are gone; nothing walks the index. Bound: `GATEWAY_ES_FOOTPRINT_STRIKE_MAX_REFUSED_IDENTITIES` markers (the refusal ledger's bound), each charged to the byte budget (256 B of nodes plus the five strings it references — always less than the head it replaces). Under the byte budget alone markers are dropped oldest first before any live head; past their count bound the oldest go. **A dropped marker** advances the authority (once per mutation) and queues a control: readers discard what they held and re-walk; that strike then has no row and no tombstone — NO DATA, the same chip the marker gave — and never an older episode, because every marker opened below the boundary, so no retained head of that strike and session opens before it and none can be admitted. New gauges `gateway_footprint_strike_eviction_markers`, `gateway_footprint_strike_eviction_marker_drops_total`. Design §G-R7/G-R8 rows and the amendment's "Eviction markers" bullet state the exact semantics. | `FootprintStrikeViewTest.anEvictedNewestEpisodeIsNamedInTombstones_theReviewersCase` (the reviewer's case, plus the marker's exact charge, EVICTED on return, retirement by a newer opening, per-session/per-timeframe scope), `…theMarkerLedgerIsBounded_forgettingAMarkerIsAnAuthorityChange_andNoOlderEpisodeTakesItsPlace` (count bound, oldest dropped, no older episode admitted or served; byte-budget priority with the live head kept, the exact charge leaving, the boundary unmoved and the authority advanced by the drop alone), `…aRefusedNewestEpisodeBehindTheBoundaryIsStillNamed_andAnUnreachableOneLeavesWithItsSessionsNewestHead` (replaces `prunedTombstonesStopCountingAsIndexed`), `FootprintStrikeDeliveryTest.latestNamesAnEvictedNewestEpisodeOnTheWire` (the reviewer's case through the REST controller: `tombstones:[{"strikeCents":680000,"openBarStartMs":100}]`), `FootprintWiringTest` exact metrics contract (the two new series) |
+
+### Why finding 2 is not fixed with an authority per replacement
+
+The review suggested "advance authority and queue control when evidence is replaced". The reader this protocol
+serves — options-edge `strike-board.js` on `fix/footprint-strike-final-review` (`b9842f63`), the web half of PR #729 —
+treats EVERY newer authority as an invalidation: `applyControl` → `applyAuthority` → `backfill()` releases the published
+fold (`m.fold = freshFold(…)`, "released: nothing displays it while this walk runs"), puts every chip in LOADING and
+re-walks `latest` (`strike-board.js:3481-3494`, `:3565-3606`); a page that reveals a newer authority restarts the walk
+with backoff (`:3518-3528`). In steady state BOTH consumers fold every strike record, and whichever folds it first makes
+the change; an authority per change would therefore fire on most live updates and keep the board LOADING through the
+session. Evidence needs no invalidation: the reader folds it by the relay's own rule — greatest revision per identity,
+newest opening per strike (`fold`, `:3405-3437`) — so it converges whether the evidence or a page arrives first. The only
+state in which a change is not sent as evidence (the cache consumer while the replay is incomplete) is covered by the
+completion, which IS an authority change. So the requested test assertion "authority advances" for the cache rev 0 →
+rev 1 case is replaced by "the change's evidence reaches every socket, in order, and the authority does not move"; every
+invalidating change still advances it.
+
+### Do the new tests bite? (each fix reverted alone, sources restored, sha256 proven)
+
+Each fix was reverted ALONE in the working tree (the exact pre-fix line restored), its tests run with
+`mvn -B -o clean test -Dtest=…`, and the source copied back; the sha256 of `OutboundChannel.java` and
+`FootprintStrikeView.java` was taken before and after every pass and was identical (`RESTORED: sha256 identical`,
+`OutboundChannel.java` 55e3ec8a2f5f…, `FootprintStrikeView.java` 2828362fa483… — the committed sources).
+
+| Revert | Went red (first failing assertion) |
+|---|---|
+| #1 teardown inline again (`teardown.run()` for `closers.execute(teardown)`) | `FootprintStrikeDeliveryTest.aSlowSocketWhoseCloseBlocks…:557` "the live consumer is not waiting inside the slow socket's close" (the live thread was still inside the blocked close 5 s later); `OutboundChannelTest.anOverflowNeverWaitsForABlockedSessionClose…:208` "…and returns without waiting for the close" (the overflowing enqueue took the 10 s the close was held) |
+| #2 evidence only from the live consumer (`if (forward && outcome.reason() == Reason.ADMITTED)`, the reviewed line) | `FootprintStrikeViewTest.aChangeTheCacheConsumerFolds…:661` expected `[CONTROL, EVIDENCE]` but was `[CONTROL]` — the reviewer's "zero frames"; `FootprintStrikeDeliveryTest.anUpdateOnlyTheCacheConsumerFolded…:598` expected `[es-footprint-strike-control, es-footprint-strike]` but was `[es-footprint-strike-control]` |
+| #3 an evicted head's index entry always removed (the reviewed behaviour) | `FootprintStrikeViewTest.anEvictedNewestEpisodeIsNamedInTombstones_theReviewersCase:717` expected `[Tombstone[strikeCents=680000, openBarStartMs=100]]` but was `[]` — the reviewer's reproduction; `…theMarkerLedgerIsBounded…:745` (0 markers); `…aRefusedNewestEpisodeBehindTheBoundaryIsStillNamed…:376`; `FootprintStrikeDeliveryTest.latestNamesAnEvictedNewestEpisodeOnTheWire:627` expected `[{"strikeCents":680000,"openBarStartMs":100}]` but was `[]` |
+
+The campaign below re-breaks each clause again, separately, and records which named tests caught it.
+
+### Mutation campaign
+
+- Nine clauses added to `scripts/footprint-campaign.spec.json` for the new normative behaviour, each quoting the as-built
+  sentence now appended to its requirement row in ES-FOOTPRINT-GATEWAY-DESIGN.md §2 (the amendment sits after the
+  generated block, so it cannot be quoted): `G-R10.3` teardown never on the enqueuer (`closers.execute(teardown)` →
+  `teardown.run()`); `G-R3.4` cache-consumer change after completion forwarded; `G-R3.5` a no-op admission queues
+  nothing; `G-R3.6` the cache consumer queues no evidence while LOADING (three mutations of the one evidence line);
+  `G-R7.1` an evicted newest episode leaves a marker; `G-R7.2` a newer opening retires it; `G-R8.1` the marker bound;
+  `G-R8.2` markers before live heads under the byte budget; `G-R8.3` a dropped marker is an authority change. No
+  existing clause needed re-anchoring: every anchor still resolves with its recorded occurrence count.
+- Re-run per `scripts/footprint-mutate.py` in a CLEAN detached worktree at the code commit `6a300d5`
+  (`git worktree add --detach`, clean before and after, removed afterwards). Baseline GREEN
+  (`mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest`). Result: **42 KILLED, 1 SURVIVED of 43** — the same recorded
+  inert survivor as before (`G-R7 the-exclusive-cursor-at-the-domain-edge site2-relaxed`). All nine new clauses KILLED,
+  by assertion failures in the named strike tests (`G-R10.3` by `aSlowSocketWhoseCloseBlocks…`; `G-R3.4`/`G-R3.5` by
+  the cache-change view and delivery tests; `G-R3.6` additionally by the ordering tests, whose cache-consumer admissions
+  would otherwise have sent evidence; `G-R7.1` by the four marker tests; `G-R8.2` also by
+  `theBudgetsEvictTheOldestIdentities…`). For the 34 existing clauses: no status changed and no kill set changed.
+- `ES-FOOTPRINT-CAMPAIGN.json` replaced by that record (every row names `6a300d5`) and §2a regenerated from it with
+  `scripts/footprint-reqstate.sh` (G-R3 3→6, G-R7 5→7, G-R8 5→8, G-R10 2→3 probes; 43 mutations, 42 killed, 1
+  surviving); `scripts/footprint-reqstate.sh --check` → "§2a matches the campaign record".
+- Unlike the first round, the campaign now probes `FootprintStrikeView` and `OutboundChannel` directly.
+
+### Verification
+
+All clean builds, Java 21, offline Maven.
+
+- Code commit `6a300d5`, before committing: `mvn -B -o clean test` (full) — **1184 run, 0 failures, 0 errors** (1177 before
+  this round; +7: `FootprintStrikeViewTest` 30→33, `FootprintStrikeDeliveryTest` 7→10, `OutboundChannelTest` 5→6),
+  plus the context smoke test 1/0. `FeedGatewayServiceTest` 259/0 — the volPremium* clock-dependent failures did not
+  occur, so there was nothing to compare against `origin/main`.
+- `mvn -B -o clean test -Dtest='Footprint*,OutboundChannelTest,CvdSpxLevelsWiringTest'` — 145/0.
+- The three Jenkinsfile gates (`mvn -B -o clean test`, `scripts/footprint-reverify.sh`,
+  `scripts/footprint-reqstate.sh --check`) were run on the commit that adds this record, with a clean tree before and
+  after; their exit codes are stated in the PR description rather than here, so recording them does not move the head
+  they were run on.
+- Not done in this round: the earlier "remaining obligations" table is unchanged; no heap measurement; no Codex
+  re-review of these fixes.
+
+### Review text (verbatim)
+
+1. [P1] A slow socket can stall both strike consumers and healthy sockets. FootprintStrikeView.java:364 holds drainLock throughout fan-out. However, OutboundChannel.java:137 handles overflow by synchronously calling session.close(). That close can block behind an outstanding socket write. Reproduced with the committed view and channel: the live consumer waits inside close, the cache consumer blocks acquiring drainLock, and its refusal control remains queued while healthy sockets wait. The watchdog skips this channel because it is already marked closed. Make overflow teardown nonblocking for the drainer; the existing delivery tests do not exercise blocked closes.
+
+2. [P1] Replacing retained evidence does not advance authority or notify readers. FootprintStrikeView.java:328 replaces a head's revision/payload without incrementing authority. Consequently, a cache-only replacement queues neither evidence nor control. Reproduced: revision 0 → revision 1 changed REST's payload while authority remained 1 → 1, with zero frames emitted. Production scenario: the live Kafka consumer misses an update during reconnect and seeks to END; the continuing cache consumer folds that update after replay completion. Connected browsers retain the superseded evidence until another authority event occurs. Advance authority and queue control when evidence is replaced, including changes to which episode is latest.
+
+3. [P2] Evicted newest episodes never produce the required tombstones. FootprintStrikeView.java:411 removes the episode's index entry completely; latest can only construct tombstones from entries remaining in that index. Reproduced with maxEpisodes=1: admit strike 680000/open 100, then strike 681000/open 200. Latest returns the second record, boundary 200, and tombstones: [], omitting {strikeCents:680000,openBarStartMs:100}. This violates the stated v2 eviction contract and leaves a browser relying on those tombstones without its explicit invalidation. Retain bounded newest-episode eviction markers; update the refusal-only documentation and tests accordingly.
