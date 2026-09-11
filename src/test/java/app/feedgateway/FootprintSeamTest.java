@@ -134,8 +134,9 @@ class FootprintSeamTest {
         events.put("futures.cvd.bars", new FeedGatewayService.TopicBinding("DATABENTO", "es-cvd-bar"));
         events.put("futures.footprint.bars", new FeedGatewayService.TopicBinding("DATABENTO", "es-footprint-bar"));
         events.put("futures.footprint", new FeedGatewayService.TopicBinding("DATABENTO", "es-footprint"));
-        List<TopicPartition> partitions = List.of(tp("futures.cvd.bars"), tp("futures.footprint.bars"), tp("futures.footprint"));
-        List<TopicPartition> footprint = List.of(tp("futures.footprint.bars"), tp("futures.footprint"));
+        events.put("futures.footprint.strike", new FeedGatewayService.TopicBinding("DATABENTO", "es-footprint-strike"));
+        List<TopicPartition> partitions = List.of(tp("futures.cvd.bars"), tp("futures.footprint.bars"), tp("futures.footprint"), tp("futures.footprint.strike"));
+        List<TopicPartition> footprint = List.of(tp("futures.footprint.bars"), tp("futures.footprint"), tp("futures.footprint.strike"));
 
         s.liveBootstrapSeek(consumer, partitions, events, true);
         verify(consumer).seekToEnd(footprint);                      // the LAST word on the footprint partitions is END
@@ -147,6 +148,10 @@ class FootprintSeamTest {
         s.liveBootstrapSeek(first, partitions, events, false);
         verify(first).seekToEnd(partitions);                        // first attempt: everything at END anyway
         verify(first, org.mockito.Mockito.never()).offsetsForTimes(any(Map.class));
+        // the LIVE consumer's seeks never open, reopen or complete the strike replay: that is the cache consumer's alone
+        assertTrue(s.footprintStrikeView().loading());
+        assertNull(s.footprintStrikeView().replayBeginsAtMs());
+        assertEquals(0, s.footprintStrikeView().authority());
     }
 
     @Test @SuppressWarnings("unchecked")
@@ -155,10 +160,13 @@ class FootprintSeamTest {
         KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
         Map<String, FeedGatewayService.TopicBinding> events = new HashMap<>();
         events.put("futures.footprint.outcomes", new FeedGatewayService.TopicBinding("DATABENTO", "es-footprint-outcome"));
-        List<TopicPartition> added = List.of(tp("futures.footprint.outcomes"));
+        events.put("futures.footprint.strike", new FeedGatewayService.TopicBinding("DATABENTO", "es-footprint-strike"));
+        List<TopicPartition> added = List.of(tp("futures.footprint.outcomes"), tp("futures.footprint.strike"));
         s.liveAdoptionSeek(consumer, s.refreshForTest(added, added, List.of()), events);
         verify(consumer, org.mockito.Mockito.atLeastOnce()).seekToEnd(added);
         verify(consumer, org.mockito.Mockito.never()).seekToBeginning(anyCollection());
+        assertTrue(s.footprintStrikeView().loading(), "a live adoption is not a replay: the strike authority is untouched");
+        assertEquals(0, s.footprintStrikeView().authority());
     }
 
     // ---- G-R3/D5: real socket fan-out through the live branch -----------------------------------------
@@ -184,6 +192,9 @@ class FootprintSeamTest {
         assertTrue(s.onFootprintLiveRecord("es-footprint-evidence", "{\"schemaVersion\":6,\"ev\":true}"));
         assertTrue(s.onFootprintLiveRecord("es-footprint-bar", FootprintViewsTest.bar("2026-08-14", "1m", 1)));
         assertTrue(s.onFootprintLiveRecord("es-footprint-outcome", FootprintViewsTest.outcome("2026-08-14", "1m", 1, "x")));
+        // the fifth event: an ADMITTED strike record is forwarded; a colliding one never is — its control frame is
+        assertTrue(s.onFootprintLiveRecord("es-footprint-strike", FootprintStrikeViewTest.e(100, 0, "A")));
+        assertFalse(s.onFootprintLiveRecord("es-footprint-strike", FootprintStrikeViewTest.e(100, 0, "B")), "a collision is not evidence");
         assertTrue(s.onFootprintLiveRecord("es-footprint-bar", FootprintViewsTest.bar("2026-08-13", "1m", 1)), "stale: still broadcast");
         assertFalse(s.onFootprintLiveRecord("es-footprint-bar", "{\"pad\":\"" + "y".repeat(300_000) + "\"}"), "oversize: dropped entirely");
         // Wait for the quantity this test ASSERTS — five footprint frames on each socket — not for a
@@ -201,13 +212,16 @@ class FootprintSeamTest {
             }
         };
         long deadline = System.currentTimeMillis() + 30_000;
-        while ((footprintFrames.apply(a) < 5 || footprintFrames.apply(b) < 5)
+        while ((footprintFrames.apply(a) < 7 || footprintFrames.apply(b) < 7)
                 && System.currentTimeMillis() < deadline) Thread.sleep(5);
         for (List<String> sink : List.of(a, b)) {
             List<String> snapshot;
             synchronized (sink) { snapshot = List.copyOf(sink); }
             List<String> footprint = snapshot.stream().filter(m -> m.contains("es-footprint")).toList();
-            assertEquals(5, footprint.size(), "four events + the stale bar, never the oversize one: " + footprint);
+            assertEquals(7, footprint.size(), "five events + the stale bar + the refusal's control, never the oversize or the refused record: " + footprint);
+            assertTrue(footprint.stream().anyMatch(m -> m.startsWith("{\"type\":\"es-footprint-strike\",") && m.contains("\\\"tag\\\":\\\"A\\\"")));
+            assertTrue(footprint.stream().anyMatch(m -> m.startsWith("{\"type\":\"es-footprint-strike-control\",")));
+            assertTrue(footprint.stream().noneMatch(m -> m.contains("\\\"tag\\\":\\\"B\\\"")), "the refused record reaches no socket");
             assertTrue(footprint.stream().anyMatch(m -> m.contains("\"es-footprint\"") && m.contains("\"live\":true")));
             assertTrue(footprint.stream().anyMatch(m -> m.contains("es-footprint-evidence")));
             assertTrue(footprint.stream().anyMatch(m -> m.contains("es-footprint-outcome")));
@@ -216,7 +230,9 @@ class FootprintSeamTest {
         String m = s.footprintMetricsText();
         assertTrue(m.contains("gateway_footprint_broadcast_total{event=\"es-footprint-bar\"} 2\n"), m);
         assertTrue(m.contains("gateway_footprint_records_total{event=\"es-footprint-bar\",consumer=\"live\"} 3\n"));
-        for (String e : new String[]{"es-footprint", "es-footprint-evidence", "es-footprint-bar", "es-footprint-outcome"}) {
+        assertTrue(m.contains("gateway_footprint_broadcast_total{event=\"es-footprint-strike\"} 1\n"), m);
+        assertTrue(m.contains("gateway_footprint_broadcast_total{event=\"es-footprint-strike-control\"} 1\n"), m);
+        for (String e : new String[]{"es-footprint", "es-footprint-evidence", "es-footprint-bar", "es-footprint-outcome", "es-footprint-strike", "es-footprint-strike-control"}) {
             assertTrue(FeedGatewayService.isGlobalBroadcastEvent(e), e + " fans out in per-session (auth) mode too (D5)");
         }
         assertFalse(FeedGatewayService.isGlobalBroadcastEvent("es-footprint-private"), "an unknown event stays non-routable");

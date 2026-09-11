@@ -2,10 +2,15 @@ package app.feedgateway;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -15,7 +20,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 /**
  * ES-FOOTPRINT-STRIKE-INTERACTION.md R14 — the gateway's fold of the {@code es.futures.footprint.strike}
@@ -26,39 +33,61 @@ import java.util.concurrent.atomic.AtomicLong;
  * identity AND a revision must be identical AS BYTES — checked for EVERY observed revision of an
  * identity, not only its head (code round-1 #1) — else that identity is REFUSED for the incarnation
  * and counted. A refused identity keeps its place in the ordering as a TOMBSTONE: if it is the newest
- * episode of a strike, {@code latest} shows NO ROW for that strike (the chip renders NO DATA), never an
- * older episode in its stead (code round-1 #3); history omits it and still lists the older ones. A
+ * episode of a strike, {@code latest} shows NO ROW for that strike and names it in the page's
+ * {@code tombstones} (the chip renders NO DATA), never an older episode in its stead (code round-1 #3);
+ * history omits it and still lists the older ones. An EVICTED newest episode is named the same way: the
+ * eviction keeps a bounded EVICTION MARKER in its place (strike re-review #3, see {@link #enforce}). A
  * CHECKPOINT carries no episode and only advances the per-timeframe high-water mark the hello reports.
  *
  * <p>Scope is by symbol AND timeframe everywhere (code round-1 #2). Unlike the bars/outcomes
  * coordinator this view never rolls a session away: history crosses sessions ("6800 may behave
  * differently on every visit"), and {@code latest} is scoped to ONE session by the reader.
  *
- * <p><b>Every retained thing is charged, conservatively, and the boundary is published.</b> The view
- * charges each head's payload, its identity strings, {@link #REVISION_BYTES} per observed revision and
- * {@link #TOMBSTONE_OVERHEAD} per tombstone — deliberate over-estimates of an object graph, since what
- * the JVM holds is a map of boxed keys and arrays, not packed bytes (round-2 #1, round-3 #1). The
- * figure is therefore an ACCOUNTING bound on what the view may retain, not a measured heap bound; the
- * deployment record says which measurement settles the latter. Budgets evict the OLDEST
- * identities by {@code openBarStartMs}, and always the WHOLE equal-opening-time bucket, so a
- * monotonic boundary can be published that is strictly above every retained head: records opening
- * before it are dropped rather than re-admitted, so an evicted identity can never return at a lower
- * revision and no retained head can sit behind the boundary with its updates silently refused
- * (code round-2 #2). When eviction cannot bring the view inside its budget the view goes UNAVAILABLE
- * rather than forgetting evidence — the same rule the refusal ledger already had.
+ * <p><b>Retained storage is what is charged (final review #3).</b> A head's payload is retained as the
+ * record's UTF-8 {@code byte[]} — never as a {@link String}, whose backing array doubles to UTF-16 the
+ * moment one character is above U+00FF — and the budget is charged the ARRAY that is actually held
+ * ({@link #arrayBytes}), each retained identity/key string by its actual storage ({@link #stringBytes}),
+ * {@link #REVISION_BYTES} per observed revision and a per-entry node overhead. That is an ACCOUNTING
+ * bound on what the view retains, not a measured heap ceiling; the design amendment names the
+ * measurement that would settle the latter. The record bytes a reader receives are published apart
+ * from it ({@link #bytesInView}). Budgets evict the OLDEST identities by {@code openBarStartMs}, and
+ * always the WHOLE equal-opening-time bucket, so a monotonic boundary can be published that is strictly
+ * above every evicted opening and at or below every retained one: records opening before it are dropped
+ * rather than re-admitted, so an evicted identity can never return at a lower revision and no retained
+ * head can sit behind the boundary with its updates silently refused (code round-2 #2). When eviction
+ * cannot bring the view inside its budget the view goes UNAVAILABLE rather than forgetting evidence —
+ * the same rule the refusal ledger already had.
  *
- * <p><b>Loading is distinguishable from empty.</b> {@link #replay(long, boolean)} carries the cache
- * consumer's replay window and whether it has crossed the end offsets captured at its bootstrap;
- * until it has, the hello and every page say {@code "loading":true} so a reader can never turn an
- * unfinished replay into a completed NO DATA (code round-2 #3). {@code replayBeginsAtMs} is the
- * window the replay actually covered, kept apart from {@code historyBeginsAtMs}, which is retained
- * inventory (code round-2 #6).
+ * <p><b>Loading is distinguishable from empty.</b> Until the cache consumer's strike replay has crossed
+ * the end offsets captured when it was (re)opened ({@link #replayRestarted}, {@link #replayCompleted}),
+ * the hello and every page say {@code "loading":true}, so a reader can never turn an unfinished replay
+ * into a completed NO DATA (code round-2 #3). {@code replayBeginsAtMs} is the cutoff the replay's seek
+ * actually used, kept apart from {@code historyBeginsAtMs}, which is retained inventory (code round-2 #6).
  *
- * <p><b>Authority changes reach connected readers.</b> A collision refusal, entering UNAVAILABLE, or
- * completing the replay fires {@link #onAuthorityChange}, which the service turns into an ordered
- * control frame so an already-READY page reconciles instead of displaying evidence the fold has
- * withdrawn (code round-2 #4). Every read is one snapshot under the lock; the lock is never held
- * while writing to a client, and never while notifying.
+ * <p><b>Delivery is ordered with the mutation that caused it (final review #1).</b> Every mutation — an
+ * admission from either consumer, a refusal, an eviction, the replay completing or reopening — decides
+ * its outcome AND queues the frames it causes (the admitted record's {@code es-footprint-strike}
+ * evidence, then the {@code es-footprint-strike-control} authority frame when the authority moved) under
+ * the ONE view lock; a per-socket hello's authority is captured and queued the same way ({@link #hello}).
+ * The queue is then drained to the sink in that order, OUTSIDE the view lock, by one drainer at a time. A
+ * record admitted before a refusal therefore always reaches a socket before that refusal's control frame,
+ * never after it, and a socket can never receive a hello older than a control it already holds. Every read
+ * is one snapshot under the lock; the lock is never held while a frame is delivered.
+ *
+ * <p><b>Every change to what the fold retains reaches the readers (strike re-review #2).</b> Two kinds of
+ * change, two signals. An ADDITIVE change — a new episode, or a newer revision replacing a head — is the
+ * admitted record itself, and it is queued as evidence by WHICHEVER consumer made it: the live consumer
+ * always, the cache consumer once the replay is complete (a cache-only fold after completion — an update
+ * the live consumer skipped when it re-sought END — used to reach no reader until some unrelated authority
+ * change). A reader folds evidence by the same rule this view does (greatest revision per identity, newest
+ * opening per strike), so it converges without discarding anything. An admission that changes nothing (a
+ * redelivery, an older revision) queues nothing. While the replay is incomplete the cache consumer queues
+ * no evidence: every reader is LOADING, and the completion is itself an authority change after which each
+ * one discards what it holds and re-walks {@code latest}. An INVALIDATING change — a refusal, an eviction
+ * that moves the boundary, a dropped eviction marker, failing closed, the replay completing or reopening —
+ * advances the {@code authority} and queues a control frame. Additive changes deliberately do NOT advance
+ * it: a reader treats every newer authority as an invalidation (it releases its fold, reads LOADING and
+ * re-walks), so an authority per update would keep a live board LOADING.
  */
 final class FootprintStrikeView {
 
@@ -75,19 +104,59 @@ final class FootprintStrikeView {
         static final Admission EPISODE = new Admission(Reason.ADMITTED, false);
     }
 
-    /** One folded identity: its identity fields, its head revision, the head's bytes and every observed revision's digest. */
+    /** What a sequenced frame is. */
+    enum FrameKind {
+        /** An ADMITTED record that changed the fold (live consumer, or cache consumer after its replay); {@code body} is the record text. */
+        EVIDENCE,
+        /** The authority changed; {@code body} is the authority field, the same shape the hello carries. */
+        CONTROL,
+        /** One socket's hello; {@code target} is that socket and {@code body} the authority field captured for it. */
+        HELLO
+    }
+
+    /** One outbound frame, queued under the view lock by the mutation (or hello) that caused it, delivered in queue order. */
+    record Frame(FrameKind kind, Object target, String body) {}
+
+    /** A strike whose newest episode in the requested session is refused or evicted: {@code latest} has no row for it, and says so. */
+    record Tombstone(long strikeCents, long openBarStartMs) {}
+
+    /**
+     * An EVICTION MARKER (strike re-review #3): the newest episode of its strike in its session, evicted. Its
+     * index entry is kept, dead, so {@code latest} names the strike in {@code tombstones} instead of showing
+     * nothing where an episode was. It holds no payload and no revision ledger — only the strings its index
+     * entry and its age-order entry already reference.
+     */
+    private static final class Marker {
+        final String identity, symbol, tf, openKey, ageKey; final long strikeCents;
+        Marker(Head h) { identity = h.identity; symbol = h.symbol; tf = h.tf; openKey = h.openKey; ageKey = h.ageKey; strikeCents = h.strikeCents; }
+    }
+
+    /** One folded identity: its identity fields and keys, its head revision, the head's UTF-8 bytes and every observed revision's digest. */
     private static final class Head {
-        final String identity, symbol, sessionDate, tf; final long strikeCents, openBarStartMs;
-        long revision; String json; boolean refused;
+        final String identity, symbol, sessionDate, tf, openKey, ageKey; final long strikeCents, openBarStartMs;
+        long revision; byte[] payload;
         final Map<Long, byte[]> digests = new HashMap<>();
         Head(String identity, String symbol, String sessionDate, String tf, long strikeCents, long openBarStartMs) {
             this.identity = identity; this.symbol = symbol; this.sessionDate = sessionDate; this.tf = tf; this.strikeCents = strikeCents; this.openBarStartMs = openBarStartMs;
+            this.openKey = openKey(sessionDate, openBarStartMs); this.ageKey = ageKey(openBarStartMs, identity);
         }
     }
 
-    /** One page of folded records: ascending by strike for {@code latest}, newest first for {@code history}. */
-    record Page(String sessionDate, List<String> records, String nextCursor, Long historyBeginsAtMs, long refused,
-                boolean unavailable, boolean loading, Long replayBeginsAtMs, long authority) {}
+    /**
+     * One page of folded records: ascending by strike for {@code latest}, newest first for {@code history}.
+     * {@code payloads} are the retained UTF-8 arrays themselves (never mutated once retained, so they are
+     * safe to write after the snapshot); {@code tombstones} is non-null for {@code latest} only.
+     */
+    record Page(String sessionDate, List<byte[]> payloads, String nextCursor, Long historyBeginsAtMs, long refused,
+                boolean unavailable, boolean loading, Long replayBeginsAtMs, long authority, String incarnation,
+                List<Tombstone> tombstones) {
+        /** The records as text (a convenience for readers of this API; the routes write {@link #payloads} directly). */
+        List<String> records() {
+            List<String> out = new ArrayList<>(payloads.size());
+            for (byte[] p : payloads) out.add(new String(p, StandardCharsets.UTF_8));
+            return out;
+        }
+    }
 
     static final long EPOCH_MAX_MS = 253_402_300_799_999L;
     static final int LATEST_LIMIT_MAX = 200, HISTORY_LIMIT_MAX = 100;
@@ -96,53 +165,87 @@ final class FootprintStrikeView {
     /**
      * What one retained revision is CHARGED. The ledger is a {@code HashMap<Long, byte[]>}, so an entry
      * is a boxed key (16), a node (32), an array header plus the digest (16 + 32) and its share of the
-     * bucket table (~16) — charged at 128 rather than the 40 packed bytes, because what the JVM holds is
-     * an object graph and the budget has to be conservative against THAT (gateway round-3 #1).
+     * bucket table (~16) — charged at 128, a deliberate over-estimate of that object graph (gateway
+     * round-3 #1).
      */
     static final int REVISION_BYTES = 128;
     /**
-     * Per-entry structural overhead: the head object and its strings, the three index nodes (scope tree,
-     * strike tree, open-key tree), the age-key string and node, and their table shares. A tombstone keeps
-     * its index node and its ledger identity. Both are deliberate over-estimates.
+     * Per-entry NODE overhead, strings and payload excluded (those are charged by their actual storage):
+     * the head object, its heads-map node and table share, the three index nodes (scope tree, strike tree,
+     * open-key tree), the age-tree node, the revision map's own object and initial table. A tombstone
+     * keeps its index node and its refusal-set node and table share. An eviction marker keeps its index
+     * node, its marker object, its marker-map node and table share and its age-order node. All three are
+     * deliberate over-estimates.
      */
-    static final int HEAD_OVERHEAD = 512, TOMBSTONE_OVERHEAD = 256;
+    static final int HEAD_OVERHEAD = 512, TOMBSTONE_OVERHEAD = 256, MARKER_OVERHEAD = 256;
+    /** Object header of a String instance (header + hash + coder + value reference), 8-aligned, with compressed oops. */
+    static final int STRING_OBJECT_BYTES = 24;
+    /** Array header (mark word, compressed class pointer, length). */
+    static final int ARRAY_HEADER_BYTES = 16;
     private static final Set<String> EPISODE_KINDS = Set.of("OPEN", "UPDATE", "CLOSE");
 
     private final ObjectMapper mapper;
     private final long maxRecordBytes, maxBytes;
     private final int maxEpisodes, maxRefused;
+    /**
+     * The eviction-marker ledger's own bound: the refusal ledger's ({@code maxRefused}) — both record a
+     * strike's newest episode that is no longer served. Markers are charged to the byte budget as well.
+     */
+    private final int maxMarkers;
+    /**
+     * Fixed for this view's life — one per gateway process. It rides the hello, the control frame and
+     * every page beside {@code authority}, so a reader that meets a different one knows the authority
+     * sequence restarted (a new process starts again at 0) and resets its comparison instead of
+     * discarding the new process's authority as older.
+     */
+    private final String incarnation = UUID.randomUUID().toString();
     /** The symbol the ROUTES scope to. Published in the hello so a live reader scopes exactly as REST does. */
     private volatile String scopeSymbol = "";
 
     private final Object lock = new Object();
     private final Map<String, Head> heads = new HashMap<>();
-    /** symbol|tf → strike → (openKey → identity). Refused identities STAY here as tombstones. */
+    /** symbol|tf → strike → (openKey → identity). Refused identities STAY here as tombstones, evicted newest episodes as markers. */
     private final Map<String, TreeMap<Long, TreeMap<String, String>>> index = new TreeMap<>();
     /** Eviction order over LIVE heads: ageKey → identity. */
     private final TreeMap<String, String> byAge = new TreeMap<>();
     private final Set<String> refused = new HashSet<>();
+    /** Eviction markers by identity, and in age order (the oldest is the first dropped). Guarded by {@link #lock}. */
+    private final Map<String, Marker> markers = new HashMap<>();
+    private final TreeMap<String, Marker> markersByAge = new TreeMap<>();
+    /** Set by {@link #foldLocked}: whether the admission it decided changed what the fold retains. Guarded by {@link #lock}. */
+    private boolean changed;
     private final Map<String, Long> hwm = new TreeMap<>();
-    private long bytes;                                         // head payloads only (what a reader would receive)
-    private long meta;                                          // identities, revision ledgers, tombstones
+    private long bytes;                                         // record bytes of the heads (what a reader receives, before quoting)
+    private long retained;                                      // storage of the retained payload arrays (what the budget charges)
+    private long meta;                                          // strings, nodes, revision ledgers, tombstones
     private int tombstones;
     private String sessionDate;
     private Long boundaryMs;                                    // monotonic: nothing that opened before it is admitted or retained
     private Long replayBeginsAtMs;
     private boolean replayComplete;
     /**
-     * Monotonic. Every authority change bumps it, and it rides the hello, the control frame and every
-     * page, so a reader can discard an OLDER authority that arrives after a newer one — the ordering
-     * hole where a stale `loading:true` hello enqueued before a completion control left readers loading
-     * for ever (gateway round-3 #3).
+     * Monotonic within the incarnation. Every authority change bumps it, and it rides the hello, the
+     * control frame and every page, so a reader can discard an OLDER authority that arrives after a
+     * newer one (gateway round-3 #3).
      */
     private long authority;
     private boolean unavailable;
-    private volatile Runnable onAuthorityChange = () -> {};
-    private final AtomicLong evictions = new AtomicLong(), collisions = new AtomicLong();
+    /** Frames queued by mutations and hellos, in the order the mutations happened. Guarded by {@link #lock}. */
+    private final ArrayDeque<Frame> outbox = new ArrayDeque<>();
+    /** One drainer at a time, so the queue's order is the order frames reach the sink. Never taken while holding {@link #lock}. */
+    private final Object drainLock = new Object();
+    private volatile Consumer<Frame> sink = f -> {};
+    /**
+     * Test seam: runs after a mutation has queued its frames and released the view lock, BEFORE this
+     * thread drains — exactly where a preempted consumer thread would pause. Null in production.
+     */
+    volatile Runnable afterDecisionForTest;
+    private final AtomicLong evictions = new AtomicLong(), collisions = new AtomicLong(), markerDrops = new AtomicLong();
 
     FootprintStrikeView(ObjectMapper mapper, long maxRecordBytes, long maxBytes, int maxEpisodes, int maxRefused) {
         if (maxRecordBytes <= 0 || maxBytes <= 0 || maxEpisodes <= 0 || maxRefused <= 0) throw new IllegalArgumentException("strike view budgets must be positive");
         this.mapper = mapper; this.maxRecordBytes = maxRecordBytes; this.maxBytes = maxBytes; this.maxEpisodes = maxEpisodes; this.maxRefused = maxRefused;
+        this.maxMarkers = maxRefused;
     }
 
     /**
@@ -157,43 +260,57 @@ final class FootprintStrikeView {
         this.scopeSymbol = s;
     }
 
-    /** What the service does when the authority the readers hold has changed (refusal, unavailable, replay complete). */
-    void onAuthorityChange(Runnable listener) { this.onAuthorityChange = listener == null ? () -> {} : listener; }
+    /** Where the sequenced frames go, in order. The service turns them into socket frames. */
+    void onFrame(Consumer<Frame> sink) { this.sink = sink == null ? f -> {} : sink; }
 
     /**
-     * The cache consumer's replay for the STRIKE partitions: the window it actually sought back to, and
-     * whether those partitions have crossed the end offsets captured at that consumer's bootstrap.
-     *
-     * <p>{@code beginsAtMs} is recorded ONCE per replay — a later call with the same generation cannot
-     * move it, because the field names the window that was seeked, not the current clock (round-3 #5).
-     * {@link #replayRestarted} reopens it when a new consumer attempt or a late adoption means the
-     * strike partitions must be replayed again (round-3 #2).
+     * A (re)opened replay of the strike partitions: readers are LOADING until {@link #replayCompleted}.
+     * {@code beginsAtMs} is the cutoff the seek ACTUALLY used (null if none was sought), passed in by the
+     * caller that sought, never recomputed from the clock (round-3 #5, final review #2). Reopening a
+     * completed replay is an authority change.
      */
-    void replay(long beginsAtMs, boolean complete) {
-        boolean notify = false;
-        synchronized (lock) {
-            if (replayBeginsAtMs == null) replayBeginsAtMs = beginsAtMs;
-            if (complete && !replayComplete) { replayComplete = true; authority++; notify = true; }
-        }
-        if (notify) onAuthorityChange.run();
-    }
-
-    /** A new replay of the strike partitions has begun: readers are loading again until it completes. */
-    void replayRestarted(long beginsAtMs) {
-        boolean notify = false;
+    void replayRestarted(Long beginsAtMs) {
         synchronized (lock) {
             replayBeginsAtMs = beginsAtMs;
-            if (replayComplete) { replayComplete = false; authority++; notify = true; }
+            if (replayComplete) { replayComplete = false; authority++; outbox.add(control()); }
         }
-        if (notify) onAuthorityChange.run();
+        drain();
+    }
+
+    /** Every partition of the open replay has crossed its end offset, after its records were applied. Idempotent. */
+    void replayCompleted() {
+        synchronized (lock) {
+            if (!replayComplete) { replayComplete = true; authority++; outbox.add(control()); }
+        }
+        drain();
+    }
+
+    /**
+     * Queue {@code target}'s hello with the authority as of NOW, in sequence with every control frame:
+     * a control queued before it carries an authority at most the hello's, and one queued after it is
+     * newer. Delivered before this returns (unless the sink throws).
+     */
+    void hello(Object target) {
+        synchronized (lock) { outbox.add(new Frame(FrameKind.HELLO, target, helloFieldLocked())); }
+        drain();
     }
 
     // ---- admission --------------------------------------------------------------------------------
 
-    Admission admit(String json) {
+    /** Admit without forwarding (the cache consumer, and every caller that is not the live broadcast path). */
+    Admission admit(String json) { return admit(json, false); }
+
+    /**
+     * Admit one record. {@code forward} says the caller is the live consumer. An ADMITTED episode that
+     * CHANGED what the fold retains (a new episode, or a newer revision replacing a head) has its evidence
+     * frame queued under the same lock as the decision when the live consumer admitted it, or when the cache
+     * consumer did and the replay is complete (strike re-review #2); an admission that changed nothing queues
+     * no evidence. An admitted CHECKPOINT is forwarded by the live consumer only. A control frame follows
+     * whenever the decision moved the authority. Both are delivered, in that order, before this returns.
+     */
+    Admission admit(String json, boolean forward) {
         if (json == null) return Admission.SHAPE;
-        int len = FootprintViews.utf8Length(json);
-        if (len > maxRecordBytes) return Admission.OVERSIZE;
+        if (FootprintViews.utf8Length(json) > maxRecordBytes) return Admission.OVERSIZE;
         JsonNode root;
         try { root = mapper.readTree(json); } catch (Exception e) { return Admission.SHAPE; }
         if (root == null || !root.isObject()) return Admission.SHAPE;
@@ -205,57 +322,105 @@ final class FootprintStrikeView {
         if ("CHECKPOINT".equals(kind)) {
             // the session date may be a genuine JSON null (nothing seen yet); an invalid non-null one is a shape drop
             if (dateNode == null || (!dateNode.isNull() && date == null)) return Admission.SHAPE;
-            synchronized (lock) { if (unavailable) return Admission.UNAVAILABLE; advance(symbol, tf, seen, date); }
+            synchronized (lock) {
+                if (unavailable) return Admission.UNAVAILABLE;
+                advance(symbol, tf, seen, date);
+                if (forward) outbox.add(new Frame(FrameKind.EVIDENCE, null, json));
+            }
+            deliver();
             return Admission.CHECKPOINT;
         }
         if (!EPISODE_KINDS.contains(kind)) return Admission.SHAPE;
         long strike = nonNegative(root, "strikeCents"), open = epoch(root, "openBarStartMs"), revision = nonNegative(root, "revision");
         if (date == null || strike < 0 || open < 0 || revision < 0 || !root.path("series").isArray()) return Admission.SHAPE;
         String identity = symbol + "|" + date + "|" + tf + "|" + strike + "|" + open;
-        byte[] digest = sha256(json);
+        // RETAINED as UTF-8, and digested from the very bytes retained (final review #3)
+        byte[] utf8 = json.getBytes(StandardCharsets.UTF_8);
+        if (utf8.length > maxRecordBytes) return Admission.OVERSIZE;
+        byte[] digest = sha256(utf8);
         Admission outcome;
-        boolean notify = false;
         synchronized (lock) {
-            if (unavailable) return Admission.UNAVAILABLE;
-            advance(symbol, tf, seen, date);
-            if (boundaryMs != null && open < boundaryMs) return Admission.EVICTED;   // before the published boundary: never re-admitted
-            if (refused.contains(identity)) return Admission.REFUSED;
-            Head h = heads.get(identity);
-            if (h != null) {
-                byte[] prior = h.digests.get(revision);
-                if (prior != null) {
-                    if (Arrays.equals(prior, digest)) return Admission.EPISODE;   // a bar colliding with itself (R6)
-                    refuse(h);                                                     // R14: a fault, not a tie to break
-                    collisions.incrementAndGet();
-                    authority++;
-                    outcome = unavailable ? Admission.UNAVAILABLE : Admission.COLLISION;
-                    notify = true;                                                 // the readers hold a value this fold has just withdrawn
-                } else {
-                    h.digests.put(revision, digest); meta += REVISION_BYTES;
-                    if (revision >= h.revision) {
-                        bytes += len - FootprintViews.utf8Length(h.json);
-                        h.revision = revision; h.json = json;
-                    }
-                    // an older revision after a newer one keeps its digest (R14) and nothing else
-                    notify = enforce();
-                    outcome = heads.containsKey(identity) ? Admission.EPISODE : Admission.EVICTED;
-                }
-            } else {
-                h = new Head(identity, symbol, date.toString(), tf, strike, open);
-                h.revision = revision; h.json = json; h.digests.put(revision, digest);
-                heads.put(identity, h);
-                index.computeIfAbsent(scope(symbol, tf), k -> new TreeMap<>()).computeIfAbsent(strike, k -> new TreeMap<>()).put(openKey(h.sessionDate, open), identity);
-                byAge.put(ageKey(open, identity), identity);
-                bytes += len; meta += headMeta(h);
-                notify = enforce();
-                // enforcement can evict the very identity just inserted: say so rather than reporting it
-                // admitted while the fold no longer holds it (round-3 #4)
-                outcome = heads.containsKey(identity) ? Admission.EPISODE : Admission.EVICTED;
-            }
+            long before = authority;
+            outcome = foldLocked(identity, symbol, date, tf, strike, open, revision, seen, utf8, digest);
+            // the admitted record FIRST, then what the same mutation did to the authority. The change reaches
+            // the readers from whichever consumer made it: a cache-only fold after the replay completed is
+            // otherwise invisible to every connected reader (strike re-review #2)
+            if (outcome.reason() == Reason.ADMITTED && changed && (forward || replayComplete)) outbox.add(new Frame(FrameKind.EVIDENCE, null, json));
+            if (authority != before) outbox.add(control());
         }
-        if (notify) onAuthorityChange.run();
+        deliver();
         return outcome;
     }
+
+    private Admission foldLocked(String identity, String symbol, LocalDate date, String tf, long strike, long open,
+                                 long revision, long seen, byte[] utf8, byte[] digest) {
+        changed = false;
+        if (unavailable) return Admission.UNAVAILABLE;
+        advance(symbol, tf, seen, date);
+        if (boundaryMs != null && open < boundaryMs) return Admission.EVICTED;   // before the published boundary: never re-admitted
+        if (refused.contains(identity)) return Admission.REFUSED;
+        Head h = heads.get(identity);
+        if (h != null) {
+            byte[] prior = h.digests.get(revision);
+            if (prior != null) {
+                if (Arrays.equals(prior, digest)) return Admission.EPISODE;   // a bar colliding with itself (R6)
+                refuse(h);                                                     // R14: a fault, not a tie to break
+                collisions.incrementAndGet();
+                authority++;                                                   // the readers hold a value this fold has just withdrawn
+                return unavailable ? Admission.UNAVAILABLE : Admission.COLLISION;
+            }
+            h.digests.put(revision, digest); meta += REVISION_BYTES;
+            if (revision >= h.revision) {
+                bytes += utf8.length - h.payload.length;
+                retained += arrayBytes(utf8.length) - arrayBytes(h.payload.length);
+                h.revision = revision; h.payload = utf8;
+                changed = true;                                                // the head readers hold is superseded (re-review #2)
+            }
+            // an older revision after a newer one keeps its digest (R14) and nothing else
+            enforce();
+            if (heads.containsKey(identity)) return Admission.EPISODE;
+            changed = false;
+            return Admission.EVICTED;
+        }
+        h = new Head(identity, symbol, date.toString(), tf, strike, open);
+        h.revision = revision; h.payload = utf8; h.digests.put(revision, digest);
+        heads.put(identity, h);
+        TreeMap<String, String> per = index.computeIfAbsent(scope(symbol, tf), k -> new TreeMap<>()).computeIfAbsent(strike, k -> new TreeMap<>());
+        per.put(h.openKey, identity);
+        // a newer opening answers for the strike from now on: an eviction marker below it is unreachable
+        retireMarkerBelow(per, h);
+        byAge.put(h.ageKey, identity);
+        bytes += utf8.length; retained += arrayBytes(utf8.length); meta += headMeta(h);
+        changed = true;
+        enforce();
+        // enforcement can evict the very identity just inserted: say so rather than reporting it
+        // admitted while the fold no longer holds it (round-3 #4)
+        if (heads.containsKey(identity)) return Admission.EPISODE;
+        changed = false;
+        return Admission.EVICTED;
+    }
+
+    private Frame control() { return new Frame(FrameKind.CONTROL, null, helloFieldLocked()); }
+
+    private void deliver() {
+        Runnable pause = afterDecisionForTest;
+        if (pause != null) pause.run();
+        drain();
+    }
+
+    /**
+     * Hand every queued frame to the sink, in queue order, one drainer at a time and never under the view
+     * lock. A caller whose frame another drainer is already delivering waits for it, so when a mutation
+     * returns its own frames have been handed on. A sink that throws leaves the frames behind it queued for
+     * the next drain, in order.
+     */
+    void drain() {
+        synchronized (drainLock) {
+            for (Frame f = nextFrame(); f != null; f = nextFrame()) sink.accept(f);
+        }
+    }
+
+    private Frame nextFrame() { synchronized (lock) { return outbox.poll(); } }
 
     /**
      * The high-water mark and the session the HELLO reports belong to the symbol the routes answer for
@@ -271,124 +436,194 @@ final class FootprintStrikeView {
         if (date != null && (sessionDate == null || date.toString().compareTo(sessionDate) > 0)) sessionDate = date.toString();
     }
 
-    /** What one head's metadata costs: its identity string (twice — head and index key) and its revision ledger. */
-    private static long headMeta(Head h) { return HEAD_OVERHEAD + 2L * h.identity.length() + (long) REVISION_BYTES * h.digests.size(); }
+    /** What one live head's non-payload storage is charged: its node overhead, every string it retains, and its revision ledger. */
+    private static long headMeta(Head h) {
+        return HEAD_OVERHEAD + stringBytes(h.identity) + stringBytes(h.symbol) + stringBytes(h.sessionDate) + stringBytes(h.tf)
+                + stringBytes(h.openKey) + stringBytes(h.ageKey) + (long) REVISION_BYTES * h.digests.size();
+    }
+
+    /** What a tombstone keeps: its index node and key, and its identity in the refusal set. */
+    private static long tombstoneMeta(Head h) { return TOMBSTONE_OVERHEAD + stringBytes(h.identity) + stringBytes(h.openKey); }
+
+    /**
+     * What an eviction marker keeps: its nodes, and every string it references (identity, open key, age
+     * key, symbol, timeframe) — charged even where another head shares one. Always less than the head it
+     * replaces was charged, so evicting a head to make room can never grow the charge.
+     */
+    private static long markerMeta(Marker m) {
+        return MARKER_OVERHEAD + stringBytes(m.identity) + stringBytes(m.openKey) + stringBytes(m.ageKey) + stringBytes(m.symbol) + stringBytes(m.tf);
+    }
 
     /** Refuse an identity: its bytes leave, its tombstone stays in the index, the refusal is remembered — within a bound. */
     private void refuse(Head h) {
-        h.refused = true;
-        bytes -= FootprintViews.utf8Length(h.json);
+        bytes -= h.payload.length;
+        retained -= arrayBytes(h.payload.length);
         meta -= headMeta(h);
-        h.json = null; h.digests.clear();
+        h.payload = null; h.digests.clear();
         heads.remove(h.identity);
-        byAge.remove(ageKey(h.openBarStartMs, h.identity));
-        if (refused.add(h.identity)) { meta += TOMBSTONE_OVERHEAD + 2L * h.identity.length(); tombstones++; }
+        byAge.remove(h.ageKey);
+        if (refused.add(h.identity)) { meta += tombstoneMeta(h); tombstones++; }
         if (refused.size() > maxRefused) unavailable = true;    // the ledger would have to forget a refusal: fail closed instead
     }
 
-    private void removeLive(Head h) {
+    /**
+     * Evict one live head. If it was the NEWEST episode of its strike in its session, its index entry stays,
+     * dead, as an EVICTION MARKER — so {@code latest} names the strike in {@code tombstones} rather than
+     * showing nothing where an episode was, and no older episode can ever be offered in its place (strike
+     * re-review #3). Every entry below it in that session is dead already (eviction runs oldest first, and
+     * an equal opening is the same identity) and unreachable now, so it is dropped here: markers and
+     * tombstones are kept only where {@code latest} can reach them, and nothing walks the whole index.
+     */
+    private void evictLive(Head h) {
         heads.remove(h.identity);
-        TreeMap<Long, TreeMap<String, String>> perScope = index.get(scope(h.symbol, h.tf));
-        if (perScope != null) {
-            TreeMap<String, String> per = perScope.get(h.strikeCents);
-            if (per != null) { per.remove(openKey(h.sessionDate, h.openBarStartMs)); if (per.isEmpty()) perScope.remove(h.strikeCents); }
-            if (perScope.isEmpty()) index.remove(scope(h.symbol, h.tf));
-        }
-        byAge.remove(ageKey(h.openBarStartMs, h.identity));
-        bytes -= FootprintViews.utf8Length(h.json);
+        byAge.remove(h.ageKey);
+        bytes -= h.payload.length;
+        retained -= arrayBytes(h.payload.length);
         meta -= headMeta(h);
+        TreeMap<Long, TreeMap<String, String>> perScope = index.get(scope(h.symbol, h.tf));
+        TreeMap<String, String> per = perScope == null ? null : perScope.get(h.strikeCents);
+        if (per == null) return;
+        var session = per.subMap(h.sessionDate + "|", true, h.sessionDate + "|~", true);
+        if (!h.openKey.equals(session.lastKey())) {
+            per.remove(h.openKey);                                               // a newer entry answers for the strike
+        } else {
+            for (Map.Entry<String, String> below : new ArrayList<>(session.headMap(h.openKey, false).entrySet())) {
+                if (heads.containsKey(below.getValue())) continue;                // never a live one (none can be below)
+                Marker old = markers.get(below.getValue());
+                if (old != null) forgetMarker(old); else tombstones--;
+                per.remove(below.getKey());
+            }
+            Marker mk = new Marker(h);
+            markers.put(mk.identity, mk);
+            markersByAge.put(mk.ageKey, mk);
+            meta += markerMeta(mk);
+        }
+        if (per.isEmpty()) perScope.remove(h.strikeCents);
+        if (perScope.isEmpty()) index.remove(scope(h.symbol, h.tf));
+    }
+
+    /** A new head in {@code per}: the eviction marker directly below it IN ITS SESSION, if any, can no longer be reached. */
+    private void retireMarkerBelow(TreeMap<String, String> per, Head h) {
+        Map.Entry<String, String> below = per.lowerEntry(h.openKey);
+        if (below == null || !below.getKey().startsWith(h.sessionDate + "|")) return;   // another session's entry, or none
+        Marker mk = markers.get(below.getValue());
+        if (mk == null) return;
+        forgetMarker(mk);
+        per.remove(below.getKey());
+    }
+
+    /** A marker's own bookkeeping and charge; the caller removes its index entry. */
+    private void forgetMarker(Marker mk) {
+        markers.remove(mk.identity);
+        markersByAge.remove(mk.ageKey);
+        meta -= markerMeta(mk);
+    }
+
+    /**
+     * Drop the OLDEST eviction marker, index entry and all. Safe for the fold: every marker opened below the
+     * boundary (it was evicted, and the boundary is strictly above every evicted opening), so no retained head
+     * of its strike and session opens before it, and none can be admitted — {@code latest} then has no row for
+     * that strike and no older episode to offer. The caller advances the authority, so a reader discards what
+     * it held under the marker and re-walks: it can read NO DATA for that strike, never an older episode.
+     */
+    private void dropOldestMarker() {
+        Marker mk = markersByAge.firstEntry().getValue();
+        forgetMarker(mk);
+        TreeMap<Long, TreeMap<String, String>> perScope = index.get(scope(mk.symbol, mk.tf));
+        TreeMap<String, String> per = perScope == null ? null : perScope.get(mk.strikeCents);
+        if (per == null) return;
+        per.remove(mk.openKey);
+        if (per.isEmpty()) perScope.remove(mk.strikeCents);
+        if (perScope.isEmpty()) index.remove(scope(mk.symbol, mk.tf));
+    }
+
+    /** Evict the oldest opening-time bucket, whole, and raise the boundary past it. Returns how many heads left. */
+    private int evictOldestBucket() {
+        int evicted = 0;
+        Head oldest = heads.get(byAge.firstEntry().getValue());
+        long bucket = oldest.openBarStartMs;
+        evictLive(oldest); evicted++;
+        // every other head that opened in the same millisecond leaves with it: a boundary at
+        // bucket + 1 would otherwise sit ABOVE a retained head, freezing its updates as EVICTED
+        while (!byAge.isEmpty()) {
+            Head next = heads.get(byAge.firstEntry().getValue());
+            if (next.openBarStartMs != bucket) break;
+            evictLive(next); evicted++;
+        }
+        // the boundary is the OLDEST RETAINED opening (never less than one past the bucket just
+        // evicted), so it is both strictly above everything evicted and at or below everything kept
+        long candidate = byAge.isEmpty() ? bucket + 1 : Math.max(bucket + 1, heads.get(byAge.firstEntry().getValue()).openBarStartMs);
+        boundaryMs = boundaryMs == null ? candidate : Math.max(boundaryMs, candidate);
+        return evicted;
     }
 
     /**
      * Oldest identities go first, whatever their scope, and always the WHOLE equal-opening-time bucket, so
-     * the boundary that follows is strictly above every retained head (round-2 #2). Returns true when the
-     * view has just failed closed and connected readers must be told.
+     * the boundary that follows is strictly above every evicted opening and at or below every retained one
+     * (round-2 #2). Eviction markers are worth less than a live head: when only the BYTE budget is exceeded
+     * they are dropped, oldest first, before any head is evicted; they are also held to their own count
+     * ({@link #maxMarkers}). An eviction that moves the boundary, dropping a marker, or failing closed bumps
+     * the authority — once per mutation.
      */
-    private boolean enforce() {
-        int evicted = 0;
+    private void enforce() {
+        int evicted = 0, dropped = 0;
         Long boundaryBefore = boundaryMs;
-        while (!byAge.isEmpty() && overBudget()) {
-            Head oldest = heads.get(byAge.firstEntry().getValue());
-            long bucket = oldest.openBarStartMs;
-            removeLive(oldest); evicted++;
-            // every other head that opened in the same millisecond leaves with it: a boundary at
-            // bucket + 1 would otherwise sit ABOVE a retained head, freezing its updates as EVICTED
-            while (!byAge.isEmpty()) {
-                Head next = heads.get(byAge.firstEntry().getValue());
-                if (next.openBarStartMs != bucket) break;
-                removeLive(next); evicted++;
-            }
-            // the boundary is the OLDEST RETAINED opening (never less than one past the bucket just
-            // evicted), so it is both strictly above everything evicted and at or below everything kept
-            long candidate = byAge.isEmpty() ? bucket + 1 : Math.max(bucket + 1, heads.get(byAge.firstEntry().getValue()).openBarStartMs);
-            boundaryMs = boundaryMs == null ? candidate : Math.max(boundaryMs, candidate);
+        while (overBudget()) {
+            boolean overCount = heads.size() > maxEpisodes;
+            if (!overCount && !markersByAge.isEmpty()) { dropOldestMarker(); dropped++; continue; }
+            if (byAge.isEmpty()) break;
+            evicted += evictOldestBucket();
         }
-        // tombstones older than the boundary are unreachable: drop them ONCE, and only when there are any
-        // (round-2 #7 — pruning per eviction walked the whole index under the lock on every eviction)
-        if (evicted > 0) {
-            evictions.addAndGet(evicted);
-            if (tombstones > 0 && boundaryMs != null) pruneTombstonesBefore(boundaryMs);
-        }
+        while (markers.size() > maxMarkers) { dropOldestMarker(); dropped++; }
+        if (evicted > 0) evictions.addAndGet(evicted);
+        if (dropped > 0) markerDrops.addAndGet(dropped);
         if (overBudget() && !unavailable) {
             // nothing left to evict and still over: the alternative is silently holding more than the
             // deployment allowed, which is the failure this budget exists to prevent
             unavailable = true;
             authority++;
-            return true;
+            return;
         }
         // an eviction MOVES the boundary, which changes what every reader may hold: that is an authority
-        // change too, not merely bookkeeping (round-3 #4)
-        if (!java.util.Objects.equals(boundaryBefore, boundaryMs)) { authority++; return true; }
-        return false;
+        // change too, not merely bookkeeping (round-3 #4) — and so is forgetting a marker a reader may hold
+        if (!java.util.Objects.equals(boundaryBefore, boundaryMs) || dropped > 0) authority++;
     }
 
-    private boolean overBudget() { return heads.size() > maxEpisodes || bytes + meta > maxBytes; }
-
-    /** Drops unreachable tombstones and DECREMENTS the indexed count, so the guard means "there are some". */
-    private void pruneTombstonesBefore(long ms) {
-        for (var scopeEntry : new ArrayList<>(index.entrySet())) {
-            for (var strikeEntry : new ArrayList<>(scopeEntry.getValue().entrySet())) {
-                TreeMap<String, String> per = strikeEntry.getValue();
-                per.entrySet().removeIf(e -> {
-                    boolean drop = !heads.containsKey(e.getValue()) && openMsOf(e.getKey()) < ms;
-                    if (drop) tombstones--;                       // round-3 #7: it was only ever incremented
-                    return drop;
-                });
-                if (per.isEmpty()) scopeEntry.getValue().remove(strikeEntry.getKey());
-            }
-            if (scopeEntry.getValue().isEmpty()) index.remove(scopeEntry.getKey());
-        }
-    }
+    private boolean overBudget() { return heads.size() > maxEpisodes || retained + meta > maxBytes; }
 
     // ---- reads (one snapshot each) -----------------------------------------------------------------
 
     /**
-     * The hello field:
-     * {@code {"symbol":..,"sessionDate":..,"hwm":{tf:seenMax},"historyBeginsAtMs":..,"replayBeginsAtMs":..,"loading":bool,"refused":n,"unavailable":bool}}.
+     * The hello field, and the body of every control frame:
+     * {@code {"authority":n,"incarnation":"..","symbol":..,"sessionDate":..,"hwm":{tf:seenMax},"historyBeginsAtMs":..,"replayBeginsAtMs":..,"loading":bool,"refused":n,"unavailable":bool}}.
      */
-    String helloField() {
-        synchronized (lock) {
-            StringBuilder sb = new StringBuilder("{\"authority\":").append(authority)
-                    .append(",\"symbol\":").append(quoted(scopeSymbol)).append(",\"sessionDate\":")
-                    .append(sessionDate == null ? "null" : "\"" + sessionDate + "\"").append(",\"hwm\":{");
-            boolean first = true;
-            for (Map.Entry<String, Long> e : hwm.entrySet()) { if (!first) sb.append(','); sb.append('"').append(e.getKey()).append("\":").append(e.getValue()); first = false; }
-            sb.append("},\"historyBeginsAtMs\":").append(historyBeginsAtLocked() == null ? "null" : historyBeginsAtLocked());
-            sb.append(",\"replayBeginsAtMs\":").append(replayBeginsAtMs == null ? "null" : replayBeginsAtMs);
-            sb.append(",\"loading\":").append(!replayComplete);
-            return sb.append(",\"refused\":").append(refused.size()).append(",\"unavailable\":").append(unavailable).append('}').toString();
-        }
+    String helloField() { synchronized (lock) { return helloFieldLocked(); } }
+
+    private String helloFieldLocked() {
+        StringBuilder sb = new StringBuilder("{\"authority\":").append(authority)
+                .append(",\"incarnation\":\"").append(incarnation).append('"')
+                .append(",\"symbol\":").append(quoted(scopeSymbol)).append(",\"sessionDate\":")
+                .append(sessionDate == null ? "null" : "\"" + sessionDate + "\"").append(",\"hwm\":{");
+        boolean first = true;
+        for (Map.Entry<String, Long> e : hwm.entrySet()) { if (!first) sb.append(','); sb.append('"').append(e.getKey()).append("\":").append(e.getValue()); first = false; }
+        Long history = historyBeginsAtLocked();
+        sb.append("},\"historyBeginsAtMs\":").append(history == null ? "null" : history);
+        sb.append(",\"replayBeginsAtMs\":").append(replayBeginsAtMs == null ? "null" : replayBeginsAtMs);
+        sb.append(",\"loading\":").append(!replayComplete);
+        return sb.append(",\"refused\":").append(refused.size()).append(",\"unavailable\":").append(unavailable).append('}').toString();
     }
 
     /**
      * {@code latest} (R14): for ONE symbol, ONE timeframe and ONE session, the folded record of the
      * episode with the greatest {@code openBarStartMs} per strike, ascending by strike; {@code afterStrike}
-     * is an exclusive cursor. A strike whose newest episode is REFUSED has no row (NO DATA), never an
-     * older one; a strike with no episode in that session simply has no row.
+     * is an exclusive cursor. A strike whose newest episode is REFUSED or EVICTED has no row (NO DATA), never
+     * an older one, and is named in {@code tombstones}; it counts as visited for the cursor. A strike with no
+     * episode in that session — or whose eviction marker was itself dropped — simply has no row.
      */
     Page latest(String symbol, String tf, String session, long afterStrikeExclusive, int limit) {
         synchronized (lock) {
-            List<String> out = new ArrayList<>();
+            List<byte[]> out = new ArrayList<>();
+            List<Tombstone> dead = new ArrayList<>();
             Long last = null;
             TreeMap<Long, TreeMap<String, String>> perScope = index.get(scope(symbol, tf));
             if (!unavailable && perScope != null && session != null && !session.isEmpty()) {
@@ -398,12 +633,12 @@ final class FootprintStrikeView {
                     last = e.getKey();
                     if (newest == null) continue;
                     Head h = heads.get(newest.getValue());
-                    if (h == null) continue;                                                              // a refused tombstone: NO DATA for this strike
-                    out.add(h.json);
+                    if (h == null) { dead.add(new Tombstone(e.getKey(), openMsOf(newest.getKey()))); continue; }   // refused or evicted: NO DATA, and said
+                    out.add(h.payload);
                     if (out.size() >= limit) break;
                 }
             }
-            return page(session, out, out.size() >= limit && last != null ? Long.toString(last) : null);
+            return page(session, out, out.size() >= limit && last != null ? Long.toString(last) : null, List.copyOf(dead));
         }
     }
 
@@ -414,7 +649,7 @@ final class FootprintStrikeView {
      */
     Page history(String symbol, String tf, long strikeCents, String beforeExclusive, int limit) {
         synchronized (lock) {
-            List<String> out = new ArrayList<>();
+            List<byte[]> out = new ArrayList<>();
             String last = null;
             TreeMap<Long, TreeMap<String, String>> perScope = index.get(scope(symbol, tf));
             TreeMap<String, String> per = perScope == null ? null : perScope.get(strikeCents);
@@ -424,17 +659,18 @@ final class FootprintStrikeView {
                     last = e.getKey();
                     Head h = heads.get(e.getValue());
                     if (h == null) continue;                                                              // refused: omitted, and the walk continues
-                    out.add(h.json);
+                    out.add(h.payload);
                     if (out.size() >= limit) break;
                 }
             }
-            return page(sessionDate, out, out.size() >= limit ? last : null);
+            return page(sessionDate, out, out.size() >= limit ? last : null, null);
         }
     }
 
-    /** Every page states the same authority the hello does, including its GENERATION. */
-    private Page page(String session, List<String> records, String cursor) {
-        return new Page(session, records, cursor, historyBeginsAtLocked(), refused.size(), unavailable, !replayComplete, replayBeginsAtMs, authority);
+    /** Every page states the same authority and incarnation the hello does. */
+    private Page page(String session, List<byte[]> records, String cursor, List<Tombstone> tombstoneList) {
+        return new Page(session, List.copyOf(records), cursor, historyBeginsAtLocked(), refused.size(), unavailable, !replayComplete,
+                replayBeginsAtMs, authority, incarnation, tombstoneList);
     }
 
     /** The cursor grammar, and the domain: a canonical calendar date and an epoch inside the domain. */
@@ -451,18 +687,40 @@ final class FootprintStrikeView {
 
     // ---- gauges -------------------------------------------------------------------------------------
 
+    String incarnation() { return incarnation; }
     String sessionDate() { synchronized (lock) { return sessionDate; } }
     Long historyBeginsAtMs() { synchronized (lock) { return historyBeginsAtLocked(); } }
+    Long replayBeginsAtMs() { synchronized (lock) { return replayBeginsAtMs; } }
     int episodesInView() { synchronized (lock) { return heads.size(); } }
+    /** The record bytes the retained heads hold — what a reader receives before quoting; NOT the budget. */
     long bytesInView() { synchronized (lock) { return bytes; } }
+    /** The storage of the retained payload arrays, as charged to the budget. */
+    long retainedBytesInView() { synchronized (lock) { return retained; } }
     long metadataBytesInView() { synchronized (lock) { return meta; } }
+    /** What the byte budget acts on: retained payload storage plus metadata. */
+    long chargedBytesInView() { synchronized (lock) { return retained + meta; } }
     int refusedIdentities() { synchronized (lock) { return refused.size(); } }
     boolean unavailable() { synchronized (lock) { return unavailable; } }
     boolean loading() { synchronized (lock) { return !replayComplete; } }
     long authority() { synchronized (lock) { return authority; } }
+    /** Refused identities still in the index (a refused one below its session's newest entry leaves when that entry is evicted). */
     int indexedTombstones() { synchronized (lock) { return tombstones; } }
+    /** Eviction markers held: evicted newest episodes {@code latest} still names. */
+    int evictionMarkers() { synchronized (lock) { return markers.size(); } }
+    int queuedFrames() { synchronized (lock) { return outbox.size(); } }
     long evictions() { return evictions.get(); }
     long collisions() { return collisions.get(); }
+    /** Eviction markers dropped (their own bound, or the byte budget): each was an authority change. */
+    long markerDrops() { return markerDrops.get(); }
+
+    /** Test seam: the length of every payload array the view actually retains, so storage can be checked against its charge. */
+    List<Integer> retainedPayloadLengthsForTest() {
+        synchronized (lock) {
+            List<Integer> out = new ArrayList<>();
+            for (Head h : heads.values()) out.add(h.payload.length);
+            return out;
+        }
+    }
 
     // ---- helpers ------------------------------------------------------------------------------------
 
@@ -483,8 +741,26 @@ final class FootprintStrikeView {
         long x = v.longValue();
         return x < 0 ? -1 : x;
     }
-    static byte[] sha256(String s) {
-        try { return MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8)); }
+
+    /** The heap an array of {@code length} bytes occupies: its header, rounded up to the 8-byte object alignment. */
+    static long arrayBytes(long length) { return (ARRAY_HEADER_BYTES + length + 7) & ~7L; }
+
+    /**
+     * The heap a String occupies under COMPACT strings (which the preflight requires, G-R8): its object
+     * plus its backing array — one byte per char while every char is Latin-1, TWO per char as soon as one
+     * is not. Charging the UTF-8 length instead is what let a mostly-ASCII string with one wide character
+     * hold twice what it was charged (final review #3).
+     */
+    static long stringBytes(String s) {
+        int n = s.length();
+        boolean latin1 = true;
+        for (int i = 0; i < n && latin1; i++) latin1 = s.charAt(i) <= 0xFF;
+        return STRING_OBJECT_BYTES + arrayBytes(latin1 ? n : 2L * n);
+    }
+
+    static byte[] sha256(String s) { return sha256(s.getBytes(StandardCharsets.UTF_8)); }
+    static byte[] sha256(byte[] b) {
+        try { return MessageDigest.getInstance("SHA-256").digest(b); }
         catch (NoSuchAlgorithmException e) { throw new IllegalStateException(e); }
     }
     private static final char[] HEX = "0123456789abcdef".toCharArray();
@@ -510,6 +786,46 @@ final class FootprintStrikeView {
             }
         }
         return sb.append('"').toString();
+    }
+
+    /**
+     * {@link #quoted} applied to a record held as UTF-8, streamed straight to {@code out}: the bytes written
+     * are exactly {@code quoted(new String(utf8, UTF_8)).getBytes(UTF_8)}. Every byte the escaping touches is
+     * ASCII, and every byte of a multi-byte UTF-8 sequence is ≥ 0x80, so escaping byte by byte can never
+     * split or alter a character — and the page never decodes the record back into a String to write it.
+     */
+    static void writeQuoted(OutputStream out, byte[] utf8) throws IOException {
+        byte[] buf = new byte[8192];
+        int n = 0;
+        buf[n++] = '"';
+        for (byte b : utf8) {
+            if (n > buf.length - 7) { out.write(buf, 0, n); n = 0; }
+            int c = b & 0xff;
+            switch (c) {
+                case '"' -> { buf[n++] = '\\'; buf[n++] = '"'; }
+                case '\\' -> { buf[n++] = '\\'; buf[n++] = '\\'; }
+                case '\n' -> { buf[n++] = '\\'; buf[n++] = 'n'; }
+                case '\r' -> { buf[n++] = '\\'; buf[n++] = 'r'; }
+                case '\t' -> { buf[n++] = '\\'; buf[n++] = 't'; }
+                default -> {
+                    if (c < 0x20) {
+                        buf[n++] = '\\'; buf[n++] = 'u'; buf[n++] = '0'; buf[n++] = '0';
+                        buf[n++] = (byte) HEX[(c >>> 4) & 0xf]; buf[n++] = (byte) HEX[c & 0xf];
+                    } else {
+                        buf[n++] = b;
+                    }
+                }
+            }
+        }
+        buf[n++] = '"';
+        out.write(buf, 0, n);
+    }
+
+    /** {@link #writeQuoted} into a fresh array. */
+    static byte[] quotedUtf8(byte[] utf8) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(utf8.length + 16);
+        try { writeQuoted(out, utf8); } catch (IOException impossible) { throw new UncheckedIOException(impossible); }
+        return out.toByteArray();
     }
 
     /**

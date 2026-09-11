@@ -125,6 +125,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, OutboundChannel> outbound = new ConcurrentHashMap<>();
     private volatile ExecutorService outboundWriters;
     private volatile java.util.concurrent.Executor outboundWriterOverride; // test seam (caller-runs)
+    private volatile java.util.concurrent.Executor outboundCloserOverride; // test seam (a failing teardown hand-over)
     private final AtomicLong wsEnqueued = new AtomicLong();
     private final AtomicLong wsCoalesced = new AtomicLong();
     private final AtomicLong wsSent = new AtomicLong();
@@ -817,8 +818,7 @@ public class FeedGatewayService implements ReplayRunner {
                     settings.esFootprintOutcomesMaxBytes(), settings.esFootprintOutcomesMaxCount());
             this.footprintStrikeView = new FootprintStrikeView(mapper, settings.esFootprintMaxRecordBytes(),
                     settings.esFootprintStrikeMaxBytes(), settings.esFootprintStrikeMaxEpisodes(), settings.esFootprintStrikeMaxRefusedIdentities());
-            this.footprintStrikeView.onAuthorityChange(this::broadcastFootprintStrikeControl);
-        this.footprintStrikeView.scopeSymbol(settings.esFootprintStrikeSymbol());
+            this.footprintStrikeView.onFrame(this::deliverFootprintStrikeFrame);
             this.footprintStrikeView.scopeSymbol(settings.esFootprintStrikeSymbol());
             this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(),
                     FootprintTopicGate.adminReader(settings.bootstrapServers(), settings.partitionRefreshMetadataTimeoutMs()));
@@ -846,7 +846,7 @@ public class FeedGatewayService implements ReplayRunner {
                 settings.esFootprintOutcomesMaxBytes(), settings.esFootprintOutcomesMaxCount());
         this.footprintStrikeView = new FootprintStrikeView(mapper, settings.esFootprintMaxRecordBytes(),
                 settings.esFootprintStrikeMaxBytes(), settings.esFootprintStrikeMaxEpisodes(), settings.esFootprintStrikeMaxRefusedIdentities());
-        this.footprintStrikeView.onAuthorityChange(this::broadcastFootprintStrikeControl);
+        this.footprintStrikeView.onFrame(this::deliverFootprintStrikeFrame);
         this.footprintStrikeView.scopeSymbol(settings.esFootprintStrikeSymbol());
         this.footprintGate = new FootprintTopicGate(footprintTopics(), settings.esFootprintMaxMessageBytesCeiling(), footprintReader);
         this.footprintBackfillPermits = new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true);
@@ -919,7 +919,7 @@ public class FeedGatewayService implements ReplayRunner {
         if ("es-footprint-strike".equals(event)) {
             // ES-FOOTPRINT-STRIKE-INTERACTION.md R14: the strike log folds by identity/revision; a refused
             // (colliding) identity is a drop the page sees as NO DATA, and is counted here.
-            FootprintStrikeView.Admission sa = footprintStrikeView.admit(json);
+            FootprintStrikeView.Admission sa = footprintStrikeView.admit(json, "live".equals(consumer));
             if (sa.reason() != FootprintStrikeView.Reason.ADMITTED) {
                 footprintCounter("drops_total{event=\"" + event + "\",consumer=\"" + consumer + "\",reason=\"" + sa.reason().name().toLowerCase(java.util.Locale.ROOT) + "\"}").incrementAndGet();
             }
@@ -996,24 +996,48 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * ES-FOOTPRINT-STRIKE-INTERACTION.md R14, code round-2 #4: an authority change — a collision refusal,
-     * the view failing closed, or the cache replay completing — reaches ALREADY-CONNECTED readers as its
-     * own control frame carrying the same field the hello carries. Without it a page that was READY kept
-     * displaying a value this fold had withdrawn, because the producer record it holds is unchanged and
-     * nothing else told it otherwise. The frame carries no evidence: it says what the authority now is.
+     * ES-FOOTPRINT-STRIKE-INTERACTION.md R14 — the sink of the strike fold's SEQUENCED frames (final review
+     * #1). The fold decides every mutation and queues the frames it causes under its own lock; they arrive
+     * here one at a time, in that order, outside that lock:
+     * <ul>
+     *   <li>EVIDENCE — a record the fold ADMITTED from the live consumer. The strike log's readers fold by
+     *       BYTES (R14), so it rides the frame as a JSON string literal: a page receives exactly the bytes
+     *       this relay compared, not a re-serialisation.</li>
+     *   <li>CONTROL — the authority changed (a refusal, an eviction that moved the boundary, failing closed,
+     *       the replay completing or reopening). It carries the same field the hello carries and no
+     *       evidence; without it a page that was READY kept displaying a value the fold had withdrawn
+     *       (code round-2 #4).</li>
+     *   <li>HELLO — one socket's cvd-hello, its strike field captured in sequence with the controls.</li>
+     * </ul>
+     * The socket channels never block, so the order frames are handed over here is the order every socket
+     * receives them: a record admitted before a refusal reaches each socket before that refusal's control.
      */
-    void broadcastFootprintStrikeControl() {
-        if (footprintStrikeView == null) return;
-        broadcast("es-footprint-strike-control", footprintStrikeView.helloField());
-        footprintCounter("broadcast_total{event=\"es-footprint-strike-control\"}").incrementAndGet();
+    void deliverFootprintStrikeFrame(FootprintStrikeView.Frame frame) {
+        switch (frame.kind()) {
+            case EVIDENCE -> {
+                broadcast("es-footprint-strike", FootprintStrikeView.quoted(frame.body()));
+                footprintCounter("broadcast_total{event=\"es-footprint-strike\"}").incrementAndGet();
+                forwardedEvents.incrementAndGet();
+            }
+            case CONTROL -> {
+                broadcast("es-footprint-strike-control", frame.body());
+                footprintCounter("broadcast_total{event=\"es-footprint-strike-control\"}").incrementAndGet();
+            }
+            case HELLO -> send((WebSocketSession) frame.target(), "cvd-hello", cvdHelloJson(frame.body()));
+        }
     }
 
-    /** The live consumer's footprint branch (G-R3/G-R9): admit, then broadcast unless oversize. Package-private for the fan-out tests. */
+    /**
+     * The live consumer's footprint branch (G-R3/G-R9): admit, then broadcast unless oversize. The STRIKE
+     * record is not broadcast here: the fold queued its evidence with the admission itself, in sequence
+     * with any refusal or eviction the other consumer causes, and has already handed it to the sockets
+     * ({@link #deliverFootprintStrikeFrame}). Broadcasting it after the admission returned is the race the
+     * final review found — a refusal's control could overtake it. Package-private for the fan-out tests.
+     */
     boolean onFootprintLiveRecord(String event, String json) {
         if (!admitFootprintRecord(event, json, "live")) return false;
-        // The strike log's readers fold by BYTES (R14): the record rides the frame as a JSON string
-        // literal so a page receives exactly the bytes this relay compared, not a re-serialisation.
-        broadcast(event, "es-footprint-strike".equals(event) ? FootprintStrikeView.quoted(json) : json);
+        if ("es-footprint-strike".equals(event)) return true;
+        broadcast(event, json);
         footprintCounter("broadcast_total{event=\"" + event + "\"}").incrementAndGet();
         forwardedEvents.incrementAndGet();
         return true;
@@ -1071,11 +1095,14 @@ public class FeedGatewayService implements ReplayRunner {
         for (String r : routes) for (String x : rejectReasons) line(sb, "gateway_footprint_backfill_rejected_total", "{route=\"" + r + "\",reason=\"" + x + "\"}", footprintCounter("backfill_rejected_total{route=\"" + r + "\",reason=\"" + x + "\"}").get());
         sb.append("# HELP gateway_footprint_strike_episodes_in_view Folded strike-interaction episodes held (ES-FOOTPRINT-STRIKE-INTERACTION.md R14).\n# TYPE gateway_footprint_strike_episodes_in_view gauge\n");
         line(sb, "gateway_footprint_strike_episodes_in_view", "", footprintStrikeView.episodesInView());
-        sb.append("# HELP gateway_footprint_strike_view_bytes Summed record lengths held by the strike view.\n# TYPE gateway_footprint_strike_view_bytes gauge\n");
+        sb.append("# HELP gateway_footprint_strike_view_bytes Summed UTF-8 record lengths of the strike view's heads: what a reader receives before quoting, not what the budget charges.\n# TYPE gateway_footprint_strike_view_bytes gauge\n");
         line(sb, "gateway_footprint_strike_view_bytes", "", footprintStrikeView.bytesInView());
-        // what the revision ledgers, identities and tombstones cost, apart from the payloads: BOTH are
-        // charged to the same budget (code round-2 #1), so both are published
-        sb.append("# HELP gateway_footprint_strike_view_metadata_bytes Identity, revision-ledger and tombstone bytes held by the strike view — charged to the same budget as the payloads.\n# TYPE gateway_footprint_strike_view_metadata_bytes gauge\n");
+        // what is RETAINED, apart from what is sent (final review #3): the payload arrays as held (header
+        // and alignment included) and the strings, nodes, revision ledgers and tombstones. The byte budget
+        // acts on these two together (code round-2 #1), so both are published
+        sb.append("# HELP gateway_footprint_strike_view_retained_bytes Heap of the strike view's retained payload arrays, header and alignment included — charged to the byte budget with the metadata.\n# TYPE gateway_footprint_strike_view_retained_bytes gauge\n");
+        line(sb, "gateway_footprint_strike_view_retained_bytes", "", footprintStrikeView.retainedBytesInView());
+        sb.append("# HELP gateway_footprint_strike_view_metadata_bytes Strings, nodes, revision ledgers and tombstones charged by the strike view — with the retained payload arrays, what the byte budget acts on.\n# TYPE gateway_footprint_strike_view_metadata_bytes gauge\n");
         line(sb, "gateway_footprint_strike_view_metadata_bytes", "", footprintStrikeView.metadataBytesInView());
         sb.append("# HELP gateway_footprint_strike_loading 1 while the cache consumer has not crossed the end offsets captured at its bootstrap: an empty page is not a completed NO DATA.\n# TYPE gateway_footprint_strike_loading gauge\n");
         line(sb, "gateway_footprint_strike_loading", "", footprintStrikeView.loading() ? 1 : 0);
@@ -1087,6 +1114,11 @@ public class FeedGatewayService implements ReplayRunner {
         line(sb, "gateway_footprint_strike_refused_identities", "", footprintStrikeView.refusedIdentities());
         sb.append("# HELP gateway_footprint_strike_unavailable Whether the strike view has failed closed for this incarnation (its refusal ledger overflowed).\n# TYPE gateway_footprint_strike_unavailable gauge\n");
         line(sb, "gateway_footprint_strike_unavailable", "", footprintStrikeView.unavailable() ? 1 : 0);
+        // strike re-review #3: evicted newest episodes latest still names, and how many of those were forgotten
+        sb.append("# HELP gateway_footprint_strike_eviction_markers Evicted newest episodes the strike view still names in latest tombstones.\n# TYPE gateway_footprint_strike_eviction_markers gauge\n");
+        line(sb, "gateway_footprint_strike_eviction_markers", "", footprintStrikeView.evictionMarkers());
+        sb.append("# HELP gateway_footprint_strike_eviction_marker_drops_total Eviction markers dropped by their own bound or the byte budget; each was an authority change.\n# TYPE gateway_footprint_strike_eviction_marker_drops_total counter\n");
+        line(sb, "gateway_footprint_strike_eviction_marker_drops_total", "", footprintStrikeView.markerDrops());
         sb.append("# HELP gateway_footprint_topic_validated Whether the footprint topic passed G-R8a validation this incarnation.\n# TYPE gateway_footprint_topic_validated gauge\n");
         for (String t : footprintTopics()) line(sb, "gateway_footprint_topic_validated", "{topic=\"" + t + "\"}", footprintGate.validated(t) ? 1 : 0);
         sb.append("# HELP gateway_footprint_topic_validation_failures_total Validation attempts that did not yield VALID, one reason each.\n# TYPE gateway_footprint_topic_validation_failures_total counter\n");
@@ -1201,7 +1233,15 @@ public class FeedGatewayService implements ReplayRunner {
         diagnosticsExecutor.scheduleAtFixedRate(this::dumpDiagnosticState, 60L, 60L, TimeUnit.SECONDS);
     }
 
-    private void enforceOutboundWriteDeadlines() {
+    /**
+     * The write watchdog (every max(100 ms, deadline/2) on the batch executor). Force-closes any send stuck past
+     * the write deadline; hands over the teardown of any closed channel an earlier attempt could not schedule
+     * (strike re-review round 3 — a closed channel stays registered until its teardown runs, so this sweep
+     * always finds it); and interrupts a session close that has held one of the shared closer threads past
+     * {@link OutboundChannel#CLOSE_DEADLINE_MS}. None of it waits on a close. Package-private: the delivery tests
+     * run it as one watchdog tick.
+     */
+    void enforceOutboundWriteDeadlines() {
         long now = System.currentTimeMillis();
         long deadline = settings.wsWriteDeadlineMs();
         for (OutboundChannel channel : outbound.values()) {
@@ -1210,7 +1250,13 @@ public class FeedGatewayService implements ReplayRunner {
             } catch (RuntimeException ignored) {
                 // a single channel must not break the sweep
             }
+            try {
+                channel.retryPendingTeardown();
+            } catch (RuntimeException ignored) {
+                // never thrown (a failed hand-over stays pending); guarded like the deadline so the sweep goes on
+            }
         }
+        OutboundChannel.TEARDOWN.interruptOverdue(now);
     }
 
     @PreDestroy
@@ -1256,7 +1302,7 @@ public class FeedGatewayService implements ReplayRunner {
     public void addClient(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
-        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(),
+        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(), outboundCloserExecutor(),
                 settings.wsMaxQueuedMessages(), settings.wsMaxQueuedBytes(), outboundMetrics, this::onSlowDisconnect);
         outbound.put(session.getId(), channel);
         clients.add(session);
@@ -1268,7 +1314,14 @@ public class FeedGatewayService implements ReplayRunner {
             // U16 (CL-R8/G19): the latest ACCEPTED levels record rides INSIDE this same hello, so
             // "hello carried no levels record" (levels: null) is distinguishable from "replay still
             // pending" — the page needs that distinction to choose `no_data` over staying blank.
-            send(session, "cvd-hello", cvdHelloJson());
+            if (footprintStrikeView != null) {
+                // ES-FOOTPRINT-STRIKE (final review #1): the strike authority this hello carries is captured
+                // and QUEUED under the fold's lock, in sequence with every control frame, so this socket can
+                // never hold a hello older than a control it already received. Delivered before this returns.
+                footprintStrikeView.hello(session);
+            } else {
+                send(session, "cvd-hello", cvdHelloJson());
+            }
         }
         // A client may reconnect after the one-shot readiness broadcast (for example after a
         // gateway restart or a transient socket failure). Re-announce the already-committed
@@ -1582,6 +1635,24 @@ public class FeedGatewayService implements ReplayRunner {
     private java.util.concurrent.Executor outboundWriterExecutor() {
         java.util.concurrent.Executor override = outboundWriterOverride;
         return override != null ? override : outboundWriters();
+    }
+
+    /**
+     * Visible for tests: the teardown executor for sockets added from now on ({@code null} restores the shared
+     * bounded pool, {@link OutboundChannel#TEARDOWN}) — so a test can make one socket's hand-over fail.
+     */
+    void outboundClosersForTest(java.util.concurrent.Executor closers) {
+        outboundCloserOverride = closers;
+    }
+
+    /** Visible for tests: the channel registered for a socket, or null once its teardown has detached it. */
+    OutboundChannel outboundChannelForTest(String socketId) {
+        return outbound.get(socketId);
+    }
+
+    private java.util.concurrent.Executor outboundCloserExecutor() {
+        java.util.concurrent.Executor override = outboundCloserOverride;
+        return override != null ? override : OutboundChannel.TEARDOWN;
     }
 
     private ExecutorService outboundWriters() {
@@ -2741,7 +2812,7 @@ public class FeedGatewayService implements ReplayRunner {
         // attempt re-bootstraps every partition through the full catch-up gate, so the incremental entries
         // are obsolete, and a dead attempt's entry could never be retired (retirement needs this consumer's
         // position()), which would withhold readiness for that source forever.
-        try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
+        try (KafkaConsumer<String, Object> consumer = newCacheConsumer(name, avro)) {
             List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
             /* VERIFIED, not merely bound, before the hydration reads a single record. This runs on every
                cache-consumer attempt including RETRIES, and an id from a previous attempt is already on
@@ -2760,12 +2831,17 @@ public class FeedGatewayService implements ReplayRunner {
                 // only covers what was true BEFORE it read a record (round 30).
                 esAuctionIdCheckDue.set(true);
             }
-            seekToCacheWindow(consumer, partitions, topicEvents);
+            // R14 (round-2 #3, round-3 #2/#5, final review #2): THIS attempt's strike replay. The hydration
+            // seek opens it for the strike partitions it owns, with the cutoff that seek ACTUALLY used; every
+            // later adoption joins it the same way; readers are LOADING until all of them cross the end
+            // offsets captured when they joined — not until another source's barriers retire, and not
+            // merely because a poll came back caught up. A retry is a new attempt, so it reopens.
+            StrikeReplay strikeReplay = new StrikeReplay();
             // Bootstrap gets the BOOTSTRAP budget: a broker that answers in 10s is slow, not broken, and
             // must bootstrap rather than crash-loop. The 2s refresh budget applies only inside the poll
             // loop, where blocking is the cost and a failed call is a free retry.
             Map<TopicPartition, Long> bootstrapEndOffsets =
-                    boundedEndOffsets(consumer, partitions, settings.metadataTimeoutMs());
+                    cacheHydrationSeek(consumer, partitions, topicEvents, strikeReplay, settings.metadataTimeoutMs());
             // Capture the key BEFORE deriving barriers from the selection. Captured after, a selection that
             // rolled in between would leave OLD-source barriers labelled with the NEW key -- a mismatch that
             // never fires, so the recompute below would never run. Captured before, the worst case is one
@@ -2778,17 +2854,12 @@ public class FeedGatewayService implements ReplayRunner {
             // by this attempt, retire per partition at barrier, SURVIVE the attempt's death (failing
             // closed), and are superseded here by the next attempt.
             supersedeBootstrapEntries(name, bootstrapEndOffsets, topicEvents);
-            // R14 (round-2 #3, round-3 #2/#5): this consumer is about to replay the strike partitions it
-            // owns, so readers are LOADING until THOSE partitions cross the end offsets captured here —
-            // not until some other source's barriers retire, and not merely because a poll came back
-            // caught up. The window published is the one actually sought, recorded once per replay.
-            noteFootprintStrikeReplayStart(bootstrapEndOffsets);
             Map<TopicPartition, Long> catchUpEndOffsets =
                     new LinkedHashMap<>(catchUpEndOffsets(bootstrapEndOffsets, topicEvents));
             List<String> events = topicEvents.values().stream().map(TopicBinding::event).distinct().toList();
             boolean live = caughtUp(consumer, catchUpEndOffsets);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
-            noteFootprintStrikeReplayProgress(consumer, bootstrapEndOffsets);
+            footprintStrikeReplayProgress(consumer, strikeReplay);   // an empty strike partition is complete at once
             if (live) {
                 markCacheCaughtUp(name, events, caughtUpFlag);
                 tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
@@ -2807,8 +2878,12 @@ public class FeedGatewayService implements ReplayRunner {
                         reopenEsAuctionLatchForNewPartitions(refresh.added());
                         verifyOrBindEsAuctionIncarnation(refresh.added());
                     }
-                    seekToCacheWindow(consumer, refresh.added(), topicEvents);
-                    Map<TopicPartition, Long> addedEndOffsets = boundedEndOffsets(consumer, refresh.added());
+                    // The cache window for the added partitions and, for a strike partition among them, the
+                    // strike replay REOPENED with the cutoff this seek used and the end offsets captured now
+                    // (final review #2: an adopted strike partition used to inherit a completion it was
+                    // never part of, or leave the fold LOADING for ever).
+                    Map<TopicPartition, Long> addedEndOffsets = cacheHydrationSeek(consumer, refresh.added(), topicEvents,
+                            strikeReplay, settings.partitionRefreshMetadataTimeoutMs());
                     // TWO barriers, deliberately not the same set.
                     // Readiness is per-SELECTED-SOURCE, so it uses the source-filtered barriers: a partition
                     // on the non-selected source must not hold the cache in RECOVERING forever (there would
@@ -2960,6 +3035,10 @@ public class FeedGatewayService implements ReplayRunner {
                 // markSelectionReady is one-shot per selection key. (The lag guard above is the opposite
                 // case: it must see the PRE-retirement exemption set, so it stays before processing.)
                 clearReachedBootstrapBarriers(bootstrappingPartitions, partitions, consumer::position);
+                // The strike replay's completion, for the same reason: evaluated only AFTER this poll's records
+                // were applied, and on every poll, independently of the shared `live` flag below — the
+                // strike authority is not the selected source's readiness (final review #2).
+                footprintStrikeReplayProgress(consumer, strikeReplay);
 
                 // A source switch invalidates this consumer's catch-up barriers: they were filtered to the
                 // source selected when they were computed, and nothing else recomputes them. Recompute
@@ -2985,7 +3064,6 @@ public class FeedGatewayService implements ReplayRunner {
                     // again. Both calls are idempotent and markSelectionReady re-validates under readyLock,
                     // so this is safe and cheap.
                     markCacheCaughtUp(name, events, caughtUpFlag);
-                    noteFootprintStrikeReplayProgress(consumer, bootstrapEndOffsets);
                     tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
                     ActiveSelection liveSelection = activeSelection.get();
                     if (liveSelection != null
@@ -2997,8 +3075,8 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
-    private void seekToCacheWindow(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions) {
-        seekToCacheWindow(consumer, partitions, null);
+    private Map<TopicPartition, Long> seekToCacheWindow(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions) {
+        return seekToCacheWindow(consumer, partitions, null);
     }
 
     /**
@@ -3012,9 +3090,13 @@ public class FeedGatewayService implements ReplayRunner {
      * to END — unchanged from the original single-window behaviour. We deliberately do NOT seek max-pain to
      * the beginning: under unknown (delete-retention) topic config that could create avoidable bootstrap
      * backlog; the timestamp-bounded window reads only what the longer TTL admits.
+     *
+     * <p>Returns the cutoff each partition was sought to (absent for a partition sought to END), so a
+     * caller that publishes the window — the strike replay's {@code replayBeginsAtMs} — states the seek
+     * that was performed rather than recomputing it from a later clock (final review #2).
      */
-    private void seekToCacheWindow(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions,
-                                   Map<String, TopicBinding> topicEvents) {
+    private Map<TopicPartition, Long> seekToCacheWindow(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions,
+                                                        Map<String, TopicBinding> topicEvents) {
         long nowMs = System.currentTimeMillis();
         Map<TopicPartition, Long> timestamps = new HashMap<>();
         List<TopicPartition> seekToEnd = new ArrayList<>();
@@ -3027,6 +3109,7 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
         seekToTimestampsOrEnd(consumer, timestamps, seekToEnd);
+        return Map.copyOf(timestamps);
     }
 
     /**
@@ -4400,34 +4483,87 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * The strike partitions this cache consumer is about to replay, and the window it will seek back to.
-     * Called before the replay so a reader is LOADING for it, and again on adoption, so a partition that
-     * appears late reopens the replay rather than inheriting a completion it was never part of.
+     * One cache-consumer ATTEMPT's replay of the strike partitions (R14; final review #2): the end offset
+     * each strike partition must reach, captured right after THAT partition's cache-window seek — at
+     * bootstrap and at every late adoption alike. Confined to the consumer's own thread; a retry is a new
+     * attempt with a new replay.
      */
-    private void noteFootprintStrikeReplayStart(Map<TopicPartition, Long> bootstrapEndOffsets) {
-        if (footprintStrikeView == null) return;
-        if (bootstrapEndOffsets.keySet().stream().noneMatch(p -> p.topic().equals(settings.esFootprintStrikeTopic()))) return;
-        footprintStrikeView.replayRestarted(System.currentTimeMillis() - settings.esFootprintStrikeSeekBackMs());
+    static final class StrikeReplay {
+        private final Map<TopicPartition, Long> barriers = new HashMap<>();
+        Map<TopicPartition, Long> barriersForTest() { return Map.copyOf(barriers); }
     }
 
     /**
-     * Completion for the STRIKE partitions ALONE: every assigned strike partition must have reached the
-     * end offset captured at this consumer's bootstrap. Before this the flag came from the shared
-     * catch-up barriers, which exclude other sources' partitions and could declare completion while the
-     * strike partition was still at position zero (round-3 #2).
+     * The cache consumer's hydration seek, for its bootstrap set and for every adoption: the cache window
+     * for {@code partitions}, the end offsets captured right after it, and — when a strike partition is
+     * among them — the strike replay (re)opened with the cutoff THIS seek used. The cutoff is captured once
+     * and is both what was sought and what {@code replayBeginsAtMs} says (final review #2).
      */
-    private void noteFootprintStrikeReplayProgress(KafkaConsumer<?, ?> consumer, Map<TopicPartition, Long> bootstrapEndOffsets) {
+    Map<TopicPartition, Long> cacheHydrationSeek(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions,
+                                                 Map<String, TopicBinding> topicEvents, StrikeReplay strikeReplay,
+                                                 long endOffsetsBudgetMs) {
+        Map<TopicPartition, Long> cutoffs = seekToCacheWindow(consumer, partitions, topicEvents);
+        Map<TopicPartition, Long> endOffsets = boundedEndOffsets(consumer, partitions, endOffsetsBudgetMs);
+        openFootprintStrikeReplay(strikeReplay, endOffsets, cutoffs);
+        return endOffsets;
+    }
+
+    /**
+     * The strike partitions among {@code endOffsets} join the attempt's replay, and readers are LOADING
+     * again until they have crossed those offsets. With several strike partitions the replay is complete
+     * only from the LATEST cutoff on (a partition sought later never read what came before its cutoff), so
+     * that is the one published. A set without a strike partition says nothing.
+     */
+    private void openFootprintStrikeReplay(StrikeReplay replay, Map<TopicPartition, Long> endOffsets, Map<TopicPartition, Long> cutoffs) {
         if (footprintStrikeView == null) return;
-        List<TopicPartition> strike = bootstrapEndOffsets.keySet().stream()
-                .filter(p -> p.topic().equals(settings.esFootprintStrikeTopic())).toList();
-        if (strike.isEmpty()) return;                       // this consumer carries none: it says nothing
-        for (TopicPartition p : strike) {
-            long end = bootstrapEndOffsets.getOrDefault(p, 0L);
-            long at;
-            try { at = consumer.position(p); } catch (RuntimeException notAssigned) { return; }
-            if (at < end) return;                           // still replaying: readers stay loading
+        boolean joined = false;
+        Long cutoff = null;
+        for (Map.Entry<TopicPartition, Long> e : endOffsets.entrySet()) {
+            if (!e.getKey().topic().equals(settings.esFootprintStrikeTopic())) continue;
+            joined = true;
+            replay.barriers.put(e.getKey(), e.getValue());
+            Long c = cutoffs.get(e.getKey());
+            if (c != null && (cutoff == null || c > cutoff)) cutoff = c;
         }
-        footprintStrikeView.replay(System.currentTimeMillis() - settings.esFootprintStrikeSeekBackMs(), true);
+        if (joined) footprintStrikeView.replayRestarted(cutoff);
+    }
+
+    /**
+     * Completion for the STRIKE partitions alone (round-3 #2, final review #2): every partition of the open
+     * replay has reached the end offset captured when it joined. The loop calls this after each poll's
+     * records are APPLIED — poll() advances position() past records it merely returned — and regardless of
+     * the shared readiness flag. A partition this consumer no longer assigns keeps the replay open.
+     */
+    void footprintStrikeReplayProgress(KafkaConsumer<?, ?> consumer, StrikeReplay replay) {
+        if (footprintStrikeView == null || replay.barriers.isEmpty()) return;
+        for (Map.Entry<TopicPartition, Long> e : replay.barriers.entrySet()) {
+            long at;
+            try { at = consumer.position(e.getKey()); } catch (RuntimeException notAssigned) { return; }
+            if (at < e.getValue()) return;                  // still replaying: readers stay loading
+        }
+        replay.barriers.clear();
+        footprintStrikeView.replayCompleted();
+    }
+
+    /** Test seam: the client a cache-consumer attempt uses; null in production, which builds a real KafkaConsumer. */
+    private volatile java.util.function.Supplier<KafkaConsumer<String, Object>> cacheConsumerForTest;
+
+    private KafkaConsumer<String, Object> newCacheConsumer(String name, boolean avro) {
+        java.util.function.Supplier<KafkaConsumer<String, Object>> seam = cacheConsumerForTest;
+        return seam != null ? seam.get() : new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name));
+    }
+
+    /** Test seam: ONE production cache-consumer attempt — the retry loop's unit — against the supplied client. */
+    void runCacheConsumerAttemptForTest(String name, Map<String, TopicBinding> topicEvents, AtomicBoolean caughtUpFlag,
+                                        KafkaConsumer<String, Object> client) {
+        cacheConsumerForTest = () -> client;
+        try { runAssignedCacheConsumerOnce(name, topicEvents, false, caughtUpFlag); } finally { cacheConsumerForTest = null; }
+    }
+
+    /** Test seam: the named consumer's next poll runs its partition refresh. */
+    void expirePartitionRefreshForTest(String name) {
+        PartitionRefresh r = partitionRefreshes.get(name);
+        if (r != null) r.nextRefreshMs = 0L;
     }
 
     private void markCacheCaughtUp(String name, List<String> events, AtomicBoolean caughtUpFlag) {
@@ -11389,6 +11525,11 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     String cvdHelloJson() {
+        return cvdHelloJson(footprintStrikeView == null ? null : footprintStrikeView.helloField());
+    }
+
+    /** The hello with the strike authority field its caller captured — for a socket, in sequence with the control frames. */
+    String cvdHelloJson(String footprintStrikeField) {
         StringBuilder sb = new StringBuilder("{\"sessionDate\":");
         String sd = cvdBarsSessionDate;
         sb.append(sd == null ? "null" : "\"" + sd + "\"").append(",\"hwm\":{");
@@ -11410,7 +11551,7 @@ public class FeedGatewayService implements ReplayRunner {
             sb.append(",\"footprint\":").append(footprintViews.helloField());
             // ES-FOOTPRINT-STRIKE-INTERACTION.md R14: the episode high-water mark rides the SAME hello, so
             // the ladder can tell LOADING from a folded value from NO DATA.
-            sb.append(",\"footprintStrike\":").append(footprintStrikeView.helloField());
+            sb.append(",\"footprintStrike\":").append(footprintStrikeField);
         }
         return sb.append('}').toString();
     }

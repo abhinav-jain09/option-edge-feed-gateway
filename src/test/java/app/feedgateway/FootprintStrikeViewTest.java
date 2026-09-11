@@ -3,9 +3,14 @@ package app.feedgateway;
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /** ES-FOOTPRINT-STRIKE-INTERACTION.md R14/R18/R20 — the gateway fold, without a broker. */
@@ -119,13 +124,13 @@ class FootprintStrikeViewTest {
 
     @Test void checkpointsAdvanceTheHelloHighWaterMarkAndCarryNoEpisode() {
         FootprintStrikeView v = view();
-        assertEquals("{\"authority\":0,\"symbol\":\"\",\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"authority\":0,\"incarnation\":\"" + v.incarnation() + "\",\"symbol\":\"\",\"sessionDate\":null,\"hwm\":{},\"historyBeginsAtMs\":null,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
         assertTrue(v.admit(checkpoint("2026-09-10", "1m", 500)).checkpoint());
         assertTrue(v.admit(checkpoint(null, "30s", 7)).checkpoint(), "a genuine JSON null session date is the producer's 'nothing seen yet'");
         assertEquals(0, v.episodesInView());
         v.admit(episode("OPEN", "2026-09-10", "5m", 680_000, 300, 0, 300, "x"));
         v.admit(checkpoint("2026-09-10", "1m", 400));                          // older watermark: never regresses
-        assertEquals("{\"authority\":0,\"symbol\":\"\",\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":500,\"30s\":7,\"5m\":300},\"historyBeginsAtMs\":300,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"authority\":0,\"incarnation\":\"" + v.incarnation() + "\",\"symbol\":\"\",\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":500,\"30s\":7,\"5m\":300},\"historyBeginsAtMs\":300,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
     }
 
     @Test void theBudgetsEvictTheOldestIdentitiesAndTheBoundaryIsMonotonic() {
@@ -143,7 +148,7 @@ class FootprintStrikeViewTest {
         FootprintStrikeView small = new FootprintStrikeView(new ObjectMapper(), 262_144, 2_000, 1000, 1000);
         small.admit(e(100, 0, "one")); small.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 200, 0, 200, "two"));
         assertEquals(1, small.episodesInView(), "the byte budget evicts too");
-        assertTrue(small.bytesInView() + small.metadataBytesInView() <= 2_000, "and it is the budget that holds");
+        assertTrue(small.chargedBytesInView() <= 2_000, "and it is the budget that holds");
         assertEquals(List.of("two"), tags(latest(small, "1m", "2026-09-10")), "the survivor is the newer identity");
     }
 
@@ -170,7 +175,7 @@ class FootprintStrikeViewTest {
         assertEquals(FootprintStrikeView.Reason.SHAPE, v.admit(e(100, 0, "x").replace("\"sessionDate\":\"2026-09-10\"", "\"sessionDate\":\"2026-09-1\"")).reason());
         assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(episode("UPDATE", "2026-09-10", "1m", 680_000, 100, 253_402_300_800_000L, 100, "big")).reason(), "a revision is a count, not an epoch");
         assertEquals(FootprintStrikeView.Reason.SHAPE, v.admit(e(100, 0, "x").replace("\"openBarStartMs\":100", "\"openBarStartMs\":253402300800000")).reason(), "an epoch outside the domain is a shape drop");
-        assertEquals("{\"authority\":0,\"symbol\":\"\",\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":100},\"historyBeginsAtMs\":100,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
+        assertEquals("{\"authority\":0,\"incarnation\":\"" + v.incarnation() + "\",\"symbol\":\"\",\"sessionDate\":\"2026-09-10\",\"hwm\":{\"1m\":100},\"historyBeginsAtMs\":100,\"replayBeginsAtMs\":null,\"loading\":true,\"refused\":0,\"unavailable\":false}", v.helloField());
         assertEquals(1, v.episodesInView());
     }
 
@@ -200,7 +205,7 @@ class FootprintStrikeViewTest {
         for (long r = 0; r < 10_000; r++) {
             last = v.admit(e(100, r, "r" + r)).reason();
             chargedAtPeak = Math.max(chargedAtPeak, v.metadataBytesInView());
-            assertTrue(v.bytesInView() + v.metadataBytesInView() <= budget, "the budget holds at revision " + r);
+            assertTrue(v.chargedBytesInView() <= budget, "the budget holds at revision " + r);
         }
         assertTrue(chargedAtPeak > 100L * FootprintStrikeView.REVISION_BYTES, "the revisions are actually charged: " + chargedAtPeak);
         assertEquals(FootprintStrikeView.Reason.EVICTED, last, "the identity leaves through the published boundary, honestly");
@@ -242,8 +247,7 @@ class FootprintStrikeViewTest {
 
     @Test void anUnfinishedReplayIsLOADING_neverACompletedEmptyPage_andCompletionReachesTheReaders() {
         FootprintStrikeView v = view();
-        List<String> control = new ArrayList<>();
-        v.onAuthorityChange(() -> control.add(v.helloField()));
+        List<String> control = controls(v);
         assertTrue(v.loading(), "nothing has replayed yet");
         assertTrue(v.helloField().contains("\"loading\":true") && v.helloField().contains("\"replayBeginsAtMs\":null"));
         assertTrue(latest(v, "1m", "2026-09-10").loading(), "an empty page while loading is NOT a completed NO DATA");
@@ -252,20 +256,21 @@ class FootprintStrikeViewTest {
         v.admit(checkpoint("2026-09-10", "1m", 5_000));
         assertTrue(v.loading() && latest(v, "1m", "2026-09-10").loading());
         assertTrue(control.isEmpty(), "no authority change yet");
-        v.replay(1_000, true);
+        v.replayRestarted(1_000L);
+        assertTrue(control.isEmpty(), "opening a replay while already loading changes no authority");
+        v.replayCompleted();
         assertFalse(v.loading());
         assertEquals(1, control.size(), "completing the replay reaches already-connected readers");
         assertTrue(control.get(0).contains("\"loading\":false") && control.get(0).contains("\"replayBeginsAtMs\":1000"));
         assertFalse(latest(v, "1m", "2026-09-10").loading());
         assertEquals(1_000L, latest(v, "1m", "2026-09-10").replayBeginsAtMs().longValue());
-        v.replay(1_000, true);
+        v.replayCompleted();
         assertEquals(1, control.size(), "completion is idempotent and does not re-notify");
     }
 
     @Test void aRefusalAndFailingClosedBothReachAlreadyConnectedReaders() {
         FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1000, 1);
-        List<String> control = new ArrayList<>();
-        v.onAuthorityChange(() -> control.add(v.helloField()));
+        List<String> control = controls(v);
         v.admit(e(100, 0, "a"));
         assertTrue(control.isEmpty(), "an ordinary admission is not an authority change");
         assertEquals(FootprintStrikeView.Reason.COLLISION, v.admit(e(100, 0, "b")).reason());
@@ -284,13 +289,13 @@ class FootprintStrikeViewTest {
         // apply an OLDER authority last and stay loading for ever (gateway round-3 #3).
         FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1000, 1);
         List<Long> seen = new ArrayList<>();
-        v.onAuthorityChange(() -> seen.add(v.authority()));
+        v.onFrame(f -> { if (f.kind() == FootprintStrikeView.FrameKind.CONTROL) seen.add(authorityOf(f.body())); });
         assertEquals(0, v.authority());
         assertTrue(v.helloField().startsWith("{\"authority\":0,"));
         assertEquals(0, latest(v, "1m", "2026-09-10").authority());
         v.admit(e(100, 0, "a"));
         assertEquals(0, v.authority(), "an ordinary admission is not an authority change");
-        v.replay(1_000, true);
+        v.replayCompleted();
         assertEquals(1, v.authority(), "completing the replay is");
         v.admit(e(100, 0, "b"));                                       // collision
         assertEquals(2, v.authority(), "and so is a refusal");
@@ -305,7 +310,7 @@ class FootprintStrikeViewTest {
         // opposite of the truth (gateway round-3 #4).
         FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1, 1000);
         List<Long> control = new ArrayList<>();
-        v.onAuthorityChange(() -> control.add(v.authority()));
+        v.onFrame(f -> { if (f.kind() == FootprintStrikeView.FrameKind.CONTROL) control.add(authorityOf(f.body())); });
         assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(episode("OPEN", "2026-09-10", "1m", 680_000, 100, 0, 100, "a")).reason());
         assertTrue(control.isEmpty());
         assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 200, 0, 200, "b")).reason());
@@ -321,20 +326,20 @@ class FootprintStrikeViewTest {
     @Test void aReplayThatRestartsReopensLOADING_andTheWindowNamesTheSeekNotTheClock() {
         FootprintStrikeView v = view();
         List<Long> control = new ArrayList<>();
-        v.onAuthorityChange(() -> control.add(v.authority()));
-        v.replayRestarted(1_000);
+        v.onFrame(f -> { if (f.kind() == FootprintStrikeView.FrameKind.CONTROL) control.add(authorityOf(f.body())); });
+        v.replayRestarted(1_000L);
         assertTrue(v.loading()); assertEquals(1_000L, latest(v, "1m", "2026-09-10").replayBeginsAtMs().longValue());
         assertTrue(control.isEmpty(), "it was already loading");
-        v.replay(9_999, true);
+        v.replayCompleted();
         assertFalse(v.loading());
         assertEquals(1_000L, latest(v, "1m", "2026-09-10").replayBeginsAtMs().longValue(),
                 "the window is the one that was SEEKED, not the clock at completion (round-3 #5)");
         assertEquals(1, control.size());
-        v.replay(12_345, true);
+        v.replayCompleted();
         assertEquals(1_000L, latest(v, "1m", "2026-09-10").replayBeginsAtMs().longValue(), "a repeated caught-up poll moves nothing");
         assertEquals(1, control.size());
         // a new consumer attempt or a late adoption reopens it, and says so
-        v.replayRestarted(50_000);
+        v.replayRestarted(50_000L);
         assertTrue(v.loading()); assertEquals(2, control.size());
         assertEquals(50_000L, latest(v, "1m", "2026-09-10").replayBeginsAtMs().longValue());
     }
@@ -348,15 +353,31 @@ class FootprintStrikeViewTest {
         assertThrows(IllegalArgumentException.class, () -> v.scopeSymbol("ES\nX"));
     }
 
-    @Test void prunedTombstonesStopCountingAsIndexed() {
-        // The guard that skips the full index scan meant "a refusal has ever happened", so one historic
-        // collision made every future eviction scan the whole index under the lock (round-3 #7).
+    @Test void aRefusedNewestEpisodeBehindTheBoundaryIsStillNamed_andAnUnreachableOneLeavesWithItsSessionsNewestHead() {
+        // Round-3 #7 guarded a scan of the WHOLE index that pruned every tombstone behind the boundary. Under
+        // protocol v2 a strike's refused or evicted newest episode must stay named in latest (strike re-review
+        // #3), so nothing walks the index any more: a dead entry is kept exactly while latest can reach it —
+        // as its session's newest entry — and leaves, locally, when it cannot.
         FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 2, 1000);
-        v.admit(e(100, 0, "a")); v.admit(e(100, 0, "b"));               // collision at open 100 -> tombstone
+        v.admit(e(100, 0, "a")); v.admit(e(100, 0, "b"));               // collision at open 100 -> 6800's newest, refused
         assertEquals(1, v.indexedTombstones());
         for (int i = 1; i <= 4; i++) v.admit(episode("OPEN", "2026-09-10", "1m", 680_000 + i * 500, 1000L * i, 0, 1000L * i, "x" + i));
-        assertEquals(0, v.indexedTombstones(), "the boundary moved past it: it is no longer in the index");
+        assertTrue(v.historyBeginsAtMs() > 100, "the boundary moved past the refused episode");
+        assertEquals(1, v.indexedTombstones(), "…but it is still 6800's newest episode in its session, so latest still names it");
+        assertTrue(latest(v, "1m", "2026-09-10").tombstones().contains(new FootprintStrikeView.Tombstone(680_000, 100)));
         assertEquals(1, v.refusedIdentities(), "the refusal itself is still remembered for the incarnation");
+        // a refused episode BELOW its session's newest head is unreachable, and leaves with that head
+        FootprintStrikeView w = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 2, 1000);
+        w.admit(e(100, 0, "a")); w.admit(e(100, 0, "b"));
+        w.admit(e(200, 0, "newer"));                                    // 6800's newest is live again
+        assertEquals(1, w.indexedTombstones());
+        w.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 300, 0, 300, "p"));
+        w.admit(episode("OPEN", "2026-09-10", "1m", 681_000, 400, 0, 400, "q"));   // evicts "newer": 6800's newest, so it becomes a marker
+        assertEquals(0, w.indexedTombstones(), "the refused entry below the marker can never be reached again: gone");
+        assertEquals(1, w.evictionMarkers());
+        assertEquals(List.of(new FootprintStrikeView.Tombstone(680_000, 200)), latest(w, "1m", "2026-09-10").tombstones(),
+                "latest names the evicted newest episode — never the refused older one, and never an older episode as data");
+        assertEquals(1, w.refusedIdentities());
     }
 
     @Test void quotedEscapesEveryControlCharacterAndItsWorstCaseIsWhatTheProxyMustSizeFor() throws Exception {
@@ -380,5 +401,384 @@ class FootprintStrikeViewTest {
         String quoted = FootprintStrikeView.quoted(json);
         assertEquals(json, new ObjectMapper().readTree(quoted).asText(), "a JSON string literal that parses back to the exact record text");
         assertTrue(quoted.startsWith("\"{\\\"kind\\\":\\\"OPEN\\\""));
+    }
+
+    // ---- final review: tombstones, retained storage, byte-exact pages, ordered delivery, incarnation ---------
+
+    /** The bodies of the CONTROL frames the view sequences, in delivery order. */
+    static List<String> controls(FootprintStrikeView v) {
+        List<String> out = java.util.Collections.synchronizedList(new ArrayList<>());
+        v.onFrame(f -> { if (f.kind() == FootprintStrikeView.FrameKind.CONTROL) out.add(f.body()); });
+        return out;
+    }
+
+    static long authorityOf(String body) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"authority\":(\\d+)").matcher(body);
+        assertTrue(m.find(), body);
+        return Long.parseLong(m.group(1));
+    }
+
+    private static List<FootprintStrikeView.Frame> recorded(FootprintStrikeView v) {
+        List<FootprintStrikeView.Frame> out = java.util.Collections.synchronizedList(new ArrayList<>());
+        v.onFrame(out::add);
+        return out;
+    }
+
+    private static List<FootprintStrikeView.FrameKind> kinds(List<FootprintStrikeView.Frame> frames) {
+        synchronized (frames) { return frames.stream().map(FootprintStrikeView.Frame::kind).toList(); }
+    }
+
+    /**
+     * Starts a LIVE admission of {@code record} on its own thread and parks that thread right after its
+     * decision was queued and the view lock released, before it drains — where a preempted consumer
+     * thread would sit. Only that thread pauses.
+     */
+    private static Thread pausedLiveAdmission(FootprintStrikeView v, String record, CountDownLatch paused, CountDownLatch resume,
+                                              AtomicReference<FootprintStrikeView.Admission> outcome) {
+        Thread t = new Thread(() -> outcome.set(v.admit(record, true)), "state-live");
+        v.afterDecisionForTest = () -> {
+            if (Thread.currentThread() != t) return;
+            paused.countDown();
+            try { resume.await(10, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        };
+        t.start();
+        return t;
+    }
+
+    @Test void latestNamesEveryStrikeWhoseNewestEpisodeIsRefused_andTheCursorCountsItAsVisited() {
+        FootprintStrikeView v = view();
+        v.admit(e(100, 0, "older"));
+        v.admit(e(200, 0, "A")); v.admit(e(200, 0, "B"));                                   // 6800's newest episode: refused
+        v.admit(episode("OPEN", "2026-09-10", "1m", 685_000, 300, 0, 300, "live"));
+        v.admit(episode("OPEN", "2026-09-09", "1m", 690_000, 50, 0, 50, "y1"));
+        v.admit(episode("OPEN", "2026-09-09", "1m", 690_000, 50, 0, 50, "y2"));            // refused, in ANOTHER session
+        FootprintStrikeView.Page p = latest(v, "1m", "2026-09-10");
+        assertEquals(List.of("live"), tags(p), "no row for the refused strike, and never its older episode");
+        assertEquals(List.of(new FootprintStrikeView.Tombstone(680_000, 200)), p.tombstones(), "…and the page SAYS which strike is NO DATA");
+        FootprintStrikeView.Page yesterday = latest(v, "1m", "2026-09-09");
+        assertEquals(List.of(new FootprintStrikeView.Tombstone(690_000, 50)), yesterday.tombstones(), "scoped to the requested session");
+        assertTrue(yesterday.records().isEmpty());
+        assertTrue(latest(v, "5m", "2026-09-10").tombstones().isEmpty(), "and to the timeframe");
+        FootprintStrikeView.Page first = v.latest("ES.v.0", "1m", "2026-09-10", -1, 1);
+        assertEquals(List.of("live"), tags(first));
+        assertEquals(List.of(new FootprintStrikeView.Tombstone(680_000, 200)), first.tombstones(), "a tombstone rides the page that visited it");
+        assertEquals("685000", first.nextCursor(), "cursor semantics unchanged");
+        FootprintStrikeView.Page after = v.latest("ES.v.0", "1m", "2026-09-10", 680_000, 200);
+        assertTrue(after.tombstones().isEmpty(), "…and is not repeated by a page that starts after it");
+        assertEquals(List.of("live"), tags(after));
+        FootprintStrikeView.Page onlyDead = v.latest("ES.v.0", "1m", "2026-09-10", -1, 200);
+        assertNull(onlyDead.nextCursor(), "a page that ends on the last strike ends pagination, tombstone or not");
+        assertNull(history(v, 680_000).tombstones(), "history pages carry no tombstones");
+        assertEquals(List.of("older"), tags(history(v, 680_000)), "history still omits the refused identity and lists the older one");
+        v.admit(e(300, 0, "newer"));
+        assertTrue(latest(v, "1m", "2026-09-10").tombstones().isEmpty(), "a genuinely newer opening replaces the tombstone");
+        assertEquals(List.of("newer", "live"), tags(latest(v, "1m", "2026-09-10")));
+    }
+
+    @Test void retainedStorageIsWhatTheBudgetCharges_evenWhenOneCharacterIsWiderThanLatin1() {
+        // The reviewer's counterexample (final review #3): maxBytes 300,000 and an admitted ~200 KB record whose
+        // ONE character above U+00FF made the retained String UTF-16 — a 400,906-byte backing array against a
+        // 201,157-byte charge. The view now retains the record's UTF-8 array, and charges that array.
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 300_000, 1000, 1000);
+        String rec = e(100, 0, "x".repeat(200_000) + "€");
+        byte[] utf8 = rec.getBytes(StandardCharsets.UTF_8);
+        assertTrue(2L * rec.length() > 300_000, "held as a UTF-16 String, this record's array alone would exceed the budget");
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(rec).reason());
+        assertEquals(List.of(utf8.length), v.retainedPayloadLengthsForTest(),
+                "retained as UTF-8: the wide character costs its three bytes, not the whole record's width");
+        assertEquals(FootprintStrikeView.arrayBytes(utf8.length), v.retainedBytesInView(), "the charge is the array actually held, header and alignment included");
+        assertEquals(v.retainedBytesInView() + v.metadataBytesInView(), v.chargedBytesInView());
+        assertTrue(v.chargedBytesInView() <= 300_000, "and the budget holds: " + v.chargedBytesInView());
+        assertEquals(utf8.length, v.bytesInView(), "the record bytes a reader receives are published apart from storage");
+        // a second such record cannot share the budget: the older one leaves through the boundary
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(e(200, 0, "y".repeat(200_000) + "€")).reason());
+        assertEquals(1, v.episodesInView());
+        assertTrue(v.chargedBytesInView() <= 300_000);
+        // retained STRINGS are charged by their storage too: one wide character makes every string that carries it UTF-16
+        FootprintStrikeView narrow = view(), wide = view();
+        narrow.admit(episode("OPEN", "E".repeat(64), "2026-09-10", "1m", 680_000, 100, 0, 100, "x"));
+        wide.admit(episode("OPEN", "€" + "E".repeat(63), "2026-09-10", "1m", 680_000, 100, 0, 100, "x"));
+        assertEquals(1, wide.episodesInView());
+        assertTrue(wide.metadataBytesInView() - narrow.metadataBytesInView() >= 3L * 64,
+                "the symbol, the identity and the age key each cost two bytes a char: " + narrow.metadataBytesInView() + " vs " + wide.metadataBytesInView());
+        assertEquals(24 + 24, FootprintStrikeView.stringBytes("abc"));
+        assertEquals(24 + FootprintStrikeView.arrayBytes(2L * 101), FootprintStrikeView.stringBytes("x".repeat(100) + "€"));
+        assertEquals(24 + FootprintStrikeView.arrayBytes(101), FootprintStrikeView.stringBytes("x".repeat(100) + "ÿ"), "U+00FF is still Latin-1");
+    }
+
+    @Test void theChargeTracksEveryRetainedArrayThroughGrowthShrinkEvictionAndRefusal() {
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 60_000, 1000, 1000);
+        java.util.Random r = new java.util.Random(7);
+        for (int i = 0; i < 600; i++) {
+            long open = 100 + r.nextInt(40) * 10L + i / 20 * 10L;                 // identities recur, and time moves on
+            long rev = r.nextInt(4);
+            String tag = (r.nextBoolean() ? "x".repeat(r.nextInt(3000)) : "é€".repeat(r.nextInt(800))) + (i % 3);
+            v.admit(e(open, rev, tag));
+            List<Integer> held = v.retainedPayloadLengthsForTest();
+            assertEquals(held.stream().mapToLong(FootprintStrikeView::arrayBytes).sum(), v.retainedBytesInView(), "retained charge == the arrays held, step " + i);
+            assertEquals(held.stream().mapToLong(Integer::longValue).sum(), v.bytesInView(), "record bytes == the heads' bytes, step " + i);
+            assertTrue(v.unavailable() || v.chargedBytesInView() <= 60_000, "the budget holds, step " + i);
+        }
+        assertTrue(v.evictions() > 0 && v.collisions() > 0, "the run exercised eviction and refusal: " + v.evictions() + "/" + v.collisions());
+    }
+
+    @Test void theRetainedUtf8IsQuotedByteForByteAsTheStringWouldBe() {
+        java.util.Random r = new java.util.Random(11);
+        int[] pool = {0, 1, 0x1f, '"', '\\', '\n', '\r', '\t', 'a', '/', 0x7f, 0x80, 0xe9, 0xff, 0x100, 0x20ac, 0xfeff, 0x1F600, 0x10FFFF};
+        for (int n = 0; n < 2000; n++) {
+            StringBuilder sb = new StringBuilder();
+            int len = n == 0 ? 20_000 : r.nextInt(40);                             // one long enough to cross the write buffer
+            for (int i = 0; i < len; i++) sb.appendCodePoint(pool[r.nextInt(pool.length)]);
+            String s = sb.toString();
+            assertArrayEquals(FootprintStrikeView.quoted(s).getBytes(StandardCharsets.UTF_8), FootprintStrikeView.quotedUtf8(s.getBytes(StandardCharsets.UTF_8)), "string " + n);
+        }
+        byte[] worst = new byte[50_000];
+        assertTrue(FootprintStrikeView.quotedUtf8(worst).length <= FootprintStrikeView.quotedBoundBytes(worst.length), "the proxy's bound still holds");
+    }
+
+    @Test void aRecordAdmittedBeforeARefusalIsDeliveredBeforeThatRefusalsControl_whicheverThreadDrains() throws Exception {
+        FootprintStrikeView v = view();
+        List<FootprintStrikeView.Frame> delivered = recorded(v);
+        CountDownLatch paused = new CountDownLatch(1), resume = new CountDownLatch(1);
+        AtomicReference<FootprintStrikeView.Admission> live = new AtomicReference<>();
+        Thread t = pausedLiveAdmission(v, e(100, 0, "A"), paused, resume, live);
+        assertTrue(paused.await(10, TimeUnit.SECONDS));
+        assertTrue(delivered.isEmpty(), "the live thread has decided and queued A, and not yet delivered it");
+        // the cache consumer refuses the same identity now — and its drain carries the queue, A first
+        assertEquals(FootprintStrikeView.Reason.COLLISION, v.admit(e(100, 0, "B")).reason());
+        assertEquals(List.of(FootprintStrikeView.FrameKind.EVIDENCE, FootprintStrikeView.FrameKind.CONTROL), kinds(delivered));
+        assertTrue(delivered.get(0).body().contains("\"tag\":\"A\""));
+        assertEquals(1, authorityOf(delivered.get(1).body()));
+        // REST completes HERE — after the control, before the live thread resumes: the identity is withdrawn
+        FootprintStrikeView.Page rest = latest(v, "1m", "2026-09-10");
+        assertTrue(rest.records().isEmpty());
+        assertEquals(1, rest.authority());
+        assertEquals(List.of(new FootprintStrikeView.Tombstone(680_000, 100)), rest.tombstones());
+        resume.countDown();
+        t.join(10_000);
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, live.get().reason(), "A WAS admitted — before the refusal");
+        assertEquals(2, delivered.size(), "nothing reaches the sink after the control: the live thread found its evidence already delivered");
+        assertEquals(0, v.queuedFrames());
+    }
+
+    @Test void aRecordAdmittedBeforeAnEvictionIsDeliveredBeforeThatEvictionsControl() throws Exception {
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1, 1000);
+        List<FootprintStrikeView.Frame> delivered = recorded(v);
+        CountDownLatch paused = new CountDownLatch(1), resume = new CountDownLatch(1);
+        AtomicReference<FootprintStrikeView.Admission> live = new AtomicReference<>();
+        Thread t = pausedLiveAdmission(v, e(100, 0, "A"), paused, resume, live);
+        assertTrue(paused.await(10, TimeUnit.SECONDS));
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(e(200, 0, "B")).reason(), "the cache consumer's newer opening evicts A");
+        assertEquals(List.of(FootprintStrikeView.FrameKind.EVIDENCE, FootprintStrikeView.FrameKind.CONTROL), kinds(delivered));
+        assertTrue(delivered.get(0).body().contains("\"tag\":\"A\""));
+        assertEquals(Long.valueOf(200), v.historyBeginsAtMs(), "the boundary moved past A");
+        assertEquals(List.of("B"), tags(history(v, 680_000)), "REST no longer holds A");
+        resume.countDown();
+        t.join(10_000);
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, live.get().reason());
+        assertEquals(2, delivered.size(), "and no evidence of A arrives after the control that withdrew it");
+    }
+
+    @Test void aHelloIsSequencedWithTheControls_noFrameCarriesAnAuthorityOlderThanOneDeliveredBeforeIt() throws Exception {
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 24, 100_000, 100_000);
+        List<FootprintStrikeView.Frame> delivered = recorded(v);
+        CountDownLatch go = new CountDownLatch(1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread mutator = new Thread(() -> { try { go.await(); for (int i = 0; i < 500; i++) { v.admit(e(1_000 + i, 0, "a")); v.admit(e(1_000 + i, 0, "b")); } } catch (Throwable x) { failure.set(x); } });
+        Thread connector = new Thread(() -> { try { go.await(); for (int i = 0; i < 500; i++) v.hello("socket-" + i); } catch (Throwable x) { failure.set(x); } });
+        mutator.start(); connector.start(); go.countDown(); mutator.join(); connector.join();
+        assertNull(failure.get());
+        long last = -1;
+        int hellos = 0, controlFrames = 0;
+        synchronized (delivered) {
+            for (FootprintStrikeView.Frame f : delivered) {
+                long a = authorityOf(f.body());
+                assertTrue(a >= last, "a " + f.kind() + " at authority " + a + " was delivered after authority " + last);
+                last = a;
+                if (f.kind() == FootprintStrikeView.FrameKind.HELLO) hellos++;
+                if (f.kind() == FootprintStrikeView.FrameKind.CONTROL) controlFrames++;
+            }
+        }
+        assertEquals(500, hellos);
+        assertEquals(500, controlFrames);
+        assertEquals(500, last);
+    }
+
+    @Test void aForeignSymbolNeverAdvancesTheNamedHello() throws Exception {
+        // round-3 additional finding: the fix existed, the committed regression did not (final review table)
+        FootprintStrikeView v = view();
+        v.scopeSymbol("ES.v.0");
+        v.admit(checkpoint("2026-09-10", "1m", 500));
+        String nq = checkpoint("2026-09-11", "1m", 9_000).replace("\"symbol\":\"ES.v.0\"", "\"symbol\":\"NQ.v.0\"");
+        assertTrue(v.admit(nq).checkpoint());
+        v.admit(episode("OPEN", "NQ.v.0", "2026-09-12", "5m", 1_900_000, 100, 0, 99_999, "nq"));
+        com.fasterxml.jackson.databind.JsonNode hello = new ObjectMapper().readTree(v.helloField());
+        assertEquals("ES.v.0", hello.get("symbol").asText());
+        assertEquals("2026-09-10", hello.get("sessionDate").asText(), "another symbol's newer session never speaks for this hello");
+        assertEquals(500, hello.get("hwm").get("1m").asLong(), "nor its high-water mark");
+        assertNull(hello.get("hwm").get("5m"), "nor a timeframe only the other symbol reached");
+        assertEquals(List.of("nq"), tags(v.history("NQ.v.0", "5m", 1_900_000, "", 100)), "its records still fold and are served by an explicit symbol");
+    }
+
+    @Test void theIncarnationIsFixedForTheViewAndRidesTheHelloEveryControlAndEveryPage() throws Exception {
+        FootprintStrikeView v = view(), other = view();
+        assertNotEquals(v.incarnation(), other.incarnation(), "a new process is a new incarnation");
+        assertEquals(v.incarnation(), UUID.fromString(v.incarnation()).toString());
+        String inc = v.incarnation();
+        List<String> control = controls(v);
+        ObjectMapper m = new ObjectMapper();
+        assertEquals(inc, m.readTree(v.helloField()).get("incarnation").asText());
+        v.admit(e(100, 0, "a")); v.admit(e(100, 0, "b")); v.replayCompleted();
+        assertEquals(2, control.size());
+        for (String c : control) assertEquals(inc, m.readTree(c).get("incarnation").asText());
+        assertEquals(inc, latest(v, "1m", "2026-09-10").incarnation());
+        assertEquals(inc, history(v, 680_000).incarnation());
+        assertEquals(inc, v.incarnation(), "it never changes within the incarnation, whatever the authority did");
+    }
+
+    // ---- strike re-review (round 2): a cache-only change reaches readers; evicted newest episodes are named ----
+
+    /**
+     * The reviewer's reproduction of #2: revision 0 → revision 1 folded by the CACHE consumer after the replay
+     * completed changed REST's payload and emitted no frame at all. The change must reach every connected
+     * reader, in order with the mutations around it — as the admitted record's evidence (a reader folds it by
+     * revision, the same rule this view applies), not as an authority change that would make every reader
+     * release its fold and re-walk. Invalidations keep advancing the authority, after their evidence.
+     */
+    @Test void aChangeTheCacheConsumerFoldsAfterTheReplayCompletedReachesTheReaders_inOrder() {
+        FootprintStrikeView v = view();
+        List<FootprintStrikeView.Frame> delivered = recorded(v);
+        String r0 = e(100, 0, "r0"), r1 = e(100, 1, "r1");
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(r0).reason());
+        assertTrue(delivered.isEmpty(), "while the replay is incomplete the cache consumer queues no evidence: its completion covers it");
+        v.replayCompleted();
+        assertEquals(List.of(FootprintStrikeView.FrameKind.CONTROL), kinds(delivered));
+        long authority = v.authority();
+        assertEquals(1, authority);
+        // revision 0 -> revision 1, from the cache consumer, after completion
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(r1).reason());
+        assertEquals(List.of("r1"), tags(latest(v, "1m", "2026-09-10")), "REST serves revision 1");
+        assertEquals(List.of(FootprintStrikeView.FrameKind.CONTROL, FootprintStrikeView.FrameKind.EVIDENCE), kinds(delivered),
+                "…and the connected readers are told: the change is queued, as evidence, by the mutation that made it");
+        assertEquals(r1, delivered.get(1).body(), "the evidence is the record the fold now holds, byte for byte");
+        assertEquals(authority, v.authority(), "a newer revision supersedes by the fold's own rule: not an invalidation");
+        // the live consumer meets the same record later (or a redelivery arrives): nothing changed, nothing is queued twice
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(r1, true).reason());
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, v.admit(r0).reason(), "an older revision after a newer one");
+        assertEquals(2, delivered.size(), "an admission that changed nothing queues nothing");
+        // a change of WHICH episode is latest for the strike, from the cache consumer
+        String newer = e(200, 0, "newer");
+        v.admit(newer);
+        assertEquals(List.of("newer"), tags(latest(v, "1m", "2026-09-10")));
+        assertEquals(newer, delivered.get(2).body());
+        // an invalidation from the cache consumer still advances the authority — after everything queued before it
+        assertEquals(FootprintStrikeView.Reason.COLLISION, v.admit(e(200, 0, "conflict")).reason());
+        assertEquals(List.of(FootprintStrikeView.FrameKind.CONTROL, FootprintStrikeView.FrameKind.EVIDENCE, FootprintStrikeView.FrameKind.EVIDENCE,
+                FootprintStrikeView.FrameKind.CONTROL), kinds(delivered));
+        assertEquals(authority + 1, authorityOf(delivered.get(3).body()));
+        // a REOPENED replay stops the cache consumer's evidence again until it completes again
+        v.replayRestarted(5L);
+        v.admit(e(300, 0, "during-the-retry"));
+        v.replayCompleted();
+        assertEquals(List.of(FootprintStrikeView.FrameKind.CONTROL, FootprintStrikeView.FrameKind.CONTROL), kinds(delivered).subList(4, 6),
+                "reopened, then completed: the readers re-walk after it and find the retry's change");
+        assertEquals(List.of("during-the-retry"), tags(latest(v, "1m", "2026-09-10")));
+        assertEquals(0, v.queuedFrames());
+    }
+
+    private static long headCharge(String symbol, String session, String tf, long strike, long open, int revisions) {
+        String identity = symbol + "|" + session + "|" + tf + "|" + strike + "|" + open;
+        String openKey = FootprintStrikeView.openKey(session, open), ageKey = String.format(Locale.ROOT, "%019d", open) + "|" + identity;
+        return FootprintStrikeView.HEAD_OVERHEAD + FootprintStrikeView.stringBytes(identity) + FootprintStrikeView.stringBytes(symbol)
+                + FootprintStrikeView.stringBytes(session) + FootprintStrikeView.stringBytes(tf) + FootprintStrikeView.stringBytes(openKey)
+                + FootprintStrikeView.stringBytes(ageKey) + (long) FootprintStrikeView.REVISION_BYTES * revisions;
+    }
+
+    private static long markerCharge(String symbol, String session, String tf, long strike, long open) {
+        String identity = symbol + "|" + session + "|" + tf + "|" + strike + "|" + open;
+        String openKey = FootprintStrikeView.openKey(session, open), ageKey = String.format(Locale.ROOT, "%019d", open) + "|" + identity;
+        return FootprintStrikeView.MARKER_OVERHEAD + FootprintStrikeView.stringBytes(identity) + FootprintStrikeView.stringBytes(openKey)
+                + FootprintStrikeView.stringBytes(ageKey) + FootprintStrikeView.stringBytes(symbol) + FootprintStrikeView.stringBytes(tf);
+    }
+
+    /**
+     * The reviewer's reproduction of #3: maxEpisodes = 1; strike 680000 opens at 100, then strike 681000 at 200.
+     * latest returned the second record, boundary 200 and NO tombstone — 6800's evicted newest episode simply
+     * vanished. It is now kept as a marker, named, charged, and retired by a genuinely newer opening.
+     */
+    @Test void anEvictedNewestEpisodeIsNamedInTombstones_theReviewersCase() {
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1, 1000);
+        List<String> control = controls(v);
+        v.admit(episode("OPEN", "2026-09-10", "1m", 680_000, 100, 0, 100, "first"));
+        v.admit(episode("OPEN", "2026-09-10", "1m", 681_000, 200, 0, 200, "second"));
+        FootprintStrikeView.Page p = latest(v, "1m", "2026-09-10");
+        assertEquals(List.of("second"), tags(p));
+        assertEquals(200L, p.historyBeginsAtMs().longValue());
+        assertEquals(List.of(new FootprintStrikeView.Tombstone(680_000, 100)), p.tombstones(), "6800's evicted newest episode is NAMED, not silently absent");
+        assertEquals(1, v.evictionMarkers());
+        assertEquals(1, control.size(), "the eviction moved the boundary: one authority change");
+        assertEquals(headCharge("ES.v.0", "2026-09-10", "1m", 681_000, 200, 1) + markerCharge("ES.v.0", "2026-09-10", "1m", 680_000, 100),
+                v.metadataBytesInView(), "the marker is charged to the byte budget, exactly");
+        assertEquals(FootprintStrikeView.Reason.EVICTED, v.admit(episode("UPDATE", "2026-09-10", "1m", 680_000, 100, 1, 101, "late")).reason(),
+                "the marked identity can never come back, at any revision");
+        assertTrue(history(v, 680_000).records().isEmpty());
+        // a genuinely newer opening of 6800 answers for it again, and retires its marker
+        v.admit(episode("OPEN", "2026-09-10", "1m", 680_000, 300, 0, 300, "third"));          // evicts 681000/200: now IT is marked
+        FootprintStrikeView.Page q = latest(v, "1m", "2026-09-10");
+        assertEquals(List.of("third"), tags(q));
+        assertEquals(List.of(new FootprintStrikeView.Tombstone(681_000, 200)), q.tombstones());
+        assertEquals(1, v.evictionMarkers(), "6800's marker left the moment a newer opening answered for the strike");
+        assertEquals(headCharge("ES.v.0", "2026-09-10", "1m", 680_000, 300, 1) + markerCharge("ES.v.0", "2026-09-10", "1m", 681_000, 200), v.metadataBytesInView());
+        assertTrue(latest(v, "1m", "2026-09-09").tombstones().isEmpty(), "markers speak for their own session only");
+        assertTrue(latest(v, "5m", "2026-09-10").tombstones().isEmpty(), "and their own timeframe");
+    }
+
+    /**
+     * Markers are bounded (the refusal ledger's bound, and the byte budget). Forgetting one is an AUTHORITY
+     * CHANGE — a reader discards what it held under it and re-walks — and it can never let an older episode
+     * take the strike's place: every marker opened below the boundary, so nothing older is retained or admitted.
+     */
+    @Test void theMarkerLedgerIsBounded_forgettingAMarkerIsAnAuthorityChange_andNoOlderEpisodeTakesItsPlace() {
+        FootprintStrikeView v = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 20, 1, 2);
+        List<String> control = controls(v);
+        for (int i = 0; i < 4; i++) v.admit(episode("OPEN", "2026-09-10", "1m", 680_000 + i * 500, 100 + i * 100, 0, 100 + i * 100, "s" + i));
+        assertEquals(2, v.evictionMarkers(), "three evicted newest episodes, room for two markers");
+        assertEquals(1, v.markerDrops(), "the OLDEST marker was forgotten");
+        FootprintStrikeView.Page p = latest(v, "1m", "2026-09-10");
+        assertEquals(List.of("s3"), tags(p));
+        assertEquals(List.of(new FootprintStrikeView.Tombstone(680_500, 200), new FootprintStrikeView.Tombstone(681_000, 300)), p.tombstones());
+        assertEquals(3, control.size(), "one authority change per mutation: the drop rode the eviction that forced it");
+        assertEquals(FootprintStrikeView.Reason.EVICTED, v.admit(episode("OPEN", "2026-09-10", "1m", 680_000, 100, 0, 100, "s0")).reason());
+        assertEquals(FootprintStrikeView.Reason.EVICTED, v.admit(episode("OPEN", "2026-09-10", "1m", 680_000, 150, 0, 150, "older-than-the-boundary")).reason(),
+                "no older episode of the forgotten strike can be admitted in its place");
+        assertTrue(history(v, 680_000).records().isEmpty());
+        assertTrue(latest(v, "1m", "2026-09-10").records().stream().noneMatch(r -> r.contains("\"strikeCents\":680000")),
+                "latest has no row for it: NO DATA, never an older episode");
+
+        // under the BYTE budget alone a marker goes before any live head — and forgetting it is an authority change on its own
+        String big = "x".repeat(20_000);
+        FootprintStrikeView probe = new FootprintStrikeView(new ObjectMapper(), 262_144, 1 << 24, 1, 1000);
+        probe.admit(e(100, 0, "s0")); probe.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 200, 0, 200, "s1"));
+        probe.admit(episode("UPDATE", "2026-09-10", "1m", 680_500, 200, 1, 201, big));
+        assertEquals(1, probe.evictionMarkers());
+        long withMarker = probe.chargedBytesInView();
+        FootprintStrikeView b = new FootprintStrikeView(new ObjectMapper(), 262_144, withMarker - 1, 1, 1000);
+        List<String> bControl = controls(b);
+        b.admit(e(100, 0, "s0")); b.admit(episode("OPEN", "2026-09-10", "1m", 680_500, 200, 0, 200, "s1"));
+        assertEquals(1, b.evictionMarkers());
+        Long boundary = b.historyBeginsAtMs();
+        long authority = b.authority();
+        long metaBefore = b.metadataBytesInView();
+        assertEquals(FootprintStrikeView.Reason.ADMITTED, b.admit(episode("UPDATE", "2026-09-10", "1m", 680_500, 200, 1, 201, big)).reason());
+        assertEquals(1, b.episodesInView(), "the live head stays: a marker is worth less than a head");
+        assertEquals(0, b.evictionMarkers()); assertEquals(1, b.markerDrops());
+        assertEquals(metaBefore + FootprintStrikeView.REVISION_BYTES - markerCharge("ES.v.0", "2026-09-10", "1m", 680_000, 100), b.metadataBytesInView(),
+                "the marker's charge left with it, exactly");
+        assertEquals(boundary, b.historyBeginsAtMs(), "nothing was evicted: the boundary did not move");
+        assertEquals(authority + 1, b.authority(), "forgetting the marker is an authority change by itself");
+        assertEquals(authority + 1, authorityOf(bControl.get(bControl.size() - 1)), "…and readers are told");
+        assertTrue(b.chargedBytesInView() <= withMarker - 1);
+        assertTrue(latest(b, "1m", "2026-09-10").tombstones().isEmpty());
+        assertFalse(b.unavailable());
     }
 }

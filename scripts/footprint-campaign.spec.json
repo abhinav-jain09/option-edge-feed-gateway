@@ -311,9 +311,153 @@
    "requirement": "G-R9",
    "clause": "records_total is incremented BEFORE admission, so it counts oversize/shape/stale records too",
    "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
-   "old": "        footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n        if (\"es-footprint-strike\".equals(event)) {\n            // ES-FOOTPRINT-STRIKE-INTERACTION.md R14: the strike log folds by identity/revision; a refused\n            // (colliding) identity is a drop the page sees as NO DATA, and is counted here.\n            FootprintStrikeView.Admission sa = footprintStrikeView.admit(json);\n            if (sa.reason() != FootprintStrikeView.Reason.ADMITTED) {\n                footprintCounter(\"drops_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\",reason=\\\"\" + sa.reason().name().toLowerCase(java.util.Locale.ROOT) + \"\\\"}\").incrementAndGet();\n            }\n            // The strike stream forwards ONLY what the fold ADMITTED. Every other footprint stream\n            // broadcasts what it drops (G-R3: the page can still render a record the view would not\n            // keep), but the strike page folds by identity and revision against this very fold, so a\n            // refused, evicted or shape-dropped record reaching it is a record the relay has already\n            // decided is not part of the authority \u2014 and the page had no way to know (round-3 #3/#4).\n            return sa.reason() == FootprintStrikeView.Reason.ADMITTED;\n        }\n        if (!\"es-footprint-bar\".equals(event) && !\"es-footprint-outcome\".equals(event)) {\n            return true;                                            // live snapshots: never admitted to a view\n        }\n        FootprintViews.Admission a = \"es-footprint-bar\".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);\n        if (a.reason() != FootprintViews.Reason.ADMITTED) {",
-   "new": "        if (\"es-footprint-strike\".equals(event)) {\n            footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n            // ES-FOOTPRINT-STRIKE-INTERACTION.md R14: the strike log folds by identity/revision; a refused\n            // (colliding) identity is a drop the page sees as NO DATA, and is counted here.\n            FootprintStrikeView.Admission sa = footprintStrikeView.admit(json);\n            if (sa.reason() != FootprintStrikeView.Reason.ADMITTED) {\n                footprintCounter(\"drops_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\",reason=\\\"\" + sa.reason().name().toLowerCase(java.util.Locale.ROOT) + \"\\\"}\").incrementAndGet();\n            }\n            // The strike stream forwards ONLY what the fold ADMITTED. Every other footprint stream\n            // broadcasts what it drops (G-R3: the page can still render a record the view would not\n            // keep), but the strike page folds by identity and revision against this very fold, so a\n            // refused, evicted or shape-dropped record reaching it is a record the relay has already\n            // decided is not part of the authority \u2014 and the page had no way to know (round-3 #3/#4).\n            return sa.reason() == FootprintStrikeView.Reason.ADMITTED;\n        }\n        if (!\"es-footprint-bar\".equals(event) && !\"es-footprint-outcome\".equals(event)) {\n            footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n            return true;                                            // live snapshots: never admitted to a view\n        }\n        FootprintViews.Admission a = \"es-footprint-bar\".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);\n        if (a.reason() == FootprintViews.Reason.OVERSIZE) return false;   // MUTATION: counted only AFTER admission\n        footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n        if (a.reason() != FootprintViews.Reason.ADMITTED) {",
+   "old": "        footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n        if (\"es-footprint-strike\".equals(event)) {\n            // ES-FOOTPRINT-STRIKE-INTERACTION.md R14: the strike log folds by identity/revision; a refused\n            // (colliding) identity is a drop the page sees as NO DATA, and is counted here.\n            FootprintStrikeView.Admission sa = footprintStrikeView.admit(json, \"live\".equals(consumer));\n            if (sa.reason() != FootprintStrikeView.Reason.ADMITTED) {\n                footprintCounter(\"drops_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\",reason=\\\"\" + sa.reason().name().toLowerCase(java.util.Locale.ROOT) + \"\\\"}\").incrementAndGet();\n            }\n            // The strike stream forwards ONLY what the fold ADMITTED. Every other footprint stream\n            // broadcasts what it drops (G-R3: the page can still render a record the view would not\n            // keep), but the strike page folds by identity and revision against this very fold, so a\n            // refused, evicted or shape-dropped record reaching it is a record the relay has already\n            // decided is not part of the authority \u2014 and the page had no way to know (round-3 #3/#4).\n            return sa.reason() == FootprintStrikeView.Reason.ADMITTED;\n        }\n        if (!\"es-footprint-bar\".equals(event) && !\"es-footprint-outcome\".equals(event)) {\n            return true;                                            // live snapshots: never admitted to a view\n        }\n        FootprintViews.Admission a = \"es-footprint-bar\".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);\n        if (a.reason() != FootprintViews.Reason.ADMITTED) {",
+   "new": "        if (\"es-footprint-strike\".equals(event)) {\n            footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n            // ES-FOOTPRINT-STRIKE-INTERACTION.md R14: the strike log folds by identity/revision; a refused\n            // (colliding) identity is a drop the page sees as NO DATA, and is counted here.\n            FootprintStrikeView.Admission sa = footprintStrikeView.admit(json, \"live\".equals(consumer));\n            if (sa.reason() != FootprintStrikeView.Reason.ADMITTED) {\n                footprintCounter(\"drops_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\",reason=\\\"\" + sa.reason().name().toLowerCase(java.util.Locale.ROOT) + \"\\\"}\").incrementAndGet();\n            }\n            // The strike stream forwards ONLY what the fold ADMITTED. Every other footprint stream\n            // broadcasts what it drops (G-R3: the page can still render a record the view would not\n            // keep), but the strike page folds by identity and revision against this very fold, so a\n            // refused, evicted or shape-dropped record reaching it is a record the relay has already\n            // decided is not part of the authority \u2014 and the page had no way to know (round-3 #3/#4).\n            return sa.reason() == FootprintStrikeView.Reason.ADMITTED;\n        }\n        if (!\"es-footprint-bar\".equals(event) && !\"es-footprint-outcome\".equals(event)) {\n            footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n            return true;                                            // live snapshots: never admitted to a view\n        }\n        FootprintViews.Admission a = \"es-footprint-bar\".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);\n        if (a.reason() == FootprintViews.Reason.OVERSIZE) return false;   // MUTATION: counted only AFTER admission\n        footprintCounter(\"records_total{event=\\\"\" + event + \"\\\",consumer=\\\"\" + consumer + \"\\\"}\").incrementAndGet();\n        if (a.reason() != FootprintViews.Reason.ADMITTED) {",
    "documentText": "`gateway_footprint_records_total{event,consumer}` \u2014 every Kafka record of that event polled by that consumer, incremented BEFORE admission (so it counts oversize/shape/stale records too)."
+  },
+  {
+   "key": "G-R10.3 a-slow-sockets-teardown-never-runs-on-the-enqueuer",
+   "requirement": "G-R10",
+   "clause": "a channel that overflows is marked closed at once and its session is closed on a shared closer thread, never on the enqueuing thread (the strike drainer)",
+   "documentText": "a channel that overflows is marked closed at once, and its session is closed on a shared closer thread, never on the enqueuing thread, so a close that blocks behind an outstanding write delays neither consumer nor any other socket.",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "            closers.execute(this::teardown);",
+   "new": "            teardown();"
+  },
+  {
+   "key": "G-R10.4 teardown-concurrency-is-bounded",
+   "requirement": "G-R10",
+   "clause": "at most CLOSER_THREADS closer threads exist at once, however many sockets overflow together: the pool queues a teardown, it never starts a thread for one",
+   "documentText": "teardowns share ONE bounded pool — at most `CLOSER_THREADS` (4) closer threads exist at once, however many sockets overflow together",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "            queue.add(teardown);",
+   "new": "            Thread t = new Thread(teardown, \"options-edge-ws-closer\"); t.setDaemon(true); t.start();"
+  },
+  {
+   "key": "G-R10.5 a-failed-teardown-hand-over-never-aborts-the-fan-out",
+   "requirement": "G-R10",
+   "clause": "a teardown the closers cannot accept (an executor that rejects or throws an Error) is never thrown at the enqueuer, so the frame still reaches every other socket",
+   "documentText": "a teardown that cannot be handed over to the closers is never thrown at the enqueuer, so the frame still reaches every other socket",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "        } catch (RuntimeException | Error handOverFailed) {",
+   "new": "        } catch (RuntimeException handOverFailed) {"
+  },
+  {
+   "key": "G-R10.6 the-watchdog-retries-a-pending-teardown",
+   "requirement": "G-R10",
+   "clause": "a teardown left pending is retried by the write watchdog until the socket is torn down",
+   "documentText": "it stays pending, and the write watchdog retries it until the socket is torn down",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "                channel.retryPendingTeardown();",
+   "new": "                // channel.retryPendingTeardown();"
+  },
+  {
+   "key": "G-R10.7 a-failure-while-reporting-never-kills-a-closer",
+   "requirement": "G-R10",
+   "clause": "a failure while reporting a teardown's failure never kills a closer thread: the report is guarded, so the teardowns behind it still run",
+   "documentText": "a failure while reporting that failure never kills a closer thread either",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "            try {\n                reporter.accept(failure);\n            } catch (Throwable reportFailed) {\n                unreported.incrementAndGet();\n            }",
+   "new": "            reporter.accept(failure);"
+  },
+  {
+   "key": "G-R10.8 an-error-from-a-teardown-never-ends-its-closer",
+   "requirement": "G-R10",
+   "clause": "an Error out of a teardown never ends its closer thread: each turn of the closer's loop catches every Throwable",
+   "documentText": "an `Error` out of a teardown never ends its closer thread",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "                    } catch (Throwable teardownFailed) {",
+   "new": "                    } catch (RuntimeException teardownFailed) {"
+  },
+  {
+   "key": "G-R10.9 a-teardown-whose-close-throws-is-pending-again",
+   "requirement": "G-R10",
+   "clause": "a teardown whose session close throws is pending again, so the write watchdog retries it and no accepted teardown is stranded",
+   "documentText": "A teardown whose session close throws is pending again, and the write watchdog retries it, so an accepted teardown is never stranded",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "            if (!closeReturned) {",
+   "new": "            if (false) {"
+  },
+  {
+   "key": "G-R10.10 a-hand-over-never-overwrites-a-closers-pending-restore",
+   "requirement": "G-R10",
+   "clause": "a hand-over never overwrites a closer's pending restore: HANDED is claimed before the teardown is published and nothing is written after the publish, so a teardown whose close threw before the hand-over returned is still pending for the write watchdog",
+   "documentText": "a hand-over never overwrites a closer's pending restore",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "            closers.execute(this::teardown);\n            return true;",
+   "new": "            closers.execute(this::teardown);\n            teardownState.set(TEARDOWN_HANDED);\n            return true;"
+  },
+  {
+   "key": "G-R3.4 a-cache-consumer-change-after-completion-is-forwarded",
+   "requirement": "G-R3",
+   "clause": "the change is queued by whichever consumer made it: the cache consumer too, once its replay is complete",
+   "documentText": "The change is queued by whichever consumer made it: the live consumer always; the cache consumer only once its replay is complete",
+   "file": "src/main/java/app/feedgateway/FootprintStrikeView.java",
+   "old": "            if (outcome.reason() == Reason.ADMITTED && changed && (forward || replayComplete)) outbox.add(new Frame(FrameKind.EVIDENCE, null, json));",
+   "new": "            if (outcome.reason() == Reason.ADMITTED && changed && forward) outbox.add(new Frame(FrameKind.EVIDENCE, null, json));"
+  },
+  {
+   "key": "G-R3.5 an-admission-that-changed-nothing-queues-nothing",
+   "requirement": "G-R3",
+   "clause": "an admission that changed nothing (a redelivery, an older revision) queues nothing",
+   "documentText": "an admission that changed nothing (a redelivery, an older revision) queues nothing.",
+   "file": "src/main/java/app/feedgateway/FootprintStrikeView.java",
+   "old": "            if (outcome.reason() == Reason.ADMITTED && changed && (forward || replayComplete)) outbox.add(new Frame(FrameKind.EVIDENCE, null, json));",
+   "new": "            if (outcome.reason() == Reason.ADMITTED && (forward || replayComplete)) outbox.add(new Frame(FrameKind.EVIDENCE, null, json));"
+  },
+  {
+   "key": "G-R3.6 the-cache-consumer-queues-no-evidence-while-loading",
+   "requirement": "G-R3",
+   "clause": "while the replay is incomplete the cache consumer queues no evidence: every reader is LOADING and the completion's authority change makes each one re-walk",
+   "documentText": "while the replay is incomplete every reader is LOADING and the completion's authority change makes each one re-walk.",
+   "file": "src/main/java/app/feedgateway/FootprintStrikeView.java",
+   "old": "            if (outcome.reason() == Reason.ADMITTED && changed && (forward || replayComplete)) outbox.add(new Frame(FrameKind.EVIDENCE, null, json));",
+   "new": "            if (outcome.reason() == Reason.ADMITTED && changed) outbox.add(new Frame(FrameKind.EVIDENCE, null, json));"
+  },
+  {
+   "key": "G-R7.1 an-evicted-newest-episode-leaves-a-marker",
+   "requirement": "G-R7",
+   "clause": "an evicted newest episode leaves an eviction marker in the index, so latest names it in tombstones and no older episode can take its place",
+   "documentText": "an evicted newest episode leaves an eviction marker in the index, so no older episode can take its place",
+   "file": "src/main/java/app/feedgateway/FootprintStrikeView.java",
+   "old": "        if (!h.openKey.equals(session.lastKey())) {",
+   "new": "        if (true) {"
+  },
+  {
+   "key": "G-R7.2 a-newer-opening-retires-the-marker",
+   "requirement": "G-R7",
+   "clause": "a genuinely newer opening of that strike in that session retires its marker",
+   "documentText": "a genuinely newer opening of that strike in that session retires its marker.",
+   "file": "src/main/java/app/feedgateway/FootprintStrikeView.java",
+   "old": "        retireMarkerBelow(per, h);",
+   "new": "        if (false) retireMarkerBelow(per, h);"
+  },
+  {
+   "key": "G-R8.1 eviction-markers-are-bounded",
+   "requirement": "G-R8",
+   "clause": "at most GATEWAY_ES_FOOTPRINT_STRIKE_MAX_REFUSED_IDENTITIES eviction markers are kept",
+   "documentText": "at most `GATEWAY_ES_FOOTPRINT_STRIKE_MAX_REFUSED_IDENTITIES` eviction markers are kept, each charged to the strike byte budget",
+   "file": "src/main/java/app/feedgateway/FootprintStrikeView.java",
+   "old": "        while (markers.size() > maxMarkers) { dropOldestMarker(); dropped++; }",
+   "new": "        while (markers.size() > Integer.MAX_VALUE) { dropOldestMarker(); dropped++; }"
+  },
+  {
+   "key": "G-R8.2 markers-go-before-live-heads-under-the-byte-budget",
+   "requirement": "G-R8",
+   "clause": "when only the byte budget is exceeded, markers are dropped oldest first before any live head is evicted",
+   "documentText": "when only the byte budget is exceeded, markers are dropped oldest first before any live head is evicted",
+   "file": "src/main/java/app/feedgateway/FootprintStrikeView.java",
+   "old": "            if (!overCount && !markersByAge.isEmpty()) { dropOldestMarker(); dropped++; continue; }",
+   "new": "            if (false) { dropOldestMarker(); dropped++; continue; }"
+  },
+  {
+   "key": "G-R8.3 dropping-a-marker-is-an-authority-change",
+   "requirement": "G-R8",
+   "clause": "dropping a marker is an authority change, so a reader discards what it held and re-walks",
+   "documentText": "dropping a marker is an authority change, so a reader discards what it held and re-walks",
+   "file": "src/main/java/app/feedgateway/FootprintStrikeView.java",
+   "old": "        if (!java.util.Objects.equals(boundaryBefore, boundaryMs) || dropped > 0) authority++;",
+   "new": "        if (!java.util.Objects.equals(boundaryBefore, boundaryMs)) authority++;"
   }
  ]
 }
