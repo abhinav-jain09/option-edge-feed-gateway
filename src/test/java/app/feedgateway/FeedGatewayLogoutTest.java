@@ -1,6 +1,7 @@
 package app.feedgateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -56,6 +57,22 @@ class FeedGatewayLogoutTest {
         assertTrue(engine.appSession("app:u1").isEmpty(), "the AppSession is removed from routing");
         verify(ws).close();                                  // socket force-closed server-side
         assertTrue(svc.healthJson().contains("\"clients\":0"), "no client sockets remain");
+    }
+
+    @Test
+    void logoutDropsTheSocketsVolPremiumDelivery() throws Exception {
+        // The socket joined the vol-premium fan-out at its replay point (per-session connect); a logged-out
+        // socket's delivery must go with it, or the fan-out keeps a reference to it for the process's life.
+        SessionRoutingEngine engine = engineWithSession();
+        FeedGatewayService svc =
+                new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), engine);
+        svc.runOutboundWritesInline();
+        svc.addClient(socket("s1"));
+        assertTrue(svc.volPremiumDeliveryForTest("s1"), "precondition: registered at its replay point");
+
+        svc.logout("app:u1");
+
+        assertFalse(svc.volPremiumDeliveryForTest("s1"));
     }
 
     @Test

@@ -24,9 +24,10 @@ import java.util.regex.Pattern;
  *
  * <p>Response, always a JSON object:
  * <pre>{"symbol":"SPX","sessionDate":"2026-08-27"|null,
- *  "observations":[&lt;IvRvReading v2&gt;,...],"warnings":[&lt;EarlyWarning v1&gt;,...]}</pre>
+ *  "observations":[&lt;IvRvReading v2&gt;,...],"warnings":[&lt;EarlyWarning v1&gt;,...],
+ *  "retention":{"complete":true,"refusedForBudget":0,"retainedBytes":N,"budgetBytes":M}}</pre>
  * Observations in {@code (frameSeq, measurementEpochMs)} order and warnings in
- * {@code (frameSeq, episodeId)} order — the same order, the same records and the same bytes a
+ * {@code (frameSeq, asOfMs, episodeId, transition)} order — the same order, the same records and the same bytes a
  * WebSocket replay delivers, because both read the one session store. Each record is the producer's
  * JSON VERBATIM: nothing is coalesced, reshaped or recomputed here. No session held for the symbol is
  * a 200 with {@code sessionDate:null} and two empty arrays, so a cold start reads as "nothing yet"
@@ -100,7 +101,12 @@ public class VolPremiumController {
             writeRecords(out, snapshot.observations());
             out.write("],\"warnings\":[".getBytes(StandardCharsets.UTF_8));
             writeRecords(out, snapshot.warnings());
-            out.write("]}".getBytes(StandardCharsets.UTF_8));
+            // Whether the arrays above are the WHOLE session: false from the first record the store
+            // refused for its retention budget, so a machine can never read a held prefix as a session.
+            out.write(("],\"retention\":{\"complete\":" + snapshot.complete()
+                    + ",\"refusedForBudget\":" + snapshot.refusedForBudget()
+                    + ",\"retainedBytes\":" + snapshot.retainedBytes()
+                    + ",\"budgetBytes\":" + snapshot.budgetBytes() + "}}").getBytes(StandardCharsets.UTF_8));
             out.flush();
             response.flushBuffer();
         } finally {

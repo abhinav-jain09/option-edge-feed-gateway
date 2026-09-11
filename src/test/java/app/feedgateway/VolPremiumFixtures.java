@@ -158,6 +158,104 @@ final class VolPremiumFixtures {
         return object(json).get(field).asLong();
     }
 
+    /**
+     * The record's TEXT with {@code from} replaced by {@code to} exactly once — for the wire-level
+     * variants (a fractional ordinal, a quoted number, a duplicated key) that no tree edit can produce.
+     */
+    static String rawReplace(String json, String from, String to) {
+        int at = json.indexOf(from);
+        if (at < 0 || json.indexOf(from, at + 1) >= 0) {
+            throw new IllegalArgumentException("'" + from + "' must occur exactly once");
+        }
+        return json.substring(0, at) + to + json.substring(at + from.length());
+    }
+
+    /** Minutes, as the producer's 5 s ordinals: the ordinal shift that moves a record by {@code ms}. */
+    static final long CADENCE_MS = 5_000L;
+
+    /**
+     * The same observation {@code ordinals} cadence steps later: its ordinal and every instant of the
+     * frame moved together, its measurement epoch kept (the accumulator did not restart). The
+     * contract re-derives the ordinal from the event time, so the two cannot drift apart.
+     */
+    static Row shiftedObservation(Row row, long ordinals) {
+        ObjectNode node = object(row.json());
+        long delta = ordinals * CADENCE_MS;
+        for (String field : new String[] {"eventTimeMs", "impliedAsOfMs", "spotAsOfMs"}) {
+            if (node.hasNonNull(field)) {
+                node.put(field, node.get(field).asLong() + delta);
+            }
+        }
+        long frameSeq = node.get("frameSeq").asLong() + ordinals;
+        node.put("frameSeq", frameSeq);
+        String symbol = node.get("symbol").asText();
+        String sessionDate = node.get("sessionDate").asText();
+        // Each trend names the earlier frame it was measured against: that frame moves with this one
+        // (its epoch does not — the accumulator did not restart).
+        for (JsonNode trend : node.withArray("trends")) {
+            ObjectNode t = (ObjectNode) trend;
+            if (!t.hasNonNull("referenceFrameSeq")) {
+                continue;   // no reference frame yet (the warming grid): nothing to move
+            }
+            t.put("referenceFrameSeq", t.get("referenceFrameSeq").asLong() + ordinals);
+            for (String field : new String[] {"referenceAsOfMs", "referenceImpliedAsOfMs", "referenceSpotAsOfMs"}) {
+                if (t.hasNonNull(field)) {
+                    t.put(field, t.get(field).asLong() + delta);
+                }
+            }
+        }
+        // ...and so does every episode the observation reports open.
+        for (JsonNode summary : node.withArray("warnings")) {
+            ObjectNode w = (ObjectNode) summary;
+            if (w.hasNonNull("openedFrameSeq")) {
+                long opened = w.get("openedFrameSeq").asLong() + ordinals;
+                w.put("openedFrameSeq", opened);
+                w.put("episodeId", symbol + "|" + sessionDate + "|" + w.get("type").asText() + "|" + opened);
+            }
+        }
+        return new Row(symbol + "|" + sessionDate + "|" + frameSeq, write(node));
+    }
+
+    /**
+     * The same warning transition {@code ordinals} cadence steps later: its instants, its ordinals and
+     * therefore its episode id moved together, so it is a transition of a DIFFERENT episode.
+     */
+    static Row shiftedWarning(Row row, long ordinals) {
+        ObjectNode node = object(row.json());
+        long delta = ordinals * CADENCE_MS;
+        node.put("asOfMs", node.get("asOfMs").asLong() + delta);
+        node.put("openedAtMs", node.get("openedAtMs").asLong() + delta);
+        node.put("frameSeq", node.get("frameSeq").asLong() + ordinals);
+        long opened = node.get("openedFrameSeq").asLong() + ordinals;
+        node.put("openedFrameSeq", opened);
+        String episodeId = node.get("symbol").asText() + "|" + node.get("sessionDate").asText() + "|"
+                + node.get("type").asText() + "|" + opened;
+        node.put("episodeId", episodeId);
+        return new Row(episodeId, write(node));
+    }
+
+    /**
+     * A FULL 09:30–16:00 session at the producer's 5 s cadence — 4,680 observations, ordinals 6840 to
+     * 11519 — built from the engine's own 371 records: block {@code b} of the stream moved
+     * {@code b × 371} ordinals later. Every record is the engine's bytes with only its time moved.
+     */
+    static List<Row> referenceSession() {
+        List<Row> stream = readings();
+        List<Row> out = new ArrayList<>(4_680);
+        for (int i = 0; i < 4_680; i++) {
+            long block = i / stream.size();
+            out.add(block == 0 ? stream.get(i) : shiftedObservation(stream.get(i % stream.size()), block * stream.size()));
+        }
+        return List.copyOf(out);
+    }
+
+    /** One more field replaced, with a JSON object built from a mutable tree edit. */
+    static String edit(String json, java.util.function.Consumer<ObjectNode> change) {
+        ObjectNode node = object(json);
+        change.accept(node);
+        return write(node);
+    }
+
     static String sha256(byte[] bytes) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));

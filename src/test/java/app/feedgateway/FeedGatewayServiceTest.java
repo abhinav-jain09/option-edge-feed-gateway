@@ -2474,17 +2474,93 @@ class FeedGatewayServiceTest {
                         VolPremiumFixtures.FIXTURE_NOW_MS), json);
     }
 
-    /** The consumers' own ingest path — admit, claim, forward under the emit lock — as a caught-up consumer. */
+    /**
+     * The consumers' own ingest path — admit, claim, route under the emit lock. Whether anything is
+     * delivered is the gateway's serving state, exactly as for the consumers.
+     */
     private static void vpRelay(FeedGatewayService service, String event, long offset, String key, String json)
             throws Exception {
         Class<?> bindingType = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
         Method relay = FeedGatewayService.class.getDeclaredMethod("relayVolPremium", bindingType,
-                ConsumerRecord.class, String.class, boolean.class);
+                ConsumerRecord.class, String.class);
         relay.setAccessible(true);
         GatewaySettings settings = new GatewaySettings();
         String topic = VP_WARN.equals(event) ? settings.volPremiumWarningsTopic() : settings.volPremiumIvrvTopic();
-        relay.invoke(service, topicBinding("DATABENTO", event),
-                recordAt(topic, 0, offset, key, json, VolPremiumFixtures.FIXTURE_NOW_MS), json, true);
+        try {
+            relay.invoke(service, topicBinding("DATABENTO", event),
+                    recordAt(topic, 0, offset, key, json, VolPremiumFixtures.FIXTURE_NOW_MS), json);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            throw e.getCause() instanceof Exception cause ? cause : e;
+        }
+    }
+
+    /** vpRelay for a socket callback, which cannot throw a checked exception. */
+    private static void vpRelayUnchecked(FeedGatewayService service, long offset, VolPremiumFixtures.Row row) {
+        try {
+            vpRelay(service, VP_OBS, offset, row.key(), row.json());
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** The state cache consumer's production recovery transition, for a consumer carrying both streams. */
+    private static void vpRecovering(FeedGatewayService service) throws Exception {
+        Method recovering = FeedGatewayService.class.getDeclaredMethod("markCacheRecovering",
+                java.util.concurrent.atomic.AtomicBoolean.class, Collection.class);
+        recovering.setAccessible(true);
+        recovering.invoke(service, service.stateCaughtUpFlagForTest(), List.of(VP_OBS, VP_WARN));
+    }
+
+    /** ...and its production catch-up transition. */
+    private static void vpCaughtUp(FeedGatewayService service) throws Exception {
+        Method caughtUp = FeedGatewayService.class.getDeclaredMethod("markCacheCaughtUp", String.class, List.class,
+                java.util.concurrent.atomic.AtomicBoolean.class);
+        caughtUp.setAccessible(true);
+        caughtUp.invoke(service, "state", List.of(VP_OBS, VP_WARN), service.stateCaughtUpFlagForTest());
+    }
+
+    /** A replacement of the same window: one second later, same ordinal, same epoch. */
+    private static String vpLater(String json, long ms) {
+        return VolPremiumFixtures.with(json, "eventTimeMs", VolPremiumFixtures.longField(json, "eventTimeMs") + ms);
+    }
+
+    /**
+     * A socket that records every frame it is sent. With {@code vpPermits}, each VOL-PREMIUM frame first
+     * takes a permit — a client that reads the chart's stream only as fast as the test lets it — while
+     * every other frame passes. {@code afterSend} runs on the writing thread after each frame is recorded.
+     */
+    private static WebSocketSession vpSocket(String id, List<String> sink, java.util.concurrent.Semaphore vpPermits,
+                                             java.util.function.Consumer<String> afterSend) {
+        return (WebSocketSession) Proxy.newProxyInstance(
+                WebSocketSession.class.getClassLoader(),
+                new Class<?>[]{WebSocketSession.class},
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "isOpen": return Boolean.TRUE;
+                        case "getId": return id;
+                        case "sendMessage":
+                            String payload = args[0] instanceof TextMessage tm ? tm.getPayload() : "";
+                            if (vpPermits != null && payload.startsWith("{\"type\":\"vol-premium-")
+                                    && !vpPermits.tryAcquire(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                                throw new java.io.IOException("the test never let this socket read");
+                            }
+                            sink.add(payload);
+                            if (afterSend != null) {
+                                afterSend.accept(payload);
+                            }
+                            return null;
+                        case "getAttributes": return new java.util.HashMap<String, Object>();
+                        case "toString": return "VpSocket[" + id + "]";
+                        case "hashCode": return System.identityHashCode(proxy);
+                        case "equals": return proxy == args[0];
+                        default:
+                            Class<?> rt = method.getReturnType();
+                            if (rt == boolean.class) return Boolean.FALSE;
+                            if (rt == int.class) return 0;
+                            if (rt == long.class) return 0L;
+                            return null;
+                    }
+                });
     }
 
     private static void vpRelay(FeedGatewayService service, long offset, VolPremiumFixtures.Row row)
@@ -2492,8 +2568,10 @@ class FeedGatewayServiceTest {
         vpRelay(service, VP_OBS, offset, row.key(), row.json());
     }
 
+    /** A socket reaching its replay point on a gateway whose vol-premium streams are caught up. */
     private static void replayVolPremium(FeedGatewayService service, WebSocketSession session)
             throws Exception {
+        service.serveVolPremiumForTest();
         Method replay = FeedGatewayService.class.getDeclaredMethod("replayVolPremiumIvrvCached",
                 WebSocketSession.class);
         replay.setAccessible(true);
@@ -2563,6 +2641,7 @@ class FeedGatewayServiceTest {
                                 sink.add(tm.getPayload());
                             }
                             return null;
+                        case "getAttributes": return new java.util.HashMap<String, Object>();
                         case "toString": return "VpSession[" + id + "]";
                         case "hashCode": return System.identityHashCode(proxy);
                         case "equals": return proxy == args[0];
@@ -2626,16 +2705,14 @@ class FeedGatewayServiceTest {
     }
 
     @Test
-    void theGatewayHoldsVolPremiumUnderTheDeclaredProductionCaps() throws Exception {
+    void theGatewayHoldsVolPremiumUnderTheDeclaredProductionBudget() throws Exception {
         VolPremiumSessionStore store = service().volPremiumStoreForTest();
-        for (String[] cap : new String[][] {{"maxObservations", "MAX_OBSERVATIONS_PER_SESSION"},
-                {"maxWarnings", "MAX_WARNINGS_PER_SESSION"}, {"maxSymbols", "MAX_SYMBOLS"}}) {
-            Field held = VolPremiumSessionStore.class.getDeclaredField(cap[0]);
-            held.setAccessible(true);
-            Field declared = VolPremiumSessionStore.class.getDeclaredField(cap[1]);
-            declared.setAccessible(true);
-            assertEquals(declared.get(null), held.get(store), cap[0] + " must be the declared " + cap[1]);
-        }
+        assertEquals(VolPremiumSessionStore.SERIES_BUDGET_BYTES, store.seriesBudgetBytes());
+        Field held = VolPremiumSessionStore.class.getDeclaredField("maxSymbols");
+        held.setAccessible(true);
+        assertEquals(VolPremiumSessionStore.MAX_SYMBOLS, held.get(store));
+        assertTrue(service().metrics().contains("gateway_vol_premium_series_budget_bytes "
+                + VolPremiumSessionStore.SERIES_BUDGET_BYTES + "\n"), "the budget is exported");
     }
 
     @Test
@@ -2965,11 +3042,17 @@ class FeedGatewayServiceTest {
         List<String> expected = new ArrayList<>(vpJson(observations));
         expected.add(warning.json());
 
+        service.serveVolPremiumForTest();
         List<String> perSession = new ArrayList<>();
         Method replay = FeedGatewayService.class.getDeclaredMethod("replayCachedToSocket", WebSocketSession.class);
         replay.setAccessible(true);
-        replay.invoke(service, vpSession("vp-auth", perSession, null));
+        WebSocketSession auth = vpSession("vp-auth", perSession, null);
+        replay.invoke(service, auth);
         assertEquals(expected, vpFrames(perSession, VP_OBS, VP_WARN));
+        // Return-to-live comes through the SAME path. The socket kept receiving the global vol-premium
+        // stream all along, so it RESUMES — nothing it already holds is sent a second time.
+        replay.invoke(service, auth);
+        assertEquals(expected, vpFrames(perSession, VP_OBS, VP_WARN), "return-to-live must not resend the session");
 
         service.runOutboundWritesInline();
         service.markStateCaughtUpWithoutHandoffForTest();
@@ -3135,9 +3218,10 @@ class FeedGatewayServiceTest {
         // The one-reading relay COALESCED vol-premium frames: behind a slow socket only the newest queued
         // one survived, so the page lost every observation in between and drew a line across them.
         FeedGatewayService service = vpService();
+        service.serveVolPremiumForTest();
         java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
         List<String> sink = new CopyOnWriteArrayList<>();
-        // The state consumer has not caught up, so there is no replay: every frame below is LIVE.
+        // The store is empty, so the socket's walk parks at once: every frame below is LIVE.
         service.addClient(vpSession("vp-slow", sink, release));
         List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings().subList(0, 50);
         long offset = 0;
@@ -3257,18 +3341,21 @@ class FeedGatewayServiceTest {
         assertEquals(broken.length + fields.size(), vpRefusals(service, VolPremiumSessionStore.Stream.WARNING,
                 VolPremiumSessionStore.Refusal.MALFORMED));
 
-        assertEquals("DATABENTO|SPX|2026-08-27|W|7141|" + warning.key(),
+        // Filed under its transition identity: series, session, ordinal, instant, episode, NONE->DEVELOPING.
+        assertEquals("DATABENTO|SPX|2026-08-27|W|7141|1787838905000|" + warning.key() + "|101",
                 vpOfferWarning(service, offset++, warning.key(), json));
 
-        // LIVE: its own event type, verbatim, and never coalesced — two transitions of one frame both arrive.
+        // LIVE: its own event type, verbatim, and never coalesced — two transitions of one frame both arrive,
+        // after the one the socket's replay handed over.
         service.runOutboundWritesInline();
+        service.serveVolPremiumForTest();
         List<String> live = new CopyOnWriteArrayList<>();
-        service.addClient(vpSession("vp-live", live, null));   // no replay: the state consumer has not caught up
+        service.addClient(vpSession("vp-live", live, null));
         VolPremiumFixtures.Row second = VolPremiumFixtures.warnings().get(1);
         VolPremiumFixtures.Row third = VolPremiumFixtures.warnings().get(2);
         vpRelay(service, VP_WARN, offset++, second.key(), second.json());
         vpRelay(service, VP_WARN, offset++, third.key(), third.json());
-        assertEquals(List.of(second.json(), third.json()), vpFrames(live, VP_WARN));
+        assertEquals(List.of(json, second.json(), third.json()), vpFrames(live, VP_WARN));
 
         // A late joiner gets the transitions AFTER the session's observations.
         VolPremiumFixtures.Row reading = VolPremiumFixtures.canonicalReading();
@@ -3289,6 +3376,7 @@ class FeedGatewayServiceTest {
         // no single incarnation can produce: at or behind the held offset, yet strictly newer.
         FeedGatewayService service = vpService();
         service.runOutboundWritesInline();
+        service.serveVolPremiumForTest();
         List<String> live = new CopyOnWriteArrayList<>();
         service.addClient(vpSession("vp-live", live, null));
         List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
@@ -3334,6 +3422,423 @@ class FeedGatewayServiceTest {
         assertFalse(service.shouldBroadcastVolPremium(sixth, 1L), "offset 1 was already broadcast for it");
         assertTrue(service.shouldBroadcastVolPremium(sixth, 7L));
         assertFalse(service.shouldBroadcastVolPremium(sixth, 6L), "an earlier offset never after a later one");
+    }
+
+    // ----- the replay/live handoff (r1 finding 3) -------------------------------------------------
+
+    @Test
+    void aLiveRecordBetweenRegistrationAndReplayInstallationArrivesOnceAndInOrder() throws Exception {
+        // addClient registers the socket and sends it "status" long before the socket reaches its replay
+        // point. A live observation relayed IN BETWEEN used to reach the socket first and then again
+        // inside its replay: N, 0, 1, ..., N. The socket now joins the vol-premium fan-out in one step
+        // with its walk, so the record is simply part of the history the walk hands over.
+        FeedGatewayService service = vpService();
+        List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+        for (int i = 0; i < 20; i++) {
+            assertNotNull(vpOffer(service, i, rows.get(i)));
+        }
+        service.markStateCaughtUpWithoutHandoffForTest();
+        service.runOutboundWritesInline();
+        List<String> sink = new CopyOnWriteArrayList<>();
+        java.util.concurrent.atomic.AtomicBoolean injected = new java.util.concurrent.atomic.AtomicBoolean();
+        service.addClient(vpSocket("vp-race", sink, null, message -> {
+            if (message.startsWith("{\"type\":\"status\"") && injected.compareAndSet(false, true)) {
+                vpRelayUnchecked(service, 20, rows.get(20));
+            }
+        }));
+        assertTrue(injected.get(), "precondition: the live record landed after registration, before the replay");
+        assertEquals(vpJson(rows.subList(0, 21)), vpFrames(sink, VP_OBS), "history first, the live record once");
+    }
+
+    @Test
+    void theCaughtUpTransitionOpensNoWindowForALiveRecordAheadOfHistory() throws Exception {
+        // A socket connected while the state cache was catching up is owed the whole session at catch-up.
+        // A live record relayed DURING the caught-up transition (here: while its "status" frame is being
+        // written) used to reach such a socket before its re-push was installed.
+        FeedGatewayService service = vpService();
+        List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+        for (int i = 0; i < 20; i++) {
+            assertNotNull(vpOffer(service, i, rows.get(i)));
+        }
+        service.runOutboundWritesInline();
+        List<String> sink = new CopyOnWriteArrayList<>();
+        java.util.concurrent.atomic.AtomicBoolean armed = new java.util.concurrent.atomic.AtomicBoolean();
+        service.addClient(vpSocket("vp-catch-up", sink, null, message -> {
+            if (message.startsWith("{\"type\":\"status\"") && armed.compareAndSet(true, false)) {
+                vpRelayUnchecked(service, 20, rows.get(20));
+            }
+        }));
+        assertTrue(vpFrames(sink, VP_OBS).isEmpty(), "held: the state cache has not caught up");
+        armed.set(true);
+        vpCaughtUp(service);
+        assertFalse(armed.get(), "precondition: the live record landed inside the caught-up transition");
+        assertEquals(vpJson(rows.subList(0, 21)), vpFrames(sink, VP_OBS), "history first, the live record once");
+    }
+
+    @Test
+    void aRecoveryAfterPartialDeliveryResumesEachSocketFromWhatItHasExactlyOnceInOrder() throws Exception {
+        // The state cache consumer falls behind while a socket is part-way through its session, records
+        // are admitted meanwhile — behind the socket's position and ahead of it — and it catches up again.
+        // The socket must receive every version it does not already hold, once, and nothing it does: the
+        // old catch-up re-push RESTARTED the walk and resent the whole session.
+        System.setProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "40");   // a walk fills 10 at a time
+        try {
+            FeedGatewayService service = vpService();
+            List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+            for (int i = 0; i < 60; i++) {
+                assertNotNull(vpOffer(service, i, rows.get(i)));
+            }
+            service.markStateCaughtUpWithoutHandoffForTest();
+            java.util.concurrent.Semaphore reads = new java.util.concurrent.Semaphore(0);
+            List<String> sink = new CopyOnWriteArrayList<>();
+            service.addClient(vpSocket("vp-partial", sink, reads, null));
+            VolPremiumSessionStore.Position cursor = service.volPremiumCursorForTest("vp-partial");
+            int k = (int) (cursor.frameSeq() - 6840L);
+            assertTrue(k >= 5 && k < 40, "precondition: a PARTIAL delivery, paced at row " + k);
+
+            vpRecovering(service);
+            assertFalse(service.volPremiumServingForTest());
+            long offset = 100;
+            VolPremiumFixtures.Row second = rows.get(2);
+            VolPremiumFixtures.Row third = rows.get(3);
+            VolPremiumFixtures.Row ahead = rows.get(k + 5);
+            String secondReplaced = vpLater(second.json(), 1_000L);
+            String thirdRestarted = VolPremiumFixtures.with(third.json(), "measurementEpochMs",
+                    VolPremiumFixtures.longField(third.json(), "eventTimeMs"));
+            String aheadReplaced = vpLater(ahead.json(), 1_000L);
+            vpRelay(service, VP_OBS, offset++, second.key(), secondReplaced);   // a replacement BEHIND the cursor
+            vpRelay(service, VP_OBS, offset++, third.key(), thirdRestarted);    // a new point BEHIND it
+            vpRelay(service, VP_OBS, offset++, ahead.key(), aheadReplaced);     // a replacement AHEAD of it
+            for (int i = 60; i < 65; i++) {
+                vpRelay(service, offset++, rows.get(i));                          // new points AHEAD of it
+            }
+            VolPremiumFixtures.Row warning = VolPremiumFixtures.canonicalWarning();
+            vpRelay(service, VP_WARN, offset++, warning.key(), warning.json());
+            assertEquals(cursor, service.volPremiumCursorForTest("vp-partial"), "nothing moves while held");
+
+            vpCaughtUp(service);
+            assertTrue(service.volPremiumServingForTest());
+            // LIVE, behind the cursor, before the socket has drained: the pending repair owes it, so the
+            // live path must leave it to the repair — sent now as well, it would arrive twice.
+            VolPremiumFixtures.Row first = rows.get(1);
+            String firstReplaced = vpLater(first.json(), 1_000L);
+            vpRelay(service, VP_OBS, offset++, first.key(), firstReplaced);
+
+            reads.release(100_000);
+            List<String> expected = new ArrayList<>(vpJson(rows.subList(0, k + 1)));
+            expected.addAll(List.of(firstReplaced, secondReplaced, thirdRestarted));   // the repair
+            for (int i = k + 1; i < 60; i++) {
+                expected.add(i == k + 5 ? aheadReplaced : rows.get(i).json());         // the walk RESUMES
+            }
+            expected.addAll(vpJson(rows.subList(60, 65)));
+            expected.add(warning.json());
+            vpAwait(() -> vpFrames(sink, VP_OBS, VP_WARN).size() >= expected.size(), 20_000L);
+            Thread.sleep(200L);   // a duplicate, if any, would land now
+            assertEquals(expected, vpFrames(sink, VP_OBS, VP_WARN));
+        } finally {
+            System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
+        }
+    }
+
+    @Test
+    void aSecondRecoveryDuringARepairNeitherLosesNorRepeatsARecord() throws Exception {
+        // The repair itself is interrupted: the cache falls behind again after the socket has taken part of
+        // what it was owed. What it took must not come again; what it had not must still come, at its
+        // newest version, once; and what changed behind the repair's progress meanwhile must come too.
+        System.setProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "40");
+        try {
+            FeedGatewayService service = vpService();
+            List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+            for (int i = 0; i < 60; i++) {
+                assertNotNull(vpOffer(service, i, rows.get(i)));
+            }
+            service.markStateCaughtUpWithoutHandoffForTest();
+            java.util.concurrent.Semaphore reads = new java.util.concurrent.Semaphore(100_000);
+            List<String> sink = new CopyOnWriteArrayList<>();
+            service.addClient(vpSocket("vp-nested", sink, reads, null));
+            vpAwait(() -> vpFrames(sink, VP_OBS).size() >= 60, 20_000L);
+            assertEquals(vpJson(rows.subList(0, 60)), vpFrames(sink, VP_OBS), "precondition: the whole session, parked");
+            reads.drainPermits();   // the socket stops reading
+
+            vpRecovering(service);
+            long offset = 100;
+            List<String> firstRound = new ArrayList<>();
+            for (int i = 0; i < 30; i++) {
+                firstRound.add(vpLater(rows.get(i).json(), 1_000L));
+                vpRelay(service, VP_OBS, offset++, rows.get(i).key(), firstRound.get(i));
+            }
+            vpCaughtUp(service);   // the repair starts; the socket's queue fills part-way through it
+            VolPremiumSessionStore.Position repairedUpTo = service.volPremiumRepairAtForTest("vp-nested");
+            assertNotNull(repairedUpTo, "precondition: the repair has begun");
+            int j = (int) (repairedUpTo.frameSeq() - 6840L);
+            assertTrue(j >= 3 && j < 20, "precondition: the repair is part-way, at row " + j);
+
+            vpRecovering(service);   // behind again, mid-repair
+            String thirdAgain = vpLater(rows.get(3).json(), 2_000L);     // already repaired: owed again
+            String twentiethAgain = vpLater(rows.get(20).json(), 2_000L); // not yet repaired: owed once, newest
+            vpRelay(service, VP_OBS, offset++, rows.get(3).key(), thirdAgain);
+            vpRelay(service, VP_OBS, offset++, rows.get(20).key(), twentiethAgain);
+            vpCaughtUp(service);
+
+            reads.release(100_000);
+            List<String> expected = new ArrayList<>(vpJson(rows.subList(0, 60)));
+            expected.addAll(firstRound.subList(0, j + 1));
+            expected.add(thirdAgain);
+            for (int i = j + 1; i < 30; i++) {
+                expected.add(i == 20 ? twentiethAgain : firstRound.get(i));
+            }
+            vpAwait(() -> vpFrames(sink, VP_OBS).size() >= expected.size(), 20_000L);
+            Thread.sleep(200L);
+            assertEquals(expected, vpFrames(sink, VP_OBS));
+        } finally {
+            System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
+        }
+    }
+
+    @Test
+    void liveRecordsReachACaughtUpSocketUnpacedLikeEveryOtherLiveEvent() throws Exception {
+        // Pacing is for the replay. A socket whose walk has handed over everything is sent each new
+        // record at once — it must not wait for its queue to drain EMPTY, which a busy socket may not do
+        // for a long time while every other live event keeps flowing to it.
+        System.setProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "40");   // a walk would stop at 10
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        try {
+            FeedGatewayService service = vpService();
+            service.serveVolPremiumForTest();
+            List<String> sink = new CopyOnWriteArrayList<>();
+            service.addClient(vpSession("vp-busy", sink, release));   // empty store: parked at once
+            List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+            for (int i = 0; i < 20; i++) {
+                vpRelay(service, i, rows.get(i));
+            }
+            OutboundChannel channel = service.outboundChannelForTest("vp-busy");
+            assertTrue(channel.queueDepth() >= 19, "all twenty queued at once, not ten; queued " + channel.queueDepth());
+            release.countDown();
+            vpAwait(() -> vpFrames(sink, VP_OBS).size() >= 20, 10_000L);
+            Thread.sleep(100L);
+            assertEquals(vpJson(rows.subList(0, 20)), vpFrames(sink, VP_OBS), "in order, once");
+        } finally {
+            release.countDown();
+            System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
+        }
+    }
+
+    @Test
+    void aCaughtUpSocketIsHandedNothingWhileHeldEvenPastTheEndOfWhatItHas() throws Exception {
+        // A socket that has everything is PARKED: live records go straight to it. While the cache
+        // consumer recovers, that must stop: the live consumer can admit a point past the socket's end
+        // BEFORE the recovering consumer reads the history under it, and sent at once that point would
+        // precede its history — and the history, landing behind it, would follow out of order.
+        FeedGatewayService service = vpService();
+        List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+        for (int i = 0; i < 50; i++) {
+            assertNotNull(vpOffer(service, i, rows.get(i)));
+        }
+        service.markStateCaughtUpWithoutHandoffForTest();
+        service.runOutboundWritesInline();
+        List<String> sink = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-parked", sink, null));
+        assertEquals(vpJson(rows.subList(0, 50)), vpFrames(sink, VP_OBS), "precondition: parked at its end");
+
+        vpRecovering(service);
+        vpRelay(service, 55, rows.get(55));            // the live consumer: a point past the socket's end
+        for (int i = 50; i < 55; i++) {
+            vpRelay(service, i, rows.get(i));          // the recovering consumer: the history under it
+        }
+        assertEquals(50, vpFrames(sink, VP_OBS).size(), "held: nothing reaches the socket");
+        vpCaughtUp(service);
+        assertEquals(vpJson(rows.subList(0, 56)), vpFrames(sink, VP_OBS), "then the rest, in order, once");
+    }
+
+    @Test
+    void aSocketThatConnectsWhileHeldIsHandedNothingUntilTheSessionHasBeenRead() throws Exception {
+        // The live consumer can admit a NEWER observation before the cache consumer's catch-up has read
+        // the history under it. A socket connecting then must not start walking the partial store: its
+        // walk would hand over the newer point, park past it, and the history filled in behind it would
+        // never reach that socket.
+        FeedGatewayService service = vpService();
+        List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+        assertNotNull(vpOffer(service, 50, rows.get(50)));   // admitted ahead of the history
+        service.runOutboundWritesInline();
+        List<String> sink = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-early", sink, null));
+        assertTrue(vpFrames(sink, VP_OBS).isEmpty(), "held: nothing before the cache has caught up");
+        for (int i = 0; i < 50; i++) {
+            assertNotNull(vpOffer(service, i, rows.get(i)));   // the catch-up reads the history
+        }
+        vpCaughtUp(service);
+        assertEquals(vpJson(rows.subList(0, 51)), vpFrames(sink, VP_OBS), "the whole session, in order, once");
+    }
+
+    @Test
+    void aSocketAlreadyClosedWhenItsReplayStartsIsNotRetained() throws Exception {
+        // A return-to-live racing the socket's teardown re-creates the delivery after removeClient dropped
+        // it; nothing would ever remove it again.
+        FeedGatewayService service = vpService();
+        assertNotNull(vpOffer(service, 0, VolPremiumFixtures.readings().get(0)));
+        WebSocketSession closed = org.mockito.Mockito.mock(WebSocketSession.class);
+        org.mockito.Mockito.when(closed.getId()).thenReturn("vp-closed");
+        org.mockito.Mockito.when(closed.isOpen()).thenReturn(false);
+        replayVolPremium(service, closed);
+        assertFalse(service.volPremiumDeliveryForTest("vp-closed"));
+    }
+
+    // ----- catch-up barriers (r1 finding 4) -------------------------------------------------------
+
+    @Test
+    void bothVolPremiumStreamsGateCatchUpWhicheverSourceIsSelected() throws Exception {
+        // Both streams are bound under DATABENTO but are GLOBAL. With IBKR selected and an IBKR partition
+        // present, the barrier used to be that partition alone: the cache read caught up — and delivery
+        // started — before a single vol-premium record had been read. (A fixture carrying only the
+        // vol-premium topics masks this: an empty selected set falls back to every partition.)
+        FeedGatewayService service = vpService();
+        service.swapActiveSelectionForTest("IBKR", "SPX", "20260827", 1L);
+        GatewaySettings settings = new GatewaySettings();
+        String ivrv = settings.volPremiumIvrvTopic();
+        String warningsTopic = settings.volPremiumWarningsTopic();
+        String ibkr = "test.ibkr.strike-flow";
+        Map<String, FeedGatewayService.TopicBinding> events = Map.of(
+                ivrv, new FeedGatewayService.TopicBinding(FeedGatewayService.VOL_PREMIUM_SOURCE, VP_OBS),
+                warningsTopic, new FeedGatewayService.TopicBinding(FeedGatewayService.VOL_PREMIUM_SOURCE, VP_WARN),
+                ibkr, new FeedGatewayService.TopicBinding("IBKR", "strike-flow"));
+
+        // The barriers themselves — bootstrap, and a vol-premium topic discovered after startup.
+        Method initial = FeedGatewayService.class.getDeclaredMethod("catchUpEndOffsets", Map.class, Map.class);
+        initial.setAccessible(true);
+        Method incremental = FeedGatewayService.class.getDeclaredMethod("selectedSourceBarriers", Map.class, Map.class);
+        incremental.setAccessible(true);
+        Map<TopicPartition, Long> ends = Map.of(new TopicPartition(ivrv, 0), 371L,
+                new TopicPartition(warningsTopic, 0), 15L, new TopicPartition(ibkr, 0), 5L);
+        assertEquals(ends.keySet(), ((Map<?, ?>) initial.invoke(service, ends, events)).keySet(),
+                "every vol-premium partition gates the bootstrap barrier");
+        Map<TopicPartition, Long> discovered = Map.of(new TopicPartition(ivrv, 0), 371L,
+                new TopicPartition(warningsTopic, 0), 15L);
+        assertEquals(discovered.keySet(), ((Map<?, ?>) incremental.invoke(service, discovered, events)).keySet(),
+                "a vol-premium topic discovered late gates the incremental barrier");
+
+        // ...and through the production cache-consumer loop.
+        VpBroker broker = new VpBroker()
+                .topic(ivrv, VolPremiumFixtures.readings())
+                .topic(warningsTopic, VolPremiumFixtures.warnings())
+                .topic(ibkr, List.of());
+        java.util.concurrent.atomic.AtomicBoolean flag = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicBoolean caughtUpBeforeFirstPoll = new java.util.concurrent.atomic.AtomicBoolean();
+        broker.onPoll = n -> {
+            if (n == 1) {
+                caughtUpBeforeFirstPoll.set(flag.get());
+            }
+            if (n >= 4) {
+                service.setRunningForTest(false);
+            }
+        };
+        service.runOutboundWritesInline();
+        List<String> waiting = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-ibkr", waiting, null));
+        service.setRunningForTest(true);
+        service.runCacheConsumerAttemptForTest("state", events, flag, broker.consumer());
+        assertFalse(caughtUpBeforeFirstPoll.get(), "caught up before the vol-premium session was read");
+        assertTrue(flag.get(), "caught up once it was");
+        assertEquals(vpFinalState(), vpFrames(waiting, VP_OBS, VP_WARN),
+                "the waiting socket got the whole session, once, in order, only after it was read");
+    }
+
+    /** The committed stream's final state: the last record per position, observations then transitions. */
+    private static List<String> vpFinalState() {
+        java.util.TreeMap<String, String> observations = new java.util.TreeMap<>();
+        for (VolPremiumFixtures.Row row : VolPremiumFixtures.readings()) {
+            observations.put(String.format("%019d|%019d", VolPremiumFixtures.longField(row.json(), "frameSeq"),
+                    VolPremiumFixtures.longField(row.json(), "measurementEpochMs")), row.json());
+        }
+        java.util.TreeMap<String, String> transitions = new java.util.TreeMap<>();
+        for (VolPremiumFixtures.Row row : VolPremiumFixtures.warnings()) {
+            transitions.put(String.format("%019d|%019d|", VolPremiumFixtures.longField(row.json(), "frameSeq"),
+                    VolPremiumFixtures.longField(row.json(), "asOfMs")) + row.key(), row.json());
+        }
+        List<String> expected = new ArrayList<>(observations.values());
+        expected.addAll(transitions.values());
+        return expected;
+    }
+
+    // ----- cleanup (r1 finding 7) -----------------------------------------------------------------
+
+    /** A gateway holding the whole stream, serving, with one socket mid-way through a PACED replay. */
+    private static FeedGatewayService vpMidReplay(WebSocketSession socket) throws Exception {
+        String socketId = socket.getId();
+        FeedGatewayService service = vpService();
+        long offset = 0;
+        for (VolPremiumFixtures.Row row : VolPremiumFixtures.readings()) {
+            assertNotNull(vpOffer(service, offset++, row));
+        }
+        service.markStateCaughtUpWithoutHandoffForTest();
+        service.addClient(socket);
+        assertTrue(service.volPremiumDeliveryForTest(socketId));
+        VolPremiumSessionStore.Position cursor = service.volPremiumCursorForTest(socketId);
+        assertNotNull(cursor);
+        assertTrue(cursor.frameSeq() < 7210L, "precondition: the replay is ACTIVE, paced at " + cursor.frameSeq());
+        return service;
+    }
+
+    @Test
+    void disconnectingASocketMidReplayDropsItsDelivery() throws Exception {
+        System.setProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "40");
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        try {
+            WebSocketSession socket = vpSession("vp-gone", new CopyOnWriteArrayList<>(), release);
+            FeedGatewayService service = vpMidReplay(socket);
+            service.removeClient(socket);
+            // Nothing else would ever remove it: a closed channel never calls its idle hook, and no pump
+            // runs for a socket nothing routes to — the entry would hold the socket for the process's life.
+            assertFalse(service.volPremiumDeliveryForTest("vp-gone"), "a gone socket's delivery must not hold it");
+            assertTrue(service.metrics().contains("gateway_vol_premium_deliveries 0\n"));
+        } finally {
+            release.countDown();
+            System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
+        }
+    }
+
+    @Test
+    void aSlowDisconnectMidReplayDropsItsDelivery() throws Exception {
+        System.setProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "40");
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        try {
+            List<String> sink = new CopyOnWriteArrayList<>();
+            FeedGatewayService service = vpService();
+            service.outboundClosersForTest(Runnable::run);   // the teardown (and onSlowDisconnect) runs inline
+            long offset = 0;
+            List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+            for (VolPremiumFixtures.Row row : rows) {
+                assertNotNull(vpOffer(service, offset++, row));
+            }
+            service.markStateCaughtUpWithoutHandoffForTest();
+            service.addClient(vpSession("vp-slow-gone", sink, release));
+            assertTrue(service.volPremiumDeliveryForTest("vp-slow-gone"));
+            // Live replacements of a point it already has go straight to the stuck socket, until its queue
+            // overflows and the channel disconnects it as a slow client.
+            VolPremiumFixtures.Row first = rows.get(0);
+            for (int i = 1; i <= 60 && service.outboundChannelForTest("vp-slow-gone") != null; i++) {
+                vpRelay(service, VP_OBS, offset++, first.key(), vpLater(first.json(), i));
+            }
+            assertNull(service.outboundChannelForTest("vp-slow-gone"), "precondition: disconnected as slow");
+            assertTrue(service.metrics().contains("options_edge_gateway_ws_slow_disconnects_total 1\n"));
+            assertFalse(service.volPremiumDeliveryForTest("vp-slow-gone"), "a slow-disconnected socket's delivery must go");
+        } finally {
+            release.countDown();
+            System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
+        }
+    }
+
+    @Test
+    void closingSocketsFromASweepDropsTheirDeliveries() throws Exception {
+        System.setProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "40");
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        try {
+            FeedGatewayService service = vpMidReplay(vpSession("vp-swept", new CopyOnWriteArrayList<>(), release));
+            service.closeSockets(List.of("vp-swept"));
+            assertFalse(service.volPremiumDeliveryForTest("vp-swept"));
+        } finally {
+            release.countDown();
+            System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
+        }
     }
 
     @Test
