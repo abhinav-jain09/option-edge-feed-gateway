@@ -265,12 +265,18 @@ final class VolPremiumSessionStore {
     static final long SERIES_INDEX_BUDGET_BYTES = SERIES_OVERHEAD_BYTES
             + ((long) MAX_OBSERVATION_POSITIONS + MAX_WARNING_POSITIONS) * ENTRY_BYTES;
 
-    /** Bytes one REST page chunk reads under the lock before it writes them out (at least one record). */
+    /**
+     * The most record bytes one REST page chunk reads under the lock before it writes them out. The next record's
+     * length is taken from the index and checked BEFORE the record is read, so no chunk exceeds this (Codex gateway r4,
+     * minor: the r3 check ran after the record was added). A chunk always holds at least one record, and one always
+     * fits: {@link IvRvReading#MAX_RECORD_BYTES} is a quarter of this.
+     */
     static final int PAGE_CHUNK_BYTES = 256 * 1024;
 
     /**
-     * Everything the store may hold on the heap, checked at boot: every series' index, plus a page chunk and one
-     * record for each REST response that may stream at once:
+     * Everything the store may hold on the heap, checked at boot: every series' index, plus, for each REST response
+     * that may stream at once, its chunk (at most {@link #PAGE_CHUNK_BYTES} of record bytes) and one record more, the
+     * margin the r3 figure reserved when a chunk could pass its bound by a record (it is kept, not re-derived):
      * {@code 2 × 42,110,464 + 4 × (262,144 + 65,536) = 85,531,648} bytes (81.6 MiB).
      *
      * <p>Held in {@code 1/}{@value #HEAP_FRACTION_DENOMINATOR} of {@code Runtime.maxMemory()}, so the heap must
@@ -407,29 +413,60 @@ final class VolPremiumSessionStore {
     record Item(Position position, String json) {
     }
 
-    /** Whether a session is whole, and what it holds, as the REST page states it. */
-    record Retention(boolean complete, long refusedForBudget, long refusedForDisk, long retainedBytes,
-                     long budgetBytes) {
+    /**
+     * Why a page is NOT the whole session, in the order the verdict reports them when several hold. The first three
+     * last for the rest of the session, so asking again does not help. The fourth passes: a new page reads the session
+     * as it then stands.
+     */
+    enum Incomplete {
+        /** A newer session replaced the one the page opened on, or it ended, while the page was being read. */
+        SESSION_ENDED,
+        /** The session's log failed: a record did not read back intact, or an append or rewrite failed. */
+        DISK_FAILURE,
+        /** The session refused a record for its envelope ({@link Refusal#SESSION_BUDGET}). */
+        SESSION_BUDGET,
+        /**
+         * A record of the page's snapshot was REPLACED before the page reached it: the version the snapshot holds is
+         * no longer indexed, so the page could not deliver it (see {@link #page}). A new page reads the session as
+         * it then stands.
+         */
+        CHANGED_WHILE_READ
     }
 
     /**
-     * One session materialised as lists (VP-346): verbatim records in replay order, and whether the store still
-     * holds ALL of it — false from the first record it refused (budget or disk), or after any disk failure. A
-     * test and diagnostic convenience: the REST route streams a {@link Page} instead, so a session's bytes are
-     * never all on the heap at once.
+     * Whether a page is the whole session, and what it holds, as the REST page states it. {@code reason} is null
+     * exactly when the page is complete. {@code retainedBytes} is the live bytes of the snapshot the page was opened
+     * on, which a complete page's records add up to.
      */
-    record Snapshot(String sessionDate, List<String> observations, List<String> warnings, boolean complete,
-                    long refusedForBudget, long refusedForDisk, long retainedBytes, long budgetBytes) {
-        Snapshot(String sessionDate, List<String> observations, List<String> warnings) {
-            this(sessionDate, observations, warnings, true, 0L, 0L, 0L, SERIES_DISK_BUDGET_BYTES);
+    record Retention(Incomplete reason, long refusedForBudget, long refusedForDisk, long retainedBytes,
+                     long budgetBytes) {
+        boolean complete() {
+            return reason == null;
         }
     }
 
     /**
-     * One series' current session as the REST route writes it: the records STREAMED from the log in chunks of at
-     * most {@link #PAGE_CHUNK_BYTES} (each chunk read under the store's lock, written out after it is released),
-     * verbatim and comma-separated, in replay order, then the retention verdict. The verdict is read after the
-     * records, and says incomplete if the session ended or failed while they were being read.
+     * One session materialised as lists (VP-346): verbatim records in replay order, and whether they are ALL of it
+     * (the page verdict, {@link Retention}). A test and diagnostic convenience: the REST route streams a {@link Page}
+     * instead, so a session's bytes are never all on the heap at once.
+     */
+    record Snapshot(String sessionDate, List<String> observations, List<String> warnings, Incomplete reason,
+                    long refusedForBudget, long refusedForDisk, long retainedBytes, long budgetBytes) {
+        Snapshot(String sessionDate, List<String> observations, List<String> warnings) {
+            this(sessionDate, observations, warnings, null, 0L, 0L, 0L, SERIES_DISK_BUDGET_BYTES);
+        }
+
+        boolean complete() {
+            return reason == null;
+        }
+    }
+
+    /**
+     * One series' current session as the REST route writes it: ONE SNAPSHOT of it, the session as it stood when the
+     * page was opened ({@link #page}), STREAMED from the log in chunks of at most {@link #PAGE_CHUNK_BYTES} (each
+     * chunk read under the store's lock, written out after it is released), verbatim and comma-separated, in replay
+     * order, then the retention verdict. The verdict is read after the records. It is complete only if they were
+     * every record of the snapshot, each once, and the session is still whole; otherwise it names the reason.
      */
     interface Page {
         /** The session date; null when the series holds no current session. */
@@ -462,7 +499,7 @@ final class VolPremiumSessionStore {
 
                 @Override
                 public Retention retention() {
-                    return new Retention(snapshot.complete(), snapshot.refusedForBudget(), snapshot.refusedForDisk(),
+                    return new Retention(snapshot.reason(), snapshot.refusedForBudget(), snapshot.refusedForDisk(),
                             snapshot.retainedBytes(), snapshot.budgetBytes());
                 }
 
@@ -495,7 +532,7 @@ final class VolPremiumSessionStore {
         final int kind;
         /** The Kafka offset of the held version. */
         long offset;
-        /** The store's admission sequence when this version was admitted; see {@link #nextChanged}. */
+        /** The store's admission sequence when this version was admitted; see {@link #nextChanged} and {@link #page}. */
         long seq;
         /** Greatest offset already broadcast for this position; -1 when none. */
         long broadcastFence;
@@ -703,6 +740,11 @@ final class VolPremiumSessionStore {
         final String symbol;
         /** The ONE partition this session's records may come from — the topic is single-partition. */
         final int partition;
+        /**
+         * Unique within this store, from 1. A REST page is tied to it rather than to the date, so a session closed and
+         * then opened again for the same date is never taken for the one the page opened on.
+         */
+        final long number;
         final SlotList observations = new SlotList();
         final SlotList warnings = new SlotList();
         /** Null when it could not be created: the session is then failed from its first record. */
@@ -716,11 +758,12 @@ final class VolPremiumSessionStore {
         /** Set by the first failure of the session's log; the session takes nothing more. */
         boolean diskFailed;
 
-        Session(String seriesKey, String sessionDate, String symbol, int partition) {
+        Session(String seriesKey, String sessionDate, String symbol, int partition, long number) {
             this.seriesKey = seriesKey;
             this.sessionDate = sessionDate;
             this.symbol = symbol;
             this.partition = partition;
+            this.number = number;
         }
 
         SlotList of(int phase) {
@@ -1277,6 +1320,8 @@ final class VolPremiumSessionStore {
             return refuseForDisk(stream, session);
         }
         int crc = VolPremiumSessionLog.crc(bytes);
+        // Strictly greater than every earlier stamp, on a new position and on a replacement alike: nextChanged and a
+        // REST page's snapshot (see page) both rely on it.
         long seq = ++admissionSeq;
         if (previous != null) {
             // REPOINT: the index now names the new version's bytes; the old ones are superseded.
@@ -1308,8 +1353,7 @@ final class VolPremiumSessionStore {
 
     /** A new session's index and log. A log that cannot be created fails the session closed from its first record. */
     private Session openSession(String seriesKey, String sessionDate, String symbol, int partition) {
-        Session session = new Session(seriesKey, sessionDate, symbol, partition);
-        long number = ++sessionNumber;
+        Session session = new Session(seriesKey, sessionDate, symbol, partition, ++sessionNumber);
         if (directory == null) {
             try {
                 directory = io.createDirectory(root, LOG_DIR_PREFIX);
@@ -1319,7 +1363,7 @@ final class VolPremiumSessionStore {
             }
         }
         try {
-            session.log = new VolPremiumSessionLog(io, directory, "s" + number);
+            session.log = new VolPremiumSessionLog(io, directory, "s" + session.number);
         } catch (IOException | RuntimeException failed) {
             failDisk(session, DiskOp.OPEN, failed);
         }
@@ -1596,75 +1640,142 @@ final class VolPremiumSessionStore {
     }
 
     /**
-     * One series' current session as the REST route streams it. The session is fixed when the page is opened:
-     * if a newer one replaces it, or it ends, while the records are being read, the page stops there and says
-     * incomplete. Each chunk is read at the clock's current time.
+     * One series' current session as the REST route streams it: a SNAPSHOT of it, taken here under the lock (Codex
+     * gateway r4, the page-consistency finding). The snapshot is named by three values: the session's
+     * {@code number}; the store's admission sequence at this instant ({@code asOfSeq}); and how many positions each
+     * stream held. It is exactly the positions held now, each in the version it holds now: the slots whose sequence
+     * is at most {@code asOfSeq}.
+     *
+     * <p><b>Why the records a page writes are that snapshot, and nothing else</b>, whatever is admitted, replaced or
+     * rewritten between its chunks:
+     * <ol>
+     *   <li>Every admission stamps its slot with a new, strictly greater admission sequence ({@link #admit}), whether it
+     *       adds a position or replaces one; nothing else changes a slot's sequence. So a slot whose sequence is at most
+     *       {@code asOfSeq} when a chunk reads it held that very version at the snapshot. A slot with a greater sequence
+     *       was inserted after the snapshot, or replaced after it.</li>
+     *   <li>A chunk writes only slots at or below {@code asOfSeq}, and passes over the others without reading them. So
+     *       every record written is the snapshot's version of a position the snapshot holds.</li>
+     *   <li>Positions never change and are never removed (a session's index is dropped whole), and each chunk resumes
+     *       strictly after the last position the one before it visited. So no position is visited twice, and the
+     *       records come out in the store's order.</li>
+     *   <li>Hence a stream of the page is every record of the snapshot exactly when it wrote as many records as the
+     *       snapshot held. A position of the snapshot is missed only when it was REPLACED before the page reached it:
+     *       its slot then carries a later sequence, and the version the snapshot holds is no longer indexed. The count
+     *       at the end of each stream detects exactly that ({@link Incomplete#CHANGED_WHILE_READ}). The page then writes
+     *       nothing more; the other stream, if it is still to come, is not written.</li>
+     *   <li>A rewrite (compaction) moves bytes, never versions or sequences, and each chunk resolves every offset
+     *       under the lock through the log as it then is. So a rewrite between chunks changes nothing a page writes.
+     *       Whatever triggered it is an admission, judged as above.</li>
+     *   <li>The page is tied to its session's number. A rollover, the session's end or a close stops it at the next
+     *       chunk ({@link Incomplete#SESSION_ENDED}). A record that does not read back intact stops it there, and
+     *       nothing past it is written, the other stream included ({@link Incomplete#DISK_FAILURE}).</li>
+     * </ol>
+     * The verdict is also incomplete if the session failed its log or refused a record for its envelope at any point
+     * before the verdict is read, even after the snapshot: a session is incomplete from its first refusal on,
+     * whichever reader asks.
+     *
+     * <p>Cost: the page holds counts and a cursor between chunks, never records or offsets, and the socket path is
+     * unchanged. During live traffic a page is complete unless a record it has yet to reach is replaced while it is
+     * written. New frames and new transitions are left out of it; the sockets deliver them.
      */
     synchronized Page page(String seriesKey, LongSupplier clock) {
         Session session = sessions.get(seriesKey);
-        String sessionDate = session == null || !sessionCurrent(session.sessionDate, clock.getAsLong())
-                ? null : session.sessionDate;
-        return new StorePage(seriesKey, sessionDate, clock);
+        if (session == null || !sessionCurrent(session.sessionDate, clock.getAsLong())) {
+            return new StorePage(seriesKey, null, 0L, 0L, new int[2], 0L, clock);
+        }
+        return new StorePage(seriesKey, session.sessionDate, session.number, admissionSeq,
+                new int[] {session.observations.size(), session.warnings.size()}, session.liveBytes, clock);
     }
 
-    private enum ChunkEnd { MORE, END, BROKEN }
+    private enum ChunkEnd { MORE, END, SESSION_ENDED, UNREADABLE }
 
     private record PageChunk(List<byte[]> records, Position last, ChunkEnd end) {
     }
 
+    /** The session a page was opened on, while it is still held and current; null once it is not. */
+    private Session sessionOf(StorePage page, long nowMs) {
+        Session session = sessions.get(page.seriesKey);
+        return session == null || session.number != page.sessionNumber || !sessionCurrent(session.sessionDate, nowMs)
+                ? null : session;
+    }
+
     /**
-     * Up to {@link #PAGE_CHUNK_BYTES} of one stream of a session, after {@code after} (null: from the start),
-     * read under the lock. BROKEN when the session is no longer the one the page opened on, or a version could not
-     * be read back intact (the session is then failed).
+     * A page's next chunk of one stream, after {@code after} (null: from the start), read under the lock: the
+     * snapshot's records in order, up to {@link #PAGE_CHUNK_BYTES} of them. Each record's length is checked against
+     * that bound before the record is read. Slots admitted after the snapshot are passed over unread. SESSION_ENDED when
+     * the session is no longer the one the page opened on; UNREADABLE when a version could not be read back intact
+     * (the session is then failed).
      */
-    private synchronized PageChunk pageChunk(String seriesKey, String sessionDate, int phase, Position after,
-                                             long nowMs) {
-        Session session = sessions.get(seriesKey);
-        if (session == null || !session.sessionDate.equals(sessionDate) || !sessionCurrent(sessionDate, nowMs)) {
-            return new PageChunk(List.of(), after, ChunkEnd.BROKEN);
+    private synchronized PageChunk pageChunk(StorePage page, int phase, Position after, long nowMs) {
+        Session session = sessionOf(page, nowMs);
+        if (session == null) {
+            return new PageChunk(List.of(), after, ChunkEnd.SESSION_ENDED);
         }
         List<byte[]> records = new ArrayList<>();
         long bytes = 0L;
-        Position last = after;
+        Slot visited = null;
+        ChunkEnd end = ChunkEnd.END;
         Iterator<Slot> it = session.of(phase).after(after, session);
         while (it.hasNext()) {
-            if (bytes >= PAGE_CHUNK_BYTES) {
-                return new PageChunk(records, last, ChunkEnd.MORE);
-            }
             Slot slot = it.next();
+            if (slot.seq > page.asOfSeq) {
+                visited = slot;   // admitted after the snapshot: not part of it
+                continue;
+            }
+            if (!records.isEmpty() && bytes + slot.length > PAGE_CHUNK_BYTES) {
+                end = ChunkEnd.MORE;   // not visited: the next chunk begins with this slot
+                break;
+            }
             byte[] record = readBytes(session, slot);
             if (record == null) {
-                return new PageChunk(records, last, ChunkEnd.BROKEN);
+                end = ChunkEnd.UNREADABLE;
+                break;
             }
             records.add(record);
             bytes += record.length;
-            last = session.positionOf(phase, slot);
+            visited = slot;
         }
-        return new PageChunk(records, last, ChunkEnd.END);
+        return new PageChunk(records, visited == null ? after : session.positionOf(phase, visited), end);
     }
 
-    /** The retention verdict of the session a page opened on, as it stands now. */
-    private synchronized Retention retention(String seriesKey, String sessionDate, long nowMs) {
-        if (sessionDate == null) {
-            return new Retention(true, 0L, 0L, 0L, seriesBudgetBytes);
+    /** The verdict of a page whose records have been written, with its session as it stands now. */
+    private synchronized Retention verdict(StorePage page, long nowMs) {
+        if (page.sessionDate == null) {
+            return new Retention(null, 0L, 0L, 0L, seriesBudgetBytes);
         }
-        Session s = sessions.get(seriesKey);
-        if (s == null || !s.sessionDate.equals(sessionDate) || !sessionCurrent(sessionDate, nowMs)) {
-            return new Retention(false, 0L, 0L, 0L, seriesBudgetBytes);   // it ended while it was being read
+        Session s = sessionOf(page, nowMs);
+        if (s == null) {
+            return new Retention(Incomplete.SESSION_ENDED, 0L, 0L, 0L, seriesBudgetBytes);   // it ended while it was being read
         }
-        return new Retention(s.refusedForBudget == 0L && !s.diskFailed, s.refusedForBudget, s.refusedForDisk,
-                s.liveBytes, seriesBudgetBytes);
+        Incomplete reason = s.diskFailed ? Incomplete.DISK_FAILURE
+                : s.refusedForBudget > 0L ? Incomplete.SESSION_BUDGET
+                : page.stopped;
+        return new Retention(reason, s.refusedForBudget, s.refusedForDisk, page.snapshotBytes, seriesBudgetBytes);
     }
 
+    /** A page over one snapshot of one session (see {@link #page}), used by the one thread that writes it out. */
     private final class StorePage implements Page {
         private final String seriesKey;
         private final String sessionDate;
+        private final long sessionNumber;
+        /** The store's admission sequence when the page was opened: the snapshot is the versions at or below it. */
+        private final long asOfSeq;
+        /** Positions each stream held at the snapshot, by phase. */
+        private final int[] held;
+        /** Live bytes of the snapshot: what a complete page's records add up to. */
+        private final long snapshotBytes;
         private final LongSupplier clock;
-        private boolean broken;
+        /** Why the page stopped, or found it had missed a record of its snapshot; null while neither happened. */
+        private Incomplete stopped;
 
-        StorePage(String seriesKey, String sessionDate, LongSupplier clock) {
+        StorePage(String seriesKey, String sessionDate, long sessionNumber, long asOfSeq, int[] held,
+                  long snapshotBytes, LongSupplier clock) {
             this.seriesKey = seriesKey;
             this.sessionDate = sessionDate;
+            this.sessionNumber = sessionNumber;
+            this.asOfSeq = asOfSeq;
+            this.held = held;
+            this.snapshotBytes = snapshotBytes;
             this.clock = clock;
         }
 
@@ -1695,34 +1806,50 @@ final class VolPremiumSessionStore {
         }
 
         /**
-         * Every record of one stream, chunk by chunk, in replay order. Stops at the first chunk that could not be read
-         * whole, and from then on hands over nothing more of the page, the other stream included.
+         * Every record of one stream of the snapshot, chunk by chunk, in replay order. Stops at the first chunk that
+         * could not be read, and at the end of a stream that missed a record of the snapshot; from then on it hands
+         * over nothing more of the page, the other stream included.
          */
         private void forEach(int phase, RecordSink sink) throws IOException {
-            if (sessionDate == null || broken) {
+            if (sessionDate == null || stopped != null) {
                 return;
             }
             Position after = null;
+            int written = 0;
             while (true) {
-                PageChunk chunk = pageChunk(seriesKey, sessionDate, phase, after, clock.getAsLong());
+                PageChunk chunk = pageChunk(this, phase, after, clock.getAsLong());
                 for (byte[] record : chunk.records()) {
                     sink.accept(record);
                 }
-                if (chunk.end() != ChunkEnd.MORE) {
-                    broken = chunk.end() == ChunkEnd.BROKEN;
-                    return;
+                written += chunk.records().size();
+                switch (chunk.end()) {
+                    case MORE -> after = chunk.last();
+                    case SESSION_ENDED -> {
+                        stopped = Incomplete.SESSION_ENDED;
+                        return;
+                    }
+                    case UNREADABLE -> {
+                        stopped = Incomplete.DISK_FAILURE;
+                        return;
+                    }
+                    case END -> {
+                        if (written != held[phase]) {
+                            // A position of the snapshot was passed over: replaced before the page reached it.
+                            stopped = Incomplete.CHANGED_WHILE_READ;
+                        }
+                        return;
+                    }
                 }
-                after = chunk.last();
             }
         }
 
         /**
-         * The verdict as it stands after the records were written. A page that stopped early did so because its
-         * session ended, was replaced or failed a read, and each of those already makes the verdict incomplete.
+         * The verdict as it stands after the records were written: complete only if they were every record of the
+         * snapshot and the session is still the one opened on, current, and whole.
          */
         @Override
         public Retention retention() {
-            return VolPremiumSessionStore.this.retention(seriesKey, sessionDate, clock.getAsLong());
+            return verdict(this, clock.getAsLong());
         }
     }
 
@@ -1742,7 +1869,7 @@ final class VolPremiumSessionStore {
             throw new java.io.UncheckedIOException(impossible);   // the sinks above write to memory
         }
         Retention r = page.retention();
-        return new Snapshot(page.sessionDate, List.copyOf(observations), List.copyOf(warnings), r.complete(),
+        return new Snapshot(page.sessionDate, List.copyOf(observations), List.copyOf(warnings), r.reason(),
                 r.refusedForBudget(), r.refusedForDisk(), r.retainedBytes(), r.budgetBytes());
     }
 

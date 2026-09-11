@@ -24,7 +24,8 @@ import java.util.regex.Pattern;
  * <p>Response, always a JSON object:
  * <pre>{"symbol":"SPX","sessionDate":"2026-08-27"|null,
  *  "observations":[&lt;IvRvReading v2 or IvRvReadingV1&gt;,...],"warnings":[&lt;EarlyWarning v1&gt;,...],
- *  "retention":{"complete":true,"refusedForBudget":0,"refusedForDisk":0,"retainedBytes":N,"budgetBytes":M}}</pre>
+ *  "retention":{"complete":true,"reason":null,"refusedForBudget":0,"refusedForDisk":0,"retainedBytes":N,
+ *               "budgetBytes":M}}</pre>
  * Through the v1-to-v2 rollout (runbook "Rollout sequence", step 2 to step 6), {@code observations} may hold
  * records of either wire version, each exactly as its producer wrote it. A reader tells them apart by each
  * record's own {@code schemaVersion}. See VolPremiumSessionStore#acceptObservation for the admission rules and
@@ -47,9 +48,20 @@ import java.util.regex.Pattern;
  * <p>A whole session can be tens of megabytes (its supported envelope, over a gigabyte), so the page is
  * STREAMED from the store's disk log in chunks of at most {@link VolPremiumSessionStore#PAGE_CHUNK_BYTES}: each
  * chunk is read under the store's lock and written out after it is released, and no copy of the response is ever
- * built. The retention verdict comes last and is read after the records, so a session that ended or failed while
- * it was being read says {@code complete:false}. At most {@link #MAX_CONCURRENT_RESPONSES} are written at once;
- * the rest get 503 with Retry-After.
+ * built. The records are ONE SNAPSHOT: the session as it stood when the page was opened (see
+ * VolPremiumSessionStore#page). Records admitted while it is written are left out, so live traffic never mixes into
+ * it. The retention verdict comes last. {@code complete:true} means both arrays are every record of that snapshot,
+ * each once, in the store's order, and that the session is still whole. Otherwise {@code complete:false}, with
+ * {@code reason}:
+ * <ul>
+ *   <li>{@code SESSION_ENDED}: a newer session replaced it, or it ended, while it was being read;</li>
+ *   <li>{@code DISK_FAILURE}: its log failed (the page stops at a record that does not read back intact);</li>
+ *   <li>{@code SESSION_BUDGET}: it refused a record for its envelope;</li>
+ *   <li>{@code CHANGED_WHILE_READ}: a record of the snapshot was replaced before the page reached it, so the version
+ *       the snapshot holds could no longer be read. Asking again returns the session as it is then.</li>
+ * </ul>
+ * {@code reason} is null exactly when {@code complete} is true. At most {@link #MAX_CONCURRENT_RESPONSES} are
+ * written at once; the rest get 503 with Retry-After.
  */
 @RestController
 public class VolPremiumController {
@@ -108,11 +120,13 @@ public class VolPremiumController {
             page.writeObservations(out);
             out.write("],\"warnings\":[".getBytes(StandardCharsets.UTF_8));
             page.writeWarnings(out);
-            // Whether the arrays above are the WHOLE session: false from the first record the store refused (its
-            // envelope or a failed disk log), and false if the session ended or failed while being read, so a
-            // machine can never read a held prefix as a session.
+            // Whether the arrays above are the WHOLE session, as one snapshot: false from the first record the store
+            // refused (its envelope or a failed disk log), false if the session ended or failed while being read, and
+            // false if a record of the snapshot changed before the page reached it. So a machine can never read a
+            // held prefix, or versions that never coexisted, as a session. The reason is null exactly when complete.
             VolPremiumSessionStore.Retention retention = page.retention();
             out.write(("],\"retention\":{\"complete\":" + retention.complete()
+                    + ",\"reason\":" + (retention.reason() == null ? "null" : "\"" + retention.reason().name() + "\"")
                     + ",\"refusedForBudget\":" + retention.refusedForBudget()
                     + ",\"refusedForDisk\":" + retention.refusedForDisk()
                     + ",\"retainedBytes\":" + retention.retainedBytes()

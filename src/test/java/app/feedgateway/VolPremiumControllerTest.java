@@ -76,9 +76,10 @@ class VolPremiumControllerTest {
         return rows.stream().map(Row::json).toList();
     }
 
-    private static String retention(boolean complete, long refusedForBudget, long refusedForDisk, long retained,
-                                    long budget) {
-        return "\"retention\":{\"complete\":" + complete + ",\"refusedForBudget\":" + refusedForBudget
+    private static String retention(VolPremiumSessionStore.Incomplete reason, long refusedForBudget, long refusedForDisk,
+                                    long retained, long budget) {
+        return "\"retention\":{\"complete\":" + (reason == null) + ",\"reason\":"
+                + (reason == null ? "null" : "\"" + reason.name() + "\"") + ",\"refusedForBudget\":" + refusedForBudget
                 + ",\"refusedForDisk\":" + refusedForDisk + ",\"retainedBytes\":" + retained + ",\"budgetBytes\":"
                 + budget + "}}";
     }
@@ -110,7 +111,7 @@ class VolPremiumControllerTest {
         String expected = "{\"symbol\":\"SPX\",\"sessionDate\":\"2026-08-27\",\"observations\":["
                 + String.join(",", json(observations)) + "],\"warnings\":["
                 + String.join(",", json(byEpisode)) + "],"
-                + retention(true, 0, 0, retained, VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES);
+                + retention(null, 0, 0, retained, VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES);
         assertEquals(expected, response.getContentAsString(StandardCharsets.UTF_8));
         JsonNode parsed = new ObjectMapper().readTree(response.getContentAsString(StandardCharsets.UTF_8));
         assertEquals(10, parsed.get("observations").size(), "and it is JSON a machine can read");
@@ -140,7 +141,7 @@ class VolPremiumControllerTest {
                     .getContentAsString(StandardCharsets.UTF_8);
             assertEquals("{\"symbol\":\"SPX\",\"sessionDate\":\"2026-08-27\",\"observations\":["
                     + String.join(",", json(session)) + "],\"warnings\":[],"
-                    + retention(true, 0, 0, bytes, VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES), body);
+                    + retention(null, 0, 0, bytes, VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES), body);
         } finally {
             store.close();
         }
@@ -158,7 +159,7 @@ class VolPremiumControllerTest {
         assertEquals(200, response.getStatus());
         assertEquals("{\"symbol\":\"SPX\",\"sessionDate\":\"2026-08-27\",\"observations\":["
                 + String.join(",", json(v1)) + "],\"warnings\":[],"
-                + retention(true, 0, 0, v1Only.volPremiumSession("SPX").retainedBytes(),
+                + retention(null, 0, 0, v1Only.volPremiumSession("SPX").retainedBytes(),
                         VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES), response.getContentAsString(StandardCharsets.UTF_8));
 
         // Mixed: the v1 run, then the engine from an ordinal the v1 run also holds — both points, v1's epoch first.
@@ -172,7 +173,7 @@ class VolPremiumControllerTest {
                 .getContentAsString(StandardCharsets.UTF_8);
         assertEquals("{\"symbol\":\"SPX\",\"sessionDate\":\"2026-08-27\",\"observations\":["
                 + String.join(",", json(mixed)) + "],\"warnings\":[" + warning.json() + "],"
-                + retention(true, 0, 0, service.volPremiumSession("SPX").retainedBytes(),
+                + retention(null, 0, 0, service.volPremiumSession("SPX").retainedBytes(),
                         VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES), body);
         JsonNode page = new ObjectMapper().readTree(body);
         List<Integer> versions = new ArrayList<>();
@@ -204,7 +205,7 @@ class VolPremiumControllerTest {
         MockHttpServletResponse response = get(controller, "NDX", "Bearer t");
         assertEquals(200, response.getStatus());
         assertEquals("{\"symbol\":\"NDX\",\"sessionDate\":null,\"observations\":[],\"warnings\":[],"
-                        + retention(true, 0, 0, 0, VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES),
+                        + retention(null, 0, 0, 0, VolPremiumSessionStore.SERIES_DISK_BUDGET_BYTES),
                 response.getContentAsString(StandardCharsets.UTF_8));
     }
 
@@ -215,11 +216,12 @@ class VolPremiumControllerTest {
         FeedGatewayService service = mock(FeedGatewayService.class);
         String reading = readings().get(0).json();
         when(service.volPremiumPage(any())).thenReturn(VolPremiumSessionStore.Page.of(new VolPremiumSessionStore.Snapshot(
-                "2026-08-27", List.of(reading), List.of(), false, 3L, 0L, 7_000L, 8_000L)));
+                "2026-08-27", List.of(reading), List.of(), VolPremiumSessionStore.Incomplete.SESSION_BUDGET, 3L, 0L,
+                7_000L, 8_000L)));
         MockHttpServletResponse response = get(new VolPremiumController(service, auth(200)), "SPX", "Bearer t");
         assertEquals(200, response.getStatus());
         String body = response.getContentAsString(StandardCharsets.UTF_8);
-        assertTrue(body.endsWith("],\"warnings\":[]," + retention(false, 3, 0, 7_000, 8_000)), body);
+        assertTrue(body.endsWith("],\"warnings\":[]," + retention(VolPremiumSessionStore.Incomplete.SESSION_BUDGET, 3, 0, 7_000, 8_000)), body);
         assertEquals(false, new ObjectMapper().readTree(body).get("retention").get("complete").asBoolean(true));
     }
 
@@ -229,10 +231,10 @@ class VolPremiumControllerTest {
         // many records it refused for it, and that the session is incomplete.
         FeedGatewayService service = mock(FeedGatewayService.class);
         when(service.volPremiumPage(any())).thenReturn(VolPremiumSessionStore.Page.of(new VolPremiumSessionStore.Snapshot(
-                "2026-08-27", List.of(), List.of(), false, 0L, 2L, 0L, 8_000L)));
+                "2026-08-27", List.of(), List.of(), VolPremiumSessionStore.Incomplete.DISK_FAILURE, 0L, 2L, 0L, 8_000L)));
         String body = get(new VolPremiumController(service, auth(200)), "SPX", "Bearer t")
                 .getContentAsString(StandardCharsets.UTF_8);
-        assertTrue(body.endsWith("\"warnings\":[]," + retention(false, 0, 2, 0, 8_000)), body);
+        assertTrue(body.endsWith("\"warnings\":[]," + retention(VolPremiumSessionStore.Incomplete.DISK_FAILURE, 0, 2, 0, 8_000)), body);
     }
 
     @Test
