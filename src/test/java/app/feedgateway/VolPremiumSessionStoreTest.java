@@ -39,16 +39,26 @@ import app.feedgateway.VolPremiumSessionStore.Refusal;
 import app.feedgateway.VolPremiumSessionStore.Snapshot;
 import app.feedgateway.VolPremiumSessionStore.Stream;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.optionsedge.contracts.volpremium.EarlyWarning;
+import com.optionsedge.contracts.volpremium.EarlyWarningType;
+import com.optionsedge.contracts.volpremium.IvRvParameterSet;
 import com.optionsedge.contracts.volpremium.IvRvReading;
+import com.optionsedge.contracts.volpremium.IvRvReadingV1;
+import com.optionsedge.contracts.volpremium.WarningSummary;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.lang.instrument.Instrumentation;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.RecordComponent;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * The session store on its own: the admission boundary, the warning transition identity, the enforced
@@ -499,9 +509,10 @@ class VolPremiumSessionStoreTest {
 
     @Test
     void aV1AndAV2ReadingOfOneOrdinalOnOneEpochAreOnePositionReplacedByOffsetAndChargedTheDifference() {
-        // TRANSITIONAL LIMIT, pinned: two producers form two runs only because their epochs differ. Should both
-        // accumulators ever begin on the same millisecond, the two readings of one ordinal are the SAME position,
-        // and the later offset replaces the earlier: the within-version rule, charged by the size difference.
+        // TRANSITIONAL LIMIT, pinned. Nothing guarantees the two producers' epochs differ: offsets do not order event
+        // times, and the engine stamps midnight + 1 ms on a frame measured before its grid starts. When they are
+        // equal, the two readings of one ordinal are the SAME position, and the later offset replaces the earlier: the
+        // within-version rule, charged by the size difference, the earlier reading of that window no longer held.
         VolPremiumSessionStore store = new VolPremiumSessionStore();
         Row v2 = readingAt(7141);
         long engineEpoch = longField(v2.json(), "measurementEpochMs");
@@ -537,19 +548,132 @@ class VolPremiumSessionStoreTest {
 
     @Test
     void theBudgetFitsTheStatedFractionOfTheHeapOrTheGatewayRefusesToStart() {
-        assertEquals(48L << 20, VolPremiumSessionStore.SERIES_BUDGET_BYTES);
+        assertEquals(80L << 20, VolPremiumSessionStore.SERIES_BUDGET_BYTES);
         assertEquals(2, VolPremiumSessionStore.MAX_SYMBOLS);
-        assertEquals(96L << 20, VolPremiumSessionStore.TOTAL_BUDGET_BYTES);
-        // Production: -Xmx1536m (JAVA_TOOL_OPTIONS in every feed-gateway overlay). 1/8 of it is 192 MiB.
+        assertEquals(160L << 20, VolPremiumSessionStore.TOTAL_BUDGET_BYTES);
+        // Production: -Xms256m -Xmx1536m (JAVA_TOOL_OPTIONS in every feed-gateway overlay), no collector named. 1/8 of
+        // it is 192 MiB under G1. Runtime.maxMemory() reports LESS than -Xmx under the other two collectors, measured
+        // on JDK 21 at those flags: Serial 1,556,938,752 bytes, Parallel 1,431,830,528. The check passes on all three.
         assertEquals(192L << 20, VolPremiumSessionStore.requireBudgetFitsHeap(
                 VolPremiumSessionStore.TOTAL_BUDGET_BYTES, 1536L << 20));
+        VolPremiumSessionStore.requireBudgetFitsHeap(VolPremiumSessionStore.TOTAL_BUDGET_BYTES, 1_556_938_752L);
+        VolPremiumSessionStore.requireBudgetFitsHeap(VolPremiumSessionStore.TOTAL_BUDGET_BYTES, 1_431_830_528L);
         long smallest = VolPremiumSessionStore.TOTAL_BUDGET_BYTES * VolPremiumSessionStore.HEAP_FRACTION_DENOMINATOR;
+        assertEquals(1280L << 20, smallest, "the smallest heap the gateway starts on");
         VolPremiumSessionStore.requireBudgetFitsHeap(VolPremiumSessionStore.TOTAL_BUDGET_BYTES, smallest);
         IllegalStateException refused = assertThrows(IllegalStateException.class,
                 () -> VolPremiumSessionStore.requireBudgetFitsHeap(VolPremiumSessionStore.TOTAL_BUDGET_BYTES, smallest - 1L));
         assertTrue(refused.getMessage().startsWith("VOL_PREMIUM_BUDGET_EXCEEDS_HEAP"), refused.getMessage());
-        // The production store is built with exactly the declared budget (its constructor ran the check).
+        // The production store is built with exactly the declared budget.
         assertEquals(VolPremiumSessionStore.SERIES_BUDGET_BYTES, new VolPremiumSessionStore().seriesBudgetBytes());
+    }
+
+    @Test
+    void theProductionConstructorRunsTheHeapCheckAndRefusesAHeapTooSmallForTheBudget() {
+        // Codex r2: the check above was reached only as a helper, and deleting the production constructor's CALL of it
+        // left every store test green. The production constructor is now run against a stated max heap.
+        long smallest = VolPremiumSessionStore.TOTAL_BUDGET_BYTES * VolPremiumSessionStore.HEAP_FRACTION_DENOMINATOR;
+        for (long tooSmall : new long[] {512L << 20, smallest - 1L}) {
+            IllegalStateException refused = assertThrows(IllegalStateException.class,
+                    () -> new VolPremiumSessionStore(() -> tooSmall), "a max heap of " + tooSmall + " bytes");
+            assertTrue(refused.getMessage().startsWith("VOL_PREMIUM_BUDGET_EXCEEDS_HEAP"), refused.getMessage());
+        }
+        assertEquals(VolPremiumSessionStore.SERIES_BUDGET_BYTES,
+                new VolPremiumSessionStore(() -> smallest).seriesBudgetBytes(), "the smallest heap that fits starts it");
+    }
+
+    @Test
+    void theNoArgumentConstructorChecksTheHeapThisJvmWasGivenInAChildJvm() throws Exception {
+        // ...and the no-argument constructor the gateway calls reads Runtime.maxMemory() and runs that check. A child
+        // JVM at -Xmx512m refuses to start the store. At production's -Xms256m -Xmx1536m it starts under each collector
+        // the JVM might pick, since the overlays name none.
+        Probe small = probe("-Xmx512m");
+        assertEquals(3, small.exit(), small.output());
+        assertTrue(small.output().contains("VOL_PREMIUM_BUDGET_EXCEEDS_HEAP"), small.output());
+        for (String collector : List.of("-XX:+UseG1GC", "-XX:+UseSerialGC", "-XX:+UseParallelGC")) {
+            Probe production = probe("-Xms256m", "-Xmx1536m", collector);
+            assertEquals(0, production.exit(), collector + ": " + production.output());
+            assertTrue(production.output().contains("session store budget 80 MiB per series x 2 series = 160 MiB"),
+                    collector + ": " + production.output());
+        }
+    }
+
+    private record Probe(int exit, String output) {
+    }
+
+    /** Runs {@link VolPremiumHeapProbe} in a child JVM on this test's class path, with the given JVM flags. */
+    private static Probe probe(String... jvmFlags) throws Exception {
+        List<String> command = new ArrayList<>();
+        command.add(java.nio.file.Path.of(System.getProperty("java.home"), "bin", "java").toString());
+        command.addAll(List.of(jvmFlags));
+        command.addAll(List.of("-cp", System.getProperty("java.class.path"), VolPremiumHeapProbe.class.getName()));
+        ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
+        builder.environment().remove("JAVA_TOOL_OPTIONS");   // the flags above, and nothing inherited, decide the heap
+        builder.environment().remove("JDK_JAVA_OPTIONS");
+        Process process = builder.start();
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertTrue(process.waitFor(60, java.util.concurrent.TimeUnit.SECONDS), "the probe JVM did not exit");
+        return new Probe(process.exitValue(), output);
+    }
+
+    @Test
+    void anObservationFasterThanTheSupportedCadenceIsRefusedCountedAndLoggedBeforeAnythingIsRetained() throws Exception {
+        // Codex r2 finding 2, the design author's decision: the SUPPORTED cadence is 5 s (§11 FRAME_CADENCE_MS, §7.1).
+        // The contracts admit down to 250 ms; the gateway refuses faster than 5 s before retaining anything.
+        assertEquals(5_000L, VolPremiumSessionStore.SUPPORTED_MIN_FRAME_CADENCE_MS);
+        Row warming = readings().get(0);   // 09:30:00: no trend reference yet, no open episode, both sides fresh
+        long sinceMidnight = longField(warming.json(), "eventTimeMs") - SESSION_MIDNIGHT_MS;
+        List<Row> faster = new ArrayList<>();
+        for (long cadence : new long[] {IvRvReading.MIN_FRAME_CADENCE_MS, 1_000L, 4_999L}) {
+            long seq = Math.floorDiv(sinceMidnight, cadence);
+            String json = edit(warming.json(), n -> {
+                n.put("frameCadenceMs", cadence);
+                n.put("frameSeq", seq);
+            });
+            MAPPER.readValue(json, IvRvReading.class);   // its own contract admits it
+            faster.add(new Row(IvRvReading.observationKey("SPX", SESSION, seq), json));
+        }
+        Row v1 = VolPremiumFixtures.v1At(6840);
+        long v1Seq = Math.floorDiv(sinceMidnight, 1_000L);
+        String v1Faster = edit(v1.json(), n -> {
+            n.put("frameCadenceMs", 1_000L);
+            n.put("frameSeq", v1Seq);
+        });
+        MAPPER.readValue(v1Faster, IvRvReadingV1.class);   // ...and the old producer's contract admits its own
+        faster.add(new Row(v1.key(), v1Faster));
+
+        VolPremiumSessionStore store = new VolPremiumSessionStore();
+        PrintStream stdout = System.out;
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(captured, true, StandardCharsets.UTF_8));
+        long offset = 0;
+        try {
+            for (Row row : faster) {
+                assertEquals(Refusal.CADENCE_UNSUPPORTED, offer(store, row, offset++).refusal(), row.json());
+            }
+        } finally {
+            System.setOut(stdout);
+        }
+        // BEFORE anything is retained: no point, no byte, not even the session the first record would have opened.
+        assertEquals(0, store.heldObservations());
+        assertEquals(0L, store.heldBytes());
+        assertNull(store.snapshot("DATABENTO|SPX", FIXTURE_NOW_MS).sessionDate(), "no session was opened");
+        assertEquals(0L, store.admittedObservations(1) + store.admittedObservations(2));
+        // LOUD: every one counted and exported, and the first logged.
+        assertEquals(4L, store.refusals(Stream.OBSERVATION, Refusal.CADENCE_UNSUPPORTED));
+        String metrics = store.metricsText();
+        assertTrue(metrics.contains(
+                "gateway_vol_premium_refused_total{stream=\"ivrv\",reason=\"CADENCE_UNSUPPORTED\"} 4\n"), metrics);
+        String log = captured.toString(StandardCharsets.UTF_8);
+        assertEquals(1, log.split("ERROR vol-premium: refusing observations at frameCadenceMs", -1).length - 1, log);
+        // The supported cadence is admitted, and so is a slower one.
+        assertTrue(offer(store, warming, offset++).admitted());
+        long slowSeq = Math.floorDiv(sinceMidnight, 10_000L);
+        String slower = edit(warming.json(), n -> {
+            n.put("frameCadenceMs", 10_000L);
+            n.put("frameSeq", slowSeq);
+        });
+        assertTrue(offer(store, new Row(IvRvReading.observationKey("SPX", SESSION, slowSeq), slower), offset++).admitted());
     }
 
     @Test
@@ -588,8 +712,8 @@ class VolPremiumSessionStoreTest {
         Position b = (Position) store.retainedObjectsForTest(other).get(2);
         assertSame(a.seriesKey(), b.seriesKey());
         assertSame(a.sessionDate(), b.sessionDate());
-        // ...and the envelope arithmetic stated on SERIES_BUDGET_BYTES is this JVM's charge of the
-        // engine's LARGEST records.
+        // ...and the engine's LARGEST real records (SERIES_BUDGET_BYTES cites the observation beside the widest the
+        // contract admits) are charged this on this JVM.
         assertTrue(VolPremiumSessionStore.COMPACT_STRINGS, "the documented figures assume compact strings");
         int largestReading = readings().stream().mapToInt(r -> r.json().length()).max().orElseThrow();
         int largestWarning = warnings().stream().mapToInt(r -> r.json().length()).max().orElseThrow();
@@ -643,6 +767,229 @@ class VolPremiumSessionStoreTest {
         System.out.println("INFO vol-premium reference workload: " + store.heldBytes() + " of "
                 + VolPremiumSessionStore.SERIES_BUDGET_BYTES + " bytes ("
                 + (100L * store.heldBytes() / VolPremiumSessionStore.SERIES_BUDGET_BYTES) + "%)");
+    }
+
+    // ----- the supported envelope (Codex r2 finding 2) -----------------------------------------------------------
+
+    /**
+     * The widest text of a string component: the bound its contract states. An episode id is DERIVED (both
+     * contracts require exactly {@code symbol|sessionDate|type|openedFrameSeq}), so its width is that identity's at
+     * the widest symbol, type and ordinal, never above the declared cap. A string component with no bound here fails
+     * the test, so a free string added to a contract cannot escape the envelope.
+     */
+    private static int widestString(Class<?> owner, String component) {
+        int typeName = 0;
+        for (EarlyWarningType type : EarlyWarningType.values()) {
+            typeName = Math.max(typeName, type.name().length());
+        }
+        int episodeId = Math.min(EarlyWarning.MAX_EPISODE_ID_CHARS,
+                IvRvReading.MAX_SYMBOL_CHARS + 1 + "yyyy-MM-dd".length() + 1 + typeName + 1 + 20);
+        String name = owner.getSimpleName() + "." + component;
+        return switch (name) {
+            case "IvRvReading.symbol", "EarlyWarning.symbol" -> IvRvReading.MAX_SYMBOL_CHARS;
+            case "IvRvReading.sessionDate", "EarlyWarning.sessionDate" -> "yyyy-MM-dd".length();
+            case "IvRvReading.baselineMode" ->
+                    Math.max(IvRvReading.MODE_PINNED.length(), IvRvReading.MODE_UNCALIBRATED.length());
+            case "IvRvReading.codeVersion", "EarlyWarning.codeVersion" -> IvRvReading.MAX_VERSION_CHARS;
+            case "IvRvReading.spreadBasis" -> IvRvReading.SPREAD_BASIS_RAW_LEVEL_DIFFERENCE.length();
+            case "IvRvReading.parameterSetHash", "EarlyWarning.parameterSetHash" ->
+                    IvRvParameterSet.V1.contentHash().length();
+            case "Provenance.chainTopic", "Provenance.spotTopic" -> IvRvReading.Provenance.MAX_TOPIC_CHARS;
+            case "Provenance.chainFeedEpochId" -> IvRvReading.Provenance.MAX_EPOCH_ID_CHARS;
+            case "WarningSummary.episodeId", "EarlyWarning.episodeId" -> episodeId;
+            default -> throw new AssertionError("no contract bound for the string " + name);
+        };
+    }
+
+    private static int longestName(Class<?> enumType) {
+        int n = 0;
+        for (Object constant : enumType.getEnumConstants()) {
+            n = Math.max(n, ((Enum<?>) constant).name().length());
+        }
+        return n;
+    }
+
+    /**
+     * The widest compact JSON of a contract record: every component present, each at the widest text its type can
+     * print (int 11, long 20, double 24 — {@code "-2.2250738585072014E-308"}), strings at their bound, enums at their
+     * longest name, a set of enums holding every name, and lists at the count the contract requires: one trend per
+     * horizon of the shipped parameter set, one summary per warning type.
+     */
+    private static long widestJson(Class<?> type) {
+        RecordComponent[] components = type.getRecordComponents();
+        long n = 2 + (components.length - 1);
+        for (RecordComponent c : components) {
+            n += c.getName().length() + 3 + widestValue(type, c);
+        }
+        return n;
+    }
+
+    private static long widestValue(Class<?> owner, RecordComponent c) {
+        Class<?> t = c.getType();
+        if (t == int.class || t == Integer.class) {
+            return 11;
+        }
+        if (t == long.class || t == Long.class) {
+            return 20;
+        }
+        if (t == double.class || t == Double.class) {
+            return 24;
+        }
+        if (t.isEnum()) {
+            return 2 + longestName(t);
+        }
+        if (t == String.class) {
+            return 2 + widestString(owner, c.getName());
+        }
+        if (t.isRecord()) {
+            return widestJson(t);
+        }
+        if (List.class.isAssignableFrom(t) || Set.class.isAssignableFrom(t)) {
+            Class<?> element = (Class<?>) ((ParameterizedType) c.getGenericType()).getActualTypeArguments()[0];
+            if (element.isEnum()) {
+                Object[] all = element.getEnumConstants();
+                long n = 2 + (all.length - 1);
+                for (Object constant : all) {
+                    n += 2 + ((Enum<?>) constant).name().length();
+                }
+                return n;
+            }
+            int count = element == IvRvReading.IvRvTrend.class ? IvRvParameterSet.V1.horizonsMs().size()
+                    : element == WarningSummary.class ? EarlyWarningType.values().length : -1;
+            if (count < 0) {
+                throw new AssertionError("no contract count for " + owner.getSimpleName() + "." + c.getName());
+            }
+            return 2 + count * widestJson(element) + (count - 1);
+        }
+        throw new AssertionError("no width rule for " + owner.getSimpleName() + "." + c.getName() + " (" + t + ")");
+    }
+
+    /** Asserts a JSON object carries exactly the record's components: the width rule counts what the producer writes. */
+    private static void assertWritesExactlyItsComponents(Class<?> type, JsonNode node) {
+        Set<String> written = new TreeSet<>();
+        node.fieldNames().forEachRemaining(written::add);
+        Set<String> components = new TreeSet<>();
+        for (RecordComponent c : type.getRecordComponents()) {
+            components.add(c.getName());
+        }
+        assertEquals(components, written, type.getSimpleName());
+    }
+
+    /**
+     * The record's own bytes with every free string at its contract bound, then insignificant whitespace to exactly
+     * {@code chars} characters. The store charges a record by its text, so this one is charged exactly what the
+     * widest canonical record costs, and the contract still validates every value in it.
+     */
+    private static String widened(String json, long chars, boolean observation) {
+        String wide = edit(json, n -> {
+            n.put("codeVersion", "v".repeat(IvRvReading.MAX_VERSION_CHARS));
+            if (observation) {
+                ObjectNode provenance = (ObjectNode) n.get("provenance");
+                provenance.put("chainTopic", "c".repeat(IvRvReading.Provenance.MAX_TOPIC_CHARS));
+                provenance.put("spotTopic", "s".repeat(IvRvReading.Provenance.MAX_TOPIC_CHARS));
+                if (provenance.hasNonNull("chainFeedEpochId")) {
+                    provenance.put("chainFeedEpochId", "e".repeat(IvRvReading.Provenance.MAX_EPOCH_ID_CHARS));
+                }
+            }
+        });
+        assertTrue(wide.length() <= chars, "a real record is wider than the widest: " + wide.length());
+        return "{" + " ".repeat((int) (chars - wide.length())) + wide.substring(1);
+    }
+
+    /** The stream's observation for ordinal {@code first + i}: row {@code i} of the stream, moved there. */
+    private static Row atOrdinal(List<Row> stream, int i, long first) {
+        Row source = stream.get(i % stream.size());
+        long shift = first + i - longField(source.json(), "frameSeq");
+        return shift == 0 ? source : VolPremiumFixtures.shiftedObservation(source, shift);
+    }
+
+    @Test
+    void theProductionBudgetHoldsTheWholeSupportedEnvelopeAtTheWidestRecordsTheContractAdmits() throws Exception {
+        // Codex r2 finding 2. The supported envelope: frames at the supported 5 s cadence (anything faster is refused
+        // before retention), every ordinal of 09:30-16:00 and of the 00:00-04:00 after-midnight allowance the store
+        // keeps, every record at the widest text the CONTRACT admits (derived here from its own components and bounds,
+        // not from the engine's typical record), plus 24 epoch breaks of a minute each and 2,400 warning transitions.
+        assertThrows(IllegalArgumentException.class, () -> IvRvParameterSet.forVersion(2),
+                "V1 is the only parameter set shipped, so an observation carries exactly its four trends");
+        long observationChars = widestJson(IvRvReading.class);
+        long warningChars = widestJson(EarlyWarning.class);
+        assertEquals(9_685L, observationChars, "the widest observation SERIES_BUDGET_BYTES states");
+        assertEquals(1_557L, warningChars, "the widest warning SERIES_BUDGET_BYTES states");
+        long observationCharge = VolPremiumSessionStore.charge("x".repeat((int) observationChars), false);
+        long warningCharge = VolPremiumSessionStore.charge("x".repeat((int) warningChars), true);
+        assertEquals(10_000L, observationCharge);
+        assertEquals(2_184L, warningCharge);
+        // The width rule counts exactly the fields the producer writes, at every level of both records...
+        JsonNode reading = MAPPER.readTree(readingAt(7141).json());
+        assertWritesExactlyItsComponents(IvRvReading.class, reading);
+        assertWritesExactlyItsComponents(IvRvReading.IvRvTrend.class, reading.get("trends").get(0));
+        assertWritesExactlyItsComponents(IvRvReading.Provenance.class, reading.get("provenance"));
+        assertWritesExactlyItsComponents(WarningSummary.class, reading.get("warnings").get(0));
+        JsonNode warning = MAPPER.readTree(warnings().get(0).json());
+        assertWritesExactlyItsComponents(EarlyWarning.class, warning);
+        assertWritesExactlyItsComponents(EarlyWarning.Components.class, warning.get("components"));
+        // ...and no record the engine produced is wider.
+        assertTrue(readings().stream().allMatch(r -> r.json().length() <= observationChars));
+        assertTrue(warnings().stream().allMatch(r -> r.json().length() <= warningChars));
+
+        // The window: every ordinal of it at 5 s.
+        assertEquals(7_560, VolPremiumSessionStore.SUPPORTED_ORDINALS_PER_SESSION);
+        List<Row> stream = readings();
+        List<Row> observations = new ArrayList<>();
+        for (int i = 0; i < 4_680; i++) {
+            observations.add(atOrdinal(stream, i, 6_840L));                // 09:30:00 .. 15:59:55
+        }
+        for (int i = 0; i < 2_880; i++) {
+            observations.add(atOrdinal(stream, i, 86_400_000L / 5_000L));  // 00:00:00 .. 03:59:55 the next day
+        }
+        assertEquals(VolPremiumSessionStore.SUPPORTED_ORDINALS_PER_SESSION, observations.size());
+        // 24 epoch breaks: a restart whose first frame begins its own epoch, then a minute of frames on it.
+        for (int b = 0; b < 24; b++) {
+            Row moved = VolPremiumFixtures.shiftedObservation(stream.get(0), 100L + 150L * b);
+            Row restarted = new Row(moved.key(), with(moved.json(), "measurementEpochMs",
+                    longField(moved.json(), "eventTimeMs")));
+            for (int j = 0; j < 12; j++) {
+                observations.add(j == 0 ? restarted : VolPremiumFixtures.shiftedObservation(restarted, j));
+            }
+        }
+        // 2,400 transitions: the engine's 15, moved to 160 successive ordinals (each a different episode).
+        List<Row> transitions = new ArrayList<>();
+        for (int shift = 0; shift < 160; shift++) {
+            for (Row w : warnings()) {
+                transitions.add(shift == 0 ? w : shiftedWarning(w, shift));
+            }
+        }
+        assertEquals(2_400, transitions.size());
+
+        long nowMs = longField(observations.get(VolPremiumSessionStore.SUPPORTED_ORDINALS_PER_SESSION - 1).json(),
+                "eventTimeMs") + 1_000L;
+        VolPremiumSessionStore store = new VolPremiumSessionStore();
+        long offset = 0;
+        for (Row row : observations) {
+            String json = widened(row.json(), observationChars, true);
+            assertEquals(observationChars, json.length());
+            Admission a = store.acceptObservation("DATABENTO", row.key(), 0, offset++, json, nowMs);
+            assertTrue(a.admitted(), row.key() + ": " + a.refusal());
+        }
+        for (Row row : transitions) {
+            String json = widened(row.json(), warningChars, false);
+            assertEquals(warningChars, json.length());
+            Admission a = store.acceptWarning("DATABENTO", row.key(), 0, offset++, json, nowMs);
+            assertTrue(a.admitted(), row.key() + ": " + a.refusal());
+        }
+        assertEquals(7_560 + 288, store.heldObservations(), "every ordinal of the window and every epoch break");
+        assertEquals(2_400, store.heldWarnings(), "every transition");
+        long envelope = VolPremiumSessionStore.SERIES_OVERHEAD_BYTES + (7_560L + 288L) * observationCharge
+                + 2_400L * warningCharge;
+        assertEquals(83_722_624L, envelope, "the arithmetic SERIES_BUDGET_BYTES states");
+        assertEquals(envelope, store.heldBytes(), "charged exactly the widest records");
+        assertTrue(store.snapshot("DATABENTO|SPX", nowMs).complete(), "nothing was refused");
+        assertEquals(0L, store.refusals(Stream.OBSERVATION, Refusal.SESSION_BUDGET));
+        assertEquals(0L, store.refusals(Stream.WARNING, Refusal.SESSION_BUDGET));
+        assertTrue(envelope <= VolPremiumSessionStore.SERIES_BUDGET_BYTES);
+        System.out.println("INFO vol-premium supported envelope at the widest records: " + envelope + " of "
+                + VolPremiumSessionStore.SERIES_BUDGET_BYTES + " bytes, " + (VolPremiumSessionStore.SERIES_BUDGET_BYTES - envelope)
+                + " spare");
     }
 
     @Test

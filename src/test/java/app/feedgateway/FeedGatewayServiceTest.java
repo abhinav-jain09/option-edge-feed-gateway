@@ -3076,14 +3076,18 @@ class FeedGatewayServiceTest {
     /** One partition per topic behind a mocked KafkaConsumer, carrying KEYED records in publication order. */
     private static final class VpBroker {
         final Map<String, List<VolPremiumFixtures.Row>> logs = new java.util.concurrent.ConcurrentHashMap<>();
-        final Map<TopicPartition, Long> positions = new java.util.concurrent.ConcurrentHashMap<>();
-        volatile List<TopicPartition> assigned = List.of();
-        final java.util.concurrent.atomic.AtomicInteger polls = new java.util.concurrent.atomic.AtomicInteger();
         volatile java.util.function.IntConsumer onPoll = n -> { };
+        /** The most records one poll returns per partition, as max.poll.records bounds a real client's poll. */
+        volatile int maxPollRecords = Integer.MAX_VALUE;
 
         VpBroker topic(String topic, List<VolPremiumFixtures.Row> rows) {
-            logs.put(topic, List.copyOf(rows));
+            logs.put(topic, new java.util.concurrent.CopyOnWriteArrayList<>(rows));
             return this;
+        }
+
+        /** Records produced after the clients started: they take the log's next offsets. */
+        void append(String topic, List<VolPremiumFixtures.Row> rows) {
+            logs.get(topic).addAll(rows);
         }
 
         long end(TopicPartition p) {
@@ -3091,8 +3095,22 @@ class FeedGatewayServiceTest {
             return log == null ? 0L : log.size();
         }
 
-        @SuppressWarnings("unchecked")
+        /** A client whose polls run the broker's {@link #onPoll}. */
         KafkaConsumer<String, Object> consumer() {
+            return consumer(n -> onPoll.accept(n));
+        }
+
+        /**
+         * A client with its OWN position, assignment and poll count, so two clients read one log independently, as
+         * the gateway's two consumers do. {@code hook} runs at the start of each of its polls, before the batch is
+         * read, with that client's poll number.
+         */
+        @SuppressWarnings("unchecked")
+        KafkaConsumer<String, Object> consumer(java.util.function.IntConsumer hook) {
+            Map<TopicPartition, Long> positions = new java.util.concurrent.ConcurrentHashMap<>();
+            java.util.concurrent.atomic.AtomicReference<List<TopicPartition>> assigned =
+                    new java.util.concurrent.atomic.AtomicReference<>(List.of());
+            java.util.concurrent.atomic.AtomicInteger polls = new java.util.concurrent.atomic.AtomicInteger();
             KafkaConsumer<String, Object> c = org.mockito.Mockito.mock(KafkaConsumer.class);
             org.mockito.Mockito.when(c.listTopics(org.mockito.ArgumentMatchers.any(java.time.Duration.class)))
                     .thenAnswer(inv -> {
@@ -3105,7 +3123,7 @@ class FeedGatewayServiceTest {
                         return m;
                     });
             org.mockito.Mockito.doAnswer(inv -> {
-                assigned = List.copyOf((Collection<TopicPartition>) inv.getArgument(0));
+                assigned.set(List.copyOf((Collection<TopicPartition>) inv.getArgument(0)));
                 return null;
             }).when(c).assign(org.mockito.ArgumentMatchers.anyCollection());
             org.mockito.Mockito.when(c.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap())).thenAnswer(inv -> {
@@ -3139,25 +3157,27 @@ class FeedGatewayServiceTest {
             org.mockito.Mockito.when(c.position(org.mockito.ArgumentMatchers.any(TopicPartition.class)))
                     .thenAnswer(inv -> {
                         TopicPartition p = inv.getArgument(0);
-                        if (!assigned.contains(p)) {
+                        if (!assigned.get().contains(p)) {
                             throw new IllegalStateException("not assigned: " + p);
                         }
                         return positions.getOrDefault(p, 0L);
                     });
+            org.mockito.Mockito.when(c.paused()).thenReturn(Set.of());
             org.mockito.Mockito.when(c.poll(org.mockito.ArgumentMatchers.any(java.time.Duration.class))).thenAnswer(inv -> {
-                onPoll.accept(polls.incrementAndGet());
+                hook.accept(polls.incrementAndGet());
                 Map<TopicPartition, List<ConsumerRecord<String, Object>>> batch = new java.util.HashMap<>();
-                for (TopicPartition p : assigned) {
+                for (TopicPartition p : assigned.get()) {
                     long at = positions.getOrDefault(p, 0L);
                     List<VolPremiumFixtures.Row> log = logs.getOrDefault(p.topic(), List.of());
+                    long to = Math.min(log.size(), at + maxPollRecords);
                     List<ConsumerRecord<String, Object>> records = new ArrayList<>();
-                    for (long o = at; o < log.size(); o++) {
+                    for (long o = at; o < to; o++) {
                         VolPremiumFixtures.Row row = log.get((int) o);
                         records.add(new ConsumerRecord<>(p.topic(), 0, o, row.key(), (Object) row.json()));
                     }
                     if (!records.isEmpty()) {
                         batch.put(p, records);
-                        positions.put(p, (long) log.size());
+                        positions.put(p, to);
                     }
                 }
                 return new org.apache.kafka.clients.consumer.ConsumerRecords<>(batch, Map.of());
@@ -3682,10 +3702,10 @@ class FeedGatewayServiceTest {
     }
 
     @Test
-    void afterARestartAV1SessionIsWhatTheTopicStillHoldsAllOfItUncompactedOnlyItsNewestPointCompacted()
+    void afterARestartASessionIsWhatTheTopicStillHoldsTheNewestV1PerSessionAndTheNewestV2PerOrdinalCompacted()
             throws Exception {
         // TRANSITIONAL LIMIT (VolPremiumSessionStore#acceptObservation). The store is heap only, so a restarted
-        // gateway rebuilds the session from the topic. v1 writes ONE key per session; v2 one per observation.
+        // gateway rebuilds the session from the topic. v1 writes ONE key per session; v2 one per ORDINAL.
         List<VolPremiumFixtures.Row> v1 = vpV1Run(6840, 6870, VolPremiumFixtures.V1_EPOCH_MS);
         List<VolPremiumFixtures.Row> v2 = vpV2Run(6870, 6880);
         List<VolPremiumFixtures.Row> published = new ArrayList<>(v1);
@@ -3703,6 +3723,27 @@ class FeedGatewayServiceTest {
         expected.addAll(vpJson(v2));
         assertEquals(expected, vpRebuiltAfterRestart(compacted),
                 "the v1 history before its newest point was only ever what a gateway saw LIVE");
+
+        // Codex r2 finding 5. The v2 key is SYMBOL|sessionDate|frameSeq: it does not carry measurementEpochMs. Two
+        // epochs at ordinal 6840 (the stream's first frame, and a restart one second into the same cadence window)
+        // share one key. Live they are two points; a delete topic rebuilds both; a compacted one keeps the newer only.
+        VolPremiumFixtures.Row first = VolPremiumFixtures.readingAt(6840);
+        assertEquals(1787837400000L, VolPremiumFixtures.longField(first.json(), "measurementEpochMs"));
+        VolPremiumFixtures.Row restarted = new VolPremiumFixtures.Row(first.key(), VolPremiumFixtures.edit(first.json(), n -> {
+            n.put("eventTimeMs", 1787837401000L);
+            n.put("measurementEpochMs", 1787837401000L);
+        }));
+        assertEquals("SPX|2026-08-27|6840", restarted.key(), "one Kafka key for both epochs");
+        List<VolPremiumFixtures.Row> twoEpochs = List.of(first, restarted);
+        FeedGatewayService liveGateway = vpService();
+        for (int i = 0; i < twoEpochs.size(); i++) {
+            assertNotNull(vpOffer(liveGateway, i, twoEpochs.get(i)), "epoch " + i + " is admitted");
+        }
+        assertEquals(2, liveGateway.volPremiumStoreForTest().heldObservations(), "live: one point per epoch");
+        assertEquals(vpJson(twoEpochs), vpRebuiltAfterRestart(twoEpochs), "delete topic: both epochs rebuild");
+        assertEquals(1, vpCompacted(twoEpochs).size(), "compaction keeps one record for the one key");
+        assertEquals(List.of(restarted.json()), vpRebuiltAfterRestart(vpCompacted(twoEpochs)),
+                "compacted topic: the newest record of the ordinal, one point where the gateway had held two");
     }
 
     @Test
@@ -4062,6 +4103,63 @@ class FeedGatewayServiceTest {
         }
         vpCaughtUp(service);
         assertEquals(vpJson(rows.subList(0, 51)), vpFrames(sink, VP_OBS), "the whole session, in order, once");
+    }
+
+    @Test
+    void recordsProducedBetweenTheCacheBarrierAndTheLiveConsumersStartReachASocketInOffsetOrderOnce() throws Exception {
+        // Codex r2 finding 1, its exact interleaving, through BOTH production consumer loops over one partition. The
+        // cache consumer captures its bootstrap end offset, 50. Records 50..54 are produced. The live consumer starts at
+        // END (55) and reads record 55 while delivery is held. The cache consumer then applies 0..49, meets its barrier
+        // and serves, and only after that reads 50..54. When the live consumer admitted 55, the store held 0..49 and 55
+        // at that moment: a socket was walked 0..49, 55 and parked past 50..54, which then followed out of order. Only
+        // the cache consumer ingests now, so the store is a contiguous prefix of the partition at every instant.
+        FeedGatewayService service = vpService();
+        GatewaySettings settings = new GatewaySettings();
+        String ivrv = settings.volPremiumIvrvTopic();
+        List<VolPremiumFixtures.Row> rows = VolPremiumFixtures.readings();
+        VpBroker broker = new VpBroker()
+                .topic(ivrv, rows.subList(0, 50))
+                .topic(settings.volPremiumWarningsTopic(), List.of());
+        broker.maxPollRecords = 50;   // a poll returns what max.poll.records allows, not the whole log
+        Map<String, FeedGatewayService.TopicBinding> events = Map.of(
+                ivrv, new FeedGatewayService.TopicBinding(FeedGatewayService.VOL_PREMIUM_SOURCE, VP_OBS),
+                settings.volPremiumWarningsTopic(), new FeedGatewayService.TopicBinding(FeedGatewayService.VOL_PREMIUM_SOURCE, VP_WARN));
+        service.runOutboundWritesInline();
+        List<String> sink = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-boundary", sink, null));   // connected while the cache consumer catches up
+
+        java.util.concurrent.atomic.AtomicInteger heldWhenTheLiveConsumerStopped = new java.util.concurrent.atomic.AtomicInteger(-1);
+        java.util.concurrent.atomic.AtomicLong liveReadUpTo = new java.util.concurrent.atomic.AtomicLong(-1L);
+        KafkaConsumer<String, Object> live = broker.consumer(n -> {
+            if (n == 1) {
+                broker.append(ivrv, List.of(rows.get(55)));   // produced after the live consumer's seekToEnd at 55
+            } else {
+                service.setRunningForTest(false);            // it has read record 55: stop it
+            }
+        });
+        KafkaConsumer<String, Object> cache = broker.consumer(n -> {
+            if (n == 1) {
+                // After the cache consumer's bootstrap captured end offset 50, before its first batch is read.
+                broker.append(ivrv, rows.subList(50, 55));
+                service.runLiveConsumerAttemptForTest("state-live", events,
+                        new java.util.concurrent.atomic.AtomicBoolean(), live, false);
+                liveReadUpTo.set(live.position(new TopicPartition(ivrv, 0)));
+                heldWhenTheLiveConsumerStopped.set(service.volPremiumStoreForTest().heldObservations());
+                service.setRunningForTest(true);             // the cache consumer carries on
+            } else if (n >= 3) {
+                service.setRunningForTest(false);
+            }
+        });
+        service.setRunningForTest(true);
+        service.runCacheConsumerAttemptForTest("state", events, new java.util.concurrent.atomic.AtomicBoolean(), cache);
+
+        assertEquals(56L, liveReadUpTo.get(), "precondition: the live consumer started at 55 and read record 55");
+        assertEquals(0, heldWhenTheLiveConsumerStopped.get(),
+                "the live consumer admitted nothing it read: the store stays a contiguous prefix");
+        assertEquals(vpJson(rows.subList(0, 56)), vpFrames(sink, VP_OBS), "0..55, in offset order, each once");
+        List<String> late = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-boundary-late", late, null));
+        assertEquals(vpJson(rows.subList(0, 56)), vpFrames(late, VP_OBS), "and the same session to a late joiner");
     }
 
     @Test

@@ -505,12 +505,12 @@ public class FeedGatewayService implements ReplayRunner {
     private final Object indicatorsEmitLock = new Object();
     /**
      * Same role as {@link #indicatorsEmitLock}, for BOTH vol-premium streams (observations and
-     * warnings). The cache and live consumers read the SAME single partition, and the contract permits
-     * a repeated ordinal at a later offset — so without one lock spanning (store admit -> broadcast)
-     * and (replay cursor read -> enqueue), a superseded offset could win the broadcast, or a replay and
-     * a live frame could each decide the other would deliver a record and neither would. It also guards
-     * every {@link VolPremiumDelivery} and {@link #volPremiumServing}, which is what makes each routing
-     * decision one comparison against state no other thread can move at the same time.
+     * warnings). Only the cache consumer ingests them, but a socket's walk also runs on the connect path and
+     * on the socket writer's thread, so without one lock spanning (store admit -> claim -> route) and
+     * (replay cursor read -> enqueue), a replay and a live frame could each decide the other would deliver a
+     * record and neither would. It also guards every {@link VolPremiumDelivery} and
+     * {@link #volPremiumServing}, which is what makes each routing decision one comparison against state no
+     * other thread can move at the same time.
      */
     private final Object volPremiumIvrvEmitLock = new Object();
     /**
@@ -2499,8 +2499,9 @@ public class FeedGatewayService implements ReplayRunner {
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
-        // JSON class as spot-vol-regime. Both consumers carry both topics, so whichever admits an offset
-        // first is the one that broadcasts it (relayVolPremium).
+        // JSON class as spot-vol-regime. Both consumers are ASSIGNED both topics (the two maps stay
+        // symmetric), but only the CACHE consumer ingests them (relayVolPremium); the live consumer's
+        // vol-premium branch says why.
         topicEvents.put(settings.volPremiumIvrvTopic(),
                 new TopicBinding(VOL_PREMIUM_SOURCE, VolPremiumSessionStore.EVENT_OBSERVATION));
         topicEvents.put(settings.volPremiumWarningsTopic(),
@@ -2644,8 +2645,9 @@ public class FeedGatewayService implements ReplayRunner {
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
-        // JSON class as spot-vol-regime. Both consumers carry both topics, so whichever admits an offset
-        // first is the one that broadcasts it (relayVolPremium).
+        // JSON class as spot-vol-regime. Both consumers are ASSIGNED both topics (the two maps stay
+        // symmetric), but only the CACHE consumer ingests them (relayVolPremium); the live consumer's
+        // vol-premium branch says why.
         topicEvents.put(settings.volPremiumIvrvTopic(),
                 new TopicBinding(VOL_PREMIUM_SOURCE, VolPremiumSessionStore.EVENT_OBSERVATION));
         topicEvents.put(settings.volPremiumWarningsTopic(),
@@ -3084,12 +3086,11 @@ public class FeedGatewayService implements ReplayRunner {
                         continue;
                     }
                     if (binding != null && isVolPremiumEvent(binding.event())) {
-                        // Same reason as indicators below: THIS consumer also ingests both vol-premium
-                        // topics, so whichever consumer admits an offset must be the one that
-                        // broadcasts it. Without this the cache consumer takes the offset, the live
-                        // consumer's duplicate is then correctly refused by the per-observation offset
-                        // gate, and nobody broadcasts — clients starve while the cache is perfectly up
-                        // to date.
+                        // THE ingest path of both vol-premium streams: this consumer alone admits, claims and
+                        // routes them (the live consumer leaves them here; see its vol-premium branch). It reads the
+                        // partition in offset order from the start of the session, so the store always holds a
+                        // contiguous prefix of it; delivery is served once that prefix reaches the bootstrap end
+                        // offsets (markCacheCaughtUp), and every later record is routed live, in order.
                         relayVolPremium(binding, record, json);
                         continue;
                     }
@@ -3396,7 +3397,7 @@ public class FeedGatewayService implements ReplayRunner {
             AtomicBoolean cacheCaughtUpFlag,
             boolean retry
     ) {
-        try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
+        try (KafkaConsumer<String, Object> consumer = newLiveConsumer(name, avro)) {
             List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
             liveBootstrapSeek(consumer, partitions, topicEvents, retry);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
@@ -3606,17 +3607,14 @@ public class FeedGatewayService implements ReplayRunner {
                         continue;
                     }
                     if (isVolPremiumEvent(binding.event())) {
-                        // Same shape as indicators below, and needed for the same two races: the
-                        // whole admit→claim→enqueue decision is ONE unit under the emit lock, and the
-                        // per-observation offset claim makes whichever consumer wins the broadcaster.
-                        // Both consumers read the same single partition, and the contract allows a
-                        // repeated ordinal at a later offset — so an event-time gate alone would let a
-                        // superseded offset broadcast over its own replacement.
-                        //
-                        // Refusal stays fail-closed: a record the store does not admit is never
-                        // live-broadcast. Whether it is delivered at all is the serving flag's call,
-                        // read inside the emit lock — never a caught-up flag read outside it.
-                        relayVolPremium(binding, record, json);
+                        // NOT INGESTED BY THIS CONSUMER (Codex r2 finding 1). The JSON-state CACHE consumer is
+                        // the one reader that admits, claims and routes both vol-premium streams, in offset order
+                        // from the start of the session, so the store is always a CONTIGUOUS prefix of the
+                        // partition. This consumer starts at END (liveBootstrapSeek), possibly past records the
+                        // cache consumer has not read yet. A record admitted here would enter the store ahead of
+                        // that history: a socket's walk would hand it over and park past it, and the history filled
+                        // in behind it would follow out of order. Left to the cache consumer, it arrives one poll
+                        // later, at one record per 5 s cadence tick.
                         continue;
                     }
                     if ("indicators".equals(binding.event())) {
@@ -4696,6 +4694,21 @@ public class FeedGatewayService implements ReplayRunner {
                                         KafkaConsumer<String, Object> client) {
         cacheConsumerForTest = () -> client;
         try { runAssignedCacheConsumerOnce(name, topicEvents, false, caughtUpFlag); } finally { cacheConsumerForTest = null; }
+    }
+
+    /** Test seam: the client a LIVE-consumer attempt uses; null in production, which builds a real KafkaConsumer. */
+    private volatile java.util.function.Supplier<KafkaConsumer<String, Object>> liveConsumerForTest;
+
+    private KafkaConsumer<String, Object> newLiveConsumer(String name, boolean avro) {
+        java.util.function.Supplier<KafkaConsumer<String, Object>> seam = liveConsumerForTest;
+        return seam != null ? seam.get() : new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name));
+    }
+
+    /** Test seam: ONE production live-consumer attempt (the retry loop's unit) against the supplied client. */
+    void runLiveConsumerAttemptForTest(String name, Map<String, TopicBinding> topicEvents, AtomicBoolean cacheCaughtUpFlag,
+                                       KafkaConsumer<String, Object> client, boolean retry) {
+        liveConsumerForTest = () -> client;
+        try { runLiveConsumerOnce(name, topicEvents, false, cacheCaughtUpFlag, retry); } finally { liveConsumerForTest = null; }
     }
 
     /** Test seam: the named consumer's next poll runs its partition refresh. */
@@ -8451,11 +8464,11 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * The ONE ingest path both consumers use for both vol-premium streams: admit to the session store,
-     * claim this offset for the record's position, and route it — as one unit under the emit lock, so
-     * the decision cannot interleave with the other consumer's, with a socket's walk, or with a
-     * serve/hold transition. A record admitted while delivery is held is routed nowhere; the walk or the
-     * repair hands it over when delivery is served again.
+     * The ONE ingest path of both vol-premium streams, used by the cache consumer alone (the live consumer
+     * leaves them to it: Codex r2 finding 1). Admit to the session store, claim this offset for the record's
+     * position, and route it, as one unit under the emit lock, so the decision cannot interleave with a
+     * socket's walk or with a serve/hold transition. A record admitted while delivery is held is routed
+     * nowhere; the walk or the repair hands it over when delivery is served again.
      */
     private void relayVolPremium(TopicBinding binding, ConsumerRecord<String, ?> record, String json) {
         synchronized (volPremiumIvrvEmitLock) {

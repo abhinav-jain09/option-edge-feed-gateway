@@ -75,14 +75,31 @@ final class VolPremiumSessionStore {
     static final String EVENT_OBSERVATION = "vol-premium-ivrv";
     static final String EVENT_WARNING = "vol-premium-warning";
 
-    /** 09:30–16:00 ET: the regular session the producer's cadence runs over (§39 item 1). */
+    /** 09:30–16:00 ET: the regular session (§39 item 1), the one the engine frames over. */
     static final long RTH_SESSION_MS = 6L * 60L * 60_000L + 30L * 60_000L;
 
-    /** The producer's configured cadence ({@code frameCadenceMs} on every record it publishes). */
-    static final long REFERENCE_FRAME_CADENCE_MS = 5_000L;
+    /**
+     * The fastest frame cadence this gateway SUPPORTS: Gate-1 §11 {@code FRAME_CADENCE_MS} = 5,000, the cadence
+     * §7.1 sizes the stream at. The contracts admit down to {@link IvRvReading#MIN_FRAME_CADENCE_MS} (250 ms),
+     * twenty times as many frames, and no retention budget that fits this heap holds a whole session of those.
+     * So an observation stamped faster is refused ({@link Refusal#CADENCE_UNSUPPORTED}), counted and logged,
+     * before anything of it is retained. Decision of the design author, 2026-09-11: the engine refuses to boot
+     * with a faster cadence too. No deployment configures one: VOL_PREMIUM_FRAME_CADENCE_MS is set in no
+     * overlay of the deploy repo, and both producers default it to 5,000.
+     */
+    static final long SUPPORTED_MIN_FRAME_CADENCE_MS = 5_000L;
 
-    /** 23,400,000 / 5,000: the observations of one full regular session at the producer's cadence. */
-    static final int REFERENCE_OBSERVATIONS_PER_SESSION = (int) (RTH_SESSION_MS / REFERENCE_FRAME_CADENCE_MS);
+    /** 23,400,000 / 5,000: the observations of one full regular session at the supported cadence. */
+    static final int REFERENCE_OBSERVATIONS_PER_SESSION = (int) (RTH_SESSION_MS / SUPPORTED_MIN_FRAME_CADENCE_MS);
+
+    /**
+     * Every ordinal of the SUPPORTED window at the supported cadence: the regular session, plus the contract's
+     * after-midnight allowance ({@link IvRvReading#MAX_AFTER_MIDNIGHT_MS}, 00:00–04:00 of the next day), which
+     * this store keeps and admits: {@code (23,400,000 + 14,400,000) / 5,000 = 7,560}. What lies outside it is
+     * stated on {@link #SERIES_BUDGET_BYTES}.
+     */
+    static final int SUPPORTED_ORDINALS_PER_SESSION =
+            (int) ((RTH_SESSION_MS + IvRvReading.MAX_AFTER_MIDNIGHT_MS) / SUPPORTED_MIN_FRAME_CADENCE_MS);
 
     /**
      * Distinct series held at once. The producer publishes SPX; one more is room for a second
@@ -97,27 +114,62 @@ final class VolPremiumSessionStore {
      *
      * <p><b>The supported envelope, and its arithmetic.</b> Each record is charged an upper bound of
      * the heap it retains ({@link #charge}): the JSON string as the JVM stores it plus a fixed
-     * per-record overhead for the entry, its tree node and its position key. The engine's real
-     * observations are 5,300–5,686 characters (the committed full-session stream), so the largest is
-     * charged {@code 256 + 32 + align8(24 + 5,686) = 6,000} bytes; its warnings are 978–1,052
-     * characters, charged at most {@code 568 + 32 + align8(24 + 1,052) = 1,680} bytes.
+     * per-record overhead for the entry, its tree node and its position key. The budget is derived from
+     * the WIDEST record the contract admits, not from the engine's typical one: every component present,
+     * every string at its contract bound (symbol 16, codeVersion 64, both topics 249, the chain epoch id 64,
+     * every episode id at the width its derived identity {@code symbol|sessionDate|type|openedFrameSeq}
+     * allows), every number at the widest text its Java type prints (int 11, long 20, double 24), the four
+     * trends of the one shipped parameter set and all fourteen warning summaries, in the producer's compact
+     * JSON. VolPremiumSessionStoreTest derives that width from the contract's own record components and
+     * constants: an observation is 9,685 characters, charged {@code 256 + 32 + align8(24 + 9,685) = 10,000}
+     * bytes (the engine's largest real one is 5,686); a warning is 1,557, charged
+     * {@code 568 + 32 + align8(24 + 1,557) = 2,184}.
      * <ul>
-     *   <li>Observations of a full 09:30–16:00 session at the producer's 5 s cadence:
-     *       {@code 4,680 × 6,000 = 28,080,000} bytes (26.8 MiB).</li>
-     *   <li>Budget: {@code 48 MiB = 50,331,648} bytes, leaving {@code 22,251,648} bytes for everything
-     *       else the session legitimately carries — every extra measurement epoch (one more point per
-     *       restart) and every warning transition, any number of types per ordinal. That is 13,245
-     *       transitions at 1,680 bytes, against the 15 the engine emitted in the committed 31 minutes
-     *       (≈190 for a whole session at that rate), or 3,708 more observations: a whole session
-     *       down to a {@code 23,400,000 / 8,388 = 2,790} ms cadence with no warnings at all.</li>
-     *   <li>Total: {@code MAX_SYMBOLS × 48 MiB = 96 MiB}, asserted at boot to fit in
-     *       {@code 1/}{@value #HEAP_FRACTION_DENOMINATOR} of {@code Runtime.maxMemory()}. Production
-     *       runs {@code -Xms256m -Xmx1536m} (JAVA_TOOL_OPTIONS in every feed-gateway overlay), so the
-     *       bound is 192 MiB and the store can hold at most 6.25% of the heap.</li>
+     *   <li>Cadence: at least {@link #SUPPORTED_MIN_FRAME_CADENCE_MS}. Anything faster is refused before it
+     *       is retained.</li>
+     *   <li>Window: every ordinal of 09:30–16:00 and of 00:00–04:00 the next day,
+     *       {@link #SUPPORTED_ORDINALS_PER_SESSION} = 7,560 observations at the widest:
+     *       {@code 75,600,000} bytes.</li>
+     *   <li>Epoch breaks: 24 in one session, each re-publishing a whole minute (12 ordinals) under its new
+     *       epoch, so 288 more points at the widest: {@code 2,880,000} bytes.</li>
+     *   <li>Warnings: 2,400 transitions at the widest, {@code 5,241,600} bytes. The engine emitted 15 in the
+     *       committed 31 minutes, about 190 for a whole session at that rate.</li>
+     *   <li>Budget: {@code 80 MiB = 83,886,080} bytes. The three lines above and the session's own
+     *       {@link #SERIES_OVERHEAD_BYTES} total {@code 83,722,624}; VolPremiumSessionStoreTest admits exactly
+     *       that session through the production store and asserts it complete.</li>
+     *   <li>Total: {@code MAX_SYMBOLS × 80 MiB = 160 MiB}, asserted at boot to fit in
+     *       {@code 1/}{@value #HEAP_FRACTION_DENOMINATOR} of {@code Runtime.maxMemory()}, so the heap must
+     *       report at least 1,280 MiB. Production runs {@code -Xms256m -Xmx1536m} (JAVA_TOOL_OPTIONS in every
+     *       feed-gateway overlay) and names no collector. Measured on JDK 21 at those flags,
+     *       {@code maxMemory()} is 1,536 MiB under G1, 1,484 MiB under Serial (what the JVM picks with one CPU)
+     *       and 1,365 MiB under Parallel, so the check passes under all three. The store can then hold at most
+     *       10.4% of the heap. VolPremiumSessionStoreTest starts the production store in child JVMs to hold
+     *       that.</li>
      *   <li>A schemaVersion 1 record (the rollout bridge) is charged by the SAME formula. It carries
      *       sixteen scalar fields and no trends or warnings, so its charge is a fraction of a v2 record's for
      *       the same window (VolPremiumSessionStoreTest measures both). Any mix of v1 and v2 points
      *       therefore fits wherever the same number of v2 points does.</li>
+     * </ul>
+     *
+     * <p><b>What the budget does NOT cover, because the contract does not bound it.</b> Each of these is
+     * admitted record by record and then meets the fail-closed rule below, never an out-of-memory:
+     * <ul>
+     *   <li>Frames outside the window. The contract files any instant from the session's ET midnight to 04:00
+     *       the next day under the session, 28 hours, and this store admits them: 20,160 ordinals at 5 s.
+     *       The engine frames only from the calendar's open to its close (SessionEngine). The v1 producer
+     *       measures on a grid spanning the open to the close but publishes on a stream-time punctuator, so
+     *       it frames wherever its input's stream time goes. All 28 hours at the widest record would take
+     *       201,600,000 bytes per series.</li>
+     *   <li>Warning volume. The engine emits a transition on every state change of every type, with no
+     *       minimum dwell, and two on one observation when it re-arms a type: up to 28 per observation, 211,680
+     *       in the window, 462 MB at the widest. No heap-resident budget holds that.</li>
+     *   <li>Epoch breaks beyond the 288 points above. The contract does not bound how many epochs a session
+     *       has; the engine starts a new one only when it loses its state.</li>
+     *   <li>Spelling. The contract bounds VALUES, not their text. An identifier made of control characters is
+     *       escaped to six characters per character (the widest observation is then 14,015 characters); text
+     *       beyond Latin-1 is held at two bytes per character (with both, 28,344 bytes charged); and
+     *       insignificant whitespace or gratuitous escapes can take a record to the 64 KiB wire cap. The store
+     *       forwards the producer's bytes verbatim, so it charges them as they are.</li>
      * </ul>
      *
      * <p><b>Beyond the envelope the store fails CLOSED and LOUD, never by truncation.</b> A record that
@@ -134,7 +186,7 @@ final class VolPremiumSessionStore {
      * exactly what the page's own cadence rule reports as stale — the gateway does not present a
      * point it could not also replay.
      */
-    static final long SERIES_BUDGET_BYTES = 48L << 20;
+    static final long SERIES_BUDGET_BYTES = 80L << 20;
 
     /** Every series together: the figure the boot check holds against the heap. */
     static final long TOTAL_BUDGET_BYTES = MAX_SYMBOLS * SERIES_BUDGET_BYTES;
@@ -183,6 +235,8 @@ final class VolPremiumSessionStore {
         MALFORMED,
         /** An observation whose schemaVersion is missing, not a JSON integer, or neither version this gateway knows. */
         SCHEMA_VERSION,
+        /** An observation stamped faster than {@link #SUPPORTED_MIN_FRAME_CADENCE_MS}: outside the budgeted envelope. */
+        CADENCE_UNSUPPORTED,
         OVERSIZE, KEY_MISMATCH, FUTURE_EVENT_TIME, SESSION_NOT_CURRENT, OLDER_SESSION,
         FOREIGN_PARTITION, REPLAYED_OFFSET, EVENT_TIME_REGRESSION, SESSION_BUDGET, SYMBOL_CAP
     }
@@ -383,20 +437,21 @@ final class VolPremiumSessionStore {
 
     /**
      * What the store needs from an observation of EITHER version, once it has passed its own contract:
-     * the version, the identity, the instant, and the Kafka key its own version requires. It is built only
+     * the version, the identity, the instant, the cadence, and the Kafka key its own version requires. It is built only
      * from a constructed contract record. The key rule is bound to the record TYPE here, so neither version
      * can be keyed by the other's rule.
      */
     private record Observation(int schemaVersion, String symbol, String sessionDate, long eventTimeMs,
-                               long frameSeq, long measurementEpochMs, String key) {
+                               long frameSeq, long measurementEpochMs, long frameCadenceMs, String key) {
         static Observation of(IvRvReadingV1 r) {
             return new Observation(r.schemaVersion(), r.symbol(), r.sessionDate(), r.eventTimeMs(), r.frameSeq(),
-                    r.measurementEpochMs(), v1SessionKey(r.symbol(), r.sessionDate()));
+                    r.measurementEpochMs(), r.frameCadenceMs(), v1SessionKey(r.symbol(), r.sessionDate()));
         }
 
         static Observation of(IvRvReading r) {
             return new Observation(r.schemaVersion(), r.symbol(), r.sessionDate(), r.eventTimeMs(), r.frameSeq(),
-                    r.measurementEpochMs(), IvRvReading.observationKey(r.symbol(), r.sessionDate(), r.frameSeq()));
+                    r.measurementEpochMs(), r.frameCadenceMs(),
+                    IvRvReading.observationKey(r.symbol(), r.sessionDate(), r.frameSeq()));
         }
     }
 
@@ -408,16 +463,28 @@ final class VolPremiumSessionStore {
     private final AtomicLong admittedV1 = new AtomicLong();
     private final AtomicLong admittedV2 = new AtomicLong();
     private boolean symbolCapLogged;
+    /** Whether the first {@link Refusal#CADENCE_UNSUPPORTED} has been logged; every one is counted. */
+    private boolean cadenceRefusalLogged;
     /** Incremented on every admission, new position or replacement; see {@link #nextChanged}. */
     private long admissionSeq;
 
     /** The production store: the declared budget, checked against the heap this JVM was given. */
     VolPremiumSessionStore() {
+        this(Runtime.getRuntime()::maxMemory);
+    }
+
+    /**
+     * The production store against a stated max heap: the declared budget, and the boot check
+     * ({@link #requireBudgetFitsHeap}) run on it. The no-argument constructor passes this JVM's own
+     * {@code Runtime.maxMemory()}; a test passes a heap too small, so deleting the check fails a test.
+     */
+    VolPremiumSessionStore(java.util.function.LongSupplier maxMemory) {
         this(SERIES_BUDGET_BYTES, MAX_SYMBOLS);
-        requireBudgetFitsHeap(TOTAL_BUDGET_BYTES, Runtime.getRuntime().maxMemory());
+        long maxMemoryBytes = maxMemory.getAsLong();
+        requireBudgetFitsHeap(TOTAL_BUDGET_BYTES, maxMemoryBytes);
         System.out.println("INFO vol-premium: session store budget " + (SERIES_BUDGET_BYTES >> 20) + " MiB per series x "
                 + MAX_SYMBOLS + " series = " + (TOTAL_BUDGET_BYTES >> 20) + " MiB, within 1/" + HEAP_FRACTION_DENOMINATOR
-                + " of the " + (Runtime.getRuntime().maxMemory() >> 20) + " MiB heap");
+                + " of the " + (maxMemoryBytes >> 20) + " MiB heap");
     }
 
     /** Test seam: the same store with a small budget, so the budget refusal is reachable in a unit test. */
@@ -474,6 +541,9 @@ final class VolPremiumSessionStore {
      *       the first slot on the topic while the gateway filed it under the second, and the two histories
      *       would disagree with nothing failing. So a v1 record under a v2-style key, and a v2 record under the
      *       v1 key, are both {@link Refusal#KEY_MISMATCH}.</li>
+     *   <li>Its {@code frameCadenceMs} must be at least {@link #SUPPORTED_MIN_FRAME_CADENCE_MS}, whichever
+     *       version it is: the retention budget is derived at that cadence ({@link #SERIES_BUDGET_BYTES}). Faster
+     *       is {@link Refusal#CADENCE_UNSUPPORTED}, counted and logged before anything is retained.</li>
      * </ol>
      * Past that point the two versions are ONE series. They share the session, the identity
      * {@code (frameSeq, measurementEpochMs)}, the byte budget and its charge, the replay order and the
@@ -481,39 +551,51 @@ final class VolPremiumSessionStore {
      *
      * <p><b>TRANSITIONAL LIMITS</b>, as found on 2026-09-11; they go away with the bridge at step 6.
      * <ul>
-     *   <li><b>After a gateway restart, a v1 session's history is only what the topic still holds.</b> This
-     *       store lives on the heap alone. A restarted gateway rebuilds it by seeking back
-     *       {@code VOL_PREMIUM_SESSION_SEEK_BACK_MS} and re-admitting what it reads. v1 writes ONE key per
-     *       session, so on a COMPACTED topic only the session's newest v1 record is guaranteed to survive.
-     *       Older records last only until the log cleaner compacts the segment holding them; the active
-     *       segment is never compacted. On such a topic, a v1 producer's whole-session history is only what
-     *       this gateway instance observed live. A restart rebuilds the newest v1 point, plus whatever the
-     *       cleaner has not yet removed. (v2 keys every observation separately, so compaction keeps all of
-     *       it.) Whether the topic IS compacted is decided by the producer, which stamps it at every boot
+     *   <li><b>After a gateway restart, a session is only what the topic still holds.</b> This store lives
+     *       on the heap alone. A restarted gateway rebuilds it by seeking back
+     *       {@code VOL_PREMIUM_SESSION_SEEK_BACK_MS} and re-admitting what it reads. What it can read depends on
+     *       the topic's cleanup policy and on each version's KEY, which is all compaction looks at:
+     *       <ul>
+     *         <li>DELETE topic: every record still within retention is there, so a rebuild recovers both
+     *             versions and every measurement epoch: the whole session.</li>
+     *         <li>COMPACTED topic: the log cleaner guarantees only the newest record per key. v1 writes ONE key
+     *             per session ({@code SYMBOL|sessionDate}), so only the session's newest v1 record is guaranteed.
+     *             v2 writes one key per ORDINAL ({@link IvRvReading#observationKey},
+     *             {@code SYMBOL|sessionDate|frameSeq}), and that key does not carry measurementEpochMs, so only
+     *             the newest v2 record PER ORDINAL is guaranteed: two epochs at one ordinal, which this store
+     *             holds live as two points, rebuild as one. Older records last only until the cleaner compacts
+     *             the segment holding them; the active segment is never compacted. What a compacted topic loses
+     *             was only ever what this gateway instance observed live.</li>
+     *       </ul>
+     *       Whether the topic IS compacted is decided by the producer, which stamps it at every boot
      *       (processing-common KafkaTopics.ensureServedTopic): compact,delete unless
      *       OPTIONS_EDGE_UNCOMPACTED_SERVED_TOPICS=true. The deploy repo sets that switch for production
      *       (options-edge-config) and for es4, so there the topic is delete, with VOL_PREMIUM_IVRV_RETENTION_MS
-     *       (default -1). Every v1 record then stays, and a restart re-reads the whole v1 session. Dev keeps
-     *       compaction (by default segment.ms is 1 h and min.cleanable.dirty.ratio 0.01).</li>
-     *   <li><b>Two producers form two runs only because their epochs differ.</b> Each producer sets
-     *       measurementEpochMs to the event time of the first record ITS accumulator folds. For v1 that is the
-     *       first record of the session a new processor instance sees, held in memory. For v2 it is the first
-     *       in-session spot tick of its grid, persisted. What keeps them apart is WHERE the replacing producer
-     *       starts reading, not that the Deployment (replicas 1, strategy Recreate) never runs both at once.
-     *       Both use the streams application id options-edge-vol-premium by default, so the replacing producer
-     *       resumes after the committed offset of the one it replaces. With a fresh id,
-     *       VOL_PREMIUM_STREAMS_AUTO_OFFSET_RESET defaults to latest. Either way its first folded record is later
-     *       than the replaced producer's first, so a switch changes the epoch and the two runs stay distinct
-     *       points. Only a replay from before the replaced producer's first record (an offset reset to
-     *       earliest) can make the epochs equal. Then a v1 and a v2 reading of one ordinal are the SAME position:
-     *       the later offset replaces the earlier, under exactly the rules that apply within one version, and
-     *       is charged the size difference. Nothing is corrupted; the newer producer's reading of the window
-     *       wins.</li>
+     *       (default -1), and a restart re-reads the whole session. Dev keeps compaction (by default segment.ms
+     *       is 1 h and min.cleanable.dirty.ratio 0.01). FeedGatewayServiceTest rebuilds both cases.</li>
+     *   <li><b>A v1 run and a v2 run are separate points only when their epochs differ, and nothing
+     *       guarantees that they do.</b> Each producer sets measurementEpochMs to the event time of the first
+     *       record ITS accumulator folds: for v1 the first record of the session a new processor instance sees,
+     *       held in memory; for v2 the first in-session spot tick of its grid, persisted. Where the replacing
+     *       producer starts reading usually makes its epoch the later one: both use the streams application id
+     *       options-edge-vol-premium by default, so the replacement resumes after the committed offset of the
+     *       producer it replaces, and with a fresh id VOL_PREMIUM_STREAMS_AUTO_OFFSET_RESET defaults to latest.
+     *       But offsets do not order EVENT TIMES. A later-offset spot record can carry the very instant T that
+     *       the replaced run's first folded record carried, and the engine stamps its session midnight + 1 ms on
+     *       a frame measured before any in-session spot tick has started its grid (SessionEngine.emitIvRv:
+     *       {@code st.measurementEpochMs > 0L ? st.measurementEpochMs : midnight + 1L}). So the two runs can
+     *       share an epoch with no offset reset at all, and no distinctness is claimed here. When they share it,
+     *       a v1 and a v2 reading of one ordinal are the SAME position {@code (frameSeq, measurementEpochMs)}: the
+     *       later offset replaces the earlier, under exactly the rules that apply within one version (never with
+     *       an earlier event time; a lower or equal offset is a replay), and the session is charged the size
+     *       difference. The earlier producer's reading of that window is then neither held nor replayed.
+     *       VolPremiumSessionStoreTest pins this in both directions.</li>
      *   <li><b>Ordering by frameSeq assumes one cadence per session.</b> Both producers read
-     *       VOL_PREMIUM_FRAME_CADENCE_MS (default 5,000). Producers publishing at different cadences in one
-     *       session would number their frames on different lattices, and this store would interleave the
-     *       frames out of time order. That is not guarded here, and a cadence change within v2 alone would do
-     *       the same.</li>
+     *       VOL_PREMIUM_FRAME_CADENCE_MS (default 5,000; nothing faster than
+     *       {@link #SUPPORTED_MIN_FRAME_CADENCE_MS} is admitted). Producers publishing at different supported
+     *       cadences in one session would number their frames on different lattices, and this store would
+     *       interleave the frames out of time order. That is not guarded here, and a cadence change within v2
+     *       alone would do the same.</li>
      *   <li>A v1 record carries no warnings and no trends, so it adds nothing to the warnings stream.</li>
      *   <li>The 64 KiB wire cap belongs to IvRvReading. IvRvReadingV1 declares none, and gateway main applied
      *       none to v1. It is applied to v1 here as well; a genuine v1 record is under 1 KiB.</li>
@@ -556,6 +638,19 @@ final class VolPremiumSessionStore {
         }
         if (!reading.key().equals(recordKey)) {
             return refuse(Stream.OBSERVATION, Refusal.KEY_MISMATCH);
+        }
+        if (reading.frameCadenceMs() < SUPPORTED_MIN_FRAME_CADENCE_MS) {
+            // Before anything is retained: no point, no charge, and no session opened or rolled over. The budget is
+            // derived at the supported cadence, so a faster producer outruns it by construction, not by accident.
+            // Counted on every record and logged once, so the refusal is never silent.
+            if (!cadenceRefusalLogged) {
+                cadenceRefusalLogged = true;
+                System.out.println("ERROR vol-premium: refusing observations at frameCadenceMs " + reading.frameCadenceMs()
+                        + " (schemaVersion " + reading.schemaVersion() + ", key " + recordKey + "): the supported minimum is "
+                        + SUPPORTED_MIN_FRAME_CADENCE_MS + " ms, the cadence the retention budget is derived at. Counted as "
+                        + "gateway_vol_premium_refused_total{stream=\"ivrv\",reason=\"CADENCE_UNSUPPORTED\"}");
+            }
+            return refuse(Stream.OBSERVATION, Refusal.CADENCE_UNSUPPORTED);
         }
         if (reading.eventTimeMs() > nowMs + MAX_FUTURE_SKEW_MS) {
             return refuse(Stream.OBSERVATION, Refusal.FUTURE_EVENT_TIME);
@@ -763,9 +858,10 @@ final class VolPremiumSessionStore {
     }
 
     /**
-     * Exactly-once, in-order live delivery for one position across the two consumers that read the
-     * same partition: whichever admits an offset first broadcasts it, and an offset at or below one
-     * already broadcast for that position never is. The fence lives ON the entry, so it is dropped with
+     * Exactly-once live delivery for one position: an offset at or below one already broadcast for that
+     * position never is again. Since Codex r2 finding 1 only the gateway's cache consumer ingests the
+     * vol-premium streams, so this guards a re-read of the partition (a retried cache attempt re-reading its
+     * window), not a race between two readers. The fence lives ON the entry, so it is dropped with
      * it — at rollover, at the session's end — and can never outlive the record it fences into a floor
      * that a recreated topic's offsets would have to climb back over.
      */
