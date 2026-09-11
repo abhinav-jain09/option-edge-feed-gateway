@@ -517,7 +517,7 @@ class FootprintStrikeDeliveryTest {
      * the live consumer waited inside that close, the cache consumer waited for the drainer, its refusal
      * control stayed queued and every healthy socket waited with it (the watchdog skipped the channel: it
      * was already marked closed). Now the channel is marked closed at once and its session is closed on a
-     * teardown thread of its own.
+     * shared closer thread, never on the drainer.
      */
     @Test void aSlowSocketWhoseCloseBlocksStallsNeitherConsumerNorAnyHealthySocket() throws Exception {
         FeedGatewayService s = FootprintWiringTest.on();                        // no runOutboundWritesInline: the production writer pool
@@ -557,7 +557,7 @@ class FootprintStrikeDeliveryTest {
             assertFalse(live.isAlive(), "the live consumer is not waiting inside the slow socket's close");
             assertFalse(cache.isAlive(), "the cache consumer is not waiting for a drainer stuck in that close");
             assertEquals(1, closeReturned.getCount(), "…and the close is STILL blocked: nothing above waited for it");
-            assertEquals("options-edge-ws-closer", closedOn.get(), "the close runs on a teardown thread of its own");
+            assertTrue(closedOn.get().startsWith("options-edge-ws-closer-"), "the close runs on a shared closer thread: " + closedOn.get());
             List<String> want = new ArrayList<>(Collections.nCopies(n, "es-footprint-strike"));
             want.add("es-footprint-strike-control");
             for (List<String> healthy : List.of(a, b)) {
@@ -576,6 +576,184 @@ class FootprintStrikeDeliveryTest {
         verify(slow, times(1)).close();
         assertTrue(slowGot.stream().filter(p -> p.startsWith("{\"type\":\"es-footprint-strike")).count() <= 1,
                 "the slow socket got at most the frame it was stuck on: its queue was dropped when it was marked closed");
+    }
+
+    // ---- strike re-review (round 3): teardowns share one bounded pool -----------------------------------------
+
+    /** A slow socket: its strike sends block until {@code sendRelease}; its close runs {@code onClose}. */
+    private static WebSocketSession slowSocket(String id, CountDownLatch sendRelease, org.mockito.stubbing.Answer<Void> onClose) throws Exception {
+        WebSocketSession ws = mock(WebSocketSession.class);
+        when(ws.getId()).thenReturn(id);
+        when(ws.isOpen()).thenReturn(true);
+        doAnswer(inv -> {
+            if (((TextMessage) inv.getArgument(0)).getPayload().startsWith("{\"type\":\"es-footprint-strike")) sendRelease.await(30, TimeUnit.SECONDS);
+            return null;
+        }).when(ws).sendMessage(any());
+        doAnswer(onClose).when(ws).close();
+        return ws;
+    }
+
+    private static List<String> strikeRecords(int n) {
+        List<String> records = new ArrayList<>();
+        for (int i = 0; i < n; i++) records.add(FootprintStrikeViewTest.episode("OPEN", "2026-09-10", "1m", 680_000 + i * 500L, 100, 0, 100, "s" + i));
+        return records;
+    }
+
+    /**
+     * The reviewer's round-3 finding on the production path: 64 sockets stop reading at once, overflow on the
+     * strike fold's drainer, and each one's close blocks. With a thread per close that was 64 live closer
+     * threads at once — and in a real mass overflow a Thread.start() that cannot get a native thread throws
+     * OutOfMemoryError on the drainer. Now at most CLOSER_THREADS closer threads ever exist, exactly that many
+     * closes are in progress while the rest wait, the live consumer and both healthy sockets are never held up,
+     * and once the closes can return every slow socket is torn down — detached — exactly once.
+     */
+    @Test void sixtyFourSlowSocketsOverflowingAtOnceNeverHoldMoreCloserThreadsThanTheBound() throws Exception {
+        OutboundChannelTest.awaitSharedClosersIdle();
+        FeedGatewayService s = FootprintWiringTest.on();                        // no runOutboundWritesInline: the production writer pool
+        List<String> a = sink(), b = sink();
+        WebSocketSession sa = socket("a", a), sb = socket("b", b);
+        // A writer thread for every socket, so 64 stuck SENDS cannot starve the healthy sockets' writes: this
+        // test is about the closers. (The pool is sized at the first addClient.)
+        withProperty("GATEWAY_WS_WRITER_THREADS", "96", () -> { s.addClient(sa); return null; });
+        s.addClient(sb);
+        int slowCount = 64, n = 80;
+        CountDownLatch sendRelease = new CountDownLatch(1), closeRelease = new CountDownLatch(1);
+        AtomicInteger closesInProgress = new AtomicInteger(), closesReturned = new AtomicInteger();
+        Map<String, AtomicInteger> closeCalls = new ConcurrentHashMap<>();
+        List<WebSocketSession> slow = new ArrayList<>();
+        for (int i = 0; i < slowCount; i++) {
+            String id = "slow-" + i;
+            slow.add(slowSocket(id, sendRelease, inv -> {
+                closeCalls.computeIfAbsent(id, k -> new AtomicInteger()).incrementAndGet();
+                closesInProgress.incrementAndGet();
+                try { closeRelease.await(30, TimeUnit.SECONDS); } finally { closesInProgress.decrementAndGet(); closesReturned.incrementAndGet(); }
+                return null;
+            }));
+        }
+        withProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "50", () -> { slow.forEach(s::addClient); return null; });
+        List<String> records = strikeRecords(n);
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        Thread live = new Thread(() -> {
+            try { for (String r : records) s.onFootprintLiveRecord("es-footprint-strike", r); } catch (Throwable t) { thrown.set(t); }
+        }, "state-live");
+        AtomicInteger peak = new AtomicInteger();
+        AtomicBoolean sampling = new AtomicBoolean(true);
+        Thread sampler = new Thread(() -> {
+            while (sampling.get()) {
+                peak.accumulateAndGet(OutboundChannelTest.liveCloserThreads(), Math::max);
+                try { Thread.sleep(2); } catch (InterruptedException e) { return; }
+            }
+        }, "closer-sampler");
+        try {
+            sampler.start();
+            live.start();
+            live.join(10_000);
+            assertFalse(live.isAlive(), "the live consumer fanned every record out while the slow sockets' closes are blocked");
+            assertNull(thrown.get(), "nothing was thrown at the drainer");
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (closesInProgress.get() < OutboundChannel.CLOSER_THREADS && System.currentTimeMillis() < deadline) Thread.sleep(5);
+            Thread.sleep(300);                                                  // room for any closer thread beyond the bound to appear
+            sampling.set(false);
+            sampler.join(5_000);
+            System.out.println("[closer-bound] FootprintStrikeDeliveryTest: 64 overflowing sockets, peak live closer threads "
+                    + peak.get() + " (bound " + OutboundChannel.CLOSER_THREADS + "), closes in progress " + closesInProgress.get()
+                    + ", queued " + OutboundChannel.TEARDOWN.queued());
+            assertTrue(peak.get() <= OutboundChannel.CLOSER_THREADS,
+                    "64 overflowing sockets held " + peak.get() + " live closer threads at once; the bound is " + OutboundChannel.CLOSER_THREADS);
+            assertEquals(OutboundChannel.CLOSER_THREADS, closesInProgress.get(), "exactly the bound's closes are in progress; the others wait");
+            for (WebSocketSession ws : slow) {
+                OutboundChannel ch = s.outboundChannelForTest(ws.getId());
+                assertNotNull(ch, ws.getId() + " stays registered, closed, until its teardown runs");
+                assertTrue(ch.isClosed(), ws.getId() + " overflowed");
+            }
+            List<String> want = Collections.nCopies(n, "es-footprint-strike");
+            for (List<String> healthy : List.of(a, b)) {
+                List<JsonNode> frames = awaitStrikeTypes(healthy, want);
+                assertEquals(records.get(n - 1), frames.get(n - 1).get("data").asText(), "every record, in order");
+            }
+            assertEquals(0, s.footprintStrikeView().queuedFrames());
+        } finally {
+            sampling.set(false);
+            closeRelease.countDown();
+            sendRelease.countDown();
+            live.join(10_000);
+        }
+        long deadline = System.currentTimeMillis() + 10_000;
+        while ((closesReturned.get() < slowCount || slow.stream().anyMatch(ws -> s.outboundChannelForTest(ws.getId()) != null))
+                && System.currentTimeMillis() < deadline) Thread.sleep(10);
+        assertEquals(slowCount, closesReturned.get(), "every close ran once it could return");
+        for (WebSocketSession ws : slow) {
+            assertEquals(1, closeCalls.get(ws.getId()).get(), "one session close for " + ws.getId());
+            assertNull(s.outboundChannelForTest(ws.getId()), "…then its detach (onClose) ran for " + ws.getId());
+        }
+    }
+
+    /**
+     * A slow socket whose teardown cannot be handed over — its executor throws OutOfMemoryError, as a
+     * Thread.start() does with no native thread left — overflows on the strike drainer. Before, the Error
+     * escaped the RuntimeException fallback: the drainer's fan-out aborted with the frame already taken from the
+     * view's outbox (every socket after it lost that record), and the channel, already marked closed, was never
+     * torn down (the watchdog skipped it). Now the fan-out completes for every other socket and the write
+     * watchdog's next tick hands the teardown over: the socket is closed and detached exactly once.
+     */
+    @Test void aSlowSocketsTeardownThatCannotBeScheduledNeitherAbortsTheFanOutNorIsLost() throws Exception {
+        FeedGatewayService s = FootprintWiringTest.on();
+        List<String> a = sink(), b = sink(), c = sink();
+        s.addClient(socket("a", a));
+        s.addClient(socket("b", b));
+        AtomicBoolean accept = new AtomicBoolean(false);
+        AtomicInteger refusals = new AtomicInteger(), closeCalls = new AtomicInteger();
+        CountDownLatch sendRelease = new CountDownLatch(1);
+        WebSocketSession slow = slowSocket("slow", sendRelease, inv -> { closeCalls.incrementAndGet(); return null; });
+        s.outboundClosersForTest(task -> {
+            if (!accept.get()) {
+                refusals.incrementAndGet();
+                throw new OutOfMemoryError("unable to create native thread: possibly out of memory or process/resource limits reached");
+            }
+            OutboundChannel.TEARDOWN.execute(task);
+        });
+        withProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "50", () -> { s.addClient(slow); return null; });
+        s.outboundClosersForTest(null);
+        s.addClient(socket("c", c));
+        int n = 80;
+        List<String> records = strikeRecords(n);
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        Thread live = new Thread(() -> {
+            try { for (String r : records) s.onFootprintLiveRecord("es-footprint-strike", r); } catch (Throwable t) { thrown.set(t); }
+        }, "state-live");
+        try {
+            live.start();
+            live.join(10_000);
+            assertFalse(live.isAlive());
+            assertNull(thrown.get(), "a teardown that could not be scheduled was thrown at the drainer: " + thrown.get());
+            List<String> want = Collections.nCopies(n, "es-footprint-strike");
+            for (List<String> healthy : List.of(a, b, c)) {
+                List<JsonNode> frames = awaitStrikeTypes(healthy, want);
+                assertEquals(records.get(n - 1), frames.get(n - 1).get("data").asText(), "every record reached every other socket, in order");
+            }
+            assertEquals(0, s.footprintStrikeView().queuedFrames());
+            assertEquals(1, refusals.get(), "the overflow tried to hand the teardown over once");
+            OutboundChannel ch = s.outboundChannelForTest("slow");
+            assertNotNull(ch, "not torn down yet: still registered");
+            assertTrue(ch.isClosed() && ch.teardownPending(), "closed, with its teardown pending rather than lost");
+            assertEquals(0, closeCalls.get());
+            s.enforceOutboundWriteDeadlines();                                    // a watchdog tick while the closers still refuse
+            assertEquals(2, refusals.get(), "the watchdog retried it");
+            assertTrue(ch.teardownPending());
+            accept.set(true);
+            s.enforceOutboundWriteDeadlines();                                    // the next tick hands it over
+            long deadline = System.currentTimeMillis() + 5_000;
+            while ((closeCalls.get() < 1 || s.outboundChannelForTest("slow") != null) && System.currentTimeMillis() < deadline) Thread.sleep(10);
+            assertEquals(1, closeCalls.get(), "the watchdog's retry closed the session");
+            assertNull(s.outboundChannelForTest("slow"), "…and detached it");
+            s.enforceOutboundWriteDeadlines();
+            Thread.sleep(50);
+            assertEquals(1, closeCalls.get(), "exactly once");
+            assertEquals(2, refusals.get());
+        } finally {
+            sendRelease.countDown();
+            live.join(10_000);
+        }
     }
 
     /**

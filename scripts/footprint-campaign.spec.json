@@ -318,11 +318,38 @@
   {
    "key": "G-R10.3 a-slow-sockets-teardown-never-runs-on-the-enqueuer",
    "requirement": "G-R10",
-   "clause": "a channel that overflows is marked closed at once and its session is closed on a teardown thread of its own, never on the enqueuing thread (the strike drainer)",
-   "documentText": "a channel that overflows is marked closed at once, and its session is closed on a teardown thread of its own, so a close that blocks behind an outstanding write delays neither consumer nor any other socket.",
+   "clause": "a channel that overflows is marked closed at once and its session is closed on a shared closer thread, never on the enqueuing thread (the strike drainer)",
+   "documentText": "a channel that overflows is marked closed at once, and its session is closed on a shared closer thread, never on the enqueuing thread, so a close that blocks behind an outstanding write delays neither consumer nor any other socket.",
    "file": "src/main/java/app/feedgateway/OutboundChannel.java",
-   "old": "            closers.execute(teardown);",
-   "new": "            teardown.run();"
+   "old": "            closers.execute(this::teardown);",
+   "new": "            teardown();"
+  },
+  {
+   "key": "G-R10.4 teardown-concurrency-is-bounded",
+   "requirement": "G-R10",
+   "clause": "at most CLOSER_THREADS closer threads exist at once, however many sockets overflow together: the pool queues a teardown, it never starts a thread for one",
+   "documentText": "teardowns share ONE bounded pool — at most `CLOSER_THREADS` (4) closer threads exist at once, however many sockets overflow together",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "            queue.add(teardown);",
+   "new": "            Thread t = new Thread(teardown, \"options-edge-ws-closer\"); t.setDaemon(true); t.start();"
+  },
+  {
+   "key": "G-R10.5 a-failed-teardown-hand-over-never-aborts-the-fan-out",
+   "requirement": "G-R10",
+   "clause": "a teardown the closers cannot accept (an executor that rejects or throws an Error) is never thrown at the enqueuer, so the frame still reaches every other socket",
+   "documentText": "a teardown that cannot be handed over to the closers is never thrown at the enqueuer, so the frame still reaches every other socket",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "        } catch (RuntimeException | Error handOverFailed) {",
+   "new": "        } catch (RuntimeException handOverFailed) {"
+  },
+  {
+   "key": "G-R10.6 the-watchdog-retries-a-pending-teardown",
+   "requirement": "G-R10",
+   "clause": "a teardown left pending is retried by the write watchdog until the socket is torn down",
+   "documentText": "it stays pending, and the write watchdog retries it until the socket is torn down",
+   "file": "src/main/java/app/feedgateway/FeedGatewayService.java",
+   "old": "                channel.retryPendingTeardown();",
+   "new": "                // channel.retryPendingTeardown();"
   },
   {
    "key": "G-R3.4 a-cache-consumer-change-after-completion-is-forwarded",

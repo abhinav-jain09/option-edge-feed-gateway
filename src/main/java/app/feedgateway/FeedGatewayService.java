@@ -125,6 +125,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, OutboundChannel> outbound = new ConcurrentHashMap<>();
     private volatile ExecutorService outboundWriters;
     private volatile java.util.concurrent.Executor outboundWriterOverride; // test seam (caller-runs)
+    private volatile java.util.concurrent.Executor outboundCloserOverride; // test seam (a failing teardown hand-over)
     private final AtomicLong wsEnqueued = new AtomicLong();
     private final AtomicLong wsCoalesced = new AtomicLong();
     private final AtomicLong wsSent = new AtomicLong();
@@ -1232,7 +1233,15 @@ public class FeedGatewayService implements ReplayRunner {
         diagnosticsExecutor.scheduleAtFixedRate(this::dumpDiagnosticState, 60L, 60L, TimeUnit.SECONDS);
     }
 
-    private void enforceOutboundWriteDeadlines() {
+    /**
+     * The write watchdog (every max(100 ms, deadline/2) on the batch executor). Force-closes any send stuck past
+     * the write deadline; hands over the teardown of any closed channel an earlier attempt could not schedule
+     * (strike re-review round 3 — a closed channel stays registered until its teardown runs, so this sweep
+     * always finds it); and interrupts a session close that has held one of the shared closer threads past
+     * {@link OutboundChannel#CLOSE_DEADLINE_MS}. None of it waits on a close. Package-private: the delivery tests
+     * run it as one watchdog tick.
+     */
+    void enforceOutboundWriteDeadlines() {
         long now = System.currentTimeMillis();
         long deadline = settings.wsWriteDeadlineMs();
         for (OutboundChannel channel : outbound.values()) {
@@ -1241,7 +1250,13 @@ public class FeedGatewayService implements ReplayRunner {
             } catch (RuntimeException ignored) {
                 // a single channel must not break the sweep
             }
+            try {
+                channel.retryPendingTeardown();
+            } catch (RuntimeException ignored) {
+                // never thrown (a failed hand-over stays pending); guarded like the deadline so the sweep goes on
+            }
         }
+        OutboundChannel.TEARDOWN.interruptOverdue(now);
     }
 
     @PreDestroy
@@ -1287,7 +1302,7 @@ public class FeedGatewayService implements ReplayRunner {
     public void addClient(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
-        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(),
+        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(), outboundCloserExecutor(),
                 settings.wsMaxQueuedMessages(), settings.wsMaxQueuedBytes(), outboundMetrics, this::onSlowDisconnect);
         outbound.put(session.getId(), channel);
         clients.add(session);
@@ -1620,6 +1635,24 @@ public class FeedGatewayService implements ReplayRunner {
     private java.util.concurrent.Executor outboundWriterExecutor() {
         java.util.concurrent.Executor override = outboundWriterOverride;
         return override != null ? override : outboundWriters();
+    }
+
+    /**
+     * Visible for tests: the teardown executor for sockets added from now on ({@code null} restores the shared
+     * bounded pool, {@link OutboundChannel#TEARDOWN}) — so a test can make one socket's hand-over fail.
+     */
+    void outboundClosersForTest(java.util.concurrent.Executor closers) {
+        outboundCloserOverride = closers;
+    }
+
+    /** Visible for tests: the channel registered for a socket, or null once its teardown has detached it. */
+    OutboundChannel outboundChannelForTest(String socketId) {
+        return outbound.get(socketId);
+    }
+
+    private java.util.concurrent.Executor outboundCloserExecutor() {
+        java.util.concurrent.Executor override = outboundCloserOverride;
+        return override != null ? override : OutboundChannel.TEARDOWN;
     }
 
     private ExecutorService outboundWriters() {

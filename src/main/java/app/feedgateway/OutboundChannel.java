@@ -8,7 +8,10 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 /**
@@ -38,21 +41,44 @@ import java.util.function.Consumer;
  * client slow. The thread that sees an overflow is an ENQUEUER: a Kafka consumer, or the strike fold's
  * drainer, which holds that stream's delivery order while it fans a frame out to every socket; the thread
  * that sees a deadline is the write watchdog. Blocking either on one slow socket's close stalled both strike
- * consumers and every healthy socket behind it. So {@link #close} only marks, drops and counts; the session
- * close and then {@code onClose} run on the {@code closers} executor. The default runs each teardown on its
- * own daemon thread: at most one per channel (the close is exactly-once), ending when the session close
- * returns — which the container's blocking-send timeout bounds even when the write it waits behind never
- * completes. Until then the channel stays registered, closed, so nothing can fall back to writing to its
- * session directly.
+ * consumers and every healthy socket behind it. So {@link #close} only marks, drops and counts, and HANDS the
+ * teardown — the session close, then {@code onClose} — to the {@code closers} executor.
+ *
+ * <p><b>Teardowns share one bounded pool</b> (strike re-review round 3). The default closers are
+ * {@link #TEARDOWN}: {@link #CLOSER_THREADS} daemon threads, started once and shared by every channel. A
+ * thread per close put no limit on how many existed at once — a mass overflow started one per channel, and a
+ * {@code Thread.start()} that could not get a native thread threw {@code OutOfMemoryError} on the drainer,
+ * aborting that frame's fan-out and leaving the channel closed with no teardown. Handing a teardown over can
+ * still fail with an injected executor; that failure is never thrown at the enqueuer and never runs the
+ * teardown inline: the teardown stays PENDING and the write watchdog hands it over again
+ * ({@link #retryPendingTeardown}). Until the teardown runs the channel stays registered, closed, so nothing
+ * can fall back to writing to its session directly.
  */
 final class OutboundChannel {
 
-    /** The default teardown executor: each channel's teardown on its own short-lived daemon thread. */
-    static final Executor TEARDOWN_ON_OWN_THREAD = task -> {
-        Thread t = new Thread(task, "options-edge-ws-closer");
-        t.setDaemon(true);
-        t.start();
-    };
+    /**
+     * How many teardowns run at once, process-wide. A closer thread does no work of its own: it waits for one
+     * session close, then runs the detach callback. A close that returns promptly holds it for microseconds, so
+     * a handful of threads clears a mass overflow; a close that blocks holds ONE closer thread and nothing else.
+     * Four lets a few stuck closes leave the rest moving, and caps what a mass overflow can cost at four
+     * threads, started once, and no more.
+     */
+    static final int CLOSER_THREADS = 4;
+
+    /**
+     * How long one session close may hold a closer thread before the write watchdog interrupts it
+     * ({@link TeardownPool#interruptOverdue}). The container already bounds a close: Tomcat's blocking-send
+     * timeout ({@code org.apache.tomcat.websocket.BLOCKING_SEND_TIMEOUT}, 20 s by default) ends the close frame's
+     * send even when the write it queues behind never completes. This deadline sits above that, as the backstop
+     * for a close that does not honour it.
+     */
+    static final long CLOSE_DEADLINE_MS = 30_000L;
+
+    /**
+     * The teardown executor every channel uses unless one is injected. Its threads start when this class
+     * initialises — at the first channel's construction, never on a thread that is closing one.
+     */
+    static final TeardownPool TEARDOWN = new TeardownPool(CLOSER_THREADS, "options-edge-ws-closer-", CLOSE_DEADLINE_MS);
 
     /** Slow-client / throughput metrics sink (implemented by the gateway over atomic counters). */
     interface Metrics {
@@ -68,6 +94,11 @@ final class OutboundChannel {
 
     private record Pending(String envelope, int bytes) {
     }
+
+    // The teardown's hand-over to the closers. NONE while the channel is open; PENDING once it is closed and the
+    // closers have not accepted its teardown; HANDING while one thread is offering it; HANDED once accepted. Only
+    // the PENDING -> HANDING transition may offer it, so the close and the watchdog's retry never hand it twice.
+    private static final int TEARDOWN_NONE = 0, TEARDOWN_PENDING = 1, TEARDOWN_HANDING = 2, TEARDOWN_HANDED = 3;
 
     private final String socketId;
     private final WebSocketSession session;
@@ -86,10 +117,12 @@ final class OutboundChannel {
     private long peakDepth;
     private volatile long sendStartedAtMs; // 0 = no send in flight; else the wall-clock the write began
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final AtomicInteger teardownState = new AtomicInteger(TEARDOWN_NONE);
+    private final AtomicBoolean tornDown = new AtomicBoolean(false);
 
     OutboundChannel(WebSocketSession session, Executor writers, int maxMessages, long maxBytes,
                     Metrics metrics, Consumer<OutboundChannel> onClose) {
-        this(session, writers, TEARDOWN_ON_OWN_THREAD, maxMessages, maxBytes, metrics, onClose);
+        this(session, writers, TEARDOWN, maxMessages, maxBytes, metrics, onClose);
     }
 
     /** {@code closers} runs each teardown (session close, then {@code onClose}); it must not be the caller's thread in production. */
@@ -243,21 +276,62 @@ final class OutboundChannel {
         }
         // Session close first, then onClose: until the close returns the channel stays registered (closed),
         // so a broadcast finds it and is refused, rather than finding no channel and writing to the session.
-        Runnable teardown = () -> {
-            closeSessionQuietly();
-            try {
-                onClose.accept(this);
-            } catch (RuntimeException e) {
-                System.out.println("Feed gateway outbound teardown of socket " + socketId + " failed in onClose: "
-                        + e.getClass().getSimpleName() + ": " + e.getMessage());
-            }
-        };
-        try {
-            closers.execute(teardown);
-        } catch (RuntimeException rejected) {
-            TEARDOWN_ON_OWN_THREAD.execute(teardown);           // a closers executor already shut down: still never inline
-        }
+        teardownState.set(TEARDOWN_PENDING);
+        handOverTeardown();
         return true;
+    }
+
+    /**
+     * Offer this channel's teardown to the closers, once. A failure to hand it over — an executor that rejects,
+     * or one that throws an {@code Error} (a thread-per-task executor whose {@code Thread.start()} cannot get a
+     * native thread) — is NOT thrown at the caller: the caller is an enqueuer in the middle of a fan-out, and a
+     * throw would abort that frame's delivery to every socket after this one. Nor is the teardown run here. It
+     * stays PENDING — the channel registered and closed — and the write watchdog offers it again
+     * ({@link #retryPendingTeardown}). Returns true if the closers accepted it now.
+     */
+    private boolean handOverTeardown() {
+        if (!teardownState.compareAndSet(TEARDOWN_PENDING, TEARDOWN_HANDING)) {
+            return false;
+        }
+        try {
+            closers.execute(this::teardown);
+            teardownState.set(TEARDOWN_HANDED);
+            return true;
+        } catch (RuntimeException | Error handOverFailed) {
+            teardownState.set(TEARDOWN_PENDING);
+            System.out.println("Feed gateway outbound teardown of socket " + socketId + " could not be scheduled ("
+                    + handOverFailed.getClass().getSimpleName() + ": " + handOverFailed.getMessage()
+                    + "); it stays pending for the write watchdog to retry");
+            return false;
+        }
+    }
+
+    /**
+     * Watchdog hook: hand over a teardown an earlier attempt could not. A closed channel stays registered until
+     * its teardown runs, so the watchdog's sweep over the registered channels always finds it. Returns true if
+     * the closers accepted it on this call; false if there was nothing pending or they refused again.
+     */
+    boolean retryPendingTeardown() {
+        return teardownState.get() == TEARDOWN_PENDING && handOverTeardown();
+    }
+
+    /** True while this channel is closed and the closers have not yet accepted its teardown. */
+    boolean teardownPending() {
+        return teardownState.get() == TEARDOWN_PENDING;
+    }
+
+    /** The session close, then {@code onClose} — at most once, on a closer thread. */
+    private void teardown() {
+        if (!tornDown.compareAndSet(false, true)) {
+            return;
+        }
+        closeSessionQuietly();
+        try {
+            onClose.accept(this);
+        } catch (RuntimeException e) {
+            System.out.println("Feed gateway outbound teardown of socket " + socketId + " failed in onClose: "
+                    + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
     }
 
     /** Quiet teardown on a NORMAL disconnect/shutdown — drops the queue, fires no slow-client signal. */
@@ -283,5 +357,139 @@ final class OutboundChannel {
 
     boolean isClosed() {
         return closed.get();
+    }
+
+    /**
+     * A fixed set of pre-started daemon threads taking teardowns from one shared queue.
+     *
+     * <p><b>Bounds.</b> Threads: exactly {@code threads}, started when the pool is built and never more —
+     * {@link #execute} only queues, so no thread is ever created on a caller. Queue: unbounded as a structure,
+     * bounded by use — a channel hands its teardown over at most once (its close is exactly-once, and a failed
+     * hand-over is offered again only while nothing was queued), so it holds at most one entry per channel that
+     * is closed and not yet torn down: never more than the sockets the gateway holds. {@link #execute} therefore
+     * never blocks, never runs the task on the caller, and rejects only after {@link #shutdownNow} (tests).
+     *
+     * <p><b>When every closer thread is stuck.</b> Later teardowns wait in the queue; nothing else waits. Their
+     * channels are already closed — every enqueue refused, queue dropped, no write ever again — so what waits is
+     * only each one's session close and detach callback: the channel stays registered, closed, until a thread
+     * frees. A thread frees when its close returns, which the container's blocking-send timeout bounds, or when
+     * the write watchdog interrupts a close that has held it past {@code closeDeadlineMs}
+     * ({@link #interruptOverdue}); that teardown then finishes — {@code onClose} still runs, once, after the
+     * close attempt — and the thread takes the next. A close that ignores both its own timeout and the interrupt
+     * keeps its thread for good and the pool goes on with one fewer; the queued teardowns stop only if every
+     * thread were lost that way, and even then no sender, writer or watchdog waits on them.
+     */
+    static final class TeardownPool implements Executor {
+        private final LinkedBlockingQueue<Runnable> queue = new LinkedBlockingQueue<>();
+        private final Worker[] workers;
+        private final long closeDeadlineMs;
+        private volatile boolean stopped;
+
+        TeardownPool(int threads, String namePrefix, long closeDeadlineMs) {
+            this.closeDeadlineMs = closeDeadlineMs;
+            this.workers = new Worker[Math.max(1, threads)];
+            for (int i = 0; i < workers.length; i++) {
+                Worker w = new Worker();
+                Thread t = new Thread(w::run, namePrefix + (i + 1));
+                t.setDaemon(true);
+                w.thread = t;
+                workers[i] = w;
+                t.start();
+            }
+        }
+
+        /** Queues the teardown for the next free closer thread: never blocks, never runs it here, never starts a thread. */
+        @Override
+        public void execute(Runnable teardown) {
+            if (stopped) {
+                throw new RejectedExecutionException("teardown pool stopped");
+            }
+            queue.add(teardown);
+        }
+
+        /**
+         * Write-watchdog hook: interrupt every close that has held its closer thread longer than the close
+         * deadline — once per close, and never the close that thread takes next. Returns how many it interrupted.
+         */
+        int interruptOverdue(long nowMs) {
+            int n = 0;
+            for (Worker w : workers) {
+                if (w.interruptIfOverdue(nowMs)) {
+                    n++;
+                }
+            }
+            return n;
+        }
+
+        /** How many closer threads are inside a teardown right now. */
+        int busy() {
+            int n = 0;
+            for (Worker w : workers) {
+                if (w.busy()) {
+                    n++;
+                }
+            }
+            return n;
+        }
+
+        /** How many teardowns wait for a free closer thread. */
+        int queued() {
+            return queue.size();
+        }
+
+        /** Stops the threads once they finish what they are doing (tests: a private pool must not outlive them). */
+        void shutdownNow() {
+            stopped = true;
+            for (Worker w : workers) {
+                w.thread.interrupt();
+            }
+        }
+
+        private final class Worker {
+            private Thread thread;
+            private Runnable current; // guarded by this
+            private long since;       // guarded by this
+            private boolean interrupted; // guarded by this: the watchdog interrupts one close at most once
+
+            void run() {
+                while (!stopped) {
+                    Runnable task;
+                    try {
+                        task = queue.take();
+                    } catch (InterruptedException stray) {
+                        continue;                          // shutdownNow, or an interrupt for a close already finished
+                    }
+                    synchronized (this) {
+                        current = task;
+                        since = System.currentTimeMillis();
+                        interrupted = false;
+                    }
+                    try {
+                        task.run();
+                    } catch (Throwable t) {
+                        // A teardown must never take its closer thread down with it.
+                        System.out.println("Feed gateway outbound teardown failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                    } finally {
+                        synchronized (this) {
+                            current = null;
+                        }
+                        Thread.interrupted();               // an interrupt meant for the close just finished is not the next one's
+                    }
+                }
+            }
+
+            synchronized boolean interruptIfOverdue(long nowMs) {
+                if (current == null || interrupted || nowMs - since <= closeDeadlineMs) {
+                    return false;
+                }
+                interrupted = true;
+                thread.interrupt();
+                return true;
+            }
+
+            synchronized boolean busy() {
+                return current != null;
+            }
+        }
     }
 }
