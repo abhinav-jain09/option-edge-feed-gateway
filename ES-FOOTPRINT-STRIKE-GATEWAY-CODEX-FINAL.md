@@ -429,3 +429,91 @@ All clean builds, Java 21, offline Maven.
 ### Review text (verbatim)
 
 [P1] Bound concurrent socket teardowns — OutboundChannel.java:51. Every closing channel starts a new platform thread, with no shared concurrency limit. Reproduced by compiling the channel in memory: overflowing 64 channels whose close() blocks creates 64 simultaneously live closer threads. A timeout bounds their lifetime, not their peak count. During mass overflow, native-thread exhaustion can throw OutOfMemoryError from Thread.start() on the strike drainer; the RuntimeException fallback does not catch it. The channel is already marked closed, so teardown/onClose never runs and the watchdog skips it. Fan-out also aborts after the frame was removed from the view's outbox, leaving remaining healthy browsers without that evidence/control. Use bounded teardown concurrency without caller-runs or an unbounded thread fallback.
+
+## Re-review (round 4) — Codex re-review of `66ac0d5` (2026-09-11)
+
+The re-review confirmed the round-3 fix (one shared, pre-started pool of four closer threads) and raised exactly one
+finding (verbatim below). Folded on `fix/footprint-strike-gw-r4` and pushed to `fix/footprint-strike-final-review`
+(PR #182) as a fast-forward of `66ac0d5`. Not re-reviewed yet: no `VERDICT: APPROVE` exists for this change.
+
+### Disposition
+
+| # | Finding | Disposition | What changed | Pinning tests |
+|---|---|---|---|---|
+| 1 | **[P2]** Failure logging can permanently kill the shared closer pool (`OutboundChannel.java:471`: under heap exhaustion, formatting the teardown-failure log line threw `OutOfMemoryError` out of the worker's catch; workers are never replaced, so four such failures killed all four and every accepted teardown — queued or submitted later — stayed queued forever, `onClose` never ran, and the watchdog cannot recover an accepted task) | **FIXED** (both layers, plus the stranded task) | **(1) Reporting never throws.** A teardown that throws is counted first — `TeardownPool.failures()`, an `AtomicLong` increment that allocates nothing — then offered to the pool's reporter inside its own `try`/`catch (Throwable)`; a report that throws is swallowed and counted (`unreported()`), so the count is that failure's only trace. The reporter is a constructor seam (`TeardownPool(threads, prefix, deadline, Consumer<Throwable>)`); production keeps the same `System.out` line. **(2) No failure ends a closer thread.** Each turn of a closer thread — the take, the bookkeeping, the teardown — is ONE `try` whose `catch (Throwable)` handler is that non-throwing report, so a thread leaves its loop only when the pool is stopped; the loop's shape is the guarantee, and a dying-worker replacement or watchdog top-up was not added because no path to an exit is left for it to catch. **(3) A dequeued teardown is never stranded.** A session close that throws an `Error` (the finding's case: heap exhaustion inside the container) left the teardown spent — `tornDown` set, state HANDED, `onClose` never called — whatever happened to the thread. Now `teardown()` puts it back: `tornDown` cleared and the state PENDING, with the channel still registered and closed, so the write watchdog's sweep hands it over again (`retryPendingTeardown`) and the retry runs the close and then `onClose`. `onClose` stays exactly once: once it has been called it is never called again, however it ended. **Same defect, one more site:** the hand-over's own failure line in `handOverTeardown` (round 3) was built and printed unguarded inside the catch that keeps a failed hand-over from the enqueuer; under heap exhaustion it would have thrown the `OutOfMemoryError` at the fan-out anyway, or out of the write watchdog's `scheduleAtFixedRate` task, which cancels every later sweep. It is guarded the same way. Kept unchanged: the pool bound of 4, no thread per close, no caller-runs, `onClose` exactly once after the session close, no write after close, the watchdog retry, the 30 s close-deadline interrupt, every other stream's semantics. | `OutboundChannelTest.aFailureWhileReportingATeardownFailureNeverKillsACloser_andNoAcceptedTeardownIsStranded` (the reviewer's reproduction without exhausting the real heap: a private 4-thread pool whose reporter throws `OutOfMemoryError`; 8 teardowns whose session close throws `OutOfMemoryError`, each followed in the queue by a healthy one; afterwards 4 of 4 closer threads alive by name, `failures` 8, `unreported` 8, the 8 teardowns queued behind the failures ran with `onClose` once each, the 8 failed ones are closed and pending again (no `onClose`); 8 more handed over later all run; the watchdog retry tears each failed one down, `onClose` exactly once and a second close; a further retry does nothing), `…aTeardownThatThrowsAnErrorNeverEndsItsCloser_andTheNextTeardownRunsOnIt` (a ONE-thread pool: `OutOfMemoryError`, `StackOverflowError`, `AssertionError` in turn, then a task that records its thread: it runs on `error-closer-1`, still the only thread; `failures` 3; each reported in order), `…aFailureWhileReportingAFailedHandOverIsThrownNeitherAtTheFanOutNorAtTheWatchdog` (`System.out` replaced by one whose `println` throws `OutOfMemoryError`; a closer executor that throws `OutOfMemoryError`; nothing thrown at the fan-out or at the watchdog retry, both reports attempted, the next channel gets every frame, the teardown stays pending and is torn down once when accepted), `FootprintStrikeDeliveryTest.aSlowSocketsTeardownThatFailsUnderHeapExhaustionKillsNoCloserAndIsNeverStranded` (the same on the production path: 16 slow sockets overflow on the strike drainer into a private 4-thread pool whose reporter throws; 8 of them have a session close that throws `OutOfMemoryError`; nothing thrown at the drainer, 4 of 4 closer threads alive, both healthy sockets get all 80 records in order, the 8 others are closed and detached once, the 8 failed ones stay registered, closed and pending; one watchdog tick closes and detaches each, exactly once) |
+
+### Do the new tests bite? (each part reverted alone, source restored, sha256 proven)
+
+Run on the committed code (`9e8a85e`). Each part of the fix was reverted ALONE in the working tree (an exact
+one-occurrence replacement), `mvn -B -o clean test -Dtest='OutboundChannelTest,FootprintStrikeDeliveryTest'` run, and
+the source copied back. The sha256 of `OutboundChannel.java` (`1f61fa420fb5…`, the file at `9e8a85e`) was taken before
+the first revert and after every restore: identical every time (`RESTORED: sha256 identical`, ×5). Every failure below
+is an assertion failure, none an error.
+
+| Revert | Went red (assertion failures) |
+|---|---|
+| A — the report is unguarded (`recordFailure` calls `reporter.accept(failure)` bare: the reviewer's exact defect) | `OutboundChannelTest.aFailureWhileReportingATeardownFailureNeverKillsACloser…:564` and `FootprintStrikeDeliveryTest.aSlowSocketsTeardownThatFailsUnderHeapExhaustion…:820`: "a closer thread died of a failure or of its report: nothing replaces it" expected **4** but was **0** — all four closer threads dead, as in the reviewer's 128 MB reproduction |
+| B — the loop catches only `RuntimeException` (an `Error` out of a teardown escapes the turn) | the same two at `:564`/`:820` (4 expected, **0** alive), and `OutboundChannelTest.aTeardownThatThrowsAnErrorNeverEndsItsCloser…:607` "the teardown after three that threw an Error ran" — never ran on the one-thread pool |
+| C — a teardown whose close throws is not put back to PENDING | `OutboundChannelTest.aFailureWhileReportingATeardownFailureNeverKillsACloser…:574` "oom-0: a teardown whose close threw is pending again, not stranded" and `FootprintStrikeDeliveryTest.aSlowSocketsTeardownThatFailsUnderHeapExhaustion…:831` "oom-0 is closed, its teardown pending again rather than stranded" — both expected true, were false (the teardown is spent and `onClose` never runs) |
+| D — the hand-over's failure report is unguarded (the round-3 line) | `OutboundChannelTest.aFailureWhileReportingAFailedHandOverIsThrownNeitherAtTheFanOutNorAtTheWatchdog:666` "the failed hand-over's report was thrown at the fan-out: java.lang.OutOfMemoryError: Java heap space" |
+| A+B+C+D together | 4 failures: all of the above |
+
+Revert A and revert B each go red on their own, and each takes all four closer threads down, so the two layers are
+not redundant and neither masks the other's absence. B keeps a teardown's own `Error` inside the turn. A keeps the
+report of that failure from escaping the handler. When a teardown's close throws AND its report throws, both are
+needed.
+
+### Mutation campaign
+
+- `scripts/footprint-campaign.spec.json`: `G-R10.3`–`G-R10.6` did not move. Their anchors
+  (`closers.execute(this::teardown);`, `queue.add(teardown);`, `} catch (RuntimeException | Error handOverFailed) {` and
+  the watchdog's `channel.retryPendingTeardown();`) are untouched by this round and still occur once each; only their
+  source lines shifted, so none was re-anchored. Three clauses were added, each quoting a round-4 as-built sentence now in
+  the G-R10 row:
+  - `G-R10.7` "a failure while reporting a teardown's failure never kills a closer thread" — the clause this finding
+    asked for. The report guard in `recordFailure` is replaced by a bare `reporter.accept(failure);`.
+  - `G-R10.8` "an Error out of a teardown never ends its closer thread": `catch (Throwable teardownFailed)` →
+    `catch (RuntimeException teardownFailed)`.
+  - `G-R10.9` "a teardown whose session close throws is pending again": `if (!closeReturned)` → `if (false)`.
+
+  A test in the campaign's classes kills all three:
+  `FootprintStrikeDeliveryTest.aSlowSocketsTeardownThatFailsUnderHeapExhaustionKillsNoCloserAndIsNeverStranded`, by
+  assertion failure. The hand-over report guard (revert D) has no clause. Only `OutboundChannelTest` pins it, and the
+  campaign command (`-Dtest=Footprint*,CvdSpxLevelsWiringTest`) does not run that class, so a clause for it would be a
+  survivor that says nothing about the test that holds it (the same reason the round-3 close-deadline interrupt has none).
+- Re-run per `scripts/footprint-mutate.py` in a CLEAN detached worktree at the code commit `9e8a85e`
+  (`git worktree add --detach`, clean before and after, removed afterwards). Baseline GREEN
+  (`mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest`, 142 tests). Result: **48 KILLED, 1 SURVIVED of 49** — the same
+  recorded inert survivor as before (`G-R7 the-exclusive-cursor-at-the-domain-edge site2-relaxed`). The three new clauses
+  are KILLED as above. `G-R10.3`, `G-R10.4` and `G-R10.6` are KILLED as before, each kill set grown by the new delivery
+  test. The other 43 clauses changed neither status nor kill set.
+- `ES-FOOTPRINT-CAMPAIGN.json` replaced by that record (every row names `9e8a85e`) and §2a regenerated from it with
+  `scripts/footprint-reqstate.sh` (G-R10 6→9 probes; 49 mutations, 48 killed, 1 surviving).
+
+### Verification
+
+All clean builds, Java 21, offline Maven.
+
+- Code commit `9e8a85e`, before committing: `mvn -B -o clean test` (full) — **1193 run, 0 failures, 0 errors** (1189
+  before this round; +4: `OutboundChannelTest` 9→12, `FootprintStrikeDeliveryTest` 12→13), plus the context smoke test
+  1/0; `FeedGatewayServiceTest` 259/0; peak live closer threads 4 (bound 4) in both 64-channel tests.
+- The three Jenkinsfile gates (`mvn -B -o clean test`, `scripts/footprint-reverify.sh`,
+  `scripts/footprint-reqstate.sh --check`) were run on the commit that adds this record, with a clean tree before and
+  after. Their exit codes are stated in the PR description rather than here, so recording them does not move the head
+  they were run on.
+- Not done in this round: no Codex re-review of this fix. No real heap exhaustion: the reproduction injects
+  `OutOfMemoryError` through the reporter seam and the session mocks rather than running under a 128 MB heap. The earlier
+  "remaining obligations" table is unchanged.
+- Adjacent and NOT changed (outside this finding):
+  - An `Error` thrown from INSIDE `onClose` is not retried, because once `onClose` has been called exactly-once wins. The
+    detach stays as far as it got, and the closer thread counts the failure and survives.
+  - A session whose close throws on every attempt is retried at every watchdog tick (every max(100 ms, deadline/2)). Each
+    attempt holds one closer thread only while it runs, and the channel stays registered and closed meanwhile.
+  - `FeedGatewayService.enforceOutboundWriteDeadlines` still guards each per-channel call with
+    `catch (RuntimeException)`. After this round nothing on that path in `OutboundChannel` throws an `Error` — the
+    hand-over report is guarded — but an `Error` from elsewhere on it would still end the scheduled sweep.
+  - The round-3 note on `writers.execute` still stands.
+
+### Review text (verbatim)
+
+[P2] Failure logging can permanently kill the shared closer pool — OutboundChannel.java:471. When a teardown encounters heap exhaustion, formatting this log message can itself throw OutOfMemoryError, escaping the worker's catch. Workers are never replaced. Reproduced twice using the current source with a 128 MB heap: all four workers died; after releasing the heap, existing and newly submitted tasks remained queued forever. Their teardown/onClose never runs, and watchdog retries cannot recover accepted tasks. Guard failure reporting against throwing or restore worker capacity after an unexpected exit. Guarding only this log statement in memory made the same reproduction recover successfully.
