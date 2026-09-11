@@ -99,7 +99,10 @@ All runs clean (`clean` every time), Java 21, offline Maven, on the code commit 
 ### Jenkinsfile gates
 
 Run on the committed tree exactly as the Jenkinsfile's `Footprint reverification` stage does (`scripts/footprint-reverify.sh`, then
-`scripts/footprint-reqstate.sh --check`). GATE_RESULTS_PENDING
+`scripts/footprint-reqstate.sh --check`). On `6bc3186` (the commit holding this record), both GREEN:
+`footprint-reverify.sh` — baseline green, "the record reproduces: 34 mutations, same claim and same outcome for every
+one" (33 KILLED, 1 SURVIVED); `footprint-reqstate.sh --check` — "§2a matches the campaign record". The same two
+commands were re-run on the branch head that adds this paragraph (documentation only); the PR states that result.
 
 ## Review text (verbatim)
 
