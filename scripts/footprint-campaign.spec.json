@@ -379,6 +379,15 @@
    "new": "            if (false) {"
   },
   {
+   "key": "G-R10.10 a-hand-over-never-overwrites-a-closers-pending-restore",
+   "requirement": "G-R10",
+   "clause": "a hand-over never overwrites a closer's pending restore: HANDED is claimed before the teardown is published and nothing is written after the publish, so a teardown whose close threw before the hand-over returned is still pending for the write watchdog",
+   "documentText": "a hand-over never overwrites a closer's pending restore",
+   "file": "src/main/java/app/feedgateway/OutboundChannel.java",
+   "old": "            closers.execute(this::teardown);\n            return true;",
+   "new": "            closers.execute(this::teardown);\n            teardownState.set(TEARDOWN_HANDED);\n            return true;"
+  },
+  {
    "key": "G-R3.4 a-cache-consumer-change-after-completion-is-forwarded",
    "requirement": "G-R3",
    "clause": "the change is queued by whichever consumer made it: the cache consumer too, once its replay is complete",

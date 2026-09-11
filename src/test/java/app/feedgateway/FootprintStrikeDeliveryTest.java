@@ -857,6 +857,78 @@ class FootprintStrikeDeliveryTest {
         }
     }
 
+    // ---- strike re-review (round 5): a hand-over never overwrites a closer's pending restore -------------------
+
+    /**
+     * The reviewer's round-5 interleaving on the production path, made certain: a slow socket overflows on the
+     * strike drainer and its teardown goes to a closer that runs it to its end — the session close throws, and the
+     * teardown puts itself back to PENDING — before the hand-over's execute() returns to the drainer. Before, the
+     * hand-over then wrote HANDED over that PENDING: the watchdog skipped the channel for good, the session was
+     * never closed again and it was never detached. Now the teardown is still pending, and the watchdog's next tick
+     * closes and detaches the socket, exactly once.
+     */
+    @Test void aSlowSocketsCloseThatFailsBeforeItsHandOverReturnsIsRetriedNotStranded() throws Exception {
+        String prefix = "strike-fast-fail-closer-";
+        OutboundChannel.TeardownPool pool = new OutboundChannel.TeardownPool(OutboundChannel.CLOSER_THREADS, prefix,
+                OutboundChannel.CLOSE_DEADLINE_MS, failure -> { });
+        try {
+            OutboundChannelTest.FinishBeforeReturning closers = new OutboundChannelTest.FinishBeforeReturning(pool);
+            FeedGatewayService s = FootprintWiringTest.on();
+            List<String> a = sink(), b = sink();
+            s.addClient(socket("a", a));
+            AtomicInteger closeCalls = new AtomicInteger();
+            CountDownLatch sendRelease = new CountDownLatch(1);
+            WebSocketSession slow = slowSocket("slow", sendRelease, inv -> {
+                if (closeCalls.incrementAndGet() == 1) throw new OutOfMemoryError("Java heap space");   // the container's close ran out of heap
+                return null;
+            });
+            s.outboundClosersForTest(closers);
+            withProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "50", () -> { s.addClient(slow); return null; });
+            s.outboundClosersForTest(null);
+            s.addClient(socket("b", b));
+            int n = 80;
+            List<String> records = strikeRecords(n);
+            AtomicReference<Throwable> thrown = new AtomicReference<>();
+            Thread live = new Thread(() -> {
+                try { for (String r : records) s.onFootprintLiveRecord("es-footprint-strike", r); } catch (Throwable t) { thrown.set(t); }
+            }, "state-live");
+            try {
+                live.start();
+                live.join(10_000);
+                assertFalse(live.isAlive());
+                assertNull(thrown.get(), "nothing was thrown at the drainer: " + thrown.get());
+                assertEquals(1, closers.handOvers.get(), "the overflow handed the teardown over once");
+                assertEquals(0, closers.unfinished.get(), "…and the closer ran it to its end before the hand-over returned");
+                assertEquals(1, closeCalls.get(), "the session close ran on the closer, and threw");
+                OutboundChannel ch = s.outboundChannelForTest("slow");
+                assertNotNull(ch, "a close that threw never reaches the detach");
+                assertTrue(ch.isClosed() && ch.teardownPending(),
+                        "the closer's restore to PENDING outlived the hand-over: the teardown is pending, not stranded");
+                List<String> want = Collections.nCopies(n, "es-footprint-strike");
+                for (List<String> healthy : List.of(a, b)) {
+                    List<JsonNode> frames = awaitStrikeTypes(healthy, want);
+                    assertEquals(records.get(n - 1), frames.get(n - 1).get("data").asText(), "every record reached every healthy socket, in order");
+                }
+                s.enforceOutboundWriteDeadlines();                                // the watchdog's tick
+                assertEquals(2, closers.handOvers.get(), "the watchdog handed the pending teardown over again");
+                assertEquals(2, closeCalls.get(), "…its close returned");
+                assertNull(s.outboundChannelForTest("slow"), "…and the socket was detached");
+                s.enforceOutboundWriteDeadlines();
+                assertEquals(2, closers.handOvers.get(), "exactly once: nothing is left to hand over");
+                assertEquals(2, closeCalls.get());
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (pool.failures() < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5);
+                assertEquals(1, pool.failures(), "the close that threw was counted on the closer");
+                assertEquals(OutboundChannel.CLOSER_THREADS, OutboundChannelTest.liveThreads(prefix));
+            } finally {
+                sendRelease.countDown();
+                live.join(10_000);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
     /**
      * The reviewer's production scenario for #2: the live consumer misses an update (it re-sought END on a
      * reconnect), and the continuing cache consumer folds it after the replay completed. Before, every

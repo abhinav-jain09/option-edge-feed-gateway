@@ -60,6 +60,11 @@ import java.util.function.Consumer;
  * log line can itself throw {@code OutOfMemoryError} — may end one; the failure is counted before it is reported.
  * A teardown whose session close throws has not reached {@code onClose}: it is pending again, and the write
  * watchdog hands it over again, so an accepted teardown is never stranded.
+ *
+ * <p><b>A hand-over never overwrites a closer's pending restore</b> (strike re-review round 5). A closer can run a
+ * teardown the instant it is published, fail, and put it back to PENDING before the thread that handed it over
+ * takes its next step. So the hand-over claims the teardown (PENDING -> HANDED) before publishing it and writes
+ * nothing after; every state write two threads can race is a compare-and-set from the state it leaves.
  */
 final class OutboundChannel {
 
@@ -102,10 +107,17 @@ final class OutboundChannel {
     private record Pending(String envelope, int bytes) {
     }
 
-    // The teardown's hand-over to the closers. NONE while the channel is open; PENDING once it is closed and the
-    // closers have not accepted its teardown; HANDING while one thread is offering it; HANDED once accepted. Only
-    // the PENDING -> HANDING transition may offer it, so the close and the watchdog's retry never hand it twice.
-    private static final int TEARDOWN_NONE = 0, TEARDOWN_PENDING = 1, TEARDOWN_HANDING = 2, TEARDOWN_HANDED = 3;
+    // The teardown's lifecycle (strike re-review round 5). NONE while the channel is open. PENDING once it is closed
+    // and no closer holds its teardown. HANDED from the moment one thread claims it for a hand-over — PENDING ->
+    // HANDED, BEFORE the teardown is published to the closers — until a closer's session close either returns
+    // (DONE, terminal) or throws (back to PENDING, for the write watchdog's retry). Only PENDING -> HANDED may offer
+    // it, so the close and the watchdog's retry never hand it over twice.
+    //
+    // Every write that another thread can race is a compare-and-set from the state it leaves, and no thread writes
+    // the state after publishing the teardown: once published, a closer may already have run it, failed and put it
+    // back to PENDING, and a later write would overwrite that. The one plain write is DONE — terminal, written only
+    // by the run whose close returned — and since every other write is a CAS from PENDING or HANDED, none leaves it.
+    private static final int TEARDOWN_NONE = 0, TEARDOWN_PENDING = 1, TEARDOWN_HANDED = 2, TEARDOWN_DONE = 3;
 
     private final String socketId;
     private final WebSocketSession session;
@@ -283,7 +295,7 @@ final class OutboundChannel {
         }
         // Session close first, then onClose: until the close returns the channel stays registered (closed),
         // so a broadcast finds it and is refused, rather than finding no channel and writing to the session.
-        teardownState.set(TEARDOWN_PENDING);
+        teardownState.compareAndSet(TEARDOWN_NONE, TEARDOWN_PENDING);   // only the close that won `closed` gets here
         handOverTeardown();
         return true;
     }
@@ -295,17 +307,26 @@ final class OutboundChannel {
      * throw would abort that frame's delivery to every socket after this one. Nor is the teardown run here. It
      * stays PENDING — the channel registered and closed — and the write watchdog offers it again
      * ({@link #retryPendingTeardown}). Returns true if the closers accepted it now.
+     *
+     * <p><b>HANDED is claimed before the teardown is published, never written after</b> (strike re-review round 5).
+     * The moment {@code execute} queues it, a closer can run it — and its session close can throw and put it back
+     * to PENDING — before this thread takes another step. Writing HANDED after {@code execute} returned overwrote
+     * that PENDING: the watchdog, which retries only a PENDING teardown, skipped the channel for good, and the
+     * session was never closed again nor {@code onClose} run. So the claim is the CAS PENDING -> HANDED, and after
+     * a successful publish nothing is written at all.
      */
     private boolean handOverTeardown() {
-        if (!teardownState.compareAndSet(TEARDOWN_PENDING, TEARDOWN_HANDING)) {
+        if (!teardownState.compareAndSet(TEARDOWN_PENDING, TEARDOWN_HANDED)) {
             return false;
         }
         try {
             closers.execute(this::teardown);
-            teardownState.set(TEARDOWN_HANDED);
             return true;
         } catch (RuntimeException | Error handOverFailed) {
-            teardownState.set(TEARDOWN_PENDING);
+            // Not accepted: back to PENDING for the watchdog — but only if it is still HANDED. An executor that
+            // published the teardown and threw anyway may have run it already; what that run did (DONE, or its own
+            // restore to PENDING) stands.
+            teardownState.compareAndSet(TEARDOWN_HANDED, TEARDOWN_PENDING);
             try {
                 System.out.println("Feed gateway outbound teardown of socket " + socketId + " could not be scheduled ("
                         + handOverFailed.getClass().getSimpleName() + ": " + handOverFailed.getMessage()
@@ -348,10 +369,14 @@ final class OutboundChannel {
             closeReturned = true;
         } finally {
             if (!closeReturned) {
-                tornDown.set(false);                     // not torn down: the retry runs it from the top
-                teardownState.set(TEARDOWN_PENDING);
+                // Not torn down: clear tornDown FIRST, then publish PENDING, so the run the watchdog's retry starts
+                // finds the teardown runnable from the top. PENDING only from HANDED — the state it was handed over
+                // in — so this restore never overwrites a run that has since finished (DONE).
+                tornDown.set(false);
+                teardownState.compareAndSet(TEARDOWN_HANDED, TEARDOWN_PENDING);
             }
         }
+        teardownState.set(TEARDOWN_DONE);                // terminal: the close returned, and tornDown stays set for good
         try {
             onClose.accept(this);
         } catch (RuntimeException e) {

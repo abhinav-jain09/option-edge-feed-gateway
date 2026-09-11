@@ -679,6 +679,260 @@ class OutboundChannelTest {
         org.mockito.Mockito.verify(wsBad, org.mockito.Mockito.times(1)).close();
     }
 
+    // ---- strike re-review round 5: a hand-over never overwrites a closer's pending restore -------------------
+
+    /**
+     * A closers executor that hands each teardown to {@code closers} and returns only once a closer thread has run
+     * it to its end — for a teardown whose session close throws, past its restore to PENDING. That makes the
+     * reviewer's round-5 interleaving certain instead of rare: the whole teardown, the failure and the restore
+     * included, happens between the hand-over's publish and the hand-over's next step. Shared with
+     * {@code FootprintStrikeDeliveryTest}, which runs the same interleaving on the production strike drainer.
+     */
+    static final class FinishBeforeReturning implements Executor {
+        private final Executor closers;
+        final AtomicInteger handOvers = new AtomicInteger();
+        final AtomicInteger unfinished = new AtomicInteger();
+
+        FinishBeforeReturning(Executor closers) {
+            this.closers = closers;
+        }
+
+        @Override
+        public void execute(Runnable teardown) {
+            CountDownLatch finished = new CountDownLatch(1);
+            closers.execute(() -> {
+                try {
+                    teardown.run();
+                } finally {
+                    finished.countDown();                            // after the teardown's own restore, before the pool records its throw
+                }
+            });
+            handOvers.incrementAndGet();
+            try {
+                // Never throws: a throw from here is a failed hand-over to the channel, which would hide the ordering.
+                if (!finished.await(10, TimeUnit.SECONDS)) unfinished.incrementAndGet();
+            } catch (InterruptedException e) {
+                unfinished.incrementAndGet();
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private static void awaitFailures(OutboundChannel.TeardownPool pool, long n) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (pool.failures() < n && System.currentTimeMillis() < deadline) Thread.sleep(5);
+    }
+
+    /**
+     * The reviewer's round-5 finding, deterministically: the closer runs the teardown the moment it is published,
+     * its session close throws, and it puts the teardown back to PENDING — all before the hand-over's execute()
+     * returns. Before, the hand-over then wrote HANDED over that PENDING: the watchdog, which retries only a
+     * PENDING teardown, skipped the channel for good, the session was never closed again and onClose never ran.
+     * Now nothing is written after the publish (HANDED is claimed before it), so the teardown is still pending, the
+     * watchdog's retry hands it over again, and onClose runs exactly once.
+     */
+    @Test
+    void aHandOverNeverOverwritesTheClosersPendingRestore_soAFastFailedCloseIsRetriedNotStranded() throws Exception {
+        String prefix = "fast-fail-closer-";
+        OutboundChannel.TeardownPool pool = new OutboundChannel.TeardownPool(OutboundChannel.CLOSER_THREADS, prefix,
+                OutboundChannel.CLOSE_DEADLINE_MS, failure -> { });
+        try {
+            FinishBeforeReturning closers = new FinishBeforeReturning(pool);
+            AtomicInteger closeCalls = new AtomicInteger(), onCloseCalls = new AtomicInteger();
+            WebSocketSession ws = mock(WebSocketSession.class);
+            when(ws.getId()).thenReturn("fast-fail");
+            when(ws.isOpen()).thenReturn(true);
+            org.mockito.Mockito.doAnswer(inv -> {
+                if (closeCalls.incrementAndGet() == 1) throw new OutOfMemoryError("Java heap space");
+                return null;
+            }).when(ws).close();
+            OutboundChannel ch = new OutboundChannel(ws, task -> { }, closers, 1, 1 << 20, metrics, c -> onCloseCalls.incrementAndGet());
+            overflow(ch);                                                   // the close hands the teardown over
+            assertEquals(1, closers.handOvers.get(), "the overflow handed the teardown over once");
+            assertEquals(0, closers.unfinished.get(), "…and the closer ran it to its end before the hand-over returned");
+            assertEquals(1, closeCalls.get(), "the session close ran on the closer, and threw");
+            assertTrue(ch.isClosed());
+            assertTrue(ch.teardownPending(), "the closer's restore to PENDING outlived the hand-over: the teardown is pending, not stranded");
+            assertEquals(0, onCloseCalls.get(), "onClose follows a close that returned, never one that threw");
+            assertTrue(ch.retryPendingTeardown(), "the watchdog's tick hands it over again");
+            assertEquals(2, closers.handOvers.get());
+            assertEquals(2, closeCalls.get(), "the retry's close returned…");
+            assertEquals(1, onCloseCalls.get(), "…and onClose ran");
+            assertFalse(ch.teardownPending());
+            assertFalse(ch.retryPendingTeardown(), "a spent teardown is never handed over again");
+            assertEquals(2, closers.handOvers.get());
+            assertEquals(1, onCloseCalls.get(), "onClose exactly once");
+            assertFalse(ch.enqueue("late", null), "and it never writes again");
+            awaitFailures(pool, 1);
+            assertEquals(1, pool.failures(), "the close that threw was counted on the closer");
+            assertEquals(OutboundChannel.CLOSER_THREADS, liveThreads(prefix));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * The other side of the same race: an executor that publishes a teardown and throws anyway, after a closer has
+     * already run it. The hand-over's failure path puts the teardown back to PENDING only if it is still HANDED —
+     * a compare-and-set, never a plain write — so a teardown that already finished (DONE) is not resurrected as
+     * pending, and one whose close threw is pending exactly once.
+     */
+    @Test
+    void aHandOverThatThrowsAfterItsTeardownRanNeverOverwritesWhatTheCloserDid() throws Exception {
+        String prefix = "publish-then-throw-closer-";
+        OutboundChannel.TeardownPool pool = new OutboundChannel.TeardownPool(OutboundChannel.CLOSER_THREADS, prefix,
+                OutboundChannel.CLOSE_DEADLINE_MS, failure -> { });
+        try {
+            FinishBeforeReturning runsIt = new FinishBeforeReturning(pool);
+            AtomicBoolean throwAfter = new AtomicBoolean(true);
+            Executor publishesThenThrows = task -> {
+                runsIt.execute(task);
+                if (throwAfter.get()) throw new RejectedExecutionException("accepted, then refused");
+            };
+            AtomicInteger okOnClose = new AtomicInteger(), failOnClose = new AtomicInteger(), failCloses = new AtomicInteger();
+            WebSocketSession wsOk = mock(WebSocketSession.class), wsFail = mock(WebSocketSession.class);
+            when(wsOk.getId()).thenReturn("ran-and-closed");
+            when(wsFail.getId()).thenReturn("ran-and-threw");
+            when(wsOk.isOpen()).thenReturn(true);
+            when(wsFail.isOpen()).thenReturn(true);
+            org.mockito.Mockito.doAnswer(inv -> {
+                if (failCloses.incrementAndGet() == 1) throw new OutOfMemoryError("Java heap space");
+                return null;
+            }).when(wsFail).close();
+            OutboundChannel ok = new OutboundChannel(wsOk, task -> { }, publishesThenThrows, 1, 1 << 20, metrics, c -> okOnClose.incrementAndGet());
+            OutboundChannel fail = new OutboundChannel(wsFail, task -> { }, publishesThenThrows, 1, 1 << 20, metrics, c -> failOnClose.incrementAndGet());
+            overflow(ok);
+            overflow(fail);
+            assertEquals(1, okOnClose.get(), "the teardown ran before the executor threw: onClose ran");
+            assertFalse(ok.teardownPending(), "a teardown that finished is not made pending again by a hand-over that threw afterwards");
+            assertFalse(ok.retryPendingTeardown(), "…so the watchdog never hands a finished teardown over again");
+            assertEquals(2, runsIt.handOvers.get(), "one hand-over each");
+            assertTrue(fail.teardownPending(), "a teardown whose close threw is pending");
+            assertEquals(0, failOnClose.get());
+            throwAfter.set(false);
+            assertTrue(fail.retryPendingTeardown(), "the watchdog's tick hands it over again");
+            assertFalse(fail.teardownPending());
+            assertEquals(1, failOnClose.get(), "onClose exactly once");
+            assertEquals(1, okOnClose.get(), "onClose exactly once");
+            org.mockito.Mockito.verify(wsOk, org.mockito.Mockito.times(1)).close();
+            assertEquals(2, failCloses.get(), "the close that threw, then the retry's");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * The stress test's size: rounds of fail-once closes, 5 x 20,000 = 100,000 by default (overridable with
+     * -Doutbound.strandStress.closes=N / -Doutbound.strandStress.rounds=R). With the hand-over's write after the
+     * publish put back, single 20,000-close runs stranded between 2 and 231 on this machine, so one round alone
+     * could come up empty; five make a green run mean something.
+     */
+    static final int STRAND_STRESS_CLOSES = Integer.getInteger("outbound.strandStress.closes", 20_000);
+    static final int STRAND_STRESS_ROUNDS = Integer.getInteger("outbound.strandStress.rounds", 5);
+
+    /** An Error thrown without building anything, as the JVM throws its own once the heap is gone. */
+    private static final OutOfMemoryError PREALLOCATED_OOM = new OutOfMemoryError("Java heap space");
+
+    /**
+     * A bare session whose first close throws. Not a mock: a mock's per-call bookkeeping slows the closer down, and
+     * the race this exists for is a closer that finishes before the thread that handed it the teardown moves on.
+     */
+    private static WebSocketSession failsFirstClose(String id, java.util.concurrent.atomic.AtomicIntegerArray closeCalls, int index) {
+        return (WebSocketSession) java.lang.reflect.Proxy.newProxyInstance(OutboundChannelTest.class.getClassLoader(),
+                new Class<?>[] {WebSocketSession.class}, (proxy, method, args) -> switch (method.getName()) {
+                    case "getId" -> id;
+                    case "isOpen" -> Boolean.TRUE;
+                    case "close" -> {
+                        if (closeCalls.incrementAndGet(index) == 1) throw PREALLOCATED_OOM;
+                        yield null;
+                    }
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    /**
+     * The reviewer's round-5 reproduction, in their style: many closes whose first session close throws, on the real
+     * four-thread pool, from several enqueuers at once. Before, a closer that ran a teardown, failed and restored
+     * PENDING before its hand-over's next step had that PENDING overwritten with HANDED — neither pending for the
+     * watchdog nor torn down: stranded (the reviewer saw 47 of 20,000). Now none is: every one is pending after its
+     * failed close, and the watchdog's retry tears each down, onClose exactly once. Five rounds of 20,000
+     * ({@link #STRAND_STRESS_ROUNDS} x {@link #STRAND_STRESS_CLOSES}) on one pool; the stranded count is summed.
+     */
+    @Test
+    void manyFailOnceClosesOnTheRealFourThreadPool_noneIsStranded() throws Exception {
+        int closes = STRAND_STRESS_CLOSES, rounds = STRAND_STRESS_ROUNDS, enqueuers = 4;
+        String prefix = "strand-stress-closer-";
+        OutboundChannel.TeardownPool pool = new OutboundChannel.TeardownPool(OutboundChannel.CLOSER_THREADS, prefix,
+                OutboundChannel.CLOSE_DEADLINE_MS, failure -> { });
+        try {
+            long t0 = System.nanoTime();
+            int totalStranded = 0;
+            List<Integer> strandedPerRound = new ArrayList<>();
+            for (int round = 0; round < rounds; round++) {
+                java.util.concurrent.atomic.AtomicIntegerArray closeCalls = new java.util.concurrent.atomic.AtomicIntegerArray(closes);
+                java.util.concurrent.atomic.AtomicIntegerArray onCloseCalls = new java.util.concurrent.atomic.AtomicIntegerArray(closes);
+                AtomicInteger tornDown = new AtomicInteger();
+                OutboundChannel[] channels = new OutboundChannel[closes];
+                for (int i = 0; i < closes; i++) {
+                    int index = i;
+                    channels[i] = new OutboundChannel(failsFirstClose("stress-" + round + "-" + i, closeCalls, i), task -> { }, pool, 1, 1 << 20, metrics, c -> {
+                        onCloseCalls.incrementAndGet(index);
+                        tornDown.incrementAndGet();
+                    });
+                }
+                long failuresBefore = pool.failures();
+                Thread[] threads = new Thread[enqueuers];
+                AtomicReference<Throwable> thrown = new AtomicReference<>();
+                for (int t = 0; t < enqueuers; t++) {
+                    int first = t;
+                    threads[t] = new Thread(() -> {
+                        try {
+                            for (int i = first; i < closes; i += enqueuers) overflow(channels[i]);
+                        } catch (Throwable e) {
+                            thrown.set(e);
+                        }
+                    }, "stress-enqueuer-" + t);
+                }
+                for (Thread t : threads) t.start();
+                for (Thread t : threads) t.join(30_000);
+                assertNull(thrown.get(), "nothing was thrown at an enqueuer: " + thrown.get());
+                long deadline = System.currentTimeMillis() + 30_000;
+                while ((pool.failures() - failuresBefore < closes || pool.busy() > 0 || pool.queued() > 0) && System.currentTimeMillis() < deadline) Thread.sleep(5);
+                assertEquals(closes, pool.failures() - failuresBefore, "every first close ran on a closer and threw");
+                assertEquals(0, tornDown.get(), "onClose follows a close that returned, never one that threw");
+                // Every close has thrown and none has been retried: a teardown that is not pending now is stranded.
+                boolean[] wasPending = new boolean[closes];
+                int pending = 0;
+                for (int i = 0; i < closes; i++) {
+                    wasPending[i] = channels[i].teardownPending();
+                    if (wasPending[i]) pending++;
+                }
+                strandedPerRound.add(closes - pending);
+                totalStranded += closes - pending;
+                for (int i = 0; i < closes; i++) {
+                    if (wasPending[i]) assertTrue(channels[i].retryPendingTeardown(), "the watchdog's tick hands " + channels[i].socketId() + " over again");
+                }
+                deadline = System.currentTimeMillis() + 30_000;
+                while (tornDown.get() < pending && System.currentTimeMillis() < deadline) Thread.sleep(5);
+                assertEquals(pending, tornDown.get(), "the watchdog's retry tore every pending one down");
+                for (int i = 0; i < closes; i++) {
+                    if (!wasPending[i]) continue;                           // stranded: counted, and asserted below
+                    assertEquals(1, onCloseCalls.get(i), "onClose exactly once for " + channels[i].socketId());
+                    assertEquals(2, closeCalls.get(i), "the close that threw, then the retry's, for " + channels[i].socketId());
+                    assertFalse(channels[i].teardownPending());
+                }
+            }
+            System.out.println("[strand-stress] " + rounds + " x " + closes + " fail-once closes on a " + OutboundChannel.CLOSER_THREADS
+                    + "-thread pool from " + enqueuers + " enqueuers: stranded " + totalStranded + " " + strandedPerRound
+                    + " (" + (System.nanoTime() - t0) / 1_000_000 + " ms)");
+            assertEquals(0, totalStranded, totalStranded + " of " + rounds * closes
+                    + " fail-once closes were stranded, neither pending for the watchdog nor torn down; per round " + strandedPerRound);
+            assertEquals(OutboundChannel.CLOSER_THREADS, liveThreads(prefix));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
     private void waitForSent(int n) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 3000;
         while (sent.size() < n && System.currentTimeMillis() < deadline) {
