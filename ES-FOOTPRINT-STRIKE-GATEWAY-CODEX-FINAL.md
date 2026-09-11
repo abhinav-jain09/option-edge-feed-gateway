@@ -355,3 +355,77 @@ All clean builds, Java 21, offline Maven.
 2. [P1] Replacing retained evidence does not advance authority or notify readers. FootprintStrikeView.java:328 replaces a head's revision/payload without incrementing authority. Consequently, a cache-only replacement queues neither evidence nor control. Reproduced: revision 0 → revision 1 changed REST's payload while authority remained 1 → 1, with zero frames emitted. Production scenario: the live Kafka consumer misses an update during reconnect and seeks to END; the continuing cache consumer folds that update after replay completion. Connected browsers retain the superseded evidence until another authority event occurs. Advance authority and queue control when evidence is replaced, including changes to which episode is latest.
 
 3. [P2] Evicted newest episodes never produce the required tombstones. FootprintStrikeView.java:411 removes the episode's index entry completely; latest can only construct tombstones from entries remaining in that index. Reproduced with maxEpisodes=1: admit strike 680000/open 100, then strike 681000/open 200. Latest returns the second record, boundary 200, and tombstones: [], omitting {strikeCents:680000,openBarStartMs:100}. This violates the stated v2 eviction contract and leaves a browser relying on those tombstones without its explicit invalidation. Retain bounded newest-episode eviction markers; update the refusal-only documentation and tests accordingly.
+
+## Re-review (round 3) — Codex re-review of `15ac5ca` (2026-09-11)
+
+The re-review accepted every earlier fix, the additive-evidence design for round-2 #2 included, and raised exactly one
+finding (verbatim below). Folded on `fix/footprint-strike-gw-r3` and pushed to `fix/footprint-strike-final-review`
+(PR #182) as a fast-forward of `15ac5ca`. Not re-reviewed yet: no `VERDICT: APPROVE` exists for this change.
+
+### Disposition
+
+| # | Finding | Disposition | What changed | Pinning tests |
+|---|---|---|---|---|
+| 1 | **[P1]** Bound concurrent socket teardowns (`OutboundChannel.java:51` started a platform thread per closing channel with no shared limit; 64 blocked closes = 64 live closer threads; an `OutOfMemoryError` from `Thread.start()` escaped the `RuntimeException` fallback on the strike drainer, so the channel, already marked closed, was never torn down and the fan-out aborted after the frame left the view's outbox) | **FIXED** | **One shared, bounded pool.** `OutboundChannel.TEARDOWN` is a `TeardownPool` of `CLOSER_THREADS` = 4 daemon threads `options-edge-ws-closer-1..4`, started once when the class initialises (at the first channel's construction, never on a closing thread) and shared by every channel. `execute` only queues: it never blocks, never runs the teardown on the caller and never starts a thread. **Queue bound:** a channel hands its teardown over at most once (a CAS state machine NONE → PENDING → HANDING → HANDED; only PENDING → HANDING may offer it, so the close and the watchdog's retry can never both hand it over, and `teardown()` is guarded exactly-once besides), so the queue holds at most one entry per socket that is closed and not yet torn down. **Stuck closers:** a blocked close holds one closer thread and nothing else; the write watchdog (`enforceOutboundWriteDeadlines`, every max(100 ms, deadline/2)) interrupts a close that has held its thread past `CLOSE_DEADLINE_MS` = 30 s (above Tomcat's 20 s blocking-send timeout, which already bounds a container close) — once per close, and never the close that thread takes next. When every closer thread is stuck the other teardowns wait in the queue and nothing else waits: their channels are already closed (every enqueue refused, queue dropped), so the cost is that each stays registered until a thread frees; a close that ignores both its timeout and the interrupt keeps its thread for good and the pool continues with one fewer (the class javadoc says so). **Hand-over failure:** `closers.execute` failing with a `RuntimeException` OR an `Error` (the reviewer's `OutOfMemoryError`) is caught in `handOverTeardown`, never thrown at the enqueuer and never run inline: the fan-out continues to every other socket, the teardown stays PENDING, and the write watchdog's sweep — which finds the channel because it is still registered — calls `retryPendingTeardown()` until the closers accept it. Kept unchanged: marked closed + queue dropped at once, `disconnectedSlow`/`writeError`/`droppedOnClose` synchronous, session close then `onClose` exactly once, no write after close, quiet `shutdown()`, every other stream's semantics. New test seams on the service: `outboundClosersForTest`, `outboundChannelForTest`; `enforceOutboundWriteDeadlines` is package-private. | `OutboundChannelTest.sixtyFourChannelsOverflowingAtOnce_neverHoldMoreCloserThreadsThanTheBound_andStallNoSender` (the reviewer's reproduction: 64 channels whose `close()` blocks on a latch overflow in one fan-out; peak live threads named `options-edge-ws-closer*`, sampled every 2 ms, ≤ 4; exactly 4 closes in progress and 60 queued; slowest enqueue < 500 ms; both healthy channels — one before, one after the 64 — get all 20 frames in order; after release `onClose` exactly once and one session close for all 64), `…aTeardownThatCannotBeHandedOverNeverAbortsTheFanOut_andTheWatchdogTearsItDownLater` (an executor throwing `OutOfMemoryError("unable to create native thread…")` and one throwing `RejectedExecutionException`; nothing thrown at the fan-out, the channels after each failed hand-over get every frame, the teardowns stay pending and are not run inline; a retry while still refused leaves them pending; the next retry hands each over once; run twice by the closer, `onClose` still once), `…whenEveryCloserIsStuck_theOtherTeardownsWait_andTheCloseDeadlineFreesTheThreads` (a private 2-thread pool with a 1 s deadline: 5 closes that never return on their own; 2 in progress, 3 queued, no `onClose`; a watchdog tick within the deadline interrupts nothing; ticks past it interrupt each close once and all 5 are torn down once), `FootprintStrikeDeliveryTest.sixtyFourSlowSocketsOverflowingAtOnceNeverHoldMoreCloserThreadsThanTheBound` (the same on the production path: 64 real socket channels whose strike sends and closes block overflow on the strike drainer; peak ≤ 4, exactly 4 closes in progress, the live consumer finishes all 80 records, both healthy sockets get all 80 in order, the view's queue is empty, every slow socket stays registered and closed until its teardown, then is closed and detached exactly once), `…aSlowSocketsTeardownThatCannotBeScheduledNeitherAbortsTheFanOutNorIsLost` (the reviewer's failure mode on the production path: the slow socket's closers throw `OutOfMemoryError`; nothing thrown at the drainer, all three healthy sockets get all 80 records, one hand-over attempt; the channel stays registered, closed, pending; a watchdog tick retries (still refused), the next hands it over and the socket is closed and detached exactly once) |
+
+Peak live closer threads in the green runs: **4** of a bound of 4 in both 64-channel tests (`[closer-bound] … peak live closer threads 4 (bound 4), closes in progress 4, queued 60`, printed by `OutboundChannelTest` and `FootprintStrikeDeliveryTest` in the full build) — the pool's four threads are the only closer threads that ever exist.
+
+### Do the new tests bite? (each part reverted alone, sources restored, sha256 proven)
+
+Each part of the fix was reverted ALONE in the working tree (an exact one-occurrence replacement), `mvn -B -o clean test
+-Dtest='OutboundChannelTest,FootprintStrikeDeliveryTest'` run, and both sources copied back. The sha256 of
+`OutboundChannel.java` (`6c0cadcd7ec5…`) and `FeedGatewayService.java` (`7716ca4cacf9…`) was taken before the first
+revert and after every restore: identical every time (`RESTORED: sha256 identical`, ×5).
+
+| Revert | Went red (assertion failures) |
+|---|---|
+| A — thread per teardown (`TeardownPool.execute` starts `new Thread(teardown, "options-edge-ws-closer")` instead of queueing: the round-2 behaviour) | `OutboundChannelTest.sixtyFourChannels…:347` "64 overflowing channels held **68** live closer threads at once; the bound is 4"; `FootprintStrikeDeliveryTest.sixtyFourSlowSockets…:658` "64 overflowing sockets held **73** live closer threads at once; the bound is 4"; `OutboundChannelTest.whenEveryCloserIsStuck…:476` expected 2 closes in progress but was 5; both existing blocked-close tests on the thread name (`…:223`, `…:560`) |
+| B — an `Error` from the hand-over escapes (`catch (RuntimeException handOverFailed)`: the reviewed fallback's reach) | `OutboundChannelTest.aTeardownThatCannotBeHandedOver…:409` and `FootprintStrikeDeliveryTest.aSlowSocketsTeardownThatCannotBeScheduled…:725`: "…was thrown at the fan-out/drainer: java.lang.OutOfMemoryError: unable to create native thread…" |
+| C — the watchdog does not retry a pending teardown | `FootprintStrikeDeliveryTest.aSlowSocketsTeardownThatCannotBeScheduled…:738` "the watchdog retried it" expected 2 but was 1 |
+| D — the close deadline never interrupts | `OutboundChannelTest.whenEveryCloserIsStuck…:485` "the deadline freed the stuck threads and the queued teardowns ran" expected 0 but was 5 |
+| A+B+C+D together | 7 failures: all of the above |
+
+### Mutation campaign
+
+- `scripts/footprint-campaign.spec.json`: `G-R10.3` re-anchored — the teardown line is now
+  `closers.execute(this::teardown);` inside `handOverTeardown`, mutated to `teardown();` (inline on the enqueuer, the same
+  intent); its clause and quoted sentence now say "a shared closer thread, never on the enqueuing thread" (the G-R10 row
+  was reworded to match: the thread is no longer "of its own"). Three clauses added, each quoting the round-3 as-built
+  sentence now in the G-R10 row: `G-R10.4` bounded teardown concurrency (`queue.add(teardown);` → a thread per
+  teardown), `G-R10.5` a failed hand-over is never thrown at the enqueuer (`catch (RuntimeException | Error …)` →
+  `catch (RuntimeException …)`), `G-R10.6` the write watchdog retries a pending teardown (the retry call commented
+  out). The close-deadline interrupt has no clause: it is pinned only by `OutboundChannelTest`, which the campaign
+  command (`-Dtest=Footprint*,CvdSpxLevelsWiringTest`) does not run, and a clause for it would be a survivor that says
+  nothing about the test that holds it.
+- Re-run per `scripts/footprint-mutate.py` in a CLEAN detached worktree at the code commit `5ae84f8`
+  (`git worktree add --detach`, clean before and after, removed afterwards). Baseline GREEN
+  (`mvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest`, 141 tests). Result: **45 KILLED, 1 SURVIVED of 46** — the same recorded
+  inert survivor as before (`G-R7 the-exclusive-cursor-at-the-domain-edge site2-relaxed`). The three new clauses are
+  KILLED by assertion failures: `G-R10.4` (bounded concurrency) by
+  `FootprintStrikeDeliveryTest.sixtyFourSlowSocketsOverflowingAtOnceNeverHoldMoreCloserThreadsThanTheBound` and
+  `…aSlowSocketWhoseCloseBlocksStallsNeitherConsumerNorAnyHealthySocket` (the closer's thread name); `G-R10.5` and
+  `G-R10.6` by `…aSlowSocketsTeardownThatCannotBeScheduledNeitherAbortsTheFanOutNorIsLost`. The re-anchored `G-R10.3` is
+  KILLED as before, its kill set grown by those two delivery tests. For the other 42 clauses no status and no kill set
+  changed.
+- `ES-FOOTPRINT-CAMPAIGN.json` replaced by that record (every row names `5ae84f8`) and §2a regenerated from it with
+  `scripts/footprint-reqstate.sh` (G-R10 3→6 probes; 46 mutations, 45 killed, 1 surviving).
+
+### Verification
+
+All clean builds, Java 21, offline Maven.
+
+- Code commit `5ae84f8`, before committing: `mvn -B -o clean test` (full) — **1189 run, 0 failures, 0 errors** (1184
+  before this round; +5: `OutboundChannelTest` 6→9, `FootprintStrikeDeliveryTest` 10→12), plus the context smoke test
+  1/0; `FeedGatewayServiceTest` 259/0.
+- The three Jenkinsfile gates (`mvn -B -o clean test`, `scripts/footprint-reverify.sh`,
+  `scripts/footprint-reqstate.sh --check`) were run on the commit that adds this record, with a clean tree before and
+  after; their exit codes are stated in the PR description rather than here, so recording them does not move the head
+  they were run on.
+- Not done in this round: the earlier "remaining obligations" table is unchanged; no heap measurement; no Codex
+  re-review of this fix. Adjacent and NOT changed (outside this finding): `OutboundChannel.enqueue` still hands its
+  drain to the shared writer pool with `writers.execute`, a fixed pool of `GATEWAY_WS_WRITER_THREADS` whose threads
+  start lazily on its first executes; a failure there would still propagate to the enqueuer.
+
+### Review text (verbatim)
+
+[P1] Bound concurrent socket teardowns — OutboundChannel.java:51. Every closing channel starts a new platform thread, with no shared concurrency limit. Reproduced by compiling the channel in memory: overflowing 64 channels whose close() blocks creates 64 simultaneously live closer threads. A timeout bounds their lifetime, not their peak count. During mass overflow, native-thread exhaustion can throw OutOfMemoryError from Thread.start() on the strike drainer; the RuntimeException fallback does not catch it. The channel is already marked closed, so teardown/onClose never runs and the watchdog skips it. Fan-out also aborts after the frame was removed from the view's outbox, leaving remaining healthy browsers without that evidence/control. Use bounded teardown concurrency without caller-runs or an unbounded thread fallback.
