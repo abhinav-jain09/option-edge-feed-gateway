@@ -2,6 +2,7 @@ package app.feedgateway;
 
 import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
@@ -12,6 +13,7 @@ import com.fasterxml.jackson.databind.type.LogicalType;
 import com.optionsedge.contracts.volpremium.EarlyWarning;
 import com.optionsedge.contracts.volpremium.EarlyWarningState;
 import com.optionsedge.contracts.volpremium.IvRvReading;
+import com.optionsedge.contracts.volpremium.IvRvReadingV1;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -33,8 +35,15 @@ import java.util.function.ToLongFunction;
  * compacted topic keeps every one of them. A cache that kept only the newest would hand a late joiner
  * one point and call it a session.
  *
+ * <p><b>Both wire versions</b> (the rollout bridge: vol-premium runbook, "Rollout sequence", step 2 until
+ * step 6). schemaVersion 1 comes from the old realised-only producer, keyed {@code SYMBOL|sessionDate}.
+ * schemaVersion 2 comes from the engine, keyed per observation. Each is admitted on its OWN contract and key
+ * rule, and both are then held as ONE series. {@link #acceptObservation} states the rules and the
+ * transitional limits.
+ *
  * <p><b>An observation is identified by {@code (frameSeq, measurementEpochMs)}</b>, which is the
- * contract's own rule (IvRvReading's constructor states it): a later frame with the same ordinal AND
+ * contract's own rule (the constructors of IvRvReading and IvRvReadingV1 both state it, and both
+ * versions define both fields identically): a later frame with the same ordinal AND
  * the same epoch is a newer reading of the same window and REPLACES it; the same ordinal on a different
  * epoch is a different measurement and stays a separate point, which is where the line breaks.
  *
@@ -105,6 +114,10 @@ final class VolPremiumSessionStore {
      *       {@code 1/}{@value #HEAP_FRACTION_DENOMINATOR} of {@code Runtime.maxMemory()}. Production
      *       runs {@code -Xms256m -Xmx1536m} (JAVA_TOOL_OPTIONS in every feed-gateway overlay), so the
      *       bound is 192 MiB and the store can hold at most 6.25% of the heap.</li>
+     *   <li>A schemaVersion 1 record (the rollout bridge) is charged by the SAME formula. It carries
+     *       sixteen scalar fields and no trends or warnings, so its charge is a fraction of a v2 record's for
+     *       the same window (VolPremiumSessionStoreTest measures both). Any mix of v1 and v2 points
+     *       therefore fits wherever the same number of v2 points does.</li>
      * </ul>
      *
      * <p><b>Beyond the envelope the store fails CLOSED and LOUD, never by truncation.</b> A record that
@@ -167,7 +180,10 @@ final class VolPremiumSessionStore {
 
     /** Why a record was not admitted; each is counted so a refusal is never silent. */
     enum Refusal {
-        MALFORMED, OVERSIZE, KEY_MISMATCH, FUTURE_EVENT_TIME, SESSION_NOT_CURRENT, OLDER_SESSION,
+        MALFORMED,
+        /** An observation whose schemaVersion is missing, not a JSON integer, or neither version this gateway knows. */
+        SCHEMA_VERSION,
+        OVERSIZE, KEY_MISMATCH, FUTURE_EVENT_TIME, SESSION_NOT_CURRENT, OLDER_SESSION,
         FOREIGN_PARTITION, REPLAYED_OFFSET, EVENT_TIME_REGRESSION, SESSION_BUDGET, SYMBOL_CAP
     }
 
@@ -354,13 +370,43 @@ final class VolPremiumSessionStore {
                     .setCoercion(CoercionInputShape.Float, CoercionAction.Fail)
                     .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail))
             .build();
-    private static final ObjectReader OBSERVATION_READER = STRICT.readerFor(IvRvReading.class);
+    /**
+     * One strict reader per observation version, both from {@link #STRICT}: each version gets every
+     * protection the other has, and each record is validated only by its own contract's constructor.
+     */
+    private static final ObjectReader V1_OBSERVATION_READER = STRICT.readerFor(IvRvReadingV1.class);
+    private static final ObjectReader V2_OBSERVATION_READER = STRICT.readerFor(IvRvReading.class);
     private static final ObjectReader WARNING_READER = STRICT.readerFor(EarlyWarning.class);
+
+    /** No usable schemaVersion: missing, null, or not a JSON integer within int range. Matches no version. */
+    static final int NO_SCHEMA_VERSION = Integer.MIN_VALUE;
+
+    /**
+     * What the store needs from an observation of EITHER version, once it has passed its own contract:
+     * the version, the identity, the instant, and the Kafka key its own version requires. It is built only
+     * from a constructed contract record. The key rule is bound to the record TYPE here, so neither version
+     * can be keyed by the other's rule.
+     */
+    private record Observation(int schemaVersion, String symbol, String sessionDate, long eventTimeMs,
+                               long frameSeq, long measurementEpochMs, String key) {
+        static Observation of(IvRvReadingV1 r) {
+            return new Observation(r.schemaVersion(), r.symbol(), r.sessionDate(), r.eventTimeMs(), r.frameSeq(),
+                    r.measurementEpochMs(), v1SessionKey(r.symbol(), r.sessionDate()));
+        }
+
+        static Observation of(IvRvReading r) {
+            return new Observation(r.schemaVersion(), r.symbol(), r.sessionDate(), r.eventTimeMs(), r.frameSeq(),
+                    r.measurementEpochMs(), IvRvReading.observationKey(r.symbol(), r.sessionDate(), r.frameSeq()));
+        }
+    }
 
     private final long seriesBudgetBytes;
     private final int maxSymbols;
     private final TreeMap<String, Session> sessions = new TreeMap<>();
     private final AtomicLong[][] refusals = new AtomicLong[Stream.values().length][Refusal.values().length];
+    /** Observations admitted (new positions and replacements), per wire version: which producer is being taken. */
+    private final AtomicLong admittedV1 = new AtomicLong();
+    private final AtomicLong admittedV2 = new AtomicLong();
     private boolean symbolCapLogged;
     /** Incremented on every admission, new position or replacement; see {@link #nextChanged}. */
     private long admissionSeq;
@@ -404,31 +450,106 @@ final class VolPremiumSessionStore {
     }
 
     /**
-     * Offer one IV/RV observation from the ivrv topic.
+     * Offer one IV/RV observation from the ivrv topic, of EITHER wire version.
      *
-     * <p>The WHOLE contract is enforced — the record is deserialised through {@link IvRvReading}, whose
-     * constructor is the producer's own validation, by a reader that refuses every lossy coercion (see
-     * {@link #STRICT}) — and then the Kafka key must be EXACTLY {@link IvRvReading#observationKey} of the
-     * parsed value. The key is what compaction acts on: a record keyed for one observation carrying
-     * another's body would take the first one's slot on the topic while the gateway filed it under the
-     * second, and the two histories would disagree with nothing failing.
+     * <p><b>Why two versions</b> (vol-premium runbook, "Rollout sequence", step 2). The live producer today is
+     * the old realised-only service, which publishes schemaVersion 1. The engine that replaces it publishes
+     * schemaVersion 2 to the SAME topic. From step 2 until the v1 bridge is removed (step 6) this gateway admits
+     * both, so the old producer keeps working until the engine replaces it (step 4), and a rollback to the old
+     * image stays safe.
      *
-     * <p>schemaVersion 1 is refused, by the contract's constructor: the producer publishes only v2 now,
-     * and a v1 record is keyed {@code SYMBOL|sessionDate}, which can never equal an observation key.
+     * <p><b>Each version on its own rules, and never on the other's:</b>
+     * <ol>
+     *   <li>{@code schemaVersion} is read FIRST, by the same strict parser ({@link #wireSchemaVersion}). It must
+     *       be a JSON integer naming a version this gateway knows. Missing, null, fractional, quoted or unknown
+     *       is {@link Refusal#SCHEMA_VERSION}. Unparseable text, a duplicated key or trailing tokens is
+     *       {@link Refusal#MALFORMED}.</li>
+     *   <li>The record is then deserialised through THAT version's contract record by the same strict reader
+     *       ({@link #STRICT}: no coercion, no duplicate keys; the 64 KiB cap is checked before any parse). v1
+     *       goes through {@link IvRvReadingV1}, v2 through {@link IvRvReading}, and each constructor is that
+     *       producer's own validation.</li>
+     *   <li>The Kafka key must then be EXACTLY that version's key: v1 {@code SYMBOL|sessionDate}
+     *       ({@link #v1SessionKey}, the rule gateway main enforced), v2 {@link IvRvReading#observationKey}. The
+     *       key is what compaction acts on. A record keyed for one slot but carrying another's body would take
+     *       the first slot on the topic while the gateway filed it under the second, and the two histories
+     *       would disagree with nothing failing. So a v1 record under a v2-style key, and a v2 record under the
+     *       v1 key, are both {@link Refusal#KEY_MISMATCH}.</li>
+     * </ol>
+     * Past that point the two versions are ONE series. They share the session, the identity
+     * {@code (frameSeq, measurementEpochMs)}, the byte budget and its charge, the replay order and the
+     * exactly-once handoff. The producer's bytes are forwarded verbatim.
+     *
+     * <p><b>TRANSITIONAL LIMITS</b>, as found on 2026-09-11; they go away with the bridge at step 6.
+     * <ul>
+     *   <li><b>After a gateway restart, a v1 session's history is only what the topic still holds.</b> This
+     *       store lives on the heap alone. A restarted gateway rebuilds it by seeking back
+     *       {@code VOL_PREMIUM_SESSION_SEEK_BACK_MS} and re-admitting what it reads. v1 writes ONE key per
+     *       session, so on a COMPACTED topic only the session's newest v1 record is guaranteed to survive.
+     *       Older records last only until the log cleaner compacts the segment holding them; the active
+     *       segment is never compacted. On such a topic, a v1 producer's whole-session history is only what
+     *       this gateway instance observed live. A restart rebuilds the newest v1 point, plus whatever the
+     *       cleaner has not yet removed. (v2 keys every observation separately, so compaction keeps all of
+     *       it.) Whether the topic IS compacted is decided by the producer, which stamps it at every boot
+     *       (processing-common KafkaTopics.ensureServedTopic): compact,delete unless
+     *       OPTIONS_EDGE_UNCOMPACTED_SERVED_TOPICS=true. The deploy repo sets that switch for production
+     *       (options-edge-config) and for es4, so there the topic is delete, with VOL_PREMIUM_IVRV_RETENTION_MS
+     *       (default -1). Every v1 record then stays, and a restart re-reads the whole v1 session. Dev keeps
+     *       compaction (by default segment.ms is 1 h and min.cleanable.dirty.ratio 0.01).</li>
+     *   <li><b>Two producers form two runs only because their epochs differ.</b> Each producer sets
+     *       measurementEpochMs to the event time of the first record ITS accumulator folds. For v1 that is the
+     *       first record of the session a new processor instance sees, held in memory. For v2 it is the first
+     *       in-session spot tick of its grid, persisted. A switch therefore changes the epoch, and the two runs
+     *       stay distinct points. If both accumulators ever began on the same event-time millisecond, a v1 and
+     *       a v2 reading of one ordinal would be the SAME position: the later offset would replace the earlier,
+     *       under exactly the rules that apply within one version, and would be charged the size difference.
+     *       The vol-premium Deployment runs replicas 1 with strategy Recreate, so the two images never publish
+     *       at the same time.</li>
+     *   <li><b>Ordering by frameSeq assumes one cadence per session.</b> Both producers read
+     *       VOL_PREMIUM_FRAME_CADENCE_MS (default 5,000). Producers publishing at different cadences in one
+     *       session would number their frames on different lattices, and this store would interleave the
+     *       frames out of time order. That is not guarded here, and a cadence change within v2 alone would do
+     *       the same.</li>
+     *   <li>A v1 record carries no warnings and no trends, so it adds nothing to the warnings stream.</li>
+     *   <li>The 64 KiB wire cap belongs to IvRvReading. IvRvReadingV1 declares none, and gateway main applied
+     *       none to v1. It is applied to v1 here as well; a genuine v1 record is under 1 KiB.</li>
+     *   <li>Both contract records ignore unknown fields (their own annotation). A record labelled v1 that also
+     *       carries v2 fields is therefore admitted on v1's rules alone, its extra fields unvalidated, and
+     *       forwarded verbatim. Only the cap bounds it.</li>
+     *   <li>Gateway main compared the v1 key case-insensitively. Here the comparison is exact, as v2's is,
+     *       because Kafka compacts on the key's exact bytes. The v1 producer writes exactly
+     *       {@code settings.symbol() + "|" + sessionDate}, with the same symbol in the body, so the exact rule
+     *       refuses nothing it publishes.</li>
+     * </ul>
      */
     synchronized Admission acceptObservation(String source, String recordKey, int partition, long offset,
                                              String json, long nowMs) {
         if (!withinWire(json)) {
             return refuse(Stream.OBSERVATION, json == null || json.isBlank() ? Refusal.MALFORMED : Refusal.OVERSIZE);
         }
-        IvRvReading reading;
+        int schemaVersion;
         try {
-            reading = OBSERVATION_READER.readValue(json);
+            schemaVersion = wireSchemaVersion(json);
         } catch (java.io.IOException | RuntimeException invalid) {
             return refuse(Stream.OBSERVATION, Refusal.MALFORMED);
         }
-        if (!IvRvReading.observationKey(reading.symbol(), reading.sessionDate(), reading.frameSeq())
-                .equals(recordKey)) {
+        Observation reading;
+        try {
+            // The two case labels are the contracts' own compile-time constants: if they were ever equal,
+            // this switch would not compile, rather than silently routing one version through the other.
+            reading = switch (schemaVersion) {
+                case IvRvReadingV1.CURRENT_SCHEMA_VERSION ->
+                        Observation.of(V1_OBSERVATION_READER.<IvRvReadingV1>readValue(json));
+                case IvRvReading.CURRENT_SCHEMA_VERSION ->
+                        Observation.of(V2_OBSERVATION_READER.<IvRvReading>readValue(json));
+                default -> null;
+            };
+        } catch (java.io.IOException | RuntimeException invalid) {
+            return refuse(Stream.OBSERVATION, Refusal.MALFORMED);
+        }
+        if (reading == null) {
+            return refuse(Stream.OBSERVATION, Refusal.SCHEMA_VERSION);
+        }
+        if (!reading.key().equals(recordKey)) {
             return refuse(Stream.OBSERVATION, Refusal.KEY_MISMATCH);
         }
         if (reading.eventTimeMs() > nowMs + MAX_FUTURE_SKEW_MS) {
@@ -436,8 +557,44 @@ final class VolPremiumSessionStore {
         }
         Position position = new Position(source + "|" + reading.symbol(), reading.sessionDate(),
                 Position.OBSERVATIONS, reading.frameSeq(), reading.measurementEpochMs(), "", 0);
-        return admit(Stream.OBSERVATION, position, json, charge(json, false), reading.eventTimeMs(),
+        Admission admission = admit(Stream.OBSERVATION, position, json, charge(json, false), reading.eventTimeMs(),
                 partition, offset, nowMs);
+        if (admission.admitted()) {
+            (reading.schemaVersion() == IvRvReadingV1.CURRENT_SCHEMA_VERSION ? admittedV1 : admittedV2)
+                    .incrementAndGet();
+        }
+        return admission;
+    }
+
+    /**
+     * The v1 Kafka key: ONE per session, {@code SYMBOL|sessionDate}. This is what the v1 producer writes
+     * (processing main VolPremiumStreams: {@code settings.symbol() + "|" + sessionDate}) and what gateway main
+     * required. Compared exactly; see {@link #acceptObservation}.
+     */
+    static String v1SessionKey(String symbol, String sessionDate) {
+        return symbol + "|" + sessionDate;
+    }
+
+    /**
+     * The record's wire version, read BEFORE any contract is chosen and as strictly as the record itself.
+     * The same parser features apply, so a duplicated key (a second schemaVersion included) or trailing tokens
+     * throw. Only a JSON INTEGER counts: {@code 1.0}, {@code "1"}, {@code true}, {@code null} or an absent
+     * field yield {@link #NO_SCHEMA_VERSION}, never a coerced 1, because a version the bytes do not literally
+     * state must not choose the contract that validates them. Throws when the text is not a JSON object.
+     */
+    static int wireSchemaVersion(String json) throws java.io.IOException {
+        JsonNode root = STRICT.readTree(json);
+        if (root == null || !root.isObject()) {
+            throw new IllegalArgumentException("an observation is a JSON object");
+        }
+        JsonNode version = root.get("schemaVersion");
+        return version != null && version.isInt() ? version.intValue() : NO_SCHEMA_VERSION;
+    }
+
+    /** Observations admitted with the given wire version (new positions and replacements); 0 for any other. */
+    long admittedObservations(int schemaVersion) {
+        return schemaVersion == IvRvReadingV1.CURRENT_SCHEMA_VERSION ? admittedV1.get()
+                : schemaVersion == IvRvReading.CURRENT_SCHEMA_VERSION ? admittedV2.get() : 0L;
     }
 
     /**
@@ -785,6 +942,14 @@ final class VolPremiumSessionStore {
                         .append(refusals(stream, reason)).append('\n');
             }
         }
+        sb.append("# HELP gateway_vol_premium_admitted_total vol-premium IV/RV observations admitted to the session ")
+                .append("cache (new positions and replacements), by wire schemaVersion. Through the v1-to-v2 rollout ")
+                .append("this says which producer the gateway is taking.\n")
+                .append("# TYPE gateway_vol_premium_admitted_total counter\n")
+                .append("gateway_vol_premium_admitted_total{stream=\"ivrv\",schema=\"")
+                .append(IvRvReadingV1.CURRENT_SCHEMA_VERSION).append("\"} ").append(admittedV1.get()).append('\n')
+                .append("gateway_vol_premium_admitted_total{stream=\"ivrv\",schema=\"")
+                .append(IvRvReading.CURRENT_SCHEMA_VERSION).append("\"} ").append(admittedV2.get()).append('\n');
         sb.append("# HELP gateway_vol_premium_cached_observations IV/RV observations held for the current sessions.\n")
                 .append("# TYPE gateway_vol_premium_cached_observations gauge\n")
                 .append("gateway_vol_premium_cached_observations ").append(heldObservations()).append('\n')

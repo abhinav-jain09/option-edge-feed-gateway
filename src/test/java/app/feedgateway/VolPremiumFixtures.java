@@ -112,6 +112,64 @@ final class VolPremiumFixtures {
         return canonical("early-warning.canonical.v1.json");
     }
 
+    // ----- schemaVersion 1: the OLD realised-only producer (the rollout bridge) --------------------------
+
+    /**
+     * The v1 producer's measurement epoch in these fixtures: 09:15 ET on the fixture session, i.e. an
+     * old-producer process that started before the open. It differs from the engine's epoch (09:30:00, the
+     * stream's), which is what a producer switch does. Each producer's epoch is the first record ITS OWN
+     * accumulator folded.
+     */
+    static final long V1_EPOCH_MS = SESSION_MIDNIGHT_MS + (9L * 60L + 15L) * 60_000L;
+
+    /** The old image's build id, so a v1 record's bytes are recognisably not the engine's. */
+    static final String V1_CODE_VERSION = "vp-v1-realised-only";
+
+    /** The v1 producer's serialiser: processing main VolPremiumStreams.JSON is a plain {@code new ObjectMapper()}. */
+    private static final ObjectMapper V1_PRODUCER_JSON = new ObjectMapper();
+
+    /** The v1 producer's Kafka key: ONE per session, {@code settings.symbol() + "|" + sessionDate}. */
+    static String v1Key(String symbol, String sessionDate) {
+        return symbol + "|" + sessionDate;
+    }
+
+    /**
+     * What the OLD producer would have published for the same window as an engine row. It takes the row's
+     * sixteen v1 components (the v2 record's first sixteen ARE the v1 record's), with schemaVersion 1, on the
+     * given measurement epoch. It is built through IvRvReadingV1's own constructor, so the contract validates
+     * every one, serialised as that producer serialises it, and keyed as it keys it.
+     */
+    static Row v1Of(Row engineRow, long measurementEpochMs) {
+        ObjectNode n = object(engineRow.json());
+        com.optionsedge.contracts.volpremium.IvRvReadingV1 reading =
+                new com.optionsedge.contracts.volpremium.IvRvReadingV1(
+                        com.optionsedge.contracts.volpremium.IvRvReadingV1.CURRENT_SCHEMA_VERSION,
+                        n.get("symbol").asText(), n.get("sessionDate").asText(), n.get("eventTimeMs").asLong(),
+                        nullableDouble(n, "atmIvPct"), nullableLong(n, "impliedAsOfMs"),
+                        nullableDouble(n, "realisedVolPct"), nullableDouble(n, "impliedMinusRealisedPct"),
+                        n.get("gridCoverage").asDouble(), n.get("maxContiguousGapSlots").asInt(),
+                        n.get("returnsObserved").asInt(), measurementEpochMs, n.get("frameSeq").asLong(),
+                        n.get("frameCadenceMs").asLong(), n.get("baselineMode").asText(), V1_CODE_VERSION);
+        try {
+            return new Row(v1Key(reading.symbol(), reading.sessionDate()), V1_PRODUCER_JSON.writeValueAsString(reading));
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** The v1 record for the stream's window at one ordinal, on the v1 producer's epoch. */
+    static Row v1At(long frameSeq) {
+        return v1Of(readingAt(frameSeq), V1_EPOCH_MS);
+    }
+
+    private static Double nullableDouble(JsonNode n, String field) {
+        return n.hasNonNull(field) ? Double.valueOf(n.get(field).asDouble()) : null;
+    }
+
+    private static Long nullableLong(JsonNode n, String field) {
+        return n.hasNonNull(field) ? Long.valueOf(n.get(field).asLong()) : null;
+    }
+
     /** One top-level field replaced; every other byte of the record's content kept. */
     static String with(String json, String field, long value) {
         ObjectNode node = object(json);

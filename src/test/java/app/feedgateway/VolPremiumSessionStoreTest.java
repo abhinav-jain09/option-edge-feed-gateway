@@ -110,24 +110,32 @@ class VolPremiumSessionStoreTest {
         VolPremiumSessionStore store = new VolPremiumSessionStore();
         Row canonical = canonicalReading();
         String json = canonical.json();
+        // The third column is the refusal: a version the bytes do not state as a JSON integer is refused by
+        // the version gate itself (SCHEMA_VERSION) before any contract is chosen; everything else by the
+        // strict reader of the version it names (MALFORMED).
         String[][] variants = {
                 {"a fractional ordinal (filed as 7141, forwarded as 7141.5)",
-                        rawReplace(json, "\"frameSeq\":7141,", "\"frameSeq\":7141.5,")},
-                {"an ordinal written as a float", rawReplace(json, "\"frameSeq\":7141,", "\"frameSeq\":7141.0,")},
-                {"an ordinal written as a string", rawReplace(json, "\"frameSeq\":7141,", "\"frameSeq\":\"7141\",")},
+                        rawReplace(json, "\"frameSeq\":7141,", "\"frameSeq\":7141.5,"), "MALFORMED"},
+                {"an ordinal written as a float", rawReplace(json, "\"frameSeq\":7141,", "\"frameSeq\":7141.0,"),
+                        "MALFORMED"},
+                {"an ordinal written as a string", rawReplace(json, "\"frameSeq\":7141,", "\"frameSeq\":\"7141\","),
+                        "MALFORMED"},
                 {"a fractional wire version (would pass the v2 gate as 2)",
-                        rawReplace(json, "\"schemaVersion\":2,", "\"schemaVersion\":2.5,")},
-                {"a wire version written as a string", rawReplace(json, "\"schemaVersion\":2,", "\"schemaVersion\":\"2\",")},
+                        rawReplace(json, "\"schemaVersion\":2,", "\"schemaVersion\":2.5,"), "SCHEMA_VERSION"},
+                {"a wire version written as a string", rawReplace(json, "\"schemaVersion\":2,", "\"schemaVersion\":\"2\","),
+                        "SCHEMA_VERSION"},
                 {"a string component written as a number",
-                        rawReplace(json, "\"codeVersion\":\"code-test\"", "\"codeVersion\":7")},
+                        rawReplace(json, "\"codeVersion\":\"code-test\"", "\"codeVersion\":7"), "MALFORMED"},
                 {"a string component written as a boolean",
-                        rawReplace(json, "\"codeVersion\":\"code-test\"", "\"codeVersion\":true")},
+                        rawReplace(json, "\"codeVersion\":\"code-test\"", "\"codeVersion\":true"), "MALFORMED"},
                 {"the ordinal twice, the first one different",
-                        rawReplace(json, "\"frameSeq\":7141,", "\"frameSeq\":7140,\"frameSeq\":7141,")}};
+                        rawReplace(json, "\"frameSeq\":7141,", "\"frameSeq\":7140,\"frameSeq\":7141,"), "MALFORMED"}};
         long offset = 0;
+        long malformed = 0;
         for (String[] v : variants) {
             Admission refused = store.acceptObservation("DATABENTO", canonical.key(), 0, offset++, v[1], FIXTURE_NOW_MS);
-            assertEquals(Refusal.MALFORMED, refused.refusal(), v[0] + " must be refused");
+            assertEquals(Refusal.valueOf(v[2]), refused.refusal(), v[0] + " must be refused");
+            malformed += "MALFORMED".equals(v[2]) ? 1 : 0;
         }
         // An enum is its NAME on the wire: ordinal 0 is IV_EXPANSION_DEVELOPING to Jackson's default
         // reader, and the forwarded bytes would carry a 0 where every consumer expects a type.
@@ -137,7 +145,8 @@ class VolPremiumSessionStoreTest {
                 store.acceptWarning("DATABENTO", warning.key(), 0, offset++, byOrdinal, FIXTURE_NOW_MS).refusal(),
                 "an enum written as its ordinal must be refused");
 
-        assertEquals(variants.length, store.refusals(Stream.OBSERVATION, Refusal.MALFORMED));
+        assertEquals(malformed, store.refusals(Stream.OBSERVATION, Refusal.MALFORMED));
+        assertEquals(variants.length - malformed, store.refusals(Stream.OBSERVATION, Refusal.SCHEMA_VERSION));
         assertEquals(0, store.heldObservations());
         assertEquals(0, store.heldWarnings());
         assertTrue(walk(store, FIXTURE_NOW_MS).isEmpty(), "nothing refused is ever replayed");
@@ -248,6 +257,280 @@ class VolPremiumSessionStoreTest {
         assertEquals(first.position(), again.position());
         assertEquals(1, store.heldWarnings());
         assertEquals(Refusal.REPLAYED_OFFSET, offerWarning(store, opening, 5).refusal());
+    }
+
+    // ----- the rollout bridge: schemaVersion 1 (runbook "Rollout sequence", step 2) ------------------
+
+    private static Refusal refusal(VolPremiumSessionStore store, String key, String json, long offset) {
+        return store.acceptObservation("DATABENTO", key, 0, offset, json, FIXTURE_NOW_MS).refusal();
+    }
+
+    private static List<String> fieldNames(String json) throws Exception {
+        List<String> names = new ArrayList<>();
+        MAPPER.readTree(json).fieldNames().forEachRemaining(names::add);
+        return names;
+    }
+
+    @Test
+    void aV1ObservationIsAdmittedOnItsOwnContractAndKeyAndNeitherVersionBorrowsTheOthersRules() throws Exception {
+        VolPremiumSessionStore store = new VolPremiumSessionStore();
+        Row v1 = VolPremiumFixtures.v1At(7141);
+        Row v2 = canonicalReading();
+        assertEquals("SPX|2026-08-27", v1.key(), "precondition: the v1 producer's key, one per session");
+        long offset = 0;
+
+        // KEY: each version's own rule, exactly.
+        for (String wrong : new String[] {v2.key(), "spx|2026-08-27", "SPX|2026-08-27 ", "SPX|2026-08-28", "SPX", ""}) {
+            assertEquals(Refusal.KEY_MISMATCH, refusal(store, wrong, v1.json(), offset++), "v1 under '" + wrong + "'");
+        }
+        assertEquals(Refusal.KEY_MISMATCH, refusal(store, null, v1.json(), offset++), "a keyless v1 record");
+        assertEquals(Refusal.KEY_MISMATCH, refusal(store, v1.key(), v2.json(), offset++), "v2 under the v1 key");
+        assertEquals(8L, store.refusals(Stream.OBSERVATION, Refusal.KEY_MISMATCH));
+
+        // CONTRACT: each version's own constructor. A v2 record missing a v2-only field is refused although its
+        // sixteen v1 fields are valid: v2 never falls back to v1's contract.
+        assertEquals(Refusal.MALFORMED, refusal(store, v2.key(), VolPremiumFixtures.without(v2.json(), "trends"), offset++));
+        String json = v1.json();
+        String[][] brokenV1 = {
+                {"an ordinal that disagrees with its own timestamp", with(json, "frameSeq", 7140)},
+                {"a coverage outside [0,1]", with(json, "gridCoverage", 2)},
+                {"a measurement epoch from another day",
+                        with(json, "measurementEpochMs", VolPremiumFixtures.V1_EPOCH_MS - 86_400_000L)},
+                {"a cadence outside the contract's bounds", with(json, "frameCadenceMs", 99)},
+                {"a zero implied vol", with(json, "atmIvPct", 0)},
+                {"a spread that is not atmIvPct - realisedVolPct", with(json, "impliedMinusRealisedPct", 999)},
+                {"an unknown baseline mode", with(json, "baselineMode", "CALIBRATED")},
+                {"trailing tokens", json + "{}"}};
+        for (String[] c : brokenV1) {
+            assertEquals(Refusal.MALFORMED, refusal(store, v1.key(), c[1], offset++), c[0] + " must be refused");
+        }
+        // Every v1 field must be PRESENT, and no primitive an explicit null — schemaVersion itself is the gate's.
+        List<String> fields = fieldNames(json);
+        assertEquals(16, fields.size(), "the v1 reading has 16 fields");
+        for (String field : fields) {
+            assertEquals("schemaVersion".equals(field) ? Refusal.SCHEMA_VERSION : Refusal.MALFORMED,
+                    refusal(store, v1.key(), VolPremiumFixtures.without(json, field), offset++),
+                    "a v1 reading missing " + field);
+        }
+        String[] primitives = {"schemaVersion", "eventTimeMs", "gridCoverage", "maxContiguousGapSlots",
+                "returnsObserved", "measurementEpochMs", "frameSeq", "frameCadenceMs"};
+        for (String field : primitives) {
+            assertEquals("schemaVersion".equals(field) ? Refusal.SCHEMA_VERSION : Refusal.MALFORMED,
+                    refusal(store, v1.key(), VolPremiumFixtures.withNull(json, field), offset++),
+                    "an explicit null " + field);
+        }
+        // ABSENT is not null, even where null is valid. A warming v1 record's realised side is null; without the
+        // field it would deserialise to that same null, pass the contract, and be forwarded verbatim WITHOUT the
+        // field. For v1 this is the one hole FAIL_ON_MISSING_CREATOR_PROPERTIES alone closes: every other
+        // missing field is also caught by FAIL_ON_NULL_FOR_PRIMITIVES or by the constructor.
+        Row warming = VolPremiumFixtures.v1At(6840);
+        assertTrue(warming.json().contains("\"realisedVolPct\":null"), "precondition: the realised side is null");
+        for (String nullable : new String[] {"realisedVolPct", "impliedMinusRealisedPct"}) {
+            assertEquals(Refusal.MALFORMED, refusal(store, warming.key(),
+                    VolPremiumFixtures.without(warming.json(), nullable), offset++),
+                    "a warming v1 reading missing its null " + nullable);
+        }
+        // The 64 KiB wire cap applies to v1 too, although its contract states none.
+        assertEquals(Refusal.OVERSIZE, refusal(store, v1.key(),
+                with(json, "pad", "x".repeat(IvRvReading.MAX_RECORD_BYTES)), offset++));
+        assertEquals(0, store.heldObservations(), "nothing refused is held");
+        assertEquals(0L, store.admittedObservations(1));
+
+        // Under its own key it is admitted, filed by (frameSeq, measurementEpochMs), retained verbatim.
+        Admission admitted = store.acceptObservation("DATABENTO", v1.key(), 0, offset++, json, FIXTURE_NOW_MS);
+        assertTrue(admitted.admitted(), String.valueOf(admitted.refusal()));
+        assertEquals(new Position("DATABENTO|SPX", SESSION, Position.OBSERVATIONS, 7141,
+                VolPremiumFixtures.V1_EPOCH_MS, ""), admitted.position());
+        assertEquals(List.of(json), store.snapshot("DATABENTO|SPX", FIXTURE_NOW_MS).observations());
+        assertEquals(1L, store.admittedObservations(1));
+        assertEquals(0L, store.admittedObservations(2));
+
+        // A v1 body that also carries v2 fields (a stated transitional limit): v1's contract ignores unknown
+        // fields, so it is judged by v1's rules alone — admitted under the v1 key, refused under a v2 key — and
+        // relabelled v2 it meets v2's contract, which refuses it.
+        String withV2Fields = edit(json, n -> n.putArray("trends"));
+        assertTrue(store.acceptObservation("DATABENTO", v1.key(), 0, offset++, withV2Fields, FIXTURE_NOW_MS).admitted());
+        assertEquals(Refusal.KEY_MISMATCH, refusal(store, v2.key(), withV2Fields, offset++));
+        assertEquals(Refusal.MALFORMED, refusal(store, v2.key(), with(withV2Fields, "schemaVersion", 2), offset++));
+        assertEquals(2L, store.admittedObservations(1));
+    }
+
+    @Test
+    void theVersionIsReadFirstAndStrictlyAndAnUnknownOneIsRefusedBeforeAnyContractIsChosen() throws Exception {
+        VolPremiumSessionStore store = new VolPremiumSessionStore();
+        Row v1 = VolPremiumFixtures.v1At(7141);
+        String json = v1.json();
+        String version = "\"schemaVersion\":1,";
+        String[][] versions = {
+                {"version 0", rawReplace(json, version, "\"schemaVersion\":0,")},
+                {"version 3, a future producer", rawReplace(json, version, "\"schemaVersion\":3,")},
+                {"version -1", rawReplace(json, version, "\"schemaVersion\":-1,")},
+                {"Integer.MAX_VALUE", rawReplace(json, version, "\"schemaVersion\":2147483647,")},
+                {"2^32 + 1, which truncates to 1 as an int", rawReplace(json, version, "\"schemaVersion\":4294967297,")},
+                {"1.0, the right number but not an integer", rawReplace(json, version, "\"schemaVersion\":1.0,")},
+                {"1e0", rawReplace(json, version, "\"schemaVersion\":1e0,")},
+                {"a quoted 1", rawReplace(json, version, "\"schemaVersion\":\"1\",")},
+                {"true", rawReplace(json, version, "\"schemaVersion\":true,")},
+                {"null", rawReplace(json, version, "\"schemaVersion\":null,")},
+                {"an object", rawReplace(json, version, "\"schemaVersion\":{\"v\":1},")},
+                {"an array", rawReplace(json, version, "\"schemaVersion\":[1],")},
+                {"absent", VolPremiumFixtures.without(json, "schemaVersion")}};
+        long offset = 0;
+        for (String[] c : versions) {
+            assertEquals(Refusal.SCHEMA_VERSION, refusal(store, v1.key(), c[1], offset++), c[0]);
+        }
+        assertEquals(versions.length, store.refusals(Stream.OBSERVATION, Refusal.SCHEMA_VERSION));
+        // Not ONE parseable JSON object: MALFORMED — a second schemaVersion included, whichever comes first.
+        String[][] malformed = {
+                {"schemaVersion twice, 2 then 1", rawReplace(json, version, "\"schemaVersion\":2,\"schemaVersion\":1,")},
+                {"schemaVersion twice, 1 then 2", rawReplace(json, version, "\"schemaVersion\":1,\"schemaVersion\":2,")},
+                {"trailing tokens", json + " 1"},
+                {"an array around the record", "[" + json + "]"},
+                {"a bare number", "1"},
+                {"a JSON null", "null"},
+                {"truncated", "{\"schemaVersion\":1,"}};
+        for (String[] c : malformed) {
+            assertEquals(Refusal.MALFORMED, refusal(store, v1.key(), c[1], offset++), c[0]);
+        }
+        assertEquals(malformed.length, store.refusals(Stream.OBSERVATION, Refusal.MALFORMED));
+        assertEquals(0, store.heldObservations());
+        assertTrue(store.metricsText().contains("gateway_vol_premium_refused_total{stream=\"ivrv\",reason=\"SCHEMA_VERSION\"} "
+                + versions.length + "\n"), "counted, so an unknown producer is never silent");
+        // The gate itself, pinned.
+        assertEquals(1, VolPremiumSessionStore.wireSchemaVersion(json));
+        assertEquals(2, VolPremiumSessionStore.wireSchemaVersion(canonicalReading().json()));
+        assertEquals(VolPremiumSessionStore.NO_SCHEMA_VERSION,
+                VolPremiumSessionStore.wireSchemaVersion(rawReplace(json, version, "\"schemaVersion\":1.0,")));
+    }
+
+    @Test
+    void aV1ObservationGetsEveryProtectionOfTheStrictReader() {
+        // Gateway main read v1 leniently (the missing-field and null-primitive checks only). v1 is forwarded
+        // VERBATIM now, like v2, so it gets the same strict reader: the bytes must say what the contract validated.
+        VolPremiumSessionStore store = new VolPremiumSessionStore();
+        Row v1 = VolPremiumFixtures.v1At(7141);
+        String json = v1.json();
+        long returns = longField(json, "returnsObserved");
+        String[][] variants = {
+                {"a fractional ordinal (filed as 7141, forwarded as 7141.5)", edit(json, n -> n.put("frameSeq", 7141.5))},
+                {"an ordinal written as a float", edit(json, n -> n.put("frameSeq", 7141.0))},
+                {"an ordinal written as a string", edit(json, n -> n.put("frameSeq", "7141"))},
+                {"a count written as a string", edit(json, n -> n.put("returnsObserved", String.valueOf(returns)))},
+                {"a string component written as a number", edit(json, n -> n.put("codeVersion", 7))},
+                {"a string component written as a boolean", edit(json, n -> n.put("codeVersion", true))},
+                // FAIL_ON_NUMBERS_FOR_ENUMS has no v1 counterpart: IvRvReadingV1 has no enum component. Its
+                // baselineMode is a String, which the textual-coercion rule guards.
+                {"the baseline mode written as a number", edit(json, n -> n.put("baselineMode", 0))},
+                {"the ordinal twice, the first one different",
+                        rawReplace(json, "\"frameSeq\":7141,", "\"frameSeq\":7140,\"frameSeq\":7141,")},
+                {"trailing tokens", json + "{}"}};
+        long offset = 0;
+        for (String[] c : variants) {
+            assertEquals(Refusal.MALFORMED, refusal(store, v1.key(), c[1], offset++), c[0] + " must be refused");
+        }
+        assertEquals(variants.length, store.refusals(Stream.OBSERVATION, Refusal.MALFORMED));
+        assertEquals(0, store.heldObservations());
+        assertTrue(walk(store, FIXTURE_NOW_MS).isEmpty(), "nothing refused is ever replayed");
+        // The producer's own bytes pass: an integer literal in a double component is the same number, exactly.
+        assertTrue(offer(store, v1, offset++).admitted());
+        assertEquals(List.of(json), walk(store, FIXTURE_NOW_MS));
+    }
+
+    @Test
+    void aV1RecordIsChargedByTheSameFormulaAndTheBudgetRefusesPastItAsForV2() {
+        Row v1 = VolPremiumFixtures.v1At(7141);
+        Row v2 = readingAt(7141);
+        assertTrue(VolPremiumSessionStore.COMPACT_STRINGS, "the figures below assume compact strings");
+        assertTrue(v1.json().chars().allMatch(c -> c <= 0xFF), "precondition: a Latin-1 record");
+        // The formula, exactly: fixed overhead + String object + aligned array of one byte per Latin-1 char.
+        long expected = VolPremiumSessionStore.RECORD_OVERHEAD_BYTES + VolPremiumSessionStore.STRING_OBJECT_BYTES
+                + ((VolPremiumSessionStore.ARRAY_HEADER_BYTES + v1.json().length() + 7L) & ~7L);
+        assertEquals(expected, VolPremiumSessionStore.charge(v1.json(), false));
+        assertTrue(v1.json().length() < 1_024, "a genuine v1 record is under 1 KiB: " + v1.json().length());
+        assertTrue(4 * VolPremiumSessionStore.charge(v1.json(), false) < VolPremiumSessionStore.charge(v2.json(), false),
+                "a fraction of a v2 record's charge for the same window: " + expected + " vs "
+                        + VolPremiumSessionStore.charge(v2.json(), false));
+
+        // The session is charged exactly that, and the charge bounds what the JVM itself reports.
+        Instrumentation jvm = net.bytebuddy.agent.ByteBuddyAgent.install();
+        VolPremiumSessionStore store = new VolPremiumSessionStore();
+        Position at = offer(store, v1, 0).position();
+        assertEquals(VolPremiumSessionStore.SERIES_OVERHEAD_BYTES + expected, store.heldBytes());
+        List<Object> objects = store.retainedObjectsForTest(at);
+        assertEquals(4, objects.size());
+        long fixed = jvm.getObjectSize(objects.get(0)) + jvm.getObjectSize(objects.get(1))
+                + jvm.getObjectSize(objects.get(2));
+        long string = jvm.getObjectSize(objects.get(3)) + jvm.getObjectSize(new byte[v1.json().length()]);
+        assertTrue(VolPremiumSessionStore.RECORD_OVERHEAD_BYTES >= fixed, "fixed objects " + fixed);
+        assertTrue(VolPremiumSessionStore.retainedStringBytes(v1.json()) >= string, "string " + string);
+
+        // The refuse-past-budget policy, unchanged for v1: a budget of exactly ten v1 records holds ten, refuses
+        // the eleventh, evicts nothing, and says the session is incomplete.
+        List<Row> run = new ArrayList<>();
+        for (long seq = 6840; seq < 6852; seq++) {
+            run.add(VolPremiumFixtures.v1At(seq));
+        }
+        long budget = VolPremiumSessionStore.SERIES_OVERHEAD_BYTES;
+        for (int i = 0; i < 10; i++) {
+            budget += VolPremiumSessionStore.charge(run.get(i).json(), false);
+        }
+        VolPremiumSessionStore small = new VolPremiumSessionStore(budget, 2);
+        PrintStream stdout = System.out;
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(captured, true, StandardCharsets.UTF_8));
+        try {
+            for (int i = 0; i < 10; i++) {
+                assertTrue(offer(small, run.get(i), i).admitted(), "v1 row " + i + " fits the budget");
+            }
+            assertEquals(Refusal.SESSION_BUDGET, offer(small, run.get(10), 10).refusal());
+            // A v2 point at an ordinal v1 holds is a NEW position (another epoch) and needs its own charge.
+            assertEquals(Refusal.SESSION_BUDGET, offer(small, readingAt(6845), 11).refusal());
+        } finally {
+            System.setOut(stdout);
+        }
+        String log = captured.toString(StandardCharsets.UTF_8);
+        assertEquals(1, log.split("ERROR vol-premium: session DATABENTO\\|SPX " + SESSION, -1).length - 1, log);
+        assertEquals(json(run.subList(0, 10)), walk(small, FIXTURE_NOW_MS), "nothing held was evicted");
+        assertEquals(budget, small.heldBytes());
+        Snapshot snapshot = small.snapshot("DATABENTO|SPX", FIXTURE_NOW_MS);
+        assertFalse(snapshot.complete());
+        assertEquals(2L, snapshot.refusedForBudget());
+    }
+
+    @Test
+    void aV1AndAV2ReadingOfOneOrdinalOnOneEpochAreOnePositionReplacedByOffsetAndChargedTheDifference() {
+        // TRANSITIONAL LIMIT, pinned: two producers form two runs only because their epochs differ. Should both
+        // accumulators ever begin on the same millisecond, the two readings of one ordinal are the SAME position,
+        // and the later offset replaces the earlier: the within-version rule, charged by the size difference.
+        VolPremiumSessionStore store = new VolPremiumSessionStore();
+        Row v2 = readingAt(7141);
+        long engineEpoch = longField(v2.json(), "measurementEpochMs");
+        Row v1 = VolPremiumFixtures.v1Of(v2, engineEpoch);
+        Admission first = offer(store, v1, 0);
+        assertTrue(first.admitted());
+        long overhead = VolPremiumSessionStore.SERIES_OVERHEAD_BYTES;
+        assertEquals(overhead + VolPremiumSessionStore.charge(v1.json(), false), store.heldBytes());
+
+        Admission second = offer(store, v2, 1);
+        assertTrue(second.admitted());
+        assertEquals(first.position(), second.position(), "one position");
+        assertEquals(1, store.heldObservations());
+        assertEquals(overhead + VolPremiumSessionStore.charge(v2.json(), false), store.heldBytes());
+        assertEquals(List.of(v2.json()), walk(store, FIXTURE_NOW_MS));
+
+        // ...and back (a rollback re-publishing that window): the v1 reading replaces the v2 one; the charge shrinks.
+        assertTrue(offer(store, v1, 2).admitted());
+        assertEquals(overhead + VolPremiumSessionStore.charge(v1.json(), false), store.heldBytes());
+        assertEquals(List.of(v1.json()), walk(store, FIXTURE_NOW_MS));
+
+        // The offset and event-time rules are the same across versions.
+        assertEquals(Refusal.REPLAYED_OFFSET, offer(store, v2, 1).refusal(), "a lower offset is a replay");
+        String v1Later = with(v1.json(), "eventTimeMs", longField(v1.json(), "eventTimeMs") + 1_000L);
+        assertTrue(offer(store, new Row(v1.key(), v1Later), 3).admitted());
+        assertEquals(Refusal.EVENT_TIME_REGRESSION, offer(store, v2, 4).refusal(),
+                "a later offset with an earlier event time is a regression, whichever version carries it");
+        assertEquals(3L, store.admittedObservations(1));
+        assertEquals(1L, store.admittedObservations(2));
     }
 
     // ----- capacity and memory (r1 findings 5 and 6) ----------------------------------------------

@@ -24,8 +24,12 @@ import java.util.regex.Pattern;
  *
  * <p>Response, always a JSON object:
  * <pre>{"symbol":"SPX","sessionDate":"2026-08-27"|null,
- *  "observations":[&lt;IvRvReading v2&gt;,...],"warnings":[&lt;EarlyWarning v1&gt;,...],
+ *  "observations":[&lt;IvRvReading v2 or IvRvReadingV1&gt;,...],"warnings":[&lt;EarlyWarning v1&gt;,...],
  *  "retention":{"complete":true,"refusedForBudget":0,"retainedBytes":N,"budgetBytes":M}}</pre>
+ * Through the v1-to-v2 rollout (runbook "Rollout sequence", step 2 to step 6), {@code observations} may hold
+ * records of either wire version, each exactly as its producer wrote it. A reader tells them apart by each
+ * record's own {@code schemaVersion}. See VolPremiumSessionStore#acceptObservation for the admission rules and
+ * the transitional limits.
  * Observations in {@code (frameSeq, measurementEpochMs)} order and warnings in
  * {@code (frameSeq, asOfMs, episodeId, transition)} order — the same order, the same records and the same bytes a
  * WebSocket replay delivers, because both read the one session store. Each record is the producer's

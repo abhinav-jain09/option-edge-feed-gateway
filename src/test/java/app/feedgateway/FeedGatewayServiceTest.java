@@ -2747,7 +2747,7 @@ class FeedGatewayServiceTest {
     }
 
     @Test
-    void volPremiumIvrvRefusesSchemaVersion1AndEveryContractInvalidBody() throws Exception {
+    void volPremiumIvrvRefusesEveryContractInvalidV2Body() throws Exception {
         // The WHOLE contract, through IvRvReading's own constructor. A body that the contract refuses and
         // the gateway admitted would be cached, replayed and broadcast, and then refused by every browser:
         // a live client keeps what it has while a late joiner is served only the broken record.
@@ -2756,8 +2756,15 @@ class FeedGatewayServiceTest {
         String json = canonical.json();
         String key = canonical.key();
         long offset = 1;
+        // A v2 body RELABELLED schemaVersion 1 is judged by v1's rules, never by v2's: v1's contract takes its
+        // sixteen v1 fields (it ignores the rest), and v1's key is ONE per session — so under this v2
+        // observation key it is a key mismatch, not a v2 record with a wrong number in it.
+        assertNull(vpOffer(service, offset++, key, VolPremiumFixtures.with(json, "schemaVersion", 1)),
+                "schemaVersion 1 under a v2 observation key must be refused");
+        assertEquals(1L, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.KEY_MISMATCH));
+        long schemaVersion = 0;
         String[][] broken = {
-                {"schemaVersion 1 — the producer publishes only v2 now", VolPremiumFixtures.with(json, "schemaVersion", 1)},
                 {"an ordinal that disagrees with its own timestamp", VolPremiumFixtures.with(json, "frameSeq", 7140)},
                 {"a coverage outside [0,1]", VolPremiumFixtures.with(json, "gridCoverage", 2)},
                 {"a measurement epoch from another day", VolPremiumFixtures.with(json, "measurementEpochMs",
@@ -2781,7 +2788,9 @@ class FeedGatewayServiceTest {
             assertNull(vpOffer(service, offset++, key, VolPremiumFixtures.without(json, field)),
                     "a reading missing " + field + " must be refused, not defaulted");
         }
-        malformed += fields.size();
+        // ...except schemaVersion itself: without it no contract can be chosen, so the version gate refuses it.
+        malformed += fields.size() - 1;
+        schemaVersion++;
         // ...and an EXPLICIT null for a primitive is the same hole by a different door.
         String[] primitives = {"schemaVersion", "eventTimeMs", "gridCoverage", "maxContiguousGapSlots",
                 "returnsObserved", "measurementEpochMs", "frameSeq", "frameCadenceMs",
@@ -2790,7 +2799,8 @@ class FeedGatewayServiceTest {
             assertNull(vpOffer(service, offset++, key, VolPremiumFixtures.withNull(json, field)),
                     "an explicit null " + field + " must be refused, not defaulted");
         }
-        malformed += primitives.length;
+        malformed += primitives.length - 1;   // an explicit null schemaVersion: the version gate again
+        schemaVersion++;
         // The declared yyyy-MM-dd grammar, not merely a parseable calendar date.
         for (String badDate : new String[] {"+10000-01-01", "-0001-01-01", "2026-8-27", "20260827"}) {
             assertNull(vpOffer(service, offset++, key, VolPremiumFixtures.with(json, "sessionDate", badDate)),
@@ -2799,6 +2809,8 @@ class FeedGatewayServiceTest {
         malformed += 4;
         assertEquals(malformed, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
                 VolPremiumSessionStore.Refusal.MALFORMED));
+        assertEquals(schemaVersion, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.SCHEMA_VERSION), "a missing or null version never reaches a contract");
 
         // The contract's wire bound. An unknown field is IGNORED by the record, so a padded but otherwise
         // perfect reading is refused by the byte bound alone — which is what makes the cap a memory bound.
@@ -3309,6 +3321,388 @@ class FeedGatewayServiceTest {
         } finally {
             System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
         }
+    }
+
+    // ----- the rollout bridge: schemaVersion 1 from the old producer (runbook "Rollout sequence", step 2) -----
+
+    /** The v1 records the old producer publishes for ordinals [from, to), on the given epoch. */
+    private static List<VolPremiumFixtures.Row> vpV1Run(long from, long to, long epochMs) {
+        List<VolPremiumFixtures.Row> out = new ArrayList<>();
+        for (long seq = from; seq < to; seq++) {
+            out.add(VolPremiumFixtures.v1Of(VolPremiumFixtures.readingAt(seq), epochMs));
+        }
+        return out;
+    }
+
+    /** The engine's own records for ordinals [from, to). */
+    private static List<VolPremiumFixtures.Row> vpV2Run(long from, long to) {
+        List<VolPremiumFixtures.Row> out = new ArrayList<>();
+        for (long seq = from; seq < to; seq++) {
+            out.add(VolPremiumFixtures.readingAt(seq));
+        }
+        return out;
+    }
+
+    @Test
+    void aV1OnlySessionIsAdmittedRetainedReplayedLiveAndServedVerbatim() throws Exception {
+        // Step 2's whole point: the LIVE producer today is the old realised-only service, and this gateway must
+        // keep drawing it. Every one of its records carries the SAME Kafka key (SPX|sessionDate, one per
+        // session); the gateway files each under its own (frameSeq, measurementEpochMs), never under the key.
+        FeedGatewayService service = vpService();
+        service.runOutboundWritesInline();
+        service.serveVolPremiumForTest();
+        List<String> live = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-v1-live", live, null));   // parked: nothing is held yet
+        List<VolPremiumFixtures.Row> v1 = vpV1Run(6840, 6852, VolPremiumFixtures.V1_EPOCH_MS);
+        assertEquals(List.of("SPX|2026-08-27"), v1.stream().map(VolPremiumFixtures.Row::key).distinct().toList(),
+                "precondition: the v1 producer writes ONE key for the whole session");
+        long offset = 0;
+        for (VolPremiumFixtures.Row row : v1) {
+            vpRelay(service, offset++, row);
+        }
+        VolPremiumSessionStore store = service.volPremiumStoreForTest();
+        assertEquals(12, store.heldObservations(), "RETAINED: every v1 point of the session, not the newest");
+        assertEquals(0, store.heldWarnings(), "a v1 record carries no warnings");
+        assertEquals(12L, store.admittedObservations(1));
+        assertEquals(0L, store.admittedObservations(2));
+
+        // LIVE: each record in the one envelope, the producer's bytes verbatim, in order, once.
+        assertEquals(vpJson(v1), vpFrames(live, VP_OBS, VP_WARN));
+        String firstEnvelope = live.stream().filter(m -> m.startsWith("{\"type\":\"" + VP_OBS + "\""))
+                .findFirst().orElseThrow();
+        assertEquals("{\"type\":\"vol-premium-ivrv\",\"data\":" + v1.get(0).json() + "}", firstEnvelope,
+                "the same envelope as v2, around the v1 producer's exact bytes");
+
+        // REPLAY: a late joiner gets the whole v1 session, in ordinal order, verbatim.
+        List<String> late = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-v1-late", late, null));
+        assertEquals(vpJson(v1), vpFrames(late, VP_OBS, VP_WARN));
+
+        // REST: the same records, bytes and order; complete; no warnings.
+        VolPremiumSessionStore.Snapshot rest = service.volPremiumSession("SPX");
+        assertEquals(VolPremiumFixtures.SESSION, rest.sessionDate());
+        assertEquals(vpJson(v1), rest.observations());
+        assertTrue(rest.warnings().isEmpty());
+        assertTrue(rest.complete());
+        String metrics = service.metrics();
+        assertTrue(metrics.contains("gateway_vol_premium_admitted_total{stream=\"ivrv\",schema=\"1\"} 12\n"), metrics);
+        assertTrue(metrics.contains("gateway_vol_premium_admitted_total{stream=\"ivrv\",schema=\"2\"} 0\n"), metrics);
+        assertEquals("DATABENTO|SPX|2026-08-27|6852|" + VolPremiumFixtures.V1_EPOCH_MS,
+                vpOffer(service, offset++, VolPremiumFixtures.v1At(6852)),
+                "filed under its own ordinal on the v1 producer's epoch");
+    }
+
+    @Test
+    void aMixedV1ToV2SessionCrossesTheEpochChangeAsTwoDistinctRuns() throws Exception {
+        // Step 4: the engine replaces the old producer mid-session. Each producer's measurementEpochMs is the
+        // first record ITS accumulator folded, so a switch changes the epoch, and that is what keeps the two
+        // runs apart. Here the v1 run is on 09:15 and the engine's records are the fixture stream's (09:30).
+        // The engine also publishes the ordinal the old producer last wrote: TWO points, where the line breaks.
+        FeedGatewayService service = vpService();
+        service.runOutboundWritesInline();
+        service.serveVolPremiumForTest();
+        List<String> live = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-switch-live", live, null));
+        List<VolPremiumFixtures.Row> v1 = vpV1Run(6840, 6870, VolPremiumFixtures.V1_EPOCH_MS);
+        List<VolPremiumFixtures.Row> v2 = vpV2Run(6869, 6900);
+        long v2Epoch = VolPremiumFixtures.longField(v2.get(0).json(), "measurementEpochMs");
+        assertTrue(VolPremiumFixtures.V1_EPOCH_MS < v2Epoch, "precondition: the switch changed the epoch");
+        long offset = 0;
+        for (VolPremiumFixtures.Row row : v1) {
+            vpRelay(service, offset++, row);
+        }
+        for (VolPremiumFixtures.Row row : v2) {
+            vpRelay(service, offset++, row);
+        }
+        VolPremiumFixtures.Row warning = VolPremiumFixtures.canonicalWarning();
+        vpRelay(service, VP_WARN, offset++, warning.key(), warning.json());
+
+        VolPremiumSessionStore store = service.volPremiumStoreForTest();
+        assertEquals(61, store.heldObservations(), "30 + 31: ordinal 6869 is one point on EACH epoch");
+        assertEquals(1, store.heldWarnings(), "the v1 records added no warnings");
+        assertEquals(30L, store.admittedObservations(1));
+        assertEquals(31L, store.admittedObservations(2));
+        List<String> expected = new ArrayList<>(vpJson(v1));   // ...6869 on the v1 epoch sorts first
+        expected.addAll(vpJson(v2));                           // then 6869 on the engine's, then onwards
+        expected.add(warning.json());
+        assertEquals(expected, vpFrames(live, VP_OBS, VP_WARN), "live: in order, once, verbatim");
+        List<String> late = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-switch-late", late, null));
+        assertEquals(expected, vpFrames(late, VP_OBS, VP_WARN), "replay: the same session");
+        VolPremiumSessionStore.Snapshot rest = service.volPremiumSession("SPX");
+        assertEquals(expected.subList(0, 61), rest.observations());
+        assertEquals(List.of(warning.json()), rest.warnings());
+
+        // Exactly where the basis changed: ordinal 6869, v1 then v2, on two epochs.
+        JsonNode lastV1 = VolPremiumFixtures.MAPPER.readTree(v1.get(29).json());
+        JsonNode firstV2 = VolPremiumFixtures.MAPPER.readTree(v2.get(0).json());
+        assertEquals(6869L, lastV1.get("frameSeq").asLong());
+        assertEquals(6869L, firstV2.get("frameSeq").asLong());
+        assertEquals(1, lastV1.get("schemaVersion").intValue());
+        assertEquals(2, firstV2.get("schemaVersion").intValue());
+        assertNotEquals(lastV1.get("measurementEpochMs").asLong(), firstV2.get("measurementEpochMs").asLong());
+    }
+
+    @Test
+    void aRollbackFromV2ToTheV1ImageIsAdmittedAsANewRunAndTheEngineRunIsKept() throws Exception {
+        // Step 4's rollback: the previous v1 image is redeployed. Its accumulator is heap state, so it starts
+        // again on the first record it sees (a NEW epoch), and it keys by session again. The v1 records are
+        // judged by v1's rules although v2 came first; the engine's run and its warnings stay.
+        FeedGatewayService service = vpService();
+        service.runOutboundWritesInline();
+        service.serveVolPremiumForTest();
+        List<String> live = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-rollback-live", live, null));
+        List<VolPremiumFixtures.Row> v2 = vpV2Run(6840, 6870);
+        long rollbackAt = VolPremiumFixtures.longField(VolPremiumFixtures.readingAt(6870).json(), "eventTimeMs");
+        List<VolPremiumFixtures.Row> v1 = vpV1Run(6870, 6900, rollbackAt);   // the old image: its first record
+        long offset = 0;
+        for (VolPremiumFixtures.Row row : v2) {
+            vpRelay(service, offset++, row);
+        }
+        VolPremiumFixtures.Row warning = VolPremiumFixtures.canonicalWarning();
+        vpRelay(service, VP_WARN, offset++, warning.key(), warning.json());
+        for (VolPremiumFixtures.Row row : v1) {
+            vpRelay(service, offset++, row);
+        }
+
+        VolPremiumSessionStore store = service.volPremiumStoreForTest();
+        assertEquals(60, store.heldObservations());
+        assertEquals(1, store.heldWarnings(), "the engine's warning survives the rollback");
+        assertEquals(30L, store.admittedObservations(2));
+        assertEquals(30L, store.admittedObservations(1));
+        List<String> observations = new ArrayList<>(vpJson(v2));
+        observations.addAll(vpJson(v1));
+        List<String> expected = new ArrayList<>(observations);
+        expected.add(warning.json());
+        List<String> liveExpected = new ArrayList<>(vpJson(v2));
+        liveExpected.add(warning.json());
+        liveExpected.addAll(vpJson(v1));
+        // Live, each arrived when it was relayed; the warning sorts after every observation, so the v1 points that
+        // followed it are points BEHIND this parked socket's cursor, sent at once, after what they follow.
+        assertEquals(liveExpected, vpFrames(live, VP_OBS, VP_WARN), "live: every record once, verbatim");
+        List<String> late = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-rollback-late", late, null));
+        assertEquals(expected, vpFrames(late, VP_OBS, VP_WARN), "replay: both runs in ordinal order, then warnings");
+        assertEquals(observations, service.volPremiumSession("SPX").observations());
+
+        // Rolling forward again later is the same switch in the other direction: a v2 record is admitted
+        // alongside the v1 run, on the engine's own epoch.
+        assertNotNull(vpOffer(service, offset++, VolPremiumFixtures.readingAt(6900)));
+        assertEquals(61, store.heldObservations());
+    }
+
+    @Test
+    void eachVersionRefusesWhatItsOwnRulesRefuseAndNothingRefusedIsHeldOrForwarded() throws Exception {
+        FeedGatewayService service = vpService();
+        service.runOutboundWritesInline();
+        service.serveVolPremiumForTest();
+        List<String> live = new CopyOnWriteArrayList<>();
+        service.addClient(vpSession("vp-refusals", live, null));
+        VolPremiumFixtures.Row v1 = VolPremiumFixtures.v1At(7141);
+        VolPremiumFixtures.Row v2 = VolPremiumFixtures.canonicalReading();
+        long offset = 0;
+        // Each version's KEY rule, never the other's.
+        vpRelay(service, VP_OBS, offset++, v2.key(), v1.json());           // v1 under a v2-style key
+        vpRelay(service, VP_OBS, offset++, "spx|2026-08-27", v1.json());   // v1, not the producer's spelling
+        vpRelay(service, VP_OBS, offset++, v1.key(), v2.json());           // v2 under the v1 key
+        assertEquals(3L, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.KEY_MISMATCH));
+        // An unknown, missing or non-integer version: refused before any contract is chosen.
+        String[][] badVersions = {
+                {v2.key(), VolPremiumFixtures.with(v2.json(), "schemaVersion", 3)},
+                {v1.key(), VolPremiumFixtures.with(v1.json(), "schemaVersion", 0)},
+                {v1.key(), VolPremiumFixtures.without(v1.json(), "schemaVersion")},
+                {v1.key(), VolPremiumFixtures.rawReplace(v1.json(), "\"schemaVersion\":1,", "\"schemaVersion\":1.0,")},
+                {v2.key(), VolPremiumFixtures.rawReplace(v2.json(), "\"schemaVersion\":2,", "\"schemaVersion\":\"2\",")}};
+        for (String[] bad : badVersions) {
+            vpRelay(service, VP_OBS, offset++, bad[0], bad[1]);
+        }
+        assertEquals(badVersions.length, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.SCHEMA_VERSION));
+        // Coercion, on EACH version: the bytes must say what that version's contract validated.
+        String[][] coerced = {
+                {v1.key(), VolPremiumFixtures.rawReplace(v1.json(), "\"frameSeq\":7141,", "\"frameSeq\":7141.5,")},
+                {v1.key(), VolPremiumFixtures.rawReplace(v1.json(), "\"frameSeq\":7141,", "\"frameSeq\":\"7141\",")},
+                {v1.key(), VolPremiumFixtures.rawReplace(v1.json(), "\"frameSeq\":7141,", "\"frameSeq\":7140,\"frameSeq\":7141,")},
+                {v2.key(), VolPremiumFixtures.rawReplace(v2.json(), "\"frameSeq\":7141,", "\"frameSeq\":7141.5,")},
+                {v2.key(), VolPremiumFixtures.rawReplace(v2.json(), "\"frameSeq\":7141,", "\"frameSeq\":\"7141\",")}};
+        for (String[] c : coerced) {
+            vpRelay(service, VP_OBS, offset++, c[0], c[1]);
+        }
+        assertEquals(coerced.length, vpRefusals(service, VolPremiumSessionStore.Stream.OBSERVATION,
+                VolPremiumSessionStore.Refusal.MALFORMED));
+        assertEquals(0, service.volPremiumStoreForTest().heldObservations(), "nothing refused is held");
+        assertTrue(vpFrames(live, VP_OBS, VP_WARN).isEmpty(), "nothing refused is forwarded: " + live);
+        assertNull(service.volPremiumSession("SPX").sessionDate(), "nor served");
+
+        // Each under its own key is admitted and forwarded: one window, two producers, two points.
+        vpRelay(service, offset++, v1);
+        vpRelay(service, offset++, v2);
+        assertEquals(List.of(v1.json(), v2.json()), vpFrames(live, VP_OBS));
+    }
+
+    @Test
+    void acrossVersionsTheReplayLiveHandoffIsOrderedAndExactlyOnce() throws Exception {
+        // The v1 session is held; a socket is still being walked through it when the engine takes over. A live
+        // v2 record ahead of the socket's cursor waits for the walk, even at an ordinal v1 also holds, and a v1
+        // replacement behind the cursor goes at once, after the point it replaces. Nothing twice, nothing lost.
+        System.setProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "40");   // a walk fills 10 at a time
+        try {
+            FeedGatewayService service = vpService();
+            List<VolPremiumFixtures.Row> v1 = vpV1Run(6840, 6900, VolPremiumFixtures.V1_EPOCH_MS);
+            long offset = 0;
+            for (VolPremiumFixtures.Row row : v1) {
+                assertNotNull(vpOffer(service, offset++, row));
+            }
+            service.markStateCaughtUpWithoutHandoffForTest();
+            java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+            List<String> sink = new CopyOnWriteArrayList<>();
+            service.addClient(vpSession("vp-mixed-live", sink, release));
+            VolPremiumSessionStore.Position cursor = service.volPremiumCursorForTest("vp-mixed-live");
+            int k = (int) (cursor.frameSeq() - 6840L);
+            assertTrue(k >= 5 && k < 30, "precondition: the walk is part-way, at row " + k);
+
+            List<VolPremiumFixtures.Row> engine = vpV2Run(6900, 6920);
+            for (VolPremiumFixtures.Row row : engine) {
+                vpRelay(service, offset++, row);                                  // ahead of the cursor
+            }
+            VolPremiumFixtures.Row engineAtAV1Ordinal = VolPremiumFixtures.readingAt(6880);   // v1 holds 6880 too
+            vpRelay(service, offset++, engineAtAV1Ordinal);
+            VolPremiumFixtures.Row v1Third = v1.get(3);
+            String v1ThirdReplaced = vpLater(v1Third.json(), 1_000L);
+            vpRelay(service, VP_OBS, offset++, v1Third.key(), v1ThirdReplaced);   // behind the cursor
+
+            release.countDown();
+            vpAwait(() -> vpFrames(sink, VP_OBS).size() >= 82, 20_000L);
+            Thread.sleep(200L);   // a duplicate, if any, would land now
+            List<String> got = vpFrames(sink, VP_OBS);
+            assertEquals(82, got.size(), "60 v1 + 21 v2, each once, plus the one replacement");
+            int replacedAt = got.indexOf(v1ThirdReplaced);
+            assertTrue(replacedAt > got.indexOf(v1Third.json()), "the replacement follows the point it replaces");
+            List<String> originals = new ArrayList<>(got);
+            originals.remove(replacedAt);
+            List<String> expected = new ArrayList<>(vpJson(v1.subList(0, 41)));   // ...6880 on the v1 epoch
+            expected.add(engineAtAV1Ordinal.json());                               // 6880 on the engine's
+            expected.addAll(vpJson(v1.subList(41, 60)));
+            expected.addAll(vpJson(engine));
+            assertEquals(expected, originals, "and the rest arrive in (frameSeq, epoch) order across versions");
+        } finally {
+            System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
+        }
+    }
+
+    @Test
+    void aRecoveryDuringTheSwitchHandsEachSocketBothVersionsOnceInOrder() throws Exception {
+        // The state cache falls behind while a socket is part-way through a v1 session; meanwhile a v1 window is
+        // corrected behind the socket, the engine publishes a point behind it (a new epoch: a new point) and
+        // takes over ahead of it. At catch-up the socket gets exactly what it lacks, once, in order.
+        System.setProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "40");
+        try {
+            FeedGatewayService service = vpService();
+            List<VolPremiumFixtures.Row> v1 = vpV1Run(6840, 6900, VolPremiumFixtures.V1_EPOCH_MS);
+            for (int i = 0; i < 60; i++) {
+                assertNotNull(vpOffer(service, i, v1.get(i)));
+            }
+            service.markStateCaughtUpWithoutHandoffForTest();
+            java.util.concurrent.Semaphore reads = new java.util.concurrent.Semaphore(0);
+            List<String> sink = new CopyOnWriteArrayList<>();
+            service.addClient(vpSocket("vp-switch-partial", sink, reads, null));
+            VolPremiumSessionStore.Position cursor = service.volPremiumCursorForTest("vp-switch-partial");
+            int k = (int) (cursor.frameSeq() - 6840L);
+            assertTrue(k >= 5 && k < 40, "precondition: a PARTIAL delivery, paced at row " + k);
+
+            vpRecovering(service);
+            long offset = 100;
+            VolPremiumFixtures.Row secondV1 = v1.get(2);
+            String secondReplaced = vpLater(secondV1.json(), 1_000L);
+            vpRelay(service, VP_OBS, offset++, secondV1.key(), secondReplaced);   // v1 replacement BEHIND the cursor
+            VolPremiumFixtures.Row engineBehind = VolPremiumFixtures.readingAt(6843);
+            vpRelay(service, offset++, engineBehind);                             // v2 new point BEHIND it
+            List<VolPremiumFixtures.Row> engineAhead = vpV2Run(6900, 6905);
+            for (VolPremiumFixtures.Row row : engineAhead) {
+                vpRelay(service, offset++, row);                                  // v2 AHEAD of it
+            }
+            assertEquals(cursor, service.volPremiumCursorForTest("vp-switch-partial"), "nothing moves while held");
+            vpCaughtUp(service);
+
+            reads.release(100_000);
+            List<String> expected = new ArrayList<>(vpJson(v1.subList(0, k + 1)));
+            expected.addAll(List.of(secondReplaced, engineBehind.json()));   // the repair, in position order
+            expected.addAll(vpJson(v1.subList(k + 1, 60)));                  // the walk RESUMES
+            expected.addAll(vpJson(engineAhead));
+            vpAwait(() -> vpFrames(sink, VP_OBS).size() >= expected.size(), 20_000L);
+            Thread.sleep(200L);
+            assertEquals(expected, vpFrames(sink, VP_OBS));
+        } finally {
+            System.clearProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES");
+        }
+    }
+
+    /** What Kafka's log cleaner GUARANTEES to keep of a compacted log: the newest record per key, in order. */
+    private static List<VolPremiumFixtures.Row> vpCompacted(List<VolPremiumFixtures.Row> log) {
+        Map<String, Integer> newest = new java.util.HashMap<>();
+        for (int i = 0; i < log.size(); i++) {
+            newest.put(log.get(i).key(), i);
+        }
+        List<VolPremiumFixtures.Row> out = new ArrayList<>();
+        for (int i = 0; i < log.size(); i++) {
+            if (newest.get(log.get(i).key()) == i) {
+                out.add(log.get(i));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * A freshly started gateway reading {@code log} from the ivrv topic through the PRODUCTION cache-consumer
+     * loop, then a late joiner's replay. (The mocked broker numbers the records 0..n-1; a compacted log keeps
+     * its original offsets with gaps, and the gateway only relies on their order.)
+     */
+    private static List<String> vpRebuiltAfterRestart(List<VolPremiumFixtures.Row> log) throws Exception {
+        FeedGatewayService service = vpService();
+        GatewaySettings settings = new GatewaySettings();
+        VpBroker broker = new VpBroker()
+                .topic(settings.volPremiumIvrvTopic(), log)
+                .topic(settings.volPremiumWarningsTopic(), List.of());
+        broker.onPoll = n -> {
+            if (n >= 4) {
+                service.setRunningForTest(false);
+            }
+        };
+        Map<String, FeedGatewayService.TopicBinding> events = Map.of(
+                settings.volPremiumIvrvTopic(), new FeedGatewayService.TopicBinding(FeedGatewayService.VOL_PREMIUM_SOURCE, VP_OBS),
+                settings.volPremiumWarningsTopic(), new FeedGatewayService.TopicBinding(FeedGatewayService.VOL_PREMIUM_SOURCE, VP_WARN));
+        service.setRunningForTest(true);
+        service.runCacheConsumerAttemptForTest("state", events, new java.util.concurrent.atomic.AtomicBoolean(),
+                broker.consumer());
+        List<String> sink = new ArrayList<>();
+        replayVolPremium(service, vpSession("vp-restarted", sink, null));
+        return vpFrames(sink, VP_OBS, VP_WARN);
+    }
+
+    @Test
+    void afterARestartAV1SessionIsWhatTheTopicStillHoldsAllOfItUncompactedOnlyItsNewestPointCompacted()
+            throws Exception {
+        // TRANSITIONAL LIMIT (VolPremiumSessionStore#acceptObservation). The store is heap only, so a restarted
+        // gateway rebuilds the session from the topic. v1 writes ONE key per session; v2 one per observation.
+        List<VolPremiumFixtures.Row> v1 = vpV1Run(6840, 6870, VolPremiumFixtures.V1_EPOCH_MS);
+        List<VolPremiumFixtures.Row> v2 = vpV2Run(6870, 6880);
+        List<VolPremiumFixtures.Row> published = new ArrayList<>(v1);
+        published.addAll(v2);
+
+        // Where the topic is NOT compacted (prod and es4: the producer stamps delete), every record is still
+        // there, and a restart rebuilds the whole mixed session.
+        assertEquals(vpJson(published), vpRebuiltAfterRestart(published));
+
+        // Where it IS compacted (dev), the cleaner may keep only the newest record per KEY. Of the v1 run, only its
+        // last point is guaranteed to survive; every v2 point, keyed by its own ordinal, survives.
+        List<VolPremiumFixtures.Row> compacted = vpCompacted(published);
+        assertEquals(1 + v2.size(), compacted.size());
+        List<String> expected = new ArrayList<>(List.of(v1.get(v1.size() - 1).json()));
+        expected.addAll(vpJson(v2));
+        assertEquals(expected, vpRebuiltAfterRestart(compacted),
+                "the v1 history before its newest point was only ever what a gateway saw LIVE");
     }
 
     @Test

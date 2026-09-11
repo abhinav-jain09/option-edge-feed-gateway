@@ -103,6 +103,40 @@ class VolPremiumControllerTest {
     }
 
     @Test
+    void servesAV1OnlyAndAMixedSessionVerbatimInReplayOrder() throws Exception {
+        // Through the rollout the page may hold either wire version, each record exactly as its producer wrote it.
+        List<Row> v1 = new ArrayList<>();
+        for (long seq = 7141; seq < 7146; seq++) {
+            v1.add(VolPremiumFixtures.v1At(seq));
+        }
+        FeedGatewayService v1Only = gatewayHolding(v1, List.of());
+        MockHttpServletResponse response = get(new VolPremiumController(v1Only, auth(200)), "SPX", "Bearer t");
+        assertEquals(200, response.getStatus());
+        assertEquals("{\"symbol\":\"SPX\",\"sessionDate\":\"2026-08-27\",\"observations\":["
+                + String.join(",", json(v1)) + "],\"warnings\":[],\"retention\":{\"complete\":true,\"refusedForBudget\":0,"
+                + "\"retainedBytes\":" + v1Only.volPremiumSession("SPX").retainedBytes() + ",\"budgetBytes\":"
+                + VolPremiumSessionStore.SERIES_BUDGET_BYTES + "}}", response.getContentAsString(StandardCharsets.UTF_8));
+
+        // Mixed: the v1 run, then the engine from an ordinal the v1 run also holds — both points, v1's epoch first.
+        List<Row> mixed = new ArrayList<>(v1);
+        for (long seq = 7145; seq < 7148; seq++) {
+            mixed.add(VolPremiumFixtures.readingAt(seq));
+        }
+        Row warning = warnings().get(0);
+        FeedGatewayService service = gatewayHolding(mixed, List.of(warning));
+        String body = get(new VolPremiumController(service, auth(200)), "SPX", "Bearer t")
+                .getContentAsString(StandardCharsets.UTF_8);
+        assertEquals("{\"symbol\":\"SPX\",\"sessionDate\":\"2026-08-27\",\"observations\":["
+                + String.join(",", json(mixed)) + "],\"warnings\":[" + warning.json() + "],\"retention\":{\"complete\":true,"
+                + "\"refusedForBudget\":0,\"retainedBytes\":" + service.volPremiumSession("SPX").retainedBytes()
+                + ",\"budgetBytes\":" + VolPremiumSessionStore.SERIES_BUDGET_BYTES + "}}", body);
+        JsonNode page = new ObjectMapper().readTree(body);
+        List<Integer> versions = new ArrayList<>();
+        page.get("observations").forEach(o -> versions.add(o.get("schemaVersion").intValue()));
+        assertEquals(List.of(1, 1, 1, 1, 1, 2, 2, 2), versions, "a reader tells them apart by each record's own version");
+    }
+
+    @Test
     void anUnauthenticatedCallerIs401AndNothingIsRead() throws Exception {
         FeedGatewayService service = mock(FeedGatewayService.class);
         MockHttpServletResponse response = get(new VolPremiumController(service, auth(401)), "SPX", null);
