@@ -17,7 +17,8 @@ class FootprintBasicHistoryTest {
     private FootprintViews view() { return new FootprintViews(mapper, 262144, 32*1024*1024, 1000, 1024*1024, 1000); }
     private String bar(int i) { return "{\"schemaVersion\":6,\"sessionDate\":\"2026-09-11\",\"symbol\":\"ES.v.0\",\"timeframe\":\"1m\",\"observations\":{\"barStartMs\":"+(OPEN+i*60000)+"}}"; }
     private JsonNode request(long after, long to) throws Exception { return mapper.readTree("{\"type\":\"es-footprint-basic-history\",\"sessionDate\":\"2026-09-11\",\"afterMs\":"+after+",\"toMs\":"+to+"}"); }
-    @Test void streamedPagesAreBoundedAscendingAndAllowTheCurrentEsSession() throws Exception {
+    // Keep this identifier stable because the mutation-audit provenance record keys on it.
+    @Test void streamedPagesAreBoundedAscendingAndExcludeOvernight() throws Exception {
         FootprintViews v=view(); for(int i=-1;i<7;i++)v.admitBar(bar(i));
         JsonNode page=mapper.readTree(FootprintBasicHistory.reply(mapper,v,request(OPEN-60001,OPEN+360000),100));
         assertEquals(4,page.path("bars").size()); assertEquals(OPEN-60000,page.path("bars").get(0).path("observations").path("barStartMs").asLong());
