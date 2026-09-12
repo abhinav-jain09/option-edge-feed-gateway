@@ -1470,23 +1470,29 @@ public final class GatewaySettings {
     }
 
     /**
-     * Compacted IV-vs-realised topic of the standalone vol-premium service (JSON
-     * {@code IvRvReadingV1} &mdash; see {@link VolPremiumTopics#IVRV}). One record per
-     * {@code SYMBOL|sessionDate}, published every frame. Resolved through the platform topic-prefix
-     * helper at deploy time, matching the spot-vol-regime sibling above.
+     * Compacted IV-vs-realised topic of the standalone vol-premium service (JSON {@code IvRvReading}
+     * schemaVersion 2 &mdash; see {@link VolPremiumTopics#IVRV}). One record per OBSERVATION, keyed
+     * {@code SYMBOL|sessionDate|frameSeq}, so compaction keeps the whole session. Resolved through the
+     * platform topic-prefix helper at deploy time, matching the spot-vol-regime sibling above.
+     *
+     * <p>There is no freshness TTL for this topic any more: GATEWAY_VOL_PREMIUM_IVRV_TTL_MS is no longer
+     * read. A per-record TTL would keep five minutes of a six-and-a-half-hour chart, so the gateway now
+     * keeps the whole current session, bounded by the contract's own session rule (see
+     * VolPremiumSessionStore), and the consumer judges whether the NEWEST point is current from its
+     * eventTimeMs and frameCadenceMs &mdash; which the contract documents as what those fields are for.
      */
     public String volPremiumIvrvTopic() {
         return value("KAFKA_VOL_PREMIUM_IVRV_TOPIC", VolPremiumTopics.IVRV);
     }
 
     /**
-     * Freshness TTL for the vol-premium IV/RV cache. Same SHORT freshness class as
-     * {@link #spotVolRegimeTtlMs()}: a volatility reading minutes old (dead producer, overnight
-     * leftover) is misleading and must read as absent &mdash; the chart simply has no current point
-     * &mdash; never replay as live. Default 5 min.
+     * Append-only early-warning topic of the same service (JSON {@code EarlyWarning}, one record per
+     * material state transition, keyed by {@code episodeId} &mdash; see
+     * {@link VolPremiumTopics#WARNINGS}). Env-overridable exactly like the ivrv topic; like every topic
+     * this gateway reads, it is never auto-created (see baseConsumerProperties).
      */
-    public long volPremiumIvrvTtlMs() {
-        return longValue("GATEWAY_VOL_PREMIUM_IVRV_TTL_MS", 300_000L, 0L);
+    public String volPremiumWarningsTopic() {
+        return value("KAFKA_VOL_PREMIUM_WARNINGS_TOPIC", VolPremiumTopics.WARNINGS);
     }
 
     /**

@@ -1,0 +1,361 @@
+package app.feedgateway;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.zip.GZIPInputStream;
+
+/**
+ * The REAL vol-premium engine output, committed under {@code src/test/resources/vol-premium/}: the
+ * canonical v2 reading and v1 early warning (byte-for-byte the files the web repo carries too) and a
+ * full-session stream of 371 observations and 15 transitions, in publication order. The observation
+ * stream is gzipped only to keep 2 MB of text out of the repository; its DECOMPRESSED bytes are
+ * pinned by SHA-256 below, as are the other three files, so a fixture cannot drift from what the
+ * engine produced without a test saying so.
+ *
+ * <p>Every payload a test offers is one of these records or a single-field variant of one, and every
+ * variant used here was run through the contract before it was relied on. They are dated to the
+ * session the engine produced them in, so the gateway is told the time through its vol-premium clock
+ * seam ({@link #FIXTURE_NOW_MS}) instead of judging a fixed date against the wall clock — which is
+ * what made the previous fixtures a date bomb.
+ */
+final class VolPremiumFixtures {
+
+    static final ObjectMapper MAPPER = new ObjectMapper();
+
+    static final String CANONICAL_READING_SHA256 = "1406e7ba57d3ec9d6bee66f3d88ded0d837132a33c03bbd1f30a4eaa8a2cbc21";
+    static final String CANONICAL_WARNING_SHA256 = "7a3bd49a79ae70113c2a0c216affdcc4ab15a9f3c6241914649fd3ddeee71802";
+    static final String READINGS_TSV_SHA256 = "141dd9b2ca5deef831ae82cd0e8599766070f7c35d0eb3ca097b5d86eab563e5";
+    static final String WARNINGS_TSV_SHA256 = "951504d4c4ccc2baf316da5c3a6ec38755514f18b44276a32e89a2ca463ea0b3";
+
+    static final String SESSION = "2026-08-27";
+    /** The stream's first observation (frameSeq 6840, 09:30:00 ET) and last (7210). */
+    static final long STREAM_FIRST_EVENT_MS = 1787837400000L;
+    static final long STREAM_LAST_EVENT_MS = 1787839250000L;
+    /** "Now" for every fixture test: one second after the stream's last observation. */
+    static final long FIXTURE_NOW_MS = STREAM_LAST_EVENT_MS + 1_000L;
+    /** ET midnight that opens the session, and the last instant the contract still files under it. */
+    static final long SESSION_MIDNIGHT_MS = 1787803200000L;
+    static final long SESSION_LAST_INSTANT_MS = SESSION_MIDNIGHT_MS + 86_400_000L
+            + com.optionsedge.contracts.volpremium.IvRvReading.MAX_AFTER_MIDNIGHT_MS;
+
+    /** A Kafka record as the producer wrote it: the key, and the value's exact bytes. */
+    record Row(String key, String json) {
+    }
+
+    private static List<Row> readings;
+    private static List<Row> warnings;
+
+    private VolPremiumFixtures() {
+    }
+
+    static byte[] resource(String name) {
+        try (InputStream in = VolPremiumFixtures.class.getResourceAsStream("/vol-premium/" + name)) {
+            if (in == null) {
+                throw new IllegalStateException("missing test resource vol-premium/" + name);
+            }
+            return in.readAllBytes();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    static byte[] readingsTsvBytes() {
+        try (InputStream in = new GZIPInputStream(new java.io.ByteArrayInputStream(resource("ivrv-readings.tsv.gz")))) {
+            return in.readAllBytes();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** All 371 observations of the stream, in publication order. */
+    static synchronized List<Row> readings() {
+        if (readings == null) {
+            readings = rows(readingsTsvBytes());
+        }
+        return readings;
+    }
+
+    /** All 15 warning transitions of the stream, in publication order. */
+    static synchronized List<Row> warnings() {
+        if (warnings == null) {
+            warnings = rows(resource("warnings.tsv"));
+        }
+        return warnings;
+    }
+
+    /** The stream's observation at one ordinal (the stream has exactly one per ordinal). */
+    static Row readingAt(long frameSeq) {
+        String suffix = "|" + frameSeq;
+        for (Row row : readings()) {
+            if (row.key().endsWith(suffix)) {
+                return row;
+            }
+        }
+        throw new IllegalArgumentException("no observation at ordinal " + frameSeq);
+    }
+
+    static Row canonicalReading() {
+        return canonical("ivrv-reading.canonical.v2.json");
+    }
+
+    static Row canonicalWarning() {
+        return canonical("early-warning.canonical.v1.json");
+    }
+
+    // ----- schemaVersion 1: the OLD realised-only producer (the rollout bridge) --------------------------
+
+    /**
+     * The v1 producer's measurement epoch in these fixtures: 09:15 ET on the fixture session, i.e. an
+     * old-producer process that started before the open. It differs from the engine's epoch (09:30:00, the
+     * stream's), which is what a producer switch does. Each producer's epoch is the first record ITS OWN
+     * accumulator folded.
+     */
+    static final long V1_EPOCH_MS = SESSION_MIDNIGHT_MS + (9L * 60L + 15L) * 60_000L;
+
+    /** The old image's build id, so a v1 record's bytes are recognisably not the engine's. */
+    static final String V1_CODE_VERSION = "vp-v1-realised-only";
+
+    /** The v1 producer's serialiser: processing main VolPremiumStreams.JSON is a plain {@code new ObjectMapper()}. */
+    private static final ObjectMapper V1_PRODUCER_JSON = new ObjectMapper();
+
+    /** The v1 producer's Kafka key: ONE per session, {@code settings.symbol() + "|" + sessionDate}. */
+    static String v1Key(String symbol, String sessionDate) {
+        return symbol + "|" + sessionDate;
+    }
+
+    /**
+     * What the OLD producer would have published for the same window as an engine row. It takes the row's
+     * sixteen v1 components (the v2 record's first sixteen ARE the v1 record's), with schemaVersion 1, on the
+     * given measurement epoch. It is built through IvRvReadingV1's own constructor, so the contract validates
+     * every one, serialised as that producer serialises it, and keyed as it keys it.
+     */
+    static Row v1Of(Row engineRow, long measurementEpochMs) {
+        ObjectNode n = object(engineRow.json());
+        com.optionsedge.contracts.volpremium.IvRvReadingV1 reading =
+                new com.optionsedge.contracts.volpremium.IvRvReadingV1(
+                        com.optionsedge.contracts.volpremium.IvRvReadingV1.CURRENT_SCHEMA_VERSION,
+                        n.get("symbol").asText(), n.get("sessionDate").asText(), n.get("eventTimeMs").asLong(),
+                        nullableDouble(n, "atmIvPct"), nullableLong(n, "impliedAsOfMs"),
+                        nullableDouble(n, "realisedVolPct"), nullableDouble(n, "impliedMinusRealisedPct"),
+                        n.get("gridCoverage").asDouble(), n.get("maxContiguousGapSlots").asInt(),
+                        n.get("returnsObserved").asInt(), measurementEpochMs, n.get("frameSeq").asLong(),
+                        n.get("frameCadenceMs").asLong(), n.get("baselineMode").asText(), V1_CODE_VERSION);
+        try {
+            return new Row(v1Key(reading.symbol(), reading.sessionDate()), V1_PRODUCER_JSON.writeValueAsString(reading));
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** The v1 record for the stream's window at one ordinal, on the v1 producer's epoch. */
+    static Row v1At(long frameSeq) {
+        return v1Of(readingAt(frameSeq), V1_EPOCH_MS);
+    }
+
+    private static Double nullableDouble(JsonNode n, String field) {
+        return n.hasNonNull(field) ? Double.valueOf(n.get(field).asDouble()) : null;
+    }
+
+    private static Long nullableLong(JsonNode n, String field) {
+        return n.hasNonNull(field) ? Long.valueOf(n.get(field).asLong()) : null;
+    }
+
+    /** One top-level field replaced; every other byte of the record's content kept. */
+    static String with(String json, String field, long value) {
+        ObjectNode node = object(json);
+        node.put(field, value);
+        return write(node);
+    }
+
+    static String with(String json, String field, String value) {
+        ObjectNode node = object(json);
+        node.put(field, value);
+        return write(node);
+    }
+
+    static String withNull(String json, String field) {
+        ObjectNode node = object(json);
+        node.putNull(field);
+        return write(node);
+    }
+
+    static String without(String json, String field) {
+        ObjectNode node = object(json);
+        node.remove(field);
+        return write(node);
+    }
+
+    /**
+     * The same observation one session later or earlier: every instant moved by whole days, the
+     * session date with them. The ordinal is unchanged because it is measured from the session's own
+     * midnight, and no DST change falls between 2026-08-26 and 2026-08-28.
+     */
+    static String shiftedDays(String json, int days, String sessionDate) {
+        ObjectNode node = object(json);
+        long delta = days * 86_400_000L;
+        for (String field : new String[] {"eventTimeMs", "impliedAsOfMs", "spotAsOfMs", "measurementEpochMs"}) {
+            if (node.hasNonNull(field)) {
+                node.put(field, node.get(field).asLong() + delta);
+            }
+        }
+        node.put("sessionDate", sessionDate);
+        return write(node);
+    }
+
+    static long longField(String json, String field) {
+        return object(json).get(field).asLong();
+    }
+
+    /**
+     * The record's TEXT with {@code from} replaced by {@code to} exactly once — for the wire-level
+     * variants (a fractional ordinal, a quoted number, a duplicated key) that no tree edit can produce.
+     */
+    static String rawReplace(String json, String from, String to) {
+        int at = json.indexOf(from);
+        if (at < 0 || json.indexOf(from, at + 1) >= 0) {
+            throw new IllegalArgumentException("'" + from + "' must occur exactly once");
+        }
+        return json.substring(0, at) + to + json.substring(at + from.length());
+    }
+
+    /** Minutes, as the producer's 5 s ordinals: the ordinal shift that moves a record by {@code ms}. */
+    static final long CADENCE_MS = 5_000L;
+
+    /**
+     * The same observation {@code ordinals} cadence steps later: its ordinal and every instant of the
+     * frame moved together, its measurement epoch kept (the accumulator did not restart). The
+     * contract re-derives the ordinal from the event time, so the two cannot drift apart.
+     */
+    static Row shiftedObservation(Row row, long ordinals) {
+        ObjectNode node = object(row.json());
+        long delta = ordinals * CADENCE_MS;
+        for (String field : new String[] {"eventTimeMs", "impliedAsOfMs", "spotAsOfMs"}) {
+            if (node.hasNonNull(field)) {
+                node.put(field, node.get(field).asLong() + delta);
+            }
+        }
+        long frameSeq = node.get("frameSeq").asLong() + ordinals;
+        node.put("frameSeq", frameSeq);
+        String symbol = node.get("symbol").asText();
+        String sessionDate = node.get("sessionDate").asText();
+        // Each trend names the earlier frame it was measured against: that frame moves with this one
+        // (its epoch does not — the accumulator did not restart).
+        for (JsonNode trend : node.withArray("trends")) {
+            ObjectNode t = (ObjectNode) trend;
+            if (!t.hasNonNull("referenceFrameSeq")) {
+                continue;   // no reference frame yet (the warming grid): nothing to move
+            }
+            t.put("referenceFrameSeq", t.get("referenceFrameSeq").asLong() + ordinals);
+            for (String field : new String[] {"referenceAsOfMs", "referenceImpliedAsOfMs", "referenceSpotAsOfMs"}) {
+                if (t.hasNonNull(field)) {
+                    t.put(field, t.get(field).asLong() + delta);
+                }
+            }
+        }
+        // ...and so does every episode the observation reports open.
+        for (JsonNode summary : node.withArray("warnings")) {
+            ObjectNode w = (ObjectNode) summary;
+            if (w.hasNonNull("openedFrameSeq")) {
+                long opened = w.get("openedFrameSeq").asLong() + ordinals;
+                w.put("openedFrameSeq", opened);
+                w.put("episodeId", symbol + "|" + sessionDate + "|" + w.get("type").asText() + "|" + opened);
+            }
+        }
+        return new Row(symbol + "|" + sessionDate + "|" + frameSeq, write(node));
+    }
+
+    /**
+     * The same warning transition {@code ordinals} cadence steps later: its instants, its ordinals and
+     * therefore its episode id moved together, so it is a transition of a DIFFERENT episode.
+     */
+    static Row shiftedWarning(Row row, long ordinals) {
+        ObjectNode node = object(row.json());
+        long delta = ordinals * CADENCE_MS;
+        node.put("asOfMs", node.get("asOfMs").asLong() + delta);
+        node.put("openedAtMs", node.get("openedAtMs").asLong() + delta);
+        node.put("frameSeq", node.get("frameSeq").asLong() + ordinals);
+        long opened = node.get("openedFrameSeq").asLong() + ordinals;
+        node.put("openedFrameSeq", opened);
+        String episodeId = node.get("symbol").asText() + "|" + node.get("sessionDate").asText() + "|"
+                + node.get("type").asText() + "|" + opened;
+        node.put("episodeId", episodeId);
+        return new Row(episodeId, write(node));
+    }
+
+    /**
+     * A FULL 09:30–16:00 session at the producer's 5 s cadence — 4,680 observations, ordinals 6840 to
+     * 11519 — built from the engine's own 371 records: block {@code b} of the stream moved
+     * {@code b × 371} ordinals later. Every record is the engine's bytes with only its time moved.
+     */
+    static List<Row> referenceSession() {
+        List<Row> stream = readings();
+        List<Row> out = new ArrayList<>(4_680);
+        for (int i = 0; i < 4_680; i++) {
+            long block = i / stream.size();
+            out.add(block == 0 ? stream.get(i) : shiftedObservation(stream.get(i % stream.size()), block * stream.size()));
+        }
+        return List.copyOf(out);
+    }
+
+    /** One more field replaced, with a JSON object built from a mutable tree edit. */
+    static String edit(String json, java.util.function.Consumer<ObjectNode> change) {
+        ObjectNode node = object(json);
+        change.accept(node);
+        return write(node);
+    }
+
+    static String sha256(byte[] bytes) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static Row canonical(String name) {
+        try {
+            JsonNode tree = MAPPER.readTree(resource(name));
+            return new Row(tree.get("key").asText(), MAPPER.writeValueAsString(tree.get("value")));
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private static List<Row> rows(byte[] tsv) {
+        List<Row> out = new ArrayList<>();
+        for (String line : new String(tsv, StandardCharsets.UTF_8).split("\n")) {
+            if (line.isEmpty()) {
+                continue;
+            }
+            int tab = line.indexOf('\t');
+            out.add(new Row(line.substring(0, tab), line.substring(tab + 1)));
+        }
+        return List.copyOf(out);
+    }
+
+    private static ObjectNode object(String json) {
+        try {
+            return (ObjectNode) MAPPER.readTree(json);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private static String write(ObjectNode node) {
+        try {
+            return MAPPER.writeValueAsString(node);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+}

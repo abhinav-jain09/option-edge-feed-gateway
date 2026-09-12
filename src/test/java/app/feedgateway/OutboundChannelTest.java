@@ -940,4 +940,47 @@ class OutboundChannelTest {
         }
         assertTrue(sent.size() >= n, "expected >= " + n + " sent, got " + sent.size());
     }
+
+    @Test
+    void theIdleHookRunsWhenTheQueueDrainsEmptyCanRefillAndNeverRunsForAClosedChannel() throws Exception {
+        // A producer that paces a large replay against this socket's bounds (the vol-premium session
+        // replay) refills from this hook. It must run each time the writer drains the queue EMPTY, be able
+        // to enqueue from inside itself (it runs outside the channel lock), survive a hook that throws,
+        // and never run for a closed channel, where nothing it enqueued could be delivered.
+        OutboundChannel ch = channel(recordingSession(), 10, 1_000_000L);
+        AtomicInteger idles = new AtomicInteger();
+        java.util.concurrent.atomic.AtomicBoolean refillAccepted = new java.util.concurrent.atomic.AtomicBoolean();
+        CountDownLatch secondIdle = new CountDownLatch(1);
+        ch.onIdle(() -> {
+            int n = idles.incrementAndGet();
+            if (n == 1) {
+                refillAccepted.set(ch.enqueue("refill", null));   // re-arms a drain from inside the hook
+            } else if (n == 2) {
+                secondIdle.countDown();
+                throw new IllegalStateException("a failing hook must not take the writer down");
+            }
+        });
+        org.junit.jupiter.api.Assertions.assertTrue(ch.enqueue("first", null));
+        org.junit.jupiter.api.Assertions.assertTrue(secondIdle.await(5, TimeUnit.SECONDS),
+                "the hook ran again once its own refill had drained");
+        org.junit.jupiter.api.Assertions.assertTrue(refillAccepted.get());
+        org.junit.jupiter.api.Assertions.assertEquals(List.of("first", "refill"), sent);
+        org.junit.jupiter.api.Assertions.assertEquals(0L, ch.queuedBytes());
+
+        // The throw above left the socket healthy: a later frame is still delivered.
+        ch.onIdle(null);
+        org.junit.jupiter.api.Assertions.assertTrue(ch.enqueue("after", null));
+        long deadline = System.currentTimeMillis() + 5_000L;
+        while (sent.size() < 3 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5L);
+        }
+        org.junit.jupiter.api.Assertions.assertEquals(List.of("first", "refill", "after"), sent);
+
+        AtomicInteger afterClose = new AtomicInteger();
+        ch.shutdown();
+        ch.onIdle(afterClose::incrementAndGet);
+        org.junit.jupiter.api.Assertions.assertFalse(ch.enqueue("late", null));
+        Thread.sleep(50L);
+        org.junit.jupiter.api.Assertions.assertEquals(0, afterClose.get(), "a closed channel never calls the hook");
+    }
 }

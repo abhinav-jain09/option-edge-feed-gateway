@@ -165,7 +165,10 @@ public class FeedGatewayService implements ReplayRunner {
             "direction-push",
             "direction-scorecard",
             "direction-progress",
-            "vol-premium-ivrv",
+            // vol-premium-ivrv (and vol-premium-warning) are deliberately ABSENT. Every observation is a
+            // point on a chart, keyed by its own ordinal: coalescing kept only the newest queued frame for
+            // a slow socket, so the page silently lost the observations in between and drew a straight
+            // line across them — the continuity the frame ordinal exists to make provable (VP-345).
             "indicators",
             "tapeZones",
             "opb-by-option", "opb-session",
@@ -426,12 +429,44 @@ public class FeedGatewayService implements ReplayRunner {
     // pill simply vanishes. Same standalone/global/JSON pass-through delivery class as the
     // greek-move-auth sibling above; NOT in the ui-batch. Keyed by symbol.
     private final Map<String, String> spotVolRegime = new ConcurrentHashMap<>();
-    // Vol-premium IV-vs-realised reading: ONE current value per SYMBOL|sessionDate
-    // (last-value-wins) on the SHORT volPremiumIvrvTtlMs window, so a stale reading (dead producer,
-    // overnight leftover) is evicted rather than replayed as live — the chart simply has no current
-    // point. Same standalone/global/JSON pass-through class as the spot-vol-regime sibling above;
-    // NOT in the ui-batch.
-    private final Map<String, String> volPremiumIvrv = new ConcurrentHashMap<>();
+    // Vol-premium IV-vs-realised: the WHOLE current session per symbol — every observation and every
+    // early-warning transition — not one current value (Gate-1 §39.7, VP-338, VP-345, VP-348, VP-366).
+    // Identity, ordering, retention and the enforced byte budget live in the store; see
+    // VolPremiumSessionStore. Its constructor refuses to start the gateway when that budget does not fit
+    // the heap this JVM was given.
+    // Same standalone/global/JSON pass-through class as the spot-vol-regime sibling above; NOT in the
+    // ui-batch.
+    private final VolPremiumSessionStore volPremiumStore = new VolPremiumSessionStore();
+    /** The binding source both vol-premium topics are bound under, and the prefix of every series key. */
+    static final String VOL_PREMIUM_SOURCE = "DATABENTO";
+    /**
+     * How far back a restarted consumer seeks the vol-premium topics: the longest span one session's
+     * records can cover — from its ET midnight to MAX_AFTER_MIDNIGHT_MS past the next one — so a restart
+     * at any point of a session re-reads all of it.
+     */
+    static final long VOL_PREMIUM_SESSION_SEEK_BACK_MS = 86_400_000L
+            + com.optionsedge.contracts.volpremium.IvRvReading.MAX_AFTER_MIDNIGHT_MS;
+    /**
+     * The vol-premium delivery state of every socket that has reached its replay point, for the rest
+     * of the socket's life (VP-345). This map — not {@code clients} — IS the vol-premium fan-out's
+     * socket set, and a socket enters it in ONE step under {@link #volPremiumIvrvEmitLock} together with
+     * its ordered walk ({@link #replayVolPremiumIvrvCached}). So a live record either precedes that step
+     * (and is then in the store, where the walk hands it over in order) or follows it (and meets the
+     * walk's cursor): it can never reach a socket ahead of the history before it, nor twice. A socket in
+     * {@code clients} that has not reached its replay point receives no vol-premium record at all.
+     * Removed on every teardown path. See {@link #routeVolPremium} for the delivery rules.
+     */
+    private final Map<String, VolPremiumDelivery> volPremiumDeliveries = new ConcurrentHashMap<>();
+    /**
+     * Whether vol-premium records are being delivered at all: true from the moment the JSON-state cache
+     * consumer — whose catch-up barriers include both vol-premium streams — has caught up, false while it
+     * is recovering. Guarded by {@link #volPremiumIvrvEmitLock} and flipped only together with every
+     * socket's delivery state ({@link #serveVolPremium}, {@link #holdVolPremium}), so the flag can never
+     * open a window in which a live record reaches a socket ahead of the history before it.
+     */
+    private boolean volPremiumServing;
+    /** Test seam: the clock every vol-premium time decision reads; null in production (the wall clock). */
+    private volatile java.util.function.LongSupplier volPremiumClockOverride;
     // Gamma-leadership CURRENT reading: ONE current value per chain (underlying|expiry),
     // last-value-wins on the SHORT gammaLeadershipTtlMs window. Same standalone/global/JSON
     // pass-through class as the two siblings above; NOT in the ui-batch.
@@ -469,15 +504,15 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private final Object indicatorsEmitLock = new Object();
     /**
-     * Same role as {@link #indicatorsEmitLock} and for the same two races. The cache and live
-     * consumers read the SAME single partition, and the contract permits an equal-event-time
-     * correction at a later offset — so without one lock spanning (cache update -> broadcast) and
-     * (cache read -> replay enqueue), a superseded offset can win the broadcast, or a replay can
-     * enqueue an older frame over a newer one already queued under the same coalescing key.
+     * Same role as {@link #indicatorsEmitLock}, for BOTH vol-premium streams (observations and
+     * warnings). Only the cache consumer ingests them, but a socket's walk also runs on the connect path and
+     * on the socket writer's thread, so without one lock spanning (store admit -> claim -> route) and
+     * (replay cursor read -> enqueue), a replay and a live frame could each decide the other would deliver a
+     * record and neither would. It also guards every {@link VolPremiumDelivery} and
+     * {@link #volPremiumServing}, which is what makes each routing decision one comparison against state no
+     * other thread can move at the same time.
      */
     private final Object volPremiumIvrvEmitLock = new Object();
-    private final Map<String, java.util.concurrent.atomic.AtomicLong> volPremiumIvrvBroadcastOffset
-            = new ConcurrentHashMap<>();
     /**
      * Times a vol-premium record arrived behind the stored offset while carrying a strictly newer
      * event time — the signature of a recreated topic, which no incarnation of this one can
@@ -491,18 +526,80 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, java.util.concurrent.atomic.AtomicLong>
             indicatorsBroadcastOffset = new ConcurrentHashMap<>();
 
-    /** Exactly-one, in-order live delivery per offset — the single-partition contract. */
-    boolean shouldBroadcastVolPremiumIvrv(String cacheKey, long offset) {
-        var gate = volPremiumIvrvBroadcastOffset.computeIfAbsent(cacheKey,
-                k -> new java.util.concurrent.atomic.AtomicLong(-1L));
-        while (true) {
-            long current = gate.get();
-            if (offset <= current) {
-                return false;
-            }
-            if (gate.compareAndSet(current, offset)) {
-                return true;
-            }
+    /**
+     * Exactly-one, in-order live delivery per offset — the single-partition contract, judged per
+     * observation now that an observation is the unit a record describes. The fence lives on the
+     * store entry, so it goes wherever the entry goes (see VolPremiumSessionStore#claimBroadcast).
+     */
+    boolean shouldBroadcastVolPremium(VolPremiumSessionStore.Position position, long offset) {
+        return volPremiumStore.claimBroadcast(position, offset);
+    }
+
+    /**
+     * The clock every vol-premium decision reads — future skew, session currency, purge. The wall
+     * clock in production. A seam because the real engine fixtures are dated to the session they were
+     * produced in, and judged against the wall clock they would expire two days after being committed.
+     */
+    long volPremiumNow() {
+        java.util.function.LongSupplier clock = volPremiumClockOverride;
+        return clock != null ? clock.getAsLong() : System.currentTimeMillis();
+    }
+
+    void volPremiumClockForTest(java.util.function.LongSupplier clock) {
+        this.volPremiumClockOverride = clock;
+    }
+
+    VolPremiumSessionStore volPremiumStoreForTest() {
+        return volPremiumStore;
+    }
+
+    /**
+     * One socket's vol-premium delivery (VP-345), from registration until the socket goes away. Every
+     * field is guarded by the emit lock.
+     *
+     * <p><b>The invariant</b>, while the store is being served: every position
+     * at or behind {@code cursor} has had its CURRENT version handed to the socket, except the
+     * positions a pending repair still owes ({@link #repairOwes}); nothing ahead of {@code cursor} has
+     * been handed over by the live path. The ordered walk advances {@code cursor} one position at a
+     * time, in the store's single replay order, paced against the socket's queue bounds.
+     *
+     * <p><b>Repair.</b> While the cache consumer recovers, nothing is delivered, so versions admitted
+     * then behind a socket's cursor would never reach it. {@code repairSince} records, per stretch of
+     * positions at or behind the cursor, the store admission up to which the socket was in step
+     * (upper bound of the stretch → admission sequence). On return to service the repair walks those
+     * positions in order and hands over exactly the versions admitted after that point, then the
+     * ordered walk continues from the cursor. Nothing the socket already has is sent again.
+     */
+    private static final class VolPremiumDelivery {
+        final WebSocketSession session;
+        /** The last position the ordered walk handed over; null until the first. */
+        VolPremiumSessionStore.Position cursor;
+        /** How far the pending repair has examined; null when it has not begun. */
+        VolPremiumSessionStore.Position repairAt;
+        /** Pending repair: upper bound of each stretch (the last is the cursor) → in step up to this admission. */
+        final java.util.TreeMap<VolPremiumSessionStore.Position, Long> repairSince = new java.util.TreeMap<>();
+        /**
+         * The walk reached the end of the store with no repair pending: every held position has been
+         * handed over. Live records then go straight to the socket like every other live event —
+         * never paced behind a queue that may not drain empty for a long time on a busy socket.
+         */
+        boolean parked;
+        /** Re-entrancy guard: an inline writer can call the idle hook from inside a pump. */
+        boolean pumping;
+        boolean again;
+
+        VolPremiumDelivery(WebSocketSession session) {
+            this.session = session;
+        }
+
+        /** Whether the pending repair will hand this position over — so the live path must not. */
+        boolean repairOwes(VolPremiumSessionStore.Position position) {
+            return !repairSince.isEmpty() && position.compareTo(repairSince.lastKey()) <= 0
+                    && (repairAt == null || position.compareTo(repairAt) > 0);
+        }
+
+        long repairThreshold(VolPremiumSessionStore.Position position) {
+            return repairSince.ceilingEntry(position).getValue();
         }
     }
 
@@ -1280,6 +1377,7 @@ public class FeedGatewayService implements ReplayRunner {
         outbound.clear();
         shutdownExecutorGracefully(outboundWriters);
         sellerActivityStore.close();
+        volPremiumStore.close();
     }
 
     static void shutdownExecutorGracefully(ExecutorService executor) {
@@ -1408,7 +1506,6 @@ public class FeedGatewayService implements ReplayRunner {
             replayGammaLeadershipCached(session);
             replayDirectionCached(session);
             replayDirectionPushCached(session);
-            replayVolPremiumIvrvCached(session);
             replayIndicatorsCached(session);
             replayTapeZonesCached(session);
             replayIbkrPreOpenCached(session);
@@ -1417,6 +1514,10 @@ public class FeedGatewayService implements ReplayRunner {
             replayCloseDirectionCached(session);
             replayZeroDteIntelligenceCached(session);
         }
+        // Vol-premium joins here whether or not the state cache has caught up: until it has, the socket's
+        // delivery is simply held (serveVolPremium walks it from the start at catch-up), so it needs no
+        // second call site and cannot be missed.
+        replayVolPremiumIvrvCached(session);
         // gex-by-strike is the one MULTI-SOURCE cache: IBKR/Unusual-Whales gex arrives via the JSON state
         // consumer while DATABENTO gex arrives via the Avro consumer. Its cached replay is only complete once
         // BOTH have caught up, so gate it on both flags (avoids a first-send that omits one source's gex).
@@ -1451,6 +1552,7 @@ public class FeedGatewayService implements ReplayRunner {
     public void removeClient(WebSocketSession session) {
         esAuctionHelloPending.remove(session);   // a socket that closed while waiting for its hello must not be held
         String id = session.getId();
+        volPremiumDeliveries.remove(id);   // a delivery (and a paced replay) for a socket that is gone must not hold it
         OutboundChannel channel = outbound.remove(id);
         spotBandSwitchDelivered.remove(id);
         WebSocketSession stored = clientsById.remove(id);
@@ -1489,6 +1591,7 @@ public class FeedGatewayService implements ReplayRunner {
             sockets = routingEngine.teardownAppSession(appSessionId);
         }
         for (String socketId : sockets) {
+            volPremiumDeliveries.remove(socketId);
             OutboundChannel channel = outbound.remove(socketId);
             WebSocketSession stored = clientsById.remove(socketId);
             if (stored != null) {
@@ -1511,6 +1614,7 @@ public class FeedGatewayService implements ReplayRunner {
             return;
         }
         for (String socketId : socketIds) {
+            volPremiumDeliveries.remove(socketId);
             OutboundChannel channel = outbound.remove(socketId);
             WebSocketSession stored = clientsById.remove(socketId);
             if (stored != null) {
@@ -1549,6 +1653,7 @@ public class FeedGatewayService implements ReplayRunner {
     /** Detach a client the channel just disconnected for being too slow (the socket is already closed). */
     private void onSlowDisconnect(OutboundChannel channel) {
         outbound.remove(channel.socketId(), channel);
+        volPremiumDeliveries.remove(channel.socketId());
         WebSocketSession stored = clientsById.remove(channel.socketId());
         if (stored != null) {
             clients.remove(stored);
@@ -1947,14 +2052,22 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# TYPE gateway_es_auction_backfill_requests_total counter\n"
                 + "gateway_es_auction_backfill_requests_total " + esAuctionBackfillRequests.get() + "\n"
                 + "gateway_es_auction_orphan_envelopes_total " + esAuctionOrphanEnvelopes.get() + "\n"
-                + "# HELP gateway_vol_premium_topic_resets_total vol-premium-ivrv records admitted as a "
-                + "recreated topic: behind the cached offset AND strictly newer, which no incarnation "
-                + "of that topic can otherwise produce. Each one is a recovery from a reset that "
-                + "would otherwise have frozen the card for the rest of the session; a rising count "
-                + "with no operator action behind it means the detector is firing on something "
-                + "else.\n"
+                + "# HELP gateway_vol_premium_topic_resets_total vol-premium records admitted as a "
+                + "recreated topic: at or behind the offset held for the SAME observation or "
+                + "transition AND strictly newer, which no incarnation of that topic can otherwise "
+                + "produce. Each one is a recovery from a reset that would otherwise have frozen that "
+                + "point for the rest of the session; a rising count with no operator action behind "
+                + "it means the detector is firing on something else.\n"
                 + "# TYPE gateway_vol_premium_topic_resets_total counter\n"
                 + "gateway_vol_premium_topic_resets_total " + VOL_PREMIUM_TOPIC_RESETS.get() + "\n"
+                + "# HELP gateway_vol_premium_serving Whether vol-premium records are being delivered (the state "
+                + "cache consumer carrying them has caught up); 0 while it recovers and every socket is held.\n"
+                + "# TYPE gateway_vol_premium_serving gauge\n"
+                + "gateway_vol_premium_serving " + boolMetric(volPremiumServingForTest()) + "\n"
+                + "# HELP gateway_vol_premium_deliveries Sockets registered for vol-premium delivery.\n"
+                + "# TYPE gateway_vol_premium_deliveries gauge\n"
+                + "gateway_vol_premium_deliveries " + volPremiumDeliveries.size() + "\n"
+                + volPremiumStore.metricsText()
                 + "# HELP options_edge_feed_gateway_snapshots Cached option snapshot count.\n"
                 + "# TYPE options_edge_feed_gateway_snapshots gauge\n"
                 + "options_edge_feed_gateway_snapshots " + snapshots.size() + "\n"
@@ -2386,8 +2499,14 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
-        // Vol-premium IV/RV rides the same optional/standalone JSON class as spot-vol-regime.
-        topicEvents.put(settings.volPremiumIvrvTopic(), new TopicBinding("DATABENTO", "vol-premium-ivrv"));
+        // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
+        // JSON class as spot-vol-regime. Both consumers are ASSIGNED both topics (the two maps stay
+        // symmetric), but only the CACHE consumer ingests them (relayVolPremium); the live consumer's
+        // vol-premium branch says why.
+        topicEvents.put(settings.volPremiumIvrvTopic(),
+                new TopicBinding(VOL_PREMIUM_SOURCE, VolPremiumSessionStore.EVENT_OBSERVATION));
+        topicEvents.put(settings.volPremiumWarningsTopic(),
+                new TopicBinding(VOL_PREMIUM_SOURCE, VolPremiumSessionStore.EVENT_WARNING));
         // Gamma-leadership CURRENT rides the same optional/standalone JSON class.
         topicEvents.put(settings.gammaLeadershipTopic(), new TopicBinding("DATABENTO", "gamma-leadership"));
         // Candle Direction CURRENT decision (commissioning shadow) rides the same optional/standalone JSON class.
@@ -2526,8 +2645,14 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
-        // Vol-premium IV/RV rides the same optional/standalone JSON class as spot-vol-regime.
-        topicEvents.put(settings.volPremiumIvrvTopic(), new TopicBinding("DATABENTO", "vol-premium-ivrv"));
+        // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
+        // JSON class as spot-vol-regime. Both consumers are ASSIGNED both topics (the two maps stay
+        // symmetric), but only the CACHE consumer ingests them (relayVolPremium); the live consumer's
+        // vol-premium branch says why.
+        topicEvents.put(settings.volPremiumIvrvTopic(),
+                new TopicBinding(VOL_PREMIUM_SOURCE, VolPremiumSessionStore.EVENT_OBSERVATION));
+        topicEvents.put(settings.volPremiumWarningsTopic(),
+                new TopicBinding(VOL_PREMIUM_SOURCE, VolPremiumSessionStore.EVENT_WARNING));
         // Gamma-leadership CURRENT rides the same optional/standalone JSON class.
         topicEvents.put(settings.gammaLeadershipTopic(), new TopicBinding("DATABENTO", "gamma-leadership"));
         // Candle Direction CURRENT decision (commissioning shadow) rides the same optional/standalone JSON class.
@@ -2774,7 +2899,8 @@ public class FeedGatewayService implements ReplayRunner {
         runRetryingConsumer(
                 name,
                 retry -> runAssignedCacheConsumerOnce(name, topicEvents, avro, caughtUpFlag),
-                () -> markCacheRecovering(caughtUpFlag)
+                () -> markCacheRecovering(caughtUpFlag,
+                        topicEvents.values().stream().map(TopicBinding::event).distinct().toList())
         );
     }
 
@@ -2903,7 +3029,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // partitions — the exact user-visible symptom of the incident being fixed. Gated on
                         // addedSelected so growth on a non-selected source cannot flap readiness for nothing.
                         live = false;
-                        markCacheRecovering(caughtUpFlag);
+                        markCacheRecovering(caughtUpFlag, events);
                     }
                     // Lag-skip protection covers EVERY added partition, source-filtered or not: the
                     // selection can change while a partition is still replaying, and it would then be
@@ -2960,21 +3086,13 @@ public class FeedGatewayService implements ReplayRunner {
                         droppedByOtherReasons.incrementAndGet();
                         continue;
                     }
-                    if (binding != null && "vol-premium-ivrv".equals(binding.event())) {
-                        // Same reason as indicators below: THIS consumer also ingests the IV/RV
-                        // topic, so whichever consumer wins updateCache for an offset must be the
-                        // one that broadcasts it. Without this block the cache consumer takes the
-                        // offset, the live consumer's duplicate is then correctly rejected by the
-                        // offset gate, and nobody broadcasts — clients starve while the cache is
-                        // perfectly up to date.
-                        synchronized (volPremiumIvrvEmitLock) {
-                            String ivrvKey = updateCache(binding, record, json);
-                            if (ivrvKey != null && caughtUpFlag.get()
-                                    && shouldBroadcastVolPremiumIvrv(ivrvKey, record.offset())) {
-                                broadcast(binding.event(), json);
-                                forwardedEvents.incrementAndGet();
-                            }
-                        }
+                    if (binding != null && isVolPremiumEvent(binding.event())) {
+                        // THE ingest path of both vol-premium streams: this consumer alone admits, claims and
+                        // routes them (the live consumer leaves them here; see its vol-premium branch). It reads the
+                        // partition in offset order from the start of the session, so the store always holds a
+                        // contiguous prefix of it; delivery is served once that prefix reaches the bootstrap end
+                        // offsets (markCacheCaughtUp), and every later record is routed live, in order.
+                        relayVolPremium(binding, record, json);
                         continue;
                     }
                     if (binding != null && "indicators".equals(binding.event())) {
@@ -3051,7 +3169,7 @@ public class FeedGatewayService implements ReplayRunner {
                             catchUpEndOffsets(boundedEndOffsets(consumer, partitions), topicEvents));
                     live = caughtUp(consumer, catchUpEndOffsets);
                     if (!live) {
-                        markCacheRecovering(caughtUpFlag);
+                        markCacheRecovering(caughtUpFlag, events);
                     }
                 }
                 if (!live && caughtUp(consumer, catchUpEndOffsets)) {
@@ -3280,7 +3398,7 @@ public class FeedGatewayService implements ReplayRunner {
             AtomicBoolean cacheCaughtUpFlag,
             boolean retry
     ) {
-        try (KafkaConsumer<String, Object> consumer = new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name))) {
+        try (KafkaConsumer<String, Object> consumer = newLiveConsumer(name, avro)) {
             List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
             liveBootstrapSeek(consumer, partitions, topicEvents, retry);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
@@ -3489,24 +3607,15 @@ public class FeedGatewayService implements ReplayRunner {
                         forwardedEvents.incrementAndGet();
                         continue;
                     }
-                    if ("vol-premium-ivrv".equals(binding.event())) {
-                        // Same shape as indicators below, and needed for the same two races: the
-                        // whole cache→CAS→enqueue decision is ONE unit under the emit lock, and the
-                        // offset CAS makes whichever consumer wins the broadcaster. Both consumers
-                        // read the same single partition, and the contract allows an equal-
-                        // event-time correction at a later offset — so an event-time gate alone
-                        // would let a superseded offset broadcast over its own correction.
-                        //
-                        // Freshness stays fail-closed: a stale reading yields a null key from
-                        // updateCache and is therefore never live-broadcast.
-                        synchronized (volPremiumIvrvEmitLock) {
-                            String ivrvKey = updateCache(binding, record, json);
-                            if (ivrvKey != null && cacheCaughtUpFlag.get()
-                                    && shouldBroadcastVolPremiumIvrv(ivrvKey, record.offset())) {
-                                broadcast(binding.event(), json);
-                                forwardedEvents.incrementAndGet();
-                            }
-                        }
+                    if (isVolPremiumEvent(binding.event())) {
+                        // NOT INGESTED BY THIS CONSUMER (Codex r2 finding 1). The JSON-state CACHE consumer is
+                        // the one reader that admits, claims and routes both vol-premium streams, in offset order
+                        // from the start of the session, so the store is always a CONTIGUOUS prefix of the
+                        // partition. This consumer starts at END (liveBootstrapSeek), possibly past records the
+                        // cache consumer has not read yet. A record admitted here would enter the store ahead of
+                        // that history: a socket's walk would hand it over and park past it, and the history filled
+                        // in behind it would follow out of order. Left to the cache consumer, it arrives one poll
+                        // later, at one record per 5 s cadence tick.
                         continue;
                     }
                     if ("indicators".equals(binding.event())) {
@@ -3948,8 +4057,13 @@ public class FeedGatewayService implements ReplayRunner {
                     // Never lag-skip the pre-open IBKR status/control stream either: R-WIRE.2 is
                     // a NON-DROP control path — a seekToEnd could permanently skip a revocation,
                     // generation close or path transition. Volume is tiny (one window's statuses).
+                    // Never lag-skip the vol-premium streams either: every observation is a point of the
+                    // session chart and every warning a transition drawn over it (VP-345, VP-366), so a
+                    // seekToEnd would cut a hole in both that no later record repairs. Volume is one
+                    // record per cadence tick plus rare transitions.
                     return !"max-pain".equals(binding.event()) && !isEsOpenDirectionEvent(binding.event())
-                            && !"ibkr-preopen-status".equals(binding.event());
+                            && !"ibkr-preopen-status".equals(binding.event())
+                            && !isVolPremiumEvent(binding.event());
                 })
                 .toList();
         if (selectedPartitions.isEmpty()) {
@@ -4006,6 +4120,23 @@ public class FeedGatewayService implements ReplayRunner {
         if (caughtUpFlag.getAndSet(false)) {
             broadcast("status", statusJson());
         }
+    }
+
+    /**
+     * The cache consumer carrying {@code events} is no longer caught up. When it carries the vol-premium
+     * streams, their delivery is HELD with it — every socket's position is recorded for the repair —
+     * until {@link #markCacheCaughtUp} serves them again.
+     */
+    private void markCacheRecovering(AtomicBoolean caughtUpFlag, Collection<String> events) {
+        if (carriesVolPremium(events)) {
+            holdVolPremium();
+        }
+        markCacheRecovering(caughtUpFlag);
+    }
+
+    static boolean carriesVolPremium(Collection<String> events) {
+        return events.contains(VolPremiumSessionStore.EVENT_OBSERVATION)
+                || events.contains(VolPremiumSessionStore.EVENT_WARNING);
     }
 
     private List<TopicPartition> partitionsFor(String name, KafkaConsumer<?, ?> consumer, Set<String> topics) {
@@ -4424,7 +4555,11 @@ public class FeedGatewayService implements ReplayRunner {
                     || "indicators".equals(binding.event())
                     || "tapeZones".equals(binding.event())
                     || "es-auction".equals(binding.event())
+                    || isVolPremiumEvent(binding.event())
                     || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
+                // Both vol-premium streams are GLOBAL advisories bound under DATABENTO only by
+                // convention: with another source selected they must still gate readiness, or the cache
+                // reads caught up — and vol-premium delivery starts — over a session not yet read.
                 // The pre-open status/control stream is SOURCE-INDEPENDENT window state:
                 // stateCaughtUp must include its partition regardless of the active market-data
                 // source, or replay could expose a pre-revocation snapshot (round-2 finding 4).
@@ -4458,9 +4593,11 @@ public class FeedGatewayService implements ReplayRunner {
                     || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
                     || "indicators".equals(preOpenBinding.event())
                     || "tapeZones".equals(preOpenBinding.event())
-                    || "es-auction".equals(preOpenBinding.event()))) {
+                    || "es-auction".equals(preOpenBinding.event())
+                    || isVolPremiumEvent(preOpenBinding.event()))) {
                 // Source-independent streams (pre-open control + shared live gex + indicators +
-                // tape-zones board) always gate mid-run barriers too (r1 finding 4).
+                // tape-zones board + both vol-premium streams) always gate mid-run barriers too (r1
+                // finding 4) — a vol-premium topic discovered late included.
                 selected.put(entry.getKey(), entry.getValue());
                 continue;
             }
@@ -4560,6 +4697,21 @@ public class FeedGatewayService implements ReplayRunner {
         try { runAssignedCacheConsumerOnce(name, topicEvents, false, caughtUpFlag); } finally { cacheConsumerForTest = null; }
     }
 
+    /** Test seam: the client a LIVE-consumer attempt uses; null in production, which builds a real KafkaConsumer. */
+    private volatile java.util.function.Supplier<KafkaConsumer<String, Object>> liveConsumerForTest;
+
+    private KafkaConsumer<String, Object> newLiveConsumer(String name, boolean avro) {
+        java.util.function.Supplier<KafkaConsumer<String, Object>> seam = liveConsumerForTest;
+        return seam != null ? seam.get() : new KafkaConsumer<>(avro ? avroConsumerProperties(name) : stringObjectConsumerProperties(name));
+    }
+
+    /** Test seam: ONE production live-consumer attempt (the retry loop's unit) against the supplied client. */
+    void runLiveConsumerAttemptForTest(String name, Map<String, TopicBinding> topicEvents, AtomicBoolean cacheCaughtUpFlag,
+                                       KafkaConsumer<String, Object> client, boolean retry) {
+        liveConsumerForTest = () -> client;
+        try { runLiveConsumerOnce(name, topicEvents, false, cacheCaughtUpFlag, retry); } finally { liveConsumerForTest = null; }
+    }
+
     /** Test seam: the named consumer's next poll runs its partition refresh. */
     void expirePartitionRefreshForTest(String name) {
         PartitionRefresh r = partitionRefreshes.get(name);
@@ -4631,14 +4783,14 @@ public class FeedGatewayService implements ReplayRunner {
                     replaySpotVolRegimeCached(client);
                 }
             }
-            // Vol-premium IV/RV is its OWN standalone event with its OWN topic. Gating its
-            // catch-up on spot-vol-regime's presence meant a consumer carrying only the IV/RV
-            // topic never re-pushed it, and one carrying only spot-vol-regime re-pushed IV/RV it
-            // had not consumed.
-            if (events.contains("vol-premium-ivrv")) {
-                for (WebSocketSession client : clients) {
-                    replayVolPremiumIvrvCached(client);
-                }
+            // Vol-premium is its OWN standalone class with its OWN topics. Delivery starts (or resumes)
+            // HERE, under the emit lock, for every socket at once: each socket's walk RESUMES from the
+            // position already handed to it, a repair first hands over exactly the versions admitted
+            // behind that position while delivery was held, and the live path only ever consults the
+            // serving flag inside the same lock — so there is no instant at which a live record can
+            // overtake a socket's history, and nothing a socket already has is sent again.
+            if (carriesVolPremium(events)) {
+                serveVolPremium();
             }
             // Indicator CURRENT is STANDALONE too: explicit re-push once caught up.
             if (events.contains("indicators")) {
@@ -5591,10 +5743,6 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private synchronized String updateCache(TopicBinding binding, ConsumerRecord<String, ?> record, String json) {
-        // Set by the offset gate when a record shows the recreated-topic shape, and ACTED ON only
-        // where the record is genuinely admitted — see both sites. Declared here because those two
-        // places are in different scopes and the fact has to travel between them.
-        boolean volPremiumRecreatedTopic = false;
         String event = binding.event();
         String key = record.key() == null || record.key().isBlank()
                 ? record.topic() + ":" + record.partition()
@@ -5610,6 +5758,15 @@ public class FeedGatewayService implements ReplayRunner {
                                 : System.currentTimeMillis());
             }
             return key;
+        }
+        if (isVolPremiumEvent(event)) {
+            // The vol-premium streams never enter the generic last-value cache. Their unit is an
+            // OBSERVATION of a session, not a current value, and every rule the generic path applies
+            // per key — offset order, recreated-topic recovery, freshness — is applied per observation
+            // by the session store instead (VolPremiumSessionStore). Answered here, like hot-strike, so
+            // no later generic gate can second-guess a record the store has already judged.
+            VolPremiumSessionStore.Admission admission = admitVolPremium(binding, record, json);
+            return admission.admitted() ? volPremiumCacheKey(admission.position()) : null;
         }
         if ("pace".equals(event)) {
             key = paceCacheKey(json, key);
@@ -5653,8 +5810,6 @@ public class FeedGatewayService implements ReplayRunner {
             key = directionProgressCacheKey(json, key);
         } else if ("spot-vol-regime".equals(event)) {
             key = spotVolRegimeCacheKey(json, key);
-        } else if ("vol-premium-ivrv".equals(event)) {
-            key = volPremiumIvrvCacheKey(json, key);
         } else if ("indicators".equals(event)) {
             key = indicatorsCacheKey(json, key);
         } else if ("tapeZones".equals(event)) {
@@ -5709,7 +5864,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         String versionKey = event + ":" + key;
         if ("ibkr-preopen-status".equals(event) || "indicators".equals(event)
-                || "tapeZones".equals(event) || "vol-premium-ivrv".equals(event)) {
+                || "tapeZones".equals(event)) {
             // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5; indicators rev 14
             // §6.9 r1 finding 2): these topics are single-partition per symbol and
             // strictly ordered by offset — Kafka timestamps may tie or regress
@@ -5718,56 +5873,9 @@ public class FeedGatewayService implements ReplayRunner {
             // partition; a DIFFERENT partition for the same key is fail-closed
             // (reject, never reorder) — each indicator symbol lives on exactly one
             // topic/partition (§7.3).
-            //
-            // vol-premium-ivrv belongs to exactly this class, and needs it for a reason the event
-            // time cannot cover: the contract permits an equal-event-time CORRECTION at a later
-            // offset (Kafka is last-write-wins), and the generic event-time gate accepts equal
-            // timestamps. Without the offset gate the cache consumer could take offset N+1 and the
-            // live consumer then take offset N, whose equal timestamp passes — broadcasting the
-            // value the correction had already superseded. The topic is single-partition by
-            // construction: the producer creates it with one partition and refuses to boot on any
-            // other count.
             RecordPosition incoming = recordPosition(record);
             RecordPosition previousPosition = cachePositions.get(versionKey);
-            // A TOPIC RECREATION IS NOT A REGRESSION, and the gate cannot tell them apart from the
-            // offset alone.
-            //
-            // A deleted-and-remade topic — an operator remaking it, the daily reset — starts again
-            // at offset zero while a perfectly fresh cache entry still holds the old incarnation's
-            // position. Every frame of the SAME session would then be refused until the offset
-            // climbed back past it, which for a mid-session recreation is the rest of the day. The
-            // cache freezes, live delivery stops, and nothing anywhere reports a fault.
-            //
-            // The EVENT TIME is what distinguishes the two. This producer stamps each reading with
-            // its own stream time, which never runs backwards, so a record that is BOTH behind the
-            // stored offset and strictly ahead of the stored event time cannot be a replay of
-            // something already seen — no incarnation of this topic can produce it. A recreation
-            // can, and does, on its very first record.
-            //
-            // So that shape RESETS the entry rather than being dropped: it is counted, and the
-            // fence goes with it, because a stale fence would suppress the same frames the
-            // position gate just stopped suppressing.
-            if (previousPosition != null && "vol-premium-ivrv".equals(event)) {
-                Long storedEventTime = cacheEventTimes.get(versionKey);
-                long incomingEventTime = eventCacheTimestamp(event, record, json);
-                // AT OR BELOW the stored offset, not strictly below. If the old incarnation had
-                // reached only offset 0 — a topic recreated moments after its first record, or one
-                // whose only frame was the session's first — the new incarnation's first record is
-                // offset 0 as well, and a strict comparison would drop the very frame this
-                // recovery exists to admit. Equal offset with a strictly newer event time is just
-                // as impossible within one incarnation as a lower one: an offset identifies a
-                // record, and this producer's event times never run backwards.
-                volPremiumRecreatedTopic = incoming.offset() <= previousPosition.offset()
-                        && previousPosition.partition().equals(incoming.partition())
-                        && storedEventTime != null && incomingEventTime > storedEventTime;
-                // NOTHING IS RECORDED HERE. Recognising the shape is not the recovery — the record
-                // still has the staleness gate ahead of it, and a recreated topic whose first
-                // record arrives past its TTL is refused. Counting and clearing the fence at this
-                // point would report a recovery that did not happen and would drop a fence for a
-                // record that never got cached or broadcast. Both happen where the record is
-                // actually admitted, below.
-            }
-            if (!volPremiumRecreatedTopic && previousPosition != null
+            if (previousPosition != null
                     && (!previousPosition.partition().equals(incoming.partition())
                         || incoming.offset() <= previousPosition.offset())) {
                 return null;
@@ -5783,18 +5891,6 @@ public class FeedGatewayService implements ReplayRunner {
                 && !"ibkr-preopen-status".equals(event)
                 && !"indicators".equals(event)
                 && !"tapeZones".equals(event)
-                // vol-premium-ivrv is DELIBERATELY still timestamp-gated, unlike the three above.
-                //
-                // Its event time cannot legitimately regress: the producer stamps each reading
-                // with its own Kafka Streams stream time, which never runs backwards, so a later
-                // record always carries an equal or greater event time. Equal is the correction
-                // case and passes this gate; strictly EARLIER is a corrupt or foreign record, and
-                // dropping it here is the same rule the browser applies to its own series — which
-                // is the point. Excluding it here instead would leave the gateway accepting a
-                // regression that every browser then discards, so a live client and a late joiner
-                // would diverge with nothing failing anywhere. The offset gate above still does
-                // the work the timestamp gate cannot: it decides which CONSUMER broadcasts, and
-                // orders the equal-time corrections that this gate lets through.
                 && previousEventTime != null && previousEventTime > eventTime) {
             return null;   // (offset-ordered streams above are never timestamp-gated —
                            // a publishedAt wall-clock regression must not outrank a
@@ -5921,19 +6017,6 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 greekMoveAuthCurrent.put(key, json); // ONE current verdict per symbol — last-value-wins
-                return key;
-            }
-            case "vol-premium-ivrv" -> {
-                cacheEventTimes.put(versionKey, eventTime);
-                cachePositions.put(versionKey, recordPosition(record));
-                volPremiumIvrv.put(key, json); // ONE current reading per source|SYMBOL|sessionDate
-                if (volPremiumRecreatedTopic) {
-                    // HERE, where the record is genuinely admitted, so the counter means what its
-                    // HELP text says — a recovery that happened — and the fence is dropped only
-                    // for a reading that will actually be cached and offered for broadcast.
-                    VOL_PREMIUM_TOPIC_RESETS.incrementAndGet();
-                    volPremiumIvrvBroadcastOffset.remove(key);
-                }
                 return key;
             }
             case "gamma-leadership" -> {
@@ -6412,6 +6495,10 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
         expiredKeys.forEach(this::removeCacheEntry);
+        // Vol-premium sessions end by the contract's session rule, judged on the vol-premium clock. The
+        // store's lock is a LEAF (it calls nothing while held), so taking it under this monitor cannot
+        // invert any lock order — which removeCacheEntry's test pins for the emit locks.
+        volPremiumStore.purge(volPremiumNow());
     }
 
     private boolean isCacheFresh(String versionKey, long nowMs) {
@@ -6916,11 +7003,13 @@ public class FeedGatewayService implements ReplayRunner {
             // live. Same ONE-seam consequences as the sibling above.
             return CachePolicy.expiring(settings.spotVolRegimeTtlMs());
         }
-        if ("vol-premium-ivrv".equals(event)) {
-            // Vol-premium IV/RV reading: same SHORT freshness class — an implied-vs-realised point
-            // is only meaningful while CURRENT, and a dead producer's last reading must read as
-            // absent rather than replay as live.
-            return CachePolicy.expiring(settings.volPremiumIvrvTtlMs());
+        if (isVolPremiumEvent(event)) {
+            // Vol-premium observations and warnings are retained for their SESSION (see
+            // VolPremiumSessionStore), so all this policy still decides is how far back a restarted
+            // consumer seeks: far enough to re-read the whole current session. It never evicts — the
+            // records never enter the generic cache, and a session ends by the contract's rule, not
+            // by record age.
+            return CachePolicy.noEviction(VOL_PREMIUM_SESSION_SEEK_BACK_MS);
         }
         if ("indicators".equals(event)) {
             // Indicator CURRENT snapshot: same SHORT freshness class — a dead
@@ -7144,11 +7233,6 @@ public class FeedGatewayService implements ReplayRunner {
             // pass the SHORT greekMoveAuthTtlMs window and render the authenticity track as live.
             return greekMoveAuthTimestamp(json);
         }
-        if ("vol-premium-ivrv".equals(event)) {
-            // Freshness tracks the PAYLOAD's own event time, never the Kafka ARRIVAL time, so a
-            // producer catching up on a backlog cannot render a stale reading as live.
-            return volPremiumIvrvTimestamp(json);
-        }
         if ("gamma-leadership".equals(event)) {
             // Freshness tracks the PAYLOAD event time (ts), never Kafka arrival time.
             return gammaLeadershipTimestamp(json);
@@ -7311,22 +7395,6 @@ public class FeedGatewayService implements ReplayRunner {
      * implausibly-future and fails closed — same freeze-safety rationale as
      * {@link #greekMoveAuthTimestamp}.
      */
-    /**
-     * Stream-time (eventTimeMs) of a vol-premium reading; -1 means malformed/absent/implausibly
-     * future and fails closed — same freeze-safety rationale as {@link #spotVolRegimeTimestamp}.
-     */
-    private long volPremiumIvrvTimestamp(String json) {
-        try {
-            long eventTimeMs = longField(mapper.readTree(json), "eventTimeMs", -1L);
-            if (eventTimeMs > System.currentTimeMillis() + SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS) {
-                return -1L; // implausibly future — fail closed, never cache or replay
-            }
-            return eventTimeMs;
-        } catch (JsonProcessingException ignored) {
-            return -1L;
-        }
-    }
-
     private long gammaLeadershipTimestamp(String json) {
         try {
             long eventTimeMs = longField(mapper.readTree(json), "ts", -1L);
@@ -7485,35 +7553,6 @@ public class FeedGatewayService implements ReplayRunner {
             directionScorecard.remove(versionKey.substring("direction-scorecard:".length()));
         } else if (versionKey.startsWith("direction-progress:")) {
             directionProgress.remove(versionKey.substring("direction-progress:".length()));
-        } else if (versionKey.startsWith("vol-premium-ivrv:")) {
-            String ivrvKey = versionKey.substring("vol-premium-ivrv:".length());
-            volPremiumIvrv.remove(ivrvKey);
-            // THE BROADCAST FENCE GOES WITH THE ENTRY IT FENCES.
-            //
-            // The fence remembers the greatest offset already broadcast for a key, which is what
-            // lets two consumers of one topic agree on who delivers a record. Kept after the cache
-            // entry is gone, it stops being a fence and becomes a floor: if the topic is recreated
-            // — deleted and remade by an operator, or wiped by the daily reset — offsets start at
-            // zero again, and every fresh frame of the SAME session would be silently refused
-            // until the offset climbed back past the old incarnation's high-water mark. The cache
-            // itself recovers, so late joiners would be served correctly while every already-open
-            // page froze: the worst shape, because nothing is failing.
-            //
-            // WHAT THIS IS AND IS NOT ATOMIC WITH, stated exactly, because the first version of
-            // this comment claimed more than the code gives.
-            //
-            // It is atomic with INGEST: updateCache holds the same instance monitor this method
-            // now holds, so the fence is removed with the timestamp, the position and the reading
-            // as one unit — a record can never find half an entry.
-            //
-            // It is NOT atomic with a consumer's BROADCAST DECISION, which runs under the emit
-            // lock and not under this monitor, and deliberately so: taking the emit lock here
-            // would invert the order both ingest paths use and deadlock the gateway. The window
-            // that leaves is benign in the only direction that matters. A purge landing between a
-            // consumer's cache write and its shouldBroadcast call can only RESET the fence, so
-            // that record broadcasts — never the reverse — and only for an entry already old
-            // enough to expire, which a freshly written one is not.
-            volPremiumIvrvBroadcastOffset.remove(ivrvKey);
         } else if (versionKey.startsWith("indicators:")) {
             indicatorsCurrent.remove(versionKey.substring("indicators:".length()));
         } else if (versionKey.startsWith("close-direction:")) {
@@ -8266,32 +8305,267 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * Late-join delivery for the vol-premium IV/RV reading: same GLOBAL advisory class as
-     * {@link #replaySpotVolRegimeCached} — deliberately NOT filtered by the active market
-     * selection, and symbol-filtered client-side. Purge-first plus the SHORT window means a late
-     * joiner gets the CURRENT reading only; anything older is simply absent and the chart shows no
-     * current point rather than a stale one.
+     * Late-join delivery of the vol-premium SESSION (VP-345): every held observation in
+     * (frameSeq, measurementEpochMs) order, then the session's warning transitions, then live. Used by
+     * addClient (legacy connect) and by replayCachedToSocket (per-session connect and return-to-live).
+     * Same GLOBAL advisory class as {@link #replaySpotVolRegimeCached}: not filtered by the active
+     * market selection, symbol-filtered client-side.
+     *
+     * <p>The socket joins the vol-premium fan-out HERE, in one step with its walk, under the emit lock
+     * (see {@link #volPremiumDeliveries}). This never RESTARTS a delivery: a socket that already has
+     * one — return-to-live from a historical replay, during which it kept receiving the global
+     * vol-premium stream — simply resumes, so nothing it holds is sent twice.
+     *
+     * <p>PACED, not flushed. A whole session is thousands of records — 4,680 at the producer's 5 s
+     * cadence — against a socket queue bounded by wsMaxQueuedMessages and wsMaxQueuedBytes. Enqueued at
+     * once, the replay itself would breach that bound and disconnect every late joiner as a "slow
+     * client" from mid-morning on. So a walk fills at most a QUARTER of the socket's bounds, and the
+     * socket's writer calls back ({@link OutboundChannel#onIdle}) each time it has drained, to fill
+     * again. The rest of the budget stays free for everything else the socket carries.
      */
     private void replayVolPremiumIvrvCached(WebSocketSession session) {
-        long nowMs = System.currentTimeMillis();
-        purgeExpiredCache(nowMs);
-        // The (cache-read -> send-enqueue) pair is atomic under the emit lock, so a live update
-        // either lands BEFORE (and replay reads the newer value) or AFTER (and its enqueue
-        // supersedes ours via coalescing). The stale ordering — live N+1 enqueued, then replayed
-        // N enqueued over it under the same coalescing key, leaving the socket on the older value
-        // until some later frame happens to arrive — cannot happen.
+        String socketId = session.getId();
         synchronized (volPremiumIvrvEmitLock) {
-            for (Map.Entry<String, String> entry : volPremiumIvrv.entrySet()) {
-                String json = entry.getValue();
-                if (json == null || json.isBlank()) {
-                    continue;
-                }
-                if (!isCacheFresh("vol-premium-ivrv:" + entry.getKey(), nowMs)) {
-                    continue;
-                }
-                send(session, "vol-premium-ivrv", json);
+            volPremiumDeliveries.computeIfAbsent(socketId, id -> new VolPremiumDelivery(session));
+            pumpVolPremium(socketId);
+        }
+    }
+
+    /**
+     * The cache consumer carrying vol-premium has caught up: serve every socket. Each socket
+     * repairs what was admitted behind its cursor while held, then walks on from its cursor; a socket
+     * that never received anything walks from the start. One step under the emit lock.
+     */
+    private void serveVolPremium() {
+        synchronized (volPremiumIvrvEmitLock) {
+            if (volPremiumServing) {
+                return;
+            }
+            volPremiumServing = true;
+            for (String socketId : new ArrayList<>(volPremiumDeliveries.keySet())) {
+                pumpVolPremium(socketId);
             }
         }
+    }
+
+    /**
+     * The cache consumer carrying vol-premium is recovering: deliver nothing until it has caught up
+     * again, and record for every socket how far it is in step, so the repair can hand over exactly
+     * what it misses meanwhile. Everything at or behind the cursor was in step up to the latest
+     * admission — except, when a repair was already under way, the stretch it had not yet examined,
+     * which keeps the older point it was in step up to.
+     */
+    private void holdVolPremium() {
+        synchronized (volPremiumIvrvEmitLock) {
+            if (!volPremiumServing) {
+                return;
+            }
+            volPremiumServing = false;
+            long inStepUpTo = volPremiumStore.admissionSeq();
+            for (Map.Entry<String, VolPremiumDelivery> e : volPremiumDeliveries.entrySet()) {
+                VolPremiumDelivery d = e.getValue();
+                OutboundChannel channel = outbound.get(e.getKey());
+                if (channel != null) {
+                    channel.onIdle(null);
+                }
+                if (d.cursor == null) {
+                    continue;   // nothing handed over yet: its walk starts from the top when served
+                }
+                if (d.repairSince.isEmpty()) {
+                    d.repairSince.put(d.cursor, inStepUpTo);
+                } else if (d.repairAt != null) {
+                    d.repairSince.headMap(d.repairAt, true).clear();
+                    d.repairSince.put(d.repairAt, inStepUpTo);
+                }
+                d.repairAt = null;
+            }
+        }
+    }
+
+    private void pumpVolPremium(String socketId) {
+        synchronized (volPremiumIvrvEmitLock) {
+            VolPremiumDelivery delivery = volPremiumDeliveries.get(socketId);
+            if (delivery == null) {
+                return;
+            }
+            if (delivery.pumping) {
+                // An inline writer drained what this pump just enqueued and called back from inside it:
+                // note it and let the outer loop refill, rather than recursing once per record.
+                delivery.again = true;
+                return;
+            }
+            delivery.pumping = true;
+            try {
+                do {
+                    delivery.again = false;
+                    fillVolPremium(socketId, delivery);
+                } while (delivery.again && volPremiumDeliveries.get(socketId) == delivery);
+            } finally {
+                delivery.pumping = false;
+            }
+        }
+    }
+
+    /**
+     * Hand the socket what it is owed, up to its share of the socket's bounds: first the pending repair
+     * (versions admitted behind the cursor while held), then the ordered walk from the cursor. When the
+     * walk reaches the end of the store the socket is PARKED: from then on each newly admitted record
+     * reaches it through {@link #routeVolPremium}, still in order, still once.
+     */
+    private void fillVolPremium(String socketId, VolPremiumDelivery delivery) {
+        if (!volPremiumServing) {
+            return;
+        }
+        delivery.parked = false;
+        long nowMs = volPremiumNow();
+        OutboundChannel channel = outbound.get(socketId);
+        int maxMessages = Math.max(1, settings.wsMaxQueuedMessages() / 4);
+        long maxBytes = Math.max(1L, settings.wsMaxQueuedBytes() / 4);
+        if (channel != null) {
+            // Installed BEFORE the budget check below, so a writer that drains the queue between that
+            // check and this pump's return still finds the hook and calls back.
+            channel.onIdle(() -> pumpVolPremium(socketId));
+        }
+        while (volPremiumDeliveries.get(socketId) == delivery) {
+            if (channel != null) {
+                if (channel.isClosed()) {
+                    return;   // its teardown (onSlowDisconnect / removeClient) drops the delivery
+                }
+                if (channel.queueDepth() >= maxMessages || channel.queuedBytes() >= maxBytes) {
+                    return;   // the writer calls back once it has drained
+                }
+            } else if (!delivery.session.isOpen()) {
+                // No channel and closed: a socket whose teardown already ran (and dropped its delivery)
+                // before a racing return-to-live re-created it. No teardown will come again — drop it here.
+                volPremiumDeliveries.remove(socketId, delivery);
+                return;
+            }
+            if (!delivery.repairSince.isEmpty()) {
+                VolPremiumSessionStore.Item owed = volPremiumStore.nextChanged(delivery.repairAt,
+                        delivery.repairSince.lastKey(), delivery::repairThreshold, nowMs);
+                if (owed != null) {
+                    delivery.repairAt = owed.position();
+                    send(delivery.session, owed.position().event(), owed.json());
+                    continue;
+                }
+                delivery.repairSince.clear();
+                delivery.repairAt = null;
+            }
+            VolPremiumSessionStore.Item next = volPremiumStore.next(delivery.cursor, nowMs);
+            if (next == null) {
+                delivery.parked = true;
+                if (channel != null) {
+                    channel.onIdle(null);   // parked: nothing is owed until the next admission
+                }
+                return;
+            }
+            delivery.cursor = next.position();
+            send(delivery.session, next.position().event(), next.json());
+        }
+    }
+
+    /**
+     * The ONE ingest path of both vol-premium streams, used by the cache consumer alone (the live consumer
+     * leaves them to it: Codex r2 finding 1). Admit to the session store, claim this offset for the record's
+     * position, and route it, as one unit under the emit lock, so the decision cannot interleave with a
+     * socket's walk or with a serve/hold transition. A record admitted while delivery is held is routed
+     * nowhere; the walk or the repair hands it over when delivery is served again.
+     */
+    private void relayVolPremium(TopicBinding binding, ConsumerRecord<String, ?> record, String json) {
+        synchronized (volPremiumIvrvEmitLock) {
+            VolPremiumSessionStore.Admission admission = admitVolPremium(binding, record, json);
+            if (!admission.admitted() || !shouldBroadcastVolPremium(admission.position(), record.offset())) {
+                return;
+            }
+            if (routeVolPremium(admission.position(), json)) {
+                forwardedEvents.incrementAndGet();
+            }
+        }
+    }
+
+    private VolPremiumSessionStore.Admission admitVolPremium(TopicBinding binding,
+                                                             ConsumerRecord<String, ?> record, String json) {
+        long nowMs = volPremiumNow();
+        VolPremiumSessionStore.Admission admission =
+                VolPremiumSessionStore.EVENT_WARNING.equals(binding.event())
+                        ? volPremiumStore.acceptWarning(binding.source(), record.key(), record.partition(),
+                                record.offset(), json, nowMs)
+                        : volPremiumStore.acceptObservation(binding.source(), record.key(), record.partition(),
+                                record.offset(), json, nowMs);
+        if (admission.recreatedTopic()) {
+            // Counted HERE, where the record is genuinely admitted, so the counter means what its HELP
+            // text says — a recovery that happened, never a shape that was merely recognised.
+            VOL_PREMIUM_TOPIC_RESETS.incrementAndGet();
+        }
+        return admission;
+    }
+
+    /**
+     * Live fan-out of one admitted vol-premium record, in both routing modes (a GLOBAL advisory), to
+     * every socket in {@link #volPremiumDeliveries}, by the one rule that keeps each socket's stream ordered and exactly-once:
+     * <ul>
+     *   <li>delivery held: nothing — the walk or the repair hands the record's position over when
+     *       delivery is served again, at its then-current version;</li>
+     *   <li>a position the socket's pending repair still owes: nothing — the repair hands it over;</li>
+     *   <li>at or behind the socket's cursor (a replacement of a point it already has, or a point that
+     *       sorts behind it): now, after what it follows;</li>
+     *   <li>ahead of the cursor of a PARKED socket — one whose walk has handed over everything held —
+     *       now, and the cursor moves to it: nothing lies between, so order and the invariant hold, and
+     *       live records are never paced like a replay;</li>
+     *   <li>ahead of the cursor of a socket still walking: the walk, which hands it over when it gets
+     *       there, at its then-current version.</li>
+     * </ul>
+     * Returns whether delivery is being served.
+     */
+    private boolean routeVolPremium(VolPremiumSessionStore.Position position, String json) {
+        String event = position.event();
+        if (perSessionRouting() && !isGlobalBroadcastEvent(event)) {
+            droppedNonRoutableEvents.incrementAndGet();
+            return false;
+        }
+        if (!volPremiumServing) {
+            // Held: nothing, whatever a socket's state. A PARKED socket would otherwise be sent a point
+            // admitted past its end — possibly ahead of history the recovering consumer has not read yet.
+            return false;
+        }
+        for (Map.Entry<String, VolPremiumDelivery> e : volPremiumDeliveries.entrySet()) {
+            VolPremiumDelivery d = e.getValue();
+            if (d.repairOwes(position)) {
+                continue;
+            }
+            if (d.cursor != null && position.compareTo(d.cursor) <= 0) {
+                send(d.session, event, json);
+                continue;
+            }
+            if (d.parked) {
+                d.cursor = position;
+                send(d.session, event, json);
+                continue;
+            }
+            pumpVolPremium(e.getKey());
+        }
+        return true;
+    }
+
+    /** The key updateCache reports for an admitted vol-premium record: its series, session and position. */
+    static String volPremiumCacheKey(VolPremiumSessionStore.Position p) {
+        return p.phase() == VolPremiumSessionStore.Position.OBSERVATIONS
+                ? p.seriesKey() + "|" + p.sessionDate() + "|" + p.frameSeq() + "|" + p.epochMs()
+                : p.seriesKey() + "|" + p.sessionDate() + "|W|" + p.frameSeq() + "|" + p.epochMs() + "|"
+                        + p.episodeId() + "|" + p.transition();
+    }
+
+    /**
+     * One symbol's current session, verbatim and in replay order, MATERIALISED. Tests and diagnostics only: GET
+     * /api/vol-premium/ivrv streams {@link #volPremiumPage} instead, so a session's bytes are never all on the heap.
+     */
+    public VolPremiumSessionStore.Snapshot volPremiumSession(String symbol) {
+        return volPremiumStore.snapshot(VOL_PREMIUM_SOURCE + "|" + symbol, volPremiumNow());
+    }
+
+    /** One symbol's current session for GET /api/vol-premium/ivrv, streamed from the store's log in bounded chunks. */
+    public VolPremiumSessionStore.Page volPremiumPage(String symbol) {
+        return volPremiumStore.page(VOL_PREMIUM_SOURCE + "|" + symbol, this::volPremiumNow);
     }
 
     private void replayDirectionPushCached(WebSocketSession session) {
@@ -9765,7 +10039,18 @@ public class FeedGatewayService implements ReplayRunner {
         return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
                 || "es-cvd-spx-levels".equals(event)
                 || "es-auction".equals(event)
-                || isFootprintEvent(event);
+                || isFootprintEvent(event)
+                // The vol-premium records are the producer's contract, validated whole and forwarded
+                // VERBATIM (VP-337: the UI never recomputes). Enriched, every record gained two fields
+                // and was re-serialised by Jackson, so what a socket, the REST route and the byte bound
+                // saw was the gateway's rewrite of the record rather than the record itself.
+                || isVolPremiumEvent(event);
+    }
+
+    /** The two vol-premium streams: IV/RV observations and early-warning transitions. */
+    static boolean isVolPremiumEvent(String event) {
+        return VolPremiumSessionStore.EVENT_OBSERVATION.equals(event)
+                || VolPremiumSessionStore.EVENT_WARNING.equals(event);
     }
 
     /**
@@ -10223,86 +10508,6 @@ public class FeedGatewayService implements ReplayRunner {
             // give updateCache a stable eviction key (the Kafka record key is also the symbol).
         }
         return fallback;
-    }
-
-    /**
-     * Key a vol-premium reading by SYMBOL|sessionDate, matching the producer's own record key.
-     * updateCache then source-prefixes it, so the stored key is source|SYMBOL|sessionDate — the
-     * sessionDate component is what stops two sessions sharing one cache slot.
-     */
-    /**
-     * The vol-premium reader, which is STRICTER than the shared mapper on one specific point.
-     *
-     * <p>Jackson fills a missing record component with the Java default — 0 for an int, null for a
-     * reference — so a payload with maxContiguousGapSlots simply deleted deserialises to a
-     * perfectly valid reading of zero, and the constructor has nothing to object to. The browser
-     * refuses it, because undefined is not a count. That is precisely the divergence this
-     * boundary exists to prevent: the live client keeps what it has while a late joiner is served
-     * only the broken record and shows nothing.
-     *
-     * <p>Two features, because the same hole has two doors. FAIL_ON_MISSING_CREATOR_PROPERTIES
-     * closes the omitted field. FAIL_ON_NULL_FOR_PRIMITIVES closes the adjacent one: an EXPLICIT
-     * null for a primitive component is also converted to the Java default, so
-     * {@code "maxContiguousGapSlots": null} arrives as a valid-looking zero by a different route.
-     *
-     * <p>Neither touches the four legitimately nullable fields — atmIvPct, impliedAsOfMs,
-     * realisedVolPct and the spread are boxed, are null on purpose, and are validated against each
-     * other by the record itself.
-     */
-    private static final com.fasterxml.jackson.databind.ObjectReader VOL_PREMIUM_READER =
-            new com.fasterxml.jackson.databind.ObjectMapper()
-                    .enable(com.fasterxml.jackson.databind.DeserializationFeature
-                            .FAIL_ON_MISSING_CREATOR_PROPERTIES)
-                    .enable(com.fasterxml.jackson.databind.DeserializationFeature
-                            .FAIL_ON_NULL_FOR_PRIMITIVES)
-                    .readerFor(com.optionsedge.contracts.volpremium.IvRvReadingV1.class);
-
-    private String volPremiumIvrvCacheKey(String json, String fallback) {
-        com.optionsedge.contracts.volpremium.IvRvReadingV1 reading;
-        try {
-            // The WHOLE contract, not the two fields the key is built from.
-            //
-            // This method is the single gate for both paths — updateCache stores under the key it
-            // returns, and a null key also suppresses the broadcast — so whatever it admits is
-            // what a late joiner is served. Checking only symbol and sessionDate admitted a
-            // payload with a valid identity and a broken body: a bad schemaVersion, an ordinal
-            // that disagreed with its own timestamp, a coverage outside [0,1], a measurement epoch
-            // from another day. Such a record has a valid event time, so it passes freshness, and
-            // its identity is the SAME cache slot as the good reading at a higher offset — it
-            // evicts a still-fresh value and is broadcast in its place. Live browsers reject it
-            // and keep what they have; a late joiner receives only the broken value and shows
-            // nothing, with no way to tell that a good reading existed.
-            //
-            // Deserialising through the contract record makes this boundary exactly as strong as
-            // the browser's and as the producer's, because it IS the producer's: every invariant
-            // is enforced by the record's own constructor rather than by a copy of it kept here
-            // and left to drift.
-            //
-            // THE COST IS DELIBERATE AND FAIL-CLOSED: this pins the gateway to the contract
-            // version it was built against, so a producer that bumps schemaVersion blanks the card
-            // until the gateway is redeployed with the new contract. That is the safe direction —
-            // the browser pins the same version and would reject the payload anyway — and it makes
-            // a contract bump a deployment-ordering fact rather than a silent divergence.
-            reading = VOL_PREMIUM_READER.readValue(json);
-        } catch (JsonProcessingException | RuntimeException invalid) {
-            // NULL, not the record key. Falling back was justified as "malformed payloads expire
-            // immediately anyway", and that is only true of unparseable JSON or a bad event time.
-            // Because the Kafka key for this topic already IS "SPX|sessionDate", the fallback
-            // handed a malformed record the SAME cache slot as the good value.
-            return null;
-        }
-        // Locale.ROOT, not the JVM default: a cache KEY must not depend on the host's locale.
-        String key = reading.symbol().toUpperCase(Locale.ROOT) + "|" + reading.sessionDate();
-        // And the record KEY must agree with the payload it carries. Kafka's key is what compaction
-        // and last-write-wins act on, so a record keyed for one session carrying another session's
-        // body would take the first session's slot and hold it — the payload decides what is
-        // displayed, the key decides what it displaces, and only agreement makes those the same
-        // thing.
-        if (fallback != null && !fallback.isBlank()
-                && !fallback.toUpperCase(Locale.ROOT).equals(key)) {
-            return null;
-        }
-        return key;
     }
 
     private long directionTimestamp(String json) {
@@ -12766,6 +12971,9 @@ public class FeedGatewayService implements ReplayRunner {
             // is on — i.e. the card is permanently blank in authenticated prod while every test
             // that exercises the unauthenticated path still passes.
             "vol-premium-ivrv",
+            // Its early-warning transitions are the same GLOBAL advisory class, overlaid on the same
+            // chart (VP-366), and for the same reason must reach per-session (auth) sockets too.
+            "vol-premium-warning",
             // Agent A short-premium recommendation is a GLOBAL advisory overlay (the UI filters by
             // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
             // in per-session (auth) mode too, not only legacy mode — otherwise it is silently
@@ -14014,10 +14222,29 @@ public class FeedGatewayService implements ReplayRunner {
     int esAuctionHelloPendingForTest() { return esAuctionHelloPending.size(); }
 
     /** Test seam: marks the auction view hydrated and releases every held hello, as markCacheCaughtUp does. */
-    void markStateCaughtUpForTest() { stateCaughtUp.set(true); esAuctionHandoffFrozen.set(true); flushEsAuctionHellos(); }
+    void markStateCaughtUpForTest() { stateCaughtUp.set(true); serveVolPremium(); esAuctionHandoffFrozen.set(true); flushEsAuctionHellos(); }
 
     /** Test seam: the view has hydrated but NO handoff has been captured — the state tryFreeze is asked from. */
-    void markStateCaughtUpWithoutHandoffForTest() { stateCaughtUp.set(true); }
+    void markStateCaughtUpWithoutHandoffForTest() { stateCaughtUp.set(true); serveVolPremium(); }
+    /** Test seam: the state cache consumer's flag, for driving its real catch-up / recovery transitions. */
+    AtomicBoolean stateCaughtUpFlagForTest() { return stateCaughtUp; }
+    /** Test seams: a socket's vol-premium delivery — registered at all, its walk cursor, its repair progress. */
+    boolean volPremiumDeliveryForTest(String socketId) { return volPremiumDeliveries.containsKey(socketId); }
+    VolPremiumSessionStore.Position volPremiumCursorForTest(String socketId) {
+        synchronized (volPremiumIvrvEmitLock) {
+            VolPremiumDelivery d = volPremiumDeliveries.get(socketId);
+            return d == null ? null : d.cursor;
+        }
+    }
+    VolPremiumSessionStore.Position volPremiumRepairAtForTest(String socketId) {
+        synchronized (volPremiumIvrvEmitLock) {
+            VolPremiumDelivery d = volPremiumDeliveries.get(socketId);
+            return d == null ? null : d.repairAt;
+        }
+    }
+    boolean volPremiumServingForTest() { synchronized (volPremiumIvrvEmitLock) { return volPremiumServing; } }
+    /** Test seam: the vol-premium streams are caught up — the same transition markCacheCaughtUp makes. */
+    void serveVolPremiumForTest() { serveVolPremium(); }
 
     /** Test seams for the two discovery-path steps, which the cache loop calls from inside a live consumer. */
     void reopenEsAuctionLatchForNewPartitionsForTest(List<TopicPartition> added) { reopenEsAuctionLatchForNewPartitions(added); }
