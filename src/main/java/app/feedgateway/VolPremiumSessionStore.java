@@ -436,7 +436,7 @@ final class VolPremiumSessionStore {
     /**
      * Whether a page is the whole session, and what it holds, as the REST page states it. {@code reason} is null
      * exactly when the page is complete. {@code retainedBytes} is the live bytes of the snapshot the page was opened
-     * on, which a complete page's records add up to.
+     * on, which a complete page's records add up to, whatever the reason, SESSION_ENDED included.
      */
     record Retention(Incomplete reason, long refusedForBudget, long refusedForDisk, long retainedBytes,
                      long budgetBytes) {
@@ -1741,11 +1741,12 @@ final class VolPremiumSessionStore {
     /** The verdict of a page whose records have been written, with its session as it stands now. */
     private synchronized Retention verdict(StorePage page, long nowMs) {
         if (page.sessionDate == null) {
-            return new Retention(null, 0L, 0L, 0L, seriesBudgetBytes);
+            return new Retention(null, 0L, 0L, page.snapshotBytes, seriesBudgetBytes);   // no session: a snapshot of 0
         }
         Session s = sessionOf(page, nowMs);
         if (s == null) {
-            return new Retention(Incomplete.SESSION_ENDED, 0L, 0L, 0L, seriesBudgetBytes);   // it ended while it was being read
+            // It ended while it was being read. The snapshot's size is still the one it was opened on (Codex r5).
+            return new Retention(Incomplete.SESSION_ENDED, 0L, 0L, page.snapshotBytes, seriesBudgetBytes);
         }
         Incomplete reason = s.diskFailed ? Incomplete.DISK_FAILURE
                 : s.refusedForBudget > 0L ? Incomplete.SESSION_BUDGET

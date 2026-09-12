@@ -129,6 +129,18 @@ class VolPremiumPageConsistencyTest {
         return out;
     }
 
+    /**
+     * The UTF-8 bytes of records as the page opened on them, summed from the records themselves: the figure every
+     * verdict of that page states as {@code retainedBytes}, whatever its reason (Codex r5).
+     */
+    private static long utf8Bytes(List<String> records) {
+        long n = 0L;
+        for (String record : records) {
+            n += record.getBytes(StandardCharsets.UTF_8).length;
+        }
+        return n;
+    }
+
     /** {@code written} is a subsequence of {@code snapshot}: only its records, each at most once, in its order. */
     private static void assertSubsequenceOf(List<String> snapshot, List<String> written) {
         int at = 0;
@@ -228,6 +240,8 @@ class VolPremiumPageConsistencyTest {
 
         assertFalse(served.retention().complete(), "the snapshot's 40 was replaced before the page reached it");
         assertEquals(Incomplete.CHANGED_WHILE_READ, served.retention().reason()); // r4-api
+        assertEquals(45L * WIDE, utf8Bytes(opened), "precondition: the snapshot's own size");
+        assertEquals(utf8Bytes(opened), served.retention().retainedBytes(), "the snapshot's captured size, not what was served");
         assertSubsequenceOf(opened, served.observations());
         assertFalse(served.observations().contains(wideCorrected(40).json()), "no version admitted after the page opened");
         // Asked again, undisturbed: complete, and the session as it now stands, both corrections included.
@@ -256,6 +270,8 @@ class VolPremiumPageConsistencyTest {
 
         assertFalse(served.retention().complete());
         assertEquals(Incomplete.CHANGED_WHILE_READ, served.retention().reason()); // r4-api
+        assertEquals(44L * WIDE, served.retention().retainedBytes(), "the 44 opened on, not the 45 held after");
+        assertEquals(utf8Bytes(opened), served.retention().retainedBytes());
         assertSubsequenceOf(opened, served.observations());
         Served again = serve(store, () -> FIXTURE_NOW_MS, null);
         assertTrue(again.retention().complete());
@@ -334,6 +350,8 @@ class VolPremiumPageConsistencyTest {
         // session's records under the old one's verdict and said complete.
         VolPremiumSessionStore store = storeIn(root);
         admitWide(store, range(0, 3));
+        long openedBytes = utf8Bytes(replay(store, FIXTURE_NOW_MS).get(0));
+        assertEquals(3L * WIDE, openedBytes, "precondition");
         Page page = store.page(SERIES, () -> FIXTURE_NOW_MS);
         store.close();
         assertTrue(offer(store, wide(0), 10).admitted(), "a new session of the same date");
@@ -344,6 +362,8 @@ class VolPremiumPageConsistencyTest {
         assertEquals(0, out.size(), "nothing of another session is written");
         assertFalse(retention.complete());
         assertEquals(Incomplete.SESSION_ENDED, retention.reason()); // r4-api
+        assertEquals(openedBytes, retention.retainedBytes(),
+                "Codex r5: the snapshot's captured size, though the session it was captured from is gone");
     }
 
     @Test
@@ -371,6 +391,8 @@ class VolPremiumPageConsistencyTest {
         assertEquals(List.of(), served.warnings());
         assertFalse(served.retention().complete());
         assertEquals(Incomplete.DISK_FAILURE, served.retention().reason()); // r4-api
+        assertEquals(45L * WIDE, served.retention().retainedBytes(), "the snapshot's captured size, not the 30 served");
+        assertEquals(utf8Bytes(opened), served.retention().retainedBytes());
     }
 
     @Test
@@ -392,6 +414,8 @@ class VolPremiumPageConsistencyTest {
         assertFalse(served.retention().complete());
         assertEquals(Incomplete.DISK_FAILURE, served.retention().reason()); // r4-api
         assertEquals(1L, served.retention().refusedForDisk());
+        assertEquals(45L * WIDE, served.retention().retainedBytes(), "the snapshot's captured size");
+        assertEquals(utf8Bytes(opened), served.retention().retainedBytes());
     }
 
     @Test
@@ -415,6 +439,47 @@ class VolPremiumPageConsistencyTest {
         assertFalse(served.observations().contains(next.json()), "nothing of the next session");
         assertFalse(served.retention().complete());
         assertEquals(Incomplete.SESSION_ENDED, served.retention().reason()); // r4-api
+        assertEquals(45L * WIDE, served.retention().retainedBytes(),
+                "Codex r5: a nonempty response states the snapshot's captured size, never zero");
+        assertEquals(utf8Bytes(opened), served.retention().retainedBytes());
+    }
+
+    @Test
+    void anExpiryMidPageStopsItAndStillStatesTheSnapshotsCapturedSize(@TempDir Path root) throws Exception {
+        // Codex r5: the session stops being current while the page is written out, with nothing admitted after it.
+        VolPremiumSessionStore store = storeIn(root);
+        admitWide(store, range(0, 45));
+        List<String> opened = replay(store, FIXTURE_NOW_MS).get(0);
+        long[] clock = {FIXTURE_NOW_MS};
+
+        Served served = serve(store, () -> clock[0], () -> clock[0] = FIXTURE_NOW_MS + 86_400_000L);
+
+        assertTrue(!served.observations().isEmpty() && served.observations().size() < opened.size(),
+                "the chunk read before the expiry, and nothing after it");
+        assertEquals(opened.subList(0, served.observations().size()), served.observations());
+        assertFalse(served.retention().complete());
+        assertEquals(Incomplete.SESSION_ENDED, served.retention().reason()); // r4-api
+        assertEquals(45L * WIDE, served.retention().retainedBytes(), "the snapshot's captured size, never zero");
+        assertEquals(utf8Bytes(opened), served.retention().retainedBytes());
+    }
+
+    @Test
+    void aBudgetRefusalMidPageSaysSoAndStillStatesTheSnapshotsCapturedSize(@TempDir Path root) throws Exception {
+        // A session whose budget is exactly its 45 records refuses the 46th while the page is written out: the
+        // snapshot reads back whole, the verdict is SESSION_BUDGET, and the size is the snapshot's.
+        VolPremiumSessionStore store = VolPremiumSessionDiskTest.storeIn(root, VolPremiumSessionLog.FILES, 45L * WIDE);
+        admitWide(store, range(0, 45));
+        List<String> opened = replay(store, FIXTURE_NOW_MS).get(0);
+
+        Served served = serve(store, () -> FIXTURE_NOW_MS,
+                () -> assertEquals(Refusal.SESSION_BUDGET, offer(store, wide(45), 100).refusal()));
+
+        assertEquals(opened, served.observations());
+        assertFalse(served.retention().complete());
+        assertEquals(Incomplete.SESSION_BUDGET, served.retention().reason()); // r4-api
+        assertEquals(1L, served.retention().refusedForBudget());
+        assertEquals(45L * WIDE, served.retention().retainedBytes(), "the snapshot's captured size");
+        assertEquals(utf8Bytes(opened), served.retention().retainedBytes());
     }
 
     // ----- the chunk bound (Codex r4 minor) and the undisturbed control --------------------------------------------
