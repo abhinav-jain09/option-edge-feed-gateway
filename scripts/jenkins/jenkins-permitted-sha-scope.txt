@@ -1,4 +1,4 @@
 # Scope of the permitted-commit guard in this repository — read by scripts/jenkins/validate-jenkinsfile-guard.py
 # (shared with options-edge-deploy, options-edge-processing and options-edge). Format: <Jenkinsfile> | in|out | options | reason
-Jenkinsfile        | in | before=Resolve profile,Build; contracts=.deps/options-edge-contracts | image build+push (option-edge-feed-gateway): guard first inside Build, contracts bound before mvn install, dev rollout trigger compatibility-checked and bound to the pushed digest
+Jenkinsfile        | in | before=Resolve profile,Build; contracts=.deps/options-edge-contracts | image build+push (option-edge-feed-gateway): guard first inside Build, contracts bound before mvn install, dev rollout trigger checks service-deploy's definition at DEPLOY_PERMITTED_SHA and bound to the pushed digest
 Jenkinsfile.deploy | in | before=Checkout (main only); contracts=.deps/options-edge-contracts   | host java process restart: existing main-only checkout first, guard second, contracts bound before mvn install
