@@ -166,7 +166,7 @@ pipeline {
           # ...and the DOCUMENT must be the one that record produces. Reverification compares the
           # spec, the record and a fresh run; it never looks at the rendered section, so a pinned
           # cell typed straight into ES-FOOTPRINT-GATEWAY-DESIGN.md by hand survives it untouched
-          # while all 34 mutations reproduce and the gate goes green. --check regenerates the
+          # while every mutation in the record reproduces and the gate goes green. --check regenerates the
           # section and refuses if what is committed is not byte-for-byte what the record yields.
           scripts/footprint-reqstate.sh --check
         '''
