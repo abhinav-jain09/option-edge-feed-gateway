@@ -123,6 +123,18 @@ def main() -> int:
     ]:
         r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, repl, 1))
         check(f"the host job's contracts guard {label} is refused", r.returncode == 1 and say in r.stdout, r.stdout)
+    # Codex gateway I9 / web M6-M7 on the real host job: the acquisition step and the guard are tied by RESOLVED path and
+    # adjacency; the acquisition step carries nothing but the clone.
+    acq_clone = next(l for l in jd.split("\n") if l.strip().startswith("git clone") and ".deps/options-edge-contracts" in l)
+    r = validate_mutated("Jenkinsfile.deploy", jd.replace(acq_clone, acq_clone + "; mvn -B -f .deps/options-edge-contracts/pom.xml install", 1))
+    check("M6: an effect on the contracts acquisition's own line (real Jenkinsfile.deploy) is refused", r.returncode == 1 and "no other command, separator or effect" in r.stdout, r.stdout)
+    t0 = jd.index("        timeout(time: 10, unit: 'MINUTES') {\n          sh 'PERMITTED_SHA=")
+    t1 = jd.index("        }\n", t0) + len("        }\n")
+    tblock = jd[t0:t1]
+    r = validate_mutated("Jenkinsfile.deploy", jd[:t0] + "        dir('other') {\n" + tblock.replace("\n        ", "\n          ").replace("        timeout", "          timeout", 1) + "        }\n" + jd[t1:])
+    check("I9/M7: the contracts guard wrapped in dir('other') (real Jenkinsfile.deploy) is refused", r.returncode == 1 and "the guard resolves to 'other/.deps/options-edge-contracts'" in r.stdout, r.stdout)
+    r = validate_mutated("Jenkinsfile.deploy", jd[:t1] + "        dir('other') {\n          sh " + chr(39) * 3 + "\n            git clone \"$CONTRACTS_REPO\" .deps/options-edge-contracts\n          " + chr(39) * 3 + "\n        }\n" + tblock + jd[t1:])
+    check("I9: a second checkout into other/.deps/options-edge-contracts guarded as .deps/options-edge-contracts is refused", r.returncode == 1 and "the acquisition to 'other/.deps/options-edge-contracts'" in r.stdout, r.stdout)
     r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, ind + "script {\n" + ind + "  return\n" + guard_line + "\n" + ind + "}", 1))
     check("the host job's contracts guard behind an early return in its block (Codex gateway I6) is refused", r.returncode == 1 and ("can be skipped" in r.stdout or "is not re-bound" in r.stdout), r.stdout)
 
