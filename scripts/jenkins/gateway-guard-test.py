@@ -91,6 +91,13 @@ def main() -> int:
         m = m.replace(blk, "          if (false) {\n" + blk + "          }\n", 1)
     r = validate_mutated("Jenkinsfile", m)
     check("M1: both compatibility checks wrapped in if (false) are refused", r.returncode == 1 and "is not executably protected" in r.stdout, r.stdout)
+    m = jf
+    for blk in blocks:
+        m = m.replace(blk, "          return\n" + blk, 1)
+    m = m.replace("          build job: 'service-deploy',", "        }\n        script {\n          build job: 'service-deploy',", 1)
+    r = validate_mutated("Jenkinsfile", m)
+    check("M1 r4: return before each check, trigger in a later script block (Codex reproduction) is refused",
+          r.returncode == 1 and "is not executably protected" in r.stdout, r.stdout)
     r = validate_mutated("Jenkinsfile", jf.replace(blocks[1], "          catchError(buildResult: 'FAILURE') {\n" + blocks[1] + "          }\n", 1))
     check("M1: the trigger stage's check wrapped in catchError is refused", r.returncode == 1 and "is not executably protected" in r.stdout, r.stdout)
     r = validate_mutated("Jenkinsfile", jf.replace("string(name: 'PERMITTED_SHA', value: params.DEPLOY_PERMITTED_SHA.trim())", "string(name: 'PERMITTED_SHA', value: dsha)", 1))
