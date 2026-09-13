@@ -1,0 +1,29 @@
+name: Jenkins permitted-commit guard
+
+# Deployment Permission Rule (options-edge rule.md): the image-build job publishes the gateway image
+# every environment pulls and rolls the dev pod, so it takes PERMITTED_SHA and refuses — before the
+# Image stage, in the workspace the image is built from — unless the checkout is exactly the
+# permitted commit on origin/main. This repository has no other GitHub check (its build CI is
+# Jenkins itself), so the guard script's cases and the Jenkinsfiles' guard position are proven here.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jenkins-permitted-sha-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Guard script refuses every unpermitted case; both Jenkinsfiles carry it before any effect
+        run: bash scripts/jenkins/validate-jenkinsfile-guard.sh

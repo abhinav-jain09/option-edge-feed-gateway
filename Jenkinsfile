@@ -11,15 +11,24 @@ pipeline {
   // itself pinned to an agent on .102 that holds the kubeconfigs.
   agent none
   options {
+    disableRestartFromStage()   // Deployment Permission Rule: no "Restart from Stage" past the permitted-commit guard
     // Serialize builds so each build's push -> Deploy+verify is atomic: two concurrent
     // builds must not both move the mutable :dev tag while the other's Deploy+verify
     // stage resolves it (Codex: a moving-tag race would let the wrong build verify green).
     disableConcurrentBuilds()
   }
   parameters {
+    string(name: 'PERMITTED_SHA', defaultValue: '', trim: true,
+      description: 'REQUIRED — Deployment Permission Rule (options-edge rule.md). The full 40-character commit id of THIS repository that Abhinav permitted for this image build. The Permitted commit guard stage — FIRST inside Build, before contracts install, tests, package and image — refuses the build unless the checked-out HEAD is exactly this commit AND on origin/main; empty, short or mismatched values are refused and nothing is substituted. An SCM-triggered build has no value and therefore stops at the guard before anything is built. A manual click needs it too: copy it from `git rev-parse origin/main`.')
+    string(name: 'PERMITTED_SHA_GUARD_VERSION', defaultValue: '922f76ce5af2ff005cb6b330ceea65faf3738d1237cb7d33384c3583d9b1df9a',
+      description: 'DO NOT EDIT BY HAND — the sha256 of scripts/jenkins/permitted-sha-guard.sh this definition runs (Deployment Permission Rule). The guard refuses to run under any other value. It is a DECLARATION, not proof that this job enforces the guard: a caller that triggers this job judges its SCM definition and its Jenkinsfile at the forwarded commit (scripts/jenkins/require-guarded-downstream.sh). Regenerate with scripts/jenkins/permitted-sha-guard-version.sh when the guard changes.')
+    string(name: 'CONTRACTS_PERMITTED_SHA', defaultValue: '', trim: true,
+      description: 'REQUIRED — Deployment Permission Rule. The full 40-character commit id of options-edge-contracts permitted for this build: the Install Contracts stage clones contracts at CONTRACTS_BRANCH and compiles that source into the gateway, so it is a second source of the image and is bound on its own. Refused before mvn install unless the clone is exactly this commit on main; empty, short or mismatched values are refused and nothing is substituted.')
+    string(name: 'DEPLOY_PERMITTED_SHA', defaultValue: '', trim: true,
+      description: 'REQUIRED when the dev Deploy+verify stage runs (ENVIRONMENT=dev, PUSH_IMAGE, DEPLOY_AND_VERIFY) — Deployment Permission Rule. The full 40-character commit id of options-edge-deploy permitted for the dev rollout this build triggers (service-deploy SERVICE=feed-gateway). Forwarded to that job as its PERMITTED_SHA, where ITS guard refuses unless its checkout is exactly this commit. Empty or malformed values stop this build before the downstream deploy is triggered.')
     choice(name: 'ENVIRONMENT', choices: ['dev', 'production'], description: 'Target environment — drives registry + build platform from oeProfile (single source of truth)')
     string(name: 'IMAGE_REGISTRY', defaultValue: '', description: 'Override registry. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers (e.g. bring-up-all).')
-    string(name: 'IMAGE_TAG', defaultValue: '', description: 'Docker tag. Defaults to current git SHA.')
+    string(name: 'IMAGE_TAG', defaultValue: '', description: 'MUST stay empty (Deployment Permission Rule, artifact identity): the per-build tag is derived inside the pipeline from BUILD_ID and the permitted SHA, so the image lock can name THIS build\'s image; a caller-supplied tag is refused. Kept only so an old caller that passes it is refused loudly rather than silently ignored.')
     string(name: 'DEV_IMAGE_TAG', defaultValue: 'dev', description: 'Also publish this mutable dev tag for the deploy job. Empty disables it.')
     string(name: 'BUILD_PLATFORM', defaultValue: '', description: 'Override platform. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers.')
     string(name: 'CONTRACTS_BRANCH', defaultValue: 'main', description: 'options-edge-contracts branch to install before building the gateway')
@@ -40,6 +49,12 @@ pipeline {
       options { skipDefaultCheckout() }
       steps {
         script {
+          // Deployment Permission Rule: the contracts source is selected by its exact branch name.
+          // An alias (origin/main, refs/heads/main) or any other branch is refused before anything
+          // is checked out — the guard judges the literal name, and so does this.
+          if ((params.CONTRACTS_BRANCH ?: 'main') != 'main') {
+            error("CONTRACTS_BRANCH must be exactly 'main' (got '${params.CONTRACTS_BRANCH}'): every environment builds contracts from main, selected by that name.")
+          }
           def p = oeProfile(params.ENVIRONMENT)
           env.IMAGE_REGISTRY = params.IMAGE_REGISTRY?.trim() ? params.IMAGE_REGISTRY : p.registry
           // Push address for THIS builder. Identical to IMAGE_REGISTRY except where the
@@ -84,8 +99,80 @@ pipeline {
     stage('Build') {
       agent { label "${env.BUILD_AGENT_LABEL}" }
       stages {
-    stage('Install Contracts') {
+    // ---- Deployment Permission Rule (options-edge rule.md): Jenkins enforces the permitted commit ----
+    // PERMITTED_SHA is REQUIRED. scripts/jenkins/permitted-sha-guard.sh refuses, in this order: a checkout
+    // that is not on origin/main (the environment-branch restriction, kept as its own condition —
+    // BRANCH_NAME and GIT_BRANCH are each judged, one never masks the other); a missing, empty, short or
+    // otherwise malformed PERMITTED_SHA (nothing is substituted for it); a checked-out HEAD that is not
+    // exactly PERMITTED_SHA. FIRST inside Build, in the one workspace the contracts install, the tests,
+    // the jar and the image all come from, before ANY build step: an SCM-triggered build carries no
+    // PERMITTED_SHA and therefore stops right here — nothing compiled, nothing written to ~/.m2, no
+    // image built or pushed, no dev pod rolled — until it is triggered with the permitted commit.
+    // error(), never catchError: a refusal is a stop, not a coloured result. Both SHAs are in the log.
+    stage('Permitted commit guard') {
+      options { timeout(time: 10, unit: 'MINUTES') }
       steps {
+        script {
+          def rc = sh(returnStatus: true, script: 'bash scripts/jenkins/permitted-sha-guard.sh')
+          if (rc != 0) {
+            error("Permitted commit guard REFUSED this build (rc=${rc}) — see its output above. Nothing was built, installed, pushed or deployed.")
+          }
+          env.PERMITTED_SHA_GUARD = 'PASSED'
+        }
+      }
+    }
+    // The dev rollout's inputs are judged HERE, before the first build step, so a missing
+    // DEPLOY_PERMITTED_SHA or an unguarded service-deploy never surfaces only after the image was
+    // already pushed. Same predicate as the Deploy + verify (dev) stage below, which judges them again.
+    stage('Deploy preflight (dev rollout inputs)') {
+      when {
+        expression { env.PERMITTED_SHA_GUARD == 'PASSED' && (
+          params.ENVIRONMENT == 'dev' && params.PUSH_IMAGE && params.DEPLOY_AND_VERIFY &&
+            params.DEV_IMAGE_TAG == 'dev' &&
+            (env.JOB_NAME?.endsWith('option-edge-feed-gateway')))
+        }
+      }
+      steps {
+        script {
+          def dsha = (params.DEPLOY_PERMITTED_SHA ?: '').trim()
+          if (!dsha.matches('^[0-9a-f]{40}$')) {
+            error("This build would roll the dev pod, which needs DEPLOY_PERMITTED_SHA: the full 40-character options-edge-deploy commit permitted for that rollout (got '${dsha}'). Nothing was built.")
+          }
+          // Early, so a rollout that could not be triggered stops the build before anything is built: the
+          // SAME definition check the trigger stage repeats right before `build job:` (service-deploy's
+          // job configuration, DEPLOY_PERMITTED_SHA as options-edge-deploy main's tip, its
+          // Jenkinsfile.service-deploy at that commit judged by this repository's validator).
+          def compat = sh(returnStatus: true, script: 'bash scripts/jenkins/require-guarded-downstream.sh service-deploy "${DEPLOY_PERMITTED_SHA:?}" REQUIRED_IMAGE')
+          if (compat != 0) {
+            error("service-deploy's definition at DEPLOY_PERMITTED_SHA could not be confirmed to run the permitted-commit guard (rc=${compat}) — this build would end by triggering it, so it stops before building. Nothing was built.")
+          }
+        }
+      }
+    }
+    stage('Install Contracts') {
+      when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
+      steps {
+        // The contracts clone is compiled INTO the gateway (IvRvReading's constructor decides which payloads it
+        // admits). Acquired in its own step, bound by the dedicated guard step, and only then installed.
+        sh '''
+          set -eu
+          rm -rf .deps/options-edge-contracts
+          git clone git@github.com:abhinav-jain09/options-edge-contracts.git .deps/options-edge-contracts
+          git -C .deps/options-edge-contracts checkout main
+        '''
+        // SECOND SOURCE, SECOND BINDING (Deployment Permission Rule): the contracts clone above is compiled in,
+        // so it needs its own permitted commit — judged on that checkout, against CONTRACTS_PERMITTED_SHA, with
+        // the selected ref judged as the literal name, BEFORE mvn install. A DEDICATED step whose whole script is
+        // the guard command: the step fails if and only if the guard refuses (validator rule 9).
+        timeout(time: 10, unit: 'MINUTES') {
+          sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/permitted-sha-guard.sh --dir .deps/options-edge-contracts --ref main'
+        }
+        // PROVENANCE (Deployment Permission Rule): re-prove, immediately before the contracts source is compiled in,
+        // that the contracts checkout is still exactly its permitted commit's tree — nothing changed after checkout
+        // (verify-permitted-tree.sh; target/ is its own build output). Validator rule 9b.
+        timeout(time: 10, unit: 'MINUTES') {
+          sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
+        }
         sh '''
           set -eu
           if [ -x "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java" ]; then
@@ -100,10 +187,11 @@ pipeline {
           fi
           export MAVEN_SKIP_RC=true
           export PATH="$JAVA_HOME/bin:$PATH"
+          # Per-WORKSPACE Maven repository (artifact identity): the contracts jar this build installs
+          # must be the one its tests, its footprint campaign and its packaging consume. A shared
+          # ~/.m2 lets ANY other job on this builder overwrite the same coordinate in between.
+          export MAVEN_OPTS="-Dmaven.repo.local=$WORKSPACE/.m2/repository${MAVEN_OPTS:+ $MAVEN_OPTS}"
           java -version
-          rm -rf .deps/options-edge-contracts
-          git clone git@github.com:abhinav-jain09/options-edge-contracts.git .deps/options-edge-contracts
-          git -C .deps/options-edge-contracts checkout "${CONTRACTS_BRANCH:-main}"
           # RECORD THE REVISION, because the branch is mutable and the contract is EXECUTABLE here.
           # The gateway validates vol-premium readings by deserialising them through
           # IvRvReading's own constructor, so what this clone resolved to decides which payloads
@@ -113,10 +201,20 @@ pipeline {
           git -C .deps/options-edge-contracts rev-parse HEAD > .contracts-sha
           echo "contracts revision: $(cat .contracts-sha)"
           mvn -B -f .deps/options-edge-contracts/pom.xml install
+          # ARTIFACT IDENTITY, part 1: the contracts jar just installed, by CONTENT. Recorded here,
+          # re-verified before packaging, and verified INSIDE the packaged jar — the binding of the
+          # permitted contracts commit is carried to the artifact, not assumed.
+          CV="$(mvn -q -f .deps/options-edge-contracts/pom.xml help:evaluate -Dexpression=project.version -DforceStdout)"
+          CJAR="$WORKSPACE/.m2/repository/com/optionsedge/options-edge-contracts/$CV/options-edge-contracts-$CV.jar"
+          [ -f "$CJAR" ] || { echo "installed contracts jar not found at $CJAR" >&2; exit 1; }
+          printf '%s\n' "$CV" > .contracts-version
+          bash scripts/jenkins/permitted-sha-guard-version.sh "$CJAR" > .contracts-jar-sha256
+          echo "contracts jar $CV sha256: $(cat .contracts-jar-sha256)"
         '''
       }
     }
     stage('Test') {
+      when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
         sh '''
           set -eu
@@ -132,12 +230,17 @@ pipeline {
           fi
           export MAVEN_SKIP_RC=true
           export PATH="$JAVA_HOME/bin:$PATH"
+          # Per-WORKSPACE Maven repository (artifact identity): the contracts jar this build installs
+          # must be the one its tests, its footprint campaign and its packaging consume. A shared
+          # ~/.m2 lets ANY other job on this builder overwrite the same coordinate in between.
+          export MAVEN_OPTS="-Dmaven.repo.local=$WORKSPACE/.m2/repository${MAVEN_OPTS:+ $MAVEN_OPTS}"
           java -version
           mvn -B test
         '''
       }
     }
     stage('Footprint reverification') {
+      when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
         sh '''
           set -eu
@@ -153,6 +256,10 @@ pipeline {
           fi
           export MAVEN_SKIP_RC=true
           export PATH="$JAVA_HOME/bin:$PATH"
+          # Per-WORKSPACE Maven repository (artifact identity): the contracts jar this build installs
+          # must be the one its tests, its footprint campaign and its packaging consume. A shared
+          # ~/.m2 lets ANY other job on this builder overwrite the same coordinate in between.
+          export MAVEN_OPTS="-Dmaven.repo.local=$WORKSPACE/.m2/repository${MAVEN_OPTS:+ $MAVEN_OPTS}"
           # The pinned column of ES-FOOTPRINT-GATEWAY-DESIGN.md rests on ES-FOOTPRINT-CAMPAIGN.json,
           # and that is a file: the generator's refusals compare the record against itself and
           # against the source it names, which a self-consistent forgery satisfies. Only re-running
@@ -173,6 +280,7 @@ pipeline {
       }
     }
     stage('Package') {
+      when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
         sh '''
           set -eu
@@ -188,12 +296,30 @@ pipeline {
           fi
           export MAVEN_SKIP_RC=true
           export PATH="$JAVA_HOME/bin:$PATH"
+          # Per-WORKSPACE Maven repository (artifact identity): the contracts jar this build installs
+          # must be the one its tests, its footprint campaign and its packaging consume. A shared
+          # ~/.m2 lets ANY other job on this builder overwrite the same coordinate in between.
+          export MAVEN_OPTS="-Dmaven.repo.local=$WORKSPACE/.m2/repository${MAVEN_OPTS:+ $MAVEN_OPTS}"
           java -version
+          # ARTIFACT IDENTITY, part 2: the contracts jar about to be packaged in is still the one this
+          # build installed and bound (the repository is per-workspace, but verified, never assumed).
+          CV="$(cat .contracts-version)"
+          CJAR="$WORKSPACE/.m2/repository/com/optionsedge/options-edge-contracts/$CV/options-edge-contracts-$CV.jar"
+          [ "$(bash scripts/jenkins/permitted-sha-guard-version.sh "$CJAR")" = "$(cat .contracts-jar-sha256)" ] \
+            || { echo "the installed contracts jar changed since it was bound — refusing to package" >&2; exit 1; }
           mvn -B package
+          # part 3: the packaged jar, by content, and the contracts jar INSIDE it (Spring Boot fat jar,
+          # BOOT-INF/lib) must be the bound one. This is what proves what was consumed.
+          JAR="$(ls target/options-edge-feed-gateway-*.jar | grep -v '\\.original$' | head -1)"
+          [ -n "$JAR" ] || { echo "no packaged gateway jar under target/" >&2; exit 1; }
+          bash scripts/jenkins/permitted-sha-guard-version.sh "$JAR" > .jar-sha256
+          bash scripts/jenkins/verify-embedded-contracts.sh "$JAR" "$(cat .contracts-jar-sha256)"
+          echo "packaged $JAR sha256: $(cat .jar-sha256)"
         '''
       }
     }
     stage('Image') {
+      when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
         sh '''
           set -eu
@@ -212,10 +338,19 @@ pipeline {
           # suppress the :dev moving tag for prod (empties the DEV_IMAGE_TAG guard below).
           if [ "${ENVIRONMENT:-dev}" = "production" ]; then DEV_IMAGE_TAG=""; fi
           # dev = <build>-<sha>; PROD = prod-<build>-<sha> (self-documents env+build+commit).
+          # ARTIFACT IDENTITY: the unique per-build tag the image lock is resolved through is DERIVED here
+          # from BUILD_ID and the permitted SHA (which the guard proved equals HEAD) — never taken from a
+          # caller: a shared caller-chosen tag would let another build's push be recorded as this one's.
+          if [ -n "${IMAGE_TAG:-}" ]; then
+            echo "IMAGE_TAG='$IMAGE_TAG' is refused: the per-build tag is derived from BUILD_ID and PERMITTED_SHA so the image lock names THIS build's image. Nothing was built." >&2
+            exit 1
+          fi
+          [ "$(git rev-parse HEAD)" = "${PERMITTED_SHA:?}" ] || { echo "HEAD is not PERMITTED_SHA — refusing to tag" >&2; exit 1; }
+          SHORT_SHA="$(printf '%s' "$PERMITTED_SHA" | cut -c1-12)"
           if [ "${ENVIRONMENT:-dev}" = "production" ]; then
-            TAG="${IMAGE_TAG:-prod-${BUILD_NUMBER:-manual}-$(git rev-parse --short=12 HEAD)}"
+            TAG="prod-${BUILD_ID:?}-$SHORT_SHA"
           else
-            TAG="${IMAGE_TAG:-${BUILD_NUMBER:-manual}-$(git rev-parse --short=12 HEAD)}"
+            TAG="${BUILD_ID:?}-$SHORT_SHA"
           fi
           DEV_TAG="${DEV_IMAGE_TAG:-}"
           BUILD_PLATFORM="${BUILD_PLATFORM:-linux/arm64}"
@@ -268,10 +403,17 @@ EOF
             docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
             rm -f "$BUILDKITD_CONFIG"
           }
-          CONTRACTS_SHA="$(cat .contracts-sha 2>/dev/null || echo unknown)"
-          # A LABEL, so the revision travels with the image rather than only with the build log —
-          # see the note in the contracts install stage.
-          BUILD_LABELS="--label options-edge.contracts-revision=$CONTRACTS_SHA"
+          # ARTIFACT IDENTITY, part 4: the jar about to become the image is the one packaged and
+          # verified above — by content, again — and its provenance travels as labels.
+          JAR="$(ls target/options-edge-feed-gateway-*.jar | grep -v '\\.original$' | head -1)"
+          [ "$(bash scripts/jenkins/permitted-sha-guard-version.sh "$JAR")" = "$(cat .jar-sha256)" ] \
+            || { echo "the packaged jar changed since it was verified — refusing to build the image" >&2; exit 1; }
+          bash scripts/jenkins/verify-embedded-contracts.sh "$JAR" "$(cat .contracts-jar-sha256)"
+          CONTRACTS_SHA="$(cat .contracts-sha)"
+          GIT_COMMIT_FULL="$(git rev-parse HEAD)"
+          # LABELS, so the revisions and contents travel with the image rather than only with the
+          # build log — see the note in the contracts install stage.
+          BUILD_LABELS="--label options-edge.contracts-revision=$CONTRACTS_SHA --label options-edge.source-revision=$GIT_COMMIT_FULL --label options-edge.jar-sha256=$(cat .jar-sha256) --label options-edge.contracts-jar-sha256=$(cat .contracts-jar-sha256) --label options-edge.guard-version=${PERMITTED_SHA_GUARD_VERSION:-}"
           TAG_ARGS="-t $IMAGE"
           if [ -n "$DEV_TAG" ] && [ "$DEV_TAG" != "$TAG" ]; then
             TAG_ARGS="$TAG_ARGS -t $DEV_IMAGE"
@@ -279,12 +421,52 @@ EOF
           if [ "${ENVIRONMENT:-dev}" = "production" ]; then
             TAG_ARGS="$TAG_ARGS -t $PROD_IMAGE"   # prod also gets the self-documenting :prod moving tag
           fi
+          mkdir -p .jenkins-tmp
+          rm -f ".jenkins-tmp/push-metadata-$BUILD_ID.json" ".jenkins-tmp/image-lock-$BUILD_ID.env" ".jenkins-tmp/required-image-$BUILD_ID"
           if [ "$PUSH_IMAGE" = "true" ]; then
-            docker buildx build --builder "$BUILDER_NAME" --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS --push .
+            docker buildx build --builder "$BUILDER_NAME" --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS \
+              --metadata-file ".jenkins-tmp/push-metadata-$BUILD_ID.json" --push .
+            # IMAGE LOCK, from THIS build's own push result: buildx's metadata file for this BUILD_ID names
+            # the digest it pushed; the registry must serve that same digest for the unique per-build tag.
+            # The dev rollout below forwards it as REQUIRED_IMAGE so service-deploy rolls THIS image.
+            PUSHED="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("containerimage.digest",""))' ".jenkins-tmp/push-metadata-$BUILD_ID.json")"
+            printf '%s' "$PUSHED" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "this build's push reported no image digest ('$PUSHED') — no image lock" >&2; exit 1; }
+            DIGEST="$(bash scripts/jenkins/resolve-pushed-digest.sh "$PUSH_REGISTRY" options-edge-feed-gateway "$TAG")"
+            [ "$DIGEST" = "$PUSHED" ] || { echo "the registry serves $DIGEST for $TAG, this build pushed $PUSHED — refusing to record another build's image" >&2; exit 1; }
+            {
+              echo "OPTIONS_EDGE_IMAGE_LOCK_FORMAT=1"
+              echo "OPTIONS_EDGE_IMAGE_LOCK_SOURCE_REPO=$(git config --get remote.origin.url || true)"
+              echo "OPTIONS_EDGE_IMAGE_LOCK_GIT_COMMIT=$GIT_COMMIT_FULL"
+              echo "OPTIONS_EDGE_IMAGE_LOCK_CONTRACTS_GIT_COMMIT=$CONTRACTS_SHA"
+              echo "OPTIONS_EDGE_IMAGE_LOCK_CONTRACTS_JAR_SHA256=$(cat .contracts-jar-sha256)"
+              echo "OPTIONS_EDGE_IMAGE_LOCK_JAR_SHA256=$(cat .jar-sha256)"
+              echo "OPTIONS_EDGE_IMAGE_LOCK_GUARD_VERSION=${PERMITTED_SHA_GUARD_VERSION:-}"
+              echo "OPTIONS_EDGE_IMAGE_LOCK_BUILD_ID=$BUILD_ID"
+              echo "OPTIONS_EDGE_IMAGE_LOCK_BUILD_URL=${BUILD_URL:-}"
+              echo "OPTIONS_EDGE_IMAGE_LOCK_PLATFORM=$BUILD_PLATFORM"
+              echo "OPTIONS_EDGE_IMAGE_LOCK_TAG=$TAG"
+              echo "FEED_GATEWAY_IMAGE=$IMAGE_REGISTRY/options-edge-feed-gateway:$TAG@$DIGEST"
+              echo "FEED_GATEWAY_IMAGE_GIT_COMMIT=$GIT_COMMIT_FULL"
+            } > ".jenkins-tmp/image-lock-$BUILD_ID.env"
+            printf '%s\n' "$IMAGE_REGISTRY/options-edge-feed-gateway:$TAG@$DIGEST" > ".jenkins-tmp/required-image-$BUILD_ID"
+            sed 's/^/image-lock: /' ".jenkins-tmp/image-lock-$BUILD_ID.env"
           else
             docker buildx build --builder "$BUILDER_NAME" --platform "$BUILD_PLATFORM" --no-cache $BUILD_LABELS $TAG_ARGS --load .
           fi
         '''
+        script {
+          // Only THIS build's lock (keyed by BUILD_ID, written from its own push result) is archived and
+          // forwarded; a build that pushed nothing publishes no lock and forwards no REQUIRED_IMAGE.
+          if (params.PUSH_IMAGE && fileExists(".jenkins-tmp/image-lock-${env.BUILD_ID}.env")) {
+            def lock = readFile(".jenkins-tmp/image-lock-${env.BUILD_ID}.env")
+            if (!lock.contains("OPTIONS_EDGE_IMAGE_LOCK_BUILD_ID=${env.BUILD_ID}\n")) {
+              error("the image lock for build ${env.BUILD_ID} does not name this build. Nothing was deployed.")
+            }
+            writeFile file: '.jenkins-tmp/options-edge-image-lock.env', text: lock
+            archiveArtifacts artifacts: '.jenkins-tmp/options-edge-image-lock.env', fingerprint: true
+            env.GATEWAY_REQUIRED_IMAGE = readFile(".jenkins-tmp/required-image-${env.BUILD_ID}").trim()
+          }
+        }
       }
     }
       }
@@ -304,21 +486,55 @@ EOF
       // kubeconfigs. So this can run anywhere.
       agent any
       when {
-        expression {
+        expression { env.PERMITTED_SHA_GUARD == 'PASSED' && (
           params.ENVIRONMENT == 'dev' && params.PUSH_IMAGE && params.DEPLOY_AND_VERIFY &&
             params.DEV_IMAGE_TAG == 'dev' &&
-            (env.JOB_NAME?.endsWith('option-edge-feed-gateway'))
+            (env.JOB_NAME?.endsWith('option-edge-feed-gateway')))
         }
       }
       steps {
-        build job: 'service-deploy',
-          parameters: [
-            string(name: 'SERVICE', value: 'feed-gateway'),
-            string(name: 'ENVIRONMENT', value: 'dev'),
-            booleanParam(name: 'BUILD_IMAGES', value: false),
-            booleanParam(name: 'DEPLOY_DRY_RUN', value: false)
-          ],
-          wait: true, propagate: true
+        script {
+          // A second workspace on its own agent (`agent any`, with Declarative's implicit checkout):
+          // re-bound to the permitted commit before any repository script runs from it.
+          timeout(time: 10, unit: 'MINUTES') {
+            def rg = sh(returnStatus: true, script: 'bash scripts/jenkins/permitted-sha-guard.sh')
+            if (rg != 0) {
+              error("Permitted commit guard (rollout workspace) REFUSED this checkout (rc=${rg}) — the image was pushed; nothing was deployed.")
+            }
+          }
+          // Downstream deployment trigger (Deployment Permission Rule): the rollout is a deployment of
+          // its own, of ANOTHER repository (options-edge-deploy), and needs that repository's permitted
+          // commit. Judged here, before `build job:`, so a missing value never starts a build that
+          // would only fail at its own guard.
+          def dsha = (params.DEPLOY_PERMITTED_SHA ?: '').trim()
+          if (!dsha.matches('^[0-9a-f]{40}$')) {
+            error("Deploy+verify needs DEPLOY_PERMITTED_SHA: the full 40-character options-edge-deploy commit permitted for the dev rollout (got '${dsha}'). The image was pushed; nothing was deployed.")
+          }
+          if (!(env.GATEWAY_REQUIRED_IMAGE ?: '').matches('^[^@\\s]+@sha256:[0-9a-f]{64}$')) {
+            error("no digest-pinned image was recorded for this build (got '${env.GATEWAY_REQUIRED_IMAGE}') — refusing to roll an image this build cannot name. Nothing was deployed.")
+          }
+          // FAIL-CLOSED definition check, in the same block as the trigger (judged in the preflight too):
+          // forwarding a SHA binds nothing unless service-deploy EXECUTES the guard. The helper reads its
+          // job configuration (Pipeline from SCM, options-edge-deploy */main, Jenkinsfile.service-deploy),
+          // requires DEPLOY_PERMITTED_SHA to be main's tip, fetches that commit and runs this repository's
+          // validator on the Jenkinsfile the child will load, with its guard hashing to ours.
+          def compat = sh(returnStatus: true, script: 'bash scripts/jenkins/require-guarded-downstream.sh service-deploy "${DEPLOY_PERMITTED_SHA:?}" REQUIRED_IMAGE')
+          if (compat != 0) {
+            error("service-deploy's definition at DEPLOY_PERMITTED_SHA could not be confirmed to run the permitted-commit guard (rc=${compat}) — not triggering it. The image was pushed; nothing was deployed.")
+          }
+          build job: 'service-deploy',
+            parameters: [
+              // service-deploy's own guard compares ITS checkout against this, byte for byte, before
+              // any kubectl; REQUIRED_IMAGE makes it roll exactly the digest this build pushed.
+              string(name: 'PERMITTED_SHA', value: params.DEPLOY_PERMITTED_SHA.trim()),
+              string(name: 'REQUIRED_IMAGE', value: env.GATEWAY_REQUIRED_IMAGE),
+              string(name: 'SERVICE', value: 'feed-gateway'),
+              string(name: 'ENVIRONMENT', value: 'dev'),
+              booleanParam(name: 'BUILD_IMAGES', value: false),
+              booleanParam(name: 'DEPLOY_DRY_RUN', value: false)
+            ],
+            wait: true, propagate: true
+        }
       }
     }
   }
