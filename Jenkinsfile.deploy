@@ -15,6 +15,8 @@ pipeline {
   }
 
   parameters {
+    string(name: 'CONTRACTS_PERMITTED_SHA', defaultValue: '', trim: true,
+      description: 'REQUIRED — Deployment Permission Rule. The full 40-character commit id of options-edge-contracts permitted for this restart: the Install Contracts stage clones contracts (main) and compiles that source into the jar, so it is bound on its own, before mvn install. Empty, short or mismatched values are refused and nothing is substituted.')
     string(name: 'PERMITTED_SHA', defaultValue: '', trim: true,
       description: 'REQUIRED — Deployment Permission Rule (options-edge rule.md). The full 40-character commit id of THIS repository that Abhinav permitted for this run. The Permitted commit guard stage refuses the build before the jar is built or the process is restarted unless the checked-out HEAD is exactly this commit AND on origin/main; empty, short or mismatched values are refused and nothing is substituted. A manual click needs it too: copy it from `git rev-parse origin/main`.')
   }
@@ -75,6 +77,11 @@ pipeline {
           set -euo pipefail
           rm -rf .deps/options-edge-contracts
           git clone "$CONTRACTS_REPO" .deps/options-edge-contracts
+          git -C .deps/options-edge-contracts checkout main
+          # SECOND SOURCE, SECOND BINDING (Deployment Permission Rule): the contracts clone is compiled
+          # into the jar this job restarts, so it needs its own permitted commit — judged on that
+          # checkout, against CONTRACTS_PERMITTED_SHA, BEFORE mvn install. Non-zero stops the step.
+          PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/permitted-sha-guard.sh --dir .deps/options-edge-contracts --ref main || exit 1
           mvn -B -f .deps/options-edge-contracts/pom.xml install -DskipTests
         '''
       }

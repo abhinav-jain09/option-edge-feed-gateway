@@ -19,7 +19,9 @@ pipeline {
   }
   parameters {
     string(name: 'PERMITTED_SHA', defaultValue: '', trim: true,
-      description: 'REQUIRED — Deployment Permission Rule (options-edge rule.md). The full 40-character commit id of THIS repository that Abhinav permitted for this image build. The Permitted commit guard stage — right before the Image stage, in the workspace the image is built from — refuses the build unless the checked-out HEAD is exactly this commit AND on origin/main; empty, short or mismatched values are refused and nothing is substituted. An SCM-triggered build has no value and therefore stops at the guard: it compiles and tests, and publishes nothing. A manual click needs it too: copy it from `git rev-parse origin/main`.')
+      description: 'REQUIRED — Deployment Permission Rule (options-edge rule.md). The full 40-character commit id of THIS repository that Abhinav permitted for this image build. The Permitted commit guard stage — FIRST inside Build, before contracts install, tests, package and image — refuses the build unless the checked-out HEAD is exactly this commit AND on origin/main; empty, short or mismatched values are refused and nothing is substituted. An SCM-triggered build has no value and therefore stops at the guard before anything is built. A manual click needs it too: copy it from `git rev-parse origin/main`.')
+    string(name: 'CONTRACTS_PERMITTED_SHA', defaultValue: '', trim: true,
+      description: 'REQUIRED — Deployment Permission Rule. The full 40-character commit id of options-edge-contracts permitted for this build: the Install Contracts stage clones contracts at CONTRACTS_BRANCH and compiles that source into the gateway, so it is a second source of the image and is bound on its own. Refused before mvn install unless the clone is exactly this commit on main; empty, short or mismatched values are refused and nothing is substituted.')
     string(name: 'DEPLOY_PERMITTED_SHA', defaultValue: '', trim: true,
       description: 'REQUIRED when the dev Deploy+verify stage runs (ENVIRONMENT=dev, PUSH_IMAGE, DEPLOY_AND_VERIFY) — Deployment Permission Rule. The full 40-character commit id of options-edge-deploy permitted for the dev rollout this build triggers (service-deploy SERVICE=feed-gateway). Forwarded to that job as its PERMITTED_SHA, where ITS guard refuses unless its checkout is exactly this commit. Empty or malformed values stop this build before the downstream deploy is triggered.')
     choice(name: 'ENVIRONMENT', choices: ['dev', 'production'], description: 'Target environment — drives registry + build platform from oeProfile (single source of truth)')
@@ -89,6 +91,51 @@ pipeline {
     stage('Build') {
       agent { label "${env.BUILD_AGENT_LABEL}" }
       stages {
+    // ---- Deployment Permission Rule (options-edge rule.md): Jenkins enforces the permitted commit ----
+    // PERMITTED_SHA is REQUIRED. scripts/jenkins/permitted-sha-guard.sh refuses, in this order: a checkout
+    // that is not on origin/main (the environment-branch restriction, kept as its own condition —
+    // BRANCH_NAME and GIT_BRANCH are each judged, one never masks the other); a missing, empty, short or
+    // otherwise malformed PERMITTED_SHA (nothing is substituted for it); a checked-out HEAD that is not
+    // exactly PERMITTED_SHA. FIRST inside Build, in the one workspace the contracts install, the tests,
+    // the jar and the image all come from, before ANY build step: an SCM-triggered build carries no
+    // PERMITTED_SHA and therefore stops right here — nothing compiled, nothing written to ~/.m2, no
+    // image built or pushed, no dev pod rolled — until it is triggered with the permitted commit.
+    // error(), never catchError: a refusal is a stop, not a coloured result. Both SHAs are in the log.
+    stage('Permitted commit guard') {
+      steps {
+        script {
+          def rc = sh(returnStatus: true, script: 'bash scripts/jenkins/permitted-sha-guard.sh')
+          if (rc != 0) {
+            error("Permitted commit guard REFUSED this build (rc=${rc}) — see its output above. Nothing was built, installed, pushed or deployed.")
+          }
+          env.PERMITTED_SHA_GUARD = 'PASSED'
+        }
+      }
+    }
+    // The dev rollout's inputs are judged HERE, before the first build step, so a missing
+    // DEPLOY_PERMITTED_SHA or an unguarded service-deploy never surfaces only after the image was
+    // already pushed. Same predicate as the Deploy + verify (dev) stage below, which judges them again.
+    stage('Deploy preflight (dev rollout inputs)') {
+      when {
+        expression {
+          params.ENVIRONMENT == 'dev' && params.PUSH_IMAGE && params.DEPLOY_AND_VERIFY &&
+            params.DEV_IMAGE_TAG == 'dev' &&
+            (env.JOB_NAME?.endsWith('option-edge-feed-gateway'))
+        }
+      }
+      steps {
+        script {
+          def dsha = (params.DEPLOY_PERMITTED_SHA ?: '').trim()
+          if (!dsha.matches('^[0-9a-f]{40}$')) {
+            error("This build would roll the dev pod, which needs DEPLOY_PERMITTED_SHA: the full 40-character options-edge-deploy commit permitted for that rollout (got '${dsha}'). Nothing was built.")
+          }
+          def compat = sh(returnStatus: true, script: 'bash scripts/jenkins/require-guarded-downstream.sh service-deploy')
+          if (compat != 0) {
+            error("service-deploy does not enforce PERMITTED_SHA yet (rc=${compat}) — this build would end by triggering an unguarded rollout, so it stops before building. Nothing was built.")
+          }
+        }
+      }
+    }
     stage('Install Contracts') {
       steps {
         sh '''
@@ -109,6 +156,12 @@ pipeline {
           rm -rf .deps/options-edge-contracts
           git clone git@github.com:abhinav-jain09/options-edge-contracts.git .deps/options-edge-contracts
           git -C .deps/options-edge-contracts checkout "${CONTRACTS_BRANCH:-main}"
+          # SECOND SOURCE, SECOND BINDING (Deployment Permission Rule): the contracts clone is compiled
+          # INTO the gateway (IvRvReading's constructor decides which payloads it admits), so it needs
+          # its own permitted commit. Same guard, on that checkout, against CONTRACTS_PERMITTED_SHA,
+          # with the selected ref judged (--ref: a CONTRACTS_BRANCH override to anything but main is
+          # refused) — BEFORE mvn install writes it into the builder's ~/.m2. Non-zero stops the step.
+          PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/permitted-sha-guard.sh --dir .deps/options-edge-contracts --ref "${CONTRACTS_BRANCH:-main}" || exit 1
           # RECORD THE REVISION, because the branch is mutable and the contract is EXECUTABLE here.
           # The gateway validates vol-premium readings by deserialising them through
           # IvRvReading's own constructor, so what this clone resolved to decides which payloads
@@ -196,27 +249,6 @@ pipeline {
           java -version
           mvn -B package
         '''
-      }
-    }
-    // ---- Deployment Permission Rule (options-edge rule.md): Jenkins enforces the permitted commit ----
-    // PERMITTED_SHA is REQUIRED. scripts/jenkins/permitted-sha-guard.sh refuses, in this order: a checkout
-    // that is not on origin/main (the environment-branch restriction, kept as its own condition); a
-    // missing, empty, short or otherwise malformed PERMITTED_SHA (nothing is substituted for it); a
-    // checked-out HEAD that is not exactly PERMITTED_SHA. It sits HERE, after Package and before Image,
-    // in the one workspace the jar and the image are built from, with no checkout between it and the
-    // push: what it permits is what gets published. Install Contracts / Test / Footprint reverification /
-    // Package run before it because they publish nothing — so an SCM-triggered build (which carries no
-    // PERMITTED_SHA) still compiles and tests, then STOPS here: no image is built or pushed, no dev
-    // pod is rolled, until the build is triggered with the permitted commit. error(), never catchError.
-    stage('Permitted commit guard') {
-      steps {
-        script {
-          def rc = sh(returnStatus: true, script: 'bash scripts/jenkins/permitted-sha-guard.sh')
-          if (rc != 0) {
-            error("Permitted commit guard REFUSED this build (rc=${rc}) — see its output above. No image was built or pushed, nothing was deployed.")
-          }
-          env.PERMITTED_SHA_GUARD = 'PASSED'
-        }
       }
     }
     stage('Image') {
@@ -345,6 +377,13 @@ EOF
           def dsha = (params.DEPLOY_PERMITTED_SHA ?: '').trim()
           if (!dsha.matches('^[0-9a-f]{40}$')) {
             error("Deploy+verify needs DEPLOY_PERMITTED_SHA: the full 40-character options-edge-deploy commit permitted for the dev rollout (got '${dsha}'). The image was pushed; nothing was deployed.")
+          }
+          // FAIL-CLOSED compatibility check (judged in the preflight too): forwarding a SHA binds
+          // nothing unless service-deploy's LIVE definition declares and enforces PERMITTED_SHA —
+          // Jenkins drops an unknown parameter and the old pipeline would roll the pod unguarded.
+          def compat = sh(returnStatus: true, script: 'bash scripts/jenkins/require-guarded-downstream.sh service-deploy')
+          if (compat != 0) {
+            error("service-deploy does not enforce PERMITTED_SHA yet (rc=${compat}) — not triggering an unguarded rollout. The image was pushed; nothing was deployed.")
           }
           build job: 'service-deploy',
             parameters: [
