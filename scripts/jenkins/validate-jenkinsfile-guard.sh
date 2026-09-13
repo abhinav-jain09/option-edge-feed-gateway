@@ -7,6 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 bash scripts/jenkins/permitted-sha-guard-test.sh | tail -1 | grep -q 'ALL PASS' || { echo "FAIL: guard self-test did not report ALL PASS"; exit 1; }
+bash scripts/jenkins/verify-permitted-tree-test.sh | tail -1 | grep -q 'ALL PASS' || { echo "FAIL: provenance verify self-test did not report ALL PASS"; exit 1; }
 python3 scripts/jenkins/validate-jenkinsfile-guard-test.py | tail -1 | grep -q 'ALL PASS' || { echo "FAIL: validator mutation suite did not report ALL PASS"; exit 1; }
 python3 scripts/jenkins/require-guarded-downstream-test.py | tail -1 | grep -q 'ALL PASS' || { echo "FAIL: downstream-definition suite did not report ALL PASS"; exit 1; }
 python3 scripts/jenkins/gateway-guard-test.py | tail -1 | grep -q 'ALL PASS' || { echo "FAIL: gateway guard test did not report ALL PASS"; exit 1; }

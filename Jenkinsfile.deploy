@@ -93,6 +93,11 @@ pipeline {
         timeout(time: 10, unit: 'MINUTES') {
           sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/permitted-sha-guard.sh --dir .deps/options-edge-contracts --ref main'
         }
+        // PROVENANCE (Deployment Permission Rule): re-prove, immediately before the contracts source is compiled in,
+        // that the contracts checkout is still exactly its permitted commit's tree (verify-permitted-tree.sh). Rule 9b.
+        timeout(time: 10, unit: 'MINUTES') {
+          sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
+        }
         sh '''
           set -euo pipefail
           mvn -B -f .deps/options-edge-contracts/pom.xml install -DskipTests

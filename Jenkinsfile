@@ -167,6 +167,12 @@ pipeline {
         timeout(time: 10, unit: 'MINUTES') {
           sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/permitted-sha-guard.sh --dir .deps/options-edge-contracts --ref main'
         }
+        // PROVENANCE (Deployment Permission Rule): re-prove, immediately before the contracts source is compiled in,
+        // that the contracts checkout is still exactly its permitted commit's tree — nothing changed after checkout
+        // (verify-permitted-tree.sh; target/ is its own build output). Validator rule 9b.
+        timeout(time: 10, unit: 'MINUTES') {
+          sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
+        }
         sh '''
           set -eu
           if [ -x "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java" ]; then

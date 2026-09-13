@@ -135,18 +135,18 @@ def main() -> int:
     check("I9/M7: the contracts guard wrapped in dir('other') (real Jenkinsfile.deploy) is refused", r.returncode == 1 and "the guard resolves to 'other/.deps/options-edge-contracts'" in r.stdout, r.stdout)
     r = validate_mutated("Jenkinsfile.deploy", jd[:t1] + "        dir('other') {\n          sh " + chr(39) * 3 + "\n            git clone \"$CONTRACTS_REPO\" .deps/options-edge-contracts\n          " + chr(39) * 3 + "\n        }\n" + tblock + jd[t1:])
     check("I9: a second checkout into other/.deps/options-edge-contracts guarded as .deps/options-edge-contracts is refused", r.returncode == 1 and "the acquisition to 'other/.deps/options-edge-contracts'" in r.stdout, r.stdout)
-    # Codex #1043 r8 M1-R8 on the real host and image jobs: after its guard the contracts checkout is read-only.
-    for jname, mvn_line in [("Jenkinsfile.deploy", "          mvn -B -f .deps/options-edge-contracts/pom.xml install -DskipTests\n"),
-                            ("Jenkinsfile", "          mvn -B -f .deps/options-edge-contracts/pom.xml install\n")]:
+    # Codex #1043 r8/r9 → runtime provenance verification. mvn install compiles the contracts source into the image,
+    # so it must be preceded by the dedicated verify-permitted-tree step for the contracts checkout. Remove that step
+    # and the definition is refused (its runtime behaviour — pull, reset, copy, archive-over-tree — is covered by
+    # verify-permitted-tree-test.sh).
+    for jname in ("Jenkinsfile.deploy", "Jenkinsfile"):
         src = jd if jname == "Jenkinsfile.deploy" else jf
-        for label, ins in [
-            ("git -C <contracts> pull --ff-only (Codex reproduction)", "          git -C .deps/options-edge-contracts pull --ff-only origin main\n"),
-            ("fetch then reset --hard FETCH_HEAD", "          git -C .deps/options-edge-contracts fetch origin main\n          git -C .deps/options-edge-contracts reset --hard FETCH_HEAD\n"),
-            ("cd <contracts> && git checkout", "          cd .deps/options-edge-contracts && git checkout -q origin/feature && cd \"$WORKSPACE\"\n"),
-            ("rsync into the checkout", "          rsync -a /tmp/contracts/ .deps/options-edge-contracts/\n"),
-        ]:
-            r = validate_mutated(jname, src.replace(mvn_line, ins + mvn_line, 1))
-            check(f"M1-R8: {label} before mvn install (real {jname}) is refused", r.returncode == 1 and "is changed after its guard" in r.stdout, r.stdout)
+        vstep = next(l for l in src.split("\n") if "verify-permitted-tree.sh --dir .deps/options-edge-contracts" in l)
+        block = "        timeout(time: 10, unit: 'MINUTES') {\n" + vstep + "\n        }\n"
+        assert block in src, jname
+        r = validate_mutated(jname, src.replace(block, "", 1))
+        check(f"provenance: contracts mvn install without a verify-permitted-tree step (real {jname}) is refused",
+              r.returncode == 1 and "the nested checkout '.deps/options-edge-contracts'" in r.stdout, r.stdout)
     r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, ind + "script {\n" + ind + "  return\n" + guard_line + "\n" + ind + "}", 1))
     check("the host job's contracts guard behind an early return in its block (Codex gateway I6) is refused", r.returncode == 1 and ("can be skipped" in r.stdout or "is not re-bound" in r.stdout), r.stdout)
 

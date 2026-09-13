@@ -17,3 +17,5 @@ target/
 # footprint reverification reads as a dirty tree and refuses to run against. The gate would have
 # failed on every Jenkins build, for a directory the build itself creates.
 .deps/
+__pycache__/
+*.pyc
