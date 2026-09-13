@@ -19,3 +19,8 @@ target/
 .deps/
 __pycache__/
 *.pyc
+.contracts-version
+.contracts-jar-sha256
+.jar-sha256
+.m2/
+.jenkins-tmp/

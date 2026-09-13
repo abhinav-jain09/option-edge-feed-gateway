@@ -150,6 +150,28 @@ def main() -> int:
     r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, ind + "script {\n" + ind + "  return\n" + guard_line + "\n" + ind + "}", 1))
     check("the host job's contracts guard behind an early return in its block (Codex gateway I6) is refused", r.returncode == 1 and ("can be skipped" in r.stdout or "is not re-bound" in r.stdout), r.stdout)
 
+    # Codex N4: the byproducts the build writes into the workspace root (.contracts-version, .contracts-jar-sha256,
+    # .jar-sha256, the workspace maven cache) must be ignored, so the mandatory footprint gate's `git status
+    # --porcelain` (and any workspace verify) still sees a clean tree. Check out HEAD, apply this change's .gitignore,
+    # create those byproducts, and assert git status is empty.
+    tmp = tempfile.mkdtemp()
+    co = os.path.join(tmp, "co")
+    subprocess.run(["git", "-C", ROOT, "worktree", "add", "--detach", co, "HEAD"], capture_output=True)
+    try:
+        shutil.copy(os.path.join(ROOT, ".gitignore"), os.path.join(co, ".gitignore"))
+        subprocess.run(["git", "-C", co, "add", ".gitignore"], capture_output=True)
+        subprocess.run(["git", "-C", co, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "i"], capture_output=True)
+        for rel, body in [(".contracts-sha", "a\n"), (".contracts-version", "0.2.0\n"), (".contracts-jar-sha256", "d\n"),
+                          (".jar-sha256", "e\n"), (".m2/repository/x.jar", "j\n"), ("target/x.jar", "j\n"), (".jenkins-tmp/l", "l\n")]:
+            p = os.path.join(co, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").write(body)
+        st = subprocess.run(["git", "-C", co, "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
+        check("N4: the build's root byproducts are gitignored, so the footprint gate sees a clean tree", st == "", f"git status not empty:\n{st}")
+    finally:
+        subprocess.run(["git", "-C", ROOT, "worktree", "remove", "--force", co], capture_output=True)
+        shutil.rmtree(tmp, True)
+
     # ---- artifact identity: the Image stage's shell, executed ----
     block = shell_body(jf, "stage('Image')")
 
