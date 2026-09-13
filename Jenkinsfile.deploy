@@ -65,6 +65,7 @@ pipeline {
     // is not exactly PERMITTED_SHA. Before the contracts install, the package and the restart.
     // error(), never catchError: a refusal is a stop, not a coloured result. Both SHAs are in the log.
     stage('Permitted commit guard') {
+      options { timeout(time: 10, unit: 'MINUTES') }
       steps {
         script {
           def rc = sh(returnStatus: true, script: 'bash scripts/jenkins/permitted-sha-guard.sh')
@@ -84,10 +85,16 @@ pipeline {
           rm -rf .deps/options-edge-contracts
           git clone "$CONTRACTS_REPO" .deps/options-edge-contracts
           git -C .deps/options-edge-contracts checkout main
-          # SECOND SOURCE, SECOND BINDING (Deployment Permission Rule): the contracts clone is compiled
-          # into the jar this job restarts, so it needs its own permitted commit — judged on that
-          # checkout, against CONTRACTS_PERMITTED_SHA, BEFORE mvn install. Non-zero stops the step.
-          PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/permitted-sha-guard.sh --dir .deps/options-edge-contracts --ref main || exit 1
+        '''
+        // SECOND SOURCE, SECOND BINDING (Deployment Permission Rule): the contracts clone above is compiled in,
+        // so it needs its own permitted commit — judged on that checkout, against CONTRACTS_PERMITTED_SHA, with
+        // the selected ref judged as the literal name, BEFORE mvn install. A DEDICATED step whose whole script is
+        // the guard command: the step fails if and only if the guard refuses (validator rule 9).
+        timeout(time: 10, unit: 'MINUTES') {
+          sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/permitted-sha-guard.sh --dir .deps/options-edge-contracts --ref main'
+        }
+        sh '''
+          set -euo pipefail
           mvn -B -f .deps/options-edge-contracts/pom.xml install -DskipTests
           # ARTIFACT IDENTITY, part 1: the installed contracts jar, by content — re-verified before
           # packaging and verified inside the packaged jar.

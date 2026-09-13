@@ -108,19 +108,23 @@ def main() -> int:
     check("N3: the single-backslash '\\.original$' Groovy escape is refused", r.returncode == 1 and "not a Groovy escape" in r.stdout, r.stdout)
     r = validate_mutated("Jenkinsfile", jf.replace("    stage('Image') {\n      when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }\n", "    stage('Image') {\n", 1))
     check("an effect stage whose gate is removed is refused", r.returncode == 1 and "stage 'Image' after the guard has no `when` gate" in r.stdout, r.stdout)
-    body = shell_body(jd, "stage('Install Contracts')")
-    guard_line = next(l for l in body.split("\n") if "permitted-sha-guard.sh --dir" in l)
-    r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, guard_line.replace("PERMITTED_SHA=", "echo PERMITTED_SHA=", 1), 1))
-    check("the host job's contracts guard only echoed is refused", r.returncode == 1 and "is not re-bound" in r.stdout, r.stdout)
-    ic = jd.index("stage('Install Contracts')")
-    s0 = jd.index("sh " + chr(39) * 3, ic)
-    s1 = jd.index(chr(39) * 3, s0 + 6) + 3
-    mutated = jd[:s0] + "sh(script: " + jd[s0 + 3:s1] + ", returnStatus: true)" + jd[s1:]
-    r = validate_mutated("Jenkinsfile.deploy", mutated)
-    check("M2 r5: Install Contracts as sh(script: ..., returnStatus: true) with the option after the string (Codex reproduction) is refused",
-          r.returncode == 1 and "whose failure stops the build" in r.stdout, r.stdout)
-    r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, guard_line[:len(guard_line) - len(guard_line.lstrip())] + "out=`\n" + guard_line + "\n` || true", 1))
-    check("the host job's contracts guard in a backtick substitution is refused", r.returncode == 1 and "backtick" in r.stdout, r.stdout)
+    # The contracts guard is a DEDICATED step now (validator rule 9): its script is exactly the guard command.
+    guard_line = next(l for l in jd.split("\n") if l.strip().startswith("sh 'PERMITTED_SHA=") and "permitted-sha-guard.sh --dir" in l)
+    ind = guard_line[:len(guard_line) - len(guard_line.lstrip())]
+    cmd = guard_line.strip()[len("sh '"):-1]
+    for label, repl, say in [
+        ("only echoed", ind + "sh 'echo " + cmd + "'", "is not re-bound"),
+        ("with sh(script: ..., returnStatus: true) (Codex gateway M2 r5)", ind + "sh(script: '" + cmd + "', returnStatus: true)", "is not re-bound"),
+        ("with a quoted 'returnStatus' key (Codex gateway M2 r6)", ind + "sh(script: '" + cmd + "', 'returnStatus': true)", "is not re-bound"),
+        ("in a backtick substitution", ind + "sh 'out=`" + cmd + "` || true'", "is not re-bound"),
+        ("after exit 0; exit 1 (Codex gateway I7)", ind + "sh 'exit 0; exit 1; " + cmd + "'", "is not re-bound"),
+        ("under an EXIT trap (Codex gateway I8)", ind + "sh 'trap \\'exit 0\\' EXIT; " + cmd + "'", "is not re-bound"),
+        ("back inside a shell block with || exit 1 (the old form)", ind + "sh " + chr(39) * 3 + "\n" + ind + "  set -eu\n" + ind + "  " + cmd + " || exit 1\n" + ind + chr(39) * 3, "is not re-bound"),
+    ]:
+        r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, repl, 1))
+        check(f"the host job's contracts guard {label} is refused", r.returncode == 1 and say in r.stdout, r.stdout)
+    r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, ind + "script {\n" + ind + "  return\n" + guard_line + "\n" + ind + "}", 1))
+    check("the host job's contracts guard behind an early return in its block (Codex gateway I6) is refused", r.returncode == 1 and ("can be skipped" in r.stdout or "is not re-bound" in r.stdout), r.stdout)
 
     # ---- artifact identity: the Image stage's shell, executed ----
     block = shell_body(jf, "stage('Image')")

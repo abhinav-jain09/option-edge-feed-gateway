@@ -110,6 +110,7 @@ pipeline {
     // image built or pushed, no dev pod rolled — until it is triggered with the permitted commit.
     // error(), never catchError: a refusal is a stop, not a coloured result. Both SHAs are in the log.
     stage('Permitted commit guard') {
+      options { timeout(time: 10, unit: 'MINUTES') }
       steps {
         script {
           def rc = sh(returnStatus: true, script: 'bash scripts/jenkins/permitted-sha-guard.sh')
@@ -151,6 +152,21 @@ pipeline {
     stage('Install Contracts') {
       when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
+        // The contracts clone is compiled INTO the gateway (IvRvReading's constructor decides which payloads it
+        // admits). Acquired in its own step, bound by the dedicated guard step, and only then installed.
+        sh '''
+          set -eu
+          rm -rf .deps/options-edge-contracts
+          git clone git@github.com:abhinav-jain09/options-edge-contracts.git .deps/options-edge-contracts
+          git -C .deps/options-edge-contracts checkout main
+        '''
+        // SECOND SOURCE, SECOND BINDING (Deployment Permission Rule): the contracts clone above is compiled in,
+        // so it needs its own permitted commit — judged on that checkout, against CONTRACTS_PERMITTED_SHA, with
+        // the selected ref judged as the literal name, BEFORE mvn install. A DEDICATED step whose whole script is
+        // the guard command: the step fails if and only if the guard refuses (validator rule 9).
+        timeout(time: 10, unit: 'MINUTES') {
+          sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/permitted-sha-guard.sh --dir .deps/options-edge-contracts --ref main'
+        }
         sh '''
           set -eu
           if [ -x "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java" ]; then
@@ -170,15 +186,6 @@ pipeline {
           # ~/.m2 lets ANY other job on this builder overwrite the same coordinate in between.
           export MAVEN_OPTS="-Dmaven.repo.local=$WORKSPACE/.m2/repository${MAVEN_OPTS:+ $MAVEN_OPTS}"
           java -version
-          rm -rf .deps/options-edge-contracts
-          git clone git@github.com:abhinav-jain09/options-edge-contracts.git .deps/options-edge-contracts
-          git -C .deps/options-edge-contracts checkout main
-          # SECOND SOURCE, SECOND BINDING (Deployment Permission Rule): the contracts clone is compiled
-          # INTO the gateway (IvRvReading's constructor decides which payloads it admits), so it needs
-          # its own permitted commit. Same guard, on that checkout, against CONTRACTS_PERMITTED_SHA,
-          # with the selected ref judged as the literal name — BEFORE mvn install writes it into the
-          # per-workspace repository. Non-zero stops the step.
-          PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/permitted-sha-guard.sh --dir .deps/options-edge-contracts --ref main || exit 1
           # RECORD THE REVISION, because the branch is mutable and the contract is EXECUTABLE here.
           # The gateway validates vol-premium readings by deserialising them through
           # IvRvReading's own constructor, so what this clone resolved to decides which payloads
@@ -483,9 +490,11 @@ EOF
         script {
           // A second workspace on its own agent (`agent any`, with Declarative's implicit checkout):
           // re-bound to the permitted commit before any repository script runs from it.
-          def rg = sh(returnStatus: true, script: 'bash scripts/jenkins/permitted-sha-guard.sh')
-          if (rg != 0) {
-            error("Permitted commit guard (rollout workspace) REFUSED this checkout (rc=${rg}) — the image was pushed; nothing was deployed.")
+          timeout(time: 10, unit: 'MINUTES') {
+            def rg = sh(returnStatus: true, script: 'bash scripts/jenkins/permitted-sha-guard.sh')
+            if (rg != 0) {
+              error("Permitted commit guard (rollout workspace) REFUSED this checkout (rc=${rg}) — the image was pushed; nothing was deployed.")
+            }
           }
           // Downstream deployment trigger (Deployment Permission Rule): the rollout is a deployment of
           // its own, of ANOTHER repository (options-edge-deploy), and needs that repository's permitted
