@@ -11,12 +11,17 @@ pipeline {
   // itself pinned to an agent on .102 that holds the kubeconfigs.
   agent none
   options {
+    disableRestartFromStage()   // Deployment Permission Rule: no "Restart from Stage" past the permitted-commit guard
     // Serialize builds so each build's push -> Deploy+verify is atomic: two concurrent
     // builds must not both move the mutable :dev tag while the other's Deploy+verify
     // stage resolves it (Codex: a moving-tag race would let the wrong build verify green).
     disableConcurrentBuilds()
   }
   parameters {
+    string(name: 'PERMITTED_SHA', defaultValue: '', trim: true,
+      description: 'REQUIRED — Deployment Permission Rule (options-edge rule.md). The full 40-character commit id of THIS repository that Abhinav permitted for this image build. The Permitted commit guard stage — right before the Image stage, in the workspace the image is built from — refuses the build unless the checked-out HEAD is exactly this commit AND on origin/main; empty, short or mismatched values are refused and nothing is substituted. An SCM-triggered build has no value and therefore stops at the guard: it compiles and tests, and publishes nothing. A manual click needs it too: copy it from `git rev-parse origin/main`.')
+    string(name: 'DEPLOY_PERMITTED_SHA', defaultValue: '', trim: true,
+      description: 'REQUIRED when the dev Deploy+verify stage runs (ENVIRONMENT=dev, PUSH_IMAGE, DEPLOY_AND_VERIFY) — Deployment Permission Rule. The full 40-character commit id of options-edge-deploy permitted for the dev rollout this build triggers (service-deploy SERVICE=feed-gateway). Forwarded to that job as its PERMITTED_SHA, where ITS guard refuses unless its checkout is exactly this commit. Empty or malformed values stop this build before the downstream deploy is triggered.')
     choice(name: 'ENVIRONMENT', choices: ['dev', 'production'], description: 'Target environment — drives registry + build platform from oeProfile (single source of truth)')
     string(name: 'IMAGE_REGISTRY', defaultValue: '', description: 'Override registry. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers (e.g. bring-up-all).')
     string(name: 'IMAGE_TAG', defaultValue: '', description: 'Docker tag. Defaults to current git SHA.')
@@ -193,6 +198,27 @@ pipeline {
         '''
       }
     }
+    // ---- Deployment Permission Rule (options-edge rule.md): Jenkins enforces the permitted commit ----
+    // PERMITTED_SHA is REQUIRED. scripts/jenkins/permitted-sha-guard.sh refuses, in this order: a checkout
+    // that is not on origin/main (the environment-branch restriction, kept as its own condition); a
+    // missing, empty, short or otherwise malformed PERMITTED_SHA (nothing is substituted for it); a
+    // checked-out HEAD that is not exactly PERMITTED_SHA. It sits HERE, after Package and before Image,
+    // in the one workspace the jar and the image are built from, with no checkout between it and the
+    // push: what it permits is what gets published. Install Contracts / Test / Footprint reverification /
+    // Package run before it because they publish nothing — so an SCM-triggered build (which carries no
+    // PERMITTED_SHA) still compiles and tests, then STOPS here: no image is built or pushed, no dev
+    // pod is rolled, until the build is triggered with the permitted commit. error(), never catchError.
+    stage('Permitted commit guard') {
+      steps {
+        script {
+          def rc = sh(returnStatus: true, script: 'bash scripts/jenkins/permitted-sha-guard.sh')
+          if (rc != 0) {
+            error("Permitted commit guard REFUSED this build (rc=${rc}) — see its output above. No image was built or pushed, nothing was deployed.")
+          }
+          env.PERMITTED_SHA_GUARD = 'PASSED'
+        }
+      }
+    }
     stage('Image') {
       steps {
         sh '''
@@ -311,14 +337,27 @@ EOF
         }
       }
       steps {
-        build job: 'service-deploy',
-          parameters: [
-            string(name: 'SERVICE', value: 'feed-gateway'),
-            string(name: 'ENVIRONMENT', value: 'dev'),
-            booleanParam(name: 'BUILD_IMAGES', value: false),
-            booleanParam(name: 'DEPLOY_DRY_RUN', value: false)
-          ],
-          wait: true, propagate: true
+        script {
+          // Downstream deployment trigger (Deployment Permission Rule): the rollout is a deployment of
+          // its own, of ANOTHER repository (options-edge-deploy), and needs that repository's permitted
+          // commit. Judged here, before `build job:`, so a missing value never starts a build that
+          // would only fail at its own guard.
+          def dsha = (params.DEPLOY_PERMITTED_SHA ?: '').trim()
+          if (!dsha.matches('^[0-9a-f]{40}$')) {
+            error("Deploy+verify needs DEPLOY_PERMITTED_SHA: the full 40-character options-edge-deploy commit permitted for the dev rollout (got '${dsha}'). The image was pushed; nothing was deployed.")
+          }
+          build job: 'service-deploy',
+            parameters: [
+              // service-deploy's own guard compares ITS checkout against this, byte for byte, before
+              // any kubectl.
+              string(name: 'PERMITTED_SHA', value: dsha),
+              string(name: 'SERVICE', value: 'feed-gateway'),
+              string(name: 'ENVIRONMENT', value: 'dev'),
+              booleanParam(name: 'BUILD_IMAGES', value: false),
+              booleanParam(name: 'DEPLOY_DRY_RUN', value: false)
+            ],
+            wait: true, propagate: true
+        }
       }
     }
   }
