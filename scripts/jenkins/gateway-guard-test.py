@@ -112,6 +112,15 @@ def main() -> int:
     guard_line = next(l for l in body.split("\n") if "permitted-sha-guard.sh --dir" in l)
     r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, guard_line.replace("PERMITTED_SHA=", "echo PERMITTED_SHA=", 1), 1))
     check("the host job's contracts guard only echoed is refused", r.returncode == 1 and "is not re-bound" in r.stdout, r.stdout)
+    ic = jd.index("stage('Install Contracts')")
+    s0 = jd.index("sh " + chr(39) * 3, ic)
+    s1 = jd.index(chr(39) * 3, s0 + 6) + 3
+    mutated = jd[:s0] + "sh(script: " + jd[s0 + 3:s1] + ", returnStatus: true)" + jd[s1:]
+    r = validate_mutated("Jenkinsfile.deploy", mutated)
+    check("M2 r5: Install Contracts as sh(script: ..., returnStatus: true) with the option after the string (Codex reproduction) is refused",
+          r.returncode == 1 and "whose failure stops the build" in r.stdout, r.stdout)
+    r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, guard_line[:len(guard_line) - len(guard_line.lstrip())] + "out=`\n" + guard_line + "\n` || true", 1))
+    check("the host job's contracts guard in a backtick substitution is refused", r.returncode == 1 and "backtick" in r.stdout, r.stdout)
 
     # ---- artifact identity: the Image stage's shell, executed ----
     block = shell_body(jf, "stage('Image')")
