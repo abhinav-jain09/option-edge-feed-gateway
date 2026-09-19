@@ -39,8 +39,8 @@ def read(name: str) -> str:
 def validate_mutated(name: str, text: str) -> subprocess.CompletedProcess:
     tmp = tempfile.mkdtemp()
     try:
-        os.makedirs(os.path.join(tmp, "scripts/jenkins"))
-        shutil.copy(os.path.join(HERE, "permitted-sha-guard.sh"), os.path.join(tmp, "scripts/jenkins/permitted-sha-guard.sh"))
+        # the whole scripts/ tree: the validator follows every repository script a step runs
+        shutil.copytree(os.path.join(ROOT, "scripts"), os.path.join(tmp, "scripts"), ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copy(MANIFEST, os.path.join(tmp, "scope.txt"))
         with open(os.path.join(tmp, name), "w") as fh:
             fh.write(text)
@@ -142,11 +142,46 @@ def main() -> int:
     for jname in ("Jenkinsfile.deploy", "Jenkinsfile"):
         src = jd if jname == "Jenkinsfile.deploy" else jf
         vstep = next(l for l in src.split("\n") if "verify-permitted-tree.sh --dir .deps/options-edge-contracts" in l)
-        block = "        timeout(time: 10, unit: 'MINUTES') {\n" + vstep + "\n        }\n"
+        ind = vstep[:len(vstep) - len(vstep.lstrip())][:-2]
+        block = ind + "timeout(time: 10, unit: 'MINUTES') {\n" + vstep + "\n" + ind + "}\n"
         assert block in src, jname
         r = validate_mutated(jname, src.replace(block, "", 1))
         check(f"provenance: contracts mvn install without a verify-permitted-tree step (real {jname}) is refused",
               r.returncode == 1 and "the nested checkout '.deps/options-edge-contracts'" in r.stdout, r.stdout)
+
+    # Codex gateway r11 I10 (the class): statement adjacency protected the statement boundary, not the commands INSIDE the
+    # consuming step. Each effect is now a DEDICATED step whose whole body is one command matched against its template;
+    # a source change inside that step, however spelled, is refused — on both real files.
+    tq = chr(39) * 3
+    install = "sh 'mvn -B -f .deps/options-edge-contracts/pom.xml install'"
+    package = "sh 'mvn -B package'"
+    image = next(l.strip() for l in jf.split("\n") if l.strip().startswith("sh 'docker buildx build ") and '-t "${IMAGE_REF_2}"' not in l)
+    for jname, src, old, new, say in [
+        ("Jenkinsfile", jf, install, "sh 'cp -r /tmp/other/src .deps/options-edge-contracts/ && mvn -B -f .deps/options-edge-contracts/pom.xml install'", "does not fit the fixed `mvn` template"),
+        ("Jenkinsfile", jf, install, "sh " + tq + "\n              git -C .deps/options-edge-contracts apply /tmp/p.diff\n              mvn -B -f .deps/options-edge-contracts/pom.xml install\n            " + tq, "is not a DEDICATED effect step"),
+        ("Jenkinsfile", jf, install, "sh 'mvn -B -f .deps/options-edge-contracts/pom.xml versions:set -DnewVersion=9 install'", "is not in the template's goal list"),
+        ("Jenkinsfile", jf, package, "sh 'mvn -B package -Dmaven.repo.local=/tmp/other; true'", "does not fit the fixed `mvn` template"),
+        ("Jenkinsfile", jf, package, "sh " + tq + "\n              export MAVEN_OPTS=-Dx\n              mvn -B package\n            " + tq, "is not a DEDICATED effect step"),
+        ("Jenkinsfile", jf, image, image.replace("--no-cache ", "--no-cache --build-context extra=/tmp/other "), "is not an option of the docker build template"),
+        ("Jenkinsfile", jf, image, image.replace(" .'", " \"${CTX}\"'"), "the build context must be a literal"),
+        ("Jenkinsfile", jf, image, "sh 'cp /tmp/other.jar target/ && " + image[len("sh '"):], "does not fit the fixed `docker` template"),
+        ("Jenkinsfile.deploy", jd, "sh 'mvn -B clean package -DskipTests'", "sh 'rm -rf src && mvn -B clean package -DskipTests'", "does not fit the fixed `mvn` template"),
+        ("Jenkinsfile.deploy", jd, "sh 'mvn -B -f .deps/options-edge-contracts/pom.xml install -DskipTests'", "sh 'mvn -B -f .deps/options-edge-contracts/pom.xml install -DskipTests > /tmp/log'", "does not fit the fixed `mvn` template"),
+    ]:
+        assert src.count(old) >= 1, (jname, old)
+        r = validate_mutated(jname, src.replace(old, new, 1))
+        check(f"I10 class: the effect step's own body — {new[:70]!r} in {jname} is refused", r.returncode == 1 and say in r.stdout, r.stdout)
+    # web M10 on this file: the image context '.' holds the contracts clone too, so the build needs BOTH verifies
+    cblock = next(l for l in jf.split("\n") if "verify-permitted-tree.sh --dir .deps/options-edge-contracts" in l and l.startswith("                  "))
+    ind = cblock[:len(cblock) - len(cblock.lstrip())][:-2]
+    cb = ind + "timeout(time: 10, unit: 'MINUTES') {\n" + cblock + "\n" + ind + "}\n"
+    assert jf.count(cb) == 2, jf.count(cb)
+    r = validate_mutated("Jenkinsfile", jf.replace(cb, "", 1))
+    check("M10: the image build of context '.' without the contracts-clone verify is refused", r.returncode == 1 and "consumes a path inside the nested checkout '.deps/options-edge-contracts'" in r.stdout, r.stdout)
+    pblock_line = next(l for l in jf.split("\n") if "verify-permitted-tree.sh --dir . " in l and l.startswith("                  "))
+    pb = ind + "timeout(time: 10, unit: 'MINUTES') {\n" + pblock_line + "\n" + ind + "}\n"
+    r = validate_mutated("Jenkinsfile", jf.replace(pb, "", 1))
+    check("M10: the image build without the primary verify is refused", r.returncode == 1 and "the primary checkout '.'" in r.stdout, r.stdout)
     r = validate_mutated("Jenkinsfile.deploy", jd.replace(guard_line, ind + "script {\n" + ind + "  return\n" + guard_line + "\n" + ind + "}", 1))
     check("the host job's contracts guard behind an early return in its block (Codex gateway I6) is refused", r.returncode == 1 and ("can be skipped" in r.stdout or "is not re-bound" in r.stdout), r.stdout)
 
@@ -168,12 +203,40 @@ def main() -> int:
             open(p, "w").write(body)
         st = subprocess.run(["git", "-C", co, "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
         check("N4: the build's root byproducts are gitignored, so the footprint gate sees a clean tree", st == "", f"git status not empty:\n{st}")
+        # the primary verify in front of `mvn package` and the image build must ACCEPT exactly what this build writes (its
+        # --allow-ignored list parsed from the real Jenkinsfile), with the contracts clone and Python bytecode present too
+        for rel, body in [(".deps/options-edge-contracts/pom.xml", "<project/>\n"), (".jenkins-tmp/java-home", "/x\n"), ("scripts/__pycache__/m.pyc", "c")]:
+            p = os.path.join(co, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").write(body)
+        vline = next(l for l in jf.split("\n") if "verify-permitted-tree.sh --dir . " in l)
+        allow = vline.split("verify-permitted-tree.sh --dir . ", 1)[1].rstrip("'").split()
+        head = subprocess.run(["git", "-C", co, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        r = subprocess.run(["bash", os.path.join(HERE, "verify-permitted-tree.sh"), "--dir", co] + allow, capture_output=True, text=True,
+                           env={**os.environ, "PERMITTED_SHA": head})
+        check("the primary verify accepts the real post-build workspace (declared byproducts only)", r.returncode == 0, r.stdout + r.stderr)
+        open(os.path.join(co, "src-extra.txt"), "w").write("x")
+        r = subprocess.run(["bash", os.path.join(HERE, "verify-permitted-tree.sh"), "--dir", co] + allow, capture_output=True, text=True,
+                           env={**os.environ, "PERMITTED_SHA": head})
+        check("the same workspace with one untracked file added is refused", r.returncode != 0 and "differs from the permitted commit" in r.stderr, r.stdout + r.stderr)
     finally:
         subprocess.run(["git", "-C", ROOT, "worktree", "remove", "--force", co], capture_output=True)
         shutil.rmtree(tmp, True)
 
-    # ---- artifact identity: the Image stage's shell, executed ----
-    block = shell_body(jf, "stage('Image')")
+    # ---- artifact identity: the Image stage, executed step by step: prepare -> the DEDICATED build step (its env from
+    # the prepare step's file, as withEnv hands it) -> lock ----
+    stage_txt = jf[jf.index("stage('Image')"):jf.index("// Only THIS build's lock (keyed by BUILD_ID")]
+    prep_block = shell_body(stage_txt, "Image: prepare")
+    lock_block = shell_body(stage_txt, "Image: lock")
+    two_tag_line = next(l.strip() for l in stage_txt.split("\n") if l.strip().startswith("sh 'docker buildx build ") and '"${IMAGE_REF_2}"' in l)
+    one_tag_line = next(l.strip() for l in stage_txt.split("\n") if l.strip().startswith("sh 'docker buildx build ") and '"${IMAGE_REF_2}"' not in l)
+    block = "\n".join([
+        "set -e",
+        "( " + prep_block + " )",
+        "while IFS= read -r kv; do [ -n \"$kv\" ] && export \"$kv\"; done < \".jenkins-tmp/image-env-$BUILD_ID\"",
+        "if [ -n \"$IMAGE_REF_2\" ]; then " + two_tag_line[len("sh '"):-1] + "; else " + one_tag_line[len("sh '"):-1] + "; fi",
+        "( " + lock_block + " )",
+    ])
 
     def world():
         tmp = tempfile.mkdtemp()

@@ -93,14 +93,16 @@ pipeline {
         timeout(time: 10, unit: 'MINUTES') {
           sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/permitted-sha-guard.sh --dir .deps/options-edge-contracts --ref main'
         }
-        // PROVENANCE (Deployment Permission Rule): re-prove, immediately before the contracts source is compiled in,
-        // that the contracts checkout is still exactly its permitted commit's tree (verify-permitted-tree.sh). Rule 9b.
+        // PROVENANCE (Deployment Permission Rule, validator rule 9b): the verify re-proves, immediately before the contracts
+        // source is compiled in, that its checkout is still exactly the permitted commit's tree, and the install is a
+        // DEDICATED step whose whole body is the one mvn command — nothing can run between the verification and the
+        // consumption.
         timeout(time: 10, unit: 'MINUTES') {
           sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
         }
+        sh 'mvn -B -f .deps/options-edge-contracts/pom.xml install -DskipTests'
         sh '''
           set -euo pipefail
-          mvn -B -f .deps/options-edge-contracts/pom.xml install -DskipTests
           # ARTIFACT IDENTITY, part 1: the installed contracts jar, by content — re-verified before
           # packaging and verified inside the packaged jar.
           CV="$(mvn -q -f .deps/options-edge-contracts/pom.xml help:evaluate -Dexpression=project.version -DforceStdout)"
@@ -123,7 +125,16 @@ pipeline {
           CJAR="$WORKSPACE/.m2/repository/com/optionsedge/options-edge-contracts/$CV/options-edge-contracts-$CV.jar"
           [ "$(bash scripts/jenkins/permitted-sha-guard-version.sh "$CJAR")" = "$(cat .contracts-jar-sha256)" ] \
             || { echo "the installed contracts jar changed since it was bound — refusing to package" >&2; exit 1; }
-          mvn -B clean package -DskipTests
+        '''
+        // PROVENANCE (validator rule 9b): the gateway source is compiled into the jar this job launches, so the package is a
+        // DEDICATED step right after the verify of the primary checkout (the declared ignored names are what this build
+        // itself writes).
+        timeout(time: 10, unit: 'MINUTES') {
+          sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored __pycache__'
+        }
+        sh 'mvn -B clean package -DskipTests'
+        sh '''
+          set -euo pipefail
           # part 3: the packaged jar, by content, and the contracts jar INSIDE it.
           JAR="$(find target -maxdepth 1 -type f -name 'options-edge-feed-gateway-*.jar' ! -name '*.original' | sort | head -n1)"
           [ -n "$JAR" ] || { echo "no packaged gateway jar under target/" >&2; exit 1; }
