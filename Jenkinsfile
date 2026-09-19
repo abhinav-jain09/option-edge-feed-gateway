@@ -20,7 +20,7 @@ pipeline {
   parameters {
     string(name: 'PERMITTED_SHA', defaultValue: '', trim: true,
       description: 'REQUIRED — Deployment Permission Rule (options-edge rule.md). The full 40-character commit id of THIS repository that Abhinav permitted for this image build. The Permitted commit guard stage — FIRST inside Build, before contracts install, tests, package and image — refuses the build unless the checked-out HEAD is exactly this commit AND on origin/main; empty, short or mismatched values are refused and nothing is substituted. An SCM-triggered build has no value and therefore stops at the guard before anything is built. A manual click needs it too: copy it from `git rev-parse origin/main`.')
-    string(name: 'PERMITTED_SHA_GUARD_VERSION', defaultValue: '922f76ce5af2ff005cb6b330ceea65faf3738d1237cb7d33384c3583d9b1df9a',
+    string(name: 'PERMITTED_SHA_GUARD_VERSION', defaultValue: 'd2a653cfeb2e8ef7103e5590db93e9004adcb20673972f373617b63301ee6784',
       description: 'DO NOT EDIT BY HAND — the sha256 of scripts/jenkins/permitted-sha-guard.sh this definition runs (Deployment Permission Rule). The guard refuses to run under any other value. It is a DECLARATION, not proof that this job enforces the guard: a caller that triggers this job judges its SCM definition and its Jenkinsfile at the forwarded commit (scripts/jenkins/require-guarded-downstream.sh). Regenerate with scripts/jenkins/permitted-sha-guard-version.sh when the guard changes.')
     string(name: 'CONTRACTS_PERMITTED_SHA', defaultValue: '', trim: true,
       description: 'REQUIRED — Deployment Permission Rule. The full 40-character commit id of options-edge-contracts permitted for this build: the Install Contracts stage clones contracts at CONTRACTS_BRANCH and compiles that source into the gateway, so it is a second source of the image and is bound on its own. Refused before mvn install unless the clone is exactly this commit on main; empty, short or mismatched values are refused and nothing is substituted.')
@@ -227,27 +227,42 @@ pipeline {
     stage('Test') {
       when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
+        // `mvn test` COMPILES this repository's source and runs it. By the validator's effect definition it is
+        // not an effect — it installs, ships and publishes nothing, so there is no artifact to bind — and that
+        // is exactly why Codex M1 could replace a tracked file after the guard and have it compiled and executed
+        // here, before the first verify (which used to be in Package). The compile does not get to be the one
+        // step that reads an unproved tree: the toolchain is resolved in a step that consumes nothing, the
+        // workspace is verified, and then the test command runs ALONE, with nothing between the verification and
+        // the compile. The declared ignored paths are this build's own output.
         sh '''
           set -eu
           if [ -x "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java" ]; then
-            export JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
+            JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
           elif [ -x /usr/lib/jvm/java-21/bin/java ]; then
-            export JAVA_HOME=/usr/lib/jvm/java-21
+            JAVA_HOME=/usr/lib/jvm/java-21
           elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
-            export JAVA_HOME="$JAVA_HOME"
+            JAVA_HOME="$JAVA_HOME"
           else
             echo "Java 21 was not found on this Jenkins agent" >&2
             exit 1
           fi
-          export MAVEN_SKIP_RC=true
-          export PATH="$JAVA_HOME/bin:$PATH"
-          # Per-WORKSPACE Maven repository (artifact identity): the contracts jar this build installs
-          # must be the one its tests, its footprint campaign and its packaging consume. A shared
-          # ~/.m2 lets ANY other job on this builder overwrite the same coordinate in between.
-          export MAVEN_OPTS="-Dmaven.repo.local=$WORKSPACE/.m2/repository${MAVEN_OPTS:+ $MAVEN_OPTS}"
-          java -version
-          mvn -B test
+          mkdir -p .jenkins-tmp
+          printf '%s\n' "$JAVA_HOME" > .jenkins-tmp/java-home
+          "$JAVA_HOME/bin/java" -version
         '''
+        script {
+          def jh = readFile('.jenkins-tmp/java-home').trim()
+          // Per-WORKSPACE Maven repository (artifact identity): the contracts jar this build installed
+          // must be the one its tests, its footprint campaign and its packaging consume. A shared
+          // ~/.m2 lets ANY other job on this builder overwrite the same coordinate in between.
+          withEnv(["JAVA_HOME=${jh}", "PATH+JDK=${jh}/bin", 'MAVEN_SKIP_RC=true',
+                   "MAVEN_OPTS=-Dmaven.repo.local=${env.WORKSPACE}/.m2/repository${env.MAVEN_OPTS ? ' ' + env.MAVEN_OPTS : ''}"]) {
+            timeout(time: 10, unit: 'MINUTES') {
+              sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+            }
+            sh 'mvn -B test'
+          }
+        }
       }
     }
     stage('Footprint reverification') {
@@ -330,7 +345,7 @@ pipeline {
             // output, the per-workspace Maven repository, the contracts clone (verified on its own before its install),
             // the provenance files, .jenkins-tmp/ and Python bytecode from the footprint scripts.
             timeout(time: 10, unit: 'MINUTES') {
-              sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored __pycache__'
+              sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
             }
             sh 'mvn -B package'
             // part 3: the packaged jar, by content, and the contracts jar INSIDE it (Spring Boot fat jar,
@@ -478,7 +493,7 @@ EOF
                   sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
                 }
                 timeout(time: 10, unit: 'MINUTES') {
-                  sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored __pycache__'
+                  sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
                 }
                 sh 'docker buildx build --builder "${BUILDER_NAME}" --platform "${BUILD_PLATFORM}" --no-cache --label "options-edge.contracts-revision=${LABEL_CONTRACTS_REVISION}" --label "options-edge.source-revision=${LABEL_SOURCE_REVISION}" --label "options-edge.jar-sha256=${LABEL_JAR_SHA256}" --label "options-edge.contracts-jar-sha256=${LABEL_CONTRACTS_JAR_SHA256}" --label "options-edge.guard-version=${LABEL_GUARD_VERSION}" -t "${IMAGE_REF_1}" -t "${IMAGE_REF_2}" --metadata-file "${PUSH_METADATA}" --output "${BUILD_OUTPUT}" .'
               } else {
@@ -486,7 +501,7 @@ EOF
                   sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
                 }
                 timeout(time: 10, unit: 'MINUTES') {
-                  sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored __pycache__'
+                  sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
                 }
                 sh 'docker buildx build --builder "${BUILDER_NAME}" --platform "${BUILD_PLATFORM}" --no-cache --label "options-edge.contracts-revision=${LABEL_CONTRACTS_REVISION}" --label "options-edge.source-revision=${LABEL_SOURCE_REVISION}" --label "options-edge.jar-sha256=${LABEL_JAR_SHA256}" --label "options-edge.contracts-jar-sha256=${LABEL_CONTRACTS_JAR_SHA256}" --label "options-edge.guard-version=${LABEL_GUARD_VERSION}" -t "${IMAGE_REF_1}" --metadata-file "${PUSH_METADATA}" --output "${BUILD_OUTPUT}" .'
               }

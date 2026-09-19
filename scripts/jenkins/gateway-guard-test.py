@@ -108,6 +108,39 @@ def main() -> int:
     check("N3: the single-backslash '\\.original$' Groovy escape is refused", r.returncode == 1 and "not a Groovy escape" in r.stdout, r.stdout)
     r = validate_mutated("Jenkinsfile", jf.replace("    stage('Image') {\n      when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }\n", "    stage('Image') {\n", 1))
     check("an effect stage whose gate is removed is refused", r.returncode == 1 and "stage 'Image' after the guard has no `when` gate" in r.stdout, r.stdout)
+
+    # Codex gateway round 4, M1 — the Test stage compiled this repository's source with no verification in front
+    # of it: `mvn -B test` sat inside a preparation-plus-command shell body and the first primary-tree verify was
+    # in Package, so a tracked file replaced after the guard was compiled and executed here. `mvn test` is not an
+    # EFFECT (it publishes nothing), so the validator does not demand the verify — these assertions do. They are
+    # about THIS file: the test command is its own step, and the statement immediately before it is the primary
+    # verify, with nothing in between.
+    VERIFY_CMD = "sh 'PERMITTED_SHA=\"${PERMITTED_SHA:-}\" bash scripts/jenkins/verify-permitted-tree.sh --dir ."
+
+    def compile_is_verified(text: str) -> bool:
+        """True when `sh 'mvn -B test'` is its own step and the last step before it is the primary verify."""
+        stage = text[text.index("    stage('Test') {"):text.index("    stage('Footprint reverification') {")]
+        if "\n            sh 'mvn -B test'\n" not in stage:
+            return False
+        before = stage[:stage.index("sh 'mvn -B test'")]
+        if VERIFY_CMD not in before:
+            return False
+        # every `sh ` between the verify step and the compile — there must be none
+        return before[before.rindex(VERIFY_CMD) + len(VERIFY_CMD):].count("sh ") == 0
+
+    check("M1: the Test stage's compile is its own step, immediately after the primary verify", compile_is_verified(jf))
+    check("M1: that assertion fails when a step is inserted between the verify and the compile",
+          not compile_is_verified(jf.replace("            sh 'mvn -B test'\n",
+                                             "            sh 'cp /tmp/other.java src/main/java/app/feedgateway/FootprintViews.java'\n            sh 'mvn -B test'\n", 1)))
+    ts_only = jf[jf.index("    stage('Test') {"):jf.index("    stage('Footprint reverification') {")]
+    vblk = ts_only[ts_only.index("            timeout(time: 10, unit: 'MINUTES') {"):ts_only.index("            sh 'mvn -B test'")]
+    check("M1: and when the verify block is removed from the stage",
+          not compile_is_verified(jf.replace(vblk, "", 1)))
+    pk = jf[jf.index("    stage('Package') {"):jf.index("    stage('Image') {")]
+    ts = jf[jf.index("    stage('Test') {"):jf.index("    stage('Footprint reverification') {")]
+    check("M1: the Test stage's verify declares the same paths as the Package verify",
+          ts[ts.index(VERIFY_CMD):ts.index("'\n", ts.index(VERIFY_CMD))] == pk[pk.index(VERIFY_CMD):pk.index("'\n", pk.index(VERIFY_CMD))])
+
     # The contracts guard is a DEDICATED step now (validator rule 9): its script is exactly the guard command.
     guard_line = next(l for l in jd.split("\n") if l.strip().startswith("sh 'PERMITTED_SHA=") and "permitted-sha-guard.sh --dir" in l)
     ind = guard_line[:len(guard_line) - len(guard_line.lstrip())]
