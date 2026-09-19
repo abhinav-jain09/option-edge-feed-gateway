@@ -1034,6 +1034,39 @@ public final class GatewaySettings {
         return longValue("GATEWAY_IBKR_PREOPEN_STATUS_TTL_MS", 4 * 3_600_000L, 0L);
     }
 
+    /**
+     * Overnight ThetaData GTH board plane (GATE-1-OVERNIGHT-THETADATA.md §4.2): a SECOND instance of the
+     * pre-open plane — the overnight path's status/control stream ({@code options.thetadata.gex.status},
+     * JSON {@code IbkrPreOpenStatus} shapes, event "thetadata-gth-status") plus its compacted per-strike
+     * VALUE topic ({@code options.thetadata.gex.strike}, GexStrikeAvro, event "thetadata-gex-by-strike").
+     * Default OFF — the whole plane ships dark until {@code GATEWAY_THETADATA_GTH_ENABLED}.
+     */
+    public boolean thetadataGthEnabled() {
+        return "true".equalsIgnoreCase(value("GATEWAY_THETADATA_GTH_ENABLED", "false"));
+    }
+
+    public String thetadataGthStatusTopic() {
+        return value("KAFKA_THETADATA_GEX_STATUS_TOPIC", "options.thetadata.gex.status");
+    }
+
+    /** The overnight VALUE topic: {@code compact,delete}, keyed {@code SPX|D|strike} — the durable value store
+     *  (§4.2): the newest value per strike survives the producer stopping; {@code GTH_CLOSED} tombstones every
+     *  key of the session. */
+    public String thetadataGthStrikeTopic() {
+        return value("KAFKA_THETADATA_GEX_STRIKE_TOPIC", "options.thetadata.gex.strike");
+    }
+
+    /** One GTH session (20:15 D-1 -> 06:15 D is under 10 h): 12 h covers a restart anywhere inside it and can
+     *  never replay the previous night's plane as live. */
+    public long thetadataGthStatusTtlMs() {
+        return longValue("GATEWAY_THETADATA_GTH_STATUS_TTL_MS", 12 * 3_600_000L, 0L);
+    }
+
+    /** Same session-length window for the value plane (a strike re-emits only when its quote changes). */
+    public long thetadataGthStrikeTtlMs() {
+        return longValue("GATEWAY_THETADATA_GTH_STRIKE_TTL_MS", 12 * 3_600_000L, 0L);
+    }
+
     /** Long last-value-wins window for the aligned book (like gex-by-strike); the align service re-emits ~5s. */
     public long esGexTtlMs() {
         return longValue("GATEWAY_ES_GEX_TTL_MS", maxPainTtlMs(), 0L);

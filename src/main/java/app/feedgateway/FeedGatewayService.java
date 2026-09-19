@@ -100,6 +100,14 @@ public class FeedGatewayService implements ReplayRunner {
      * is safe here and is REQUIRED for a correct physical-offset barrier.
      */
     static final String BARRIER_CONSUMER_ISOLATION = "read_uncommitted";
+
+    /**
+     * Overnight ThetaData GTH board plane (GATE-1-OVERNIGHT-THETADATA.md §4.2): the SSE/WS event names of
+     * the second status-plane instance and of its durable per-strike value plane. Compile-time constants
+     * so they can label switch cases and the static broadcast allowlist.
+     */
+    static final String THETADATA_GTH_STATUS_EVENT = "thetadata-gth-status";
+    static final String THETADATA_GEX_BY_STRIKE_EVENT = "thetadata-gex-by-strike";
     private final Instant startedAt = Instant.now();
     private final GatewaySettings settings;
     // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1..G-R11) — null unless the flag is on ----
@@ -274,6 +282,16 @@ public class FeedGatewayService implements ReplayRunner {
     // rows ("SPX|<D>|<strike>") AND "__"-prefixed controls (path/manifest/heartbeat/ownership)
     // — the UI needs BOTH to drive per-strike chips + window state. Dark unless enabled.
     private final Map<String, String> ibkrPreOpenStatus = new ConcurrentHashMap<>();
+    // ---- Overnight ThetaData GTH board plane (GATE-1-OVERNIGHT-THETADATA.md §4.2): the SECOND
+    // instance of the pre-open status plane plus a per-key VALUE cache. Both maps hold the WRAPPED
+    // wire form keyed by the source-prefixed cache key ("THETADATA|<raw key>"); strike rows
+    // ("SPX|D|<strike>") AND "__"-prefixed controls (path/manifest/baseline/baseline-complete/
+    // carry/heartbeat/ownership) cache on the status plane. The value topic is compact,delete so the
+    // newest value per strike is durable in Kafka whether or not the producer is still running; a
+    // tombstone (the GTH_CLOSED transaction writes one per published key) EVICTS the cached value.
+    // Dark unless enabled.
+    private final Map<String, String> thetadataGthStatus = new ConcurrentHashMap<>();
+    private final Map<String, String> thetadataGexByStrike = new ConcurrentHashMap<>();
     // ---- Pre-open IBKR GEX value plane (rev13 Phase 3 slice 2: R-ARB + the R-STOP frozen-projection
     // cache). Sessioned value records arriving on the SHARED live topic (USER D14) are arbitrated off
     // the Databento pipeline into this plane; Databento records are NEVER touched (D11). Keyed by the
@@ -1509,10 +1527,21 @@ public class FeedGatewayService implements ReplayRunner {
             replayIndicatorsCached(session);
             replayTapeZonesCached(session);
             replayIbkrPreOpenCached(session);
+            // Overnight GTH status plane: the same standalone class (bootstrap protocol §4.2: status
+            // plane first, then the value cache below, then live).
+            replayThetadataGthStatusCached(session);
             // Close-direction: replay the session's frozen verdict (or the current interim) so a page
             // reload in the final hour restores the card instead of waiting for the next minute tick.
             replayCloseDirectionCached(session);
             replayZeroDteIntelligenceCached(session);
+        }
+        // Overnight GTH VALUE plane: replayed AFTER the status plane and only once BOTH consumers
+        // are caught up — the values ride the Avro consumer while the controls (__path, __manifest,
+        // __baseline-complete) ride the JSON state consumer; serving on avro alone could hand a
+        // client a value whose gating control has not been consumed yet. The web keeps a value
+        // numberless until its status/manifest lands, so the order is a courtesy, not the safety.
+        if (settings.thetadataGthEnabled() && thetadataGthServingUp()) {
+            replayThetadataGexCached(session);
         }
         // Vol-premium joins here whether or not the state cache has caught up: until it has, the socket's
         // delivery is simply held (serveVolPremium walks it from the start at catch-up), so it needs no
@@ -1918,6 +1947,13 @@ public class FeedGatewayService implements ReplayRunner {
                           + "\"ibkrPreOpenGexDroppedSessioned\":" + ibkrPreOpenGexDroppedSessioned.get() + ","
                           + "\"ibkrPreOpenGexRejected\":" + ibkrPreOpenGexRejected.get() + ","
                         : "")
+                // Overnight GTH plane counters: flag-gated for the same feature-off identity reason.
+                + (settings.thetadataGthEnabled()
+                        ? "\"thetadataGthStatus\":" + thetadataGthStatus.size() + ","
+                          + "\"thetadataGexByStrike\":" + thetadataGexByStrike.size() + ","
+                          + "\"thetadataGexTombstones\":" + thetadataGexTombstones.get() + ","
+                          + "\"thetadataGexRejected\":" + thetadataGexRejected.get() + ","
+                        : "")
                 + "\"strikeSr\":" + strikeSr.size() + ","
                 + "\"gexMagnet\":" + gexMagnet.size() + ","
                 // ES-on-SPX aligned cache. On environments where the feature is OFF (e.g. the ES
@@ -2163,6 +2199,14 @@ public class FeedGatewayService implements ReplayRunner {
                 // Flag-gated like the statusJson counters (O7 feature-off identity, round-2
                 // finding 5): with the feature OFF the scrape is byte-equivalent to a build
                 // without it — the es-gex/es-strike-intel precedent above.
+                + (settings.thetadataGthEnabled()
+                        ? "# HELP options_edge_feed_gateway_thetadata_gth_status Overnight GTH status/control rows cached (GATE-1-OVERNIGHT-THETADATA §4.2).\n"
+                          + "# TYPE options_edge_feed_gateway_thetadata_gth_status gauge\n"
+                          + "options_edge_feed_gateway_thetadata_gth_status " + thetadataGthStatus.size() + "\n"
+                          + "# HELP options_edge_feed_gateway_thetadata_gex_by_strike Overnight GTH per-strike values cached (durable value plane).\n"
+                          + "# TYPE options_edge_feed_gateway_thetadata_gex_by_strike gauge\n"
+                          + "options_edge_feed_gateway_thetadata_gex_by_strike " + thetadataGexByStrike.size() + "\n"
+                        : "")
                 + (settings.ibkrPreOpenEnabled()
                         ? "# HELP options_edge_feed_gateway_ibkr_preopen_gex_candidates Pre-open IBKR GEX live candidates (rev13 slice 2).\n"
                           + "# TYPE options_edge_feed_gateway_ibkr_preopen_gex_candidates gauge\n"
@@ -2400,6 +2444,13 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
         topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
+        if (settings.thetadataGthEnabled()) {
+            // Overnight GTH VALUE plane (GATE-1-OVERNIGHT-THETADATA.md §4.2): GexStrikeAvro on the wire,
+            // compacted, keyed SPX|D|strike — consumed via the Avro deserializer like the Databento gex
+            // topic, but into its OWN per-key cache (never the Databento plane), seekToBeginning on
+            // every (re)start, tombstones evict.
+            topicEvents.put(settings.thetadataGthStrikeTopic(), new TopicBinding("THETADATA", THETADATA_GEX_BY_STRIKE_EVENT));
+        }
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2428,6 +2479,11 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.ibkrPreOpenEnabled()) {
             // Pre-open IBKR GEX status/control stream (rev13 Phase 3) — JSON on the wire.
             topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
+        }
+        if (settings.thetadataGthEnabled()) {
+            // Overnight GTH status/control stream (GATE-1-OVERNIGHT-THETADATA.md §4.2): the second
+            // instance of the pre-open status plane — JSON IbkrPreOpenStatus shapes on the wire.
+            topicEvents.put(settings.thetadataGthStatusTopic(), new TopicBinding("THETADATA", THETADATA_GTH_STATUS_EVENT));
         }
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
@@ -2559,6 +2615,11 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
         topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
+        if (settings.thetadataGthEnabled()) {
+            // Overnight GTH VALUE plane — keep the cache + live Avro consumer topic sets symmetric so
+            // live overnight values (and the GTH_CLOSED tombstones) actually flow post-bootstrap.
+            topicEvents.put(settings.thetadataGthStrikeTopic(), new TopicBinding("THETADATA", THETADATA_GEX_BY_STRIKE_EVENT));
+        }
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -2569,6 +2630,10 @@ public class FeedGatewayService implements ReplayRunner {
             // Pre-open IBKR GEX status/control stream (rev13 Phase 3) — keep the cache + live
             // JSON consumer topic sets symmetric so live statuses actually flow post-bootstrap.
             topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
+        }
+        if (settings.thetadataGthEnabled()) {
+            // Overnight GTH status/control stream — cache + live JSON consumer sets kept symmetric.
+            topicEvents.put(settings.thetadataGthStatusTopic(), new TopicBinding("THETADATA", THETADATA_GTH_STATUS_EVENT));
         }
         topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
         // Canonical SPX spot — dedicated event, NOT index-price: its payload source names the cascade
@@ -3042,6 +3107,14 @@ public class FeedGatewayService implements ReplayRunner {
                         bootstrappingPartitions.keySet());
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
+                    if (binding != null && THETADATA_GEX_BY_STRIKE_EVENT.equals(binding.event())) {
+                        // Overnight GTH VALUE plane (§4.2 durable value replay): its own per-key
+                        // cache, the producer's Avro record serialised byte-for-byte (never enriched
+                        // with the binding's provenance), a NULL value is the GTH_CLOSED tombstone
+                        // and evicts. The cache consumer never live-broadcasts (mirrors slice 1).
+                        ingestThetadataGex(record, avro ? avroJson(record.value()) : stringJson(record.value()), false);
+                        continue;
+                    }
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
                     // pairing fields, control JSON): it reaches the browser byte-untouched —
                     // never enriched/reserialized. The tape-zones board is the same class: it is
@@ -3218,7 +3291,18 @@ public class FeedGatewayService implements ReplayRunner {
         long nowMs = System.currentTimeMillis();
         Map<TopicPartition, Long> timestamps = new HashMap<>();
         List<TopicPartition> seekToEnd = new ArrayList<>();
+        List<TopicPartition> seekToBeginning = new ArrayList<>();
         for (TopicPartition partition : partitions) {
+            if (isThetadataGthTopic(partition.topic(), topicEvents)) {
+                // Overnight GTH planes (GATE-1-OVERNIGHT-THETADATA.md §4.2): BOTH topics are
+                // compact,delete with bounded cardinality (<= 7 sessions x (42 strikes + controls)),
+                // and they are the durable store the board is reconstructed from after any restart —
+                // the compacted per-key HEAD is what must be read, not a timestamp window whose
+                // cutoff could sit past a strike's last (still-current) value or past a tombstone.
+                // Read from the BEGINNING; the 12 h TTL at ingest still refuses a previous night.
+                seekToBeginning.add(partition);
+                continue;
+            }
             long ttlMs = windowTtlMsFor(partition, topicEvents, nowMs);
             if (ttlMs <= 0) {
                 seekToEnd.add(partition);
@@ -3226,8 +3310,20 @@ public class FeedGatewayService implements ReplayRunner {
                 timestamps.put(partition, nowMs - ttlMs);
             }
         }
+        if (!seekToBeginning.isEmpty()) {
+            consumer.seekToBeginning(seekToBeginning);
+        }
         seekToTimestampsOrEnd(consumer, timestamps, seekToEnd);
         return Map.copyOf(timestamps);
+    }
+
+    /** A partition of one of the two overnight GTH topics (status or value plane). */
+    private boolean isThetadataGthTopic(String topic, Map<String, TopicBinding> topicEvents) {
+        if (topicEvents == null) {
+            return false;
+        }
+        TopicBinding binding = topicEvents.get(topic);
+        return binding != null && isThetadataGthEvent(binding.event());
     }
 
     /**
@@ -3436,6 +3532,14 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
+                    if (binding != null && THETADATA_GEX_BY_STRIKE_EVENT.equals(binding.event())) {
+                        // Overnight GTH VALUE plane: the live consumer is the broadcasting side —
+                        // delivery rides the caught-up flag and a per-partition offset CAS gate
+                        // (exactly-once across both ingesting consumers, in partition order).
+                        ingestThetadataGex(record, avro ? avroJson(record.value()) : stringJson(record.value()),
+                                cacheCaughtUpFlag.get());
+                        continue;
+                    }
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
                     // pairing fields, control JSON): it reaches the browser byte-untouched —
                     // never enriched/reserialized. The tape-zones board is the same class: it is
@@ -3661,8 +3765,9 @@ public class FeedGatewayService implements ReplayRunner {
                     if ("dealer-ledger".equals(binding.event()) && (forwardJson == null || forwardJson.isBlank())) {
                         continue; // join not ready / stale-dropped — nothing to forward for this record
                     }
-                    if ("ibkr-preopen-status".equals(binding.event())) {
-                        // Pre-open window state (rev13 R-STATE): a STANDALONE global stream like
+                    if (isStatusPlaneEvent(binding.event())) {
+                        // Pre-open window state (rev13 R-STATE) — and the overnight GTH plane, its
+                        // second instance: a STANDALONE global stream like
                         // close-direction/spot-vol-regime — its own websocket event, never a
                         // ui-batch row, never selection-routed (payloads carry sessionId; clients
                         // gate on it), never coalesced (controls must not drop). BOTH consumers
@@ -3671,7 +3776,7 @@ public class FeedGatewayService implements ReplayRunner {
                         // duplicate rejection (cacheKey == null for the second consumer) never
                         // suppresses a live delivery. The wrap carries (recordKey, offset) so the
                         // client renders last-writer-wins even when a replay interleaves.
-                        if (cacheCaughtUpFlag.get() && shouldBroadcastIbkrPreOpen(record.offset())) {
+                        if (cacheCaughtUpFlag.get() && shouldBroadcastStatusPlane(binding.event(), record.offset())) {
                             broadcast(binding.event(),
                                     wrapIbkrPreOpenStatus(String.valueOf(record.key()),
                                             record.offset(), record.timestamp(), json));
@@ -4063,6 +4168,9 @@ public class FeedGatewayService implements ReplayRunner {
                     // record per cadence tick plus rare transitions.
                     return !"max-pain".equals(binding.event()) && !isEsOpenDirectionEvent(binding.event())
                             && !"ibkr-preopen-status".equals(binding.event())
+                            // The overnight GTH planes are the same NON-DROP control class: a seekToEnd
+                            // could skip a GTH_CLOSED, a __baseline-complete or a session's tombstones.
+                            && !isThetadataGthEvent(binding.event())
                             && !isVolPremiumEvent(binding.event());
                 })
                 .toList();
@@ -4552,6 +4660,9 @@ public class FeedGatewayService implements ReplayRunner {
             }
             if ("ibkr-preopen-status".equals(binding.event())
                     || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
+                    // The overnight GTH status + value planes are source-independent window state too
+                    // (a replay must never expose a value ahead of its GTH_CLOSED tombstone).
+                    || isThetadataGthEvent(binding.event())
                     || "indicators".equals(binding.event())
                     || "tapeZones".equals(binding.event())
                     || "es-auction".equals(binding.event())
@@ -4591,6 +4702,7 @@ public class FeedGatewayService implements ReplayRunner {
             TopicBinding preOpenBinding = topicEvents.get(entry.getKey().topic());
             if (preOpenBinding != null && ("ibkr-preopen-status".equals(preOpenBinding.event())
                     || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
+                    || isThetadataGthEvent(preOpenBinding.event())
                     || "indicators".equals(preOpenBinding.event())
                     || "tapeZones".equals(preOpenBinding.event())
                     || "es-auction".equals(preOpenBinding.event())
@@ -4807,6 +4919,19 @@ public class FeedGatewayService implements ReplayRunner {
             if (events.contains("ibkr-preopen-status")) {
                 for (WebSocketSession client : clients) {
                     replayIbkrPreOpenCached(client);
+                }
+            }
+            // Overnight GTH plane: status plane re-push when the JSON state consumer catches up;
+            // the VALUE plane re-pushes once BOTH barriers are up (values on avro, controls on the
+            // JSON consumer) — whichever consumer catches up LAST triggers it, after the statuses.
+            if (events.contains(THETADATA_GTH_STATUS_EVENT)) {
+                for (WebSocketSession client : clients) {
+                    replayThetadataGthStatusCached(client);
+                }
+            }
+            if (settings.thetadataGthEnabled() && isThetadataGthEvent(events) && thetadataGthServingUp()) {
+                for (WebSocketSession client : clients) {
+                    replayThetadataGexCached(client);
                 }
             }
             // Pre-open IBKR GEX value plane (slice 2): re-push once BOTH barriers are up — the avro
@@ -5863,7 +5988,7 @@ public class FeedGatewayService implements ReplayRunner {
             key = binding.source() + "|" + key;
         }
         String versionKey = event + ":" + key;
-        if ("ibkr-preopen-status".equals(event) || "indicators".equals(event)
+        if (isStatusPlaneEvent(event) || "indicators".equals(event)
                 || "tapeZones".equals(event)) {
             // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5; indicators rev 14
             // §6.9 r1 finding 2): these topics are single-partition per symbol and
@@ -5888,7 +6013,7 @@ public class FeedGatewayService implements ReplayRunner {
         // with an older Kafka timestamp would be silently dropped before the UI sees the transition.
         boolean isTerminalMaxPainShortCircuitBypass = "max-pain".equals(event) && isMaxPainExpired(json);
         if (!isTerminalMaxPainShortCircuitBypass
-                && !"ibkr-preopen-status".equals(event)
+                && !isStatusPlaneEvent(event)
                 && !"indicators".equals(event)
                 && !"tapeZones".equals(event)
                 && previousEventTime != null && previousEventTime > eventTime) {
@@ -6196,6 +6321,21 @@ public class FeedGatewayService implements ReplayRunner {
                 // Reconstruction is order-INDEPENDENT (round-1 finding 1): a status arriving after
                 // its value completes the pending pair right here, not at some later poll.
                 reevaluateIbkrPreOpenPendingProjections(System.currentTimeMillis());
+                return key;
+            }
+            case THETADATA_GTH_STATUS_EVENT -> {
+                // Overnight GTH status plane (GATE-1-OVERNIGHT-THETADATA.md §4.2): the pre-open
+                // status case above, instantiated for the second plane. Last-value-wins per Kafka
+                // record key (strike rows AND "__" controls: __path/__manifest/__baseline/
+                // __baseline-complete/__carry/__heartbeat/__ownership/__revocation), the RAW key
+                // wrapped around the byte-untouched producer value. No value-plane arbitration
+                // here: the overnight values live on their OWN compacted topic (never the shared
+                // live gex topic), so the web's projection is the only arbiter (§4.2/§4.3).
+                String rawKey = String.valueOf(record.key());
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                thetadataGthStatus.put(key,
+                        wrapIbkrPreOpenStatus(rawKey, record.offset(), record.timestamp(), json));
                 return key;
             }
             case "tapeZones" -> {
@@ -7047,6 +7187,16 @@ public class FeedGatewayService implements ReplayRunner {
             // reconnect, can never replay yesterday's window as live (rev13 R-STATE).
             return CachePolicy.expiring(settings.ibkrPreOpenStatusTtlMs());
         }
+        if (THETADATA_GTH_STATUS_EVENT.equals(event)) {
+            // Overnight GTH window state: one GTH session's horizon (default 12h). The seek-back is
+            // irrelevant here — the compacted topics are read from the BEGINNING on every (re)start
+            // (seekToCacheWindow) so the durable per-key head is always reconstructed; the TTL is
+            // what keeps a previous night's plane from replaying as live.
+            return CachePolicy.expiring(settings.thetadataGthStatusTtlMs());
+        }
+        if (THETADATA_GEX_BY_STRIKE_EVENT.equals(event)) {
+            return CachePolicy.expiring(settings.thetadataGthStrikeTtlMs());
+        }
         if ("tapeZones".equals(event)) {
             // Tape-zones board: the SHORT freshness class (spot-vol-regime/indicators). A board
             // from a dead service or a stale mirror must read as ABSENT on late-join, never live.
@@ -7596,6 +7746,10 @@ public class FeedGatewayService implements ReplayRunner {
             gexOiStatus.remove(versionKey.substring("gex-oi-status:".length()));
         } else if (versionKey.startsWith("ibkr-preopen-status:")) {
             ibkrPreOpenStatus.remove(versionKey.substring("ibkr-preopen-status:".length()));
+        } else if (versionKey.startsWith(THETADATA_GTH_STATUS_EVENT + ":")) {
+            thetadataGthStatus.remove(versionKey.substring(THETADATA_GTH_STATUS_EVENT.length() + 1));
+        } else if (versionKey.startsWith(THETADATA_GEX_BY_STRIKE_EVENT + ":")) {
+            thetadataGexByStrike.remove(versionKey.substring(THETADATA_GEX_BY_STRIKE_EVENT.length() + 1));
         } else if (versionKey.startsWith("tapeZones:")) {
             String tapeZonesKey = versionKey.substring("tapeZones:".length());
             tapeZonesBoards.remove(tapeZonesKey);
@@ -8861,6 +9015,202 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     // ==================================================================================
+    // Overnight ThetaData GTH board plane — GATE-1-OVERNIGHT-THETADATA.md §4.2 / §4.3.
+    // A SECOND INSTANCE of the pre-open status plane (options.thetadata.gex.status ->
+    // "thetadata-gth-status", the slice-1 machinery verbatim: raw pass-through, offset-ordered
+    // last-value-wins per Kafka key, session-length TTL, replay to every new socket) plus the
+    // durable VALUE plane (options.thetadata.gex.strike, compact,delete, keyed SPX|D|strike ->
+    // "thetadata-gex-by-strike"): the newest value per strike is retained by Kafka regardless of
+    // whether the producer is still running, so a gateway restarted after the producer's last
+    // quote reconstructs the same board; the GTH_CLOSED transaction tombstones every published key,
+    // so a gateway restarted after the close replays statuses and NO values. Both topics are read
+    // read_committed (RECORD_CONSUMER_ISOLATION) so an aborted transaction never surfaces.
+    // ==================================================================================
+
+    /** The two wrapped status-plane streams (pre-open IBKR and overnight GTH) share every rule. */
+    private static boolean isStatusPlaneEvent(String event) {
+        return "ibkr-preopen-status".equals(event) || THETADATA_GTH_STATUS_EVENT.equals(event);
+    }
+
+    /** Either overnight GTH plane event (status or value). */
+    static boolean isThetadataGthEvent(String event) {
+        return THETADATA_GTH_STATUS_EVENT.equals(event) || THETADATA_GEX_BY_STRIKE_EVENT.equals(event);
+    }
+
+    private static boolean isThetadataGthEvent(Collection<String> events) {
+        return events.contains(THETADATA_GTH_STATUS_EVENT) || events.contains(THETADATA_GEX_BY_STRIKE_EVENT);
+    }
+
+    /** Single-partition exactly-once in-order live-delivery gate for the GTH status plane (the
+     *  slice-1 gate, one AtomicLong per plane so the two planes' offset spaces never interfere). */
+    private final java.util.concurrent.atomic.AtomicLong thetadataGthBroadcastOffset =
+            new java.util.concurrent.atomic.AtomicLong(-1L);
+
+    boolean shouldBroadcastThetadataGth(long offset) {
+        while (true) {
+            long current = thetadataGthBroadcastOffset.get();
+            if (offset <= current) {
+                return false;
+            }
+            if (thetadataGthBroadcastOffset.compareAndSet(current, offset)) {
+                return true;
+            }
+        }
+    }
+
+    private boolean shouldBroadcastStatusPlane(String event, long offset) {
+        return THETADATA_GTH_STATUS_EVENT.equals(event)
+                ? shouldBroadcastThetadataGth(offset)
+                : shouldBroadcastIbkrPreOpen(offset);
+    }
+
+    /** Per-partition exactly-once in-order live-delivery gate for the GTH VALUE plane (32 partitions). */
+    private final Map<Integer, java.util.concurrent.atomic.AtomicLong> thetadataGexBroadcastOffsets =
+            new ConcurrentHashMap<>();
+
+    boolean shouldBroadcastThetadataGex(int partition, long offset) {
+        java.util.concurrent.atomic.AtomicLong gate = thetadataGexBroadcastOffsets.computeIfAbsent(
+                partition, ignored -> new java.util.concurrent.atomic.AtomicLong(-1L));
+        while (true) {
+            long current = gate.get();
+            if (offset <= current) {
+                return false;
+            }
+            if (gate.compareAndSet(current, offset)) {
+                return true;
+            }
+        }
+    }
+
+    /** Both consumers of the GTH plane are caught up: values ride the Avro consumer, the controls
+     *  that gate them ride the JSON state consumer. */
+    private boolean thetadataGthServingUp() {
+        return avroCaughtUp.get() && stateCaughtUp.get();
+    }
+
+    /** The wrapped wire form of a GTH VALUE: the Kafka record key IS the identity ("SPX|D|6300"),
+     *  (partition, offset) is the ordering token for same-key last-writer-wins inside the plane
+     *  (never across planes — §4.2 rule 2), {@code timestampMs} the broker CreateTime, and the
+     *  producer's GexStrikeAvro record rides as {@code gex} byte-for-byte as serialised. */
+    static String wrapThetadataGex(String recordKey, int partition, long offset, long timestampMs, String json) {
+        StringBuilder sb = new StringBuilder("{\"recordKey\":\"");
+        appendJsonEscaped(sb, recordKey);
+        return sb.append("\",\"partition\":").append(partition)
+                .append(",\"offset\":").append(offset)
+                .append(",\"timestampMs\":").append(timestampMs)
+                .append(",\"gex\":").append(json).append('}').toString();
+    }
+
+    /** The live tombstone wire form: a compacted-topic null value (the GTH_CLOSED transaction
+     *  writes one per published key) — the client drops the strike's overnight value. */
+    static String wrapThetadataGexTombstone(String recordKey, int partition, long offset, long timestampMs) {
+        StringBuilder sb = new StringBuilder("{\"recordKey\":\"");
+        appendJsonEscaped(sb, recordKey);
+        return sb.append("\",\"partition\":").append(partition)
+                .append(",\"offset\":").append(offset)
+                .append(",\"timestampMs\":").append(timestampMs)
+                .append(",\"phase\":\"EVICTED\",\"reason\":\"TOMBSTONE\"}").toString();
+    }
+
+    /**
+     * Ingest one record of the overnight VALUE topic into the per-key cache and, on the live
+     * consumer once caught up, broadcast it. Package-private so the tests drive the production seam.
+     *
+     * <ul>
+     *   <li>Offset-ordered last-value-wins per Kafka key on its own partition (the status-plane rule):
+     *       a strictly higher offset wins; an equal/lower offset — the sibling consumer's duplicate or a
+     *       compacted redelivery — is rejected; a DIFFERENT partition for the same key is fail-closed.</li>
+     *   <li>A NULL value is the tombstone: the cached value is evicted and the eviction is broadcast so
+     *       a connected client drops the strike; a tombstone for an unknown key is a no-op.</li>
+     *   <li>The session-length TTL applies at ingest (a value older than the window is never cached) and
+     *       through the periodic purge, so a previous night's value can never replay as live.</li>
+     * </ul>
+     *
+     * @return the source-prefixed cache key on acceptance (value cached or evicted), null when rejected.
+     */
+    synchronized String ingestThetadataGex(ConsumerRecord<String, ?> record, String json, boolean liveBroadcast) {
+        String rawKey = record.key() == null || record.key().isBlank()
+                ? record.topic() + ":" + record.partition()
+                : record.key();
+        String key = "THETADATA|" + rawKey;
+        String versionKey = THETADATA_GEX_BY_STRIKE_EVENT + ":" + key;
+        RecordPosition incoming = recordPosition(record);
+        RecordPosition previousPosition = cachePositions.get(versionKey);
+        if (previousPosition != null
+                && (!previousPosition.partition().equals(incoming.partition())
+                    || incoming.offset() <= previousPosition.offset())) {
+            return null;
+        }
+        long nowMs = System.currentTimeMillis();
+        long eventTime = record.timestamp() > 0 ? record.timestamp() : nowMs;
+        if (json == null || json.isBlank()) {
+            // Tombstone. Advance the position (a redelivered older value must not resurrect the
+            // strike), drop the value and tell connected clients.
+            cachePositions.put(versionKey, incoming);
+            boolean existed = thetadataGexByStrike.remove(key) != null;
+            cacheEventTimes.remove(versionKey);
+            if (existed) {
+                thetadataGexTombstones.incrementAndGet();
+            }
+            if (liveBroadcast && shouldBroadcastThetadataGex(record.partition(), record.offset())) {
+                broadcast(THETADATA_GEX_BY_STRIKE_EVENT,
+                        wrapThetadataGexTombstone(rawKey, record.partition(), record.offset(), record.timestamp()));
+                forwardedEvents.incrementAndGet();
+            }
+            return key;
+        }
+        if (isExpired(THETADATA_GEX_BY_STRIKE_EVENT, eventTime, nowMs)) {
+            removeCacheEntry(versionKey);
+            cachePositions.put(versionKey, incoming);
+            thetadataGexRejected.incrementAndGet();
+            return null;
+        }
+        String wrapped = wrapThetadataGex(rawKey, record.partition(), record.offset(), record.timestamp(), json);
+        cacheEventTimes.put(versionKey, eventTime);
+        cachePositions.put(versionKey, incoming);
+        thetadataGexByStrike.put(key, wrapped);
+        if (liveBroadcast && shouldBroadcastThetadataGex(record.partition(), record.offset())) {
+            broadcast(THETADATA_GEX_BY_STRIKE_EVENT, wrapped);
+            forwardedEvents.incrementAndGet();
+        }
+        return key;
+    }
+
+    private final AtomicLong thetadataGexTombstones = new AtomicLong();
+    private final AtomicLong thetadataGexRejected = new AtomicLong();
+
+    /** Re-push the fresh overnight GTH status plane to one client (standalone advisory class). */
+    private void replayThetadataGthStatusCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        for (Map.Entry<String, String> entry : thetadataGthStatus.entrySet()) {
+            String wrapped = entry.getValue();
+            if (wrapped == null || wrapped.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh(THETADATA_GTH_STATUS_EVENT + ":" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, THETADATA_GTH_STATUS_EVENT, wrapped);
+        }
+    }
+
+    /** Re-push the fresh overnight GTH VALUE plane to one client — always AFTER the status plane
+     *  (bootstrap protocol §4.2: status plane -> value cache -> live). */
+    private void replayThetadataGexCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        for (Map.Entry<String, String> entry : thetadataGexByStrike.entrySet()) {
+            String wrapped = entry.getValue();
+            if (wrapped == null || wrapped.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh(THETADATA_GEX_BY_STRIKE_EVENT + ":" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, THETADATA_GEX_BY_STRIKE_EVENT, wrapped);
+        }
+    }
+
+    // ==================================================================================
     // Pre-open IBKR GEX value plane — rev13 Phase 3 slice 2 (R-ARB arbitration + the R-STOP
     // frozen-projection cache). The shared live topic (USER D14) carries BOTH planes; the
     // gateway separates them by the validated exact provenance tuple and never relabels
@@ -10036,7 +10386,7 @@ public class FeedGatewayService implements ReplayRunner {
      * {@code marketDataSource}/{@code source}/{@code sessionDate} over the producer's own fields.
      */
     private static boolean isRawPassThroughEvent(String event) {
-        return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
+        return isStatusPlaneEvent(event) || "tapeZones".equals(event)
                 || "es-cvd-spx-levels".equals(event)
                 || "es-auction".equals(event)
                 || isFootprintEvent(event)
@@ -11993,6 +12343,13 @@ public class FeedGatewayService implements ReplayRunner {
             // see strike/path rows that a not-yet-consumed revocation or generation supersedes.
             // The caught-up re-push covers this client the moment the barrier clears.
             replayIbkrPreOpenCached(session);
+            // Overnight GTH status plane: same class, same barrier (status plane before values).
+            replayThetadataGthStatusCached(session);
+        }
+        if (settings.thetadataGthEnabled() && thetadataGthServingUp()) {
+            // Overnight GTH VALUE plane, gated on BOTH consumers exactly like the pre-open value
+            // plane below (values on avro, controls on the JSON state consumer).
+            replayThetadataGexCached(session);
         }
         if (settings.ibkrPreOpenEnabled() && ibkrPreOpenGexServingUp()) {
             // Value-plane sibling of the block above, gated on BOTH consumers (round-2
@@ -12961,6 +13318,11 @@ public class FeedGatewayService implements ReplayRunner {
             // class as its status sibling — sessionId-gated client-side, never selection-routed
             // (GatewayRecordMapper deliberately has no route for it).
             "ibkr-preopen-gex",
+            // Overnight ThetaData GTH board plane (GATE-1-OVERNIGHT-THETADATA.md §4.2): the second
+            // instance of the pre-open status plane and its durable per-strike value plane — both
+            // GLOBAL wrapped streams, sessionId/recordKey-gated client-side, never selection-routed
+            // (GatewayRecordMapper deliberately has no route for either).
+            THETADATA_GTH_STATUS_EVENT, THETADATA_GEX_BY_STRIKE_EVENT,
             // Drop-classifier SHADOW nowcast: a GLOBAL advisory (identical for every user,
             // display-only). Allowlisted so the standalone broadcast reaches per-session
             // (auth) sockets too — without this, authenticated prod silently drops it.
