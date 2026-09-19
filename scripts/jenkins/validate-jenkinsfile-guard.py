@@ -119,7 +119,9 @@ form; that is deliberate):
      argument is one single-quoted literal equal to the template), sits alone in a timeout(time: N, unit: 'MINUTES')
      block inside a stage's steps. verify-permitted-tree.sh re-checks HEAD == permitted AND a clean working tree at run
      time (nothing modified, staged, deleted or untracked; ignored paths only under a declared --allow-ignored name).
-  9c. The permission variables (PERMITTED_SHA, X_PERMITTED_SHA) are READ-ONLY: defined only by parameters{}, never assigned
+  9c. The shell text of every `sh` step is READABLE: one string literal, or a top-level constant that is one literal ending
+     at a line boundary followed by one literal (as in `sh JDK_SETUP + <literal>`) — never pieces joined at run time.
+     The permission variables (PERMITTED_SHA, X_PERMITTED_SHA) are READ-ONLY: defined only by parameters{}, never assigned
      by `env.X =`, withEnv([...]) or environment{}. `parallel` is not accepted (a concurrent branch could change a tree
      between a verify and its effect). A git command that moves a checkout's HEAD or worktree after the guard is refused
      outside the dedicated acquisition step.
@@ -942,7 +944,9 @@ def script_has_effects(body: str, resolver, seen: frozenset, python: bool = Fals
 # shell: no second command, no `; && || | & ( ) { } < > `` ` `` $( ) here-document, no cd/pushd/export, no
 # assignment prefix, no comment, no glob. A body the grammar does not accept is refused and must be restructured — the
 # preparation moves to an earlier step that is not an effect, the values reach the effect as environment variables.
-WORD_LIT = re.compile(r"[A-Za-z0-9_./:=@%+,-]+")        # always used with fullmatch (a `$` anchor admits a trailing newline)
+# (always used with fullmatch: a `$` anchor admits a trailing newline). `!` inside a word is literal in a non-interactive
+# shell (only a whole leading `!` negates, and every template requires its command as the first word).
+WORD_LIT = re.compile(r"[A-Za-z0-9_./:=@%+,!-]+")
 DQ_BODY = re.compile(r"(?:[A-Za-z0-9_./:=@%+,-]|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)*")
 VAR_REF = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*")
 
@@ -983,7 +987,7 @@ def shell_words(cmd: str):
         w = prefix
         if "'" in w:
             return "a single quote (single-quoted words are not in any template)"
-        if re.search(r"[;&|<>`(){}*?\[\]!~#\\]", w) or "$" in w:
+        if re.search(r"[;&|<>`(){}*?\[\]~#\\]", w) or "$" in w or w == "!":
             return f"a shell metacharacter, glob or unquoted `$` in {w!r} — only plain words and double-quoted \"…${{VAR}}…\" values are accepted"
         if not WORD_LIT.fullmatch(w):
             return f"a word outside the template alphabet ({w!r})"
@@ -2355,6 +2359,62 @@ def check_in_scope(path: str, entry: dict, guard_hash: str, root_dir: str = ".")
                     problems.append(f"{head} consumes a path inside {where} but the verify step(s) immediately before it re-check {', '.join(repr(v['dir'] or '.') for v in chain)} — every consumed path must be covered by a verify of the checkout it resolves into (a verify of the primary workspace does not vouch for a nested checkout, nor a nested one for its parent)")
                 elif not any(v["var"] == want_var for v in hits):
                     problems.append(f"{head}: the verify step for {where} uses PERMITTED_SHA source '{hits[0]['var']}', but this checkout is guarded with '{want_var}' — the verify must re-check the SAME permitted commit the guard bound")
+
+    # The shell text of every `sh` step is READABLE: one string literal, optionally prefixed by a top-level constant that
+    # is itself one string literal ending at a line boundary (`sh JDK_SETUP + '''…'''`). Anything else — two literals
+    # joined (`'doc' + 'ker build'`), a local variable, a method call — would let a command be assembled at run time from
+    # pieces no scan sees whole.
+    top_constants: dict[str, str] = {}
+    for cm_ in re.finditer(r"(?m)^([A-Z][A-Z0-9_]*)\s*=\s*(?='|\")", text):
+        lit_ = next(((q_, s_, e_) for q_, s_, e_ in g.strings if s_ - len(q_) == cm_.end()), None)
+        if lit_ is not None and g.is_code(cm_.start()):
+            top_constants[cm_.group(1)] = groovy_decode(text[lit_[1]:lit_[2]], gstring=lit_[0] in ('"', '"""'))[0]
+    lit_at = {s_ - len(q_): (q_, s_, e_) for q_, s_, e_ in g.strings}
+    for shm in re.finditer(r"\bsh\b(?=\s*[('\"A-Za-z_])", text):
+        if not g.is_code(shm.start()) or text[max(0, shm.start() - 4):shm.start()].endswith("def "):
+            continue
+        i = shm.end()
+        n_ = len(text)
+        while i < n_ and text[i] in " \t":
+            i += 1
+        paren = i < n_ and text[i] == "("
+        if paren:
+            close = matched_close(g.code_only(i, min(n_, i + 20000)), 0)
+            args = g.code_only(i, i + (close or 0) + 1) if close is not None else ""
+            sm_ = re.search(r"\bscript\s*:", args)
+            if sm_:
+                i = i + sm_.end()
+            else:
+                i += 1
+            while i < n_ and text[i] in " \t\n":
+                i += 1
+        parts: list[tuple[str, str]] = []
+        while True:
+            if i in lit_at:
+                q_, s_, e_ = lit_at[i]
+                parts.append(("lit", text[s_:e_]))
+                i = e_ + len(q_)
+            else:
+                im_ = re.match(r"[A-Za-z_][A-Za-z0-9_.]*(?:\(\))?", text[i:])
+                if not im_:
+                    break
+                parts.append(("id", im_.group(0)))
+                i += im_.end()
+            k_ = i
+            while k_ < n_ and text[k_] in " \t":
+                k_ += 1
+            if k_ < n_ and text[k_] == "+":
+                i = k_ + 1
+                while i < n_ and text[i] in " \t\n":
+                    i += 1
+                continue
+            break
+        ok_ = (len(parts) == 1 and parts[0][0] == "lit") or (
+            len(parts) == 2 and parts[0][0] == "id" and parts[1][0] == "lit" and parts[0][1] in top_constants
+            and re.search(r"\n[ \t]*$", top_constants[parts[0][1]]) is not None)
+        if not ok_:
+            ln = text.count("\n", 0, shm.start()) + 1
+            problems.append(f"line {ln}: the shell text of this `sh` step is not one string literal (optionally prefixed by a top-level constant that is one literal ending at a line boundary) — a command assembled from pieces at run time cannot be read: {lines[ln - 1].strip()[:90]}")
 
     # The permission variables are READ-ONLY. The guard and every verify step read PERMITTED_SHA / X_PERMITTED_SHA from the
     # build's environment; a Groovy `env.X_PERMITTED_SHA = …`, a `withEnv(['X_PERMITTED_SHA=…'])` or an environment{}

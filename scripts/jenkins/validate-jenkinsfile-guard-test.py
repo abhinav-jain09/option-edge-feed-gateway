@@ -709,6 +709,25 @@ def main() -> int:
          good.replace(BUILD, BUILD + "            sh '''\n              cat > \"$WORKSPACE/lib.sh\" <<'LIB'\n              greet() { echo hi; }\n              LIB\n            '''\n            sh '''\n              . \"$WORKSPACE/lib.sh\"\n              greet\n            '''\n"), MANIFEST, True)
     case("a script written some other way (not in the tree, no here-document) is refused",
          good.replace(BUILD, "            sh 'bash ./made-at-runtime.sh'\n"), MANIFEST, False, "not a file in the tree")
+    # the shell text of an `sh` step is READABLE: one literal, optionally prefixed by a top-level constant that is one literal
+    # ending at a line boundary — a command assembled from pieces at run time cannot be scanned
+    for label, step in [
+        ("two literals joined", "            sh 'doc' + 'ker build -t app app-src'\n"),
+        ("a local variable joined to a literal", "            script {\n              def c = 'doc'\n              sh c + 'ker build -t app app-src'\n            }\n"),
+        ("script: built from two literals", "            sh(script: 'doc' + 'ker build -t app app-src')\n"),
+        ("a method result", "            script {\n              sh buildCommand()\n            }\n"),
+    ]:
+        case(f"sh shell text: {label} is refused", good.replace(BUILD, step), MANIFEST, False, "is not one string literal")
+    SETUP_OK = "SETUP = " + chr(39) * 3 + "\n  export X=1\n" + chr(39) * 3 + "\n"
+    case("a top-level constant ending at a line boundary may prefix a literal",
+         SETUP_OK + good.replace(BUILD, BUILD + "            sh SETUP + 'mvn -B test'\n"), MANIFEST, True)
+    case("a top-level constant NOT ending at a line boundary is refused (it could complete a command the literal starts)",
+         "SETUP = 'echo doc'\n" + good.replace(BUILD, BUILD + "            sh SETUP + 'ker build -t app app-src'\n"), MANIFEST, False, "is not one string literal")
+    # `!` inside a word is literal (processing's -pl !module); a whole-word `!` in an effect step is refused
+    case("mvn -pl !module in a dedicated step is fine",
+         good.replace(VERIFY_APP + BUILD, "            timeout(time: 10, unit: 'MINUTES') {\n              sh 'PERMITTED_SHA=\"${PERMITTED_SHA:-}\" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored app-src'\n            }\n            sh 'mvn -B package -pl !other-module'\n"), MANIFEST, True)
+    case("a negated effect step (! mvn …) is refused",
+         good.replace(BUILD, "            sh '! mvn -B -f app-src/pom.xml install'\n"), MANIFEST, False, "source-consuming effect")
     case("local data piped into ssh (tar | ssh) is refused",
          good.replace(BUILD, "            sh 'tar -C app-src -cf - . | ssh builder \"tar -xf - -C /srv\"'\n"), MANIFEST, False, "ships local data over ssh")
     case("a remote command over ssh is not a local source consumption",
