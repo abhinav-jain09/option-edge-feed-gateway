@@ -5118,6 +5118,60 @@ class FeedGatewayServiceTest {
                 "and the REST route must answer null rather than serve it");
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void aVerdictLeftBehindByEvictionIsStillNeverReplayedOrServed() throws Exception {
+        // The SECOND line of defence, tested on its own because the first hides it. purgeExpiredCache
+        // drops the entry's event time and then calls the eviction branch to drop the payload; if that
+        // branch were ever missed — a new event added without one, the mistake the long else-if chain
+        // invites — the payload would sit in the map forever with no event time behind it. isCacheFresh
+        // answers false for exactly that state, so a verdict nothing can date is never replayed and
+        // never served. Without the gate it would be broadcast to every late joiner, undated, for the
+        // life of the process.
+        FeedGatewayService service = service();
+        Field cache = FeedGatewayService.class.getDeclaredField("volPremiumCurrent");
+        cache.setAccessible(true);
+        ((Map<String, String>) cache.get(service)).put("DATABENTO|SPX|" + etSessionDate(System.currentTimeMillis()),
+                verdictJson(System.currentTimeMillis() - 1_000L, DangerLevel.DANGEROUS));
+
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod(
+                "replayVolPremiumFrameCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertTrue(sink.isEmpty(), "an undatable verdict must never replay; got: " + sink);
+        assertNull(service.volPremiumCurrentVerdict("SPX"),
+                "and the REST route must not serve it either — both read the same freshness rule");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void anExpiredVerdictIsEvictedFromItsOwnMapNotJustFromTheFreshnessIndex() throws Exception {
+        // The eviction branch itself: without it the payload leaks for the life of the process while
+        // only its event time is reclaimed. A last-value cache of a record republished every five
+        // seconds must give its bytes back.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String session = etSessionDate(now);
+        String verdict = verdictJson(now - 1_000L, DangerLevel.DANGEROUS);
+        assertEquals("DATABENTO|SPX|" + session,
+                updateCache(service, topicBinding("DATABENTO", VP_FRAME),
+                        recordAt(settings.volPremiumCurrentTopic(), 0, 1L, "SPX|" + session, verdict, now),
+                        verdict),
+                "precondition: the verdict is cached");
+        Field cache = FeedGatewayService.class.getDeclaredField("volPremiumCurrent");
+        cache.setAccessible(true);
+        assertEquals(1, ((Map<String, String>) cache.get(service)).size(), "precondition: it is held");
+
+        Method purge = FeedGatewayService.class.getDeclaredMethod("purgeExpiredCache", long.class);
+        purge.setAccessible(true);
+        purge.invoke(service, now + 10L * 60_000L);   // ten minutes on, twice the window
+
+        assertTrue(((Map<String, String>) cache.get(service)).isEmpty(),
+                "an expired verdict must leave the verdict map, not only the freshness index");
+    }
+
     /** The ET trading date an instant is filed under — computed, never hardcoded, so no test is a date bomb. */
     private static String etSessionDate(long instantMs) {
         return java.time.Instant.ofEpochMilli(instantMs)
