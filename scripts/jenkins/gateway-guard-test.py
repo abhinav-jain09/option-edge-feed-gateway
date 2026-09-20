@@ -136,17 +136,32 @@ def main() -> int:
     COMPILE = "sh '" + COMPILE_CMD + "'"
 
     def compile_is_verified(text: str) -> bool:
-        """Every statement running the compile is immediately preceded by the verification statement."""
-        ok_, _why = gstmt.verified_steps(text, *gstmt.span(text, "    stage('Test') {", "    stage('Footprint reverification') {"),
-                                         COMPILE_CMD, ".")
+        """EVERY Maven invocation that consumes this checkout's source, in ANY stage, however spelled, is
+        immediately preceded by the complete verification of this checkout against PERMITTED_SHA.
+
+        Round 5 replaced "the statement `sh 'mvn -B test'`" with that rule. Matching a command by its
+        literal spelling could not work: `sh 'mvn\u0020-B test'` is exactly `mvn -B test` to Groovy,
+        `sh 'mvn test'` and `sh 'mvn -B -q test'` are the same compile differently written, and an
+        unverified compile in another stage was outside the searched span. The classifier decides by
+        PHASE and PROJECT — an invocation reaching compile or later, against this checkout's own pom —
+        so `mvn -B -f .deps/options-edge-contracts/pom.xml install` (another source, bound by its own
+        verification) and `mvn -q -f … help:evaluate` (no lifecycle phase) are correctly not its
+        business, and anything it cannot decide is a refusal."""
+        ok_, _why = gstmt.verified_commands(text, "mvn", gstmt.mvn_classifier(), "PERMITTED_SHA", ".")
         return ok_
 
     # The reader REFUSES constructs it does not model, and a refusal is False. So the file it reads must
     # stay inside what it models — asserted here rather than discovered when an assertion silently
     # weakens. (Round 4: the gateway's two slashy regexes became single-quoted strings for this reason.)
     for name, text in (("Jenkinsfile", jf), ("Jenkinsfile.deploy", jd)):
-        _refusals = gstmt.lex(text)[1]
+        _src = gstmt.decode_unicode_escapes(text)
+        _mark, _refusals = gstmt.lex(_src)
+        if not _refusals:
+            _refusals = gstmt.control_flow_refusals(_src, _mark, gstmt.sibling_lists(_src, _mark, 0, len(_src)))
         check(f"M1: the statement reader models every construct in {name}", not _refusals, "; ".join(_refusals[:3]))
+    # Jenkinsfile.deploy also compiles this checkout; the same rule holds there, in its own stages.
+    _ok_d, _why_d = gstmt.verified_commands(jd, "mvn", gstmt.mvn_classifier(), "PERMITTED_SHA", ".")
+    check("M1: every source-consuming Maven invocation in Jenkinsfile.deploy is verified too", _ok_d, _why_d)
     check("M1: the Test stage's compile is its own step, immediately after the primary verify", compile_is_verified(jf))
     # NEGATIVE CONTROLS. Each removes or defeats the thing the assertion tests; the assertion must go red.
     # `sh` was the only step v1 could see; comments were invisible to v2; a second compile was never looked at.
@@ -185,6 +200,21 @@ def main() -> int:
                     "            " + COMPILE + "\n            echo($/ // ${sh('mvn -B test')} /$)\n", 1)),
         ("a helper defined outside the stage that runs the compile (Codex round 4)",
          jf.replace("pipeline {", "def helper() { sh 'mvn -B test' }\npipeline {", 1)),
+        # Codex round 5: the command by another spelling, in another stage, or under a brace-less `if`
+        ("the same compile spelled with a unicode escape (Codex round 5)",
+         jf.replace("            " + COMPILE + "\n", "            " + COMPILE + "\n            sh 'mvn\\u0020-B test'\n", 1)),
+        ("a plain `mvn test`, no flags (Codex round 5)",
+         jf.replace("            " + COMPILE + "\n", "            " + COMPILE + "\n            sh 'mvn test'\n", 1)),
+        ("`mvn -B -q test`, the same compile with another flag (Codex round 5)",
+         jf.replace("            " + COMPILE + "\n", "            " + COMPILE + "\n            sh 'mvn -B -q test'\n", 1)),
+        ("an unverified compile in ANOTHER stage (Codex round 5)",
+         jf.replace("    stage('Package') {\n", "    stage('Sneak') {\n      steps {\n        sh 'mvn -B test'\n      }\n    }\n    stage('Package') {\n", 1)),
+        ("a brace-less `if` owning the verification (Codex round 5)",
+         jf.replace("            timeout(time: 10, unit: 'MINUTES') {\n              sh 'PERMITTED_SHA=\"${PERMITTED_SHA:-}\" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target",
+                    "            if (false)\n            timeout(time: 10, unit: 'MINUTES') {\n              sh 'PERMITTED_SHA=\"${PERMITTED_SHA:-}\" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target", 1)),
+        ("the verification reading the wrong permission variable (Codex round 5)",
+         jf.replace('PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target',
+                    'PERMITTED_SHA="${GIT_COMMIT:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target', 1)),
         # Codex round 4: the verification's own failure suppressed or its command extended
         ("the verification's failure suppressed with || true (Codex round 4)",
          jf.replace(" --allow-ignored scripts/jenkins/__pycache__'\n            }\n            " + COMPILE,
@@ -200,9 +230,18 @@ def main() -> int:
         changed = mutated != jf
         check(f"M1 negative control: {label} — mutation applied and the assertion goes red",
               changed and not compile_is_verified(mutated), "" if changed else "the mutation did not change the file")
+    def declared_paths(section: str) -> str | None:
+        """The verify command of a section, or None — total, so a mutation cannot fail by exception."""
+        i = section.find(VERIFY_CMD)
+        if i < 0:
+            return None
+        j = section.find("'\n", i)
+        return section[i:j] if j > 0 else None
+
     pk = jf[jf.index("    stage('Package') {"):jf.index("    stage('Image') {")]
+    _t, _p = declared_paths(ts_span), declared_paths(pk)
     check("M1: the Test stage's verify declares the same paths as the Package verify",
-          ts_span[ts_span.index(VERIFY_CMD):ts_span.index("'\n", ts_span.index(VERIFY_CMD))] == pk[pk.index(VERIFY_CMD):pk.index("'\n", pk.index(VERIFY_CMD))])
+          _t is not None and _t == _p, f"test={_t}\npackage={_p}")
     # ...and the reader that decides all of the above passes its own assertions.
     _st = subprocess.run(["python3", os.path.join(HERE, "groovy-statements.py"), "--self-test"], capture_output=True, text=True)
     check("M1: the shared statement reader passes its own self-test", _st.returncode == 0 and "ALL PASS" in _st.stdout, _st.stdout + _st.stderr)
