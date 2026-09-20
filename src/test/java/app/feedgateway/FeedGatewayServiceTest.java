@@ -4960,7 +4960,12 @@ class FeedGatewayServiceTest {
 
         // Both JSON-state consumers bind it, checked where the maps are built (same rule as the two
         // siblings above): bound in only one, and either catch-up or the live broadcast starves.
-        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        //
+        // COMMENT-STRIPPED. A source scan cannot otherwise tell a bind from a comment describing
+        // one, and this file comments every bind it makes — so the count could be met by prose with
+        // a bind deleted. (The pre-existing source scans in this class have the same shape and are
+        // deliberately left alone here; this is the one this change adds.)
+        String source = codeOf("src/main/java/app/feedgateway/FeedGatewayService.java");
         assertEquals(2, source.split(java.util.regex.Pattern.quote(
                 "topicEvents.put(settings.volPremiumCurrentTopic(),"), -1).length - 1);
     }
@@ -6912,6 +6917,58 @@ class FeedGatewayServiceTest {
                 System.setProperty(key, previous);
             }
         }
+    }
+
+    /**
+     * A source file with its comments removed and its string literals kept, for the assertions that
+     * scan {@code FeedGatewayService.java} itself.
+     *
+     * <p>Without this a scan cannot distinguish the wiring from a comment about the wiring, and the
+     * better the file is documented the weaker the check becomes. It walks characters rather than
+     * running a regex for the reason the browser-asset scanner in the web repo does: a regex cannot
+     * tell a {@code //} inside a URL from the start of a comment.
+     */
+    private static String codeOf(String path) throws Exception {
+        String src = Files.readString(Path.of(path));
+        StringBuilder out = new StringBuilder(src.length());
+        int i = 0;
+        while (i < src.length()) {
+            char c = src.charAt(i);
+            char next = i + 1 < src.length() ? src.charAt(i + 1) : '\0';
+            if (c == '/' && next == '*') {
+                int end = src.indexOf("*/", i + 2);
+                i = end < 0 ? src.length() : end + 2;
+                out.append(' ');
+                continue;
+            }
+            if (c == '/' && next == '/') {
+                int end = src.indexOf('\n', i + 2);
+                i = end < 0 ? src.length() : end;
+                out.append(' ');
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                out.append(c);
+                i++;
+                while (i < src.length() && src.charAt(i) != c) {
+                    if (src.charAt(i) == '\\' && i + 1 < src.length()) {
+                        out.append(src.charAt(i)).append(src.charAt(i + 1));
+                        i += 2;
+                        continue;
+                    }
+                    out.append(src.charAt(i));
+                    i++;
+                }
+                if (i < src.length()) {
+                    out.append(src.charAt(i));
+                    i++;
+                }
+                continue;
+            }
+            out.append(c);
+            i++;
+        }
+        return out.toString();
     }
 
     private static Object topicBinding(String source, String event) throws Exception {
