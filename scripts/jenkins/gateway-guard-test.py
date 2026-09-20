@@ -112,34 +112,68 @@ def main() -> int:
     # Codex gateway round 4, M1 — the Test stage compiled this repository's source with no verification in front
     # of it: `mvn -B test` sat inside a preparation-plus-command shell body and the first primary-tree verify was
     # in Package, so a tracked file replaced after the guard was compiled and executed here. `mvn test` is not an
-    # EFFECT (it publishes nothing), so the validator does not demand the verify — these assertions do. They are
-    # about THIS file: the test command is its own step, and the statement immediately before it is the primary
-    # verify, with nothing in between.
+    # EFFECT (it publishes nothing), so the validator does not demand the verify — these assertions do.
+    #
+    # Round 5 rewrote them. The first version decided adjacency with `…count("sh ") == 0`, which only sees SHELL
+    # steps: Codex inserted `writeFile file: 'pom.xml', text: '<project/>'` between the verify and the compile and
+    # the suite still reported 48 passed. A Jenkins step does not have to be `sh` to rewrite a file. What is
+    # asserted now is that the verify's own timeout block is the statement IMMEDIATELY BEFORE the compile —
+    # nothing at all between them but whitespace and comments — so any inserted statement, of any kind, fails.
     VERIFY_CMD = "sh 'PERMITTED_SHA=\"${PERMITTED_SHA:-}\" bash scripts/jenkins/verify-permitted-tree.sh --dir ."
+    COMPILE = "sh 'mvn -B test'"
+
+    def test_stage(text: str) -> str:
+        try:
+            return text[text.index("    stage('Test') {"):text.index("    stage('Footprint reverification') {")]
+        except ValueError:
+            return ""
 
     def compile_is_verified(text: str) -> bool:
-        """True when `sh 'mvn -B test'` is its own step and the last step before it is the primary verify."""
-        stage = text[text.index("    stage('Test') {"):text.index("    stage('Footprint reverification') {")]
-        if "\n            sh 'mvn -B test'\n" not in stage:
+        """True when the statement immediately before `sh 'mvn -B test'` is the primary verify step.
+
+        Total: every shape that is not "verify, then compile, with nothing between" returns False rather than
+        raising, so a mutation can never pass by breaking the parse."""
+        stage = test_stage(text)
+        if not stage or ("\n            " + COMPILE + "\n") not in stage:
             return False
-        before = stage[:stage.index("sh 'mvn -B test'")]
+        i = stage.index(COMPILE)
+        before = stage[:i]
         if VERIFY_CMD not in before:
             return False
-        # every `sh ` between the verify step and the compile — there must be none
-        return before[before.rindex(VERIFY_CMD) + len(VERIFY_CMD):].count("sh ") == 0
+        j = before.rindex(VERIFY_CMD)
+        nl = before.find("\n", j)                      # end of the verify `sh '…'` line
+        if nl < 0:
+            return False
+        close = before.find("}", nl)                   # the closing brace of its timeout block
+        if close < 0:
+            return False
+        # between the end of the verify statement and the compile there may be NOTHING but blank lines and
+        # `//` comments — no sh, no writeFile, no unstash, no dir, no step of any kind.
+        between = before[close + 1:]
+        return all(not ln.strip() or ln.strip().startswith("//") for ln in between.splitlines())
 
     check("M1: the Test stage's compile is its own step, immediately after the primary verify", compile_is_verified(jf))
-    check("M1: that assertion fails when a step is inserted between the verify and the compile",
-          not compile_is_verified(jf.replace("            sh 'mvn -B test'\n",
-                                             "            sh 'cp /tmp/other.java src/main/java/app/feedgateway/FootprintViews.java'\n            sh 'mvn -B test'\n", 1)))
-    ts_only = jf[jf.index("    stage('Test') {"):jf.index("    stage('Footprint reverification') {")]
-    vblk = ts_only[ts_only.index("            timeout(time: 10, unit: 'MINUTES') {"):ts_only.index("            sh 'mvn -B test'")]
-    check("M1: and when the verify block is removed from the stage",
-          not compile_is_verified(jf.replace(vblk, "", 1)))
+    # Every one of these is a real Jenkins step that can rewrite the tree between the verify and the compile.
+    # `sh` was the only one the first version of this assertion could see.
+    for label, stmt in [
+        ("sh", "            sh 'cp /tmp/other.java src/main/java/app/feedgateway/FootprintViews.java'\n"),
+        ("writeFile (Codex reproduction)", "            writeFile file: 'pom.xml', text: '<project/>'\n"),
+        ("unstash", "            unstash 'other-tree'\n"),
+        ("dir", "            dir('src') { }\n"),
+        ("fileOperations", "            fileOperations([fileCopyOperation(includes: '/tmp/x', targetLocation: 'src')])\n"),
+        ("readFile into a writeFile", "            writeFile file: 'src/x', text: readFile('/tmp/x')\n"),
+        ("a bare method call", "            mutateTheTree()\n"),
+    ]:
+        check(f"M1: a {label} step between the verify and the compile fails the assertion",
+              not compile_is_verified(jf.replace("            " + COMPILE + "\n", stmt + "            " + COMPILE + "\n", 1)))
+    ts_only = test_stage(jf)
+    vblk = ts_only[ts_only.index("            timeout(time: 10, unit: 'MINUTES') {"):ts_only.index("            " + COMPILE)]
+    check("M1: and when the verify block is removed from the stage", not compile_is_verified(jf.replace(vblk, "", 1)))
+    check("M1: and when the compile is moved back inside a preparation shell body (the shape this replaced)",
+          not compile_is_verified(jf.replace("            " + COMPILE + "\n", "            sh 'set -eu; java -version; mvn -B test'\n", 1)))
     pk = jf[jf.index("    stage('Package') {"):jf.index("    stage('Image') {")]
-    ts = jf[jf.index("    stage('Test') {"):jf.index("    stage('Footprint reverification') {")]
     check("M1: the Test stage's verify declares the same paths as the Package verify",
-          ts[ts.index(VERIFY_CMD):ts.index("'\n", ts.index(VERIFY_CMD))] == pk[pk.index(VERIFY_CMD):pk.index("'\n", pk.index(VERIFY_CMD))])
+          ts_only[ts_only.index(VERIFY_CMD):ts_only.index("'\n", ts_only.index(VERIFY_CMD))] == pk[pk.index(VERIFY_CMD):pk.index("'\n", pk.index(VERIFY_CMD))])
 
     # The contracts guard is a DEDICATED step now (validator rule 9): its script is exactly the guard command.
     guard_line = next(l for l in jd.split("\n") if l.strip().startswith("sh 'PERMITTED_SHA=") and "permitted-sha-guard.sh --dir" in l)
