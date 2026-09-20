@@ -20,7 +20,7 @@ pipeline {
   parameters {
     string(name: 'PERMITTED_SHA', defaultValue: '', trim: true,
       description: 'REQUIRED — Deployment Permission Rule (options-edge rule.md). The full 40-character commit id of THIS repository that Abhinav permitted for this image build. The Permitted commit guard stage — FIRST inside Build, before contracts install, tests, package and image — refuses the build unless the checked-out HEAD is exactly this commit AND on origin/main; empty, short or mismatched values are refused and nothing is substituted. An SCM-triggered build has no value and therefore stops at the guard before anything is built. A manual click needs it too: copy it from `git rev-parse origin/main`.')
-    string(name: 'PERMITTED_SHA_GUARD_VERSION', defaultValue: '1d0fd0c60c4a2764dffb0bd26b15525bd08470a3c49be7ae7d9ef177d1a1a6b9',
+    string(name: 'PERMITTED_SHA_GUARD_VERSION', defaultValue: '2971059ec2474255aede8a43a40a9d4fae004a731b77961b519e3937b8a9411e',
       description: 'DO NOT EDIT BY HAND — the sha256 of scripts/jenkins/permitted-sha-guard.sh this definition runs (Deployment Permission Rule). The guard refuses to run under any other value. It is a DECLARATION, not proof that this job enforces the guard: a caller that triggers this job judges its SCM definition and its Jenkinsfile at the forwarded commit (scripts/jenkins/require-guarded-downstream.sh). Regenerate with scripts/jenkins/permitted-sha-guard-version.sh when the guard changes.')
     string(name: 'CONTRACTS_PERMITTED_SHA', defaultValue: '', trim: true,
       description: 'REQUIRED — Deployment Permission Rule. The full 40-character commit id of options-edge-contracts permitted for this build: the Install Contracts stage clones contracts at CONTRACTS_BRANCH and compiles that source into the gateway, so it is a second source of the image and is bound on its own. Refused before mvn install unless the clone is exactly this commit on main; empty, short or mismatched values are refused and nothing is substituted.')
@@ -76,8 +76,14 @@ pipeline {
           // dev-registry loopback aliases. The Image stage writes a buildkit insecure-
           // registry config for the EFFECTIVE IMAGE_REGISTRY iff its normalized form is
           // in this set (so prod pushes work via http, not just dev).
+          // The two regexes are single-quoted strings, not slashy literals. String.replaceFirst takes a
+          // regex String, so the patterns are unchanged ('^https?://' and '/+$'); what changes is that
+          // scripts/jenkins/groovy-statements.py, which decides the Test-stage adjacency assertion on the
+          // statements of THIS FILE, models quoted strings and refuses slashy ones rather than guessing
+          // at them. A construct the reader refuses makes that assertion red, so the file stays inside
+          // what it models. See that script's header for the full refusal list.
           def normalize = { String r ->
-            r?.toString()?.trim()?.toLowerCase()?.replaceFirst(/^https?:\/\//, '')?.replaceFirst(/\/+$/, '')
+            r?.toString()?.trim()?.toLowerCase()?.replaceFirst('^https?://', '')?.replaceFirst('/+$', '')
           }
           def knownEnvs = ['dev', 'production']
           // Include BOTH vantage points on each registry: an off-host builder pushes to

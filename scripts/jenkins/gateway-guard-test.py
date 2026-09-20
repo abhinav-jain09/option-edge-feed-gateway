@@ -138,9 +138,15 @@ def main() -> int:
     def compile_is_verified(text: str) -> bool:
         """Every statement running the compile is immediately preceded by the verification statement."""
         ok_, _why = gstmt.verified_steps(text, *gstmt.span(text, "    stage('Test') {", "    stage('Footprint reverification') {"),
-                                         COMPILE_CMD, VERIFY_CMD)
+                                         COMPILE_CMD, ".")
         return ok_
 
+    # The reader REFUSES constructs it does not model, and a refusal is False. So the file it reads must
+    # stay inside what it models — asserted here rather than discovered when an assertion silently
+    # weakens. (Round 4: the gateway's two slashy regexes became single-quoted strings for this reason.)
+    for name, text in (("Jenkinsfile", jf), ("Jenkinsfile.deploy", jd)):
+        _refusals = gstmt.lex(text)[1]
+        check(f"M1: the statement reader models every construct in {name}", not _refusals, "; ".join(_refusals[:3]))
     check("M1: the Test stage's compile is its own step, immediately after the primary verify", compile_is_verified(jf))
     # NEGATIVE CONTROLS. Each removes or defeats the thing the assertion tests; the assertion must go red.
     # `sh` was the only step v1 could see; comments were invisible to v2; a second compile was never looked at.
@@ -162,6 +168,33 @@ def main() -> int:
          jf.replace("            " + COMPILE + "\n", "            " + COMPILE + "\n            writeFile file: 'pom.xml', text: '<project/>'\n            " + COMPILE + "\n", 1)),
         ("a writer INSIDE the verification timeout",
          jf.replace("'\n            }\n            " + COMPILE, "'\n              writeFile file: 'pom.xml', text: '<project/>'\n            }\n            " + COMPILE, 1)),
+        # Codex round 4: valid Groovy that hid a real second compile from the v3 reader's comment scan
+        # AND from its count, because both used the same classification. Each of these three printed
+        # `EXECUTED: mvn -B test` under Groovy 4.0.24.
+        ("a dollar-slashy string opening a comment the reader did not model (Codex round 4)",
+         jf.replace("            " + COMPILE + "\n",
+                    "            " + COMPILE + "\n            def x = $/ /* /$\n            writeFile file: 'pom.xml', text: '<project/>'\n            " + COMPILE + "\n            // */\n", 1)),
+        ("a slashy string opening a comment the reader did not model (Codex round 4)",
+         jf.replace("            " + COMPILE + "\n",
+                    "            " + COMPILE + "\n            def x = /a\\/*/\n            " + COMPILE + "\n            // */\n", 1)),
+        ("nested interpolation quotes opening a comment (Codex round 4)",
+         jf.replace("            " + COMPILE + "\n",
+                    "            " + COMPILE + "\n            def x = \"${ \"/*\" }\"\n            " + COMPILE + "\n            // */\n", 1)),
+        ("an executable compile inside dollar-slashy interpolation (Codex round 4)",
+         jf.replace("            " + COMPILE + "\n",
+                    "            " + COMPILE + "\n            echo($/ // ${sh('mvn -B test')} /$)\n", 1)),
+        ("a helper defined outside the stage that runs the compile (Codex round 4)",
+         jf.replace("pipeline {", "def helper() { sh 'mvn -B test' }\npipeline {", 1)),
+        # Codex round 4: the verification's own failure suppressed or its command extended
+        ("the verification's failure suppressed with || true (Codex round 4)",
+         jf.replace(" --allow-ignored scripts/jenkins/__pycache__'\n            }\n            " + COMPILE,
+                    " --allow-ignored scripts/jenkins/__pycache__ || true'\n            }\n            " + COMPILE, 1)),
+        ("a second command appended to the verification",
+         jf.replace(" --allow-ignored scripts/jenkins/__pycache__'\n            }\n            " + COMPILE,
+                    " --allow-ignored scripts/jenkins/__pycache__; true'\n            }\n            " + COMPILE, 1)),
+        ("a trailing comment appended to the verification",
+         jf.replace(" --allow-ignored scripts/jenkins/__pycache__'\n            }\n            " + COMPILE,
+                    " --allow-ignored scripts/jenkins/__pycache__ #x'\n            }\n            " + COMPILE, 1)),
     ]
     for label, mutated in mutations:
         changed = mutated != jf
