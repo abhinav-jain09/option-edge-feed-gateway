@@ -183,17 +183,46 @@ class WsJwtHandshakeInterceptorTest {
      * Helper that captures prior {@code IB_SYMBOL}/{@code IB_EXPIRY} sys-property values, sets them to the
      * supplied values for the duration of the test body, then restores them — never plain-clearing. Plain
      * clearing would corrupt later tests that depend on a pre-set value (review finding L-1).
+     *
+     * <p>Deliberately drives the expiry through the LEGACY {@code IB_EXPIRY} key: this exercises the
+     * deprecated backward-compat fallback end-to-end through the handshake, proving old config still
+     * resolves. It also clears any {@code MARKET_DATA_EXPIRY} for the body so the fallback is the sole
+     * source (and restores it after). See {@link #withSymbolAndMarketDataExpiry} for the primary-key path.
      */
     private static void withSymbolAndExpiry(String symbol, String expiry, Runnable body) {
         String prevSym = System.getProperty("IB_SYMBOL");
         String prevExp = System.getProperty("IB_EXPIRY");
+        String prevMde = System.getProperty("MARKET_DATA_EXPIRY");
         if (symbol == null) System.clearProperty("IB_SYMBOL"); else System.setProperty("IB_SYMBOL", symbol);
         if (expiry == null) System.clearProperty("IB_EXPIRY"); else System.setProperty("IB_EXPIRY", expiry);
+        System.clearProperty("MARKET_DATA_EXPIRY");
         try {
             body.run();
         } finally {
             if (prevSym == null) System.clearProperty("IB_SYMBOL"); else System.setProperty("IB_SYMBOL", prevSym);
             if (prevExp == null) System.clearProperty("IB_EXPIRY"); else System.setProperty("IB_EXPIRY", prevExp);
+            if (prevMde == null) System.clearProperty("MARKET_DATA_EXPIRY"); else System.setProperty("MARKET_DATA_EXPIRY", prevMde);
+        }
+    }
+
+    /**
+     * Sibling of {@link #withSymbolAndExpiry} that drives the expiry through the PRIMARY, source-neutral
+     * {@code MARKET_DATA_EXPIRY} key (clearing the legacy {@code IB_EXPIRY} for the body), proving the new
+     * config resolves the same handshake path.
+     */
+    private static void withSymbolAndMarketDataExpiry(String symbol, String expiry, Runnable body) {
+        String prevSym = System.getProperty("IB_SYMBOL");
+        String prevExp = System.getProperty("IB_EXPIRY");
+        String prevMde = System.getProperty("MARKET_DATA_EXPIRY");
+        if (symbol == null) System.clearProperty("IB_SYMBOL"); else System.setProperty("IB_SYMBOL", symbol);
+        System.clearProperty("IB_EXPIRY");
+        if (expiry == null) System.clearProperty("MARKET_DATA_EXPIRY"); else System.setProperty("MARKET_DATA_EXPIRY", expiry);
+        try {
+            body.run();
+        } finally {
+            if (prevSym == null) System.clearProperty("IB_SYMBOL"); else System.setProperty("IB_SYMBOL", prevSym);
+            if (prevExp == null) System.clearProperty("IB_EXPIRY"); else System.setProperty("IB_EXPIRY", prevExp);
+            if (prevMde == null) System.clearProperty("MARKET_DATA_EXPIRY"); else System.setProperty("MARKET_DATA_EXPIRY", prevMde);
         }
     }
 
@@ -239,6 +268,32 @@ class WsJwtHandshakeInterceptorTest {
             assertEquals(exp.toEpochMilli(), attrs.get(WsJwtHandshakeInterceptor.AUTH_EXPIRES_AT_ATTR),
                     "the reaper must see token expiry on the bearer-flow socket too");
             assertEquals("app:u-bearer", "app:" + svc.appSessionForUser("u-bearer").userId());
+        });
+    }
+
+    @Test
+    void multiTenantBearerBindsAppSessionViaPrimaryMarketDataExpiry() {
+        // Same successful bearer attach, but the expiry is supplied via the PRIMARY, source-neutral
+        // MARKET_DATA_EXPIRY key (IB_EXPIRY cleared) — proving the rename drives the identical handshake.
+        withSymbolAndMarketDataExpiry("SPX", "20260612", () -> {
+            GatewaySettings settings = new GatewaySettings();
+            Instant exp = Instant.parse("2030-01-01T00:00:00Z");
+            VerifiedPrincipal principal = new VerifiedPrincipal("u-bearer", "alice",
+                    Set.of("user", "trader"), "options-edge-web", exp);
+            WsTicketService svc =
+                    multiTenantService("good.bearer", principal, q -> ApprovalAuthority.ApprovalDecision.approved(0L));
+            WsJwtHandshakeInterceptor interceptor =
+                    new WsJwtHandshakeInterceptor(settings, failingDecoder(), svc);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.add("Sec-WebSocket-Protocol", "oc.bearer, good.bearer");
+            Map<String, Object> attrs = new HashMap<>();
+
+            boolean ok = interceptor.beforeHandshake(requestWith(headers), mock(ServerHttpResponse.class), null, attrs);
+
+            assertTrue(ok);
+            assertEquals("app:u-bearer", attrs.get(TicketHandshakeInterceptor.ATTR_APP_SESSION_ID));
+            assertEquals("u-bearer", attrs.get(TicketHandshakeInterceptor.ATTR_USER_ID));
         });
     }
 

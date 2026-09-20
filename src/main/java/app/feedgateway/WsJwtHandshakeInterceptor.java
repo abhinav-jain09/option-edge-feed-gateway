@@ -151,7 +151,8 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
                 // The default Selection requires non-blank symbol+expiry (Selection record). If the gateway
                 // is misconfigured (no initialSymbol/initialExpiry, or an unparseable
                 // APP_MARKET_DATA_SOURCE — see {@link #defaultSelection()}), fail closed with 401 — better
-                // than a half-attached socket. Operator must set IB_SYMBOL + IB_EXPIRY (and a parseable
+                // than a half-attached socket. Operator must set IB_SYMBOL + MARKET_DATA_EXPIRY (IB_EXPIRY
+                // fallback still honored) (and a parseable
                 // source) when GATEWAY_AUTH_ENABLED=true.
                 response.setStatusCode(HttpStatus.UNAUTHORIZED);
                 return false;
