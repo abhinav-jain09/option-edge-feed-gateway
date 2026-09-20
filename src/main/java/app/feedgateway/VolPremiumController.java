@@ -138,6 +138,51 @@ public class VolPremiumController {
         }
     }
 
+    /**
+     * {@code GET /api/vol-premium/current?symbol=SPX} — the danger clock's CURRENT verdict for one
+     * symbol, so a page has one on FIRST PAINT instead of waiting for the next {@code vol-premium-frame}
+     * push. The socket carries the updates; this answers "what is it right now".
+     *
+     * <p>Response, always a JSON object:
+     * <pre>{"symbol":"SPX","verdict":&lt;VolPremiumSnapshot v1&gt;|null}</pre>
+     * The verdict is the producer's JSON VERBATIM — nothing reshaped, nothing recomputed (VP-337) — and
+     * it was admitted only after the contract's own constructor accepted it, which is where the
+     * "a missing input can never read as CLEAR" invariant lives.
+     *
+     * <p>{@code verdict:null} is a 200, not an error: no frame held, or the one held has aged out of
+     * its freshness window. Both mean the same thing to a reader — we cannot see — which Gate-1 §5.1
+     * makes incapable of softening a danger read. A consumer renders it as {@code UNAVAILABLE}.
+     *
+     * <p>The record carries its own {@code sessionDate}, and this envelope deliberately does not repeat
+     * it: two copies of one field can disagree, and the record's copy is the one a contract validated.
+     *
+     * <p>Same auth posture as {@link #ivrv}: the verdict is already broadcast to every socket the
+     * handshake admits, so the route is exactly as open as the socket and never more.
+     */
+    @GetMapping(value = "/api/vol-premium/current", produces = MediaType.APPLICATION_JSON_VALUE)
+    public void current(@RequestParam(value = "symbol", defaultValue = "SPX") String symbol,
+                        @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+                        HttpServletResponse response) throws IOException {
+        // Authentication FIRST, exactly as above: an unauthenticated caller learns nothing, not even
+        // whether the symbol is well formed.
+        LiquidityHistoryAuth.Result authResult = auth.authenticate(authorization);
+        if (authResult.status() != 200) {
+            response.setStatus(authResult.status());
+            response.flushBuffer();
+            return;
+        }
+        if (!SYMBOL.matcher(symbol).matches()) {
+            write(response, 400, "{\"error\":\"symbol must be 1-" + IvRvReading.MAX_SYMBOL_CHARS
+                    + " characters of [A-Za-z0-9._-]\"}");
+            return;
+        }
+        String verdict = service.volPremiumCurrentVerdict(symbol);
+        // symbol matched SYMBOL, so it is safe to echo; the verdict is contract-validated JSON admitted
+        // with no trailing tokens, so it is written as is.
+        write(response, 200, "{\"symbol\":\"" + symbol + "\",\"verdict\":"
+                + (verdict == null ? "null" : verdict) + "}");
+    }
+
     private static void write(HttpServletResponse response, int status, String body) throws IOException {
         response.setStatus(status);
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);

@@ -3,6 +3,14 @@ package app.feedgateway;
 import app.feedgateway.mtsession.gateway.ReplayParams;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.optionsedge.contracts.volpremium.DangerLevel;
+import com.optionsedge.contracts.volpremium.DangerReason;
+import com.optionsedge.contracts.volpremium.OperationalFlag;
+import com.optionsedge.contracts.volpremium.SideAvailability;
+import com.optionsedge.contracts.volpremium.SideRead;
+import com.optionsedge.contracts.volpremium.SpreadSide;
+import com.optionsedge.contracts.volpremium.UnavailableReason;
+import com.optionsedge.contracts.volpremium.VolPremiumSnapshot;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
@@ -4891,6 +4899,326 @@ class FeedGatewayServiceTest {
         assertTrue(sink.isEmpty(), "a stale regime must never replay to a late joiner; got: " + sink);
     }
 
+    // ----- vol-premium CURRENT verdict (the danger clock) ------------------------------------------
+    //
+    // The THIRD vol-premium topic and the first that is an ordinary last-value snapshot. Everything
+    // below exists because this record is NOT one of the two above: an observation is a point on a
+    // chart (session store, never coalesced), a verdict is a current value (generic cache, coalescible).
+
+    /** The danger clock's websocket event. */
+    private static final String VP_FRAME = FeedGatewayService.EVENT_VOL_PREMIUM_FRAME;
+
+    @Test
+    void volPremiumCurrentTopicIsBoundGlobalCoalescibleAndOnTheShortFiveMinuteWindow() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals(com.optionsedge.contracts.volpremium.VolPremiumTopics.CURRENT,
+                settings.volPremiumCurrentTopic(), "default topic must be the contract constant");
+        System.setProperty("KAFKA_VOL_PREMIUM_CURRENT_TOPIC", "dev.options.spx.vol-premium.current");
+        try {
+            assertEquals("dev.options.spx.vol-premium.current", new GatewaySettings().volPremiumCurrentTopic(),
+                    "the current topic is env-overridable exactly like its two siblings");
+        } finally {
+            System.clearProperty("KAFKA_VOL_PREMIUM_CURRENT_TOPIC");
+        }
+
+        // THE ENTRY THAT ONLY FAILS WHERE IT COSTS MOST. GatewayRecordMapper has no route for this
+        // event, so without the allowlist broadcast() drops it the moment per-session routing is on —
+        // authenticated production, the only mode prod runs in — while every test exercising the
+        // unauthenticated path still passes. That is the failure the two vol-premium entries beside it
+        // already record.
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent(VP_FRAME),
+                "the verdict must fan out in per-session (auth) mode or the chip is blank in prod");
+
+        // COALESCIBLE, unlike the two streams: it is republished every frame and only the newest
+        // matters, so dropping a superseded one behind a slow socket loses nothing.
+        Field coalescable = FeedGatewayService.class.getDeclaredField("COALESCABLE_EVENTS");
+        coalescable.setAccessible(true);
+        assertTrue(((Set<?>) coalescable.get(null)).contains(VP_FRAME),
+                "only the newest verdict matters behind a slow socket");
+
+        // NOT a session-store stream. isVolPremiumEvent means "belongs to the store", and answering
+        // true here would route the verdict into VolPremiumSessionStore's admission rules, which are
+        // written for observations keyed by ordinal.
+        assertFalse(FeedGatewayService.isVolPremiumEvent(VP_FRAME),
+                "the verdict is a last-value snapshot, not a point of the session series");
+
+        // Forwarded VERBATIM (VP-337): enrichment re-serialises through Jackson and adds fields, so a
+        // socket and the REST route would see the gateway's rewrite rather than the engine's record.
+        Method rawPassThrough = FeedGatewayService.class.getDeclaredMethod("isRawPassThroughEvent", String.class);
+        rawPassThrough.setAccessible(true);
+        assertTrue((boolean) rawPassThrough.invoke(null, VP_FRAME),
+                "the verdict must never be enriched — the bytes validated are the bytes delivered");
+
+        // The SHORT freshness class: a verdict is only meaningful while current.
+        assertEquals(300_000L, settings.volPremiumCurrentTtlMs(), "default TTL must be 5 minutes");
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, VP_FRAME, now - 2L * 60_000L, now),
+                "a 2-min-old verdict must still be fresh");
+        assertTrue(isExpired(service, VP_FRAME, now - 6L * 60_000L, now),
+                "a 6-min-old verdict must be STALE — the chip reads UNAVAILABLE, never a stale verdict");
+
+        // Both JSON-state consumers bind it, checked where the maps are built (same rule as the two
+        // siblings above): bound in only one, and either catch-up or the live broadcast starves.
+        //
+        // COMMENT-STRIPPED. A source scan cannot otherwise tell a bind from a comment describing
+        // one, and this file comments every bind it makes — so the count could be met by prose with
+        // a bind deleted. (The pre-existing source scans in this class have the same shape and are
+        // deliberately left alone here; this is the one this change adds.)
+        String source = codeOf("src/main/java/app/feedgateway/FeedGatewayService.java");
+        assertEquals(2, source.split(java.util.regex.Pattern.quote(
+                "topicEvents.put(settings.volPremiumCurrentTopic(),"), -1).length - 1);
+    }
+
+    @Test
+    void volPremiumVerdictUsesItsFrameInstantAndIsKeyedBySymbolAndSession() throws Exception {
+        // Freshness tracks the verdict's own CADENCE INSTANT (frameEventTimeMs), never the Kafka
+        // arrival time, so a producer catching up on a backlog cannot render an old verdict as the
+        // current read. The key carries the sessionDate: yesterday's verdict and today's are different
+        // records, not two versions of one.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long frameInstant = System.currentTimeMillis() - 1_000L;
+        String verdict = verdictJson(frameInstant, DangerLevel.UNAVAILABLE);
+        String session = etSessionDate(frameInstant);
+        ConsumerRecord<String, String> record = recordAt(settings.volPremiumCurrentTopic(), 0, 1L,
+                "SPX|" + session, verdict, System.currentTimeMillis());
+
+        assertEquals(frameInstant, eventCacheTimestamp(service, VP_FRAME, record),
+                "fresh Kafka arrival must not disguise a historical verdict");
+        assertEquals("DATABENTO|SPX|" + session,
+                updateCache(service, topicBinding("DATABENTO", VP_FRAME), record, verdict),
+                "updateCache must key the verdict by source|symbol|sessionDate");
+    }
+
+    @Test
+    void aVerdictTheContractRefusesNeverReachesTheCacheOrASocket() throws Exception {
+        // THE POINT OF VALIDATING AT THE GATEWAY. VolPremiumSnapshot's constructor is where the design's
+        // safety argument lives — it makes a missing input incapable of reading as CLEAR — so a payload
+        // it refuses must never be forwarded. Each of these is a DIFFERENT way the wire can lie, and all
+        // three are well-formed JSON that a byte-shovelling gateway would have passed straight through.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String session = etSessionDate(now);
+
+        // 1. A CLEAR with no pathStatsAsOfMs: the contract's earned-CLEAR rule. Nothing would show the
+        //    PATH statistics ever ran, so an uncomputed feed would render green.
+        String unearnedClear = VolPremiumFixtures.MAPPER.writeValueAsString(
+                VolPremiumFixtures.MAPPER.readTree(verdictJson(now - 1_000L, DangerLevel.UNAVAILABLE)))
+                .replace("\"overallLevel\":\"UNAVAILABLE\"", "\"overallLevel\":\"CLEAR\"");
+        assertNull(updateCache(service, topicBinding("DATABENTO", VP_FRAME),
+                        recordAt(settings.volPremiumCurrentTopic(), 0, 1L, "SPX|" + session, unearnedClear, now),
+                        unearnedClear),
+                "a CLEAR with no path evidence must be refused, not cached");
+
+        // 2. A reason code outside the frozen vocabulary (§7.3: unknown enum values are refused, never
+        //    read as a default).
+        String unknownReason = verdictJson(now - 1_000L, DangerLevel.UNAVAILABLE)
+                .replace("\"unavailableReasons\":[\"NO_BASELINE\"]",
+                        "\"unavailableReasons\":[\"SOMETHING_NEW\"]");
+        assertNull(updateCache(service, topicBinding("DATABENTO", VP_FRAME),
+                        recordAt(settings.volPremiumCurrentTopic(), 0, 2L, "SPX|" + session, unknownReason, now),
+                        unknownReason),
+                "a code outside the frozen vocabulary must be refused, not cached");
+
+        // 3. A wire version this gateway does not know.
+        String unknownVersion = verdictJson(now - 1_000L, DangerLevel.UNAVAILABLE)
+                .replace("\"schemaVersion\":1", "\"schemaVersion\":2");
+        assertNull(updateCache(service, topicBinding("DATABENTO", VP_FRAME),
+                        recordAt(settings.volPremiumCurrentTopic(), 0, 3L, "SPX|" + session, unknownVersion, now),
+                        unknownVersion),
+                "an unknown schemaVersion must be refused, not read as this one");
+
+        // And nothing refused above is sitting in the cache waiting for a late joiner.
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod(
+                "replayVolPremiumFrameCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertTrue(sink.isEmpty(), "a refused verdict must never replay to a late joiner; got: " + sink);
+    }
+
+    @Test
+    void futureVolPremiumVerdictFailsClosedAndCannotPoisonLaterValidOnes() throws Exception {
+        // Clock-skew freeze-safety, the same rule as its siblings: a future-stamped verdict would evade
+        // expiry AND poison the monotonic supersede gate, freezing the chip on one reading.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String session = etSessionDate(now);
+        String future = verdictJson(now + 60L * 60_000L, DangerLevel.DANGEROUS);
+        assertNull(updateCache(service, topicBinding("DATABENTO", VP_FRAME),
+                        recordAt(settings.volPremiumCurrentTopic(), 0, 1L, "SPX|" + session, future, now),
+                        future),
+                "an hour-ahead verdict must be dropped at ingest (fail closed), never cached");
+
+        String current = verdictJson(now - 5_000L, DangerLevel.DANGEROUS);
+        assertEquals("DATABENTO|SPX|" + session,
+                updateCache(service, topicBinding("DATABENTO", VP_FRAME),
+                        recordAt(settings.volPremiumCurrentTopic(), 0, 2L, "SPX|" + session, current, now),
+                        current),
+                "a valid verdict after a future one must be accepted — no poison left behind");
+    }
+
+    @Test
+    void freshVolPremiumVerdictIsCachedAndReplayedVerbatimToALateJoiner() throws Exception {
+        // Late-join contract: the current verdict is cached last-value-wins and replayed standalone on
+        // connect, so a board opened mid-session shows the chip at once instead of waiting for the next
+        // frame. And it replays VERBATIM — the level the engine published, not a gateway rewrite.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String session = etSessionDate(now);
+        String older = verdictJson(now - 2L * 60_000L, DangerLevel.ELEVATED);
+        assertEquals("DATABENTO|SPX|" + session,
+                updateCache(service, topicBinding("DATABENTO", VP_FRAME),
+                        recordAt(settings.volPremiumCurrentTopic(), 0, 1L, "SPX|" + session, older, now - 2L * 60_000L),
+                        older));
+        String current = verdictJson(now - 30_000L, DangerLevel.DANGEROUS);
+        assertEquals("DATABENTO|SPX|" + session,
+                updateCache(service, topicBinding("DATABENTO", VP_FRAME),
+                        recordAt(settings.volPremiumCurrentTopic(), 0, 2L, "SPX|" + session, current, now - 30_000L),
+                        current));
+
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod(
+                "replayVolPremiumFrameCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+
+        assertEquals(1, sink.size(), "exactly the CURRENT verdict must replay (last-value-wins); got: " + sink);
+        assertTrue(sink.get(0).contains("\"type\":\"" + VP_FRAME + "\"")
+                        && sink.get(0).contains("\"overallLevel\":\"DANGEROUS\""),
+                "the latest verdict must replay verbatim (JSON pass-through); was: " + sink.get(0));
+
+        // The REST route answers the same question from the same cache, so a first paint and a socket
+        // can never disagree about what the current verdict is.
+        String served = service.volPremiumCurrentVerdict("SPX");
+        assertEquals(current, served, "GET /api/vol-premium/current must serve the same bytes verbatim");
+    }
+
+    @Test
+    void staleVolPremiumVerdictIsNeitherCachedNorReplayedNorServed() throws Exception {
+        // Staleness fail-closed. Absence is the SAFE reading here: the consumer renders it UNAVAILABLE,
+        // which Gate-1 §5.1 forbids from ever softening a danger read. A stale DANGEROUS held past its
+        // window would be worse than none — it would be a verdict about a market that has moved on.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String session = etSessionDate(now);
+        String stale = verdictJson(now - 6L * 60_000L, DangerLevel.DANGEROUS);
+        assertNull(updateCache(service, topicBinding("DATABENTO", VP_FRAME),
+                        recordAt(settings.volPremiumCurrentTopic(), 0, 1L, "SPX|" + session, stale, now - 6L * 60_000L),
+                        stale),
+                "a 6-min-old verdict must be dropped at ingest (null cacheKey = never live-routed)");
+
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod(
+                "replayVolPremiumFrameCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertTrue(sink.isEmpty(), "a stale verdict must never replay to a late joiner; got: " + sink);
+        assertNull(service.volPremiumCurrentVerdict("SPX"),
+                "and the REST route must answer null rather than serve it");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void aVerdictLeftBehindByEvictionIsStillNeverReplayedOrServed() throws Exception {
+        // The SECOND line of defence, tested on its own because the first hides it. purgeExpiredCache
+        // drops the entry's event time and then calls the eviction branch to drop the payload; if that
+        // branch were ever missed — a new event added without one, the mistake the long else-if chain
+        // invites — the payload would sit in the map forever with no event time behind it. isCacheFresh
+        // answers false for exactly that state, so a verdict nothing can date is never replayed and
+        // never served. Without the gate it would be broadcast to every late joiner, undated, for the
+        // life of the process.
+        FeedGatewayService service = service();
+        Field cache = FeedGatewayService.class.getDeclaredField("volPremiumCurrent");
+        cache.setAccessible(true);
+        ((Map<String, String>) cache.get(service)).put("DATABENTO|SPX|" + etSessionDate(System.currentTimeMillis()),
+                verdictJson(System.currentTimeMillis() - 1_000L, DangerLevel.DANGEROUS));
+
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod(
+                "replayVolPremiumFrameCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertTrue(sink.isEmpty(), "an undatable verdict must never replay; got: " + sink);
+        assertNull(service.volPremiumCurrentVerdict("SPX"),
+                "and the REST route must not serve it either — both read the same freshness rule");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void anExpiredVerdictIsEvictedFromItsOwnMapNotJustFromTheFreshnessIndex() throws Exception {
+        // The eviction branch itself: without it the payload leaks for the life of the process while
+        // only its event time is reclaimed. A last-value cache of a record republished every five
+        // seconds must give its bytes back.
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String session = etSessionDate(now);
+        String verdict = verdictJson(now - 1_000L, DangerLevel.DANGEROUS);
+        assertEquals("DATABENTO|SPX|" + session,
+                updateCache(service, topicBinding("DATABENTO", VP_FRAME),
+                        recordAt(settings.volPremiumCurrentTopic(), 0, 1L, "SPX|" + session, verdict, now),
+                        verdict),
+                "precondition: the verdict is cached");
+        Field cache = FeedGatewayService.class.getDeclaredField("volPremiumCurrent");
+        cache.setAccessible(true);
+        assertEquals(1, ((Map<String, String>) cache.get(service)).size(), "precondition: it is held");
+
+        Method purge = FeedGatewayService.class.getDeclaredMethod("purgeExpiredCache", long.class);
+        purge.setAccessible(true);
+        purge.invoke(service, now + 10L * 60_000L);   // ten minutes on, twice the window
+
+        assertTrue(((Map<String, String>) cache.get(service)).isEmpty(),
+                "an expired verdict must leave the verdict map, not only the freshness index");
+    }
+
+    /** The ET trading date an instant is filed under — computed, never hardcoded, so no test is a date bomb. */
+    private static String etSessionDate(long instantMs) {
+        return java.time.Instant.ofEpochMilli(instantMs)
+                .atZone(java.time.ZoneId.of("America/New_York")).toLocalDate().toString();
+    }
+
+    /**
+     * A VALID {@code VolPremiumSnapshot}, built through the contract and serialised — never hand-written
+     * JSON, so a fixture cannot drift from what the constructor actually admits. Both sides UNAVAILABLE,
+     * which is production's real state today: {@code VOL_PREMIUM_BASELINE_VERSION=NONE}, so every
+     * baseline-dependent component reports {@code NO_BASELINE} and CLEAR is unreachable (VP-325).
+     */
+    private static String verdictJson(long frameEventTimeMs, DangerLevel level) throws Exception {
+        // Reasons are OVERALL-scoped so both sides carry them and the fold reproduces `level`
+        // exactly, which is what the constructor checks. STRUCTURE alone is one family (ELEVATED);
+        // STRUCTURE + PRICING is two (DANGEROUS). Neither is PATH, so pathStatsAsOfMs may be null.
+        Set<DangerReason> reasons = switch (level) {
+            case ELEVATED -> java.util.EnumSet.of(DangerReason.NEGATIVE_DEALER_GAMMA);
+            case DANGEROUS -> java.util.EnumSet.of(DangerReason.NEGATIVE_DEALER_GAMMA,
+                    DangerReason.UNDERPAID_FOR_REMAINING_VARIANCE);
+            default -> java.util.EnumSet.noneOf(DangerReason.class);
+        };
+        Set<UnavailableReason> blind = level == DangerLevel.UNAVAILABLE
+                ? java.util.EnumSet.of(UnavailableReason.NO_BASELINE)
+                : java.util.EnumSet.noneOf(UnavailableReason.class);
+        SideAvailability availability = level == DangerLevel.UNAVAILABLE
+                ? SideAvailability.NEITHER : SideAvailability.BOTH_SIDES;
+        List<SideRead> sides = List.of(
+                new SideRead(SpreadSide.BULL_PUT_SPREAD, level, reasons, blind,
+                        null, null, null, null, null, null, null, null, null, null, null, null, null, null, null),
+                new SideRead(SpreadSide.BEAR_CALL_SPREAD, level, reasons, blind,
+                        null, null, null, null, null, null, null, null, null, null, null, null, null, null, null));
+        VolPremiumSnapshot verdict = new VolPremiumSnapshot(
+                VolPremiumSnapshot.CURRENT_SCHEMA_VERSION, "SPX", etSessionDate(frameEventTimeMs),
+                frameEventTimeMs, null, level, availability,
+                reasons, blind,
+                java.util.EnumSet.noneOf(OperationalFlag.class), sides,
+                VolPremiumSnapshot.EVIDENCE_STRENGTH,
+                "NONE", "0".repeat(64), "2026.1", "1".repeat(64), "test");
+        return VolPremiumFixtures.MAPPER.writeValueAsString(verdict);
+    }
+
     // ----- spot-vol-regime STRIKE BAND (latched glyph marking) -------------------------------------
     //
     // The band is the USER-approved (2026-08-02) latched strike marking: when the regime becomes
@@ -6589,6 +6917,58 @@ class FeedGatewayServiceTest {
                 System.setProperty(key, previous);
             }
         }
+    }
+
+    /**
+     * A source file with its comments removed and its string literals kept, for the assertions that
+     * scan {@code FeedGatewayService.java} itself.
+     *
+     * <p>Without this a scan cannot distinguish the wiring from a comment about the wiring, and the
+     * better the file is documented the weaker the check becomes. It walks characters rather than
+     * running a regex for the reason the browser-asset scanner in the web repo does: a regex cannot
+     * tell a {@code //} inside a URL from the start of a comment.
+     */
+    private static String codeOf(String path) throws Exception {
+        String src = Files.readString(Path.of(path));
+        StringBuilder out = new StringBuilder(src.length());
+        int i = 0;
+        while (i < src.length()) {
+            char c = src.charAt(i);
+            char next = i + 1 < src.length() ? src.charAt(i + 1) : '\0';
+            if (c == '/' && next == '*') {
+                int end = src.indexOf("*/", i + 2);
+                i = end < 0 ? src.length() : end + 2;
+                out.append(' ');
+                continue;
+            }
+            if (c == '/' && next == '/') {
+                int end = src.indexOf('\n', i + 2);
+                i = end < 0 ? src.length() : end;
+                out.append(' ');
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                out.append(c);
+                i++;
+                while (i < src.length() && src.charAt(i) != c) {
+                    if (src.charAt(i) == '\\' && i + 1 < src.length()) {
+                        out.append(src.charAt(i)).append(src.charAt(i + 1));
+                        i += 2;
+                        continue;
+                    }
+                    out.append(src.charAt(i));
+                    i++;
+                }
+                if (i < src.length()) {
+                    out.append(src.charAt(i));
+                    i++;
+                }
+                continue;
+            }
+            out.append(c);
+            i++;
+        }
+        return out.toString();
     }
 
     private static Object topicBinding(String source, String event) throws Exception {

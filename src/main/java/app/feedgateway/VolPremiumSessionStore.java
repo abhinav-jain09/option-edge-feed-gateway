@@ -15,6 +15,7 @@ import com.optionsedge.contracts.volpremium.EarlyWarningState;
 import com.optionsedge.contracts.volpremium.EarlyWarningType;
 import com.optionsedge.contracts.volpremium.IvRvReading;
 import com.optionsedge.contracts.volpremium.IvRvReadingV1;
+import com.optionsedge.contracts.volpremium.VolPremiumSnapshot;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -850,6 +851,15 @@ final class VolPremiumSessionStore {
      * One strict reader per observation version, both from {@link #STRICT}: each version gets every
      * protection the other has, and each record is validated only by its own contract's constructor.
      */
+    /**
+     * The SAME strict admission, for the danger clock's CURRENT verdict. The verdict is not a session
+     * record and is cached elsewhere (it is a current value, not a point on a chart), but it is
+     * forwarded VERBATIM by the identical rule, so it must be validated by the identical reader: the
+     * bytes a browser receives have to be the bytes a contract constructor accepted, and every
+     * coercion the block above refuses would otherwise let the gateway validate one record and forward
+     * another.
+     */
+    static final ObjectReader VERDICT_READER = STRICT.readerFor(VolPremiumSnapshot.class);
     private static final ObjectReader V1_OBSERVATION_READER = STRICT.readerFor(IvRvReadingV1.class);
     private static final ObjectReader V2_OBSERVATION_READER = STRICT.readerFor(IvRvReading.class);
     private static final ObjectReader WARNING_READER = STRICT.readerFor(EarlyWarning.class);

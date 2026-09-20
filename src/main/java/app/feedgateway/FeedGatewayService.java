@@ -140,6 +140,14 @@ public class FeedGatewayService implements ReplayRunner {
         @Override public void writeError() { wsWriteErrors.incrementAndGet(); }
         @Override public void droppedOnClose(int messages) { wsDroppedOnClose.addAndGet(messages); }
     };
+    /**
+     * The websocket event carrying the danger clock's CURRENT verdict. It is NOT one of
+     * {@link #isVolPremiumEvent}'s two — that predicate means "belongs to the session store", and this
+     * record does not. Declared HERE, above COALESCABLE_EVENTS, because that set reads it in its own
+     * initializer and a static field read by simple name before its declaration is an illegal forward
+     * reference.
+     */
+    static final String EVENT_VOL_PREMIUM_FRAME = "vol-premium-frame";
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
             "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "spot-band", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "gex-oi-status",
@@ -160,6 +168,11 @@ public class FeedGatewayService implements ReplayRunner {
             "zero-dte-intelligence",
             "greek-move-auth",
             "spot-vol-regime",
+            // The danger clock's CURRENT verdict IS coalescible, unlike the two vol-premium streams
+            // noted below, and for the reason stated there in reverse: behind a slow socket only the
+            // newest verdict matters, and it is republished every frame, so dropping a superseded one
+            // loses nothing a later frame does not carry.
+            EVENT_VOL_PREMIUM_FRAME,
             "gamma-leadership",
             "direction",
             "direction-push",
@@ -437,6 +450,26 @@ public class FeedGatewayService implements ReplayRunner {
     // Same standalone/global/JSON pass-through class as the spot-vol-regime sibling above; NOT in the
     // ui-batch.
     private final VolPremiumSessionStore volPremiumStore = new VolPremiumSessionStore();
+    /**
+     * The danger clock's CURRENT verdict (the vol-premium service's {@code VolPremiumSnapshot}): ONE
+     * current value per {@code SYMBOL|sessionDate} (last-value-wins) on the SHORT
+     * volPremiumCurrentTtlMs window, so a late-joining client gets TODAY'S verdict on connect and a
+     * dead producer reads as absent rather than replaying last night's. Same standalone/global/JSON
+     * pass-through delivery class as the greek-move-auth and spot-vol-regime siblings above; NOT in
+     * the ui-batch.
+     *
+     * <p>It is deliberately NOT in {@link #volPremiumStore}. That store exists because an OBSERVATION
+     * is a point on a chart and losing one breaks the line (VP-345); a VERDICT is a current value and
+     * only the newest matters. Two records from one service, two delivery classes, for the reason each
+     * record is shaped the way it is.
+     */
+    private final Map<String, String> volPremiumCurrent = new ConcurrentHashMap<>();
+    /**
+     * Clock-skew fail-closed bound for the verdict's own {@code frameEventTimeMs}, the same rule and
+     * the same reason as {@link #SPOT_VOL_REGIME_MAX_FUTURE_SKEW_MS}: a future-dated frame must neither
+     * evade the freshness window nor poison the monotonic supersede gate.
+     */
+    private static final long VOL_PREMIUM_FRAME_MAX_FUTURE_SKEW_MS = 60_000L;
     /** The binding source both vol-premium topics are bound under, and the prefix of every series key. */
     static final String VOL_PREMIUM_SOURCE = "DATABENTO";
     /**
@@ -1503,6 +1536,7 @@ public class FeedGatewayService implements ReplayRunner {
             // track rather than waiting for the next live verdict.
             replayGreekMoveAuthCached(session);
             replaySpotVolRegimeCached(session);
+            replayVolPremiumFrameCached(session);
             replayGammaLeadershipCached(session);
             replayDirectionCached(session);
             replayDirectionPushCached(session);
@@ -2507,6 +2541,12 @@ public class FeedGatewayService implements ReplayRunner {
                 new TopicBinding(VOL_PREMIUM_SOURCE, VolPremiumSessionStore.EVENT_OBSERVATION));
         topicEvents.put(settings.volPremiumWarningsTopic(),
                 new TopicBinding(VOL_PREMIUM_SOURCE, VolPremiumSessionStore.EVENT_WARNING));
+        // The danger clock's CURRENT verdict is the THIRD vol-premium topic and the FIRST that is an
+        // ordinary last-value snapshot: it rides the generic cache with spot-vol-regime, not the
+        // session store, so isVolPremiumEvent must stay false for it. Both consumers are assigned it
+        // (the two maps stay symmetric).
+        topicEvents.put(settings.volPremiumCurrentTopic(),
+                new TopicBinding(VOL_PREMIUM_SOURCE, EVENT_VOL_PREMIUM_FRAME));
         // Gamma-leadership CURRENT rides the same optional/standalone JSON class.
         topicEvents.put(settings.gammaLeadershipTopic(), new TopicBinding("DATABENTO", "gamma-leadership"));
         // Candle Direction CURRENT decision (commissioning shadow) rides the same optional/standalone JSON class.
@@ -2653,6 +2693,12 @@ public class FeedGatewayService implements ReplayRunner {
                 new TopicBinding(VOL_PREMIUM_SOURCE, VolPremiumSessionStore.EVENT_OBSERVATION));
         topicEvents.put(settings.volPremiumWarningsTopic(),
                 new TopicBinding(VOL_PREMIUM_SOURCE, VolPremiumSessionStore.EVENT_WARNING));
+        // The danger clock's CURRENT verdict is the THIRD vol-premium topic and the FIRST that is an
+        // ordinary last-value snapshot: it rides the generic cache with spot-vol-regime, not the
+        // session store, so isVolPremiumEvent must stay false for it. Both consumers are assigned it
+        // (the two maps stay symmetric).
+        topicEvents.put(settings.volPremiumCurrentTopic(),
+                new TopicBinding(VOL_PREMIUM_SOURCE, EVENT_VOL_PREMIUM_FRAME));
         // Gamma-leadership CURRENT rides the same optional/standalone JSON class.
         topicEvents.put(settings.gammaLeadershipTopic(), new TopicBinding("DATABENTO", "gamma-leadership"));
         // Candle Direction CURRENT decision (commissioning shadow) rides the same optional/standalone JSON class.
@@ -3773,6 +3819,20 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                         continue;
                     }
+                    if (EVENT_VOL_PREMIUM_FRAME.equals(binding.event())) {
+                        // Danger-clock CURRENT verdict: the same GLOBAL advisory delivery class as
+                        // spot-vol-regime above — own websocket event, never a ui-batch row, never
+                        // selection-routed (every client receives it and filters by symbol
+                        // client-side). Freshness fail-closed via the SHORT volPremiumCurrentTtlMs
+                        // window: a stale or malformed verdict yields cacheKey == null and is never
+                        // live-broadcast, so the chip reads UNAVAILABLE rather than showing a verdict
+                        // whose inputs are hours old.
+                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                            broadcast(binding.event(), forwardJson);
+                            forwardedEvents.incrementAndGet();
+                        }
+                        continue;
+                    }
                     // Selection captured ONCE for this record's forward+readiness decision (legacy mode).
                     ActiveSelection decided = null;
                     // Per-session mode: route directly via the engine using the authoritative
@@ -4781,6 +4841,11 @@ public class FeedGatewayService implements ReplayRunner {
             if (events.contains("spot-vol-regime")) {
                 for (WebSocketSession client : clients) {
                     replaySpotVolRegimeCached(client);
+                }
+            }
+            if (events.contains(EVENT_VOL_PREMIUM_FRAME)) {
+                for (WebSocketSession client : clients) {
+                    replayVolPremiumFrameCached(client);
                 }
             }
             // Vol-premium is its OWN standalone class with its OWN topics. Delivery starts (or resumes)
@@ -5810,6 +5875,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = directionProgressCacheKey(json, key);
         } else if ("spot-vol-regime".equals(event)) {
             key = spotVolRegimeCacheKey(json, key);
+        } else if (EVENT_VOL_PREMIUM_FRAME.equals(event)) {
+            key = volPremiumFrameCacheKey(json, key);
         } else if ("indicators".equals(event)) {
             key = indicatorsCacheKey(json, key);
         } else if ("tapeZones".equals(event)) {
@@ -6059,6 +6126,12 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 spotVolRegime.put(key, json); // ONE current regime per symbol — last heartbeat wins
+                return key;
+            }
+            case EVENT_VOL_PREMIUM_FRAME -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                volPremiumCurrent.put(key, json); // ONE current verdict per symbol|sessionDate
                 return key;
             }
             case "indicators" -> {
@@ -7003,6 +7076,14 @@ public class FeedGatewayService implements ReplayRunner {
             // live. Same ONE-seam consequences as the sibling above.
             return CachePolicy.expiring(settings.spotVolRegimeTtlMs());
         }
+        if (EVENT_VOL_PREMIUM_FRAME.equals(event)) {
+            // Danger-clock CURRENT verdict: the SHORT window again (default 5 min). A verdict is only
+            // meaningful while current, and the consumer renders its absence as UNAVAILABLE — which
+            // Gate-1 §5.1 forbids from ever softening a danger read — so expiry here is safe in the
+            // one direction that matters. See volPremiumCurrentTtlMs for its coupling to the
+            // producer's frame cadence.
+            return CachePolicy.expiring(settings.volPremiumCurrentTtlMs());
+        }
         if (isVolPremiumEvent(event)) {
             // Vol-premium observations and warnings are retained for their SESSION (see
             // VolPremiumSessionStore), so all this policy still decides is how far back a restarted
@@ -7252,6 +7333,12 @@ public class FeedGatewayService implements ReplayRunner {
             // stale regime as live.
             return spotVolRegimeTimestamp(json);
         }
+        if (EVENT_VOL_PREMIUM_FRAME.equals(event)) {
+            // Same rule again, on the verdict's own CADENCE INSTANT (frameEventTimeMs): a producer
+            // catching up on a backlog appends frames now whose instants are old, and arrival time
+            // would render one of them as the current read.
+            return volPremiumFrameTimestamp(json);
+        }
         if ("indicators".equals(event)) {
             return indicatorsTimestamp(json);
         }
@@ -7407,6 +7494,44 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /**
+     * The CADENCE INSTANT ({@code frameEventTimeMs}) of a danger-clock verdict, AND its admission: -1
+     * means malformed, oversize, outside the frozen vocabulary, refused by the contract, or
+     * implausibly future, and {@code isExpired} turns -1 into a refusal — so such a record is never
+     * cached, never broadcast and never replayed. Same freeze-safety rationale as
+     * {@link #spotVolRegimeTimestamp}, plus the contract check.
+     *
+     * <p><b>The contract runs HERE rather than at the browser</b> because {@code VolPremiumSnapshot}'s
+     * constructor is where the design's safety argument lives: it is what makes a missing input
+     * incapable of reading as {@code CLEAR}. A gateway that forwarded unparsed bytes would hand the
+     * browser a verdict nothing had checked.
+     *
+     * <p>{@code frameEventTimeMs}, never {@code pathStatsAsOfMs}: the contract separates them exactly
+     * so a consumer cannot read frame freshness as evidence freshness (Gate-1 §7.1), and this is the
+     * frame-freshness question.
+     */
+    private long volPremiumFrameTimestamp(String json) {
+        if (json == null
+                || json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+                        > com.optionsedge.contracts.volpremium.VolPremiumFrame.MAX_RECORD_BYTES) {
+            // The verdict is a proper PART of a ledger frame, so it cannot legitimately exceed the
+            // frame's own §10.2 cap. Bounded BEFORE parsing, so an oversize payload is refused rather
+            // than deserialised.
+            return -1L;
+        }
+        try {
+            com.optionsedge.contracts.volpremium.VolPremiumSnapshot verdict =
+                    VolPremiumSessionStore.VERDICT_READER.readValue(json);
+            long frameEventTimeMs = verdict.frameEventTimeMs();
+            if (frameEventTimeMs > System.currentTimeMillis() + VOL_PREMIUM_FRAME_MAX_FUTURE_SKEW_MS) {
+                return -1L; // implausibly future — fail closed, never cache/replay/poison the supersede gate
+            }
+            return frameEventTimeMs;
+        } catch (JsonProcessingException | RuntimeException refused) {
+            return -1L;
+        }
+    }
+
     private long spotVolRegimeTimestamp(String json) {
         try {
             long eventTimeMs = longField(mapper.readTree(json), "asOfEventTimeMs", -1L);
@@ -7543,6 +7668,8 @@ public class FeedGatewayService implements ReplayRunner {
             greekMoveAuthCurrent.remove(versionKey.substring("greek-move-auth:".length()));
         } else if (versionKey.startsWith("spot-vol-regime:")) {
             spotVolRegime.remove(versionKey.substring("spot-vol-regime:".length()));
+        } else if (versionKey.startsWith(EVENT_VOL_PREMIUM_FRAME + ":")) {
+            volPremiumCurrent.remove(versionKey.substring(EVENT_VOL_PREMIUM_FRAME.length() + 1));
         } else if (versionKey.startsWith("direction:")) {
             directionCurrent.remove(versionKey.substring("direction:".length()));
         } else if (versionKey.startsWith("direction-push:")) {
@@ -8625,6 +8752,78 @@ public class FeedGatewayService implements ReplayRunner {
                 continue;
             }
             send(session, "gamma-leadership", json);
+        }
+    }
+
+    /**
+     * The freshest CURRENT verdict held for one symbol, exactly as its producer wrote it, or null when
+     * none is held or the one held has aged out. Backs {@code GET /api/vol-premium/current}, so a page
+     * has a verdict on FIRST PAINT rather than only on the next push — the websocket carries the
+     * updates, this answers the question "what is it right now".
+     *
+     * <p>Same freshness rules as the websocket path, deliberately: purge-first and {@code isCacheFresh}
+     * on the SHORT window, so the route and a socket can never disagree about whether a verdict is
+     * current. Null here means the consumer renders UNAVAILABLE, which is the honest reading and the
+     * one Gate-1 §5.1 forbids from softening a danger read.
+     *
+     * <p>A symbol can hold entries for more than one {@code sessionDate} while the older is still
+     * inside its window (a session boundary), so the NEWEST frame instant wins rather than whichever
+     * entry the map iterates first.
+     */
+    String volPremiumCurrentVerdict(String symbol) {
+        if (symbol == null || symbol.isBlank()) {
+            return null;
+        }
+        String wanted = symbol.toUpperCase();
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        String newest = null;
+        long newestInstant = Long.MIN_VALUE;
+        for (Map.Entry<String, String> entry : volPremiumCurrent.entrySet()) {
+            String key = entry.getKey();
+            String json = entry.getValue();
+            if (key == null || json == null || json.isBlank()) {
+                continue;
+            }
+            // updateCache source-prefixes every cache key, so an entry is SOURCE|SYMBOL|sessionDate.
+            // The SYMBOL segment is compared rather than a prefix match on the whole key: the source
+            // is a binding convention this route has no business hard-coding, and no segment of the
+            // key can itself contain a pipe.
+            String[] segments = key.split("\\|", -1);
+            if (segments.length != 3 || !wanted.equals(segments[1])) {
+                continue;
+            }
+            if (!isCacheFresh(EVENT_VOL_PREMIUM_FRAME + ":" + key, nowMs)) {
+                continue;
+            }
+            long instant = volPremiumFrameTimestamp(json);
+            if (instant > newestInstant) {
+                newestInstant = instant;
+                newest = json;
+            }
+        }
+        return newest;
+    }
+
+    /**
+     * Late-join delivery for the danger-clock CURRENT verdict: the same GLOBAL advisory class as
+     * {@link #replaySpotVolRegimeCached} — intentionally NOT filtered by the active market selection,
+     * symbol-filtered client-side. Purge-first + isCacheFresh run on the SHORT volPremiumCurrentTtlMs
+     * window, so a late joiner gets the CURRENT verdict or none: anything older is simply absent, and
+     * the chip reads UNAVAILABLE rather than yesterday's danger read.
+     */
+    private void replayVolPremiumFrameCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        for (Map.Entry<String, String> entry : volPremiumCurrent.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh(EVENT_VOL_PREMIUM_FRAME + ":" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            send(session, EVENT_VOL_PREMIUM_FRAME, json);
         }
     }
 
@@ -10044,7 +10243,13 @@ public class FeedGatewayService implements ReplayRunner {
                 // VERBATIM (VP-337: the UI never recomputes). Enriched, every record gained two fields
                 // and was re-serialised by Jackson, so what a socket, the REST route and the byte bound
                 // saw was the gateway's rewrite of the record rather than the record itself.
-                || isVolPremiumEvent(event);
+                || isVolPremiumEvent(event)
+                // The CURRENT verdict is the producer's contract too, and forwarded VERBATIM for the
+                // same reason (VP-337): enrichment re-serialises the record through Jackson and adds
+                // marketDataSource/source, so a socket and the REST route would see the gateway's
+                // rewrite rather than the frame the engine signed off. It also carries its own
+                // sessionDate, which no other party may author.
+                || EVENT_VOL_PREMIUM_FRAME.equals(event);
     }
 
     /** The two vol-premium streams: IV/RV observations and early-warning transitions. */
@@ -10632,6 +10837,32 @@ public class FeedGatewayService implements ReplayRunner {
             }
         } catch (JsonProcessingException ignored) {
             // Malformed payloads expire immediately via gammaLeadershipTimestamp.
+        }
+        return fallback;
+    }
+
+    /**
+     * Cache key of a danger-clock CURRENT verdict: {@code SYMBOL|sessionDate}, derived from the PAYLOAD
+     * so last-value-wins never depends on the Kafka record key's shape (the topic is keyed the same
+     * way, but the cache must not trust that).
+     *
+     * <p>The session date is PART of the key, and that is the point rather than an accident of the
+     * topic's own keying: yesterday's verdict and today's are different records, not two versions of
+     * one. Keying by symbol alone would let last-value-wins overwrite today's frame with a late
+     * arrival from a previous session, which is the exact "overnight leftover rendered as live"
+     * failure the TTL exists to prevent — and would do it inside the freshness window.
+     */
+    private String volPremiumFrameCacheKey(String json, String fallback) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase();
+            String sessionDate = text(root, "sessionDate");
+            if (!symbol.isBlank() && !sessionDate.isBlank()) {
+                return symbol + "|" + sessionDate;
+            }
+        } catch (JsonProcessingException ignored) {
+            // Malformed payloads expire immediately via volPremiumFrameTimestamp; the fallback only
+            // gives updateCache a stable eviction key.
         }
         return fallback;
     }
@@ -11980,6 +12211,10 @@ public class FeedGatewayService implements ReplayRunner {
         // return-to-live from a historical replay (replayLiveCacheToAppSession -> replayCachedToSocket).
         replayGreekMoveAuthCached(session);
         replaySpotVolRegimeCached(session);
+        // Same STANDALONE global-advisory class, and the same reason it must be here as well as in
+        // addClient: this is the path that serves per-session (auth) connections and return-to-live
+        // from a historical replay.
+        replayVolPremiumFrameCached(session);
         replayGammaLeadershipCached(session);
         replayDirectionCached(session);
         replayDirectionPushCached(session);
@@ -12974,6 +13209,14 @@ public class FeedGatewayService implements ReplayRunner {
             // Its early-warning transitions are the same GLOBAL advisory class, overlaid on the same
             // chart (VP-366), and for the same reason must reach per-session (auth) sockets too.
             "vol-premium-warning",
+            // The danger clock's CURRENT verdict is the third of them and the same GLOBAL advisory
+            // class: identical for every user, display-only, symbol-filtered client-side, and
+            // GatewayRecordMapper deliberately has no route for it either. Without this entry
+            // broadcast() drops it the moment GATEWAY_AUTH_ENABLED=true — the chip would be
+            // permanently absent in authenticated production while every test exercising the
+            // unauthenticated path still passed. That is the failure the two entries above record,
+            // and it is the reason this one is written down rather than assumed.
+            EVENT_VOL_PREMIUM_FRAME,
             // Agent A short-premium recommendation is a GLOBAL advisory overlay (the UI filters by
             // symbol client-side). Allowlisting it here lets routeOrBroadcast/broadcast fan it out
             // in per-session (auth) mode too, not only legacy mode — otherwise it is silently
