@@ -1496,6 +1496,47 @@ public final class GatewaySettings {
     }
 
     /**
+     * SERVED last-value CURRENT topic of the same service: the danger clock's VERDICT for one instant
+     * (JSON {@code VolPremiumSnapshot} schemaVersion 1 &mdash; see {@link VolPremiumTopics#CURRENT}).
+     * ONE record per {@code SYMBOL|sessionDate}, republished every frame, so last-value-wins per key is
+     * the whole of it. Env-overridable exactly like its two siblings; like every topic this gateway
+     * reads, it is never auto-created (see baseConsumerProperties).
+     *
+     * <p>This is a DIFFERENT delivery class from the two topics above, and deliberately so. An
+     * observation is a POINT ON A CHART and the whole session must survive; a verdict is a CURRENT
+     * VALUE and only the newest one matters. So the frame rides the plain last-value cache with the
+     * greek-move-auth / spot-vol-regime siblings, never {@code VolPremiumSessionStore}.
+     *
+     * <p>The FRAME LEDGER {@code options.spx.vol-premium.events} is deliberately NOT bound here. It is
+     * session history (Gate-1 §7.2, every scored frame a record, ~4,680 a session at the default
+     * cadence) and bridging it is a sizing decision of its own, not a line in this method.
+     */
+    public String volPremiumCurrentTopic() {
+        return value("KAFKA_VOL_PREMIUM_CURRENT_TOPIC", VolPremiumTopics.CURRENT);
+    }
+
+    /**
+     * Freshness TTL for the vol-premium CURRENT verdict cache. Same SHORT freshness class and rationale
+     * as {@link #greekMoveAuthTtlMs()} and {@link #spotVolRegimeTtlMs()}: a verdict minutes old (dead
+     * producer, overnight leftover) must read as ABSENT rather than replay as live. Default 5 min.
+     *
+     * <p>Absent is the SAFE reading here in a way it is not for a regime pill, which is why the short
+     * window is right rather than merely conventional: the consumer of this record renders a missing
+     * verdict as {@code UNAVAILABLE} &mdash; "we cannot see" &mdash; and Gate-1 §5.1 makes
+     * {@code UNAVAILABLE} incapable of softening a danger read. There is no staleness here that can
+     * become a false all-clear.
+     *
+     * <p><b>It is coupled to the producer's cadence, and a deployment that changes one must change the
+     * other.</b> The engine's {@code FRAME_CADENCE_MS} defaults to 5 s but its supported envelope
+     * reaches 600 s (Gate-1 §11), and a cadence longer than this window would leave the verdict reading
+     * UNAVAILABLE between frames. That failure is in the fail-closed direction, and it is stated here
+     * rather than papered over with a window wide enough to hide a dead producer.
+     */
+    public long volPremiumCurrentTtlMs() {
+        return longValue("GATEWAY_VOL_PREMIUM_CURRENT_TTL_MS", 300_000L, 0L);
+    }
+
+    /**
      * Compacted CURRENT topic of the standalone indicator-service (JSON
      * {@code IndicatorSnapshot}, rev 14 §7.1). One record per canonical symbol
      * (ES|SPX) every 5 s during the active session plus event-triggered publishes.

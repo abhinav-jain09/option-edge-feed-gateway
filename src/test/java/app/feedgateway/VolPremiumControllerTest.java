@@ -335,4 +335,72 @@ class VolPremiumControllerTest {
                 jakarta.servlet.http.HttpServletResponse.class).getAnnotation(GetMapping.class);
         assertArrayEquals(new String[] {"/api/vol-premium/ivrv"}, mapping.value());
     }
+
+    // ----- GET /api/vol-premium/current — the danger clock's verdict on first paint -----------------
+
+    @Test
+    void theCurrentRouteIsTheOneTheWebRepoCalls() throws Exception {
+        GetMapping mapping = VolPremiumController.class.getMethod("current", String.class, String.class,
+                jakarta.servlet.http.HttpServletResponse.class).getAnnotation(GetMapping.class);
+        assertArrayEquals(new String[] {"/api/vol-premium/current"}, mapping.value());
+    }
+
+    @Test
+    void theCurrentVerdictIsServedVerbatimUnderItsOwnEnvelope() throws Exception {
+        // VERBATIM (VP-337): the producer's record, not a reshaping of it. The envelope carries the
+        // symbol and nothing else — the record owns its sessionDate, and two copies of one field can
+        // disagree.
+        FeedGatewayService service = mock(FeedGatewayService.class);
+        String verdict = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"overallLevel\":\"DANGEROUS\"}";
+        when(service.volPremiumCurrentVerdict("SPX")).thenReturn(verdict);
+
+        MockHttpServletResponse response = current(new VolPremiumController(service, auth(200)), "SPX", "Bearer t");
+
+        assertEquals(200, response.getStatus());
+        assertTrue(response.getContentType().startsWith("application/json"), response.getContentType());
+        assertEquals("{\"symbol\":\"SPX\",\"verdict\":" + verdict + "}",
+                response.getContentAsString(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void noVerdictHeldIsATwoHundredWithNullRatherThanAnError() throws Exception {
+        // Nothing held, or what is held has aged out: both mean "we cannot see", which the consumer
+        // renders as UNAVAILABLE. An error status would make a cold start indistinguishable from a
+        // broken gateway, and Gate-1 §5.1 makes UNAVAILABLE incapable of softening a danger read
+        // anyway — so the honest answer is a 200 carrying null.
+        FeedGatewayService service = mock(FeedGatewayService.class);
+        when(service.volPremiumCurrentVerdict("SPX")).thenReturn(null);
+
+        MockHttpServletResponse response = current(new VolPremiumController(service, auth(200)), "SPX", "Bearer t");
+
+        assertEquals(200, response.getStatus());
+        assertEquals("{\"symbol\":\"SPX\",\"verdict\":null}",
+                response.getContentAsString(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void theCurrentRouteAuthenticatesBeforeItLooksAtTheSymbol() throws Exception {
+        // An unauthenticated caller learns nothing, not even whether the symbol is well formed — the
+        // same posture as the ivrv route, and the cache is never touched.
+        FeedGatewayService service = mock(FeedGatewayService.class);
+        MockHttpServletResponse unauthorized =
+                current(new VolPremiumController(service, auth(401)), "not a symbol!", "Bearer bad");
+        assertEquals(401, unauthorized.getStatus());
+        assertEquals("", unauthorized.getContentAsString(StandardCharsets.UTF_8));
+        verify(service, never()).volPremiumCurrentVerdict(any());
+
+        // Authenticated, the malformed symbol is a 400 — still without a cache lookup, so a symbol that
+        // could not name a series is refused rather than searched for.
+        MockHttpServletResponse badSymbol =
+                current(new VolPremiumController(service, auth(200)), "not a symbol!", "Bearer t");
+        assertEquals(400, badSymbol.getStatus());
+        verify(service, never()).volPremiumCurrentVerdict(any());
+    }
+
+    private static MockHttpServletResponse current(VolPremiumController controller, String symbol,
+                                                   String authorization) throws Exception {
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        controller.current(symbol, authorization, response);
+        return response;
+    }
 }
