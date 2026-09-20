@@ -22,6 +22,12 @@ import stat
 import subprocess
 import sys
 import tempfile
+import importlib.util as _ilu_g
+
+_spec_g = _ilu_g.spec_from_file_location(
+    "gstmt", os.path.join(os.path.dirname(os.path.abspath(__file__)), "groovy-statements.py"))
+gstmt = _ilu_g.module_from_spec(_spec_g)
+_spec_g.loader.exec_module(gstmt)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -109,71 +115,64 @@ def main() -> int:
     r = validate_mutated("Jenkinsfile", jf.replace("    stage('Image') {\n      when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }\n", "    stage('Image') {\n", 1))
     check("an effect stage whose gate is removed is refused", r.returncode == 1 and "stage 'Image' after the guard has no `when` gate" in r.stdout, r.stdout)
 
-    # Codex gateway round 4, M1 — the Test stage compiled this repository's source with no verification in front
-    # of it: `mvn -B test` sat inside a preparation-plus-command shell body and the first primary-tree verify was
-    # in Package, so a tracked file replaced after the guard was compiled and executed here. `mvn test` is not an
-    # EFFECT (it publishes nothing), so the validator does not demand the verify — these assertions do.
+    # Codex gateway round 4, M1 — the Test stage compiled this repository's source with no verification in
+    # front of it: `mvn -B test` sat inside a preparation-plus-command shell body and the first primary-tree
+    # verify was in Package, so a tracked file replaced after the guard was compiled and executed here.
+    # `mvn test` is not an EFFECT (it publishes nothing), so the validator does not demand the verify — this
+    # assertion does.
     #
-    # Round 5 rewrote them. The first version decided adjacency with `…count("sh ") == 0`, which only sees SHELL
-    # steps: Codex inserted `writeFile file: 'pom.xml', text: '<project/>'` between the verify and the compile and
-    # the suite still reported 48 passed. A Jenkins step does not have to be `sh` to rewrite a file. What is
-    # asserted now is that the verify's own timeout block is the statement IMMEDIATELY BEFORE the compile —
-    # nothing at all between them but whitespace and comments — so any inserted statement, of any kind, fails.
-    VERIFY_CMD = "sh 'PERMITTED_SHA=\"${PERMITTED_SHA:-}\" bash scripts/jenkins/verify-permitted-tree.sh --dir ."
-    COMPILE = "sh 'mvn -B test'"
-
-    def test_stage(text: str) -> str:
-        try:
-            return text[text.index("    stage('Test') {"):text.index("    stage('Footprint reverification') {")]
-        except ValueError:
-            return ""
+    # ROUND 6 REWROTE THE ASSERTION ITSELF, for the second time, because it kept accepting more than it named:
+    #   v1 decided with `count("sh ") == 0` — a `writeFile` walked through it (Codex round 5).
+    #   v2 searched raw text with index/rindex/find — Codex round 6 prefixed all three lines of the
+    #      verification block with `// `, left the real compile alone, and this suite said ALL PASS with no
+    #      executable verification at all; and appended a SECOND `sh 'mvn -B test'` that the first-occurrence
+    #      lookup never looked at.
+    # A third string rule would have been a third guess. The decision is now made on STATEMENTS, by
+    # scripts/jenkins/groovy-statements.py (shared, byte-identical across the four repositories, and used by
+    # options-edge-deploy's nifty assertion for the same reason). That file's header states what it cannot
+    # see. Both of Codex's survivors are permanent cases below, and each is also run against the FULL suite.
+    VERIFY_CMD = "PERMITTED_SHA=\"${PERMITTED_SHA:-}\" bash scripts/jenkins/verify-permitted-tree.sh --dir ."
+    COMPILE_CMD = "mvn -B test"
+    COMPILE = "sh '" + COMPILE_CMD + "'"
 
     def compile_is_verified(text: str) -> bool:
-        """True when the statement immediately before `sh 'mvn -B test'` is the primary verify step.
-
-        Total: every shape that is not "verify, then compile, with nothing between" returns False rather than
-        raising, so a mutation can never pass by breaking the parse."""
-        stage = test_stage(text)
-        if not stage or ("\n            " + COMPILE + "\n") not in stage:
-            return False
-        i = stage.index(COMPILE)
-        before = stage[:i]
-        if VERIFY_CMD not in before:
-            return False
-        j = before.rindex(VERIFY_CMD)
-        nl = before.find("\n", j)                      # end of the verify `sh '…'` line
-        if nl < 0:
-            return False
-        close = before.find("}", nl)                   # the closing brace of its timeout block
-        if close < 0:
-            return False
-        # between the end of the verify statement and the compile there may be NOTHING but blank lines and
-        # `//` comments — no sh, no writeFile, no unstash, no dir, no step of any kind.
-        between = before[close + 1:]
-        return all(not ln.strip() or ln.strip().startswith("//") for ln in between.splitlines())
+        """Every statement running the compile is immediately preceded by the verification statement."""
+        ok_, _why = gstmt.verified_steps(text, *gstmt.span(text, "    stage('Test') {", "    stage('Footprint reverification') {"),
+                                         COMPILE_CMD, VERIFY_CMD)
+        return ok_
 
     check("M1: the Test stage's compile is its own step, immediately after the primary verify", compile_is_verified(jf))
-    # Every one of these is a real Jenkins step that can rewrite the tree between the verify and the compile.
-    # `sh` was the only one the first version of this assertion could see.
-    for label, stmt in [
-        ("sh", "            sh 'cp /tmp/other.java src/main/java/app/feedgateway/FootprintViews.java'\n"),
-        ("writeFile (Codex reproduction)", "            writeFile file: 'pom.xml', text: '<project/>'\n"),
-        ("unstash", "            unstash 'other-tree'\n"),
-        ("dir", "            dir('src') { }\n"),
-        ("fileOperations", "            fileOperations([fileCopyOperation(includes: '/tmp/x', targetLocation: 'src')])\n"),
-        ("readFile into a writeFile", "            writeFile file: 'src/x', text: readFile('/tmp/x')\n"),
-        ("a bare method call", "            mutateTheTree()\n"),
-    ]:
-        check(f"M1: a {label} step between the verify and the compile fails the assertion",
-              not compile_is_verified(jf.replace("            " + COMPILE + "\n", stmt + "            " + COMPILE + "\n", 1)))
-    ts_only = test_stage(jf)
-    vblk = ts_only[ts_only.index("            timeout(time: 10, unit: 'MINUTES') {"):ts_only.index("            " + COMPILE)]
-    check("M1: and when the verify block is removed from the stage", not compile_is_verified(jf.replace(vblk, "", 1)))
-    check("M1: and when the compile is moved back inside a preparation shell body (the shape this replaced)",
-          not compile_is_verified(jf.replace("            " + COMPILE + "\n", "            sh 'set -eu; java -version; mvn -B test'\n", 1)))
+    # NEGATIVE CONTROLS. Each removes or defeats the thing the assertion tests; the assertion must go red.
+    # `sh` was the only step v1 could see; comments were invisible to v2; a second compile was never looked at.
+    ts_span = jf[jf.index("    stage('Test') {"):jf.index("    stage('Footprint reverification') {")]
+    vblk = ts_span[ts_span.index("            timeout(time: 10, unit: 'MINUTES') {"):ts_span.index("            " + COMPILE)]
+    mutations = [
+        ("sh", jf.replace("            " + COMPILE + "\n", "            sh 'cp /tmp/other.java src/main/java/app/feedgateway/FootprintViews.java'\n            " + COMPILE + "\n", 1)),
+        ("writeFile (Codex round 5)", jf.replace("            " + COMPILE + "\n", "            writeFile file: 'pom.xml', text: '<project/>'\n            " + COMPILE + "\n", 1)),
+        ("unstash", jf.replace("            " + COMPILE + "\n", "            unstash 'other-tree'\n            " + COMPILE + "\n", 1)),
+        ("dir", jf.replace("            " + COMPILE + "\n", "            dir('src') { }\n            " + COMPILE + "\n", 1)),
+        ("fileOperations", jf.replace("            " + COMPILE + "\n", "            fileOperations([fileCopyOperation(includes: '/tmp/x', targetLocation: 'src')])\n            " + COMPILE + "\n", 1)),
+        ("readFile into a writeFile", jf.replace("            " + COMPILE + "\n", "            writeFile file: 'src/x', text: readFile('/tmp/x')\n            " + COMPILE + "\n", 1)),
+        ("a bare method call", jf.replace("            " + COMPILE + "\n", "            mutateTheTree()\n            " + COMPILE + "\n", 1)),
+        ("the verify block deleted", jf.replace(vblk, "", 1)),
+        ("the compile back inside a preparation shell body", jf.replace("            " + COMPILE + "\n", "            sh 'set -eu; java -version; mvn -B test'\n", 1)),
+        ("the verification COMMENTED OUT, compile untouched (Codex round 6)",
+         jf.replace(vblk, "".join("            // " + ln.strip() + "\n" for ln in vblk.strip().splitlines()), 1)),
+        ("a SECOND, unverified compile appended (Codex round 6)",
+         jf.replace("            " + COMPILE + "\n", "            " + COMPILE + "\n            writeFile file: 'pom.xml', text: '<project/>'\n            " + COMPILE + "\n", 1)),
+        ("a writer INSIDE the verification timeout",
+         jf.replace("'\n            }\n            " + COMPILE, "'\n              writeFile file: 'pom.xml', text: '<project/>'\n            }\n            " + COMPILE, 1)),
+    ]
+    for label, mutated in mutations:
+        changed = mutated != jf
+        check(f"M1 negative control: {label} — mutation applied and the assertion goes red",
+              changed and not compile_is_verified(mutated), "" if changed else "the mutation did not change the file")
     pk = jf[jf.index("    stage('Package') {"):jf.index("    stage('Image') {")]
     check("M1: the Test stage's verify declares the same paths as the Package verify",
-          ts_only[ts_only.index(VERIFY_CMD):ts_only.index("'\n", ts_only.index(VERIFY_CMD))] == pk[pk.index(VERIFY_CMD):pk.index("'\n", pk.index(VERIFY_CMD))])
+          ts_span[ts_span.index(VERIFY_CMD):ts_span.index("'\n", ts_span.index(VERIFY_CMD))] == pk[pk.index(VERIFY_CMD):pk.index("'\n", pk.index(VERIFY_CMD))])
+    # ...and the reader that decides all of the above passes its own assertions.
+    _st = subprocess.run(["python3", os.path.join(HERE, "groovy-statements.py"), "--self-test"], capture_output=True, text=True)
+    check("M1: the shared statement reader passes its own self-test", _st.returncode == 0 and "ALL PASS" in _st.stdout, _st.stdout + _st.stderr)
 
     # The contracts guard is a DEDICATED step now (validator rule 9): its script is exactly the guard command.
     guard_line = next(l for l in jd.split("\n") if l.strip().startswith("sh 'PERMITTED_SHA=") and "permitted-sha-guard.sh --dir" in l)
