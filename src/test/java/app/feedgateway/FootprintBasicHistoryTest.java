@@ -17,6 +17,11 @@ class FootprintBasicHistoryTest {
     private FootprintViews view() { return new FootprintViews(mapper, 262144, 32*1024*1024, 1000, 1024*1024, 1000); }
     private String bar(int i) { return "{\"schemaVersion\":6,\"sessionDate\":\"2026-09-11\",\"symbol\":\"ES.v.0\",\"timeframe\":\"1m\",\"observations\":{\"barStartMs\":"+(OPEN+i*60000)+"}}"; }
     private JsonNode request(long after, long to) throws Exception { return mapper.readTree("{\"type\":\"es-footprint-basic-history\",\"sessionDate\":\"2026-09-11\",\"afterMs\":"+after+",\"toMs\":"+to+"}"); }
+    private String detailedBar(int i) {
+        long t = SESSION_OPEN + i * 60_000L, price = 760000L + i * 25L;
+        return "{\"schemaVersion\":6,\"sessionDate\":\"2026-09-11\",\"symbol\":\"ES.v.0\",\"timeframe\":\"1m\",\"tickCents\":25,\"observations\":{"
+                + "\"barStartMs\":" + t + ",\"barEndMs\":" + (t + 60_000L) + ",\"complete\":true,\"barQuality\":\"READABLE\",\"replayDeterministic\":true,\"levelsTruncated\":false,\"volume\":3,\"delta\":1,\"openCents\":" + price + ",\"highCents\":" + (price + 25) + ",\"lowCents\":" + (price - 25) + ",\"closeCents\":" + price + ",\"levels\":[{\"priceCents\":" + price + ",\"bid\":1,\"ask\":2,\"unk\":0}]},\"structure\":{}}";
+    }
     // Keep this identifier stable because the mutation-audit provenance record keys on it.
     @Test void streamedPagesAreBoundedAscendingAndExcludeOvernight() throws Exception {
         FootprintViews v=view(); for(int i=-1;i<7;i++)v.admitBar(bar(i));
@@ -40,6 +45,21 @@ class FootprintBasicHistoryTest {
         v.admitBar(bar(0).replace("2026-09-11","2026-09-14"));
         JsonNode mismatch=mapper.readTree(FootprintBasicHistory.reply(mapper,v,request(OPEN-1,OPEN),4));
         assertTrue(mismatch.path("sessionMismatch").asBoolean());assertTrue(mismatch.path("bars").isEmpty());
+    }
+    @Test void oneHourHistoryIsAggregatedInTheGatewayNotTheBrowser() throws Exception {
+        FootprintViews v = view();
+        for (int i = 0; i < 60; i++) v.admitBar(detailedBar(i));
+        var request = (com.fasterxml.jackson.databind.node.ObjectNode) request(SESSION_OPEN - 1, SESSION_OPEN + 59 * 60_000L);
+        request.put("timeframe", "1h");
+        JsonNode page = mapper.readTree(FootprintBasicHistory.reply(mapper, v, request, 4));
+        assertEquals("1h", page.path("timeframe").asText());
+        assertEquals(1, page.path("bars").size());
+        JsonNode bar = page.path("bars").get(0);
+        assertEquals("1h", bar.path("timeframe").asText());
+        assertEquals(SESSION_OPEN, bar.path("observations").path("barStartMs").asLong());
+        assertEquals(180, bar.path("observations").path("volume").asLong());
+        assertEquals(60, bar.path("observations").path("levels").size());
+        assertTrue(page.path("nextCursor").isNull());
     }
     @Test void historyUsesRegisteredSocketsAndTheExistingBoundedWriter() throws Exception {
         FeedGatewayService s=FootprintWiringTest.on();s.runOutboundWritesInline();s.footprintViews().admitBar(bar(0));
