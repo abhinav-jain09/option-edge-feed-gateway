@@ -107,13 +107,19 @@ final class FootprintBasicHistory {
             record.put("sessionDate", first.path("sessionDate").asText());
             ObjectNode o = record.putObject("observations");
             o.put("barStartMs", start); o.put("barEndMs", end);
-            boolean complete = true, deterministic = true, truncated = false;
+            // A bucket is readable only when every expected closed 1-minute source bar is present.
+            // Never present an in-progress or gappy hour as a final aggregate.
+            boolean complete = rows.size() == (end - start) / 60_000L, deterministic = true, truncated = false;
+            long expectedStart = start;
             long volume = 0, delta = 0; Long open = null, high = null, low = null, close = null;
             Map<Long, long[]> levels = new java.util.TreeMap<>();
             for (String json : rows) {
                 JsonNode r = mapper.readTree(json), source = r.path("observations");
                 if (!symbol.equals(r.path("symbol").asText()) || !source.isObject()) return null;
-                complete &= source.path("complete").asBoolean(false);
+                complete &= source.path("barStartMs").asLong(Long.MIN_VALUE) == expectedStart
+                        && source.path("barEndMs").asLong(Long.MIN_VALUE) == expectedStart + 60_000L
+                        && source.path("complete").asBoolean(false);
+                expectedStart += 60_000L;
                 deterministic &= source.path("replayDeterministic").asBoolean(false);
                 truncated |= source.path("levelsTruncated").asBoolean(false);
                 volume = Math.addExact(volume, source.path("volume").asLong());

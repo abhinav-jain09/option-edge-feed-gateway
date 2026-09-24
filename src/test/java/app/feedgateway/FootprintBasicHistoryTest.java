@@ -61,6 +61,17 @@ class FootprintBasicHistoryTest {
         assertEquals(60, bar.path("observations").path("levels").size());
         assertTrue(page.path("nextCursor").isNull());
     }
+    @Test void oneHourHistoryNeverLabelsMissingMinutesComplete() throws Exception {
+        FootprintViews v = view();
+        for (int i = 0; i < 59; i++) v.admitBar(detailedBar(i));
+        var request = (com.fasterxml.jackson.databind.node.ObjectNode) request(SESSION_OPEN - 1, SESSION_OPEN + 59 * 60_000L);
+        request.put("timeframe", "1h");
+        JsonNode page = mapper.readTree(FootprintBasicHistory.reply(mapper, v, request, 4));
+        assertEquals(1, page.path("bars").size());
+        assertFalse(page.path("bars").get(0).path("observations").path("complete").asBoolean());
+        assertEquals("PARTIAL", page.path("bars").get(0).path("observations").path("barQuality").asText());
+    }
+
     @Test void historyUsesRegisteredSocketsAndTheExistingBoundedWriter() throws Exception {
         FeedGatewayService s=FootprintWiringTest.on();s.runOutboundWritesInline();s.footprintViews().admitBar(bar(0));
         WebSocketSession ws=mock(WebSocketSession.class);when(ws.getId()).thenReturn("basic");when(ws.isOpen()).thenReturn(true);
