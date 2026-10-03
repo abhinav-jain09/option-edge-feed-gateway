@@ -771,6 +771,15 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong cvdSpxLevelsDrops = new AtomicLong();
     /** U16: records refused because their provenance REGRESSED against what is retained (CL-R7 V1). */
     private final AtomicLong cvdSpxLevelsRegressions = new AtomicLong();
+    /** STRUCTURE: latest ACCEPTED market-structure record (verbatim), replayed on connect; null = none. */
+    private final java.util.concurrent.atomic.AtomicReference<String> marketStructureLatest =
+            new java.util.concurrent.atomic.AtomicReference<>();
+    /** STRUCTURE: records rejected at the boundary (invalid, oversize, tombstone). */
+    private final AtomicLong marketStructureDrops = new AtomicLong();
+    /** STRUCTURE: records refused because their asOfMs REGRESSED against what is retained. */
+    private final AtomicLong marketStructureRegressions = new AtomicLong();
+    /** STRUCTURE retention baseline: asOfMs of the retained record; guarded by the retain lock. -1 = none. */
+    private long marketStructureAsOfMs = -1L;
     /** U16 retention baseline: the provenance of the retained record; guarded by the retain lock. */
     private CvdSpxLevelsProvenance cvdSpxLevelsProvenance;
     /** U16: the end offset hydration read to, handed to the live consumer once; -1 = none. */
@@ -2066,6 +2075,15 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_gateway_ws_dropped_on_close_total Queued messages discarded when a slow client was dropped.\n"
                 + "# TYPE options_edge_gateway_ws_dropped_on_close_total counter\n"
                 + "options_edge_gateway_ws_dropped_on_close_total " + wsDroppedOnClose.get() + "\n"
+                + "# HELP gateway_market_structure_enabled Whether the market-structure stream is enabled.\n"
+                + "# TYPE gateway_market_structure_enabled gauge\n"
+                + "gateway_market_structure_enabled " + boolMetric(settings.marketStructureEnabled()) + "\n"
+                + "# HELP gateway_market_structure_drops_total market-structure records dropped at the gateway boundary (invalid, oversize, tombstone).\n"
+                + "# TYPE gateway_market_structure_drops_total counter\n"
+                + "gateway_market_structure_drops_total " + marketStructureDrops.get() + "\n"
+                + "# HELP gateway_market_structure_regressions_total market-structure records refused because their asOfMs regressed.\n"
+                + "# TYPE gateway_market_structure_regressions_total counter\n"
+                + "gateway_market_structure_regressions_total " + marketStructureRegressions.get() + "\n"
                 + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
                 + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
                 + "gateway_cvd_spx_levels_enabled " + boolMetric(settings.esCvdSpxLevelsEnabled()) + "\n"
@@ -2731,6 +2749,12 @@ public class FeedGatewayService implements ReplayRunner {
             // cache consumer is deliberately NOT subscribed: updateCache has no case for it, and
             // this event keeps its own latest-record retention for the connect replay.
             topicEvents.put(settings.esCvdSpxLevelsTopic(), new TopicBinding("DATABENTO", "es-cvd-spx-levels"));
+        }
+        if (settings.marketStructureEnabled()) {
+            // STRUCTURE: the market-structure service's per-fold levels record — LIVE consumer only,
+            // same reasoning as es-cvd-spx-levels: updateCache has no case for it and the event
+            // keeps its own latest-record retention for the connect replay.
+            topicEvents.put(settings.marketStructureTopic(), new TopicBinding("DATABENTO", "market-structure"));
         }
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
@@ -3512,6 +3536,7 @@ public class FeedGatewayService implements ReplayRunner {
                         evictStrikeSrTombstone(binding, record);
                         evictEsStrikeIntelTombstone(binding, record);
                         evictCvdSpxLevelsTombstone(binding == null ? null : binding.event(), record);
+                        evictMarketStructureTombstone(binding == null ? null : binding.event(), record);
                         noteCvdSpxLevelsProgress(binding, record);
                         continue;
                     }
@@ -3599,6 +3624,20 @@ public class FeedGatewayService implements ReplayRunner {
                             forwardedEvents.incrementAndGet();
                         }
                         noteCvdSpxLevelsProgress(binding, record);
+                        continue;
+                    }
+                    if ("market-structure".equals(binding.event())) {
+                        // STRUCTURE: the market-structure service's record, delivered VERBATIM (raw
+                        // pass-through). Boundary checks only — size, envelope, a monotonic asOfMs —
+                        // the page's model validates the full structure contract and hides the layer
+                        // on anything malformed. Rejected here = counted and dropped, never retained.
+                        Long asOf = validateMarketStructure(json);
+                        if (asOf == null) {
+                            marketStructureDrops.incrementAndGet();
+                        } else if (retainMarketStructure(asOf, json)) {
+                            broadcast(binding.event(), json);
+                            forwardedEvents.incrementAndGet();
+                        }
                         continue;
                     }
                     if ("delta-flow-accel".equals(binding.event())) {
@@ -10237,6 +10276,7 @@ public class FeedGatewayService implements ReplayRunner {
     private static boolean isRawPassThroughEvent(String event) {
         return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
                 || "es-cvd-spx-levels".equals(event)
+                || "market-structure".equals(event)
                 || "es-auction".equals(event)
                 || isFootprintEvent(event)
                 // The vol-premium records are the producer's contract, validated whole and forwarded
@@ -11372,7 +11412,9 @@ public class FeedGatewayService implements ReplayRunner {
             return null;
         }
         try {
-            com.fasterxml.jackson.databind.JsonNode n = mapper.readTree(json);
+            // Strict: trailing tokens after the object are refused — this raw record rides the hello
+            // and the live envelope by string concatenation (the same defect class as market-structure).
+            com.fasterxml.jackson.databind.JsonNode n = strictTreeReader().readValue(json);
             if (n == null || !n.isObject()) return null;
             if (!n.path("schemaVersion").asText("").matches("1\\.\\d+\\.\\d+")) return null;
             if (!CVD_SPX_LEVELS_KEY.equals(n.path("symbol").asText(""))) return null;
@@ -11942,6 +11984,93 @@ public class FeedGatewayService implements ReplayRunner {
         cvdSpxLevelsDrops.incrementAndGet();
     }
 
+    // ── STRUCTURE (market-structure.levels v1) boundary + retention ────────────────────────────
+    static final int MARKET_STRUCTURE_MAX_BYTES = 65536;
+    /**
+     * Strict reader for every RAW, hello-embedded record (market-structure AND es-cvd-spx-levels): a
+     * body with TRAILING TOKENS ("{…}null") must never be retained — the raw string is concatenated
+     * into the live envelope and the hello, so anything but one complete object corrupts both.
+     * Derived from the injected mapper so the boundary keeps the application's parser configuration.
+     */
+    private com.fasterxml.jackson.databind.ObjectReader strictTreeReader() {
+        return mapper.readerFor(com.fasterxml.jackson.databind.JsonNode.class)
+                .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
+    }
+
+    /**
+     * STRUCTURE boundary gate: the record is the producer's contract, forwarded VERBATIM, so this
+     * checks only what the gateway must not relay — oversize bodies (pre-parse, UTF-8 length),
+     * non-objects, a schema major other than 1, a service other than {@code market-structure}, a
+     * state outside {OK, UNAVAILABLE}, trailing tokens after the object, and a missing or non-positive
+     * JS-exact {@code asOfMs}. The
+     * page's model validates the full structure and hides the layer on anything malformed, so a
+     * record this gate passes can never be PARTIALLY drawn. Returns the record's asOfMs, or null.
+     */
+    Long validateMarketStructure(String json) {
+        if (json == null) return null;
+        if (json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > MARKET_STRUCTURE_MAX_BYTES) {
+            return null;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode n = strictTreeReader().readValue(json);
+            if (n == null || !n.isObject()) return null;
+            if (!n.path("schemaVersion").isIntegralNumber() || n.path("schemaVersion").asLong(-1) != 1L) return null;
+            if (!"market-structure".equals(n.path("service").asText(""))) return null;
+            String state = n.path("state").asText("");
+            if (!"OK".equals(state) && !"UNAVAILABLE".equals(state)) return null;
+            Long asOfMs = levelsInt(n, "asOfMs");
+            if (asOfMs == null || asOfMs <= 0) return null;
+            return asOfMs;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * STRUCTURE retention: the latest record wins by its own {@code asOfMs}; an older record (a
+     * lagging incarnation, a replay) is refused, counted, and forwarded nowhere, so a stale fold can
+     * never displace a newer one on the browser. Equal asOfMs re-retains (an idempotent republish).
+     */
+    synchronized boolean retainMarketStructure(long asOfMs, String json) {
+        if (marketStructureAsOfMs > asOfMs) {
+            marketStructureRegressions.incrementAndGet();
+            return false;
+        }
+        marketStructureAsOfMs = asOfMs;
+        marketStructureLatest.set(json);
+        return true;
+    }
+
+    /**
+     * STRUCTURE withdrawal: a TOMBSTONE on the topic (reset tooling) clears the connect replay AND
+     * the retention baseline. The value path has NO key gate (the producer's key contract is not
+     * written), so neither does this one — a withdrawal under ANY key erases; a key gate on one side
+     * only would leave a withdrawn record in every later hello. Non-tombstone unparseable values
+     * just count.
+     */
+    synchronized void evictMarketStructureTombstone(String event, org.apache.kafka.clients.consumer.ConsumerRecord<String, ?> record) {
+        if (!"market-structure".equals(event)) {
+            return;
+        }
+        if (record.value() == null) {
+            marketStructureLatest.set(null);
+            marketStructureAsOfMs = -1L;
+        }
+        marketStructureDrops.incrementAndGet();
+    }
+
+    java.util.concurrent.atomic.AtomicReference<String> marketStructureLatestForTest() {
+        return marketStructureLatest;
+    }
+
+    long marketStructureDropsForTest() {
+        return marketStructureDrops.get();
+    }
+
+    long marketStructureRegressionsForTest() {
+        return marketStructureRegressions.get();
+    }
+
     java.util.concurrent.atomic.AtomicReference<String> cvdSpxLevelsLatestForTest() {
         return cvdSpxLevelsLatest;
     }
@@ -11957,7 +12086,8 @@ public class FeedGatewayService implements ReplayRunner {
     /** R46 hello payload: {"sessionDate":...,"hwm":{"30s":<lastBarStartMs>,...}}. */
     /** G-R6: the cvd-hello frame is sent whenever CVD, SPX levels OR footprint is enabled. */
     boolean sendsCvdHello() {
-        return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || footprintViews != null;
+        return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || settings.marketStructureEnabled()
+                || footprintViews != null;
     }
 
     String cvdHelloJson() {
@@ -11980,6 +12110,12 @@ public class FeedGatewayService implements ReplayRunner {
             // Verbatim record or an explicit null — the FIELD's presence is the completion signal.
             String levels = cvdSpxLevelsLatest.get();
             sb.append(",\"levels\":").append(levels == null ? "null" : levels);
+        }
+        if (settings.marketStructureEnabled()) {
+            // STRUCTURE: same contract as `levels` — verbatim record or an explicit null; the FIELD's
+            // presence tells the page this gateway has a structure stream (absent = flag off).
+            String structure = marketStructureLatest.get();
+            sb.append(",\"structure\":").append(structure == null ? "null" : structure);
         }
         if (footprintViews != null) {
             // G-R6: ONE atomic snapshot of the footprint coordinator rides the SAME hello; the field's
@@ -13275,6 +13411,10 @@ public class FeedGatewayService implements ReplayRunner {
             "es-footprint-bar",
             "es-footprint-outcome",
             "es-footprint-strike",
+            // STRUCTURE: the market-structure record is a GLOBAL advisory (identical for every
+            // authenticated socket, display-only) — the same class as es-cvd-spx-levels; without
+            // this entry per-session (auth) mode silently drops every frame (the U16 defect).
+            "market-structure",
             // ...and the strike fold's own authority frame (R14, code round-2 #4): a refusal, the view
             // failing closed, or the replay completing. Same class, same gate; it carries no evidence.
             "es-footprint-strike-control",

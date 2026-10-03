@@ -160,6 +160,18 @@ class CvdSpxLevelsWiringTest {
         assertTrue(s.retainCvdSpxLevels(s.validateCvdSpxLevels(ok("20260817", 1, 1))),
                 "after an operator wipe the baseline starts over");
     }
+    @Test
+    void trailingTokensAfterTheObjectAreRefusedSoTheHelloStaysWellFormed() {
+        var s = service();
+        String valid = ok("20260817", 1000, 5);
+        assertNotNull(s.validateCvdSpxLevels(valid));
+        // "{…}null" parses leniently as the object alone, would be retained verbatim and then
+        // corrupt both the live envelope and the hello by concatenation.
+        assertNull(s.validateCvdSpxLevels(valid + "null"));
+        assertNull(s.validateCvdSpxLevels(valid + " {}"));
+        assertNotNull(s.validateCvdSpxLevels(valid + "  \n"), "trailing whitespace is not a token");
+    }
+
 
     @Test void boundaryRefusesOversizeRecords() {
         var s = service();
