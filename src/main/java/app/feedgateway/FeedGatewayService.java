@@ -13390,10 +13390,6 @@ public class FeedGatewayService implements ReplayRunner {
             // es-cvd/es-cvd-bar frame as non-routable.
             "es-cvd",
             "es-cvd-bar",
-            // STRUCTURE: the market-structure record is a GLOBAL advisory (identical for every
-            // authenticated socket, display-only) — the same class as es-cvd-spx-levels; without
-            // this entry per-session (auth) mode silently drops every frame (the U16 defect).
-            "market-structure",
             // ES Footprint (G-R3, D5): ES-global market microstructure, identical for every
             // authenticated socket — the same class as es-cvd; the only gate is authentication.
             "es-footprint",
@@ -13401,6 +13397,10 @@ public class FeedGatewayService implements ReplayRunner {
             "es-footprint-bar",
             "es-footprint-outcome",
             "es-footprint-strike",
+            // STRUCTURE: the market-structure record is a GLOBAL advisory (identical for every
+            // authenticated socket, display-only) — the same class as es-cvd-spx-levels; without
+            // this entry per-session (auth) mode silently drops every frame (the U16 defect).
+            "market-structure",
             // ...and the strike fold's own authority frame (R14, code round-2 #4): a refusal, the view
             // failing closed, or the replay completing. Same class, same gate; it carries no evidence.
             "es-footprint-strike-control",
