@@ -11412,7 +11412,9 @@ public class FeedGatewayService implements ReplayRunner {
             return null;
         }
         try {
-            com.fasterxml.jackson.databind.JsonNode n = mapper.readTree(json);
+            // Strict: trailing tokens after the object are refused — this raw record rides the hello
+            // and the live envelope by string concatenation (the same defect class as market-structure).
+            com.fasterxml.jackson.databind.JsonNode n = strictTreeReader().readValue(json);
             if (n == null || !n.isObject()) return null;
             if (!n.path("schemaVersion").asText("").matches("1\\.\\d+\\.\\d+")) return null;
             if (!CVD_SPX_LEVELS_KEY.equals(n.path("symbol").asText(""))) return null;
@@ -11984,11 +11986,16 @@ public class FeedGatewayService implements ReplayRunner {
 
     // ── STRUCTURE (market-structure.levels v1) boundary + retention ────────────────────────────
     static final int MARKET_STRUCTURE_MAX_BYTES = 65536;
-    /** Strict reader: a body with TRAILING TOKENS ("{…}null") must never be retained — the raw string is
-     *  concatenated into the live envelope and the hello, so anything but one complete object corrupts both. */
-    private static final com.fasterxml.jackson.databind.ObjectReader MARKET_STRUCTURE_READER =
-            new ObjectMapper().readerFor(com.fasterxml.jackson.databind.JsonNode.class)
-                    .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
+    /**
+     * Strict reader for every RAW, hello-embedded record (market-structure AND es-cvd-spx-levels): a
+     * body with TRAILING TOKENS ("{…}null") must never be retained — the raw string is concatenated
+     * into the live envelope and the hello, so anything but one complete object corrupts both.
+     * Derived from the injected mapper so the boundary keeps the application's parser configuration.
+     */
+    private com.fasterxml.jackson.databind.ObjectReader strictTreeReader() {
+        return mapper.readerFor(com.fasterxml.jackson.databind.JsonNode.class)
+                .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
+    }
 
     /**
      * STRUCTURE boundary gate: the record is the producer's contract, forwarded VERBATIM, so this
@@ -12005,7 +12012,7 @@ public class FeedGatewayService implements ReplayRunner {
             return null;
         }
         try {
-            com.fasterxml.jackson.databind.JsonNode n = MARKET_STRUCTURE_READER.readValue(json);
+            com.fasterxml.jackson.databind.JsonNode n = strictTreeReader().readValue(json);
             if (n == null || !n.isObject()) return null;
             if (!n.path("schemaVersion").isIntegralNumber() || n.path("schemaVersion").asLong(-1) != 1L) return null;
             if (!"market-structure".equals(n.path("service").asText(""))) return null;
