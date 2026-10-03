@@ -11984,13 +11984,18 @@ public class FeedGatewayService implements ReplayRunner {
 
     // ── STRUCTURE (market-structure.levels v1) boundary + retention ────────────────────────────
     static final int MARKET_STRUCTURE_MAX_BYTES = 65536;
-    static final String MARKET_STRUCTURE_KEY = "SPX";
+    /** Strict reader: a body with TRAILING TOKENS ("{…}null") must never be retained — the raw string is
+     *  concatenated into the live envelope and the hello, so anything but one complete object corrupts both. */
+    private static final com.fasterxml.jackson.databind.ObjectReader MARKET_STRUCTURE_READER =
+            new ObjectMapper().readerFor(com.fasterxml.jackson.databind.JsonNode.class)
+                    .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
 
     /**
      * STRUCTURE boundary gate: the record is the producer's contract, forwarded VERBATIM, so this
      * checks only what the gateway must not relay — oversize bodies (pre-parse, UTF-8 length),
      * non-objects, a schema major other than 1, a service other than {@code market-structure}, a
-     * state outside {OK, UNAVAILABLE}, and a missing or non-positive JS-exact {@code asOfMs}. The
+     * state outside {OK, UNAVAILABLE}, trailing tokens after the object, and a missing or non-positive
+     * JS-exact {@code asOfMs}. The
      * page's model validates the full structure and hides the layer on anything malformed, so a
      * record this gate passes can never be PARTIALLY drawn. Returns the record's asOfMs, or null.
      */
@@ -12000,7 +12005,7 @@ public class FeedGatewayService implements ReplayRunner {
             return null;
         }
         try {
-            com.fasterxml.jackson.databind.JsonNode n = mapper.readTree(json);
+            com.fasterxml.jackson.databind.JsonNode n = MARKET_STRUCTURE_READER.readValue(json);
             if (n == null || !n.isObject()) return null;
             if (!n.path("schemaVersion").isIntegralNumber() || n.path("schemaVersion").asLong(-1) != 1L) return null;
             if (!"market-structure".equals(n.path("service").asText(""))) return null;
@@ -12031,14 +12036,16 @@ public class FeedGatewayService implements ReplayRunner {
 
     /**
      * STRUCTURE withdrawal: a TOMBSTONE on the topic (reset tooling) clears the connect replay AND
-     * the retention baseline. Same key gate as the value path: a foreign-key tombstone is counted
-     * and ignored. Non-tombstone unparseable values just count.
+     * the retention baseline. The value path has NO key gate (the producer's key contract is not
+     * written), so neither does this one — a withdrawal under ANY key erases; a key gate on one side
+     * only would leave a withdrawn record in every later hello. Non-tombstone unparseable values
+     * just count.
      */
     synchronized void evictMarketStructureTombstone(String event, org.apache.kafka.clients.consumer.ConsumerRecord<String, ?> record) {
         if (!"market-structure".equals(event)) {
             return;
         }
-        if (record.value() == null && MARKET_STRUCTURE_KEY.equals(record.key())) {
+        if (record.value() == null) {
             marketStructureLatest.set(null);
             marketStructureAsOfMs = -1L;
         }

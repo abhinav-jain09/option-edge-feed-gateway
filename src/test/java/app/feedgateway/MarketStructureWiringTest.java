@@ -89,21 +89,29 @@ class MarketStructureWiringTest {
     }
 
     @Test
-    void onlyAKeyedTombstoneWithdrawsTheReplay() {
+    void aTombstoneOfThisEventUnderAnyKeyWithdrawsTheReplay() {
         var s = service();
         assertTrue(s.retainMarketStructure(100L, ok(100L)));
-        s.evictMarketStructureTombstone("market-structure",
-                new ConsumerRecord<>("options.market-structure.levels", 0, 1L, "OTHER", null));
-        assertNotNull(s.marketStructureLatestForTest().get(), "a foreign-key tombstone is counted, not an erase");
-        assertEquals(1L, s.marketStructureDropsForTest());
         s.evictMarketStructureTombstone("es-cvd-spx-levels",
-                new ConsumerRecord<>("options.es-cvd-spx-levels", 0, 1L, FeedGatewayService.MARKET_STRUCTURE_KEY, null));
+                new ConsumerRecord<>("options.es-cvd-spx-levels", 0, 1L, "ES.v.0", null));
         assertNotNull(s.marketStructureLatestForTest().get(), "another event's tombstone never touches this retention");
+        assertEquals(0L, s.marketStructureDropsForTest());
+        // The value path has no key gate, so the withdrawal has none either: whatever key the
+        // producer used, its tombstone erases — otherwise a withdrawn record rides every later hello.
         s.evictMarketStructureTombstone("market-structure",
-                new ConsumerRecord<>("options.market-structure.levels", 0, 2L, FeedGatewayService.MARKET_STRUCTURE_KEY, null));
+                new ConsumerRecord<>("options.market-structure.levels", 0, 2L, "whatever-key", null));
         assertNull(s.marketStructureLatestForTest().get());
-        assertEquals(2L, s.marketStructureDropsForTest());
+        assertEquals(1L, s.marketStructureDropsForTest());
         assertTrue(s.retainMarketStructure(50L, ok(50L)), "after a withdrawal the baseline is erased: an older fold is accepted again");
+    }
+
+    @Test
+    void trailingTokensAfterTheObjectAreRefusedSoTheEnvelopeAndHelloStayWellFormed() throws Exception {
+        var s = service();
+        assertNull(s.validateMarketStructure(ok(9) + "null"), "\"{…}null\" parses leniently but is NOT one object");
+        assertNull(s.validateMarketStructure(ok(9) + " {}"));
+        assertNull(s.validateMarketStructure(ok(9) + ","));
+        assertEquals(9L, s.validateMarketStructure(ok(9) + "  \n"), "trailing whitespace is not a token");
     }
 
     @Test
@@ -119,7 +127,11 @@ class MarketStructureWiringTest {
             assertTrue(on.cvdHelloJson().contains(",\"structure\":null"), "flag on, nothing retained: an explicit null");
             assertTrue(on.retainMarketStructure(100L, ok(100L)));
             assertTrue(on.cvdHelloJson().contains(",\"structure\":" + ok(100L)), "the retained record rides VERBATIM");
-            new ObjectMapper().readTree(on.cvdHelloJson());   // still one well-formed hello object
+            // Still ONE well-formed hello object — parsed with trailing-token failure on, the same
+            // strictness the boundary applies to the record it embeds.
+            new ObjectMapper().readerFor(com.fasterxml.jackson.databind.JsonNode.class)
+                    .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .readValue(on.cvdHelloJson());
         } finally {
             System.clearProperty("GATEWAY_MARKET_STRUCTURE_ENABLED");
         }
