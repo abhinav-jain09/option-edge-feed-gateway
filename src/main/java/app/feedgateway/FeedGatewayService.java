@@ -194,6 +194,7 @@ public class FeedGatewayService implements ReplayRunner {
     // to absorb realistic inter-service NTP skew; tight enough that a poisoned record can never freeze a
     // symbol's track for more than this bound.
     private static final long GREEK_MOVE_AUTH_MAX_FUTURE_SKEW_MS = 60_000L;
+    private static final long GAMMA_NAVIGATION_MAX_FUTURE_SKEW_MS = 60_000L;
     // Same clock-skew fail-closed bound for the spot-vol-regime snapshot's asOfEventTimeMs (a past
     // stream-time observation): a future-dated record must neither evade the SHORT freshness window
     // nor poison the monotonic supersede gate.
@@ -385,6 +386,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     private final Map<String, String> gammaMigration = new ConcurrentHashMap<>();
+    /** Gamma Navigator shadow view per chain. REST-only, like gammaRotation. */
+    private final Map<String, String> gammaNavigation = new ConcurrentHashMap<>();
     /** Corridor-gauge live state per symbol|expiry (JSON, last-value-wins). Standalone event. */
     private final Map<String, String> corridorGauges = new ConcurrentHashMap<>();
     /**
@@ -2451,6 +2454,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
         topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
         topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
+        if (settings.gammaNavigationEnabled()) {
+            topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
+        }
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
@@ -2616,6 +2622,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
         topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
         topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
+        if (settings.gammaNavigationEnabled()) {
+            topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
+        }
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
@@ -3118,7 +3127,11 @@ public class FeedGatewayService implements ReplayRunner {
                     // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
                     // stamping must never overwrite the service's own sessionDate (UI design §3).
                     String json;
-                    if (binding != null && isRawPassThroughEvent(binding.event())) {
+                    if (binding != null && "gamma-navigation".equals(binding.event())) {
+                        // Avro on the wire, canonical JSON at REST. Skip enrichJson so the
+                        // producer remains the only author of contract fields.
+                        json = avroJson(record.value());
+                    } else if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
                         String rawJson = avro ? avroJson(record.value()) : stringJson(record.value());
@@ -3512,7 +3525,10 @@ public class FeedGatewayService implements ReplayRunner {
                     // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
                     // stamping must never overwrite the service's own sessionDate (UI design §3).
                     String json;
-                    if (binding != null && isRawPassThroughEvent(binding.event())) {
+                    if (binding != null && "gamma-navigation".equals(binding.event())) {
+                        // Avro on the wire, canonical JSON at REST; see the cache-consumer twin.
+                        json = avroJson(record.value());
+                    } else if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
                         String rawJson = avro ? avroJson(record.value()) : stringJson(record.value());
@@ -3719,6 +3735,11 @@ public class FeedGatewayService implements ReplayRunner {
                         continue;
                     }
                     String cacheKey = updateCache(binding, record, json);
+                    if ("gamma-navigation".equals(binding.event())) {
+                        // Authenticated REST snapshot only. Stop before BOTH per-session routing
+                        // and legacy ui-batch accounting; caching above is its complete delivery.
+                        continue;
+                    }
                     if (skipsLiveSpotBandForward(binding.event(), perSessionRouting())) {
                         // ONLY in per-session mode. There the live path routes one socket message per
                         // record, and the client has no "spot-band" message handler, so the browser would
@@ -6362,6 +6383,12 @@ public class FeedGatewayService implements ReplayRunner {
                 gammaMigration.put(key, json);
                 return key;
             }
+            case "gamma-navigation" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gammaNavigation.put(key, json);
+                return key;
+            }
             case "gamma-fragility" -> {
                 // Same contract as gamma-rotation: one record per chain is the whole panel.
                 cacheEventTimes.put(versionKey, eventTime);
@@ -7224,6 +7251,12 @@ public class FeedGatewayService implements ReplayRunner {
             // Seek-back matches, so a restart rebuilds a log whose last move was hours ago.
             return CachePolicy.noEviction(settings.optionChainOffHoursSeekBackMs());
         }
+        if ("gamma-navigation".equals(event)) {
+            // Deliberately a heartbeat, unlike rotation/fragility: the producer emits every
+            // evaluation and the payload carries validUntilMs. The generic 15-minute envelope is
+            // only restart/retention headroom; the UI expires the conclusion at validUntilMs.
+            return CachePolicy.expiring(settings.cacheTtlMs());
+        }
         if (MARKET_AWARE_CHAIN_EVENTS.contains(event)) {
             if (isRegularTradingHours(nowMs)) {
                 return CachePolicy.expiring(settings.optionChainRthCacheTtlMs());
@@ -7340,6 +7373,20 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private long eventCacheTimestamp(String event, ConsumerRecord<?, ?> record, String json) {
+        if ("gamma-navigation".equals(event)) {
+            // A caught-up/backfilled record must be ordered and expired by the producer decision
+            // time, never by its fresh Kafka arrival time.
+            try {
+                long eventTimeMs = longField(mapper.readTree(json), "eventTimeMs", -1L);
+                if (eventTimeMs < 0L
+                        || eventTimeMs > System.currentTimeMillis() + GAMMA_NAVIGATION_MAX_FUTURE_SKEW_MS) {
+                    return -1L;
+                }
+                return eventTimeMs;
+            } catch (JsonProcessingException | RuntimeException malformed) {
+                return -1L;
+            }
+        }
         if ("zero-dte-intelligence".equals(event)) {
             // Never use fresh Kafka arrival time for a replayed direction decision. A historical record
             // arriving now must expire from its decision time, otherwise an old unusual burst can tint
@@ -7776,6 +7823,8 @@ public class FeedGatewayService implements ReplayRunner {
             corridorGauges.remove(versionKey.substring("corridor-gauge:".length()));
         } else if (versionKey.startsWith("gamma-migration:")) {
             gammaMigration.remove(versionKey.substring("gamma-migration:".length()));
+        } else if (versionKey.startsWith("gamma-navigation:")) {
+            gammaNavigation.remove(versionKey.substring("gamma-navigation:".length()));
         } else if (versionKey.startsWith("gamma-rotation:")) {
             gammaRotation.remove(versionKey.substring("gamma-rotation:".length()));
         } else if (versionKey.startsWith("gamma-fragility:")) {
@@ -7894,6 +7943,11 @@ public class FeedGatewayService implements ReplayRunner {
 
     public String cachedGammaMigration(String symbol, String expiry) {
         return cachedByChain(gammaMigration, symbol, expiry);
+    }
+
+    /** The bounded Gamma Navigator shadow record for one chain, or null when none is cached. */
+    public String cachedGammaNavigation(String symbol, String expiry) {
+        return cachedByChain(gammaNavigation, symbol, expiry);
     }
 
     /** The peak-rotation windows and raw move log for one chain, or null when none is cached. */

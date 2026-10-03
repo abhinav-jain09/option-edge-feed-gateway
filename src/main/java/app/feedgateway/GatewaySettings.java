@@ -963,6 +963,16 @@ public final class GatewaySettings {
         return value("KAFKA_GAMMA_MIGRATION_TOPIC", "options.spx.gamma-migration.current");
     }
 
+    /** Bounded shadow navigation record produced by gamma-migration-service. */
+    public String gammaNavigationTopic() {
+        return value("KAFKA_GAMMA_NAVIGATION_TOPIC", "options.spx.gamma-navigation.current");
+    }
+
+    /** Runtime kill switch for the experimental navigation integration; defaults dark-safe off. */
+    public boolean gammaNavigationEnabled() {
+        return boolValue("GAMMA_NAVIGATION_ENABLED", false);
+    }
+
     /**
      * Peak ROTATION (Avro, per-chain last-value-wins). Broadcast as event "gamma-rotation".
      *
