@@ -968,6 +968,11 @@ public final class GatewaySettings {
         return value("KAFKA_GAMMA_NAVIGATION_TOPIC", "options.spx.gamma-navigation.current");
     }
 
+    /** Runtime kill switch for the experimental navigation integration; defaults dark-safe on. */
+    public boolean gammaNavigationEnabled() {
+        return boolValue("GAMMA_NAVIGATION_ENABLED", true);
+    }
+
     /**
      * Peak ROTATION (Avro, per-chain last-value-wins). Broadcast as event "gamma-rotation".
      *

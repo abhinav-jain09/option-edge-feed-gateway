@@ -1,6 +1,7 @@
 package app.feedgateway.gammamigration;
 
 import app.feedgateway.FeedGatewayService;
+import app.feedgateway.GatewaySettings;
 import app.feedgateway.liquidityhistory.LiquidityHistoryAuth;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.lang.reflect.Method;
@@ -22,15 +23,22 @@ class GammaNavigationControllerTest {
 
     private static LiquidityHistoryAuth auth(int status) {
         LiquidityHistoryAuth auth = mock(LiquidityHistoryAuth.class);
+        when(auth.enforcing()).thenReturn(true);
         when(auth.authenticate(any())).thenReturn(new LiquidityHistoryAuth.Result(status, "tester"));
         return auth;
+    }
+
+    private static GatewaySettings enabledSettings() {
+        GatewaySettings settings = mock(GatewaySettings.class);
+        when(settings.gammaNavigationEnabled()).thenReturn(true);
+        return settings;
     }
 
     @Test
     void servesTheNavigationRecordVerbatimFromItsOwnCache() {
         FeedGatewayService service = mock(FeedGatewayService.class);
         when(service.cachedGammaNavigation("SPX", "20261003")).thenReturn(RECORD);
-        var response = new GammaNavigationController(service, auth(200), new ObjectMapper())
+        var response = new GammaNavigationController(service, auth(200), new ObjectMapper(), enabledSettings())
                 .gammaNavigation("SPX", "20261003", "Bearer t");
         assertEquals(RECORD, response.getBody());
         verify(service).cachedGammaNavigation("SPX", "20261003");
@@ -40,7 +48,7 @@ class GammaNavigationControllerTest {
     @Test
     void absenceIsAnExplicitPresentFalseResponse() {
         FeedGatewayService service = mock(FeedGatewayService.class);
-        var response = new GammaNavigationController(service, auth(200), new ObjectMapper())
+        var response = new GammaNavigationController(service, auth(200), new ObjectMapper(), enabledSettings())
                 .gammaNavigation("spx", "20261003", "Bearer t");
         assertEquals(200, response.getStatusCode().value());
         assertTrue(response.getBody().contains("\"present\":false"));
@@ -52,7 +60,7 @@ class GammaNavigationControllerTest {
         FeedGatewayService service = mock(FeedGatewayService.class);
         when(service.activeSymbolExpiry()).thenReturn(new String[]{"SPX", "20261003"});
         when(service.cachedGammaNavigation("SPX", "20261003")).thenReturn(RECORD);
-        var response = new GammaNavigationController(service, auth(200), new ObjectMapper())
+        var response = new GammaNavigationController(service, auth(200), new ObjectMapper(), enabledSettings())
                 .gammaNavigation(null, null, "Bearer t");
         assertEquals(RECORD, response.getBody());
     }
@@ -60,10 +68,35 @@ class GammaNavigationControllerTest {
     @Test
     void authenticationRunsBeforeCacheAccess() {
         FeedGatewayService service = mock(FeedGatewayService.class);
-        var response = new GammaNavigationController(service, auth(401), new ObjectMapper())
+        var response = new GammaNavigationController(service, auth(401), new ObjectMapper(), enabledSettings())
                 .gammaNavigation("SPX", "20261003", null);
         assertEquals(401, response.getStatusCode().value());
         verify(service, never()).cachedGammaNavigation(any(), any());
+    }
+
+    @Test
+    void authenticationDisabledFailsClosedBeforeCacheAccess() {
+        FeedGatewayService service = mock(FeedGatewayService.class);
+        LiquidityHistoryAuth auth = mock(LiquidityHistoryAuth.class);
+        when(auth.enforcing()).thenReturn(false);
+        var response = new GammaNavigationController(service, auth, new ObjectMapper(), enabledSettings())
+                .gammaNavigation("SPX", "20261003", null);
+        assertEquals(401, response.getStatusCode().value());
+        verify(service, never()).cachedGammaNavigation(any(), any());
+        verify(auth, never()).authenticate(any());
+    }
+
+    @Test
+    void killSwitchWithdrawsEndpointBeforeAuthOrCacheWork() {
+        FeedGatewayService service = mock(FeedGatewayService.class);
+        LiquidityHistoryAuth auth = mock(LiquidityHistoryAuth.class);
+        GatewaySettings settings = mock(GatewaySettings.class);
+        when(settings.gammaNavigationEnabled()).thenReturn(false);
+        var response = new GammaNavigationController(service, auth, new ObjectMapper(), settings)
+                .gammaNavigation("SPX", "20261003", "Bearer t");
+        assertEquals(404, response.getStatusCode().value());
+        verify(service, never()).cachedGammaNavigation(any(), any());
+        verify(auth, never()).authenticate(any());
     }
 
     @Test

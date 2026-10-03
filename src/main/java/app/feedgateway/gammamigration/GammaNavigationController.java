@@ -1,6 +1,7 @@
 package app.feedgateway.gammamigration;
 
 import app.feedgateway.FeedGatewayService;
+import app.feedgateway.GatewaySettings;
 import app.feedgateway.liquidityhistory.LiquidityHistoryAuth;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -23,14 +24,16 @@ public class GammaNavigationController {
     private final FeedGatewayService service;
     private final LiquidityHistoryAuth auth;
     private final ObjectMapper mapper;
+    private final GatewaySettings settings;
     private final GammaMigrationController.RateLimiter rateLimiter =
             new GammaMigrationController.RateLimiter(RATE_LIMIT_PER_MIN, 60_000L);
 
     public GammaNavigationController(FeedGatewayService service, LiquidityHistoryAuth auth,
-                                     ObjectMapper mapper) {
+                                     ObjectMapper mapper, GatewaySettings settings) {
         this.service = service;
         this.auth = auth;
         this.mapper = mapper == null ? new ObjectMapper() : mapper;
+        this.settings = settings;
     }
 
     @GetMapping(value = "/api/gamma-navigation", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -38,6 +41,12 @@ public class GammaNavigationController {
             @RequestParam(value = "symbol", required = false) String symbol,
             @RequestParam(value = "expiry", required = false) String expiry,
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
+        if (settings == null || !settings.gammaNavigationEnabled()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+        }
+        if (!auth.enforcing()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
         LiquidityHistoryAuth.Result authResult = auth.authenticate(authorization);
         if (authResult.status() != 200) return ResponseEntity.status(authResult.status()).build();
         long retry = rateLimiter.tryAcquire(authResult.principal(), System.currentTimeMillis());

@@ -2453,7 +2453,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
         topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
         topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
-        topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
+        if (settings.gammaNavigationEnabled()) {
+            topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
+        }
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
@@ -2619,7 +2621,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
         topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
         topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
-        topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
+        if (settings.gammaNavigationEnabled()) {
+            topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
+        }
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
