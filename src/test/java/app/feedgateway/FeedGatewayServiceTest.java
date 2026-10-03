@@ -7470,6 +7470,21 @@ class FeedGatewayServiceTest {
         assertEquals("DATABENTO|SPX|20261003", updateCache(service, binding,
                 recordAt(settings.gammaNavigationTopic(), 0, 2L, "SPX|20261003", newer, now), newer));
         assertEquals(newer, service.cachedGammaNavigation("SPX", "20261003"));
+
+        String missingTime = "{\"messageType\":\"GAMMA_NAVIGATION_V1\",\"symbol\":\"SPX\","
+                + "\"expiry\":\"20261003\"}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.gammaNavigationTopic(), 0, 4L, "SPX|20261003", missingTime, now), missingTime));
+        String malformedTime = "{\"messageType\":\"GAMMA_NAVIGATION_V1\",\"symbol\":\"SPX\","
+                + "\"expiry\":\"20261003\",\"eventTimeMs\":\"later\"}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.gammaNavigationTopic(), 0, 5L, "SPX|20261003", malformedTime, now), malformedTime));
+        String futureTime = "{\"messageType\":\"GAMMA_NAVIGATION_V1\",\"symbol\":\"SPX\","
+                + "\"expiry\":\"20261003\",\"eventTimeMs\":" + (now + 120_000L) + "}";
+        assertNull(updateCache(service, binding,
+                recordAt(settings.gammaNavigationTopic(), 0, 6L, "SPX|20261003", futureTime, now), futureTime));
+        assertEquals(newer, service.cachedGammaNavigation("SPX", "20261003"),
+                "invalid producer times must not replace or pin the current conclusion");
         assertNull(updateCache(service, binding,
                 recordAt(settings.gammaNavigationTopic(), 0, 3L, "SPX|20261003", first, now + 1L), first),
                 "an older producer event must never replace the current conclusion");

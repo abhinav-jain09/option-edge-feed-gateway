@@ -194,6 +194,7 @@ public class FeedGatewayService implements ReplayRunner {
     // to absorb realistic inter-service NTP skew; tight enough that a poisoned record can never freeze a
     // symbol's track for more than this bound.
     private static final long GREEK_MOVE_AUTH_MAX_FUTURE_SKEW_MS = 60_000L;
+    private static final long GAMMA_NAVIGATION_MAX_FUTURE_SKEW_MS = 60_000L;
     // Same clock-skew fail-closed bound for the spot-vol-regime snapshot's asOfEventTimeMs (a past
     // stream-time observation): a future-dated record must neither evade the SHORT freshness window
     // nor poison the monotonic supersede gate.
@@ -7376,7 +7377,12 @@ public class FeedGatewayService implements ReplayRunner {
             // A caught-up/backfilled record must be ordered and expired by the producer decision
             // time, never by its fresh Kafka arrival time.
             try {
-                return longField(mapper.readTree(json), "eventTimeMs", -1L);
+                long eventTimeMs = longField(mapper.readTree(json), "eventTimeMs", -1L);
+                if (eventTimeMs < 0L
+                        || eventTimeMs > System.currentTimeMillis() + GAMMA_NAVIGATION_MAX_FUTURE_SKEW_MS) {
+                    return -1L;
+                }
+                return eventTimeMs;
             } catch (JsonProcessingException | RuntimeException malformed) {
                 return -1L;
             }
