@@ -7454,6 +7454,35 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void gammaNavigationCachesPerChainRollsForwardAndEvictsWithoutEnteringTheBatch() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        Object binding = topicBinding("DATABENTO", "gamma-navigation");
+        String first = "{\"messageType\":\"GAMMA_NAVIGATION_V1\",\"symbol\":\"SPX\","
+                + "\"expiry\":\"20261003\",\"eventTimeMs\":" + (now - 1_000L) + "}";
+        assertEquals("DATABENTO|SPX|20261003", updateCache(service, binding,
+                recordAt(settings.gammaNavigationTopic(), 0, 1L, "SPX|20261003", first, now - 1_000L), first));
+        assertEquals(first, service.cachedGammaNavigation("spx", "2026-10-03"));
+
+        String newer = "{\"messageType\":\"GAMMA_NAVIGATION_V1\",\"symbol\":\"SPX\","
+                + "\"expiry\":\"20261003\",\"eventTimeMs\":" + now + "}";
+        assertEquals("DATABENTO|SPX|20261003", updateCache(service, binding,
+                recordAt(settings.gammaNavigationTopic(), 0, 2L, "SPX|20261003", newer, now), newer));
+        assertEquals(newer, service.cachedGammaNavigation("SPX", "20261003"));
+        assertNull(updateCache(service, binding,
+                recordAt(settings.gammaNavigationTopic(), 0, 3L, "SPX|20261003", first, now + 1L), first),
+                "an older producer event must never replace the current conclusion");
+        assertEquals(newer, service.cachedGammaNavigation("SPX", "20261003"));
+
+        Method remove = FeedGatewayService.class.getDeclaredMethod("removeCacheEntry", String.class);
+        remove.setAccessible(true);
+        remove.invoke(service, "gamma-navigation:DATABENTO|SPX|20261003");
+        assertNull(service.cachedGammaNavigation("SPX", "20261003"));
+        assertTrue(isExpired(service, "gamma-navigation", now - settings.cacheTtlMs() - 1L, now));
+    }
+
+    @Test
     void uiBatchEnvelopeCarriesGexMagnetsArrayKey() throws Exception {
         FeedGatewayService service = service();
         String json = "{\"messageType\":\"GEX_MAGNET\",\"symbol\":\"SPX\",\"expiry\":\"20260710\",\"magnetStrike\":6050.0}";

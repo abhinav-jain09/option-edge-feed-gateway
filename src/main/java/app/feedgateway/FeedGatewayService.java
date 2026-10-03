@@ -7372,6 +7372,15 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private long eventCacheTimestamp(String event, ConsumerRecord<?, ?> record, String json) {
+        if ("gamma-navigation".equals(event)) {
+            // A caught-up/backfilled record must be ordered and expired by the producer decision
+            // time, never by its fresh Kafka arrival time.
+            try {
+                return longField(mapper.readTree(json), "eventTimeMs", -1L);
+            } catch (JsonProcessingException | RuntimeException malformed) {
+                return -1L;
+            }
+        }
         if ("zero-dte-intelligence".equals(event)) {
             // Never use fresh Kafka arrival time for a replayed direction decision. A historical record
             // arriving now must expire from its decision time, otherwise an old unusual burst can tint
