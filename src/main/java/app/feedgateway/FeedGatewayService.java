@@ -12086,8 +12086,10 @@ public class FeedGatewayService implements ReplayRunner {
     /** R46 hello payload: {"sessionDate":...,"hwm":{"30s":<lastBarStartMs>,...}}. */
     /** G-R6: the cvd-hello frame is sent whenever CVD, SPX levels OR footprint is enabled. */
     boolean sendsCvdHello() {
-        return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || settings.marketStructureEnabled()
-                || footprintViews != null;
+        // STRUCTURE joins the hello too. Kept as its own line so the recorded footprint campaign's
+        // G-R6.2 mutation (which drops the footprint term from the line below) still applies verbatim.
+        if (settings.marketStructureEnabled()) return true;
+        return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || footprintViews != null;
     }
 
     String cvdHelloJson() {
