@@ -311,6 +311,20 @@ public final class GatewaySettings {
         return boolValue("GATEWAY_ES_CVD_SPX_LEVELS_ENABLED", false);
     }
 
+    /**
+     * Market-structure levels for the Context Tape STRUCTURE layer (`market-structure.levels` v1,
+     * JSON, one record per 1m fold from the market-structure service). OFF by default: the flag is
+     * the last rollout step, and an absent `structure` field in the hello is how the page learns
+     * this gateway has no structure stream.
+     */
+    public String marketStructureTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_TOPIC", "options.market-structure.levels");
+    }
+
+    public boolean marketStructureEnabled() {
+        return boolValue("GATEWAY_MARKET_STRUCTURE_ENABLED", false);
+    }
+
     // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1/G-R2/G-R7/G-R8/G-R8a) -----------------
 
     /** G-R1: OFF by default — the four ES-only topics do not exist on every cluster. */
