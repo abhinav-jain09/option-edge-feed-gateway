@@ -787,6 +787,15 @@ public final class ContextTapeUpstream implements AutoCloseable {
 
     /** {@code GET <base>/api/context-tape/session} — one snapshot, one request/response. */
     public SessionResponse session() {
+        return request("/api/context-tape/session", MAX_SESSION_BYTES);
+    }
+
+    /** Hash-pinned ZDCE shadow projection, kept on the same bounded transport as the tape. */
+    public SessionResponse compression() {
+        return request("/api/context-tape/compression", MAX_SESSION_BYTES);
+    }
+
+    private SessionResponse request(String path, int maxBytes) {
         // Gate BEFORE creating an exchange, and capture the client TOGETHER WITH ITS GENERATION,
         // atomically, under the lifecycle lock: the disposal built later must be tagged with the
         // generation whose client actually produced the stream, and a recycle can land anywhere
@@ -825,7 +834,7 @@ public final class ContextTapeUpstream implements AutoCloseable {
             // Request construction is INSIDE the mapped block: newBuilder/uri/header/build can all throw
             // IllegalArgumentException for a bad address or header, and an escape here is a 500 with a
             // stack trace on the browser's side.
-            HttpRequest req = HttpRequest.newBuilder(uri("/api/context-tape/session"))
+            HttpRequest req = HttpRequest.newBuilder(uri(path))
                     .timeout(requestTimeout)
                     .header("Accept", "application/json")
                     // Ask for no CONTENT coding. This is only a request, though — see
@@ -865,7 +874,7 @@ public final class ContextTapeUpstream implements AutoCloseable {
                 throw new UnavailableException(CODE_PROTOCOL,
                         "context-tape session request budget was exhausted before the body was read", null);
             }
-            byte[] body = readOnDeadline(resp.body(), MAX_SESSION_BYTES, deadlineNanos);
+            byte[] body = readOnDeadline(resp.body(), maxBytes, deadlineNanos);
             // The exchange completed end to end: this generation's pool works, so any failure run
             // against it is cleared (and it becomes eligible for poisoned-pool recycling later).
             noteTransportSuccess(bornGeneration);

@@ -161,6 +161,20 @@ class ContextTapeControllerTest {
     }
 
     @Test
+    void theCompressionProjectionUsesItsDedicatedUpstreamRoute() throws Exception {
+        String body = "{\"schemaVersion\":\"zdce.context-tape-view.1\",\"phase\":\"LIVE\"}";
+        HttpClient http = clientReturning(200, "application/json", body);
+
+        ResponseEntity<byte[]> res = controller(http, 200).compression("Bearer t");
+
+        assertEquals(200, res.getStatusCode().value());
+        assertEquals(body, bodyText(res), "the calibrated projection must not be reshaped in transit");
+        assertEquals("no-store", res.getHeaders().getFirst("Cache-Control"));
+        assertEquals("http://context-tape-service:8134/api/context-tape/compression",
+                capturedRequest(http).uri().toString());
+    }
+
+    @Test
     void theWarming503KeepsItsStatusBodyAndRetryAfter() throws Exception {
         // The whole point of the endpoint's error contract: WARMING is a meaningful state the page
         // renders ("backfill in progress"), not a failure to collapse into a generic error.

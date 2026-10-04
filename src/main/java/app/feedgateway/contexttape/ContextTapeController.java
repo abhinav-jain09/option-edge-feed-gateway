@@ -162,6 +162,17 @@ public class ContextTapeController {
     @GetMapping("/api/context-tape/session")
     public ResponseEntity<byte[]> session(
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
+        return proxy(authorization, false);
+    }
+
+    /** Same auth, rate limit, bulkhead and byte-for-byte status forwarding as the session route. */
+    @GetMapping("/api/context-tape/compression")
+    public ResponseEntity<byte[]> compression(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
+        return proxy(authorization, true);
+    }
+
+    private ResponseEntity<byte[]> proxy(String authorization, boolean compression) {
         // ---- Fail closed (mirrors /api/pin-flow): the shared LiquidityHistoryAuth serves an
         // authenticated "anonymous" principal when WS auth is globally disabled (local dev) — that
         // fallback would leave this endpoint serving session data UNauthenticated. This route must be
@@ -194,7 +205,7 @@ public class ContextTapeController {
         }
         ContextTapeUpstream.SessionResponse response;
         try {
-            response = upstream.session();
+            response = compression ? upstream.compression() : upstream.session();
         } catch (ContextTapeUpstream.UnavailableException unreachable) {
             logUnreachable(unreachable);
             // Retry-After on the gateway's own 502s too — the contract puts it on EVERY gateway
