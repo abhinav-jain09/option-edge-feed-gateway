@@ -21,7 +21,7 @@ import org.apache.kafka.common.serialization.StringDeserializer;
  */
 public final class MirroredEsCompressionStore implements EsCompressionSource, AutoCloseable {
     static final String ARTIFACT_SHA =
-            "9b59499f2db8651262992cea9107d3333eeede3af46e5920c4e6e283a9a6e3f3";
+            "805813c6aa321d379207fcd2d758bfac9c8b73b3397b539753450ca8107804fd";
     private static final int MAX_BYTES = 1 << 20;
     private static final long MAX_FUTURE_MS = 60_000L;
 
@@ -137,9 +137,8 @@ public final class MirroredEsCompressionStore implements EsCompressionSource, Au
     @Override public ContextTapeUpstream.SessionResponse esCompression() {
         Snapshot current = snapshot;
         long now = System.currentTimeMillis();
-        if (!settings.zeroDteEsChallengerMirrorEnabled() || current == null) {
-            return unavailable("MIRROR_WARMING");
-        }
+        if (!settings.zeroDteEsChallengerMirrorEnabled()) return unavailable("MIRROR_DISABLED");
+        if (current == null) return unavailable("MIRROR_WARMING");
         if (!current.ready()) return unavailable("SOURCE_WARMING");
         if (now - current.generatedAtMs() > settings.zeroDteEsChallengerMirrorMaxAgeMs()) {
             return unavailable("MIRROR_STALE");

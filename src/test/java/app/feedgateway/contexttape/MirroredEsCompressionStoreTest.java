@@ -70,6 +70,16 @@ class MirroredEsCompressionStoreTest {
         store.close();
     }
 
+    @Test void disabledMirrorIsReportedAsOffRatherThanBackfilling() {
+        MirroredEsCompressionStore store = new MirroredEsCompressionStore(
+                settings(false, 180_000L), new ObjectMapper());
+        ContextTapeUpstream.SessionResponse response = store.esCompression();
+        assertEquals(503, response.status());
+        assertEquals("{\"error\":\"WARMING\",\"state\":\"MIRROR_DISABLED\"}",
+                new String(response.body(), java.nio.charset.StandardCharsets.UTF_8));
+        store.close();
+    }
+
     private static GatewaySettings settings(boolean mirrorEnabled, long maxAgeMs) {
         GatewaySettings settings = mock(GatewaySettings.class);
         when(settings.enabled()).thenReturn(false); // direct acceptance tests do not start Kafka
