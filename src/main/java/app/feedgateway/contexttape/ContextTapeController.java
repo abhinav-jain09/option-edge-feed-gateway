@@ -101,13 +101,20 @@ public class ContextTapeController {
     static final AtomicLong REFUSED_AT_CAP = new AtomicLong();
     static final AtomicLong UPSTREAM_UNREACHABLE = new AtomicLong();
     static final AtomicLong UPSTREAM_PROTOCOL_FAULTS = new AtomicLong();
+    static final AtomicLong COMPRESSION_SERVED = new AtomicLong();
+    static final AtomicLong COMPRESSION_WARMING_FORWARDED = new AtomicLong();
+    static final AtomicLong COMPRESSION_ERRORS_FORWARDED = new AtomicLong();
+    static final AtomicLong COMPRESSION_RATE_LIMITED = new AtomicLong();
+    static final AtomicLong COMPRESSION_REFUSED_AT_CAP = new AtomicLong();
 
     private final ContextTapeUpstream upstream;
     private final LiquidityHistoryAuth auth;
     private final ObjectMapper mapper;
     private final RateLimiter rateLimiter;
+    private final RateLimiter compressionRateLimiter;
     /** Package-visible so a test can exhaust it. */
     final java.util.concurrent.Semaphore sessionSlots;
+    final java.util.concurrent.Semaphore compressionSlots;
     private final AtomicLong lastUnreachableLogMs = new AtomicLong(0L);
 
     @org.springframework.beans.factory.annotation.Autowired
@@ -129,7 +136,9 @@ public class ContextTapeController {
         this.auth = auth;
         this.mapper = mapper == null ? new ObjectMapper() : mapper;
         this.rateLimiter = new RateLimiter(rateLimitPerMinute, 60_000L, MAX_TRACKED_PRINCIPALS);
+        this.compressionRateLimiter = new RateLimiter(rateLimitPerMinute, 60_000L, MAX_TRACKED_PRINCIPALS);
         this.sessionSlots = new java.util.concurrent.Semaphore(maxConcurrentSessions);
+        this.compressionSlots = new java.util.concurrent.Semaphore(Math.max(1, maxConcurrentSessions / 4));
     }
 
     /**
@@ -144,6 +153,12 @@ public class ContextTapeController {
                 + " rateLimited=" + RATE_LIMITED.get()
                 + " refusedAtCap=" + REFUSED_AT_CAP.get()
                 + " sessionSlotsFree=" + sessionSlots.availablePermits()
+                + " compressionServed=" + COMPRESSION_SERVED.get()
+                + " compressionWarmingForwarded=" + COMPRESSION_WARMING_FORWARDED.get()
+                + " compressionErrorsForwarded=" + COMPRESSION_ERRORS_FORWARDED.get()
+                + " compressionRateLimited=" + COMPRESSION_RATE_LIMITED.get()
+                + " compressionRefusedAtCap=" + COMPRESSION_REFUSED_AT_CAP.get()
+                + " compressionSlotsFree=" + compressionSlots.availablePermits()
                 + " upstreamUnreachable=" + UPSTREAM_UNREACHABLE.get()
                 + " upstreamProtocolFaults=" + UPSTREAM_PROTOCOL_FAULTS.get()
                 + " abandonedDisposals=" + ContextTapeUpstream.DISPOSALS_ABANDONED.get()
@@ -162,6 +177,17 @@ public class ContextTapeController {
     @GetMapping("/api/context-tape/session")
     public ResponseEntity<byte[]> session(
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
+        return proxy(authorization, false);
+    }
+
+    /** Same auth, rate limit, bulkhead and byte-for-byte status forwarding as the session route. */
+    @GetMapping("/api/context-tape/compression")
+    public ResponseEntity<byte[]> compression(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
+        return proxy(authorization, true);
+    }
+
+    private ResponseEntity<byte[]> proxy(String authorization, boolean compression) {
         // ---- Fail closed (mirrors /api/pin-flow): the shared LiquidityHistoryAuth serves an
         // authenticated "anonymous" principal when WS auth is globally disabled (local dev) — that
         // fallback would leave this endpoint serving session data UNauthenticated. This route must be
@@ -174,9 +200,10 @@ public class ContextTapeController {
         if (authResult.status() != 200) {
             return ResponseEntity.status(authResult.status()).build();
         }
-        long retryAfterSeconds = rateLimiter.tryAcquire(authResult.principal(), System.currentTimeMillis());
+        RateLimiter selectedLimiter = compression ? compressionRateLimiter : rateLimiter;
+        long retryAfterSeconds = selectedLimiter.tryAcquire(authResult.principal(), System.currentTimeMillis());
         if (retryAfterSeconds > 0) {
-            RATE_LIMITED.incrementAndGet();
+            if (compression) COMPRESSION_RATE_LIMITED.incrementAndGet(); else RATE_LIMITED.incrementAndGet();
             // Self-describing, not a bare status: the page reads the error token, and Retry-After
             // says when to come back.
             return json(HttpStatus.TOO_MANY_REQUESTS, error("RATE_LIMITED",
@@ -186,22 +213,23 @@ public class ContextTapeController {
         // Refuse BEFORE calling upstream: an in-flight session call holds a Tomcat worker for up to
         // the whole request budget, and those workers are shared with every other endpoint here.
         // Answering the overflow immediately is strictly better than queueing it on a saturating pool.
-        if (!sessionSlots.tryAcquire()) {
-            REFUSED_AT_CAP.incrementAndGet();
+        java.util.concurrent.Semaphore selectedSlots = compression ? compressionSlots : sessionSlots;
+        if (!selectedSlots.tryAcquire()) {
+            if (compression) COMPRESSION_REFUSED_AT_CAP.incrementAndGet(); else REFUSED_AT_CAP.incrementAndGet();
             return json(HttpStatus.SERVICE_UNAVAILABLE, error("GATEWAY_BUSY",
                     "this gateway is already carrying its maximum number of in-flight session calls"),
                     "1");
         }
         ContextTapeUpstream.SessionResponse response;
         try {
-            response = upstream.session();
+            response = compression ? upstream.compression() : upstream.session();
         } catch (ContextTapeUpstream.UnavailableException unreachable) {
             logUnreachable(unreachable);
             // Retry-After on the gateway's own 502s too — the contract puts it on EVERY gateway
             // addition, and "the service was unreachable just now" is exactly a retry-in-a-moment.
             return json(HttpStatus.BAD_GATEWAY, unreachableError(unreachable), "5");
         } finally {
-            sessionSlots.release();
+            selectedSlots.release();
         }
         ResponseEntity.BodyBuilder out = ResponseEntity.status(response.status())
                 .contentType(mediaType(response.contentType(), MediaType.APPLICATION_JSON))
@@ -217,11 +245,13 @@ public class ContextTapeController {
         // only the contracted {"error":"WARMING"} body is warming — a 503 carrying anything else is
         // a failure the UI renders as one, and the operator counter must not disagree with the UI.
         if (response.status() == 200) {
-            SESSIONS_SERVED.incrementAndGet();
+            if (compression) COMPRESSION_SERVED.incrementAndGet(); else SESSIONS_SERVED.incrementAndGet();
         } else if (response.status() == 503 && isWarmingBody(response.body())) {
-            WARMING_FORWARDED.incrementAndGet();
+            if (compression) COMPRESSION_WARMING_FORWARDED.incrementAndGet();
+            else WARMING_FORWARDED.incrementAndGet();
         } else {
-            UPSTREAM_ERRORS_FORWARDED.incrementAndGet();
+            if (compression) COMPRESSION_ERRORS_FORWARDED.incrementAndGet();
+            else UPSTREAM_ERRORS_FORWARDED.incrementAndGet();
         }
         return out.body(response.body() == null ? new byte[0] : response.body());
     }

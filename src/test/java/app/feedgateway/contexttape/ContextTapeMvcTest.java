@@ -120,6 +120,24 @@ class ContextTapeMvcTest {
     }
 
     @Test
+    void anAuthenticatedCompressionRequestIsDispatchedAndCarriedThroughUnchanged() throws Exception {
+        String body = "{\"schemaVersion\":\"zdce.context-tape-view.1\",\"phase\":\"LIVE\"}";
+        mvc(clientReturning(200, "application/json", body), 200)
+                .perform(get("/api/context-tape/compression").header("Authorization", "Bearer t"))
+                .andExpect(status().isOk())
+                .andExpect(content().string(body))
+                .andExpect(header().string("Cache-Control", "no-store"));
+    }
+
+    @Test
+    void anUnauthenticatedCompressionRequestIsRefusedBeforeTheUpstreamIsTouched() throws Exception {
+        HttpClient http = mock(HttpClient.class);
+        mvc(http, 401).perform(get("/api/context-tape/compression"))
+                .andExpect(status().isUnauthorized());
+        verifyNoInteractions(http);
+    }
+
+    @Test
     void theWarming503IsDeliveredToTheBrowserAsA503WithItsOwnBody() throws Exception {
         // The single most important status on this path: it is the only thing that tells the page the
         // backfill is still running rather than the service being broken.
