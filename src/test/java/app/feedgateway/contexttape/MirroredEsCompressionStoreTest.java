@@ -82,7 +82,7 @@ class MirroredEsCompressionStoreTest {
 
     private static String envelope(long generatedAtMs, String sha, boolean ready) {
         return "{\"schemaVersion\":\"zdce.es-challenger-view.1\","
-                + "\"service\":\"zero-dte-es-challenger\","
+                + "\"service\":\"zero-dte-es-challenger-service\","
                 + "\"modelVersion\":\"zdce-es-challenger-v1\","
                 + "\"authority\":\"SHADOW_NOT_FOR_TRADING\",\"source\":\"ES_ANALYSIS\","
                 + "\"capability\":\"PRICE_VOLUME_ONLY\",\"artifactSha256\":\"" + sha + "\","

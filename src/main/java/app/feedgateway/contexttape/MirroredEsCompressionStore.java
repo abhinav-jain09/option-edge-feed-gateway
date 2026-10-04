@@ -21,7 +21,7 @@ import org.apache.kafka.common.serialization.StringDeserializer;
  */
 public final class MirroredEsCompressionStore implements EsCompressionSource, AutoCloseable {
     static final String ARTIFACT_SHA =
-            "ede3998e7ef41804bfc627d61e211d62491f2fca7ecd6582a4d2ff8953bc8ba5";
+            "9b59499f2db8651262992cea9107d3333eeede3af46e5920c4e6e283a9a6e3f3";
     private static final int MAX_BYTES = 1 << 20;
     private static final long MAX_FUTURE_MS = 60_000L;
 
@@ -110,7 +110,7 @@ public final class MirroredEsCompressionStore implements EsCompressionSource, Au
             long generatedAtMs = node.path("generatedAtMs").asLong(0L);
             boolean valid = node.isObject()
                     && "zdce.es-challenger-view.1".equals(node.path("schemaVersion").asText())
-                    && "zero-dte-es-challenger".equals(node.path("service").asText())
+                    && "zero-dte-es-challenger-service".equals(node.path("service").asText())
                     && "zdce-es-challenger-v1".equals(node.path("modelVersion").asText())
                     && "SHADOW_NOT_FOR_TRADING".equals(node.path("authority").asText())
                     && "ES_ANALYSIS".equals(node.path("source").asText())
