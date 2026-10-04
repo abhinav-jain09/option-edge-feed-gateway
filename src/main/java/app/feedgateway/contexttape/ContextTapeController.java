@@ -82,6 +82,10 @@ public class ContextTapeController {
 
     /** Never log an unreachable-upstream failure more than this often: an outage is per-request. */
     private static final long UNREACHABLE_LOG_INTERVAL_MS = 30_000L;
+    private static final EsCompressionSource DISABLED_ES_SOURCE = () ->
+            new ContextTapeUpstream.SessionResponse(503, "application/json", "5",
+                    "{\"error\":\"WARMING\",\"state\":\"MIRROR_DISABLED\"}"
+                            .getBytes(StandardCharsets.UTF_8));
 
     /**
      * Counters, each incremented ONCE at the transition that authorises it, exposed on the same
@@ -106,39 +110,63 @@ public class ContextTapeController {
     static final AtomicLong COMPRESSION_ERRORS_FORWARDED = new AtomicLong();
     static final AtomicLong COMPRESSION_RATE_LIMITED = new AtomicLong();
     static final AtomicLong COMPRESSION_REFUSED_AT_CAP = new AtomicLong();
+    static final AtomicLong ES_COMPRESSION_SERVED = new AtomicLong();
+    static final AtomicLong ES_COMPRESSION_WARMING_FORWARDED = new AtomicLong();
+    static final AtomicLong ES_COMPRESSION_ERRORS_FORWARDED = new AtomicLong();
+    static final AtomicLong ES_COMPRESSION_RATE_LIMITED = new AtomicLong();
+    static final AtomicLong ES_COMPRESSION_REFUSED_AT_CAP = new AtomicLong();
 
     private final ContextTapeUpstream upstream;
+    private final EsCompressionSource esSource;
     private final LiquidityHistoryAuth auth;
     private final ObjectMapper mapper;
     private final RateLimiter rateLimiter;
     private final RateLimiter compressionRateLimiter;
+    private final RateLimiter esCompressionRateLimiter;
     /** Package-visible so a test can exhaust it. */
     final java.util.concurrent.Semaphore sessionSlots;
     final java.util.concurrent.Semaphore compressionSlots;
+    final java.util.concurrent.Semaphore esCompressionSlots;
     private final AtomicLong lastUnreachableLogMs = new AtomicLong(0L);
 
     @org.springframework.beans.factory.annotation.Autowired
-    public ContextTapeController(ContextTapeUpstream upstream, LiquidityHistoryAuth auth,
+    public ContextTapeController(
+                                 @org.springframework.beans.factory.annotation.Qualifier("contextTapeUpstream")
+                                 ContextTapeUpstream upstream,
+                                 @org.springframework.beans.factory.annotation.Qualifier("esCompressionSource")
+                                 EsCompressionSource esSource,
+                                 LiquidityHistoryAuth auth,
                                  ObjectMapper mapper) {
-        this(upstream, auth, mapper, RATE_LIMIT_PER_MIN, MAX_CONCURRENT_SESSIONS);
+        this(upstream, esSource, auth, mapper, RATE_LIMIT_PER_MIN, MAX_CONCURRENT_SESSIONS);
     }
 
     /** Test seam: an explicit budget, so the 429 path can be exercised without 60 warm-up calls. */
     ContextTapeController(ContextTapeUpstream upstream, LiquidityHistoryAuth auth, ObjectMapper mapper,
                           int rateLimitPerMinute) {
-        this(upstream, auth, mapper, rateLimitPerMinute, MAX_CONCURRENT_SESSIONS);
+        this(upstream, DISABLED_ES_SOURCE, auth, mapper,
+                rateLimitPerMinute, MAX_CONCURRENT_SESSIONS);
     }
 
     /** Test seam: explicit budget AND concurrency cap, so the bulkhead can be saturated cheaply. */
     ContextTapeController(ContextTapeUpstream upstream, LiquidityHistoryAuth auth, ObjectMapper mapper,
                           int rateLimitPerMinute, int maxConcurrentSessions) {
+        this(upstream, DISABLED_ES_SOURCE, auth, mapper,
+                rateLimitPerMinute, maxConcurrentSessions);
+    }
+
+    ContextTapeController(ContextTapeUpstream upstream, EsCompressionSource esSource,
+                          LiquidityHistoryAuth auth, ObjectMapper mapper,
+                          int rateLimitPerMinute, int maxConcurrentSessions) {
         this.upstream = upstream;
+        this.esSource = esSource;
         this.auth = auth;
         this.mapper = mapper == null ? new ObjectMapper() : mapper;
         this.rateLimiter = new RateLimiter(rateLimitPerMinute, 60_000L, MAX_TRACKED_PRINCIPALS);
         this.compressionRateLimiter = new RateLimiter(rateLimitPerMinute, 60_000L, MAX_TRACKED_PRINCIPALS);
+        this.esCompressionRateLimiter = new RateLimiter(rateLimitPerMinute, 60_000L, MAX_TRACKED_PRINCIPALS);
         this.sessionSlots = new java.util.concurrent.Semaphore(maxConcurrentSessions);
         this.compressionSlots = new java.util.concurrent.Semaphore(Math.max(1, maxConcurrentSessions / 4));
+        this.esCompressionSlots = new java.util.concurrent.Semaphore(Math.max(1, maxConcurrentSessions / 4));
     }
 
     /**
@@ -159,6 +187,14 @@ public class ContextTapeController {
                 + " compressionRateLimited=" + COMPRESSION_RATE_LIMITED.get()
                 + " compressionRefusedAtCap=" + COMPRESSION_REFUSED_AT_CAP.get()
                 + " compressionSlotsFree=" + compressionSlots.availablePermits()
+                + " esCompressionServed=" + ES_COMPRESSION_SERVED.get()
+                + " esCompressionWarmingForwarded=" + ES_COMPRESSION_WARMING_FORWARDED.get()
+                + " esCompressionErrorsForwarded=" + ES_COMPRESSION_ERRORS_FORWARDED.get()
+                + " esCompressionRateLimited=" + ES_COMPRESSION_RATE_LIMITED.get()
+                + " esCompressionRefusedAtCap=" + ES_COMPRESSION_REFUSED_AT_CAP.get()
+                + " esCompressionSlotsFree=" + esCompressionSlots.availablePermits()
+                + " esCompressionMirrorAccepted=" + esSource.acceptedCount()
+                + " esCompressionMirrorRejected=" + esSource.rejectedCount()
                 + " upstreamUnreachable=" + UPSTREAM_UNREACHABLE.get()
                 + " upstreamProtocolFaults=" + UPSTREAM_PROTOCOL_FAULTS.get()
                 + " abandonedDisposals=" + ContextTapeUpstream.DISPOSALS_ABANDONED.get()
@@ -177,17 +213,26 @@ public class ContextTapeController {
     @GetMapping("/api/context-tape/session")
     public ResponseEntity<byte[]> session(
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
-        return proxy(authorization, false);
+        return proxy(authorization, Route.SESSION);
     }
 
     /** Same auth, rate limit, bulkhead and byte-for-byte status forwarding as the session route. */
     @GetMapping("/api/context-tape/compression")
     public ResponseEntity<byte[]> compression(
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
-        return proxy(authorization, true);
+        return proxy(authorization, Route.SPX_COMPRESSION);
     }
 
-    private ResponseEntity<byte[]> proxy(String authorization, boolean compression) {
+    /** Isolated ES-primary challenger. Its payload is forwarded without baseline fallback or reshaping. */
+    @GetMapping("/api/context-tape/es-compression")
+    public ResponseEntity<byte[]> esCompression(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
+        return proxy(authorization, Route.ES_COMPRESSION);
+    }
+
+    private enum Route { SESSION, SPX_COMPRESSION, ES_COMPRESSION }
+
+    private ResponseEntity<byte[]> proxy(String authorization, Route route) {
         // ---- Fail closed (mirrors /api/pin-flow): the shared LiquidityHistoryAuth serves an
         // authenticated "anonymous" principal when WS auth is globally disabled (local dev) — that
         // fallback would leave this endpoint serving session data UNauthenticated. This route must be
@@ -200,10 +245,18 @@ public class ContextTapeController {
         if (authResult.status() != 200) {
             return ResponseEntity.status(authResult.status()).build();
         }
-        RateLimiter selectedLimiter = compression ? compressionRateLimiter : rateLimiter;
+        RateLimiter selectedLimiter = switch (route) {
+            case SESSION -> rateLimiter;
+            case SPX_COMPRESSION -> compressionRateLimiter;
+            case ES_COMPRESSION -> esCompressionRateLimiter;
+        };
         long retryAfterSeconds = selectedLimiter.tryAcquire(authResult.principal(), System.currentTimeMillis());
         if (retryAfterSeconds > 0) {
-            if (compression) COMPRESSION_RATE_LIMITED.incrementAndGet(); else RATE_LIMITED.incrementAndGet();
+            switch (route) {
+                case SESSION -> RATE_LIMITED.incrementAndGet();
+                case SPX_COMPRESSION -> COMPRESSION_RATE_LIMITED.incrementAndGet();
+                case ES_COMPRESSION -> ES_COMPRESSION_RATE_LIMITED.incrementAndGet();
+            }
             // Self-describing, not a bare status: the page reads the error token, and Retry-After
             // says when to come back.
             return json(HttpStatus.TOO_MANY_REQUESTS, error("RATE_LIMITED",
@@ -213,16 +266,28 @@ public class ContextTapeController {
         // Refuse BEFORE calling upstream: an in-flight session call holds a Tomcat worker for up to
         // the whole request budget, and those workers are shared with every other endpoint here.
         // Answering the overflow immediately is strictly better than queueing it on a saturating pool.
-        java.util.concurrent.Semaphore selectedSlots = compression ? compressionSlots : sessionSlots;
+        java.util.concurrent.Semaphore selectedSlots = switch (route) {
+            case SESSION -> sessionSlots;
+            case SPX_COMPRESSION -> compressionSlots;
+            case ES_COMPRESSION -> esCompressionSlots;
+        };
         if (!selectedSlots.tryAcquire()) {
-            if (compression) COMPRESSION_REFUSED_AT_CAP.incrementAndGet(); else REFUSED_AT_CAP.incrementAndGet();
+            switch (route) {
+                case SESSION -> REFUSED_AT_CAP.incrementAndGet();
+                case SPX_COMPRESSION -> COMPRESSION_REFUSED_AT_CAP.incrementAndGet();
+                case ES_COMPRESSION -> ES_COMPRESSION_REFUSED_AT_CAP.incrementAndGet();
+            }
             return json(HttpStatus.SERVICE_UNAVAILABLE, error("GATEWAY_BUSY",
                     "this gateway is already carrying its maximum number of in-flight session calls"),
                     "1");
         }
         ContextTapeUpstream.SessionResponse response;
         try {
-            response = compression ? upstream.compression() : upstream.session();
+            response = switch (route) {
+                case SESSION -> upstream.session();
+                case SPX_COMPRESSION -> upstream.compression();
+                case ES_COMPRESSION -> esSource.esCompression();
+            };
         } catch (ContextTapeUpstream.UnavailableException unreachable) {
             logUnreachable(unreachable);
             // Retry-After on the gateway's own 502s too — the contract puts it on EVERY gateway
@@ -245,13 +310,19 @@ public class ContextTapeController {
         // only the contracted {"error":"WARMING"} body is warming — a 503 carrying anything else is
         // a failure the UI renders as one, and the operator counter must not disagree with the UI.
         if (response.status() == 200) {
-            if (compression) COMPRESSION_SERVED.incrementAndGet(); else SESSIONS_SERVED.incrementAndGet();
+            switch (route) {
+                case SESSION -> SESSIONS_SERVED.incrementAndGet();
+                case SPX_COMPRESSION -> COMPRESSION_SERVED.incrementAndGet();
+                case ES_COMPRESSION -> ES_COMPRESSION_SERVED.incrementAndGet();
+            }
         } else if (response.status() == 503 && isWarmingBody(response.body())) {
-            if (compression) COMPRESSION_WARMING_FORWARDED.incrementAndGet();
-            else WARMING_FORWARDED.incrementAndGet();
+            if (route == Route.SPX_COMPRESSION) COMPRESSION_WARMING_FORWARDED.incrementAndGet();
+            else if (route == Route.SESSION) WARMING_FORWARDED.incrementAndGet();
+            else ES_COMPRESSION_WARMING_FORWARDED.incrementAndGet();
         } else {
-            if (compression) COMPRESSION_ERRORS_FORWARDED.incrementAndGet();
-            else UPSTREAM_ERRORS_FORWARDED.incrementAndGet();
+            if (route == Route.SPX_COMPRESSION) COMPRESSION_ERRORS_FORWARDED.incrementAndGet();
+            else if (route == Route.SESSION) UPSTREAM_ERRORS_FORWARDED.incrementAndGet();
+            else ES_COMPRESSION_ERRORS_FORWARDED.incrementAndGet();
         }
         return out.body(response.body() == null ? new byte[0] : response.body());
     }

@@ -1934,6 +1934,20 @@ public final class GatewaySettings {
                              value("CONTEXT_TAPE_BASE_URL", "http://context-tape-service:8134"));
     }
 
+    /** Mirrored ES-machine projection is opt-in; classification never runs in this gateway. */
+    public boolean zeroDteEsChallengerMirrorEnabled() {
+        return boolValue("ZERO_DTE_ES_CHALLENGER_MIRROR_ENABLED", false);
+    }
+
+    public String zeroDteEsChallengerMirrorTopic() {
+        return value("ZERO_DTE_ES_CHALLENGER_MIRROR_TOPIC",
+                "es.context-tape.es-compression.current");
+    }
+
+    public long zeroDteEsChallengerMirrorMaxAgeMs() {
+        return longValue("ZERO_DTE_ES_CHALLENGER_MIRROR_MAX_AGE_MS", 180_000L, 60_000L);
+    }
+
     /** TCP connect budget for the session call; exceeded → 502 with a JSON error, never a stack trace. */
     public long contextTapeConnectTimeoutMs() {
         return longValue("CONTEXT_TAPE_CONNECT_TIMEOUT_MS", 2_000L, 200L);

@@ -105,8 +105,12 @@ class ContextTapeControllerTest {
     }
 
     private ContextTapeUpstream upstream(HttpClient http) {
+        return upstream("http://context-tape-service:8134/", http);
+    }
+
+    private ContextTapeUpstream upstream(String baseUrl, HttpClient http) {
         ContextTapeUpstream created =
-                new ContextTapeUpstream("http://context-tape-service:8134/", Duration.ofSeconds(5), http);
+                new ContextTapeUpstream(baseUrl, Duration.ofSeconds(5), http);
         upstreams.add(created);
         return created;
     }
@@ -172,6 +176,87 @@ class ContextTapeControllerTest {
         assertEquals("no-store", res.getHeaders().getFirst("Cache-Control"));
         assertEquals("http://context-tape-service:8134/api/context-tape/compression",
                 capturedRequest(http).uri().toString());
+    }
+
+    @Test
+    void theEsChallengerUsesOnlyTheMirroredProjectionSource() throws Exception {
+        String body = "{\"schemaVersion\":\"zdce.es-challenger-view.1\",\"source\":\"ES_ANALYSIS\"}";
+        HttpClient baselineHttp = mock(HttpClient.class);
+        EsCompressionSource mirror = () -> new ContextTapeUpstream.SessionResponse(
+                200, "application/json", null, body.getBytes(StandardCharsets.UTF_8));
+        ContextTapeController controller = new ContextTapeController(
+                upstream(baselineHttp),
+                mirror,
+                authReturning(200), new ObjectMapper(), Integer.MAX_VALUE, 16);
+
+        ResponseEntity<byte[]> res = controller.esCompression("Bearer t");
+
+        assertEquals(200, res.getStatusCode().value());
+        assertEquals(body, bodyText(res));
+        assertEquals("no-store", res.getHeaders().getFirst("Cache-Control"));
+        verifyNoInteractions(baselineHttp);
+    }
+
+    @Test
+    void esMirrorWarmingIsCountedSeparatelyFromErrors() throws Exception {
+        long warmingBefore = ContextTapeController.ES_COMPRESSION_WARMING_FORWARDED.get();
+        long errorsBefore = ContextTapeController.ES_COMPRESSION_ERRORS_FORWARDED.get();
+        HttpClient baselineHttp = mock(HttpClient.class);
+        EsCompressionSource mirror = () -> new ContextTapeUpstream.SessionResponse(
+                503, "application/json", "5",
+                "{\"error\":\"WARMING\",\"state\":\"NO_ACCEPTED_RECORD\"}"
+                        .getBytes(StandardCharsets.UTF_8));
+        ContextTapeController controller = new ContextTapeController(
+                upstream(baselineHttp), mirror,
+                authReturning(200), new ObjectMapper(), Integer.MAX_VALUE, 16);
+
+        ResponseEntity<byte[]> res = controller.esCompression("Bearer t");
+
+        assertEquals(503, res.getStatusCode().value());
+        assertEquals("5", res.getHeaders().getFirst("Retry-After"));
+        assertEquals(warmingBefore + 1,
+                ContextTapeController.ES_COMPRESSION_WARMING_FORWARDED.get());
+        assertEquals(errorsBefore, ContextTapeController.ES_COMPRESSION_ERRORS_FORWARDED.get());
+        verifyNoInteractions(baselineHttp);
+    }
+
+    @Test
+    void operatorCountersExposeMirrorAcceptanceAndRejection() {
+        HttpClient baselineHttp = mock(HttpClient.class);
+        EsCompressionSource mirror = new EsCompressionSource() {
+            @Override public ContextTapeUpstream.SessionResponse esCompression() {
+                return new ContextTapeUpstream.SessionResponse(
+                        503, "application/json", "5",
+                        "{\"error\":\"WARMING\"}".getBytes(StandardCharsets.UTF_8));
+            }
+            @Override public long acceptedCount() { return 17L; }
+            @Override public long rejectedCount() { return 3L; }
+        };
+        ContextTapeController controller = new ContextTapeController(
+                upstream(baselineHttp), mirror,
+                authReturning(200), new ObjectMapper(), Integer.MAX_VALUE, 16);
+
+        String counters = controller.counters();
+
+        assertTrue(counters.contains("esCompressionMirrorAccepted=17"));
+        assertTrue(counters.contains("esCompressionMirrorRejected=3"));
+    }
+
+    @Test
+    void esAndSpxCompressionHaveIndependentRateBudgets() throws Exception {
+        HttpClient baselineHttp = clientReturning(200, "application/json", SESSION_JSON);
+        EsCompressionSource mirror = () -> new ContextTapeUpstream.SessionResponse(
+                200, "application/json", null, SESSION_JSON.getBytes(StandardCharsets.UTF_8));
+        ContextTapeController controller = new ContextTapeController(
+                upstream(baselineHttp),
+                mirror,
+                authReturning(200), new ObjectMapper(), 1, 16);
+
+        assertEquals(200, controller.compression("Bearer t").getStatusCode().value());
+        assertEquals(200, controller.esCompression("Bearer t").getStatusCode().value());
+        assertEquals(429, controller.compression("Bearer t").getStatusCode().value());
+        assertEquals(429, controller.esCompression("Bearer t").getStatusCode().value());
+        verify(baselineHttp).send(any(HttpRequest.class), any());
     }
 
     @Test
