@@ -27,4 +27,11 @@ public class ContextTapeConfig {
                 Duration.ofMillis(settings.contextTapeConnectTimeoutMs()),
                 Duration.ofMillis(settings.contextTapeRequestTimeoutMs()));
     }
+
+    /** Read-only relay of the ES-machine current topic mirrored into this environment. */
+    @Bean(name = "esCompressionSource", destroyMethod = "close")
+    public MirroredEsCompressionStore esCompressionSource(
+            GatewaySettings settings, com.fasterxml.jackson.databind.ObjectMapper mapper) {
+        return new MirroredEsCompressionStore(settings, mapper);
+    }
 }

@@ -70,11 +70,19 @@ class ContextTapeMvcTest {
     }
 
     private MockMvc mvc(HttpClient http, LiquidityHistoryAuth auth) {
+        return mvc(http, () -> new ContextTapeUpstream.SessionResponse(
+                503, "application/json", "5",
+                "{\"error\":\"WARMING\",\"state\":\"MIRROR_DISABLED\"}"
+                        .getBytes(StandardCharsets.UTF_8)), auth);
+    }
+
+    private MockMvc mvc(HttpClient http, EsCompressionSource esSource,
+                        LiquidityHistoryAuth auth) {
         ContextTapeUpstream upstream =
                 new ContextTapeUpstream("http://context-tape-service:8134", Duration.ofSeconds(5), http);
         upstreams.add(upstream);
         ContextTapeController controller = new ContextTapeController(
-                upstream, auth, new ObjectMapper(), Integer.MAX_VALUE);
+                upstream, esSource, auth, new ObjectMapper(), Integer.MAX_VALUE, 16);
         return MockMvcBuilders.standaloneSetup(controller).build();
     }
 
@@ -127,6 +135,20 @@ class ContextTapeMvcTest {
                 .andExpect(status().isOk())
                 .andExpect(content().string(body))
                 .andExpect(header().string("Cache-Control", "no-store"));
+    }
+
+    @Test
+    void anAuthenticatedEsCompressionRequestIsDispatchedAndCarriedThroughUnchanged() throws Exception {
+        String body = "{\"schemaVersion\":\"zdce.es-challenger-view.1\",\"source\":\"ES_ANALYSIS\"}";
+        HttpClient baselineHttp = mock(HttpClient.class);
+        EsCompressionSource mirror = () -> new ContextTapeUpstream.SessionResponse(
+                200, "application/json", null, body.getBytes(StandardCharsets.UTF_8));
+        mvc(baselineHttp, mirror, authReturning(200))
+                .perform(get("/api/context-tape/es-compression").header("Authorization", "Bearer t"))
+                .andExpect(status().isOk())
+                .andExpect(content().string(body))
+                .andExpect(header().string("Cache-Control", "no-store"));
+        verifyNoInteractions(baselineHttp);
     }
 
     @Test
