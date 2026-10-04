@@ -175,6 +175,19 @@ class ContextTapeControllerTest {
     }
 
     @Test
+    void compressionHasAnIndependentRateBudgetFromTheSessionSnapshot() throws Exception {
+        HttpClient http = clientReturning(200, "application/json", SESSION_JSON);
+        ContextTapeController controller = controller(http, 200, 1);
+
+        assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+        assertEquals(200, controller.compression("Bearer t").getStatusCode().value(),
+                "compression polling must not consume the session route's budget");
+        assertEquals(429, controller.session("Bearer t").getStatusCode().value());
+        assertEquals(429, controller.compression("Bearer t").getStatusCode().value());
+        verify(http, times(2)).send(any(HttpRequest.class), any());
+    }
+
+    @Test
     void theWarming503KeepsItsStatusBodyAndRetryAfter() throws Exception {
         // The whole point of the endpoint's error contract: WARMING is a meaningful state the page
         // renders ("backfill in progress"), not a failure to collapse into a generic error.
