@@ -175,6 +175,40 @@ class ContextTapeControllerTest {
     }
 
     @Test
+    void theEsBoxViewUsesItsDedicatedUpstreamRoute() throws Exception {
+        String body = "{\"schemaVersion\":\"escx.context-tape-view.1\",\"state\":\"LIVE\",\"ready\":true}";
+        HttpClient http = clientReturning(200, "application/json", body);
+
+        ResponseEntity<byte[]> res = controller(http, 200).esBox("Bearer t");
+
+        assertEquals(200, res.getStatusCode().value());
+        assertEquals(body, bodyText(res), "the view must not be reshaped in transit");
+        assertEquals("no-store", res.getHeaders().getFirst("Cache-Control"));
+        assertEquals("http://context-tape-service:8134/api/context-tape/es-box",
+                capturedRequest(http).uri().toString());
+    }
+
+    @Test
+    void esBoxHasAnIndependentRateBudgetAndForwardsTheUpstreamWarmingEnvelope() throws Exception {
+        HttpClient http = clientReturning(200, "application/json", SESSION_JSON);
+        ContextTapeController controller = controller(http, 200, 1);
+
+        assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+        assertEquals(200, controller.compression("Bearer t").getStatusCode().value());
+        assertEquals(200, controller.esBox("Bearer t").getStatusCode().value(),
+                "es-box polling must not consume the session or compression budgets");
+        assertEquals(429, controller.esBox("Bearer t").getStatusCode().value());
+        verify(http, times(3)).send(any(HttpRequest.class), any());
+
+        HttpClient warming = clientReturning(503, "application/json", "{\"error\":\"WARMING\",\"state\":\"STARTING\"}");
+        long before = ContextTapeController.ES_BOX_WARMING_FORWARDED.get();
+        ResponseEntity<byte[]> res = controller(warming, 200).esBox("Bearer t");
+        assertEquals(503, res.getStatusCode().value());
+        assertEquals("{\"error\":\"WARMING\",\"state\":\"STARTING\"}", bodyText(res));
+        assertEquals(before + 1, ContextTapeController.ES_BOX_WARMING_FORWARDED.get());
+    }
+
+    @Test
     void compressionHasAnIndependentRateBudgetFromTheSessionSnapshot() throws Exception {
         HttpClient http = clientReturning(200, "application/json", SESSION_JSON);
         ContextTapeController controller = controller(http, 200, 1);

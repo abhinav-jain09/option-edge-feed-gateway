@@ -795,6 +795,11 @@ public final class ContextTapeUpstream implements AutoCloseable {
         return request("/api/context-tape/compression", MAX_SESSION_BYTES);
     }
 
+    /** {@code GET <base>/api/context-tape/es-box} — the ES BOX view, same transport and byte ceiling as the session. */
+    public SessionResponse esBox() {
+        return request("/api/context-tape/es-box", MAX_SESSION_BYTES);
+    }
+
     private SessionResponse request(String path, int maxBytes) {
         // Gate BEFORE creating an exchange, and capture the client TOGETHER WITH ITS GENERATION,
         // atomically, under the lifecycle lock: the disposal built later must be tagged with the
