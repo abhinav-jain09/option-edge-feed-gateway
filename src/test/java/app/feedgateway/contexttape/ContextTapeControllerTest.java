@@ -120,6 +120,45 @@ class ContextTapeControllerTest {
                 rateLimitPerMinute);
     }
 
+    /** A controller whose ES BOX route rides its OWN upstream (as the Spring wiring builds it). */
+    private ContextTapeController controller(HttpClient sessionHttp, HttpClient esBoxHttp, int maxConcurrentSessions) {
+        return new ContextTapeController(upstream(sessionHttp), upstream(esBoxHttp), authReturning(200), new ObjectMapper(),
+                Integer.MAX_VALUE, maxConcurrentSessions);
+    }
+
+    /**
+     * A response body whose FIRST read blocks until the gate opens — the headers arrived, the body never does.
+     * This is what parks an upstream READER thread (readOnDeadline submits the drain to the reader pool), which
+     * is the round-1 failure mode; blocking in send() would park only the caller. close() releases the read.
+     */
+    static final class BlockedBody extends java.io.InputStream {
+        static final java.util.concurrent.atomic.AtomicInteger READS_PARKED = new java.util.concurrent.atomic.AtomicInteger();
+        private final java.util.concurrent.CountDownLatch gate;
+        private final java.util.concurrent.CountDownLatch closed = new java.util.concurrent.CountDownLatch(1);
+        BlockedBody(java.util.concurrent.CountDownLatch gate) { this.gate = gate; }
+        @Override public int read() throws java.io.IOException {
+            READS_PARKED.incrementAndGet();
+            try {
+                while (gate.getCount() > 0 && closed.getCount() > 0) {
+                    if (gate.await(5, java.util.concurrent.TimeUnit.MILLISECONDS)) break;
+                }
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new java.io.IOException("interrupted"); }
+            return -1;
+        }
+        @Override public void close() { closed.countDown(); }
+    }
+
+    /** An HttpClient whose responses carry a {@link BlockedBody}: headers now, body never (until the gate opens). */
+    private static HttpClient clientWithBlockedBodies(java.util.concurrent.CountDownLatch gate, int status) throws Exception {
+        HttpClient http = mock(HttpClient.class);
+        HttpResponse resp = mock(HttpResponse.class);
+        when(resp.statusCode()).thenReturn(status);
+        when(resp.headers()).thenReturn(contentType("application/json"));
+        when(resp.body()).thenAnswer(inv -> new BlockedBody(gate));
+        when(http.send(any(HttpRequest.class), any())).thenReturn(resp);
+        return http;
+    }
+
     private static String bodyText(ResponseEntity<byte[]> res) {
         return new String(res.getBody(), StandardCharsets.UTF_8);
     }
@@ -172,6 +211,89 @@ class ContextTapeControllerTest {
         assertEquals("no-store", res.getHeaders().getFirst("Cache-Control"));
         assertEquals("http://context-tape-service:8134/api/context-tape/compression",
                 capturedRequest(http).uri().toString());
+    }
+
+    @Test
+    void theEsBoxViewUsesItsDedicatedUpstreamRoute() throws Exception {
+        String body = "{\"schemaVersion\":\"escx.context-tape-view.1\",\"state\":\"LIVE\",\"ready\":true}";
+        HttpClient http = clientReturning(200, "application/json", body);
+
+        ResponseEntity<byte[]> res = controller(http, 200).esBox("Bearer t");
+
+        assertEquals(200, res.getStatusCode().value());
+        assertEquals(body, bodyText(res), "the view must not be reshaped in transit");
+        assertEquals("no-store", res.getHeaders().getFirst("Cache-Control"));
+        assertEquals("http://context-tape-service:8134/api/context-tape/es-box",
+                capturedRequest(http).uri().toString());
+    }
+
+    /**
+     * Round-1 failing input, reproduced: READER_THREADS session calls whose bodies never arrive park EVERY reader of
+     * the session upstream (proof: a 17th session call is REFUSED, 502, by that pool), and the ES BOX call still
+     * returns 200 through its own upstream without touching the session transport.
+     */
+    @Test
+    void esBoxRidesItsOwnUpstreamAndSurvivesASessionTransportWhoseEveryReaderIsBlocked() throws Exception {
+        java.util.concurrent.CountDownLatch gate = new java.util.concurrent.CountDownLatch(1);
+        BlockedBody.READS_PARKED.set(0);
+        HttpClient blockedSession = clientWithBlockedBodies(gate, 200);
+        HttpClient esBoxHttp = clientReturning(200, "application/json", "{\"schemaVersion\":\"escx.context-tape-view.1\"}");
+        ContextTapeController controller = controller(blockedSession, esBoxHttp, 64);
+        java.util.List<Thread> inFlight = new java.util.ArrayList<>();
+        for (int i = 0; i < ContextTapeUpstream.READER_THREADS; i++) {
+            Thread t = new Thread(() -> controller.session("Bearer t"));
+            t.setDaemon(true);
+            t.start();
+            inFlight.add(t);
+        }
+        // every reader thread of the session upstream is now parked inside a body read
+        for (int i = 0; i < 500 && BlockedBody.READS_PARKED.get() < ContextTapeUpstream.READER_THREADS; i++) {
+            Thread.sleep(10);
+        }
+        assertEquals(ContextTapeUpstream.READER_THREADS, BlockedBody.READS_PARKED.get(), "all session readers must be parked in body reads");
+        try {
+            ResponseEntity<byte[]> refused = controller.session("Bearer t");
+            assertEquals(502, refused.getStatusCode().value(), "the session upstream's reader pool IS saturated: the next session call is refused");
+            ResponseEntity<byte[]> res = controller.esBox("Bearer t");
+            assertEquals(200, res.getStatusCode().value(), "the ES BOX route must not be starved by the session route's blocked readers");
+            assertEquals("http://context-tape-service:8134/api/context-tape/es-box", capturedRequest(esBoxHttp).uri().toString());
+            verify(blockedSession, times(ContextTapeUpstream.READER_THREADS + 1)).send(any(HttpRequest.class), any());   // ES BOX never touched it
+        } finally {
+            gate.countDown();
+            for (Thread t : inFlight) t.join(15_000);
+        }
+    }
+
+    @Test
+    void esBoxWarmingForwardsRetryAfterByteForByte() throws Exception {
+        java.net.http.HttpHeaders headers = java.net.http.HttpHeaders.of(
+                java.util.Map.of("Content-Type", java.util.List.of("application/json"), "Retry-After", java.util.List.of("5")), (a, b) -> true);
+        HttpClient warming = clientReturning(503, headers, "{\"error\":\"WARMING\",\"state\":\"STARTING\"}".getBytes(StandardCharsets.UTF_8));
+        ResponseEntity<byte[]> res = controller(warming, 200).esBox("Bearer t");
+        assertEquals(503, res.getStatusCode().value());
+        assertEquals("5", res.getHeaders().getFirst("Retry-After"));
+        assertEquals("no-store", res.getHeaders().getFirst("Cache-Control"));
+        assertEquals("{\"error\":\"WARMING\",\"state\":\"STARTING\"}", bodyText(res));
+    }
+
+    @Test
+    void esBoxHasAnIndependentRateBudgetAndForwardsTheUpstreamWarmingEnvelope() throws Exception {
+        HttpClient http = clientReturning(200, "application/json", SESSION_JSON);
+        ContextTapeController controller = controller(http, 200, 1);
+
+        assertEquals(200, controller.session("Bearer t").getStatusCode().value());
+        assertEquals(200, controller.compression("Bearer t").getStatusCode().value());
+        assertEquals(200, controller.esBox("Bearer t").getStatusCode().value(),
+                "es-box polling must not consume the session or compression budgets");
+        assertEquals(429, controller.esBox("Bearer t").getStatusCode().value());
+        verify(http, times(3)).send(any(HttpRequest.class), any());
+
+        HttpClient warming = clientReturning(503, "application/json", "{\"error\":\"WARMING\",\"state\":\"STARTING\"}");
+        long before = ContextTapeController.ES_BOX_WARMING_FORWARDED.get();
+        ResponseEntity<byte[]> res = controller(warming, 200).esBox("Bearer t");
+        assertEquals(503, res.getStatusCode().value());
+        assertEquals("{\"error\":\"WARMING\",\"state\":\"STARTING\"}", bodyText(res));
+        assertEquals(before + 1, ContextTapeController.ES_BOX_WARMING_FORWARDED.get());
     }
 
     @Test

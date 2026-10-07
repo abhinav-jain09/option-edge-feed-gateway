@@ -74,7 +74,7 @@ class ContextTapeMvcTest {
                 new ContextTapeUpstream("http://context-tape-service:8134", Duration.ofSeconds(5), http);
         upstreams.add(upstream);
         ContextTapeController controller = new ContextTapeController(
-                upstream, auth, new ObjectMapper(), Integer.MAX_VALUE);
+                upstream, auth, new ObjectMapper(), Integer.MAX_VALUE);   // the test seam rides one upstream for both routes
         return MockMvcBuilders.standaloneSetup(controller).build();
     }
 
@@ -136,6 +136,23 @@ class ContextTapeMvcTest {
                 .andExpect(status().isUnauthorized());
         verifyNoInteractions(http);
     }
+    @Test
+    void anAuthenticatedEsBoxViewRequestIsDispatchedAndCarriedThroughUnchanged() throws Exception {
+        String body = "{\"schemaVersion\":\"escx.context-tape-view.1\",\"phase\":\"LIVE\"}";
+        mvc(clientReturning(200, "application/json", body), 200)
+                .perform(get("/api/context-tape/es-box").header("Authorization", "Bearer t"))
+                .andExpect(status().isOk())
+                .andExpect(content().string(body))
+                .andExpect(header().string("Cache-Control", "no-store"));
+    }
+    @Test
+    void anUnauthenticatedEsBoxViewRequestIsRefusedBeforeTheUpstreamIsTouched() throws Exception {
+        HttpClient http = mock(HttpClient.class);
+        mvc(http, 401).perform(get("/api/context-tape/es-box"))
+                .andExpect(status().isUnauthorized());
+        verifyNoInteractions(http);
+    }
+
 
     @Test
     void theWarming503IsDeliveredToTheBrowserAsA503WithItsOwnBody() throws Exception {
