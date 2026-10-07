@@ -22,7 +22,20 @@ public class ContextTapeConfig {
      * outlive the application.
      */
     @Bean(destroyMethod = "close")
+    @org.springframework.context.annotation.Primary        // the session/compression transport; the ES BOX one is injected by qualifier
     public ContextTapeUpstream contextTapeUpstream(GatewaySettings settings) {
+        return new ContextTapeUpstream(settings.contextTapeBaseUrl(),
+                Duration.ofMillis(settings.contextTapeConnectTimeoutMs()),
+                Duration.ofMillis(settings.contextTapeRequestTimeoutMs()));
+    }
+
+    /**
+     * The ES BOX view gets its OWN upstream (own HTTP client, reader and closer pools) so the route is
+     * isolated end to end: a session call whose body blocks holds a reader of the session upstream, never
+     * one the ES BOX route needs, and four blocking ES BOX reads cannot take reader capacity from the session.
+     */
+    @Bean(name = "esBoxUpstream", destroyMethod = "close")
+    public ContextTapeUpstream esBoxUpstream(GatewaySettings settings) {
         return new ContextTapeUpstream(settings.contextTapeBaseUrl(),
                 Duration.ofMillis(settings.contextTapeConnectTimeoutMs()),
                 Duration.ofMillis(settings.contextTapeRequestTimeoutMs()));

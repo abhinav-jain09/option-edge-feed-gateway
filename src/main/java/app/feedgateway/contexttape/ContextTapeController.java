@@ -116,6 +116,7 @@ public class ContextTapeController {
     enum Route { SESSION, COMPRESSION, ES_BOX }
 
     private final ContextTapeUpstream upstream;
+    private final ContextTapeUpstream esBoxUpstream;      // the ES BOX route's own transport (reader pool, client): isolation end to end
     private final LiquidityHistoryAuth auth;
     private final ObjectMapper mapper;
     private final RateLimiter rateLimiter;
@@ -128,21 +129,29 @@ public class ContextTapeController {
     private final AtomicLong lastUnreachableLogMs = new AtomicLong(0L);
 
     @org.springframework.beans.factory.annotation.Autowired
-    public ContextTapeController(ContextTapeUpstream upstream, LiquidityHistoryAuth auth,
-                                 ObjectMapper mapper) {
-        this(upstream, auth, mapper, RATE_LIMIT_PER_MIN, MAX_CONCURRENT_SESSIONS);
+    public ContextTapeController(@org.springframework.beans.factory.annotation.Qualifier("contextTapeUpstream") ContextTapeUpstream upstream,
+                                 @org.springframework.beans.factory.annotation.Qualifier("esBoxUpstream") ContextTapeUpstream esBoxUpstream,
+                                 LiquidityHistoryAuth auth, ObjectMapper mapper) {
+        this(upstream, esBoxUpstream, auth, mapper, RATE_LIMIT_PER_MIN, MAX_CONCURRENT_SESSIONS);
     }
 
     /** Test seam: an explicit budget, so the 429 path can be exercised without 60 warm-up calls. */
     ContextTapeController(ContextTapeUpstream upstream, LiquidityHistoryAuth auth, ObjectMapper mapper,
                           int rateLimitPerMinute) {
-        this(upstream, auth, mapper, rateLimitPerMinute, MAX_CONCURRENT_SESSIONS);
+        this(upstream, upstream, auth, mapper, rateLimitPerMinute, MAX_CONCURRENT_SESSIONS);
     }
 
     /** Test seam: explicit budget AND concurrency cap, so the bulkhead can be saturated cheaply. */
     ContextTapeController(ContextTapeUpstream upstream, LiquidityHistoryAuth auth, ObjectMapper mapper,
                           int rateLimitPerMinute, int maxConcurrentSessions) {
+        this(upstream, upstream, auth, mapper, rateLimitPerMinute, maxConcurrentSessions);
+    }
+
+    /** Test seam: a distinct ES BOX upstream, so route isolation can be exercised against a blocked session transport. */
+    ContextTapeController(ContextTapeUpstream upstream, ContextTapeUpstream esBoxUpstream, LiquidityHistoryAuth auth,
+                          ObjectMapper mapper, int rateLimitPerMinute, int maxConcurrentSessions) {
         this.upstream = upstream;
+        this.esBoxUpstream = esBoxUpstream;
         this.auth = auth;
         this.mapper = mapper == null ? new ObjectMapper() : mapper;
         this.rateLimiter = new RateLimiter(rateLimitPerMinute, 60_000L, MAX_TRACKED_PRINCIPALS);
@@ -250,7 +259,7 @@ public class ContextTapeController {
         }
         ContextTapeUpstream.SessionResponse response;
         try {
-            response = route == Route.COMPRESSION ? upstream.compression() : route == Route.ES_BOX ? upstream.esBox() : upstream.session();
+            response = route == Route.COMPRESSION ? upstream.compression() : route == Route.ES_BOX ? esBoxUpstream.esBox() : upstream.session();
         } catch (ContextTapeUpstream.UnavailableException unreachable) {
             logUnreachable(unreachable);
             // Retry-After on the gateway's own 502s too — the contract puts it on EVERY gateway

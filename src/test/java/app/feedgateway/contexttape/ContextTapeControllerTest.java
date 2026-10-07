@@ -120,6 +120,23 @@ class ContextTapeControllerTest {
                 rateLimitPerMinute);
     }
 
+    /** A controller whose ES BOX route rides its OWN upstream (as the Spring wiring builds it). */
+    private ContextTapeController controller(HttpClient sessionHttp, HttpClient esBoxHttp, int maxConcurrentSessions) {
+        return new ContextTapeController(upstream(sessionHttp), upstream(esBoxHttp), authReturning(200), new ObjectMapper(),
+                Integer.MAX_VALUE, maxConcurrentSessions);
+    }
+
+    /** An HttpClient whose every send BLOCKS until the latch opens — a body that never arrives. */
+    private static HttpClient clientBlocking(java.util.concurrent.CountDownLatch gate, int status, String body) throws Exception {
+        HttpClient http = mock(HttpClient.class);
+        HttpResponse resp = mock(HttpResponse.class);
+        when(resp.statusCode()).thenReturn(status);
+        when(resp.headers()).thenReturn(contentType("application/json"));
+        when(resp.body()).thenAnswer(inv -> new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
+        when(http.send(any(HttpRequest.class), any())).thenAnswer(inv -> { gate.await(); return resp; });
+        return http;
+    }
+
     private static String bodyText(ResponseEntity<byte[]> res) {
         return new String(res.getBody(), StandardCharsets.UTF_8);
     }
@@ -186,6 +203,49 @@ class ContextTapeControllerTest {
         assertEquals("no-store", res.getHeaders().getFirst("Cache-Control"));
         assertEquals("http://context-tape-service:8134/api/context-tape/es-box",
                 capturedRequest(http).uri().toString());
+    }
+
+    @Test
+    void esBoxRidesItsOwnUpstreamAndSurvivesASessionTransportWhoseEveryReaderIsBlocked() throws Exception {
+        java.util.concurrent.CountDownLatch gate = new java.util.concurrent.CountDownLatch(1);
+        HttpClient blockedSession = clientBlocking(gate, 200, SESSION_JSON);
+        HttpClient esBoxHttp = clientReturning(200, "application/json", "{\"schemaVersion\":\"escx.context-tape-view.1\"}");
+        ContextTapeController controller = controller(blockedSession, esBoxHttp, 64);
+        // saturate EVERY reader thread of the session upstream with bodies that never arrive
+        java.util.List<Thread> inFlight = new java.util.ArrayList<>();
+        java.util.concurrent.atomic.AtomicInteger sessionResults = new java.util.concurrent.atomic.AtomicInteger();
+        for (int i = 0; i < ContextTapeUpstream.READER_THREADS; i++) {
+            Thread t = new Thread(() -> { controller.session("Bearer t"); sessionResults.incrementAndGet(); });
+            t.setDaemon(true);
+            t.start();
+            inFlight.add(t);
+        }
+        // wait until all sixteen are inside the upstream (each holds a reader on the blocked client)
+        for (int i = 0; i < 200 && org.mockito.Mockito.mockingDetails(blockedSession).getInvocations().size() < ContextTapeUpstream.READER_THREADS; i++) {
+            Thread.sleep(10);
+        }
+        verify(blockedSession, times(ContextTapeUpstream.READER_THREADS)).send(any(HttpRequest.class), any());
+        try {
+            ResponseEntity<byte[]> res = controller.esBox("Bearer t");
+            assertEquals(200, res.getStatusCode().value(), "the ES BOX route must not be starved by the session route's blocked readers");
+            assertEquals("http://context-tape-service:8134/api/context-tape/es-box", capturedRequest(esBoxHttp).uri().toString());
+            verify(blockedSession, times(ContextTapeUpstream.READER_THREADS)).send(any(HttpRequest.class), any());   // nothing of ES BOX touched it
+        } finally {
+            gate.countDown();
+            for (Thread t : inFlight) t.join(10_000);
+        }
+    }
+
+    @Test
+    void esBoxWarmingForwardsRetryAfterByteForByte() throws Exception {
+        java.net.http.HttpHeaders headers = java.net.http.HttpHeaders.of(
+                java.util.Map.of("Content-Type", java.util.List.of("application/json"), "Retry-After", java.util.List.of("5")), (a, b) -> true);
+        HttpClient warming = clientReturning(503, headers, "{\"error\":\"WARMING\",\"state\":\"STARTING\"}".getBytes(StandardCharsets.UTF_8));
+        ResponseEntity<byte[]> res = controller(warming, 200).esBox("Bearer t");
+        assertEquals(503, res.getStatusCode().value());
+        assertEquals("5", res.getHeaders().getFirst("Retry-After"));
+        assertEquals("no-store", res.getHeaders().getFirst("Cache-Control"));
+        assertEquals("{\"error\":\"WARMING\",\"state\":\"STARTING\"}", bodyText(res));
     }
 
     @Test

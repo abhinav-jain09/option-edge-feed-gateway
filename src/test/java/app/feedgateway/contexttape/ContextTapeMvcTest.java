@@ -74,7 +74,7 @@ class ContextTapeMvcTest {
                 new ContextTapeUpstream("http://context-tape-service:8134", Duration.ofSeconds(5), http);
         upstreams.add(upstream);
         ContextTapeController controller = new ContextTapeController(
-                upstream, auth, new ObjectMapper(), Integer.MAX_VALUE);
+                upstream, auth, new ObjectMapper(), Integer.MAX_VALUE);   // the test seam rides one upstream for both routes
         return MockMvcBuilders.standaloneSetup(controller).build();
     }
 
