@@ -126,14 +126,36 @@ class ContextTapeControllerTest {
                 Integer.MAX_VALUE, maxConcurrentSessions);
     }
 
-    /** An HttpClient whose every send BLOCKS until the latch opens — a body that never arrives. */
-    private static HttpClient clientBlocking(java.util.concurrent.CountDownLatch gate, int status, String body) throws Exception {
+    /**
+     * A response body whose FIRST read blocks until the gate opens — the headers arrived, the body never does.
+     * This is what parks an upstream READER thread (readOnDeadline submits the drain to the reader pool), which
+     * is the round-1 failure mode; blocking in send() would park only the caller. close() releases the read.
+     */
+    static final class BlockedBody extends java.io.InputStream {
+        static final java.util.concurrent.atomic.AtomicInteger READS_PARKED = new java.util.concurrent.atomic.AtomicInteger();
+        private final java.util.concurrent.CountDownLatch gate;
+        private final java.util.concurrent.CountDownLatch closed = new java.util.concurrent.CountDownLatch(1);
+        BlockedBody(java.util.concurrent.CountDownLatch gate) { this.gate = gate; }
+        @Override public int read() throws java.io.IOException {
+            READS_PARKED.incrementAndGet();
+            try {
+                while (gate.getCount() > 0 && closed.getCount() > 0) {
+                    if (gate.await(5, java.util.concurrent.TimeUnit.MILLISECONDS)) break;
+                }
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new java.io.IOException("interrupted"); }
+            return -1;
+        }
+        @Override public void close() { closed.countDown(); }
+    }
+
+    /** An HttpClient whose responses carry a {@link BlockedBody}: headers now, body never (until the gate opens). */
+    private static HttpClient clientWithBlockedBodies(java.util.concurrent.CountDownLatch gate, int status) throws Exception {
         HttpClient http = mock(HttpClient.class);
         HttpResponse resp = mock(HttpResponse.class);
         when(resp.statusCode()).thenReturn(status);
         when(resp.headers()).thenReturn(contentType("application/json"));
-        when(resp.body()).thenAnswer(inv -> new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
-        when(http.send(any(HttpRequest.class), any())).thenAnswer(inv -> { gate.await(); return resp; });
+        when(resp.body()).thenAnswer(inv -> new BlockedBody(gate));
+        when(http.send(any(HttpRequest.class), any())).thenReturn(resp);
         return http;
     }
 
@@ -205,34 +227,40 @@ class ContextTapeControllerTest {
                 capturedRequest(http).uri().toString());
     }
 
+    /**
+     * Round-1 failing input, reproduced: READER_THREADS session calls whose bodies never arrive park EVERY reader of
+     * the session upstream (proof: a 17th session call is REFUSED, 502, by that pool), and the ES BOX call still
+     * returns 200 through its own upstream without touching the session transport.
+     */
     @Test
     void esBoxRidesItsOwnUpstreamAndSurvivesASessionTransportWhoseEveryReaderIsBlocked() throws Exception {
         java.util.concurrent.CountDownLatch gate = new java.util.concurrent.CountDownLatch(1);
-        HttpClient blockedSession = clientBlocking(gate, 200, SESSION_JSON);
+        BlockedBody.READS_PARKED.set(0);
+        HttpClient blockedSession = clientWithBlockedBodies(gate, 200);
         HttpClient esBoxHttp = clientReturning(200, "application/json", "{\"schemaVersion\":\"escx.context-tape-view.1\"}");
         ContextTapeController controller = controller(blockedSession, esBoxHttp, 64);
-        // saturate EVERY reader thread of the session upstream with bodies that never arrive
         java.util.List<Thread> inFlight = new java.util.ArrayList<>();
-        java.util.concurrent.atomic.AtomicInteger sessionResults = new java.util.concurrent.atomic.AtomicInteger();
         for (int i = 0; i < ContextTapeUpstream.READER_THREADS; i++) {
-            Thread t = new Thread(() -> { controller.session("Bearer t"); sessionResults.incrementAndGet(); });
+            Thread t = new Thread(() -> controller.session("Bearer t"));
             t.setDaemon(true);
             t.start();
             inFlight.add(t);
         }
-        // wait until all sixteen are inside the upstream (each holds a reader on the blocked client)
-        for (int i = 0; i < 200 && org.mockito.Mockito.mockingDetails(blockedSession).getInvocations().size() < ContextTapeUpstream.READER_THREADS; i++) {
+        // every reader thread of the session upstream is now parked inside a body read
+        for (int i = 0; i < 500 && BlockedBody.READS_PARKED.get() < ContextTapeUpstream.READER_THREADS; i++) {
             Thread.sleep(10);
         }
-        verify(blockedSession, times(ContextTapeUpstream.READER_THREADS)).send(any(HttpRequest.class), any());
+        assertEquals(ContextTapeUpstream.READER_THREADS, BlockedBody.READS_PARKED.get(), "all session readers must be parked in body reads");
         try {
+            ResponseEntity<byte[]> refused = controller.session("Bearer t");
+            assertEquals(502, refused.getStatusCode().value(), "the session upstream's reader pool IS saturated: the next session call is refused");
             ResponseEntity<byte[]> res = controller.esBox("Bearer t");
             assertEquals(200, res.getStatusCode().value(), "the ES BOX route must not be starved by the session route's blocked readers");
             assertEquals("http://context-tape-service:8134/api/context-tape/es-box", capturedRequest(esBoxHttp).uri().toString());
-            verify(blockedSession, times(ContextTapeUpstream.READER_THREADS)).send(any(HttpRequest.class), any());   // nothing of ES BOX touched it
+            verify(blockedSession, times(ContextTapeUpstream.READER_THREADS + 1)).send(any(HttpRequest.class), any());   // ES BOX never touched it
         } finally {
             gate.countDown();
-            for (Thread t : inFlight) t.join(10_000);
+            for (Thread t : inFlight) t.join(15_000);
         }
     }
 
