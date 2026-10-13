@@ -14,6 +14,8 @@ import org.junit.jupiter.api.Test;
  * Early-auction verdict ledger relay (EARLY-AUCTION-VERDICT-STAGE1-GATE1.md): opt-in, state CACHE
  * consumer only, no WebSocket event — a keyed, append-ordered session view behind the polled
  * {@code GET /api/early-auction/events} endpoint, retained for the current plus previous trade date.
+ * Identity is rebuilt from the VALIDATED payload (EAV-R0d), never taken from the Kafka key (CODE
+ * round 1), so a malformed or foreign key can neither mint a duplicate row nor collapse two records.
  */
 class EarlyAuctionVerdictWiringTest {
 
@@ -27,10 +29,6 @@ class EarlyAuctionVerdictWiringTest {
                 + "\"sessionId\":\"dev|" + tradeDate + "|r0\",\"tradeDate\":\"" + tradeDate + "\""
                 + (discriminator == null ? "" : ",\"discriminator\":\"" + discriminator + "\"")
                 + ",\"seq\":" + seq + "}";
-    }
-
-    private static String key(String kind, String tradeDate, String discriminator) {
-        return "abcd1234|dev|" + tradeDate + "|r0|" + kind + (discriminator == null ? "" : "|" + discriminator);
     }
 
     private static String source() throws Exception {
@@ -53,47 +51,78 @@ class EarlyAuctionVerdictWiringTest {
         assertEquals("2026-10-14", s.validateEarlyAuctionVerdict(ok));
         assertEquals("2026-10-14", s.validateEarlyAuctionVerdict(rec("SESSION_CLOSE", "2026-10-14", null, 2)),
                 "a terminal has no discriminator and is still a contracted record");
+        assertEquals("2026-10-14", s.validateEarlyAuctionVerdict(rec("SOME_FUTURE_KIND_V2", "2026-10-14", "d", 3)),
+                "schema evolution is additive: a kind this gateway has never heard of is still a ledger record");
         assertNull(s.validateEarlyAuctionVerdict(null));
         assertNull(s.validateEarlyAuctionVerdict("not json"));
         assertNull(s.validateEarlyAuctionVerdict("[1,2]"));
         assertNull(s.validateEarlyAuctionVerdict(ok + "null"), "\"{…}null\" parses leniently but is NOT one object");
         assertNull(s.validateEarlyAuctionVerdict(ok + " {}"));
         assertNull(s.validateEarlyAuctionVerdict(ok.replace("\"kind\":\"PREDICTION\",", "")), "kind is the spine");
+        assertNull(s.validateEarlyAuctionVerdict(ok.replace("\"kind\":\"PREDICTION\"", "\"kind\":\"prediction!\"")),
+                "a kind is SHAPED (A-Z, digits, underscores), never free text");
+        assertNull(s.validateEarlyAuctionVerdict(ok.replace("\"kind\":\"PREDICTION\"", "\"kind\":7")),
+                "a numeric kind is a foreign record, not a lenient spelling");
         assertNull(s.validateEarlyAuctionVerdict(ok.replace("\"sessionId\":\"dev|2026-10-14|r0\",", "")));
+        assertNull(s.validateEarlyAuctionVerdict(
+                ok.replace("\"sessionId\":\"dev|2026-10-14|r0\"", "\"sessionId\":42")),
+                "a numeric sessionId is refused (CODE round 1)");
         assertNull(s.validateEarlyAuctionVerdict(ok.replace("\"literalsHash\":\"abcd1234\",", "")));
+        assertNull(s.validateEarlyAuctionVerdict(
+                ok.replace("\"literalsHash\":\"abcd1234\"", "\"literalsHash\":1234")),
+                "a numeric literalsHash is refused (CODE round 1)");
+        assertNull(s.validateEarlyAuctionVerdict(
+                ok.replace("\"sessionId\":\"dev|2026-10-14|r0\"", "\"sessionId\":\"" + "x".repeat(300) + "\"")),
+                "an identity component is retained memory, so it is bounded");
         assertNull(s.validateEarlyAuctionVerdict(ok.replace("\"tradeDate\":\"2026-10-14\"", "\"tradeDate\":\"20261014\"")),
                 "tradeDate must be YYYY-MM-DD");
+        assertNull(s.validateEarlyAuctionVerdict(ok.replace("\"tradeDate\":\"2026-10-14\"", "\"tradeDate\":\"2026-99-99\"")),
+                "2026-99-99 is date-SHAPED, not a date (CODE round 1)");
         String oversize = ok.replace(",\"seq\":1",
                 ",\"pad\":\"" + "x".repeat(FeedGatewayService.EARLY_AUCTION_VERDICT_MAX_BYTES) + "\",\"seq\":1");
         assertNull(s.validateEarlyAuctionVerdict(oversize));
     }
 
     @Test
-    void viewDedupesByLedgerKeyAndKeepsAppendOrder() {
+    void identityIsThePayloadsOwnLedgerKeyAndKeepsAppendOrder() {
         var s = service();
-        s.onEarlyAuctionVerdictRecord(key("PREDICTION", "2026-10-14", "p1"), rec("PREDICTION", "2026-10-14", "p1", 1), 10);
-        s.onEarlyAuctionVerdictRecord(key("OUTCOME", "2026-10-14", "p1"), rec("OUTCOME", "2026-10-14", "p1", 2), 11);
-        // crash-recovery re-emission: same ledger key at a later offset is a semantic no-op
-        s.onEarlyAuctionVerdictRecord(key("PREDICTION", "2026-10-14", "p1"), rec("PREDICTION", "2026-10-14", "p1", 1), 12);
+        s.onEarlyAuctionVerdictRecord(rec("PREDICTION", "2026-10-14", "p1", 1), 10);
+        s.onEarlyAuctionVerdictRecord(rec("OUTCOME", "2026-10-14", "p1", 2), 11);
+        // crash-recovery re-emission: the same payload identity at a later offset is a semantic no-op
+        s.onEarlyAuctionVerdictRecord(rec("PREDICTION", "2026-10-14", "p1", 1), 12);
         var page = s.earlyAuctionVerdictPage(null, -1, 100);
         assertEquals("2026-10-14", page.tradeDate());
         assertEquals(2, page.events().size(), "the redelivered record is dropped, not duplicated");
         assertEquals(10, page.events().get(0).offset());
         assertEquals(11, page.events().get(1).offset(), "append (offset) order is the page order");
-        // a record produced WITHOUT a Kafka key still folds by its payload-rebuilt ledger key
-        s.onEarlyAuctionVerdictRecord(null, rec("OUTCOME", "2026-10-14", "p1", 2), 13);
-        assertEquals(2, s.earlyAuctionVerdictPage(null, -1, 100).events().size());
+        // TWO terminals for one session fold onto one row — one terminal per session IS the contract
+        s.onEarlyAuctionVerdictRecord(rec("SESSION_CLOSE", "2026-10-14", null, 3), 13);
+        s.onEarlyAuctionVerdictRecord(rec("SESSION_CLOSE", "2026-10-14", null, 3), 14);
+        assertEquals(3, s.earlyAuctionVerdictsCached());
         // a record the boundary refuses is counted, never stored
-        s.onEarlyAuctionVerdictRecord("k", "not json", 14);
+        s.onEarlyAuctionVerdictRecord("not json", 15);
         assertEquals(1, s.earlyAuctionVerdictDropsForTest());
-        assertEquals(2, s.earlyAuctionVerdictsCached());
+        assertEquals(3, s.earlyAuctionVerdictsCached());
+    }
+
+    @Test
+    void distinctRecordsWithoutADiscriminatorNeverCollapse() {
+        // Outside the contract (a NON-terminal record missing its discriminator), the view must
+        // choose visibility over dedupe: two distinct MISS records must both survive (CODE round 1),
+        // keyed by their own offsets — while a redelivery of the SAME offset still folds.
+        var s = service();
+        s.onEarlyAuctionVerdictRecord(rec("MISS", "2026-10-14", null, 1), 20);
+        s.onEarlyAuctionVerdictRecord(rec("MISS", "2026-10-14", null, 2), 21);
+        assertEquals(2, s.earlyAuctionVerdictsCached(), "distinct keyless records are never hidden behind each other");
+        s.onEarlyAuctionVerdictRecord(rec("MISS", "2026-10-14", null, 1), 20);
+        assertEquals(2, s.earlyAuctionVerdictsCached(), "the same offset redelivered still folds");
     }
 
     @Test
     void pageCursorsByOffsetAndHonoursTheLimit() {
         var s = service();
         for (int i = 0; i < 5; i++) {
-            s.onEarlyAuctionVerdictRecord(key("MISS", "2026-10-14", "m" + i), rec("MISS", "2026-10-14", "m" + i, i), i);
+            s.onEarlyAuctionVerdictRecord(rec("MISS", "2026-10-14", "m" + i, i), i);
         }
         var first = s.earlyAuctionVerdictPage(null, -1, 2);
         assertEquals(2, first.events().size());
@@ -109,16 +138,16 @@ class EarlyAuctionVerdictWiringTest {
     @Test
     void retentionHoldsTheTwoGreatestTradeDates() {
         var s = service();
-        s.onEarlyAuctionVerdictRecord(key("SESSION_CLOSE", "2026-10-10", null), rec("SESSION_CLOSE", "2026-10-10", null, 1), 1);
-        s.onEarlyAuctionVerdictRecord(key("SESSION_CLOSE", "2026-10-13", null), rec("SESSION_CLOSE", "2026-10-13", null, 2), 2);
-        s.onEarlyAuctionVerdictRecord(key("PREDICTION", "2026-10-14", "p1"), rec("PREDICTION", "2026-10-14", "p1", 3), 3);
+        s.onEarlyAuctionVerdictRecord(rec("SESSION_CLOSE", "2026-10-10", null, 1), 1);
+        s.onEarlyAuctionVerdictRecord(rec("SESSION_CLOSE", "2026-10-13", null, 2), 2);
+        s.onEarlyAuctionVerdictRecord(rec("PREDICTION", "2026-10-14", "p1", 3), 3);
         assertEquals("2026-10-14", s.earlyAuctionVerdictTradeDateForTest());
         assertTrue(s.earlyAuctionVerdictPage("2026-10-10", -1, 100).events().isEmpty(),
                 "a third-greatest date is evicted when a newer one rolls in");
         assertEquals(1, s.earlyAuctionVerdictPage("2026-10-13", -1, 100).events().size(),
                 "the previous date stays inspectable");
         // a dead session's replay (older than the retained previous date) is dropped, never resurrected
-        s.onEarlyAuctionVerdictRecord(key("MISS", "2026-10-09", "m1"), rec("MISS", "2026-10-09", "m1", 4), 4);
+        s.onEarlyAuctionVerdictRecord(rec("MISS", "2026-10-09", "m1", 4), 4);
         assertTrue(s.earlyAuctionVerdictPage("2026-10-09", -1, 100).events().isEmpty());
         assertEquals(1, s.earlyAuctionVerdictDropsForTest());
     }
@@ -127,14 +156,14 @@ class EarlyAuctionVerdictWiringTest {
     void capRefusesWithinADateButARollForwardAlwaysAdmits() {
         var s = service();
         for (int i = 0; i < FeedGatewayService.EARLY_AUCTION_VERDICT_MAX_RECORDS; i++) {
-            s.onEarlyAuctionVerdictRecord(key("MISS", "2026-10-14", "m" + i), rec("MISS", "2026-10-14", "m" + i, i), i);
+            s.onEarlyAuctionVerdictRecord(rec("MISS", "2026-10-14", "m" + i, i), i);
         }
         assertEquals(FeedGatewayService.EARLY_AUCTION_VERDICT_MAX_RECORDS, s.earlyAuctionVerdictsCached());
-        s.onEarlyAuctionVerdictRecord(key("MISS", "2026-10-14", "overflow"), rec("MISS", "2026-10-14", "overflow", -1), 99_999);
+        s.onEarlyAuctionVerdictRecord(rec("MISS", "2026-10-14", "overflow", -1), 99_999);
         assertEquals(1, s.earlyAuctionVerdictRefusedAtCapForTest(), "within one date the HEAD is the evidence: the tail is refused");
         assertEquals(FeedGatewayService.EARLY_AUCTION_VERDICT_MAX_RECORDS, s.earlyAuctionVerdictsCached());
         // a NEW trade date must never be frozen out by a view pinned full with yesterday
-        s.onEarlyAuctionVerdictRecord(key("PREDICTION", "2026-10-15", "p1"), rec("PREDICTION", "2026-10-15", "p1", 0), 100_000);
+        s.onEarlyAuctionVerdictRecord(rec("PREDICTION", "2026-10-15", "p1", 0), 100_000);
         assertEquals("2026-10-15", s.earlyAuctionVerdictTradeDateForTest());
         assertEquals(1, s.earlyAuctionVerdictsCached());
     }
@@ -173,7 +202,8 @@ class EarlyAuctionVerdictWiringTest {
         int branch = src.indexOf("if (binding != null && \"early-auction-verdict\".equals(binding.event())) {");
         assertTrue(branch > 0);
         String body = src.substring(branch, src.indexOf("continue;", branch));
-        assertTrue(body.contains("onEarlyAuctionVerdictRecord("), "the keyed upsert is the branch's whole work");
+        assertTrue(body.contains("onEarlyAuctionVerdictRecord(json, record.offset())"),
+                "the keyed upsert is the branch's whole work, and the Kafka key is never its identity");
         assertFalse(body.contains("broadcast("), "poll-only view: nothing reaches the sockets");
         assertTrue(branch < src.indexOf("updateCache(binding, record, json);", branch),
                 "the branch precedes the generic cache path");
@@ -185,7 +215,7 @@ class EarlyAuctionVerdictWiringTest {
     @Test
     void controllerShapesOneWellFormedEnvelope() throws Exception {
         var s = service();
-        s.onEarlyAuctionVerdictRecord(key("PREDICTION", "2026-10-14", "p1"), rec("PREDICTION", "2026-10-14", "p1", 1), 7);
+        s.onEarlyAuctionVerdictRecord(rec("PREDICTION", "2026-10-14", "p1", 1), 7);
         GatewayController controller = new GatewayController(s,
                 (app.feedgateway.liquidityhistory.LiquidityHistoryStore) null,
                 (java.util.function.Function<String, app.feedgateway.liquidityhistory.LiquidityHistoryAuth.Result>) null);

@@ -3252,10 +3252,10 @@ public class FeedGatewayService implements ReplayRunner {
                         // session's evidence ledger, not a latest value) and never a broadcast (the
                         // /early-auction panel polls GET /api/early-auction/events). This cache
                         // consumer is the event's one feed: hydration and live consumption are the
-                        // same code path, so there is no second emitter to deduplicate against.
-                        onEarlyAuctionVerdictRecord(
-                                record.key() == null ? null : String.valueOf(record.key()),
-                                json, record.offset());
+                        // same code path, so there is no second emitter to deduplicate against. The
+                        // Kafka key is deliberately NOT passed: identity is rebuilt from the
+                        // validated payload (see onEarlyAuctionVerdictRecord).
+                        onEarlyAuctionVerdictRecord(json, record.offset());
                         continue;
                     }
                     updateCache(binding, record, json);
@@ -11478,15 +11478,21 @@ public class FeedGatewayService implements ReplayRunner {
      * The state cache consumer's one entry point for a polled ledger record: boundary-validate,
      * dedupe by ledger key, retain under the two-trade-date rule. No broadcast — the view is read
      * over REST only ({@link #earlyAuctionVerdictPage}).
+     *
+     * <p>The dedupe identity is rebuilt from the VALIDATED payload, never taken from the Kafka key
+     * (CODE round 1): the payload fields are the part of the record the boundary has actually
+     * checked, while a malformed or foreign key could mint a second logical row for the same record
+     * — or collapse two distinct ones. The producer writes the key FROM those same fields
+     * (EAV-R0d), so for every contracted record the two spell the same identity anyway.
      */
-    void onEarlyAuctionVerdictRecord(String key, String json, long offset) {
+    void onEarlyAuctionVerdictRecord(String json, long offset) {
         earlyAuctionVerdictRecords.incrementAndGet();
         String tradeDate = validateEarlyAuctionVerdict(json);
         if (tradeDate == null) {
             earlyAuctionVerdictDrops.incrementAndGet();
             return;
         }
-        String ledgerKey = key != null && !key.isBlank() ? key : earlyAuctionVerdictKeyFrom(json);
+        String ledgerKey = earlyAuctionVerdictKeyFrom(json, offset);
         if (ledgerKey == null) {
             earlyAuctionVerdictDrops.incrementAndGet();
             return;
@@ -11524,12 +11530,22 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** The spine's kind vocabulary by SHAPE, not enumeration: schema evolution is additive "on every
+     *  kind", so a kind this gateway has never heard of is still a ledger record — but a number, an
+     *  empty string or free text is not. Session ids and hashes get length bounds for the same
+     *  reason the record gets a byte bound: a view key is retained memory. */
+    private static final java.util.regex.Pattern EARLY_AUCTION_KIND =
+            java.util.regex.Pattern.compile("[A-Z][A-Z0-9_]{0,63}");
+
     /**
      * Boundary reader: ONE JSON object (trailing tokens refused, like market-structure), within the
-     * record bound, carrying the EAV-R0d identity spine every ledger kind shares — {@code kind},
-     * {@code sessionId}, {@code literalsHash} and a {@code YYYY-MM-DD} {@code tradeDate}. Field
-     * CONTENT beyond the spine is deliberately not validated: the contract is additive-only per kind
-     * and "consumers ignore unknown fields", so the panel, not this relay, decides what to render.
+     * record bound, carrying the EAV-R0d identity spine every ledger kind shares — a shaped
+     * {@code kind}, TEXTUAL {@code sessionId} and {@code literalsHash} (a numeric field is a foreign
+     * record, not a lenient spelling — CODE round 1), and a {@code tradeDate} that is a REAL
+     * calendar date, not merely date-shaped. Field CONTENT beyond the spine is deliberately not
+     * validated, and the kind is validated by shape rather than enumerated: the contract is
+     * additive-only per kind and "consumers ignore unknown fields", so the panel, not this relay,
+     * decides what to render — a kind allowlist here would silently drop every future kind.
      *
      * @return the record's tradeDate, or null when the record is refused
      */
@@ -11541,27 +11557,45 @@ public class FeedGatewayService implements ReplayRunner {
         try {
             com.fasterxml.jackson.databind.JsonNode n = strictTreeReader().readValue(json);
             if (n == null || !n.isObject()) return null;
-            if (n.path("kind").asText("").isEmpty()) return null;
-            if (n.path("sessionId").asText("").isEmpty()) return null;
-            if (n.path("literalsHash").asText("").isEmpty()) return null;
-            String tradeDate = n.path("tradeDate").asText("");
+            if (!n.path("kind").isTextual() || !EARLY_AUCTION_KIND.matcher(n.path("kind").asText()).matches()) {
+                return null;
+            }
+            if (!isBoundedText(n.path("sessionId")) || !isBoundedText(n.path("literalsHash"))) return null;
+            if (!n.path("tradeDate").isTextual()) return null;
+            String tradeDate = n.path("tradeDate").asText();
             if (!tradeDate.matches("\\d{4}-\\d{2}-\\d{2}")) return null;
+            java.time.LocalDate.parse(tradeDate);              // 2026-99-99 is date-SHAPED, not a date
             return tradeDate;
         } catch (Exception e) {
             return null;
         }
     }
 
-    /** EAV-R0d fallback for a record produced without a Kafka key: rebuild the ledger key from the
-     *  payload's own identity fields (the terminal kinds legitimately have no discriminator). */
-    private String earlyAuctionVerdictKeyFrom(String json) {
+    /** A non-empty JSON STRING within the key-component bound (256 — the ids are hashes and short names). */
+    private static boolean isBoundedText(JsonNode field) {
+        return field.isTextual() && !field.asText().isEmpty() && field.asText().length() <= 256;
+    }
+
+    /**
+     * The EAV-R0d ledger key, rebuilt from the payload's own identity fields. Every ORDINARY and
+     * SPECIAL record carries its {@code discriminator} in the payload (the terminals legitimately
+     * have none — and ONE terminal per session is exactly the dedupe the keyless form gives them).
+     * A NON-terminal record missing its discriminator is outside the contract; rather than collapse
+     * distinct records onto one key, it is keyed by its own partition offset — a redelivery of the
+     * same offset still folds, and nothing real is ever hidden behind a sibling.
+     */
+    private String earlyAuctionVerdictKeyFrom(String json, long offset) {
         try {
             JsonNode n = mapper.readTree(json);
             String kind = n.path("kind").asText("");
             String sessionId = n.path("sessionId").asText("");
             String literalsHash = n.path("literalsHash").asText("");
             if (kind.isEmpty() || sessionId.isEmpty() || literalsHash.isEmpty()) return null;
-            String discriminator = n.path("discriminator").asText("");
+            String discriminator = n.path("discriminator").isTextual() ? n.path("discriminator").asText() : "";
+            boolean terminal = "SESSION_CLOSE".equals(kind) || "SESSION_ABORTED".equals(kind);
+            if (discriminator.isEmpty() && !terminal) {
+                return literalsHash + "|" + sessionId + "|" + kind + "|@" + offset;
+            }
             return literalsHash + "|" + sessionId + "|" + kind
                     + (discriminator.isEmpty() ? "" : "|" + discriminator);
         } catch (JsonProcessingException e) {
