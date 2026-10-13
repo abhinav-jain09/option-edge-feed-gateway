@@ -383,6 +383,40 @@ public class GatewayController {
         return sb.toString();
     }
 
+    /**
+     * Early-auction verdict ledger poll: the retained records of one trade date (default: the current
+     * one), in APPEND order, strictly after {@code afterOffset} (the page's own cursor; −1 = from the
+     * beginning), up to {@code limit} rows. Each row carries the record VERBATIM plus its partition
+     * offset, so the page polls incrementally by feeding the last offset back. Auth: identical to
+     * {@code /api/auction/minutes} — the same JWT gate as every /api route, no extra check here.
+     * Response: {"enabled":bool, "tradeDate":..., "events":[{"offset":n,"record":{...}}...]} where
+     * {@code enabled:false} says the relay flag itself is off (the view is then not even subscribed),
+     * so the panel can tell "relay off" from "quiet session".
+     */
+    @GetMapping(value = "/api/early-auction/events", produces = MediaType.APPLICATION_JSON_VALUE)
+    public String earlyAuctionEvents(@org.springframework.web.bind.annotation.RequestParam(value = "tradeDate", defaultValue = "") String tradeDate,
+                                     @org.springframework.web.bind.annotation.RequestParam(value = "afterOffset", defaultValue = "-1") long afterOffset,
+                                     @org.springframework.web.bind.annotation.RequestParam(value = "limit", defaultValue = "500") int limit) {
+        int capped = Math.max(1, Math.min(limit, 1000));
+        // The response ECHOES tradeDate, so it is validated rather than escaped (the auctionMinutes rule).
+        if (!tradeDate.isEmpty() && !TRADE_DATE.matcher(tradeDate).matches()) {
+            return "{\"error\":\"tradeDate must be YYYY-MM-DD\",\"enabled\":false,\"tradeDate\":null,\"events\":[]}";
+        }
+        // Enabled flag, trade date and rows are ONE atomic snapshot (the cvdBarsPage rule).
+        FeedGatewayService.EarlyAuctionVerdictPage page =
+                service.earlyAuctionVerdictPage(tradeDate, afterOffset, capped);
+        StringBuilder sb = new StringBuilder("{\"enabled\":").append(page.enabled());
+        sb.append(",\"tradeDate\":").append(page.tradeDate() == null ? "null" : "\"" + page.tradeDate() + "\"");
+        sb.append(",\"events\":[");
+        for (int i = 0; i < page.events().size(); i++) {
+            if (i > 0) sb.append(',');
+            FeedGatewayService.EarlyAuctionVerdictEntry e = page.events().get(i);
+            sb.append("{\"offset\":").append(e.offset()).append(",\"record\":").append(e.json()).append('}');
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
     @GetMapping(value = "/metrics", produces = MediaType.TEXT_PLAIN_VALUE)
     public String metrics() {
         // Liquidity-history §7 metrics are appended to the same text endpoint the rest of the
