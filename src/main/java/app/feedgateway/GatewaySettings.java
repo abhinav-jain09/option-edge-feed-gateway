@@ -325,6 +325,32 @@ public final class GatewaySettings {
         return boolValue("GATEWAY_MARKET_STRUCTURE_ENABLED", false);
     }
 
+    /**
+     * Early-auction verdict evidence ledger (EARLY-AUCTION-VERDICT-STAGE1-GATE1.md:
+     * {@code early-auction.verdicts.shadow}, JSON, ONE partition, one immutable record per line —
+     * PREDICTION / OUTCOME / MISS / terminals). Feeds the read-only {@code /early-auction} web panel
+     * through {@code GET /api/early-auction/events}: a POLLED REST view, deliberately no WebSocket
+     * event. OFF by default: enabling the relay is the owner's own rollout step, separate from the
+     * shadow service's go-live.
+     */
+    public String earlyAuctionVerdictTopic() {
+        return value("KAFKA_EARLY_AUCTION_VERDICT_TOPIC", "early-auction.verdicts.shadow");
+    }
+
+    public boolean earlyAuctionVerdictEnabled() {
+        return boolValue("GATEWAY_EARLY_AUCTION_VERDICT_ENABLED", false);
+    }
+
+    /**
+     * Restart-hydration window for the verdict ledger. The topic's retention is INFINITE (delete-only,
+     * retention −1), so the window — never the topic — must bound the replay. Default 7 days: covers
+     * the previous trade date across any weekend/holiday gap (the es-auction seek-back rule), and a
+     * session writes at most a few thousand small records, so the replay stays cheap.
+     */
+    public long earlyAuctionVerdictSeekBackMs() {
+        return longValue("GATEWAY_EARLY_AUCTION_VERDICT_SEEK_BACK_MS", 7L * 24 * 3_600_000L, 1L);
+    }
+
     // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1/G-R2/G-R7/G-R8/G-R8a) -----------------
 
     /** G-R1: OFF by default — the four ES-only topics do not exist on every cluster. */

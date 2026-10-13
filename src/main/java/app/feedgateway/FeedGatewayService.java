@@ -2107,6 +2107,24 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# TYPE gateway_es_auction_backfill_requests_total counter\n"
                 + "gateway_es_auction_backfill_requests_total " + esAuctionBackfillRequests.get() + "\n"
                 + "gateway_es_auction_orphan_envelopes_total " + esAuctionOrphanEnvelopes.get() + "\n"
+                + "# HELP gateway_early_auction_verdict_enabled Whether the early-auction verdict ledger relay is enabled.\n"
+                + "# TYPE gateway_early_auction_verdict_enabled gauge\n"
+                + "gateway_early_auction_verdict_enabled " + boolMetric(settings.earlyAuctionVerdictEnabled()) + "\n"
+                + "# HELP gateway_early_auction_verdict_records_total early-auction verdict ledger records polled.\n"
+                + "# TYPE gateway_early_auction_verdict_records_total counter\n"
+                + "gateway_early_auction_verdict_records_total " + earlyAuctionVerdictRecords.get() + "\n"
+                + "# HELP gateway_early_auction_verdict_drops_total verdict records refused at the boundary (invalid, oversize, foreign, dead date).\n"
+                + "# TYPE gateway_early_auction_verdict_drops_total counter\n"
+                + "gateway_early_auction_verdict_drops_total " + earlyAuctionVerdictDrops.get() + "\n"
+                + "# HELP gateway_early_auction_verdict_refused_at_cap_total verdict records refused because the view is at its record cap.\n"
+                + "# TYPE gateway_early_auction_verdict_refused_at_cap_total counter\n"
+                + "gateway_early_auction_verdict_refused_at_cap_total " + earlyAuctionVerdictRefusedAtCap.get() + "\n"
+                + "# HELP gateway_early_auction_verdict_cached Ledger records held in the /api/early-auction/events view (current plus previous trade date).\n"
+                + "# TYPE gateway_early_auction_verdict_cached gauge\n"
+                + "gateway_early_auction_verdict_cached " + earlyAuctionVerdictsCached() + "\n"
+                + "# HELP gateway_early_auction_verdict_requests_total /api/early-auction/events pages served.\n"
+                + "# TYPE gateway_early_auction_verdict_requests_total counter\n"
+                + "gateway_early_auction_verdict_requests_total " + earlyAuctionVerdictRequests.get() + "\n"
                 + "# HELP gateway_vol_premium_topic_resets_total vol-premium records admitted as a "
                 + "recreated topic: at or behind the offset held for the SAME observation or "
                 + "transition AND strictly newer, which no incarnation of that topic can otherwise "
@@ -2598,6 +2616,16 @@ public class FeedGatewayService implements ReplayRunner {
         addEsCvdTopics(topicEvents);
         addEsFootprintTopics(topicEvents);
         addEsAuctionTopics(topicEvents);
+        if (settings.earlyAuctionVerdictEnabled()) {
+            // Early-auction verdict ledger: CACHE consumer ONLY — the opposite polarity of
+            // market-structure (live-only). There is no WebSocket event for it: the /early-auction
+            // panel POLLS GET /api/early-auction/events, and this consumer — which keeps consuming
+            // past its hydration barrier — is the one feed of the keyed session view behind that
+            // endpoint. The live consumer is deliberately not subscribed: with no broadcast there is
+            // nothing for it to own, and a second reader would only race the same keyed upsert.
+            topicEvents.put(settings.earlyAuctionVerdictTopic(),
+                    new TopicBinding("DATABENTO", "early-auction-verdict"));
+        }
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
@@ -3217,6 +3245,17 @@ public class FeedGatewayService implements ReplayRunner {
                         // shape) and the /api/auction/minutes view stayed EMPTY after a restart
                         // until the next live minute arrived. Fed the KAFKA KEY, like the live branch.
                         onEsAuctionCacheRecord(record.key() == null ? null : String.valueOf(record.key()), json);
+                        continue;
+                    }
+                    if (binding != null && "early-auction-verdict".equals(binding.event())) {
+                        // Keyed ledger upsert ONLY — never the generic cache (the view holds a whole
+                        // session's evidence ledger, not a latest value) and never a broadcast (the
+                        // /early-auction panel polls GET /api/early-auction/events). This cache
+                        // consumer is the event's one feed: hydration and live consumption are the
+                        // same code path, so there is no second emitter to deduplicate against.
+                        onEarlyAuctionVerdictRecord(
+                                record.key() == null ? null : String.valueOf(record.key()),
+                                json, record.offset());
                         continue;
                     }
                     updateCache(binding, record, json);
@@ -7271,6 +7310,13 @@ public class FeedGatewayService implements ReplayRunner {
             // most the last few minutes. Default = the topic's 7-day retention, which covers the
             // previous trade date across any weekend/holiday gap; ~390 records per date, so cheap.
             return CachePolicy.noEviction(settings.esAuctionSeekBackMs());
+        }
+        if ("early-auction-verdict".equals(event)) {
+            // Verdict ledger records never enter the generic cache maps (the keyed view applies its
+            // own current + previous trade date retention), so ONLY the seek-back matters here — and
+            // it is load-bearing: the ledger topic's retention is INFINITE (delete-only, −1), so the
+            // window, never the topic, is what bounds the restart replay (the es-auction rule).
+            return CachePolicy.noEviction(settings.earlyAuctionVerdictSeekBackMs());
         }
         return CachePolicy.expiring(settings.cacheTtlMs());
     }
@@ -11385,6 +11431,205 @@ public class FeedGatewayService implements ReplayRunner {
     long esAuctionRecordsForTest() { return esAuctionRecords.get(); }
 
     long esAuctionBackfillRequestsForTest() { return esAuctionBackfillRequests.get(); }
+
+    // ---- Early-auction verdict ledger view (early-auction-verdict) ----------------------------
+
+    /**
+     * Ledger-keyed view of the early-auction verdict shadow ledger (EARLY-AUCTION-VERDICT-STAGE1-GATE1.md
+     * EAV-R0d): key = the record's own ledger key ({@code literalsHash|sessionId|kind|discriminator},
+     * taken from the Kafka key, or rebuilt from the payload when a record was produced without one),
+     * value = (offset, tradeDate, verbatim JSON). INSERTION ORDER IS APPEND ORDER: the ledger topic has
+     * ONE partition and this view's one feed (the state cache consumer) traverses it in offset order,
+     * so a {@link java.util.LinkedHashMap} preserves the ledger's own order — and an at-least-once
+     * redelivery (same ledger key: the service re-emits on crash recovery as "a semantic no-op under
+     * ledger dedupe by record key") is dropped without moving or duplicating its row. Records are
+     * IMMUTABLE by contract, so first-write-wins is the whole of the dedupe rule.
+     *
+     * <p>Retention is the es-auction rule: the two GREATEST trade dates seen, whatever order they
+     * arrived in; a record older than the second-greatest retained date is a dead session's replay and
+     * is dropped, never resurrected.
+     */
+    private final java.util.LinkedHashMap<String, EarlyAuctionVerdictEntry> earlyAuctionVerdicts =
+            new java.util.LinkedHashMap<>();
+    /** The newest trade date the view holds; null until the first record. */
+    private volatile String earlyAuctionVerdictTradeDate;
+    /** The trade date the current one rolled forward FROM (kept so yesterday stays inspectable). */
+    private volatile String earlyAuctionVerdictPrevTradeDate;
+    private final AtomicLong earlyAuctionVerdictRecords = new AtomicLong();
+    private final AtomicLong earlyAuctionVerdictDrops = new AtomicLong();
+    private final AtomicLong earlyAuctionVerdictRefusedAtCap = new AtomicLong();
+    private final AtomicLong earlyAuctionVerdictRequests = new AtomicLong();
+
+    /** One ledger record's bound. Predictions carry a 7-witness vote vector with evidence snapshots and
+     *  a SESSION_MANIFEST chunk carries 74 compact entries (≤96 canonical bytes each, EAV-R10a), so the
+     *  largest contracted record is well under this — anything above it is foreign, not a verdict. */
+    static final int EARLY_AUCTION_VERDICT_MAX_BYTES = 65_536;
+    /** Hard cap on retained rows. A session's reserved capacity is ~10k ordinary records plus the
+     *  special families (EAV-R0c), so two retained sessions fit with headroom; past the cap NEW records
+     *  are refused and counted rather than evicting the ledger's head — a truncated TAIL is visible on
+     *  the panel as a frozen view plus a climbing refusal counter, while silent HEAD eviction would
+     *  falsify the one thing the ledger exists to prove (what was predicted, before the outcome). */
+    static final int EARLY_AUCTION_VERDICT_MAX_RECORDS = 25_000;
+
+    /** One retained ledger record: its partition offset (the page cursor), trade date, verbatim JSON. */
+    public record EarlyAuctionVerdictEntry(long offset, String tradeDate, String json) { }
+
+    /**
+     * The state cache consumer's one entry point for a polled ledger record: boundary-validate,
+     * dedupe by ledger key, retain under the two-trade-date rule. No broadcast — the view is read
+     * over REST only ({@link #earlyAuctionVerdictPage}).
+     */
+    void onEarlyAuctionVerdictRecord(String key, String json, long offset) {
+        earlyAuctionVerdictRecords.incrementAndGet();
+        String tradeDate = validateEarlyAuctionVerdict(json);
+        if (tradeDate == null) {
+            earlyAuctionVerdictDrops.incrementAndGet();
+            return;
+        }
+        String ledgerKey = key != null && !key.isBlank() ? key : earlyAuctionVerdictKeyFrom(json);
+        if (ledgerKey == null) {
+            earlyAuctionVerdictDrops.incrementAndGet();
+            return;
+        }
+        synchronized (earlyAuctionVerdicts) {
+            String prev = earlyAuctionVerdictPrevTradeDate;
+            if (prev != null && tradeDate.compareTo(prev) < 0) {
+                earlyAuctionVerdictDrops.incrementAndGet();
+                return;                                           // dead-session replay
+            }
+            if (earlyAuctionVerdicts.containsKey(ledgerKey)) {
+                return;                                           // immutable record redelivered: a no-op
+            }
+            if (earlyAuctionVerdicts.size() >= EARLY_AUCTION_VERDICT_MAX_RECORDS) {
+                // A NEW trade date must always be admittable — a view pinned full by yesterday must
+                // not freeze today out — so the roll-forward eviction runs before the refusal: drop
+                // the oldest retained date and retry. Within one date the refusal stands (see the
+                // cap's comment: the ledger's HEAD is the evidence, the truncated TAIL is visible).
+                String current = earlyAuctionVerdictTradeDate;
+                if (current != null && tradeDate.compareTo(current) > 0) {
+                    String oldest = earlyAuctionVerdicts.values().stream()
+                            .map(EarlyAuctionVerdictEntry::tradeDate)
+                            .min(java.util.Comparator.naturalOrder()).orElse(null);
+                    if (oldest != null) {
+                        earlyAuctionVerdicts.values().removeIf(e -> e.tradeDate().equals(oldest));
+                    }
+                }
+                if (earlyAuctionVerdicts.size() >= EARLY_AUCTION_VERDICT_MAX_RECORDS) {
+                    earlyAuctionVerdictRefusedAtCap.incrementAndGet();
+                    return;
+                }
+            }
+            earlyAuctionVerdicts.put(ledgerKey, new EarlyAuctionVerdictEntry(offset, tradeDate, json));
+            earlyAuctionVerdictRecomputeRetentionLocked();
+        }
+    }
+
+    /**
+     * Boundary reader: ONE JSON object (trailing tokens refused, like market-structure), within the
+     * record bound, carrying the EAV-R0d identity spine every ledger kind shares — {@code kind},
+     * {@code sessionId}, {@code literalsHash} and a {@code YYYY-MM-DD} {@code tradeDate}. Field
+     * CONTENT beyond the spine is deliberately not validated: the contract is additive-only per kind
+     * and "consumers ignore unknown fields", so the panel, not this relay, decides what to render.
+     *
+     * @return the record's tradeDate, or null when the record is refused
+     */
+    String validateEarlyAuctionVerdict(String json) {
+        if (json == null) return null;
+        if (json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > EARLY_AUCTION_VERDICT_MAX_BYTES) {
+            return null;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode n = strictTreeReader().readValue(json);
+            if (n == null || !n.isObject()) return null;
+            if (n.path("kind").asText("").isEmpty()) return null;
+            if (n.path("sessionId").asText("").isEmpty()) return null;
+            if (n.path("literalsHash").asText("").isEmpty()) return null;
+            String tradeDate = n.path("tradeDate").asText("");
+            if (!tradeDate.matches("\\d{4}-\\d{2}-\\d{2}")) return null;
+            return tradeDate;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** EAV-R0d fallback for a record produced without a Kafka key: rebuild the ledger key from the
+     *  payload's own identity fields (the terminal kinds legitimately have no discriminator). */
+    private String earlyAuctionVerdictKeyFrom(String json) {
+        try {
+            JsonNode n = mapper.readTree(json);
+            String kind = n.path("kind").asText("");
+            String sessionId = n.path("sessionId").asText("");
+            String literalsHash = n.path("literalsHash").asText("");
+            if (kind.isEmpty() || sessionId.isEmpty() || literalsHash.isEmpty()) return null;
+            String discriminator = n.path("discriminator").asText("");
+            return literalsHash + "|" + sessionId + "|" + kind
+                    + (discriminator.isEmpty() ? "" : "|" + discriminator);
+        } catch (JsonProcessingException e) {
+            return null;
+        }
+    }
+
+    /** The es-auction retention rule verbatim: hold the two greatest trade dates seen. Caller holds the view lock. */
+    private void earlyAuctionVerdictRecomputeRetentionLocked() {
+        java.util.TreeSet<String> dates = new java.util.TreeSet<>();
+        for (EarlyAuctionVerdictEntry e : earlyAuctionVerdicts.values()) {
+            dates.add(e.tradeDate());
+        }
+        if (dates.isEmpty()) {
+            earlyAuctionVerdictTradeDate = null;
+            earlyAuctionVerdictPrevTradeDate = null;
+            return;
+        }
+        String current = dates.last();
+        String prev = dates.lower(current);
+        if (prev != null && dates.size() > 2) {
+            earlyAuctionVerdicts.values().removeIf(e -> e.tradeDate().compareTo(prev) < 0);
+        }
+        earlyAuctionVerdictTradeDate = current;
+        earlyAuctionVerdictPrevTradeDate = prev;
+    }
+
+    /** One ATOMIC poll page: enabled flag, trade date, rows and the follow-up cursor under one lock. */
+    public record EarlyAuctionVerdictPage(boolean enabled, String tradeDate,
+                                          java.util.List<EarlyAuctionVerdictEntry> events) { }
+
+    /**
+     * Ledger records for one trade date in append (offset) order, strictly after {@code afterOffset}
+     * (the poll cursor; −1 = from the beginning), at most {@code limit} rows. A null/blank
+     * {@code tradeDate} means the current one; a date the view does not hold answers an empty page
+     * labelled with the requested date. {@code enabled} travels with the page so the panel can say
+     * "relay off" instead of "no records yet" — with the flag off this view is not even subscribed,
+     * and an empty page would otherwise be indistinguishable from a quiet session.
+     */
+    public EarlyAuctionVerdictPage earlyAuctionVerdictPage(String tradeDate, long afterOffset, int limit) {
+        earlyAuctionVerdictRequests.incrementAndGet();
+        boolean enabled = settings.earlyAuctionVerdictEnabled();
+        synchronized (earlyAuctionVerdicts) {
+            String td = tradeDate == null || tradeDate.isBlank()
+                    ? earlyAuctionVerdictTradeDate : tradeDate.trim();
+            if (td == null) {
+                return new EarlyAuctionVerdictPage(enabled, null, java.util.List.of());
+            }
+            java.util.List<EarlyAuctionVerdictEntry> out = new java.util.ArrayList<>();
+            for (EarlyAuctionVerdictEntry e : earlyAuctionVerdicts.values()) {
+                if (!td.equals(e.tradeDate()) || e.offset() <= afterOffset) continue;
+                if (out.size() >= limit) break;
+                out.add(e);
+            }
+            return new EarlyAuctionVerdictPage(enabled, td, out);
+        }
+    }
+
+    /** Rows held across both retained trade dates (the gateway_early_auction_verdict_cached gauge). */
+    int earlyAuctionVerdictsCached() {
+        synchronized (earlyAuctionVerdicts) {
+            return earlyAuctionVerdicts.size();
+        }
+    }
+
+    String earlyAuctionVerdictTradeDateForTest() { return earlyAuctionVerdictTradeDate; }
+    long earlyAuctionVerdictDropsForTest() { return earlyAuctionVerdictDrops.get(); }
+    long earlyAuctionVerdictRefusedAtCapForTest() { return earlyAuctionVerdictRefusedAtCap.get(); }
 
     /** U16 boundary cap: one levels record may never exceed the design's 64 KiB record bound. */
     static final int CVD_SPX_LEVELS_MAX_BYTES = 65536;
