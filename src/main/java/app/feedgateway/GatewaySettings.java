@@ -351,6 +351,24 @@ public final class GatewaySettings {
         return longValue("GATEWAY_EARLY_AUCTION_VERDICT_SEEK_BACK_MS", 7L * 24 * 3_600_000L, 1L);
     }
 
+    /**
+     * Market commentary per-minute records ({@code options.spx.market-commentary.minute}, JSON, one partition). Feeds the read-only
+     * {@code /market-commentary} web panel through {@code GET /api/market-commentary/state}: a POLLED REST view, no WebSocket event.
+     * OFF by default: enabling the relay is the owner's own rollout step.
+     */
+    public String marketCommentaryTopic() {
+        return value("KAFKA_MARKET_COMMENTARY_MINUTE_TOPIC", "options.spx.market-commentary.minute");
+    }
+
+    public boolean marketCommentaryEnabled() {
+        return boolValue("GATEWAY_MARKET_COMMENTARY_ENABLED", false);
+    }
+
+    /** Restart-hydration window: the previous trade date across a weekend or holiday (the topic keeps 120 days, the window bounds the replay). */
+    public long marketCommentarySeekBackMs() {
+        return longValue("GATEWAY_MARKET_COMMENTARY_SEEK_BACK_MS", 5L * 24 * 3_600_000L, 1L);
+    }
+
     // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1/G-R2/G-R7/G-R8/G-R8a) -----------------
 
     /** G-R1: OFF by default — the four ES-only topics do not exist on every cluster. */

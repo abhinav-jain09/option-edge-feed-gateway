@@ -417,6 +417,35 @@ public class GatewayController {
         return sb.toString();
     }
 
+    /**
+     * Market commentary state poll: the newest per-minute record of one trade date (default: the newest held) in full, plus one
+     * compact cell per minute for the session strip. Auth: the same JWT gate as every /api route. {@code enabled:false} says the relay
+     * flag itself is off, so the panel can tell "relay off" from "no data yet".
+     */
+    @GetMapping(value = "/api/market-commentary/state", produces = MediaType.APPLICATION_JSON_VALUE)
+    public String marketCommentaryState(@org.springframework.web.bind.annotation.RequestParam(value = "tradeDate", defaultValue = "") String tradeDate) {
+        boolean validDate = tradeDate.isEmpty();
+        if (!validDate && TRADE_DATE.matcher(tradeDate).matches()) {
+            try { java.time.LocalDate.parse(tradeDate); validDate = true; } catch (java.time.format.DateTimeParseException ignored) { validDate = false; }
+        }
+        if (!validDate) {
+            return "{\"error\":\"tradeDate must be a calendar date YYYY-MM-DD\",\"enabled\":false,\"tradeDate\":null,\"latest\":null,\"cells\":[]}";
+        }
+        MarketCommentaryView.Page page = service.marketCommentaryPage(tradeDate);
+        StringBuilder sb = new StringBuilder("{\"enabled\":").append(page.enabled());
+        sb.append(",\"tradeDate\":").append(page.tradeDate() == null ? "null" : "\"" + page.tradeDate() + "\"");
+        sb.append(",\"latest\":").append(page.latestJson() == null ? "null" : page.latestJson());
+        sb.append(",\"cells\":[");
+        for (int i = 0; i < page.cells().size(); i++) {
+            MarketCommentaryView.Cell c = page.cells().get(i);
+            if (i > 0) sb.append(',');
+            sb.append("{\"m\":\"").append(c.minute()).append("\",\"a\":\"").append(c.alignment()).append("\",\"l\":\"").append(c.lean())
+              .append("\",\"q\":\"").append(c.quality()).append("\",\"f\":\"").append(c.finalizedBy()).append("\"}");
+        }
+        sb.append("],\"recordsSeen\":").append(page.recordsSeen()).append(",\"recordsRefused\":").append(page.recordsRefused()).append('}');
+        return sb.toString();
+    }
+
     @GetMapping(value = "/metrics", produces = MediaType.TEXT_PLAIN_VALUE)
     public String metrics() {
         // Liquidity-history §7 metrics are appended to the same text endpoint the rest of the
