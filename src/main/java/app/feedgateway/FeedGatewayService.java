@@ -2107,6 +2107,18 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# TYPE gateway_es_auction_backfill_requests_total counter\n"
                 + "gateway_es_auction_backfill_requests_total " + esAuctionBackfillRequests.get() + "\n"
                 + "gateway_es_auction_orphan_envelopes_total " + esAuctionOrphanEnvelopes.get() + "\n"
+                + "# HELP gateway_market_commentary_enabled Whether the market commentary relay is enabled.\n"
+                + "# TYPE gateway_market_commentary_enabled gauge\n"
+                + "gateway_market_commentary_enabled " + boolMetric(settings.marketCommentaryEnabled()) + "\n"
+                + "# HELP gateway_market_commentary_records_total market commentary minute records polled.\n"
+                + "# TYPE gateway_market_commentary_records_total counter\n"
+                + "gateway_market_commentary_records_total " + marketCommentaryView.seen() + "\n"
+                + "# HELP gateway_market_commentary_refused_total minute records refused at the boundary.\n"
+                + "# TYPE gateway_market_commentary_refused_total counter\n"
+                + "gateway_market_commentary_refused_total " + marketCommentaryView.refused() + "\n"
+                + "# HELP gateway_market_commentary_cached Minute records held in the /api/market-commentary/state view.\n"
+                + "# TYPE gateway_market_commentary_cached gauge\n"
+                + "gateway_market_commentary_cached " + marketCommentaryView.cached() + "\n"
                 + "# HELP gateway_early_auction_verdict_enabled Whether the early-auction verdict ledger relay is enabled.\n"
                 + "# TYPE gateway_early_auction_verdict_enabled gauge\n"
                 + "gateway_early_auction_verdict_enabled " + boolMetric(settings.earlyAuctionVerdictEnabled()) + "\n"
@@ -2625,6 +2637,10 @@ public class FeedGatewayService implements ReplayRunner {
             // nothing for it to own, and a second reader would only race the same keyed upsert.
             topicEvents.put(settings.earlyAuctionVerdictTopic(),
                     new TopicBinding("DATABENTO", "early-auction-verdict"));
+        }
+        if (settings.marketCommentaryEnabled()) {
+            // Market commentary: CACHE consumer ONLY (polled REST view, no broadcast), like the early-auction verdict ledger.
+            topicEvents.put(settings.marketCommentaryTopic(), new TopicBinding("DATABENTO", "market-commentary"));
         }
         // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
@@ -3245,6 +3261,10 @@ public class FeedGatewayService implements ReplayRunner {
                         // shape) and the /api/auction/minutes view stayed EMPTY after a restart
                         // until the next live minute arrived. Fed the KAFKA KEY, like the live branch.
                         onEsAuctionCacheRecord(record.key() == null ? null : String.valueOf(record.key()), json);
+                        continue;
+                    }
+                    if (binding != null && "market-commentary".equals(binding.event())) {
+                        marketCommentaryView.accept(json);
                         continue;
                     }
                     if (binding != null && "early-auction-verdict".equals(binding.event())) {
@@ -7310,6 +7330,10 @@ public class FeedGatewayService implements ReplayRunner {
             // most the last few minutes. Default = the topic's 7-day retention, which covers the
             // previous trade date across any weekend/holiday gap; ~390 records per date, so cheap.
             return CachePolicy.noEviction(settings.esAuctionSeekBackMs());
+        }
+        if ("market-commentary".equals(event)) {
+            // Minute records never enter the generic cache maps (the keyed view keeps its own two trade dates); only the seek-back matters.
+            return CachePolicy.noEviction(settings.marketCommentarySeekBackMs());
         }
         if ("early-auction-verdict".equals(event)) {
             // Verdict ledger records never enter the generic cache maps (the keyed view applies its
@@ -11431,6 +11455,14 @@ public class FeedGatewayService implements ReplayRunner {
     long esAuctionRecordsForTest() { return esAuctionRecords.get(); }
 
     long esAuctionBackfillRequestsForTest() { return esAuctionBackfillRequests.get(); }
+
+    // ---- Market commentary view (market-commentary) --------------------------------------------
+    private final MarketCommentaryView marketCommentaryView = new MarketCommentaryView();
+
+    /** One atomic snapshot for {@code GET /api/market-commentary/state}. */
+    public MarketCommentaryView.Page marketCommentaryPage(String tradeDate) {
+        return marketCommentaryView.page(settings.marketCommentaryEnabled(), tradeDate);
+    }
 
     // ---- Early-auction verdict ledger view (early-auction-verdict) ----------------------------
 
