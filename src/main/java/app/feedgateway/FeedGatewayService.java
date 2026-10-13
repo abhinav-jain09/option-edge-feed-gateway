@@ -11577,12 +11577,19 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * The EAV-R0d ledger key, rebuilt from the payload's own identity fields. Every ORDINARY and
-     * SPECIAL record carries its {@code discriminator} in the payload (the terminals legitimately
-     * have none — and ONE terminal per session is exactly the dedupe the keyless form gives them).
-     * A NON-terminal record missing its discriminator is outside the contract; rather than collapse
-     * distinct records onto one key, it is keyed by its own partition offset — a redelivery of the
-     * same offset still folds, and nothing real is ever hidden behind a sibling.
+     * The EAV-R0d ledger identity, rebuilt from the payload's own identity fields — encoded
+     * LENGTH-PREFIXED rather than {@code '|'}-joined (CODE round 2): a sessionId carries pipes of
+     * its own, so plain concatenation lets {@code (a, b|c)} collide with {@code (a|b, c)}, and a
+     * silent collapse of two evidence rows is the precise failure this key exists to prevent.
+     *
+     * <p>Every ORDINARY and SPECIAL record carries its {@code discriminator} in the payload. The
+     * terminals ({@code SESSION_CLOSE}/{@code SESSION_ABORTED}) legitimately have NONE, and ONE
+     * terminal per session is the contract — so for a terminal any payload discriminator is
+     * IGNORED rather than honoured (CODE round 2): a foreign terminal-shaped record must fold onto
+     * the session's one terminal row, never mint a second. A NON-terminal record missing its
+     * discriminator is outside the contract; rather than collapse distinct records onto one key, it
+     * is keyed by its own partition offset — a redelivery of the same offset still folds, and
+     * nothing real is ever hidden behind a sibling.
      */
     private String earlyAuctionVerdictKeyFrom(String json, long offset) {
         try {
@@ -11591,16 +11598,22 @@ public class FeedGatewayService implements ReplayRunner {
             String sessionId = n.path("sessionId").asText("");
             String literalsHash = n.path("literalsHash").asText("");
             if (kind.isEmpty() || sessionId.isEmpty() || literalsHash.isEmpty()) return null;
-            String discriminator = n.path("discriminator").isTextual() ? n.path("discriminator").asText() : "";
             boolean terminal = "SESSION_CLOSE".equals(kind) || "SESSION_ABORTED".equals(kind);
+            String discriminator = !terminal && n.path("discriminator").isTextual()
+                    ? n.path("discriminator").asText() : "";
+            String spine = lengthPrefixed(literalsHash) + lengthPrefixed(sessionId) + lengthPrefixed(kind);
             if (discriminator.isEmpty() && !terminal) {
-                return literalsHash + "|" + sessionId + "|" + kind + "|@" + offset;
+                return spine + "@" + offset;
             }
-            return literalsHash + "|" + sessionId + "|" + kind
-                    + (discriminator.isEmpty() ? "" : "|" + discriminator);
+            return spine + (discriminator.isEmpty() ? "" : lengthPrefixed(discriminator));
         } catch (JsonProcessingException e) {
             return null;
         }
+    }
+
+    /** {@code "ab" -> "2:ab"} — an injective join: no component boundary can migrate. */
+    private static String lengthPrefixed(String component) {
+        return component.length() + ":" + component;
     }
 
     /** The es-auction retention rule verbatim: hold the two greatest trade dates seen. Caller holds the view lock. */

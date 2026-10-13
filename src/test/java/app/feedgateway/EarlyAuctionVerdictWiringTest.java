@@ -106,6 +106,24 @@ class EarlyAuctionVerdictWiringTest {
     }
 
     @Test
+    void theIdentityJoinIsInjectiveAndATerminalsDiscriminatorIsIgnored() {
+        var s = service();
+        // CODE round 2: '|'-joined components collide when a component carries pipes of its own —
+        // (literalsHash "a", sessionId "b|c") must NOT fold with (literalsHash "a|b", sessionId "c").
+        s.onEarlyAuctionVerdictRecord("{\"kind\":\"MISS\",\"literalsHash\":\"a\",\"sessionId\":\"b|c\","
+                + "\"tradeDate\":\"2026-10-14\",\"discriminator\":\"d\"}", 1);
+        s.onEarlyAuctionVerdictRecord("{\"kind\":\"MISS\",\"literalsHash\":\"a|b\",\"sessionId\":\"c\","
+                + "\"tradeDate\":\"2026-10-14\",\"discriminator\":\"d\"}", 2);
+        assertEquals(2, s.earlyAuctionVerdictsCached(),
+                "a boundary-migrated identity must never collapse two evidence rows");
+        // CODE round 2: a terminal-shaped record carrying a discriminator must still fold onto the
+        // session's ONE terminal row — the discriminator is ignored, never honoured.
+        s.onEarlyAuctionVerdictRecord(rec("SESSION_CLOSE", "2026-10-14", null, 3), 3);
+        s.onEarlyAuctionVerdictRecord(rec("SESSION_CLOSE", "2026-10-14", "forged", 4), 4);
+        assertEquals(3, s.earlyAuctionVerdictsCached(), "one terminal per session IS the contract");
+    }
+
+    @Test
     void distinctRecordsWithoutADiscriminatorNeverCollapse() {
         // Outside the contract (a NON-terminal record missing its discriminator), the view must
         // choose visibility over dedupe: two distinct MISS records must both survive (CODE round 1),
