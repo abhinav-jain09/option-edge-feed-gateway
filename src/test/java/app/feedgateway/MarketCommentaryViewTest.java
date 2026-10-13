@@ -23,10 +23,10 @@ class MarketCommentaryViewTest {
 
     @Test void refusesWrongRevisionBadShapeAndOversize() {
         MarketCommentaryView v = new MarketCommentaryView();
-        assertFalse(v.accept(rec("2026-10-13", "09:31", 1, "X")));
+        assertFalse(v.accept(rec("2026-10-13", "09:31", 1, "NEUTRAL")));
         assertFalse(v.accept("not json"));
-        assertFalse(v.accept(rec("2026-13-45", "09:31", 0, "X")));
-        assertFalse(v.accept(rec("2026-10-13", "9:31", 0, "X")));
+        assertFalse(v.accept(rec("2026-13-45", "09:31", 0, "NEUTRAL")));
+        assertFalse(v.accept(rec("2026-10-13", "9:31", 0, "NEUTRAL")));
         assertFalse(v.accept("{\"schemaVersion\":1,\"padding\":\"" + "x".repeat(70_000) + "\"}"));
         assertEquals(5, v.seen());
         assertEquals(5, v.refused());
@@ -35,13 +35,21 @@ class MarketCommentaryViewTest {
 
     @Test void onlyTheTwoNewestTradeDatesAreKeptAndARedeliveryReplaces() {
         MarketCommentaryView v = new MarketCommentaryView();
-        v.accept(rec("2026-10-09", "09:31", 0, "A"));
-        v.accept(rec("2026-10-12", "09:31", 0, "B"));
-        v.accept(rec("2026-10-13", "09:31", 0, "C"));
-        v.accept(rec("2026-10-13", "09:31", 0, "D"));
+        v.accept(rec("2026-10-09", "09:31", 0, "NEUTRAL"));
+        v.accept(rec("2026-10-12", "09:31", 0, "CONFLICT"));
+        v.accept(rec("2026-10-13", "09:31", 0, "UNAVAILABLE"));
+        v.accept(rec("2026-10-13", "09:31", 0, "AUCTION_ONLY"));
         assertEquals(2, v.cached());
         assertTrue(v.page(true, "2026-10-09").cells().isEmpty());
-        assertEquals("D", v.page(true, "2026-10-13").cells().get(0).alignment());
+        assertEquals("AUCTION_ONLY", v.page(true, "2026-10-13").cells().get(0).alignment());
         assertFalse(v.page(false, "").enabled());
+    }
+
+    @Test void closedSetsAreEnforcedSoNoQuoteCanReachTheResponse() {
+        MarketCommentaryView v = new MarketCommentaryView();
+        assertFalse(v.accept("{\"schemaVersion\":1,\"tradeDate\":\"2026-10-13\",\"minute\":\"09:31\",\"revision\":0,\"finalizedBy\":\"WATERMARK\",\"alignment\":\"X\\\",\\\"forged\\\":\\\"1\",\"lean\":\"DOWN\",\"alignmentQuality\":\"PARTIAL\"}"));
+        assertFalse(v.accept(rec("2026-10-13", "09:31", 0, "NOT_AN_ALIGNMENT")));
+        assertTrue(v.accept(rec("2026-10-13", "09:31", 0, "NEUTRAL")));
+        assertEquals(1, v.cached());
     }
 }

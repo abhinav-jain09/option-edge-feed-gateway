@@ -424,8 +424,12 @@ public class GatewayController {
      */
     @GetMapping(value = "/api/market-commentary/state", produces = MediaType.APPLICATION_JSON_VALUE)
     public String marketCommentaryState(@org.springframework.web.bind.annotation.RequestParam(value = "tradeDate", defaultValue = "") String tradeDate) {
-        if (!tradeDate.isEmpty() && !TRADE_DATE.matcher(tradeDate).matches()) {
-            return "{\"error\":\"tradeDate must be YYYY-MM-DD\",\"enabled\":false,\"tradeDate\":null,\"latest\":null,\"cells\":[]}";
+        boolean validDate = tradeDate.isEmpty();
+        if (!validDate && TRADE_DATE.matcher(tradeDate).matches()) {
+            try { java.time.LocalDate.parse(tradeDate); validDate = true; } catch (java.time.format.DateTimeParseException ignored) { validDate = false; }
+        }
+        if (!validDate) {
+            return "{\"error\":\"tradeDate must be a calendar date YYYY-MM-DD\",\"enabled\":false,\"tradeDate\":null,\"latest\":null,\"cells\":[]}";
         }
         MarketCommentaryView.Page page = service.marketCommentaryPage(tradeDate);
         StringBuilder sb = new StringBuilder("{\"enabled\":").append(page.enabled());

@@ -21,6 +21,11 @@ final class MarketCommentaryView {
     private static final Pattern DATE = Pattern.compile("\\d{4}-\\d{2}-\\d{2}");
     private static final Pattern MINUTE = Pattern.compile("([01]\\d|2[0-3]):[0-5]\\d");
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    /** The closed sets of Appendix A.1; anything else is refused, so a decoded value can never carry a quote into the response. */
+    private static final java.util.Set<String> ALIGNMENT = java.util.Set.of("AGREE_BULLISH", "AGREE_BEARISH", "CONFLICT", "AUCTION_ONLY", "OPTIONS_ONLY", "NEUTRAL", "UNAVAILABLE");
+    private static final java.util.Set<String> LEAN = java.util.Set.of("UP", "DOWN", "NONE");
+    private static final java.util.Set<String> QUALITY = java.util.Set.of("FULL", "PARTIAL", "UNAVAILABLE");
+    private static final java.util.Set<String> FINALIZED_BY = java.util.Set.of("WATERMARK", "TIMEOUT", "REPLAY_TAIL");
 
     /** One minute of the strip. */
     record Cell(String minute, String alignment, String lean, String quality, String finalizedBy) { }
@@ -46,7 +51,7 @@ final class MarketCommentaryView {
             if (date == null || minute == null || !DATE.matcher(date).matches() || !MINUTE.matcher(minute).matches()) { refused.incrementAndGet(); return false; }
             LocalDate.parse(date);
             String alignment = text(n, "alignment"), lean = text(n, "lean"), quality = text(n, "alignmentQuality"), by = text(n, "finalizedBy");
-            if (alignment == null || lean == null || quality == null || by == null) { refused.incrementAndGet(); return false; }
+            if (!ALIGNMENT.contains(alignment) || !LEAN.contains(lean) || !QUALITY.contains(quality) || !FINALIZED_BY.contains(by)) { refused.incrementAndGet(); return false; }
             synchronized (byDate) {
                 byDate.computeIfAbsent(date, d -> new TreeMap<>()).put(minute, new Held(new Cell(minute, alignment, lean, quality, by), json));
                 while (byDate.size() > 2) byDate.pollFirstEntry();
