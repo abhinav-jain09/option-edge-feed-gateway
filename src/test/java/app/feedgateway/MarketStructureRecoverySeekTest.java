@@ -40,6 +40,7 @@ class MarketStructureRecoverySeekTest {
                 Map<TopicPartition, Long> cuts = call.getArgument(0);
                 return Map.of(STRUCTURE, new OffsetAndTimestamp(41, cuts.get(STRUCTURE)));
             });
+            when(consumer.endOffsets(anyCollection())).thenReturn(Map.of(STRUCTURE, 42L));
             long before = System.currentTimeMillis();
             service().liveBootstrapSeek(consumer, List.of(STRUCTURE, OTHER), BINDINGS, retry);
             long after = System.currentTimeMillis();
@@ -60,6 +61,7 @@ class MarketStructureRecoverySeekTest {
         var s = service();
         KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
         when(consumer.offsetsForTimes(anyMap())).thenReturn(Map.of(STRUCTURE, new OffsetAndTimestamp(19, 1)));
+        when(consumer.endOffsets(anyCollection())).thenReturn(Map.of(STRUCTURE, 20L));
         var refresh = s.refreshForTest(List.of(STRUCTURE, OTHER), List.of(STRUCTURE), List.of(OTHER));
         s.liveAdoptionSeek(consumer, refresh, BINDINGS);
         verify(consumer).seek(STRUCTURE, 19);
@@ -72,6 +74,7 @@ class MarketStructureRecoverySeekTest {
         var s = service();
         KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
         when(consumer.offsetsForTimes(anyMap())).thenReturn(Map.of());
+        when(consumer.endOffsets(anyCollection())).thenReturn(Map.of(STRUCTURE, 0L));
         s.seekMarketStructureSnapshot(consumer, List.of(STRUCTURE, OTHER), BINDINGS);
         verify(consumer).seekToEnd(List.of(STRUCTURE));
         verify(consumer, never()).seek(any(), anyLong());
@@ -82,37 +85,65 @@ class MarketStructureRecoverySeekTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void coldConsumerRestoresTheFinalSnapshotIntoTheNextHelloWithoutAnotherPublication() {
-        var s = service();
-        String payload = "{\"schemaVersion\":1,\"service\":\"market-structure\",\"state\":\"OK\","
-            + "\"sessionDate\":\"2026-10-13\",\"asOfMs\":1791921600000,\"sessionEnded\":true,"
-            + "\"sessionReferences\":{\"scope\":\"SPX_RTH\",\"rthOpenMs\":1791898200000,"
-            + "\"rthCloseMs\":1791921600000,\"dayHigh\":7814.15,\"dayLow\":7786.11,\"previousClose\":null},"
-            + "\"history\":\"" + "x".repeat(101 * 1024) + "\"}";
-        KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
-        Node node = new Node(1,"b",9092);
-        when(consumer.listTopics(any(Duration.class))).thenReturn(Map.of(STRUCTURE.topic(),
-            List.of(new PartitionInfo(STRUCTURE.topic(),0,node,new Node[]{node},new Node[]{node}))));
-        when(consumer.offsetsForTimes(anyMap())).thenReturn(Map.of(STRUCTURE,new OffsetAndTimestamp(0,1)));
-        var position = new java.util.concurrent.atomic.AtomicLong();
-        doAnswer(call -> {position.set(1);return null;}).when(consumer).seekToEnd(anyCollection());
-        doAnswer(call -> {position.set(call.getArgument(1));return null;}).when(consumer).seek(eq(STRUCTURE),anyLong());
-        when(consumer.assignment()).thenReturn(java.util.Set.of(STRUCTURE));
-        when(consumer.position(STRUCTURE)).thenAnswer(call -> position.get());
-        var polls = new java.util.concurrent.atomic.AtomicInteger();
-        when(consumer.poll(any(Duration.class))).thenAnswer(call -> {
-            if (polls.incrementAndGet()==1 && position.get()==0) {
-                position.set(1);
-                return new ConsumerRecords<>(Map.of(STRUCTURE,List.of(
-                    new ConsumerRecord<String,Object>(STRUCTURE.topic(),0,0,"SPX",payload))));
-            }
-            s.setRunningForTest(false);
-            return ConsumerRecords.empty();
-        });
-        s.setRunningForTest(true);
-        s.runLiveConsumerAttemptForTest("state-live",Map.of(STRUCTURE.topic(),BINDINGS.get(STRUCTURE.topic())),
-            new java.util.concurrent.atomic.AtomicBoolean(),consumer,false);
-        assertEquals(payload,s.marketStructureLatestForTest().get(),"cold startup must recover the quiet committed snapshot");
-        assertTrue(s.cvdHelloJson().contains("\"structure\":"+payload),"connect hello must carry original reference prices and asOf");
+    void coldAndRetryRecoveryPublishOnlyTheFinalSnapshotAndKeepTombstonesPrivate() throws Exception {
+        for (boolean retry : List.of(false, true)) {
+            var s = service();
+            String payload = "{\"schemaVersion\":1,\"service\":\"market-structure\",\"state\":\"OK\","
+                + "\"sessionDate\":\"2026-10-13\",\"asOfMs\":1791921600000,\"sessionEnded\":true,"
+                + "\"sessionReferences\":{\"scope\":\"SPX_RTH\",\"rthOpenMs\":1791898200000,"
+                + "\"rthCloseMs\":1791921600000,\"dayHigh\":7814.15,\"dayLow\":7786.11,\"previousClose\":null},"
+                + "\"history\":\"" + "x".repeat(101 * 1024) + "\"}";
+            String older = payload.replace("1791921600000", "1791921500000");
+            String live = payload.replace("1791921600000", "1791921600001");
+            if (retry) s.retainMarketStructure(1791921600000L, payload);
+            String held = s.marketStructureLatestForTest().get();
+            s.runOutboundWritesInline();
+            var socket = mock(org.springframework.web.socket.WebSocketSession.class);
+            when(socket.getId()).thenReturn("structure-recovery");
+            when(socket.isOpen()).thenReturn(true);
+            s.addClient(socket);
+            clearInvocations(socket);
+            KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
+            Node node = new Node(1, "b", 9092);
+            when(consumer.listTopics(any(Duration.class))).thenReturn(Map.of(STRUCTURE.topic(),
+                List.of(new PartitionInfo(STRUCTURE.topic(), 0, node, new Node[]{node}, new Node[]{node}))));
+            when(consumer.offsetsForTimes(anyMap())).thenReturn(Map.of(STRUCTURE, new OffsetAndTimestamp(0, 1)));
+            when(consumer.endOffsets(anyCollection())).thenReturn(Map.of(STRUCTURE, 3L));
+            var position = new java.util.concurrent.atomic.AtomicLong();
+            doAnswer(call -> { position.set(3); return null; }).when(consumer).seekToEnd(anyCollection());
+            doAnswer(call -> { position.set(call.getArgument(1)); return null; }).when(consumer).seek(eq(STRUCTURE), anyLong());
+            when(consumer.assignment()).thenReturn(java.util.Set.of(STRUCTURE));
+            when(consumer.position(STRUCTURE)).thenAnswer(call -> position.get());
+            var polls = new java.util.concurrent.atomic.AtomicInteger();
+            when(consumer.poll(any(Duration.class))).thenAnswer(call -> {
+                int poll = polls.incrementAndGet();
+                if (poll <= 3) {
+                    assertTrue(java.util.Objects.equals(held, s.marketStructureLatestForTest().get()),
+                        "partial history and its tombstone must not change a connect hello");
+                    verify(socket, never()).sendMessage(any());
+                }
+                if (poll == 4) {
+                    assertTrue(payload.equals(s.marketStructureLatestForTest().get()), "final committed snapshot recovered");
+                    verify(socket, times(1)).sendMessage(any());
+                }
+                if (poll <= 4 && position.get() < poll) {
+                    position.set(poll);
+                    String value = switch (poll) { case 1 -> older; case 2 -> null; case 3 -> payload; default -> live; };
+                    return new ConsumerRecords<>(Map.of(STRUCTURE, List.of(
+                        new ConsumerRecord<String, Object>(STRUCTURE.topic(), 0, poll - 1, "SPX", value))));
+                }
+                s.setRunningForTest(false);
+                return ConsumerRecords.empty();
+            });
+            s.setRunningForTest(true);
+            s.runLiveConsumerAttemptForTest("state-live", Map.of(STRUCTURE.topic(), BINDINGS.get(STRUCTURE.topic())),
+                new java.util.concurrent.atomic.AtomicBoolean(), consumer, retry);
+            assertTrue(live.equals(s.marketStructureLatestForTest().get()), "continuous live delivery resumes after recovery");
+            assertTrue(s.cvdHelloJson().contains("\"structure\":" + live), "hello keeps original prices and event time");
+            var frames = org.mockito.ArgumentCaptor.forClass(org.springframework.web.socket.TextMessage.class);
+            verify(socket, times(2)).sendMessage(frames.capture());
+            assertTrue(frames.getAllValues().get(0).getPayload().contains(payload), "only final recovered snapshot fans out");
+            assertTrue(frames.getAllValues().get(1).getPayload().contains(live), "next fresh event fans out normally");
+        }
     }
 }

@@ -1098,7 +1098,7 @@ public class FeedGatewayService implements ReplayRunner {
      * shared cache window, then the levels resume, then footprint partitions forced to END (G-R8a: the
      * cache consumer alone replays the footprint session); on a first attempt everything starts at END.
      */
-    void liveBootstrapSeek(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions,
+    Map<TopicPartition, Long> liveBootstrapSeek(KafkaConsumer<String, Object> consumer, List<TopicPartition> partitions,
                            Map<String, TopicBinding> topicEvents, boolean retry) {
         if (retry) {
             seekToCacheWindow(consumer, partitions, topicEvents);
@@ -1108,24 +1108,25 @@ public class FeedGatewayService implements ReplayRunner {
             consumer.seekToEnd(partitions);
             seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
         }
-        seekMarketStructureSnapshot(consumer, partitions, topicEvents);
+        Map<TopicPartition, Long> structureEnd = seekMarketStructureSnapshot(consumer, partitions, topicEvents);
         // The auction is positioned by ONE rule on both paths: the live cursor, then the frozen handoff,
         // and with neither the partition is PAUSED rather than consumed from a guessed position. It runs
         // AFTER the generic seek above, whose lazy seekToEnd it deliberately overrides.
         positionEsAuction(consumer, partitions);
+        return structureEnd;
     }
 
     /** The LIVE consumer's adoption seek: the existing per-event rule, then footprint partitions to END. */
-    void liveAdoptionSeek(KafkaConsumer<?, ?> consumer, Refresh refresh, Map<String, TopicBinding> topicEvents) {
+    Map<TopicPartition, Long> liveAdoptionSeek(KafkaConsumer<?, ?> consumer, Refresh refresh, Map<String, TopicBinding> topicEvents) {
         seekAddedLivePartitions(consumer, refresh, topicEvents);
         seekFootprintToEnd(consumer, refresh.added());
-        seekMarketStructureSnapshot(consumer, refresh.added(), topicEvents);
+        return seekMarketStructureSnapshot(consumer, refresh.added(), topicEvents);
     }
 
     /** The live-only structure snapshot may be quiet all night or over a holiday. Recover the
      * retained UI window on cold start, retry and late topic adoption; leave its event time intact.
      * Seven days matches the UI topic's retention floor. Other event cursors are untouched. */
-    void seekMarketStructureSnapshot(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions,
+    Map<TopicPartition, Long> seekMarketStructureSnapshot(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions,
                                      Map<String, TopicBinding> topicEvents) {
         Map<TopicPartition, Long> timestamps = new HashMap<>();
         long cutoff = System.currentTimeMillis() - Duration.ofDays(7).toMillis();
@@ -1133,7 +1134,56 @@ public class FeedGatewayService implements ReplayRunner {
             TopicBinding binding = topicEvents.get(partition.topic());
             if (binding != null && "market-structure".equals(binding.event())) timestamps.put(partition, cutoff);
         }
+        if (timestamps.isEmpty()) return Map.of();
+        Map<TopicPartition, Long> end = consumer.endOffsets(timestamps.keySet());
+        if (!end.keySet().containsAll(timestamps.keySet())) throw new IllegalStateException("structure recovery end offsets missing");
         seekToTimestampsOrEnd(consumer, timestamps, new ArrayList<>());
+        return Map.copyOf(end);
+    }
+
+    /** Historical updates are held privately until the captured committed end offsets are consumed.
+     * Withdrawals and their replacements become visible atomically; only the final value fans out. */
+    static final class MarketStructureRecovery {
+        final Map<TopicPartition, Long> end = new HashMap<>();
+        String json;
+        long asOf;
+        boolean touched, withdrawn;
+        MarketStructureRecovery(String json, long asOf) { this.json = json; this.asOf = asOf; }
+    }
+
+    private synchronized MarketStructureRecovery newMarketStructureRecovery() {
+        return new MarketStructureRecovery(marketStructureLatest.get(), marketStructureAsOfMs);
+    }
+
+    private void stageMarketStructure(MarketStructureRecovery recovery, ConsumerRecord<?, ?> record, String json) {
+        if (record.value() == null) {
+            recovery.json = null;
+            recovery.asOf = -1L;
+            recovery.touched = recovery.withdrawn = true;
+            marketStructureDrops.incrementAndGet();
+            return;
+        }
+        Long asOf = validateMarketStructure(json);
+        if (asOf == null) marketStructureDrops.incrementAndGet();
+        else if (asOf < recovery.asOf) marketStructureRegressions.incrementAndGet();
+        else {
+            recovery.json = json;
+            recovery.asOf = asOf;
+            recovery.touched = true;
+        }
+    }
+
+    private synchronized void finishMarketStructureRecovery(KafkaConsumer<?, ?> consumer, MarketStructureRecovery recovery) {
+        if (recovery.end.isEmpty() || !caughtUp(consumer, recovery.end)) return;
+        if (recovery.touched && (recovery.withdrawn || recovery.asOf >= marketStructureAsOfMs)) {
+            marketStructureAsOfMs = recovery.asOf;
+            marketStructureLatest.set(recovery.json);
+            if (recovery.json != null) {
+                broadcast("market-structure", recovery.json);
+                forwardedEvents.incrementAndGet();
+            }
+        }
+        recovery.end.clear();
     }
 
     /** Test seam: a Refresh describing partitions adopted on newly appeared topics. */
@@ -3558,7 +3608,8 @@ public class FeedGatewayService implements ReplayRunner {
     ) {
         try (KafkaConsumer<String, Object> consumer = newLiveConsumer(name, avro)) {
             List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
-            liveBootstrapSeek(consumer, partitions, topicEvents, retry);
+            MarketStructureRecovery structureRecovery = newMarketStructureRecovery();
+            structureRecovery.end.putAll(liveBootstrapSeek(consumer, partitions, topicEvents, retry));
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             while (running.get()) {
                 pauseEsAuctionOnIncarnationChange(consumer, partitions);
@@ -3567,7 +3618,11 @@ public class FeedGatewayService implements ReplayRunner {
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
-                    liveAdoptionSeek(consumer, refresh, topicEvents);
+                    Map<TopicPartition, Long> addedStructureEnd = liveAdoptionSeek(consumer, refresh, topicEvents);
+                    if (!addedStructureEnd.isEmpty()) {
+                        if (structureRecovery.end.isEmpty()) structureRecovery = newMarketStructureRecovery();
+                        structureRecovery.end.putAll(addedStructureEnd);
+                    }
                 }
                 // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
                 // is only read by dumpDiagnosticState() to distinguish "consumers polling" from "forward gate stuck".
@@ -3622,6 +3677,10 @@ public class FeedGatewayService implements ReplayRunner {
                             continue;
                         }
                         json = enrichJson(rawJson, binding);
+                    }
+                    if (binding != null && "market-structure".equals(binding.event()) && !structureRecovery.end.isEmpty()) {
+                        stageMarketStructure(structureRecovery, record, json);
+                        continue;
                     }
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
@@ -4132,6 +4191,7 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                     }
                 }
+                finishMarketStructureRecovery(consumer, structureRecovery);
                 purgeExpiredCache(System.currentTimeMillis());
                 if (settings.ibkrPreOpenEnabled()) {
                     // Consumer-local window transitions fire from the live loop too — either
