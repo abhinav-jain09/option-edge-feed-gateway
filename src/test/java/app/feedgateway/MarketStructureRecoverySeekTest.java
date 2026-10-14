@@ -156,4 +156,61 @@ class MarketStructureRecoverySeekTest {
         }
               }
 }
+    @Test
+    @SuppressWarnings("unchecked")
+    void lateTopicAdoptionHydratesPrivatelyThroughTheProductionPollLoop() throws Exception {
+        GatewaySettings settings = spy(new GatewaySettings());
+        doReturn(true).when(settings).marketStructureEnabled();
+        doReturn(STRUCTURE.topic()).when(settings).marketStructureTopic();
+        doReturn(0L).when(settings).partitionMetadataRefreshMs();
+        var s = spy(new FeedGatewayService(settings, new ObjectMapper(), new HpsfGatewayViewMapper(), null));
+        KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
+        // Start with only the already-existing topic. Refresh/assign/adoption/seek and all
+        // following polls use production code, so omitting the adoption ledger breaks this test.
+        doAnswer(call -> { consumer.assign(List.of(OTHER)); return List.of(OTHER); })
+            .when(s).bootstrapAssign(anyString(), same(consumer), anyMap());
+        Node node = new Node(1, "b", 9092);
+        when(consumer.listTopics(any(Duration.class))).thenReturn(Map.of(
+            STRUCTURE.topic(), List.of(new PartitionInfo(STRUCTURE.topic(), 0, node, new Node[]{node}, new Node[]{node})),
+            OTHER.topic(), List.of(new PartitionInfo(OTHER.topic(), 0, node, new Node[]{node}, new Node[]{node}))));
+        when(consumer.offsetsForTimes(anyMap())).thenReturn(Map.of(STRUCTURE, new OffsetAndTimestamp(0, 1)));
+        when(consumer.endOffsets(anyCollection(), any(Duration.class))).thenReturn(Map.of(STRUCTURE, 2L));
+        var position = new java.util.concurrent.atomic.AtomicLong();
+        doAnswer(call -> { position.set(2); return null; }).when(consumer).seekToEnd(anyCollection());
+        doAnswer(call -> { position.set(call.getArgument(1)); return null; }).when(consumer).seek(eq(STRUCTURE), anyLong());
+        when(consumer.assignment()).thenReturn(java.util.Set.of(STRUCTURE, OTHER));
+        when(consumer.position(STRUCTURE)).thenAnswer(call -> position.get());
+        s.runOutboundWritesInline();
+        var socket = mock(org.springframework.web.socket.WebSocketSession.class);
+        when(socket.getId()).thenReturn("late-structure");
+        when(socket.isOpen()).thenReturn(true);
+        s.addClient(socket);
+        clearInvocations(socket);
+        String old = "{\"schemaVersion\":1,\"service\":\"market-structure\",\"state\":\"OK\",\"asOfMs\":100}";
+        String latest = old.replace("100", "200");
+        var polls = new java.util.concurrent.atomic.AtomicInteger();
+        when(consumer.poll(any(Duration.class))).thenAnswer(call -> {
+            int poll = polls.incrementAndGet();
+            if (poll <= 3) {
+                assertNull(s.marketStructureLatestForTest().get(), "adoption must not expose partial history in hello");
+                verify(socket, never()).sendMessage(any());
+            }
+            if (poll == 1) return ConsumerRecords.empty();
+            if (poll == 2 || poll == 3) {
+                position.set(poll - 1);
+                return new ConsumerRecords<>(Map.of(STRUCTURE, List.of(
+                    new ConsumerRecord<String, Object>(STRUCTURE.topic(), 0, poll - 2, "SPX", poll == 2 ? old : latest))));
+            }
+            s.setRunningForTest(false);
+            return ConsumerRecords.empty();
+        });
+        s.setRunningForTest(true);
+        s.runLiveConsumerAttemptForTest("state-live", BINDINGS, new java.util.concurrent.atomic.AtomicBoolean(), consumer, false);
+        assertEquals(latest, s.marketStructureLatestForTest().get());
+        var frame = org.mockito.ArgumentCaptor.forClass(org.springframework.web.socket.TextMessage.class);
+        verify(socket, times(1)).sendMessage(frame.capture());
+        assertTrue(frame.getValue().getPayload().contains(latest));
+        assertTrue(s.cvdHelloJson().contains("\"structure\":" + latest));
+    }
+
 }
