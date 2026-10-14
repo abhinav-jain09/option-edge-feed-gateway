@@ -78,6 +78,18 @@ class MarketStructureWiringTest {
     }
 
     @Test
+    void completeSessionSizeIsAdmittedButTheUtf8CeilingIsExact() {
+        var s = service();
+        String template = ok(7).replace("\"events\":[]", "\"events\":[],\"pad\":\"\"");
+        int padding = 128 * 1024 - template.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        String atLimit = template.replace("\"pad\":\"\"", "\"pad\":\"" + "x".repeat(padding) + "\"");
+        assertEquals(7L, s.validateMarketStructure(atLimit));
+        assertNull(s.validateMarketStructure(atLimit + " "));
+        String unicodeOverLimit = atLimit.replaceFirst("x", "é");
+        assertNull(s.validateMarketStructure(unicodeOverLimit), "the bound counts UTF-8 bytes, not characters");
+    }
+
+    @Test
     void retentionKeepsTheNewestAsOfAndRefusesARegression() {
         var s = service();
         assertTrue(s.retainMarketStructure(100L, ok(100L)));

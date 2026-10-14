@@ -1108,6 +1108,7 @@ public class FeedGatewayService implements ReplayRunner {
             consumer.seekToEnd(partitions);
             seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
         }
+        seekMarketStructureSnapshot(consumer, partitions, topicEvents);
         // The auction is positioned by ONE rule on both paths: the live cursor, then the frozen handoff,
         // and with neither the partition is PAUSED rather than consumed from a guessed position. It runs
         // AFTER the generic seek above, whose lazy seekToEnd it deliberately overrides.
@@ -1118,6 +1119,21 @@ public class FeedGatewayService implements ReplayRunner {
     void liveAdoptionSeek(KafkaConsumer<?, ?> consumer, Refresh refresh, Map<String, TopicBinding> topicEvents) {
         seekAddedLivePartitions(consumer, refresh, topicEvents);
         seekFootprintToEnd(consumer, refresh.added());
+        seekMarketStructureSnapshot(consumer, refresh.added(), topicEvents);
+    }
+
+    /** The live-only structure snapshot may be quiet all night or over a holiday. Recover the
+     * retained UI window on cold start, retry and late topic adoption; leave its event time intact.
+     * Seven days matches the UI topic's retention floor. Other event cursors are untouched. */
+    void seekMarketStructureSnapshot(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions,
+                                     Map<String, TopicBinding> topicEvents) {
+        Map<TopicPartition, Long> timestamps = new HashMap<>();
+        long cutoff = System.currentTimeMillis() - Duration.ofDays(7).toMillis();
+        for (TopicPartition partition : partitions) {
+            TopicBinding binding = topicEvents.get(partition.topic());
+            if (binding != null && "market-structure".equals(binding.event())) timestamps.put(partition, cutoff);
+        }
+        seekToTimestampsOrEnd(consumer, timestamps, new ArrayList<>());
     }
 
     /** Test seam: a Refresh describing partitions adopted on newly appeared topics. */
@@ -12363,7 +12379,9 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     // ── STRUCTURE (market-structure.levels v1) boundary + retention ────────────────────────────
-    static final int MARKET_STRUCTURE_MAX_BYTES = 65536;
+    // A complete session projection with retained swing history exceeds 64 KiB.
+    // Keep a strict pre-parse bound while admitting the producer's ~101 KiB final snapshot.
+    static final int MARKET_STRUCTURE_MAX_BYTES = 128 * 1024;
     /**
      * Strict reader for every RAW, hello-embedded record (market-structure AND es-cvd-spx-levels): a
      * body with TRAILING TOKENS ("{…}null") must never be retained — the raw string is concatenated
