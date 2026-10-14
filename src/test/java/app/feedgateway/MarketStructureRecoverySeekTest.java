@@ -87,6 +87,7 @@ class MarketStructureRecoverySeekTest {
     @SuppressWarnings("unchecked")
     void coldAndRetryRecoveryPublishOnlyTheFinalSnapshotAndKeepTombstonesPrivate() throws Exception {
         for (boolean retry : List.of(false, true)) {
+          for (boolean terminalTombstone : List.of(false, true)) {
             var s = service();
             String payload = "{\"schemaVersion\":1,\"service\":\"market-structure\",\"state\":\"OK\","
                 + "\"sessionDate\":\"2026-10-13\",\"asOfMs\":1791921600000,\"sessionEnded\":true,"
@@ -108,25 +109,27 @@ class MarketStructureRecoverySeekTest {
             when(consumer.listTopics(any(Duration.class))).thenReturn(Map.of(STRUCTURE.topic(),
                 List.of(new PartitionInfo(STRUCTURE.topic(), 0, node, new Node[]{node}, new Node[]{node}))));
             when(consumer.offsetsForTimes(anyMap())).thenReturn(Map.of(STRUCTURE, new OffsetAndTimestamp(0, 1)));
-            when(consumer.endOffsets(anyCollection())).thenReturn(Map.of(STRUCTURE, 3L));
+            long capturedEnd = terminalTombstone ? 2L : 3L;
+            when(consumer.endOffsets(anyCollection(), any(Duration.class))).thenReturn(Map.of(STRUCTURE, capturedEnd));
             var position = new java.util.concurrent.atomic.AtomicLong();
-            doAnswer(call -> { position.set(3); return null; }).when(consumer).seekToEnd(anyCollection());
+            doAnswer(call -> { position.set(capturedEnd); return null; }).when(consumer).seekToEnd(anyCollection());
             doAnswer(call -> { position.set(call.getArgument(1)); return null; }).when(consumer).seek(eq(STRUCTURE), anyLong());
             when(consumer.assignment()).thenReturn(java.util.Set.of(STRUCTURE));
             when(consumer.position(STRUCTURE)).thenAnswer(call -> position.get());
             var polls = new java.util.concurrent.atomic.AtomicInteger();
             when(consumer.poll(any(Duration.class))).thenAnswer(call -> {
                 int poll = polls.incrementAndGet();
-                if (poll <= 3) {
+                if (poll <= capturedEnd) {
                     assertTrue(java.util.Objects.equals(held, s.marketStructureLatestForTest().get()),
                         "partial history and its tombstone must not change a connect hello");
                     verify(socket, never()).sendMessage(any());
                 }
-                if (poll == 4) {
-                    assertTrue(payload.equals(s.marketStructureLatestForTest().get()), "final committed snapshot recovered");
-                    verify(socket, times(1)).sendMessage(any());
+                if (poll == capturedEnd + 1) {
+                    assertTrue(java.util.Objects.equals(terminalTombstone ? null : payload, s.marketStructureLatestForTest().get()),
+                        "final committed snapshot or withdrawal recovered");
+                    verify(socket, times(terminalTombstone ? 0 : 1)).sendMessage(any());
                 }
-                if (poll <= 4 && position.get() < poll) {
+                if (poll <= capturedEnd + (terminalTombstone ? 0 : 1) && position.get() < poll) {
                     position.set(poll);
                     String value = switch (poll) { case 1 -> older; case 2 -> null; case 3 -> payload; default -> live; };
                     return new ConsumerRecords<>(Map.of(STRUCTURE, List.of(
@@ -138,6 +141,12 @@ class MarketStructureRecoverySeekTest {
             s.setRunningForTest(true);
             s.runLiveConsumerAttemptForTest("state-live", Map.of(STRUCTURE.topic(), BINDINGS.get(STRUCTURE.topic())),
                 new java.util.concurrent.atomic.AtomicBoolean(), consumer, retry);
+            if (terminalTombstone) {
+                assertNull(s.marketStructureLatestForTest().get(), "an authoritative final withdrawal clears the complete hello");
+                verify(socket, never()).sendMessage(any());
+                assertTrue(s.retainMarketStructure(1791921500000L, older), "a withdrawal resets the retention clock");
+                continue;
+            }
             assertTrue(live.equals(s.marketStructureLatestForTest().get()), "continuous live delivery resumes after recovery");
             assertTrue(s.cvdHelloJson().contains("\"structure\":" + live), "hello keeps original prices and event time");
             var frames = org.mockito.ArgumentCaptor.forClass(org.springframework.web.socket.TextMessage.class);
@@ -145,5 +154,6 @@ class MarketStructureRecoverySeekTest {
             assertTrue(frames.getAllValues().get(0).getPayload().contains(payload), "only final recovered snapshot fans out");
             assertTrue(frames.getAllValues().get(1).getPayload().contains(live), "next fresh event fans out normally");
         }
-    }
+              }
+}
 }
