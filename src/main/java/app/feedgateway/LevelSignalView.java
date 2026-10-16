@@ -18,7 +18,7 @@ final class LevelSignalView {
                  long barEndMs, String relation, List<Signal> signals) { }
     record Reading(int schemaVersion, String source, String sessionDate, String timeframe,
                    long generatedAtMs, long validUntilMs, long structureAsOfMs, String status,
-                   String reason, List<Level> levels) { }
+                   String reason, List<Level> levels, long contextAsOfMs, List<Signal> context) { }
     private record Snapshot(JsonNode root, JsonNode frame, JsonNode bar, long start, long end, long validUntil) { }
 
     static boolean validRequest(String date, String tf) {
@@ -27,7 +27,7 @@ final class LevelSignalView {
     }
     static Reading read(ObjectMapper mapper, String structureJson, String spxJson, String esJson,
                         String date, String tf, long now) {
-        Reading absent = new Reading(1, SOURCE, date, tf, now, now, 0, "UNAVAILABLE", "Fresh structure unavailable", List.of());
+        Reading absent = new Reading(1, SOURCE, date, tf, now, now, 0, "UNAVAILABLE", "Fresh structure unavailable", List.of(), 0, List.of());
         if (!validRequest(date, tf)) return absent;
         try {
             JsonNode structure = parse(mapper, structureJson);
@@ -62,24 +62,31 @@ final class LevelSignalView {
                         && stamp(bias.path("evaluatedAt")) == spx.end) {
                     signals.add(new Signal("SPX","BIAS", verdict.charAt(0) + verdict.substring(1).toLowerCase(Locale.ROOT) + " bias"));
                 }
-                String aligned = text(spx.root,"alignedDirection");
-                if (List.of("BULLISH","BEARISH").contains(aligned)) signals.add(new Signal("SPX","ALIGNMENT",
-                        aligned.equals("BULLISH") ? "Bullish timeframe alignment" : "Bearish timeframe alignment"));
-                JsonNode confluence=spx.root.path("confluence");
-                List<String> counts=List.of("bullish","bearish","neutral","unreliable");
-                if (counts.stream().allMatch(k->integer(confluence.path(k))>=0 && integer(confluence.path(k))<=6)
-                        && counts.stream().mapToLong(k->integer(confluence.path(k))).sum()==6)
-                    signals.add(new Signal("SPX","CONFLUENCE","TF: " + confluence.path("bullish").intValue() + " bull / "
-                            + confluence.path("bearish").intValue() + " bear / " + confluence.path("neutral").intValue()
-                            + " neutral / " + confluence.path("unreliable").intValue() + " unavailable"));
+                if (signals.size() > 12) return absent;
                 String side = spx.bar.path("close").doubleValue() > p ? "above" : spx.bar.path("close").doubleValue() < p ? "below" : "at";
                 out.add(new Level(id,p,role,"TESTED",spx.start,spx.end,"Closed " + side + " " + role.toLowerCase(Locale.ROOT),List.copyOf(signals)));
             }
             long until = Math.min(asOf + STRUCTURE_TTL, spx == null ? now + 5_000 : spx.validUntil);
             if (es != null) until = Math.min(until, es.validUntil);
             return new Reading(1,SOURCE,date,tf,now,until,asOf,spx == null ? "PARTIAL" : "READY",
-                    spx == null ? "Fresh complete SPX indicator bar unavailable" : "Closed-bar evidence; ES labels are futures context",List.copyOf(out));
+                    spx == null ? "Fresh complete SPX indicator bar unavailable" : "Closed-bar evidence; ES labels are futures context",List.copyOf(out),
+                    spx == null ? 0 : stamp(spx.root.path("asOfEventTime")), context(spx));
         } catch (RuntimeException e) {return absent;}
+    }
+    private static List<Signal> context(Snapshot spx) {
+        if (spx == null) return List.of();
+        List<Signal> context=new ArrayList<>();
+        String aligned=text(spx.root,"alignedDirection");
+        if (List.of("BULLISH","BEARISH").contains(aligned)) context.add(new Signal("SPX","ALIGNMENT",
+                aligned.equals("BULLISH") ? "Bullish timeframe alignment" : "Bearish timeframe alignment"));
+        JsonNode confluence=spx.root.path("confluence");
+        List<String> counts=List.of("bullish","bearish","neutral","unreliable");
+        if (counts.stream().allMatch(k->integer(confluence.path(k))>=0 && integer(confluence.path(k))<=6)
+                && counts.stream().mapToLong(k->integer(confluence.path(k))).sum()==6)
+            context.add(new Signal("SPX","CONFLUENCE","TF: " + confluence.path("bullish").intValue() + " bull / "
+                    + confluence.path("bearish").intValue() + " bear / " + confluence.path("neutral").intValue()
+                    + " neutral / " + confluence.path("unreliable").intValue() + " unreliable"));
+        return List.copyOf(context);
     }
     private static void evidence(List<Signal> out, Snapshot snapshot, String role, String source) {
         JsonNode exhaustion = snapshot.frame.path("exhaustion");

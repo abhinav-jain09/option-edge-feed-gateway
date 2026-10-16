@@ -93,14 +93,19 @@ class LevelSignalViewTest {
         assertTrue(LevelSignalView.read(M,structure()+"{}",null,null,DATE,TF,NOW).levels().isEmpty());
         assertFalse(LevelSignalView.validRequest("2026-02-30",TF));assertFalse(LevelSignalView.validRequest(DATE,"30s"));
     }
-    @Test void timeframeAgreementPassesThroughProducerCountsAndAlignment() {
+    @Test void timeframeAgreementIsSeparateSnapshotContextWithProducerCounts() {
         var s=snapshot("SPX").put("alignedDirection","BEARISH");
         s.putObject("confluence").put("bullish",1).put("bearish",3).put("neutral",1).put("unreliable",1);
-        var signals=read(structure(),s,null).levels().getFirst().signals();
-        assertTrue(signals.stream().anyMatch(v->v.name().equals("ALIGNMENT") && v.text().equals("Bearish timeframe alignment")));
-        assertTrue(signals.stream().anyMatch(v->v.name().equals("CONFLUENCE") && v.text().equals("TF: 1 bull / 3 bear / 1 neutral / 1 unavailable")));
-        ((ObjectNode)s.path("confluence")).put("bearish",9);
-        assertFalse(read(structure(),s,null).levels().getFirst().signals().stream().anyMatch(v->v.name().equals("CONFLUENCE")));
+        var reading=read(structure(),s,null);
+        assertEquals(NOW,reading.contextAsOfMs());
+        assertTrue(reading.context().stream().anyMatch(v->v.name().equals("ALIGNMENT") && v.text().equals("Bearish timeframe alignment")));
+        assertTrue(reading.context().stream().anyMatch(v->v.name().equals("CONFLUENCE") && v.text().equals("TF: 1 bull / 3 bear / 1 neutral / 1 unreliable")));
+        assertFalse(reading.levels().getFirst().signals().stream().anyMatch(v->List.of("ALIGNMENT","CONFLUENCE").contains(v.name())));
+        for(int bearish:List.of(1,9)) {
+            ((ObjectNode)s.path("confluence")).put("bearish",bearish);
+            assertFalse(read(structure(),s,null).context().stream().anyMatch(v->v.name().equals("CONFLUENCE")));
+        }
+        for(var l:reading.levels()) assertTrue(l.signals().size()<=12);
     }
     @Test void expirationIsBoundToOldestContributingSource() {
         var es=snapshot("ES").put("asOfEventTime",Instant.ofEpochMilli(NOW-4000).toString());
