@@ -12529,6 +12529,11 @@ public class FeedGatewayService implements ReplayRunner {
         marketStructureDrops.incrementAndGet();
     }
 
+    LevelSignalView.Reading levelSignals(String date, String tf) {
+        return LevelSignalView.read(mapper, settings.marketStructureEnabled() ? marketStructureLatest.get() : null,
+                indicatorsCurrent.get("DATABENTO|SPX"), indicatorsCurrent.get("DATABENTO|ES"), date, tf, System.currentTimeMillis());
+    }
+
     java.util.concurrent.atomic.AtomicReference<String> marketStructureLatestForTest() {
         return marketStructureLatest;
     }
