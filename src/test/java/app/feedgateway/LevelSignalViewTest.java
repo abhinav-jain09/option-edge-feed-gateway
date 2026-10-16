@@ -56,7 +56,7 @@ class LevelSignalViewTest {
     }
     @Test void newlyConfirmedLevelCannotClaimAnEarlierBarTest() {
         var levels=structure();((ObjectNode)levels.path("levels").get(0)).put("sinceMs",END);
-        assertEquals("NOT_TESTED",read(levels,snapshot("SPX"),null).levels().getFirst().state());
+        assertEquals("AWAITING_FULL_BAR",read(levels,snapshot("SPX"),null).levels().getFirst().state());
     }
     @Test void wrongOrStaleOrRestoringSnapshotsCannotProduceConfirmation() {
         List<ObjectNode> bad=new ArrayList<>();
@@ -92,6 +92,15 @@ class LevelSignalViewTest {
         assertTrue(read(duplicate,snapshot("SPX"),null).levels().isEmpty());
         assertTrue(LevelSignalView.read(M,structure()+"{}",null,null,DATE,TF,NOW).levels().isEmpty());
         assertFalse(LevelSignalView.validRequest("2026-02-30",TF));assertFalse(LevelSignalView.validRequest(DATE,"30s"));
+    }
+    @Test void timeframeAgreementPassesThroughProducerCountsAndAlignment() {
+        var s=snapshot("SPX").put("alignedDirection","BEARISH");
+        s.putObject("confluence").put("bullish",1).put("bearish",3).put("neutral",1).put("unreliable",1);
+        var signals=read(structure(),s,null).levels().getFirst().signals();
+        assertTrue(signals.stream().anyMatch(v->v.name().equals("ALIGNMENT") && v.text().equals("Bearish timeframe alignment")));
+        assertTrue(signals.stream().anyMatch(v->v.name().equals("CONFLUENCE") && v.text().equals("TF: 1 bull / 3 bear / 1 neutral / 1 unavailable")));
+        ((ObjectNode)s.path("confluence")).put("bearish",9);
+        assertFalse(read(structure(),s,null).levels().getFirst().signals().stream().anyMatch(v->v.name().equals("CONFLUENCE")));
     }
     @Test void expirationIsBoundToOldestContributingSource() {
         var es=snapshot("ES").put("asOfEventTime",Instant.ofEpochMilli(NOW-4000).toString());

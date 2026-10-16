@@ -46,8 +46,10 @@ final class LevelSignalView {
                 if (!"ACTIVE".equals(text(level, "state")) || !List.of("SUPPORT", "RESISTANCE").contains(role)) continue;
                 double p = level.path("price").doubleValue();
                 if (spx == null) {out.add(new Level(id,p,role,"UNAVAILABLE",0,0,"Indicator evidence unavailable",List.of())); continue;}
-                boolean tested = integer(level.path("sinceMs")) <= spx.start
-                        && spx.bar.path("low").doubleValue() <= p && p <= spx.bar.path("high").doubleValue();
+                if (integer(level.path("sinceMs")) > spx.start) {
+                    out.add(new Level(id,p,role,"AWAITING_FULL_BAR",spx.start,spx.end,"Level activated after this bar began; waiting for next full bar",List.of())); continue;
+                }
+                boolean tested = spx.bar.path("low").doubleValue() <= p && p <= spx.bar.path("high").doubleValue();
                 if (!tested) {out.add(new Level(id,p,role,"NOT_TESTED",spx.start,spx.end,"No test in latest closed SPX bar",List.of())); continue;}
                 List<Signal> signals = new ArrayList<>();
                 evidence(signals, spx, role, "SPX");
@@ -60,6 +62,16 @@ final class LevelSignalView {
                         && stamp(bias.path("evaluatedAt")) == spx.end) {
                     signals.add(new Signal("SPX","BIAS", verdict.charAt(0) + verdict.substring(1).toLowerCase(Locale.ROOT) + " bias"));
                 }
+                String aligned = text(spx.root,"alignedDirection");
+                if (List.of("BULLISH","BEARISH").contains(aligned)) signals.add(new Signal("SPX","ALIGNMENT",
+                        aligned.equals("BULLISH") ? "Bullish timeframe alignment" : "Bearish timeframe alignment"));
+                JsonNode confluence=spx.root.path("confluence");
+                List<String> counts=List.of("bullish","bearish","neutral","unreliable");
+                if (counts.stream().allMatch(k->integer(confluence.path(k))>=0 && integer(confluence.path(k))<=6)
+                        && counts.stream().mapToLong(k->integer(confluence.path(k))).sum()==6)
+                    signals.add(new Signal("SPX","CONFLUENCE","TF: " + confluence.path("bullish").intValue() + " bull / "
+                            + confluence.path("bearish").intValue() + " bear / " + confluence.path("neutral").intValue()
+                            + " neutral / " + confluence.path("unreliable").intValue() + " unavailable"));
                 String side = spx.bar.path("close").doubleValue() > p ? "above" : spx.bar.path("close").doubleValue() < p ? "below" : "at";
                 out.add(new Level(id,p,role,"TESTED",spx.start,spx.end,"Closed " + side + " " + role.toLowerCase(Locale.ROOT),List.copyOf(signals)));
             }
