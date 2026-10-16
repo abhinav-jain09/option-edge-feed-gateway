@@ -326,6 +326,20 @@ public final class GatewaySettings {
     }
 
     /**
+     * Candlestick pattern annotations for the Context Tape PATTERNS layer (processing
+     * CANDLESTICK-PATTERN-REQUIREMENT.md R6.2/R6.4: one {@code PatternAnnotationSet} per timeframe per 1m fold
+     * from the market-structure service, keyed {@code <scheduleId>|<tf>}). OFF by default, the last rollout step;
+     * an absent {@code patterns} field in the hello is how the page learns this gateway has no pattern stream.
+     */
+    public String marketStructurePatternsTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_PATTERNS_TOPIC", "options.spx.market-structure.patterns");
+    }
+
+    public boolean marketStructurePatternsEnabled() {
+        return boolValue("GATEWAY_MARKET_STRUCTURE_PATTERNS_ENABLED", false);
+    }
+
+    /**
      * Early-auction verdict evidence ledger (EARLY-AUCTION-VERDICT-STAGE1-GATE1.md:
      * {@code early-auction.verdicts.shadow}, JSON, ONE partition, one immutable record per line —
      * PREDICTION / OUTCOME / MISS / terminals). Feeds the read-only {@code /early-auction} web panel

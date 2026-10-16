@@ -783,6 +783,16 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong marketStructureRegressions = new AtomicLong();
     /** STRUCTURE retention baseline: asOfMs of the retained record; guarded by the retain lock. -1 = none. */
     private long marketStructureAsOfMs = -1L;
+    /** PATTERNS: latest ACCEPTED market-structure-patterns set PER TIMEFRAME (verbatim), replayed on connect. */
+    private final java.util.concurrent.ConcurrentHashMap<String, String> marketStructurePatternsLatest =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** PATTERNS retention baseline per timeframe: asOfMs of the retained set; guarded by the retain lock. */
+    private final java.util.Map<String, Long> marketStructurePatternsAsOfMs = new java.util.HashMap<>();
+    /** PATTERNS: sets rejected at the boundary (invalid, oversize, tombstone). */
+    private final AtomicLong marketStructurePatternsDrops = new AtomicLong();
+    /** PATTERNS: sets refused because their asOfMs REGRESSED against what is retained for that timeframe. */
+    private final AtomicLong marketStructurePatternsRegressions = new AtomicLong();
+    static final java.util.List<String> MARKET_STRUCTURE_PATTERN_TIMEFRAMES = java.util.List.of("1m", "5m", "15m");
     /** U16 retention baseline: the provenance of the retained record; guarded by the retain lock. */
     private CvdSpxLevelsProvenance cvdSpxLevelsProvenance;
     /** U16: the end offset hydration read to, handed to the live consumer once; -1 = none. */
@@ -2165,6 +2175,15 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP gateway_market_structure_regressions_total market-structure records refused because their asOfMs regressed.\n"
                 + "# TYPE gateway_market_structure_regressions_total counter\n"
                 + "gateway_market_structure_regressions_total " + marketStructureRegressions.get() + "\n"
+                + "# HELP gateway_market_structure_patterns_enabled Whether the market-structure-patterns stream is enabled.\n"
+                + "# TYPE gateway_market_structure_patterns_enabled gauge\n"
+                + "gateway_market_structure_patterns_enabled " + boolMetric(settings.marketStructurePatternsEnabled()) + "\n"
+                + "# HELP gateway_market_structure_patterns_drops_total market-structure-patterns sets dropped at the gateway boundary (invalid, oversize, tombstone).\n"
+                + "# TYPE gateway_market_structure_patterns_drops_total counter\n"
+                + "gateway_market_structure_patterns_drops_total " + marketStructurePatternsDrops.get() + "\n"
+                + "# HELP gateway_market_structure_patterns_regressions_total market-structure-patterns sets refused because their asOfMs regressed.\n"
+                + "# TYPE gateway_market_structure_patterns_regressions_total counter\n"
+                + "gateway_market_structure_patterns_regressions_total " + marketStructurePatternsRegressions.get() + "\n"
                 + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
                 + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
                 + "gateway_cvd_spx_levels_enabled " + boolMetric(settings.esCvdSpxLevelsEnabled()) + "\n"
@@ -2886,6 +2905,13 @@ public class FeedGatewayService implements ReplayRunner {
             // same reasoning as es-cvd-spx-levels: updateCache has no case for it and the event
             // keeps its own latest-record retention for the connect replay.
             topicEvents.put(settings.marketStructureTopic(), new TopicBinding("DATABENTO", "market-structure"));
+        }
+        if (settings.marketStructurePatternsEnabled()) {
+            // PATTERNS: the market-structure service's candlestick pattern sets — LIVE consumer only, same reasoning
+            // as market-structure; the event keeps its own per-timeframe latest-record retention for the hello.
+            // No seek-back: the service republishes all three sets on every 1m fold, so a restart is at most one
+            // minute behind during regular trading hours and shows "no data" outside them, which is accurate.
+            topicEvents.put(settings.marketStructurePatternsTopic(), new TopicBinding("DATABENTO", "market-structure-patterns"));
         }
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
@@ -3701,7 +3727,21 @@ public class FeedGatewayService implements ReplayRunner {
                         evictEsStrikeIntelTombstone(binding, record);
                         evictCvdSpxLevelsTombstone(binding == null ? null : binding.event(), record);
                         evictMarketStructureTombstone(binding == null ? null : binding.event(), record);
+                        evictMarketStructurePatternsTombstone(binding == null ? null : binding.event(), record);
                         noteCvdSpxLevelsProgress(binding, record);
+                        continue;
+                    }
+                    if ("market-structure-patterns".equals(binding.event())) {
+                        // PATTERNS: one PatternAnnotationSet per timeframe, delivered VERBATIM. Boundary checks only
+                        // — size, envelope, a timeframe, a monotonic asOfMs per timeframe — the page's model validates
+                        // the full contract and hides the layer on anything malformed.
+                        PatternSetBoundary b = validateMarketStructurePatterns(json);
+                        if (b == null) {
+                            marketStructurePatternsDrops.incrementAndGet();
+                        } else if (retainMarketStructurePatterns(b.timeframe(), b.asOfMs(), json)) {
+                            broadcast(binding.event(), json);
+                            forwardedEvents.incrementAndGet();
+                        }
                         continue;
                     }
                     if (!isTrustedIndexPrice(binding, json) || !isValidSpxPrice(binding, json)) {
@@ -10491,6 +10531,7 @@ public class FeedGatewayService implements ReplayRunner {
         return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
                 || "es-cvd-spx-levels".equals(event)
                 || "market-structure".equals(event)
+                || "market-structure-patterns".equals(event)
                 || "es-auction".equals(event)
                 || isFootprintEvent(event)
                 // The vol-premium records are the producer's contract, validated whole and forwarded
@@ -12546,6 +12587,74 @@ public class FeedGatewayService implements ReplayRunner {
         return marketStructureRegressions.get();
     }
 
+    // ── PATTERNS (market-structure PatternAnnotationSet v1) boundary + retention ──────────────────
+    /** The requirement's PATTERN_SET_MAX_BYTES (R6.4): 1 048 576 − 4 096. */
+    static final int MARKET_STRUCTURE_PATTERNS_MAX_BYTES = 1_048_576 - 4_096;
+
+    /** What the boundary learned about an accepted set: its timeframe and its clock. */
+    record PatternSetBoundary(String timeframe, long asOfMs) { }
+
+    /**
+     * PATTERNS boundary gate (R6.4 / D3): oversize bodies (pre-parse, UTF-8 length), non-objects, a schema major
+     * other than 1, a service other than {@code market-structure}, a state outside {OK, UNAVAILABLE}, a timeframe
+     * outside {1m, 5m, 15m}, trailing tokens, and a missing or non-positive JS-exact {@code asOfMs} are refused.
+     * The page validates the full contract and hides the layer on anything malformed, so a set this gate passes
+     * can never be PARTIALLY drawn.
+     */
+    PatternSetBoundary validateMarketStructurePatterns(String json) {
+        if (json == null) return null;
+        if (json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > MARKET_STRUCTURE_PATTERNS_MAX_BYTES) return null;
+        try {
+            com.fasterxml.jackson.databind.JsonNode n = strictTreeReader().readValue(json);
+            if (n == null || !n.isObject()) return null;
+            if (!n.path("schemaVersion").isIntegralNumber() || n.path("schemaVersion").asLong(-1) != 1L) return null;
+            if (!"market-structure".equals(n.path("service").asText(""))) return null;
+            String state = n.path("state").asText("");
+            if (!"OK".equals(state) && !"UNAVAILABLE".equals(state)) return null;
+            String tf = n.path("timeframe").asText("");
+            if (!MARKET_STRUCTURE_PATTERN_TIMEFRAMES.contains(tf)) return null;
+            Long asOfMs = levelsInt(n, "asOfMs");
+            if (asOfMs == null || asOfMs <= 0) return null;
+            return new PatternSetBoundary(tf, asOfMs);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** PATTERNS retention: per timeframe, the newest asOfMs wins; an older set is refused, counted, forwarded nowhere. */
+    synchronized boolean retainMarketStructurePatterns(String timeframe, long asOfMs, String json) {
+        Long have = marketStructurePatternsAsOfMs.get(timeframe);
+        if (have != null && have > asOfMs) {
+            marketStructurePatternsRegressions.incrementAndGet();
+            return false;
+        }
+        marketStructurePatternsAsOfMs.put(timeframe, asOfMs);
+        marketStructurePatternsLatest.put(timeframe, json);
+        return true;
+    }
+
+    /** PATTERNS withdrawal: a TOMBSTONE of this event under any key erases every timeframe's retention and baseline. */
+    synchronized void evictMarketStructurePatternsTombstone(String event, org.apache.kafka.clients.consumer.ConsumerRecord<String, ?> record) {
+        if (!"market-structure-patterns".equals(event)) return;
+        if (record.value() == null) {
+            marketStructurePatternsLatest.clear();
+            marketStructurePatternsAsOfMs.clear();
+        }
+        marketStructurePatternsDrops.incrementAndGet();
+    }
+
+    String marketStructurePatternsLatestForTest(String timeframe) {
+        return marketStructurePatternsLatest.get(timeframe);
+    }
+
+    long marketStructurePatternsDropsForTest() {
+        return marketStructurePatternsDrops.get();
+    }
+
+    long marketStructurePatternsRegressionsForTest() {
+        return marketStructurePatternsRegressions.get();
+    }
+
     java.util.concurrent.atomic.AtomicReference<String> cvdSpxLevelsLatestForTest() {
         return cvdSpxLevelsLatest;
     }
@@ -12564,6 +12673,7 @@ public class FeedGatewayService implements ReplayRunner {
         // STRUCTURE joins the hello too. Kept as its own line so the recorded footprint campaign's
         // G-R6.2 mutation (which drops the footprint term from the line below) still applies verbatim.
         if (settings.marketStructureEnabled()) return true;
+        if (settings.marketStructurePatternsEnabled()) return true;      // PATTERNS joins the hello too
         return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || footprintViews != null;
     }
 
@@ -12593,6 +12703,18 @@ public class FeedGatewayService implements ReplayRunner {
             // presence tells the page this gateway has a structure stream (absent = flag off).
             String structure = marketStructureLatest.get();
             sb.append(",\"structure\":").append(structure == null ? "null" : structure);
+        }
+        if (settings.marketStructurePatternsEnabled()) {
+            // PATTERNS: one entry per timeframe, verbatim set or an explicit null; the FIELD's presence tells the
+            // page this gateway has a pattern stream (absent = flag off).
+            sb.append(",\"patterns\":{");
+            for (int i = 0; i < MARKET_STRUCTURE_PATTERN_TIMEFRAMES.size(); i++) {
+                String tf = MARKET_STRUCTURE_PATTERN_TIMEFRAMES.get(i);
+                String set = marketStructurePatternsLatest.get(tf);
+                if (i > 0) sb.append(',');
+                sb.append('"').append(tf).append("\":").append(set == null ? "null" : set);
+            }
+            sb.append('}');
         }
         if (footprintViews != null) {
             // G-R6: ONE atomic snapshot of the footprint coordinator rides the SAME hello; the field's
@@ -13800,6 +13922,8 @@ public class FeedGatewayService implements ReplayRunner {
      */
     static final Set<String> GLOBAL_BROADCAST_EVENTS = Set.of(
             "status", "reset", "source-switching", "source-ready", "source-stale",
+            // Candlestick pattern annotation sets (market-structure service): global, verbatim, flag-gated.
+            "market-structure-patterns",
             // Pre-open IBKR GEX window state (rev13 R-STATE): a GLOBAL control/status stream —
             // identical for all users, sessionId-gated client-side. Allowlisted so the
             // standalone broadcast reaches sockets in per-session (auth) mode too
