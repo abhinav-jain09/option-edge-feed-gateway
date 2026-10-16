@@ -12674,8 +12674,8 @@ public class FeedGatewayService implements ReplayRunner {
     /** The timeframe a patterns record key names (the producer's contract: {@code <scheduleId>|<tf>}), or null. */
     static String marketStructurePatternsKeyTimeframe(String key) {
         if (key == null) return null;
-        int bar = key.lastIndexOf('|');
-        if (bar <= 0 || bar == key.length() - 1) return null;
+        int bar = key.indexOf('|');
+        if (bar <= 0 || bar != key.lastIndexOf('|') || bar == key.length() - 1) return null;   // exactly ONE delimiter, both sides non-empty
         String tf = key.substring(bar + 1);
         return MARKET_STRUCTURE_PATTERN_TIMEFRAMES.contains(tf) ? tf : null;
     }

@@ -128,7 +128,52 @@ class MarketStructurePatternsWiringTest {
         assertNull(FeedGatewayService.marketStructurePatternsKeyTimeframe("2026-10-16.r0000000000|30m"));
         assertNull(FeedGatewayService.marketStructurePatternsKeyTimeframe("|1m"));
         assertNull(FeedGatewayService.marketStructurePatternsKeyTimeframe("2026-10-16|"));
+        assertNull(FeedGatewayService.marketStructurePatternsKeyTimeframe("bad|extra|1m"), "exactly one delimiter: a second one is not the producer's key");
+        assertNull(FeedGatewayService.marketStructurePatternsKeyTimeframe("1m"), "no delimiter");
+        assertNull(FeedGatewayService.marketStructurePatternsKeyTimeframe("||1m"));
+        assertNull(FeedGatewayService.marketStructurePatternsKeyTimeframe("1m|2026-10-16"), "the timeframe is the SECOND field");
         assertEquals("15m", FeedGatewayService.marketStructurePatternsKeyTimeframe("2026-10-16.r0000000000|15m"));
+        // and a multi-delimiter tombstone withdraws nothing
+        s.evictMarketStructurePatternsTombstone("market-structure-patterns",
+                new ConsumerRecord<>("options.spx.market-structure.patterns", 0, 5L, "bad|extra|1m", null));
+        assertNotNull(s.marketStructurePatternsLatestForTest("1m"), "a malformed multi-delimiter key fails CLOSED: nothing withdrawn");
+    }
+
+    /** Every boundary predicate isolated: a set valid in every other field fails on exactly the mutated one. */
+    @Test
+    void boundaryRejectsEachPredicateInIsolation() {
+        var s = service();
+        String base = ok("5m", 1786900000000L);
+        assertNotNull(s.validateMarketStructurePatterns(base), "the base set passes");
+        String[][] mutants = {
+            {"schemaVersion missing", base.replace("\"schemaVersion\":1,", "")},
+            {"schemaVersion 2", base.replace("\"schemaVersion\":1,", "\"schemaVersion\":2,")},
+            {"schemaVersion fractional", base.replace("\"schemaVersion\":1,", "\"schemaVersion\":1.0,")},
+            {"schemaVersion text", base.replace("\"schemaVersion\":1,", "\"schemaVersion\":\"1\",")},
+            {"service missing", base.replace("\"service\":\"market-structure\",", "")},
+            {"service other", base.replace("\"service\":\"market-structure\",", "\"service\":\"context-tape\",")},
+            {"service non-string", base.replace("\"service\":\"market-structure\",", "\"service\":7,")},
+            {"state missing", base.replace("\"state\":\"OK\",", "")},
+            {"state invalid", base.replace("\"state\":\"OK\",", "\"state\":\"HALF\",")},
+            {"state non-string", base.replace("\"state\":\"OK\",", "\"state\":true,")},
+            {"timeframe missing", base.replace("\"timeframe\":\"5m\",", "")},
+            {"timeframe 30m", base.replace("\"timeframe\":\"5m\",", "\"timeframe\":\"30m\",")},
+            {"timeframe non-string", base.replace("\"timeframe\":\"5m\",", "\"timeframe\":5,")},
+            {"asOfMs missing", base.replace("\"asOfMs\":1786900000000,", "")},
+            {"asOfMs zero", base.replace("\"asOfMs\":1786900000000,", "\"asOfMs\":0,")},
+            {"asOfMs negative", base.replace("\"asOfMs\":1786900000000,", "\"asOfMs\":-5,")},
+            {"asOfMs fractional", base.replace("\"asOfMs\":1786900000000,", "\"asOfMs\":1786900000000.5,")},
+            {"asOfMs text", base.replace("\"asOfMs\":1786900000000,", "\"asOfMs\":\"1786900000000\",")},
+            {"asOfMs JS-unsafe", base.replace("\"asOfMs\":1786900000000,", "\"asOfMs\":9007199254740992,")},
+            {"trailing token", base + "1"},
+            {"array body", "[" + base + "]"},
+            {"not json", "{" + base},
+            {"empty", ""}
+        };
+        for (String[] m : mutants) {
+            assertFalse(m[1].equals(base), m[0] + ": the mutation must change the body");
+            assertNull(s.validateMarketStructurePatterns(m[1]), m[0] + " must be refused");
+        }
     }
 
     @Test
