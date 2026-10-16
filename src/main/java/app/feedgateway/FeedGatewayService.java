@@ -783,11 +783,15 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong marketStructureRegressions = new AtomicLong();
     /** STRUCTURE retention baseline: asOfMs of the retained record; guarded by the retain lock. -1 = none. */
     private long marketStructureAsOfMs = -1L;
-    /** PATTERNS: latest ACCEPTED market-structure-patterns set PER TIMEFRAME (verbatim), replayed on connect. */
-    private final java.util.concurrent.ConcurrentHashMap<String, String> marketStructurePatternsLatest =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    /** PATTERNS retention baseline per timeframe: asOfMs of the retained set; guarded by the retain lock. */
-    private final java.util.Map<String, Long> marketStructurePatternsAsOfMs = new java.util.HashMap<>();
+    /** PATTERNS: one retained set per timeframe — its clock and its verbatim bytes. */
+    record PatternEntry(long asOfMs, String json) { }
+    /**
+     * PATTERNS: the latest ACCEPTED set PER TIMEFRAME as ONE immutable snapshot. Writers (retain, keyed tombstone,
+     * recovery promotion) replace it under the retain lock; the hello reads it ONCE, so a page never sees a
+     * pre-tombstone entry beside a post-tombstone null (Codex gateway round 1 #4).
+     */
+    private final java.util.concurrent.atomic.AtomicReference<java.util.Map<String, PatternEntry>> marketStructurePatternsSnapshot =
+            new java.util.concurrent.atomic.AtomicReference<>(java.util.Map.of());
     /** PATTERNS: sets rejected at the boundary (invalid, oversize, tombstone). */
     private final AtomicLong marketStructurePatternsDrops = new AtomicLong();
     /** PATTERNS: sets refused because their asOfMs REGRESSED against what is retained for that timeframe. */
@@ -1132,30 +1136,44 @@ public class FeedGatewayService implements ReplayRunner {
         seekMarketStructureSnapshot(consumer, refresh.added(), topicEvents);
     }
 
-    /** The live-only structure snapshot may be quiet all night or over a holiday. Recover the
-     * retained UI window on cold start, retry and late topic adoption; leave its event time intact.
-     * Seven days matches the UI topic's retention floor. Other event cursors are untouched. */
+    /** The live-only structure snapshot — and the pattern sets beside it — may be quiet all night or over a
+     * holiday. Recover the retained UI window on cold start, retry and late topic adoption; leave its event time
+     * intact. Seven days matches the UI topic's retention floor (the pattern topic keeps two sessions, so its window
+     * is whatever the broker still holds). Other event cursors are untouched. */
     void seekMarketStructureSnapshot(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions,
                                      Map<String, TopicBinding> topicEvents) {
         Map<TopicPartition, Long> timestamps = new HashMap<>();
         long cutoff = System.currentTimeMillis() - Duration.ofDays(7).toMillis();
         for (TopicPartition partition : partitions) {
             TopicBinding binding = topicEvents.get(partition.topic());
-            if (binding != null && "market-structure".equals(binding.event())) timestamps.put(partition, cutoff);
+            if (binding != null && ("market-structure".equals(binding.event()) || "market-structure-patterns".equals(binding.event()))) {
+                timestamps.put(partition, cutoff);
+            }
         }
         seekToTimestampsOrEnd(consumer, timestamps, new ArrayList<>());
     }
 
     private Map<TopicPartition, Long> marketStructureEndOffsets(KafkaConsumer<?, ?> consumer,
             Collection<TopicPartition> partitions, Map<String, TopicBinding> topicEvents) {
-        List<TopicPartition> structure = new ArrayList<>();
+        return recoveryEndOffsets(consumer, partitions, topicEvents, "market-structure");
+    }
+
+    private Map<TopicPartition, Long> marketStructurePatternsEndOffsets(KafkaConsumer<?, ?> consumer,
+            Collection<TopicPartition> partitions, Map<String, TopicBinding> topicEvents) {
+        return recoveryEndOffsets(consumer, partitions, topicEvents, "market-structure-patterns");
+    }
+
+    /** The committed end offsets of one event's partitions, captured BEFORE the recovery read so catch-up is exact. */
+    private Map<TopicPartition, Long> recoveryEndOffsets(KafkaConsumer<?, ?> consumer,
+            Collection<TopicPartition> partitions, Map<String, TopicBinding> topicEvents, String event) {
+        List<TopicPartition> own = new ArrayList<>();
         for (TopicPartition partition : partitions) {
             TopicBinding binding = topicEvents.get(partition.topic());
-            if (binding != null && "market-structure".equals(binding.event())) structure.add(partition);
+            if (binding != null && event.equals(binding.event())) own.add(partition);
         }
-        if (structure.isEmpty()) return Map.of();
-        Map<TopicPartition, Long> end = boundedEndOffsets(consumer, structure);
-        if (!end.keySet().containsAll(structure)) throw new IllegalStateException("structure recovery end offsets missing");
+        if (own.isEmpty()) return Map.of();
+        Map<TopicPartition, Long> end = boundedEndOffsets(consumer, own);
+        if (!end.keySet().containsAll(own)) throw new IllegalStateException(event + " recovery end offsets missing");
         return Map.copyOf(end);
     }
 
@@ -2178,12 +2196,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP gateway_market_structure_patterns_enabled Whether the market-structure-patterns stream is enabled.\n"
                 + "# TYPE gateway_market_structure_patterns_enabled gauge\n"
                 + "gateway_market_structure_patterns_enabled " + boolMetric(settings.marketStructurePatternsEnabled()) + "\n"
-                + "# HELP gateway_market_structure_patterns_drops_total market-structure-patterns sets dropped at the gateway boundary (invalid, oversize, tombstone).\n"
-                + "# TYPE gateway_market_structure_patterns_drops_total counter\n"
-                + "gateway_market_structure_patterns_drops_total " + marketStructurePatternsDrops.get() + "\n"
-                + "# HELP gateway_market_structure_patterns_regressions_total market-structure-patterns sets refused because their asOfMs regressed.\n"
-                + "# TYPE gateway_market_structure_patterns_regressions_total counter\n"
-                + "gateway_market_structure_patterns_regressions_total " + marketStructurePatternsRegressions.get() + "\n"
+                + marketStructurePatternsCounterMetrics()
                 + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
                 + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
                 + "gateway_cvd_spx_levels_enabled " + boolMetric(settings.esCvdSpxLevelsEnabled()) + "\n"
@@ -2908,9 +2921,9 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (settings.marketStructurePatternsEnabled()) {
             // PATTERNS: the market-structure service's candlestick pattern sets — LIVE consumer only, same reasoning
-            // as market-structure; the event keeps its own per-timeframe latest-record retention for the hello.
-            // No seek-back: the service republishes all three sets on every 1m fold, so a restart is at most one
-            // minute behind during regular trading hours and shows "no data" outside them, which is accurate.
+            // as market-structure; the event keeps its own per-timeframe latest-record retention for the hello and
+            // recovers it the way the structure record does: a seek-back on cold start / retry / adoption, private
+            // staging until the captured end offsets are consumed, then one promotion and broadcast per timeframe.
             topicEvents.put(settings.marketStructurePatternsTopic(), new TopicBinding("DATABENTO", "market-structure-patterns"));
         }
         topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
@@ -3648,6 +3661,8 @@ public class FeedGatewayService implements ReplayRunner {
             List<TopicPartition> partitions = bootstrapAssign(name, consumer, topicEvents);
             MarketStructureRecovery structureRecovery = newMarketStructureRecovery();
             structureRecovery.end.putAll(marketStructureEndOffsets(consumer, partitions, topicEvents));
+            MarketStructurePatternsRecovery patternsRecovery = newMarketStructurePatternsRecovery();
+            patternsRecovery.end.putAll(marketStructurePatternsEndOffsets(consumer, partitions, topicEvents));
             liveBootstrapSeek(consumer, partitions, topicEvents, retry);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             while (running.get()) {
@@ -3661,6 +3676,11 @@ public class FeedGatewayService implements ReplayRunner {
                     if (!addedStructureEnd.isEmpty()) {
                         if (structureRecovery.end.isEmpty()) structureRecovery = newMarketStructureRecovery();
                         structureRecovery.end.putAll(addedStructureEnd);
+                    }
+                    Map<TopicPartition, Long> addedPatternsEnd = marketStructurePatternsEndOffsets(consumer, refresh.added(), topicEvents);
+                    if (!addedPatternsEnd.isEmpty()) {
+                        if (patternsRecovery.end.isEmpty()) patternsRecovery = newMarketStructurePatternsRecovery();
+                        patternsRecovery.end.putAll(addedPatternsEnd);
                     }
                     liveAdoptionSeek(consumer, refresh, topicEvents);
                 }
@@ -3720,6 +3740,10 @@ public class FeedGatewayService implements ReplayRunner {
                     }
                     if (binding != null && "market-structure".equals(binding.event()) && !structureRecovery.end.isEmpty()) {
                         stageMarketStructure(structureRecovery, record, json);
+                        continue;
+                    }
+                    if (binding != null && "market-structure-patterns".equals(binding.event()) && !patternsRecovery.end.isEmpty()) {
+                        stageMarketStructurePatterns(patternsRecovery, record, json);
                         continue;
                     }
                     if (binding == null || json == null || json.isBlank()) {
@@ -4246,6 +4270,7 @@ public class FeedGatewayService implements ReplayRunner {
                     }
                 }
                 finishMarketStructureRecovery(consumer, structureRecovery);
+                finishMarketStructurePatternsRecovery(consumer, patternsRecovery);
                 purgeExpiredCache(System.currentTimeMillis());
                 if (settings.ibkrPreOpenEnabled()) {
                     // Consumer-local window transitions fire from the live loop too — either
@@ -12588,6 +12613,17 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     // ── PATTERNS (market-structure PatternAnnotationSet v1) boundary + retention ──────────────────
+    /** With the stream OFF the only pattern metric is the enabled gauge — the metrics text is otherwise what it was (R6.4 flag-off contract). */
+    private String marketStructurePatternsCounterMetrics() {
+        if (!settings.marketStructurePatternsEnabled()) return "";
+        return "# HELP gateway_market_structure_patterns_drops_total market-structure-patterns sets dropped at the gateway boundary (invalid, oversize, tombstone).\n"
+                + "# TYPE gateway_market_structure_patterns_drops_total counter\n"
+                + "gateway_market_structure_patterns_drops_total " + marketStructurePatternsDrops.get() + "\n"
+                + "# HELP gateway_market_structure_patterns_regressions_total market-structure-patterns sets refused because their asOfMs regressed.\n"
+                + "# TYPE gateway_market_structure_patterns_regressions_total counter\n"
+                + "gateway_market_structure_patterns_regressions_total " + marketStructurePatternsRegressions.get() + "\n";
+    }
+
     /** The requirement's PATTERN_SET_MAX_BYTES (R6.4): 1 048 576 − 4 096. */
     static final int MARKET_STRUCTURE_PATTERNS_MAX_BYTES = 1_048_576 - 4_096;
 
@@ -12623,28 +12659,125 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** PATTERNS retention: per timeframe, the newest asOfMs wins; an older set is refused, counted, forwarded nowhere. */
     synchronized boolean retainMarketStructurePatterns(String timeframe, long asOfMs, String json) {
-        Long have = marketStructurePatternsAsOfMs.get(timeframe);
-        if (have != null && have > asOfMs) {
+        java.util.Map<String, PatternEntry> cur = marketStructurePatternsSnapshot.get();
+        PatternEntry have = cur.get(timeframe);
+        if (have != null && have.asOfMs() > asOfMs) {
             marketStructurePatternsRegressions.incrementAndGet();
             return false;
         }
-        marketStructurePatternsAsOfMs.put(timeframe, asOfMs);
-        marketStructurePatternsLatest.put(timeframe, json);
+        java.util.Map<String, PatternEntry> next = new java.util.HashMap<>(cur);
+        next.put(timeframe, new PatternEntry(asOfMs, json));
+        marketStructurePatternsSnapshot.set(java.util.Map.copyOf(next));
         return true;
     }
 
-    /** PATTERNS withdrawal: a TOMBSTONE of this event under any key erases every timeframe's retention and baseline. */
+    /** The timeframe a patterns record key names (the producer's contract: {@code <scheduleId>|<tf>}), or null. */
+    static String marketStructurePatternsKeyTimeframe(String key) {
+        if (key == null) return null;
+        int bar = key.lastIndexOf('|');
+        if (bar <= 0 || bar == key.length() - 1) return null;
+        String tf = key.substring(bar + 1);
+        return MARKET_STRUCTURE_PATTERN_TIMEFRAMES.contains(tf) ? tf : null;
+    }
+
+    /**
+     * PATTERNS withdrawal: the producer keys every set {@code <scheduleId>|<tf>}, so a TOMBSTONE withdraws exactly the
+     * timeframe its key names (Codex gateway round 1 #3); a tombstone whose key is not of that form withdraws nothing
+     * and is counted. Non-tombstone unparseable values just count.
+     */
     synchronized void evictMarketStructurePatternsTombstone(String event, org.apache.kafka.clients.consumer.ConsumerRecord<String, ?> record) {
         if (!"market-structure-patterns".equals(event)) return;
         if (record.value() == null) {
-            marketStructurePatternsLatest.clear();
-            marketStructurePatternsAsOfMs.clear();
+            String tf = marketStructurePatternsKeyTimeframe(record.key());
+            if (tf != null) withdrawMarketStructurePatterns(tf);
         }
         marketStructurePatternsDrops.incrementAndGet();
     }
 
+    private synchronized void withdrawMarketStructurePatterns(String timeframe) {
+        java.util.Map<String, PatternEntry> next = new java.util.HashMap<>(marketStructurePatternsSnapshot.get());
+        next.remove(timeframe);
+        marketStructurePatternsSnapshot.set(java.util.Map.copyOf(next));
+    }
+
     String marketStructurePatternsLatestForTest(String timeframe) {
-        return marketStructurePatternsLatest.get(timeframe);
+        PatternEntry e = marketStructurePatternsSnapshot.get().get(timeframe);
+        return e == null ? null : e.json();
+    }
+
+    // ── PATTERNS recovery: the levels path, per timeframe (Codex gateway round 1 #1) ─────────────
+    /** One timeframe's privately staged recovery value: the final committed set or withdrawal wins; nothing fans out before catch-up. */
+    static final class StagedPatternSet {
+        String json;
+        long asOf;
+        boolean touched, withdrawn;
+        StagedPatternSet(String json, long asOf) { this.json = json; this.asOf = asOf; }
+    }
+
+    static final class MarketStructurePatternsRecovery {
+        final Map<TopicPartition, Long> end = new HashMap<>();
+        final Map<String, StagedPatternSet> staged = new HashMap<>();
+    }
+
+    private synchronized MarketStructurePatternsRecovery newMarketStructurePatternsRecovery() {
+        MarketStructurePatternsRecovery r = new MarketStructurePatternsRecovery();
+        java.util.Map<String, PatternEntry> snap = marketStructurePatternsSnapshot.get();
+        for (String tf : MARKET_STRUCTURE_PATTERN_TIMEFRAMES) {
+            PatternEntry e = snap.get(tf);
+            r.staged.put(tf, new StagedPatternSet(e == null ? null : e.json(), e == null ? -1L : e.asOfMs()));
+        }
+        return r;
+    }
+
+    private void stageMarketStructurePatterns(MarketStructurePatternsRecovery recovery, ConsumerRecord<String, ?> record, String json) {
+        if (record.value() == null) {
+            String tf = marketStructurePatternsKeyTimeframe(record.key());
+            if (tf != null) {
+                StagedPatternSet s = recovery.staged.get(tf);
+                s.json = null;
+                s.asOf = -1L;
+                s.touched = s.withdrawn = true;
+            }
+            marketStructurePatternsDrops.incrementAndGet();
+            return;
+        }
+        PatternSetBoundary b = validateMarketStructurePatterns(json);
+        if (b == null) {
+            marketStructurePatternsDrops.incrementAndGet();
+            return;
+        }
+        StagedPatternSet s = recovery.staged.get(b.timeframe());
+        if (b.asOfMs() < s.asOf) marketStructurePatternsRegressions.incrementAndGet();
+        else {
+            s.json = json;
+            s.asOf = b.asOfMs();
+            s.touched = true;
+        }
+    }
+
+    private void finishMarketStructurePatternsRecovery(KafkaConsumer<?, ?> consumer, MarketStructurePatternsRecovery recovery) {
+        if (recovery.end.isEmpty() || !caughtUp(consumer, recovery.end)) return;
+        List<String> publish = new ArrayList<>();
+        synchronized (this) {
+            java.util.Map<String, PatternEntry> cur = marketStructurePatternsSnapshot.get();
+            java.util.Map<String, PatternEntry> next = new java.util.HashMap<>(cur);
+            for (String tf : MARKET_STRUCTURE_PATTERN_TIMEFRAMES) {
+                StagedPatternSet s = recovery.staged.get(tf);
+                if (!s.touched) continue;
+                PatternEntry have = cur.get(tf);
+                if (s.json == null) next.remove(tf);
+                else if (s.withdrawn || have == null || s.asOf >= have.asOfMs()) {
+                    next.put(tf, new PatternEntry(s.asOf, s.json));
+                    publish.add(s.json);
+                }
+            }
+            marketStructurePatternsSnapshot.set(java.util.Map.copyOf(next));
+        }
+        recovery.end.clear();
+        for (String json : publish) {
+            broadcast("market-structure-patterns", json);
+            forwardedEvents.incrementAndGet();
+        }
     }
 
     long marketStructurePatternsDropsForTest() {
@@ -12707,12 +12840,13 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.marketStructurePatternsEnabled()) {
             // PATTERNS: one entry per timeframe, verbatim set or an explicit null; the FIELD's presence tells the
             // page this gateway has a pattern stream (absent = flag off).
+            java.util.Map<String, PatternEntry> snap = marketStructurePatternsSnapshot.get();   // ONE snapshot for all three
             sb.append(",\"patterns\":{");
             for (int i = 0; i < MARKET_STRUCTURE_PATTERN_TIMEFRAMES.size(); i++) {
                 String tf = MARKET_STRUCTURE_PATTERN_TIMEFRAMES.get(i);
-                String set = marketStructurePatternsLatest.get(tf);
+                PatternEntry e = snap.get(tf);
                 if (i > 0) sb.append(',');
-                sb.append('"').append(tf).append("\":").append(set == null ? "null" : set);
+                sb.append('"').append(tf).append("\":").append(e == null ? "null" : e.json());
             }
             sb.append('}');
         }
