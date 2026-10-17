@@ -891,6 +891,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong liveRecordsEligibleForActiveSelection = new AtomicLong();
     private final AtomicLong droppedByStaleness = new AtomicLong();         // records dropped by selection-barrier / stale gate
     private final AtomicLong droppedByCacheGate = new AtomicLong();         // records dropped because cacheCaughtUpFlag was false
+    private final AtomicLong retainedCvdRecordsDropped = new AtomicLong();
     private final AtomicLong droppedByOtherReasons = new AtomicLong();      // caught-up + non-forwardable (source/symbol/expiry mismatch, etc.)
     private final AtomicLong strikeBandsRejected = new AtomicLong();        // spot-vol-regime strikeBand blocks refused by sanitizeStrikeBand
     private final AtomicLong tapeZonesRejected = new AtomicLong();          // tape-zones boards refused by the fail-closed identity contract
@@ -2500,6 +2501,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_forward_stalled_dropped_by_other_reasons_total Records dropped by source/symbol/expiry mismatch or other non-staleness reasons.\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_dropped_by_other_reasons_total counter\n"
                 + "options_edge_feed_gateway_forward_stalled_dropped_by_other_reasons_total " + droppedByOtherReasons.get() + "\n"
+                + "# HELP options_edge_feed_gateway_cvd_retained_records_dropped_total Malformed retained JSON values skipped explicitly; Avro failures are never skipped.\n"
+                + "# TYPE options_edge_feed_gateway_cvd_retained_records_dropped_total counter\n"
+                + "options_edge_feed_gateway_cvd_retained_records_dropped_total " + retainedCvdRecordsDropped.get() + "\n"
                 + "# HELP options_edge_feed_gateway_forward_stalled_live_records_polled_total Total records observed by the live consumers (poll advance signal).\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_live_records_polled_total counter\n"
                 + "options_edge_feed_gateway_forward_stalled_live_records_polled_total " + liveRecordsPolled.get() + "\n"
@@ -3235,8 +3239,9 @@ public class FeedGatewayService implements ReplayRunner {
                 markCacheCaughtUp(name, events, caughtUpFlag);
                 tryFreezeEsAuctionHandoff(consumer, partitions, ownsAuction);
             }
+            PollMaintenance canonicalMaintenance = new PollMaintenance(settings.pollMs());
             while (running.get()) {
-                ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                ConsumerRecords<String, Object> records = pollCompatible(consumer, Duration.ofMillis(settings.pollMs()));
                 // CACHE consumer: a new partition rebuilds its full per-event window, exactly like bootstrap.
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
@@ -3402,7 +3407,7 @@ public class FeedGatewayService implements ReplayRunner {
                     }
                     updateCache(binding, record, json);
                 }
-                purgeExpiredCache(System.currentTimeMillis());
+                if (avro || canonicalMaintenance.due(System.nanoTime())) purgeExpiredCache(System.currentTimeMillis());
                 if (settings.ibkrPreOpenEnabled()) {
                     // Consumer-local window transitions (fence capture / takeover snapshot / 09:35
                     // destruction) must fire even on quiet polls with no records.
@@ -3670,10 +3675,11 @@ public class FeedGatewayService implements ReplayRunner {
             patternsRecovery.end.putAll(marketStructurePatternsEndOffsets(consumer, partitions, topicEvents));
             liveBootstrapSeek(consumer, partitions, topicEvents, retry);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
+            PollMaintenance canonicalMaintenance = new PollMaintenance(settings.pollMs());
             while (running.get()) {
                 pauseEsAuctionOnIncarnationChange(consumer, partitions);
                 resumeEsAuctionOnceHandoffExists(consumer, partitions);
-                ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+                ConsumerRecords<String, Object> records = pollCompatible(consumer, Duration.ofMillis(settings.pollMs()));
                 Refresh refresh = partitionRefresh.apply(consumer, partitions);
                 partitions = refresh.partitions();
                 if (!refresh.added().isEmpty()) {
@@ -4276,7 +4282,7 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 finishMarketStructureRecovery(consumer, structureRecovery);
                 finishMarketStructurePatternsRecovery(consumer, patternsRecovery);
-                purgeExpiredCache(System.currentTimeMillis());
+                if (avro || canonicalMaintenance.due(System.nanoTime())) purgeExpiredCache(System.currentTimeMillis());
                 if (settings.ibkrPreOpenEnabled()) {
                     // Consumer-local window transitions fire from the live loop too — either
                     // consumer alone is enough to hit the fence/takeover/eviction boundaries.
@@ -12093,7 +12099,7 @@ public class FeedGatewayService implements ReplayRunner {
                     System.err.println("cvd-spx-levels hydration timed out; the first hello may carry no levels");
                     return;
                 }
-                for (ConsumerRecord<String, Object> rec : consumer.poll(hydrateRemaining(deadlineNanos))) {
+                for (ConsumerRecord<String, Object> rec : pollCompatible(consumer, hydrateRemaining(deadlineNanos))) {
                     if (rec.offset() >= end) continue;
                     // PER KEY, because compaction is per key: a later foreign-key record can sit
                     // after the governing ES.v.0 one, and taking "the last record in the
@@ -13840,7 +13846,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (consumer == null) {
             return false;
         }
-        ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(settings.pollMs()));
+        ConsumerRecords<String, Object> records = pollCompatible(consumer, Duration.ofMillis(settings.pollMs()));
         boolean appended = false;
         for (ConsumerRecord<String, Object> rec : records) {
             TopicPartition tp = new TopicPartition(rec.topic(), rec.partition());
@@ -14962,10 +14968,6 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private Properties stringObjectConsumerProperties(String name) {
-        return stringConsumerProperties(name);
-    }
-
-    private Properties stringConsumerProperties(String name) {
         Properties properties = baseConsumerProperties(name);
         com.optionsedge.contracts.avro.CanonicalAvroKafka.rollForwardConsumer(properties,
                 settings.schemaRegistryUrl(), cvdAvroBindings(), Set.of(settings.esCvdSpxLevelsTopic()));
@@ -14973,6 +14975,42 @@ public class FeedGatewayService implements ReplayRunner {
         // Bound the number of decoded records simultaneously held by a state poll.
         properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "1");
         return properties;
+    }
+
+    private Properties stringConsumerProperties(String name) {
+        Properties properties = baseConsumerProperties(name);
+        properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        return properties;
+    }
+
+    /** A decoder failure on retained legacy data follows an explicit counted skip policy. */
+    ConsumerRecords<String, Object> pollCompatible(org.apache.kafka.clients.consumer.Consumer<String, Object> consumer, Duration timeout) {
+        try { return consumer.poll(timeout); }
+        catch (org.apache.kafka.common.errors.RecordDeserializationException failure) {
+            java.nio.ByteBuffer wire = failure.valueBuffer();
+            if (failure.origin() != org.apache.kafka.common.errors.RecordDeserializationException.DeserializationExceptionOrigin.VALUE
+                    || !cvdAvroBindings().containsKey(failure.topicPartition().topic())
+                    || (wire != null && wire.hasRemaining() && wire.get(wire.position()) == 0)
+                    || failure.offset() < 0 || failure.offset() == Long.MAX_VALUE) throw failure;
+            consumer.seek(failure.topicPartition(), failure.offset() + 1);
+            long dropped = retainedCvdRecordsDropped.incrementAndGet();
+            if ((dropped & (dropped - 1)) == 0)
+                System.err.println("Gateway skipped malformed retained CVD JSON at " + failure.topicPartition()
+                        + " offset=" + failure.offset() + " total=" + dropped + "; Avro decode failures remain fatal");
+            return ConsumerRecords.empty();
+        }
+    }
+
+    /** Bound full-cache expiry scans to the existing idle-poll cadence during buffered hydration. */
+    static final class PollMaintenance {
+        private final long intervalNanos;
+        private long lastNanos;
+        private boolean started;
+        PollMaintenance(long pollMs) { intervalNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(1, pollMs)); }
+        boolean due(long nowNanos) {
+            if (started && nowNanos - lastNanos < intervalNanos) return false;
+            started = true;lastNanos = nowNanos;return true;
+        }
     }
 
     Map<String, org.apache.avro.Schema> cvdAvroBindings() {
