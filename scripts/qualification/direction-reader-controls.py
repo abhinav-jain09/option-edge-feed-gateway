@@ -15,6 +15,7 @@ METHODS={
  'ordering':'legacyNullAndTypedDeletionClearWithoutOlderConsumerRecordsResurrectingState',
  'invalid':'malformedFalseOversizeWrongIdentityAndEscapedDeletionHaveExplicitSemantics',
  'expiry':'markerExpiresWhenNoEarlierPushCanStillBeFresh',
+ 'replay':'cachedReplayAndWithdrawalUseTheSameEmitLock',
 }
 
 
@@ -44,6 +45,9 @@ def main():
       ('delete-escaped-key',' || json.contains("\\\\u")','','invalid'),
       ('withdrawal-expiry','> TimeUnit.MILLISECONDS.toNanos(settings.directionPushTtlMs())','> Long.MAX_VALUE','expiry'),
     ])
+    cases.append(('replay-emit-lock','''        synchronized (directionPushEmitLock) {
+            long pushNowMs''','''        {
+            long pushNowMs''','replay'))
     basecp=os.pathsep.join([str(ROOT/'target/test-classes'),str(ROOT/'target/classes'),deps])
     def probe(cp,method,name):
         r=subprocess.run([str(JAVA/'java'),'-Xmx1536m','-cp',cp,'app.feedgateway.DirectionReaderNegativeProbe',method],cwd=ROOT,text=True,capture_output=True,timeout=20)

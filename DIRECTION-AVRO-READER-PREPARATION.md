@@ -18,7 +18,7 @@ or equal upserts and another partition, so a second consumer cannot restore the 
 A newer current record survives a delayed older withdrawal. A repeated withdrawal is emitted once
 within the marker's retention window. The marker expires on monotonic time after the push freshness
 window, when an older push cannot still pass the existing freshness checks. A later upsert still
-uses the existing payload timestamp/session rules. No trading decision is calculated here.
+uses the existing payload timestamp/session rules. No trading decision is calculated here. Cached replay holds the same emit lock while reading and enqueueing push state, so a replay cannot enqueue an old reading after a withdrawal. A controlled thread/lock-owner test and an isolated removal control cover this race.
 
 A typed deletion must have boolean `tombstone: true`, matching SPX identity and at most 4096 API
 characters; the actual source deletion is seven small fixed fields. Escaped JSON member names are

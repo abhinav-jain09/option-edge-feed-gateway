@@ -9052,9 +9052,12 @@ public class FeedGatewayService implements ReplayRunner {
     private void replayDirectionPushCached(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
-        for (Map.Entry<String, String> entry : directionPush.entrySet()) {
-            if (entry.getValue() != null && !entry.getValue().isBlank() && isCacheFresh("direction-push:" + entry.getKey(), nowMs)) {
-                send(session, "direction-push", entry.getValue());
+        synchronized (directionPushEmitLock) {
+            long pushNowMs = System.currentTimeMillis();
+            for (Map.Entry<String, String> entry : directionPush.entrySet()) {
+                if (entry.getValue() != null && !entry.getValue().isBlank() && isCacheFresh("direction-push:" + entry.getKey(), pushNowMs)) {
+                    send(session, "direction-push", entry.getValue());
+                }
             }
         }
         for (Map.Entry<String, String> entry : directionScorecard.entrySet()) {

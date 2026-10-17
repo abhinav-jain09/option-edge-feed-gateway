@@ -114,4 +114,40 @@ class DirectionAvroRollingGatewayTest {
         try {service.onDirectionPushRecord(record(2,""),"",false);assertNull(field.get(service));}
         finally{System.clearProperty("GATEWAY_DIRECTION_PUSH_TTL_MS");}
     }
+    @Test void cachedReplayAndWithdrawalUseTheSameEmitLock() throws Exception {
+        var service=service();String push=push().toString();service.onDirectionPushRecord(record(1,push),push,false);
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        var failure=new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var slow=new java.util.concurrent.ConcurrentHashMap<String,String>(cache(service)) {
+            @Override public Set<Map.Entry<String,String>> entrySet() {
+                Set<Map.Entry<String,String>> original=super.entrySet();
+                return new AbstractSet<>() {
+                    public int size(){return original.size();}
+                    public Iterator<Map.Entry<String,String>> iterator() {
+                        entered.countDown();
+                        try {if(!release.await(5,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("replay gate timed out");}
+                        catch(InterruptedException e){throw new AssertionError(e);}
+                        return original.iterator();
+                    }
+                };
+            }
+        };
+        var field=FeedGatewayService.class.getDeclaredField("directionPush");field.setAccessible(true);field.set(service,slow);
+        var emit=FeedGatewayService.class.getDeclaredField("directionPushEmitLock");emit.setAccessible(true);Object lock=emit.get(service);
+        var replay=FeedGatewayService.class.getDeclaredMethod("replayDirectionPushCached",org.springframework.web.socket.WebSocketSession.class);replay.setAccessible(true);
+        Thread reader=new Thread(()->{try{replay.invoke(service,(Object)null);}catch(Throwable e){failure.set(e);}},"direction-replay-unit");
+        Thread deletion=new Thread(()->{try{service.onDirectionPushRecord(record(2,null),null,false);}catch(Throwable e){failure.set(e);}},"direction-delete-unit");
+        try {
+            reader.start();assertTrue(entered.await(3,java.util.concurrent.TimeUnit.SECONDS));deletion.start();
+            var threads=java.lang.management.ManagementFactory.getThreadMXBean();long deadline=System.nanoTime()+3_000_000_000L;
+            java.lang.management.ThreadInfo info;
+            do {info=threads.getThreadInfo(deletion.threadId());if(info==null||info.getThreadState()==Thread.State.BLOCKED)break;Thread.sleep(1);}
+            while(System.nanoTime()<deadline);
+            assertNotNull(info,"withdrawal must wait for replay, not complete ahead of it");
+            assertEquals(Thread.State.BLOCKED,info.getThreadState());assertEquals(reader.threadId(),info.getLockOwnerId());
+            assertNotNull(info.getLockInfo());assertEquals(System.identityHashCode(lock),info.getLockInfo().getIdentityHashCode());
+        } finally {release.countDown();reader.join(4000);if(deletion.getState()!=Thread.State.NEW)deletion.join(4000);}
+        assertFalse(reader.isAlive());assertFalse(deletion.isAlive());assertNull(failure.get());assertTrue(cache(service).isEmpty());
+    }
+
 }
