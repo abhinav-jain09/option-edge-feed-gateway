@@ -220,6 +220,20 @@ pipeline {
               bash scripts/jenkins/permitted-sha-guard-version.sh "$CJAR" > .contracts-jar-sha256
               echo "contracts jar $CV sha256: $(cat .contracts-jar-sha256)"
             '''
+            // THE VERSION THE BUILD ACTUALLY INSTALLED, published for the Maven steps below.
+            //
+            // The clone above is checked out at CONTRACTS_BRANCH (main) and compiled in, but this
+            // pom declared a FIXED version. The two disagree the moment contracts main bumps, and
+            // Maven then fails with "Could not find artifact ...options-edge-contracts:jar:<pinned>".
+            // Chasing it with a bump commit here is endless: contracts went 0.9.0 -> 0.17.0 on
+            // 2026-10-17 and this repository was bumped three times in the process. A pipeline that
+            // installs main's tip cannot also honour a consumer-pinned version; the pin stays as the
+            // LOCAL-DEV default and CI uses what it installed.
+            env.CONTRACTS_VERSION = readFile('.contracts-version').trim()
+            if (!env.CONTRACTS_VERSION) {
+              error('.contracts-version is empty after installing contracts — refusing to build with an unknown contracts version')
+            }
+            echo "contracts version installed: ${env.CONTRACTS_VERSION} (overrides this pom's pin for every Maven step, here and on es4)"
           }
         }
       }
@@ -305,7 +319,7 @@ pipeline {
             }
             // An unchanged source can still have a newly built bound contracts JAR. Drop the
           // previous Boot archive so incremental packaging cannot retain an older dependency.
-          sh 'mvn -B -DskipTests clean package'
+          sh 'mvn -B -DskipTests clean package -Doptions-edge-contracts.version="${CONTRACTS_VERSION}"'
             // part 3: the packaged jar, by content, and the contracts jar INSIDE it (Spring Boot fat jar,
             // BOOT-INF/lib) must be the bound one. This is what proves what was consumed.
             sh '''

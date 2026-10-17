@@ -120,6 +120,11 @@ for source in args[:-1]:
         self.script(self.jdk / "bin/mvn", '''
 if [ "$*" = -version ]; then echo "Apache Maven fixture"; exit 0; fi
 [[ ${MAVEN_OPTS:-} = *-DreuseForks=false* ]] || { echo "Missing test-class JVM isolation"; exit 4; }
+# The remote test MUST be told the contracts version the build installed. Without this the mvn
+# here falls back to the pom's pin, which goes stale the moment contracts main bumps — the exact
+# failure this assertion exists to make impossible to reintroduce silently.
+[[ "$*" = *-Doptions-edge-contracts.version=0.8.0* ]] || { echo "Missing installed contracts version override: $*"; exit 5; }
+[[ ${CI_CONTRACTS_VERSION:-} = 0.8.0 ]] || { echo "CI_CONTRACTS_VERSION not passed through env -i"; exit 6; }
 mkdir -p "$CI_GATEWAY_DIR/target/surefire-reports"
 printf '<testsuite tests="1" failures="0"/>' > "$CI_GATEWAY_DIR/target/surefire-reports/TEST-fixture.xml"
 echo finite-maven-stub

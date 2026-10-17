@@ -183,7 +183,12 @@ java -version
 mvn -version
 taskset -pc $$
 result=0
-mvn -B test || result=$?
+# THE INSTALLED CONTRACTS VERSION, not this pom's pin. The workspace was built against the contracts
+# jar that Install Contracts compiled from main's tip; the pom's pin is only the local-dev default and
+# goes stale the moment contracts bumps. CI_CONTRACTS_VERSION is set from .contracts-version by the
+# supervisor below, and the sha256 of that exact jar is already verified before transfer.
+: "${CI_CONTRACTS_VERSION:?the supervisor did not pass the installed contracts version}"
+mvn -B test -Doptions-edge-contracts.version="$CI_CONTRACTS_VERSION" || result=$?
 # Keep bounded failing reports too, before exiting or running mutations that overwrite XML.
 python3 scripts/jenkins/es4-test-receipt.py collect target/surefire-reports ..
 [ "$result" -eq 0 ] || exit "$result"
@@ -204,16 +209,20 @@ if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then ex
 # The Kafka test container separately has 2 GiB / one CPU limits; planned total is 8 GiB.
 cpu_list=$(cat "$dir/cpus.txt")
 [[ $cpu_list =~ ^[0-9]+,[0-9]+$ ]] || exit 64
-python3 - "$dir" "$unit" "$java_home" "$source_sha" "$cpu_list" <<'SUPERVISE'
+python3 - "$dir" "$unit" "$java_home" "$source_sha" "$cpu_list" "$cv" <<'SUPERVISE'
 import os, pathlib, selectors, subprocess, sys, time
-root, unit, java, source, cpus = sys.argv[1:]
+root, unit, java, source, cpus, contracts_version = sys.argv[1:]
 command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=" + unit,
     "--property=MemoryMax=4G", "--property=MemorySwapMax=0", "--property=TasksMax=512",
     "--property=RuntimeMaxSec=2400", "--property=TimeoutStopSec=10",
     "--property=KillMode=control-group", "taskset", "--cpu-list", cpus, "env", "-i", "PATH=" + java + "/bin:/usr/bin:/bin",
     "JAVA_HOME=" + java, "JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=" + root + "/tmp",
     "MAVEN_SKIP_RC=true", "MAVEN_OPTS=-Xmx768m -DreuseForks=false -Dmaven.repo.local=" + root + "/cache/repository -Djava.io.tmpdir=" + root + "/tmp",
-    "CI_GATEWAY_DIR=" + root + "/gateway", "CI_SOURCE_SHA=" + source, "JENKINS_URL=es4-test-transport", "CI=true", "bash", root + "/run-tests.sh"]
+    "CI_GATEWAY_DIR=" + root + "/gateway", "CI_SOURCE_SHA=" + source,
+    # env -i wipes the environment, so the installed contracts version has to be named here or the
+    # remote mvn silently falls back to the pom's (possibly stale) pin.
+    "CI_CONTRACTS_VERSION=" + contracts_version,
+    "JENKINS_URL=es4-test-transport", "CI=true", "bash", root + "/run-tests.sh"]
 child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 selector = selectors.DefaultSelector()
 selector.register(child.stdout, selectors.EVENT_READ)
