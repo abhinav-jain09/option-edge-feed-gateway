@@ -34,13 +34,33 @@ final class IndicatorSnapshotFixture {
     private IndicatorSnapshotFixture() {
     }
 
+    /**
+     * The pre-Avro Java record (what the producer holds before it serializes): complete, with the test's values merged
+     * in; its maps are keyed the way the producer keys them (timeframes 30s,1m,...; bias those plus SESSION).
+     */
+    static IndicatorSnapshot record(String json) {
+        try {
+            // an exact tree: a default tree would turn 6420.50 into 6420.5
+            com.fasterxml.jackson.databind.ObjectMapper exact = IndicatorJson.reader().copy()
+                    .setNodeFactory(com.fasterxml.jackson.databind.node.JsonNodeFactory.withExactBigDecimals(true))
+                    .enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+            ObjectNode full = exact.valueToTree(build(IndicatorSnapshot.class));
+            ObjectNode wanted = (ObjectNode) exact.readTree(json);
+            merge(full, wanted);
+            return exact.treeToValue(full, IndicatorSnapshot.class);
+        } catch (IOException e) {
+            throw new AssertionError(e);
+        }
+    }
+
     /** The generic IndicatorSnapshot record whose JSON image carries the test's values. */
     static GenericRecord generic(String json) {
+        return generic(record(json));
+    }
+
+    /** The generic record the gateway's Avro consumer yields for a producer's record. */
+    static GenericRecord generic(IndicatorSnapshot record) {
         try {
-            ObjectNode full = IndicatorJson.writer().valueToTree(build(IndicatorSnapshot.class));
-            ObjectNode wanted = (ObjectNode) IndicatorJson.reader().readTree(json);
-            merge(full, wanted);
-            IndicatorSnapshot record = IndicatorJson.reader().treeToValue(full, IndicatorSnapshot.class);
             com.optionsedge.contracts.indicators.avro.IndicatorSnapshot specific = AvroRecordMapper.toAvro(record,
                     com.optionsedge.contracts.indicators.avro.IndicatorSnapshot.class);
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
@@ -101,7 +121,12 @@ final class IndicatorSnapshotFixture {
                 return List.of(value(p.getActualTypeArguments()[0], name));
             }
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("k" + n, value(p.getActualTypeArguments()[1], name));
+            // the producer's keys, in the producer's order: the timeframe maps carry every timeframe (and bias SESSION)
+            String[] keys = name.equals("timeframes") ? new String[] {"30s", "1m", "5m", "15m", "1h", "4h"}
+                    : name.equals("bias") ? new String[] {"30s", "1m", "5m", "15m", "1h", "4h", "SESSION"} : new String[] {"k" + n};
+            for (String k : keys) {
+                m.put(k, value(p.getActualTypeArguments()[1], name));
+            }
             return m;
         }
         Class<?> c = (Class<?>) t;
@@ -120,7 +145,7 @@ final class IndicatorSnapshotFixture {
             return Boolean.TRUE;
         }
         if (c == BigDecimal.class) {
-            return new BigDecimal(n).movePointLeft(2);
+            return new BigDecimal(n).movePointLeft(2).setScale(3);   // e.g. 0.120: a trailing zero the wire must keep
         }
         if (c == byte[].class) {
             return new byte[] {1, 2};

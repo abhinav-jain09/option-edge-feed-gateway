@@ -2041,9 +2041,21 @@ class FeedGatewayServiceTest {
         GatewaySettings settings = new GatewaySettings();
         String topic = settings.indicatorsSnapshotTopic();
         String wall = java.time.Instant.ofEpochMilli(System.currentTimeMillis()).toString();
-        org.apache.avro.generic.GenericRecord snapshot = IndicatorSnapshotFixture.generic(
-                "{\"symbol\":\"SPX\",\"runId\":\"run-A\",\"revision\":5,\"publishedAt\":\"" + wall + "\"}");
+        // the producer's record BEFORE Avro: multi-key timeframes/bias maps in the producer's order, decimals with
+        // trailing zeros; the JSON-era wire was exactly IndicatorJson's rendering of it
+        com.optionsedge.contracts.indicators.IndicatorSnapshot produced = IndicatorSnapshotFixture.record(
+                "{\"symbol\":\"SPX\",\"runId\":\"run-A\",\"revision\":5,\"publishedAt\":\"" + wall + "\",\"currentPrice\":6420.50}");
+        String jsonEraWire = com.optionsedge.contracts.indicators.IndicatorJson.writer().writeValueAsString(produced);
+        assertTrue(jsonEraWire.contains("\"currentPrice\":6420.50"), jsonEraWire);
+        assertTrue(jsonEraWire.indexOf("\"30s\":") < jsonEraWire.indexOf("\"1m\":") && jsonEraWire.indexOf("\"4h\":") < jsonEraWire.indexOf("\"SESSION\":"), jsonEraWire);
+        // what the JSON era delivered: that wire through the gateway's own (unchanged) provenance stamp, in the envelope
+        Method enrich = FeedGatewayService.class.getDeclaredMethod("enrichJson", String.class, FeedGatewayService.TopicBinding.class);
+        enrich.setAccessible(true);
+        FeedGatewayService.TopicBinding indicators = new FeedGatewayService.TopicBinding("DATABENTO", "indicators");
+        String expectedEnvelope = "{\"type\":\"indicators\",\"data\":" + enrich.invoke(service, jsonEraWire, indicators) + "}";
+        org.apache.avro.generic.GenericRecord snapshot = IndicatorSnapshotFixture.generic(produced);
         String golden = IndicatorSnapshotFixture.contractJson(snapshot);
+        assertEquals(jsonEraWire, golden, "the Avro record re-emits the JSON-era wire byte for byte");
         VpBroker broker = new VpBroker().topic(topic, List.of(new VolPremiumFixtures.Row("SPX", snapshot)));
         broker.onPoll = n -> {
             if (n >= 2) {
@@ -2059,7 +2071,9 @@ class FeedGatewayServiceTest {
         replay.invoke(service, recordingSession(sink));
         assertEquals(1, sink.size(), "one cached snapshot; got: " + sink);
         String envelope = sink.get(0);
-        assertTrue(envelope.startsWith("{\"type\":\"indicators\",\"data\":") && envelope.endsWith("}"), envelope);
+        // BYTE-IDENTICAL to what the JSON era delivered for this record: the raw WebSocket envelope
+        assertEquals(expectedEnvelope, envelope);
+        assertTrue(envelope.contains("\"currentPrice\":6420.50") || expectedEnvelope.equals(envelope), envelope);
         JsonNode cached = new ObjectMapper().readTree(envelope).get("data");
         JsonNode expected = new ObjectMapper().readTree(golden);
         expected.fields().forEachRemaining(e -> assertEquals(e.getValue(), cached.get(e.getKey()), e.getKey() + " is the contract's rendering"));
