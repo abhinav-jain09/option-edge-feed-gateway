@@ -39,3 +39,13 @@ throughput, source maximum domain, replay, restore or runtime capacity. Full gat
 actual reader/consumer/archive/mirror closure must still run on es4, followed by reviewed latest-main
 Jenkins reader-first deployment in dev and production. No migration writer is eligible from this
 source-preparation document alone. Held-zero services must remain zero.
+
+The producer hardcodes the SPX push key and withdraws only when current presence
+exists at seal/roll (DirectionRuntime emit at1052 and tombstone at1087–1107 in the
+qualified processing source). Runtime keys and cadence still need confirmation.
+The web client's `applyPushState` reads symbol/session/timestamps/state, not gateway
+`marketDataSource`/`source` stamping; preserving raw push text retains those producer
+fields. Client-side typed-deletion handling is being prepared before writer activation.
+Source/main preparation approval covers the nineteen bindings. The guarded main
+Jenkins workflow must finish its es4 full tests/capacity campaign before publishing an
+accepted reader image or rolling a reader; no preparation approval replaces that gate.

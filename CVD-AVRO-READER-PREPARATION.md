@@ -1,7 +1,9 @@
 # Same-topic derived reader preparation
 
-Incomplete source preparation for the coordinated CVD roll-forward migration.
-No merge, writer enablement or runtime eligibility is claimed here. Topics,
+Source preparation for the coordinated CVD roll-forward migration. The final
+Direction reader fixes have finite Codex/Claude approval on all three criteria
+for main preparation. A main merge permits the guarded Jenkins/es4 qualification
+run; it does not permit writer enablement or bypass runtime deployment gates. Topics,
 consumer groups and offsets remain unchanged. Latest merged gateway main was
 integrated before the new EAV binding; the dependency and image-build flow follow
 qualified latest contracts main, with immutable coordinates/digests as provenance.
@@ -24,7 +26,7 @@ outputs, not captured live market evidence.
 
 Local command (Java21, task-local official contracts artifact):
 `mvn -B -Dmaven.repo.local=<qualified-task-repo> -Dtest=CvdAvroRollingGatewayTest,CvdRetainedPollTest,EarlyAuctionVerdictWiringTest test`.
-The three focused classes pass22 tests; the POM's mandatory separate mock Spring
+The original three focused classes passed22 tests; the POM's mandatory separate mock Spring
 context smoke passes1. The isolated binding-absence control has a positive
 baseline and must fail the exact EAV schema-binding assertion when removed.
 Task evidence: gateway-eav-reader-focused-tests.log and
@@ -39,9 +41,10 @@ macOS arm64/JDK21. Avro medians61–371 microseconds and4776–13032 allocated b
 plain JSON baselines1–2 microseconds/320–888 bytes. The fixture-only5ms/256KiB
 budget passes; all relative regressions above10% remain OPEN. This is reuse of
 codec evidence, not a gateway cache-loop or service-level measurement. Cache
-folding is unchanged and its existing unit suite is included. A single final
-full gateway campaign on es4 after all remaining bindings, including actual
-cadence/heap/restore/cold-registry/cache budgets, remains required. Container
+folding is unchanged and its existing unit suite is included. The nineteen bindings are now prepared; see
+[Direction reader preparation](DIRECTION-AVRO-READER-PREPARATION.md). A final full
+gateway campaign on es4, including actual cadence/heap/restore/cold-registry/cache
+budgets, remains required before the compatible reader image may deploy. Container
 budgets and record batching are unchanged. No producer may be enabled based on
 this increment. Changed-line Claude then Codex outcomes are tracked in PR219.
 
@@ -59,3 +62,11 @@ Cold-registry/poison-frame recovery and decoding a bounded oversized value befor
 the existing64KiB EAV cache gate belong in the final es4 campaign. The global
 binding map rejects duplicate/blank/new-.avro topic overrides at construction,
 even when EAV is disabled. These are disclosed limits, not runtime qualification.
+
+Current source receipt: `gateway-direction-original-fix-proof.json` in the task evidence,
+head `94ee61ae0585e3fbe7ce1b3a247d278e95aaafcd`, official contracts main
+`7cb2633481f91739af75ff6cd1f6d186c4155b2c` / Jenkins91. The later focused run passes
+15 units plus the pinned mock startup check, with19 assertion controls and6 baselines.
+The original figures above remain historical fixture evidence, not a service acceptance
+result. Compatible reader rollout follows successful Jenkins/es4 qualification; all
+new writers remain held until their own registry/reader/archive/mirror gates pass.
