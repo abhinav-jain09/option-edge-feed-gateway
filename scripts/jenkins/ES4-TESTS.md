@@ -137,3 +137,32 @@ Small capture fixtures exercise success, failed comparison, malformed input, sta
 prior artifacts, partial runs, symlink refusal and the size bound. Negative controls
 remove capture or raise the limit, and the corresponding assertions then fail.
 The transport fixtures remain stubbed and do not qualify a real host or campaign.
+
+
+## Current record and deterministic heap-failure setup
+
+Preparation run741 (gateway sourceee65b163f51f00d64c1d91e623522dbda5576330,
+contracts0.9.0) passed all1,403 full-suite tests and ran all50 mutations:
+49 KILLED and the same one known SURVIVED. Every recorded claim/outcome reproduced.
+It stopped at the expected stale FeedGatewayService source-hash check. No image
+was pushed or runtime deployed. Its complete archived footprint-reverify.json is
+copied byte-for-byte into ES-FOOTPRINT-CAMPAIGN.json; no baseline, hash, output tail
+or failure name is edited. The renderer requires one campaign commit, so all50 rows
+come from this one run. Regenerating/checking the conformance section leaves it
+unchanged because its requirement/outcome claims are unchanged.
+
+Run739 observed an extra assertion failure in the general pool/report heap-failure
+test under the hand-over mutation; run741 did not. The dedicated next test already
+forces the close-before-hand-over-return race deterministically. The general heap
+case now queues its concurrent pool tasks behind a bounded latch until the overflow
+fan-out returns, separating that pool/report failure scenario from the dedicated
+race scenario. All existing heap/thread/report/fan-out/retry assertions remain.
+Cleanup releases the latch on every exit. Neither comparator nor mutation specs,
+assertion requirements, resource caps or receipt gates are weakened.
+
+The gateway now pins the reviewed contracts0.10.0 artifact, built by Jenkins80 from
+contracts main4b0376131f00c0d4297fb45f0584010f6c2227d8 (837 tests). Its coreCVD
+schemas are unchanged. The new whole-volume regime schema and writer cache do not
+add a gateway writer. Changed test compilation is local only; real stress/test and
+all50-mutation execution remain on es4 through the final Jenkins image qualification.
+This preparation does not itself authorize a source writer or claim a production rollout.
