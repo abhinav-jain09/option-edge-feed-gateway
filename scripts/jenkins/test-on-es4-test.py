@@ -39,7 +39,7 @@ test "$(git -C "$dir" rev-parse HEAD)" = "$PERMITTED_SHA"
         self.script(self.jdk / "bin/taskset", 'echo "affinity: 0,1"')
         self.script(self.bin / "docker", 'echo finite-docker-preflight')
         self.script(self.bin / "df", 'printf "Filesystem 1024-blocks Used Available Capacity Mounted\\nfixture 999999999 0 999999999 0%% /\\n"')
-        self.script(self.bin / "systemctl", 'case "$*" in *is-system-running*) echo running;; *show*) cat "${CI_UNIT_EXEC}" 2>/dev/null || true;; *stop*) printf "%s\\n" "$*" >> "$CI_UNIT_STOPS";; esac')
+        self.script(self.bin / "systemctl", 'case "$*" in *is-system-running*) echo "${CI_MANAGER_STATE:-running}"; [ "${CI_MANAGER_STATE:-running}" = running ];; *show*) cat "${CI_UNIT_EXEC}" 2>/dev/null || true;; *stop*) printf "%s\\n" "$*" >> "$CI_UNIT_STOPS";; esac')
         self.script(self.bin / "systemd-run", '''
 # The kernel probe is not a host operation in this fixture; the final command is exercised.
 case "$*" in *oe-gateway-probe-*) exit 0;; esac
@@ -154,6 +154,15 @@ exit %d
         out = self.repo / ".jenkins-tmp/es4-tests-123"
         self.assertTrue((out / "surefire-reports/TEST-fixture.xml").is_file())
         self.assertFalse((out / "receipt.json").exists())
+
+    def test_degraded_manager_is_reachable_even_with_nonzero_exit(self):
+        self.env["CI_MANAGER_STATE"] = "degraded"
+        self.run_transport()
+
+    def test_stopping_manager_refuses_before_cache_upload(self):
+        self.env["CI_MANAGER_STATE"] = "stopping"
+        self.run_transport(1)
+        self.assertFalse((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").exists())
 
     def test_wrong_artifact_or_source_fails_before_any_transport(self):
         self.jar.write_text("altered artifact")

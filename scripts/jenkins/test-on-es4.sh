@@ -73,7 +73,8 @@ mkdir -p "$root"
 for tool in mvn git python3 systemd-run systemctl docker sha256sum tar taskset; do command -v "$tool" >/dev/null; done
 [ -x /usr/lib/jvm/java-21-openjdk/bin/java ] || exit 1
 [ -r /usr/share/zoneinfo/America/New_York ] || exit 1
-systemctl --user is-system-running | grep -Eq '^(running|degraded)$'
+manager_state=$(systemctl --user is-system-running || true)
+[[ $manager_state = running || $manager_state = degraded ]] || exit 1
 docker info >/dev/null
 # Verify the effective kernel limits and Docker access INSIDE the same clean unit context.
 cpu_list=$(python3 -c 'import os; cpus=sorted(os.sched_getaffinity(0)); assert len(cpus)>=2; print(str(cpus[0])+","+str(cpus[1]))')
