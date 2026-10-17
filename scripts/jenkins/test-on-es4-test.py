@@ -119,6 +119,7 @@ for source in args[:-1]:
     def maven(self, result):
         self.script(self.jdk / "bin/mvn", '''
 if [ "$*" = -version ]; then echo "Apache Maven fixture"; exit 0; fi
+[[ ${MAVEN_OPTS:-} = *-DreuseForks=false* ]] || { echo "Missing test-class JVM isolation"; exit 4; }
 mkdir -p "$CI_GATEWAY_DIR/target/surefire-reports"
 printf '<testsuite tests="1" failures="0"/>' > "$CI_GATEWAY_DIR/target/surefire-reports/TEST-fixture.xml"
 echo finite-maven-stub
@@ -180,6 +181,15 @@ exit %d
         self.env["CI_MANAGER_STATE"] = "stopping"
         self.run_transport(1)
         self.assertFalse((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").exists())
+
+    def test_missing_fork_isolation_is_detected_before_success(self):
+        body = self.runner.read_text()
+        self.assertIn("-DreuseForks=false", body)
+        self.runner.write_text(body.replace("-DreuseForks=false ", ""))
+        self.run_transport(1)
+        out = self.repo / ".jenkins-tmp/es4-tests-123"
+        self.assertIn("Missing test-class JVM isolation", (out / "test.log").read_text())
+        self.assertFalse((out / "receipt.json").exists())
 
     def test_wrong_artifact_or_source_fails_before_any_transport(self):
         self.jar.write_text("altered artifact")
