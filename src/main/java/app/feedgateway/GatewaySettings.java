@@ -998,7 +998,11 @@ public final class GatewaySettings {
         // .v2 is the Avro topic. Its predecessor retains hand-built JSON forever
         // (cleanup.policy=delete, retention.ms=-1), so the cutover is a RENAME rather than a
         // switch in place — see OiArrivalWatchdog.statusTopic() in options-edge-processing.
-        return value("KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC", "options.databento.gex.oi-status.v2");
+        // requireAvroTopic fails closed if the override names that predecessor: this topic is read by
+        // the AVRO consumers here, so such a configuration would hand them JSON they cannot read.
+        return app.kafka.GexOiStatusAvro.requireAvroTopic(
+                value("KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC", app.kafka.GexOiStatusAvro.AVRO_TOPIC),
+                "GatewaySettings.databentoGexOiStatusTopic (KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC)");
     }
 
     /** Unified support/resistance map (Avro, per SPX-equivalent bucket). Broadcast as event "strike-sr". */
