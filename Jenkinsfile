@@ -242,8 +242,7 @@ pipeline {
       }
       post {
         always {
-          junit testResults: ".jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/surefire-reports/*.xml", allowEmptyResults: true
-          archiveArtifacts artifacts: ".jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/test.log,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/receipt.json,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/complete.txt", allowEmptyArchive: true
+          archiveArtifacts artifacts: ".jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/surefire-reports/TEST-*.xml,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/test.log,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/receipt.json,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/complete.txt", allowEmptyArchive: true
         }
       }
     }

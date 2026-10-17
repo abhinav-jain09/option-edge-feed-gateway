@@ -211,7 +211,7 @@ command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", 
     "--property=RuntimeMaxSec=2400", "--property=TimeoutStopSec=10",
     "--property=KillMode=control-group", "taskset", "--cpu-list", cpus, "env", "-i", "PATH=" + java + "/bin:/usr/bin:/bin",
     "JAVA_HOME=" + java, "JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=" + root + "/tmp",
-    "MAVEN_SKIP_RC=true", "MAVEN_OPTS=-Xmx768m -Dmaven.repo.local=" + root + "/cache/repository -Djava.io.tmpdir=" + root + "/tmp",
+    "MAVEN_SKIP_RC=true", "MAVEN_OPTS=-Xmx768m -DreuseForks=false -Dmaven.repo.local=" + root + "/cache/repository -Djava.io.tmpdir=" + root + "/tmp",
     "CI_GATEWAY_DIR=" + root + "/gateway", "CI_SOURCE_SHA=" + source, "JENKINS_URL=es4-test-transport", "CI=true", "bash", root + "/run-tests.sh"]
 child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 selector = selectors.DefaultSelector()

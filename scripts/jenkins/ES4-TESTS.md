@@ -87,3 +87,27 @@ or receipt cannot suppress the log transfer. Bounded full-suite XML is preserved
 on Maven failure as well as success, before any mutation can overwrite it. A
 regression fixture models SFTP pre-validation of all sources and demonstrates the
 old grouped-copy failure alongside the successful independent-copy behavior.
+
+## Full-suite class isolation
+
+The first real run hit the unit's 512-task limit. Its kernel log records the
+rejected fork; a subsequent thread dump contained 214 `options-edge-ws-writer`
+threads left from earlier test classes before a later embedded-web-server class
+started. The isolated process had sufficient memory (about 1.4 GiB at the task
+limit); increasing memory would not fix this failure.
+
+The remote Maven environment now supplies `-DreuseForks=false` to the full suite
+and nested footprint Maven invocations. Surefire releases each class's JVM and its
+idle thread pools before the next class. All tests and campaign commands remain,
+and the 512-task/4 GiB limits remain enforced. Existing smoke-test fork/environment
+settings remain. Native packaging does not inherit this remote-only property.
+
+This Jenkins installation has no `junit` Pipeline step. Logs, raw XML, completion
+marker and receipt are archived directly with `archiveArtifacts`; the existing
+Python receipt gate still validates test counts, errors, hashes and provenance.
+An unavailable results-publisher plugin can no longer prevent diagnostic archival.
+
+Validation: the Maven property evaluator resolves `reuseForks` to `false` when
+supplied through MAVEN_OPTS. Transport fixtures require the property; a negative
+control removes it and cannot create a passing receipt. A fresh real Jenkins run
+still must qualify the full suite and campaign under the unchanged limits.
