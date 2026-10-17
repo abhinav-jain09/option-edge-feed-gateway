@@ -48,6 +48,22 @@ class CvdRetainedPollTest {
         }
     }
 
+    @Test void malformedRunReplayValuesFailWithoutSkippingOrCountingLiveRetainedDrops() {
+        var settings = new GatewaySettings();
+        var service = new FeedGatewayService(settings, new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+        String topic = app.feedgateway.mtsession.gateway.ReplayTopicResolver.toReplayTopic(settings.esGexSpxAlignedTopic(), "fixture-run");
+        var tp = new TopicPartition(topic, 0);
+        try (var consumer = new MockConsumer<String, Object>(OffsetResetStrategy.NONE)) {
+            consumer.assign(List.of(tp)); consumer.updateBeginningOffsets(Map.of(tp, 0L)); consumer.seek(tp, 7);
+            var error = failure(tp, 7, new byte[] {'[', ']'});
+            consumer.setPollException(error);
+            assertSame(error, assertThrows(RecordDeserializationException.class,
+                    () -> service.pollCompatible(consumer, Duration.ZERO)));
+            assertEquals(7, consumer.position(tp));
+            assertTrue(service.metrics().contains("options_edge_feed_gateway_cvd_retained_records_dropped_total 0\n"));
+        }
+    }
+
     @Test void bufferedPollsDoNotMultiplyFullCacheExpiryScans() {
         var maintenance=new FeedGatewayService.PollMaintenance(250);
         assertTrue(maintenance.due(1_000_000_000L));

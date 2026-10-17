@@ -512,6 +512,12 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> directionCurrent = new ConcurrentHashMap<>();
     // A4: the push state (one per symbol, 30 s window on BOTH stamps), every alert (one per callId, 60 s), the scorecard (one per symbol).
     private final Map<String, String> directionPush = new ConcurrentHashMap<>();
+    // One SPX source/key: retain only the latest withdrawal while an old fresh push could replay.
+    // The emit lock is always acquired before the service monitor, as with indicators.
+    private final Object directionPushEmitLock = new Object();
+    private DirectionPushWithdrawal directionPushWithdrawal;
+    private record DirectionPushWithdrawal(RecordPosition position, long admittedNanos, String json, boolean emitted) {}
+    private static final TopicBinding DIRECTION_PUSH_BINDING = new TopicBinding("DATABENTO", "direction-push");
     private final Map<String, String> directionAlert = new ConcurrentHashMap<>();
     private final Map<String, String> directionScorecard = new ConcurrentHashMap<>();
     // A5.7: the calibration progress record, one per environment. Produced once an evening, not per tick.
@@ -3301,6 +3307,10 @@ public class FeedGatewayService implements ReplayRunner {
                         bootstrappingPartitions.keySet());
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
+                    if (binding != null && "direction-push".equals(binding.event())) {
+                        onDirectionPushRecord(record, false);
+                        continue;
+                    }
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
                     // pairing fields, control JSON): it reaches the browser byte-untouched —
                     // never enriched/reserialized. The tape-zones board is the same class: it is
@@ -3734,6 +3744,10 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
+                    if (binding != null && "direction-push".equals(binding.event())) {
+                        onDirectionPushRecord(record, cacheCaughtUpFlag.get());
+                        continue;
+                    }
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
                     // pairing fields, control JSON): it reaches the browser byte-untouched —
                     // never enriched/reserialized. The tape-zones board is the same class: it is
@@ -4089,10 +4103,9 @@ public class FeedGatewayService implements ReplayRunner {
                         }
                         continue;
                     }
-                    if ("direction-push".equals(binding.event()) || "direction-alert".equals(binding.event())
-                            || "direction-scorecard".equals(binding.event())
+                    if ("direction-alert".equals(binding.event()) || "direction-scorecard".equals(binding.event())
                             || "direction-progress".equals(binding.event())) {
-                        // A4 push/alert/scorecard: the same GLOBAL advisory class; freshness fail-closed on their own windows
+                        // A4 alert/scorecard: the same GLOBAL advisory class; freshness fail-closed on their own windows
                         if (cacheKey != null && cacheCaughtUpFlag.get()) {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
@@ -9044,9 +9057,12 @@ public class FeedGatewayService implements ReplayRunner {
     private void replayDirectionPushCached(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
-        for (Map.Entry<String, String> entry : directionPush.entrySet()) {
-            if (entry.getValue() != null && !entry.getValue().isBlank() && isCacheFresh("direction-push:" + entry.getKey(), nowMs)) {
-                send(session, "direction-push", entry.getValue());
+        synchronized (directionPushEmitLock) {
+            long pushNowMs = System.currentTimeMillis();
+            for (Map.Entry<String, String> entry : directionPush.entrySet()) {
+                if (entry.getValue() != null && !entry.getValue().isBlank() && isCacheFresh("direction-push:" + entry.getKey(), pushNowMs)) {
+                    send(session, "direction-push", entry.getValue());
+                }
             }
         }
         for (Map.Entry<String, String> entry : directionScorecard.entrySet()) {
@@ -11159,6 +11175,66 @@ public class FeedGatewayService implements ReplayRunner {
             return ms;
         } catch (JsonProcessingException | java.time.format.DateTimeParseException ignored) {
             return -1L;
+        }
+    }
+
+    /** Both ingestion paths share withdrawal ordering; the live path remains the sole emitter. */
+    void onDirectionPushRecord(ConsumerRecord<String, Object> record, boolean forward) {
+        String json = stringJson(record.value());
+        synchronized (directionPushEmitLock) {
+            if (!settings.directionPushTopic().equals(record.topic()) || !"SPX".equals(record.key()) || record.offset() < 0) {
+                inactiveDroppedEvents.incrementAndGet();
+                return;
+            }
+            RecordPosition incoming = recordPosition(record);
+            long nowNanos = System.nanoTime();
+            if (directionPushWithdrawal != null && nowNanos - directionPushWithdrawal.admittedNanos()
+                    > TimeUnit.MILLISECONDS.toNanos(settings.directionPushTtlMs())) directionPushWithdrawal = null;
+            boolean deletion = record.value() == null;
+            if (!deletion && json != null && (json.contains("\"tombstone\"") || json.contains("\\u"))) {
+                try {
+                    JsonNode body = mapper.reader().with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readTree(json);
+                    if (body.has("tombstone")) {
+                        if (json.length() > 4096 || !body.path("tombstone").isBoolean() || !body.path("tombstone").booleanValue()
+                                || !"SPX".equals(body.path("symbol").asText())) {
+                            inactiveDroppedEvents.incrementAndGet();
+                            return;
+                        }
+                        deletion = true;
+                    }
+                } catch (JsonProcessingException malformed) {
+                    inactiveDroppedEvents.incrementAndGet();
+                    return;
+                }
+            }
+            DirectionPushWithdrawal previous = directionPushWithdrawal;
+            if (previous != null && (!previous.position().partition().equals(incoming.partition())
+                    || incoming.offset() < previous.position().offset()
+                    || (!deletion && incoming.offset() == previous.position().offset()))) return;
+            if (!deletion) {
+                if (json == null || json.isBlank()) return;
+                String key = updateCache(DIRECTION_PUSH_BINDING, record, json);
+                if (key != null && forward) {
+                    broadcast("direction-push", json);
+                    forwardedEvents.incrementAndGet();
+                }
+                return;
+            }
+            synchronized (this) {
+                RecordPosition current = cachePositions.get("direction-push:DATABENTO|SPX");
+                if (current != null && (!current.partition().equals(incoming.partition()) || current.offset() >= incoming.offset())) return;
+                removeCacheEntry("direction-push:DATABENTO|SPX");
+            }
+            if (previous == null || incoming.offset() != previous.position().offset()) {
+                String withdrawal = deletion && json != null ? json : "{\"symbol\":\"SPX\",\"tombstone\":true}";
+                directionPushWithdrawal = new DirectionPushWithdrawal(incoming, nowNanos, withdrawal, false);
+            }
+            DirectionPushWithdrawal withdrawal = directionPushWithdrawal;
+            if (forward && !withdrawal.emitted()) {
+                broadcast("direction-push", withdrawal.json());
+                forwardedEvents.incrementAndGet();
+                directionPushWithdrawal = new DirectionPushWithdrawal(withdrawal.position(), withdrawal.admittedNanos(), withdrawal.json(), true);
+            }
         }
     }
 
@@ -13659,12 +13735,12 @@ public class FeedGatewayService implements ReplayRunner {
         try {
             Map<TopicPartition, ReplayPartitionState> parts = new LinkedHashMap<>();
             if (!avroTopics.isEmpty()) {
-                avro = new KafkaConsumer<>(replayConsumerProps(appSessionId, true));
+                avro = new KafkaConsumer<>(replayConsumerProps(appSessionId, true, params, avroTopics));
                 handle.avroConsumer = avro; // publish for wakeup() before any blocking call
                 openReplayPartitions(appSessionId, avro, params, avroTopics, true, parts);
             }
             if (!stringTopics.isEmpty()) {
-                str = new KafkaConsumer<>(replayConsumerProps(appSessionId, false));
+                str = new KafkaConsumer<>(replayConsumerProps(appSessionId, false, params, stringTopics));
                 handle.stringConsumer = str;
                 openReplayPartitions(appSessionId, str, params, stringTopics, false, parts);
             }
@@ -13707,10 +13783,27 @@ public class FeedGatewayService implements ReplayRunner {
     record MergeRecord(ReplayChronology.Cursor cursor, String event, Object value, boolean avro) {
     }
 
-    private Properties replayConsumerProps(String appSessionId, boolean avro) {
+    Properties replayConsumerProps(String appSessionId, boolean avro, ReplayParams params,
+                                   Map<String, String> selectedTopics) {
         Properties props = avro
                 ? avroConsumerProperties("replay-" + appSessionId)
                 : stringObjectConsumerProperties("replay-" + appSessionId);
+        if (!avro && params.hasRun()) {
+            var bindings = new LinkedHashMap<String, org.apache.avro.Schema>();
+            var tombstones = new HashSet<String>();
+            for (var binding : cvdAvroBindings().entrySet()) {
+                // The orchestrator's existing replay contract contains only these namespaces.
+                String live = binding.getKey();
+                if (!live.startsWith("options.") && !live.startsWith("underlying.")) continue;
+                String replay = ReplayTopicResolver.toReplayTopic(live, params.runId());
+                if (!selectedTopics.containsKey(replay)) continue;
+                bindings.put(replay, binding.getValue());
+                if (cvdAvroTombstoneTopics().contains(live)) tombstones.add(replay);
+            }
+            if (!bindings.isEmpty())
+                com.optionsedge.contracts.avro.CanonicalAvroKafka.rollForwardConsumer(props,
+                        settings.schemaRegistryUrl(), bindings, tombstones);
+        }
         // Unique group per run so the windowed read is independent and commits nothing (read-only).
         props.put(ConsumerConfig.GROUP_ID_CONFIG,
                 settings.groupIdBase() + "-replay-" + appSessionId + "-" + (avro ? "avro" : "str"));
@@ -15011,7 +15104,7 @@ public class FeedGatewayService implements ReplayRunner {
     private Properties stringObjectConsumerProperties(String name) {
         Properties properties = baseConsumerProperties(name);
         com.optionsedge.contracts.avro.CanonicalAvroKafka.rollForwardConsumer(properties,
-                settings.schemaRegistryUrl(), cvdAvroBindings(), Set.of(settings.esCvdSpxLevelsTopic()));
+                settings.schemaRegistryUrl(), cvdAvroBindings(), cvdAvroTombstoneTopics());
         // Avro omits field names and may expand substantially into the existing API model.
         // Eight values x at most 32 MiB of UTF-16 backing = 256 MiB retained API strings.
         // Keep smaller operator batches, with room for one conversion and the existing cache budgets.
@@ -15067,7 +15160,20 @@ public class FeedGatewayService implements ReplayRunner {
                 Map.entry(settings.esCvdSpxLevelsTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_LEVELS),
                 Map.entry(settings.esOpenDirectionForecastTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.OPEN_DIRECTION_FORECAST),
                 Map.entry(settings.esOpenDirectionOutcomeTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.OPEN_DIRECTION_OUTCOME),
-                Map.entry(settings.esOpenDirectionStatusTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.OPEN_DIRECTION_STATUS));
+                Map.entry(settings.esOpenDirectionStatusTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.OPEN_DIRECTION_STATUS),
+                Map.entry(settings.esGexSpxAlignedTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_GEX_BOOK),
+                Map.entry(settings.earlyAuctionVerdictTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.EARLY_AUCTION_LEDGER),
+                Map.entry(settings.shortPremiumRecommendationTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.SHORT_PREMIUM_RECOMMENDATION),
+                Map.entry(settings.esStrikeIntelSpxAlignedTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_STRIKE_INTELLIGENCE),
+                Map.entry(settings.directionCurrentTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.directionCurrent()),
+                Map.entry(settings.directionPushTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.directionPush()),
+                Map.entry(settings.directionAlertTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.directionAlert()),
+                Map.entry(settings.directionScorecardTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.directionScorecard()));
+    }
+
+    private Set<String> cvdAvroTombstoneTopics() {
+        // Push nulls exist in retained JSON history only. New delete-retained push writes use typed deletions.
+        return Set.of(settings.esCvdSpxLevelsTopic(), settings.esStrikeIntelSpxAlignedTopic(), settings.directionPushTopic());
     }
 
     private Properties baseConsumerProperties(String name) {
