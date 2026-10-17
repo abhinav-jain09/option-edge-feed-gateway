@@ -25,7 +25,7 @@ class CvdAvroRollingGatewayTest {
                 var method=FeedGatewayService.class.getDeclaredMethod(builder,String.class);method.setAccessible(true);
                 var props=(Properties)method.invoke(service,"state-test");
                 assertEquals("false",props.get(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG));
-                assertEquals("1",props.get(ConsumerConfig.MAX_POLL_RECORDS_CONFIG));
+                assertEquals(Integer.toString(Math.min(settings.maxPollRecords(),8)),props.get(ConsumerConfig.MAX_POLL_RECORDS_CONFIG));
                 assertEquals(settings.schemaRegistryUrl(),props.get("schema.registry.url"));
                 CanonicalAvroKafka.producer(props,"mock://"+scope);
                 var config=new HashMap<String,Object>();props.forEach((k,v)->config.put((String)k,v));

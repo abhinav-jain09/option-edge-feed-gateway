@@ -14972,8 +14972,9 @@ public class FeedGatewayService implements ReplayRunner {
         com.optionsedge.contracts.avro.CanonicalAvroKafka.rollForwardConsumer(properties,
                 settings.schemaRegistryUrl(), cvdAvroBindings(), Set.of(settings.esCvdSpxLevelsTopic()));
         // Avro omits field names and may expand substantially into the existing API model.
-        // Bound the number of decoded records simultaneously held by a state poll.
-        properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "1");
+        // Eight values x at most 32 MiB of UTF-16 backing = 256 MiB retained API strings.
+        // Keep smaller operator batches, with room for one conversion and the existing cache budgets.
+        properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, Integer.toString(Math.min(settings.maxPollRecords(), 8)));
         return properties;
     }
 
