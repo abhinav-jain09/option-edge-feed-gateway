@@ -28,15 +28,14 @@ PERMITTED_SHA="${PERMITTED_SHA:?}" bash scripts/jenkins/verify-permitted-tree.sh
   --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 \
   --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__
 [ "$(cat .contracts-sha)" = "$CONTRACTS_PERMITTED_SHA" ] || { echo 'Contracts provenance mismatch' >&2; exit 1; }
+# The pom's pin is deliberately NOT consulted. This pipeline installs contracts from main's tip and
+# builds against the version it installed, which it passes as -Doptions-edge-contracts.version; a pin
+# in the pom is only the local-dev default and is stale by design the moment contracts bumps. Requiring
+# the two to agree is what forced a pin-chasing commit on every contracts release. Provenance does not
+# rest on the pom: .contracts-sha is checked against CONTRACTS_PERMITTED_SHA above, and the jar at the
+# installed version has its sha256 verified below and again on es4 before any test runs.
 cv=$(cat .contracts-version)
 [[ $cv =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 64
-python3 - "$cv" <<'PIN'
-import sys, xml.etree.ElementTree as ET
-root=ET.parse('pom.xml').getroot()
-actual=root.find('{http://maven.apache.org/POM/4.0.0}properties/{http://maven.apache.org/POM/4.0.0}options-edge-contracts.version')
-if actual is None or (actual.text or "").strip()!=sys.argv[1]:
-    raise SystemExit('Gateway dependency pin differs from the installed contracts artifact')
-PIN
 contracts_jar="$PWD/.m2/repository/com/optionsedge/options-edge-contracts/$cv/options-edge-contracts-$cv.jar"
 [ "$(bash scripts/jenkins/permitted-sha-guard-version.sh "$contracts_jar")" = "$(cat .contracts-jar-sha256)" ] \
   || { echo 'Installed contracts jar changed' >&2; exit 1; }
