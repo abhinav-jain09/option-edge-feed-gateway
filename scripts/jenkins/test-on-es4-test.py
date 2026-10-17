@@ -72,6 +72,9 @@ while args and args[0].startswith('-'):
  else:raise ValueError(args[0])
 def local(s):return s.removeprefix('abhinav@192.168.100.4:')
 dest=pathlib.Path(local(args[-1]))
+# OpenSSH SFTP may validate every source before copying any of them.
+for source in args[:-1]:
+ if not pathlib.Path(local(source)).exists():raise FileNotFoundError(source)
 for source in args[:-1]:
  p=pathlib.Path(local(source));target=dest/p.name if dest.is_dir() else dest
  if p.is_dir():shutil.copytree(p,target,dirs_exist_ok=True)
@@ -115,6 +118,7 @@ for source in args[:-1]:
 
     def maven(self, result):
         self.script(self.jdk / "bin/mvn", '''
+if [ "$*" = -version ]; then echo "Apache Maven fixture"; exit 0; fi
 mkdir -p "$CI_GATEWAY_DIR/target/surefire-reports"
 printf '<testsuite tests="1" failures="0"/>' > "$CI_GATEWAY_DIR/target/surefire-reports/TEST-fixture.xml"
 echo finite-maven-stub
@@ -145,8 +149,21 @@ exit %d
     def test_maven_failure_cannot_publish_a_pass_receipt(self):
         self.maven(2)
         self.run_transport(1)
-        self.assertFalse((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").exists())
+        out = self.repo / ".jenkins-tmp/es4-tests-123"
+        self.assertFalse((out / "receipt.json").exists())
+        self.assertIn("finite-maven-stub", (out / "test.log").read_text())
+        self.assertTrue((out / "surefire-reports/TEST-fixture.xml").is_file())
         self.assertEqual([], list(self.remote.iterdir()))
+
+    def test_grouped_optional_sources_reproduce_the_missing_failure_log(self):
+        body = self.runner.read_text()
+        start = body.index("  for evidence in test.log receipt.json complete.txt;")
+        end = body.index("\n  done", start) + len("\n  done")
+        body = body[:start] + '  scp "${ssh_args[@]}" "$host:$remote_dir/test.log" "$host:$remote_dir/receipt.json" "$host:$remote_dir/complete.txt" "$local_dir/" >/dev/null 2>&1 || true' + body[end:]
+        self.runner.write_text(body)
+        self.maven(2)
+        self.run_transport(1)
+        self.assertFalse((self.repo / ".jenkins-tmp/es4-tests-123/test.log").exists())
 
     def test_zero_status_without_sequence_completion_cannot_pass(self):
         self.env["CI_FAKE_PARTIAL"] = "1"

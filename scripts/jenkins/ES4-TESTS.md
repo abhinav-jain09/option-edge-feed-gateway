@@ -31,7 +31,8 @@ host Maven settings: only the exact contracts JAR is source/hash-bound here. The
 is packaged separately from the same source on Jenkins, rather than being the tested binary.
 Java and Maven versions are emitted inside the unit into the hashed log. Dependencies and
 plugins are neither all preinstalled nor independently pinned by this transport.
-The Mac cache tar suppresses Apple xattr metadata. A 4 GiB cache cap fails loudly; cached
+The Mac cache tar suppresses AppleDouble files; GNU tar can still warn about ignored
+Apple provenance PAX attributes. Artifact content hashes remain verified. A 4 GiB cache cap fails loudly; cached
 coordinates remain per Jenkins workspace, and a full cache requires deliberate maintenance
 through Jenkins rather than silently evicting the bound contracts dependency.
 
@@ -79,3 +80,10 @@ The existing guard validator separately tests those real guards. Transport tests
 artifact and pin refusal, failed command, zero-status incomplete sequence, window, prior-attempt refusal and unit ownership.
 Receipt faults cover missing/empty/failed/all-skipped/altered evidence and source mismatch.
 They contact no host, broker or Docker daemon and do not prove real systemd/container limits.
+
+Failure evidence is collected independently of success-only files: `test.log`,
+`receipt.json` and `complete.txt` each use their own SCP operation. A missing marker
+or receipt cannot suppress the log transfer. Bounded full-suite XML is preserved
+on Maven failure as well as success, before any mutation can overwrite it. A
+regression fixture models SFTP pre-validation of all sources and demonstrates the
+old grouped-copy failure alongside the successful independent-copy behavior.

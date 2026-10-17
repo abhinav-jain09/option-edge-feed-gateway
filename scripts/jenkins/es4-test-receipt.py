@@ -6,6 +6,9 @@ from pathlib import Path
 import sys
 import xml.etree.ElementTree as ET
 
+MAX_REPORT_BYTES = 32 << 20
+MAX_REPORT_TOTAL_BYTES = 128 << 20
+
 
 def digest(path, limit):
     if path.is_symlink() or not path.is_file() or path.stat().st_size > limit:
@@ -33,9 +36,9 @@ def evidence(root):
     total = skipped = 0
     size = 0
     for path in files:
-        sha = digest(path, 32 << 20)
+        sha = digest(path, MAX_REPORT_BYTES)
         size += path.stat().st_size
-        if size > 128 << 20:
+        if size > MAX_REPORT_TOTAL_BYTES:
             raise ValueError("test reports exceed 128 MiB")
         node = ET.parse(path).getroot()
         if node.tag != "testsuite":
@@ -52,7 +55,32 @@ def evidence(root):
             "log_sha256": digest(root / "test.log", 128 << 20)}
 
 
+def collect_reports(source, root):
+    if source.is_symlink() or not source.is_dir():
+        raise ValueError("a real Surefire report directory is required")
+    target = root / "surefire-reports"
+    target.mkdir()
+    total = count = 0
+    for path in source.glob("TEST-*.xml"):
+        count += 1
+        if count > 512 or path.is_symlink() or not path.is_file():
+            raise ValueError("invalid test report count or file")
+        size = 0
+        with path.open("rb") as incoming, (target / path.name).open("xb") as outgoing:
+            for block in iter(lambda: incoming.read(65536), b""):
+                size += len(block)
+                total += len(block)
+                if size > MAX_REPORT_BYTES or total > MAX_REPORT_TOTAL_BYTES:
+                    raise ValueError("test report collection exceeds byte budget")
+                outgoing.write(block)
+    if count == 0:
+        raise ValueError("no Surefire test reports to collect")
+
+
 def main(args):
+    if len(args) == 3 and args[0] == "collect":
+        collect_reports(Path(args[1]), Path(args[2]))
+        return
     mode, directory, source, contracts, jar, build = args
     if mode not in ("write", "verify"):
         raise ValueError("write or verify required")

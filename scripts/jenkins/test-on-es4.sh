@@ -122,7 +122,10 @@ fi
 REMOTE_FINISH
   # Transfer failures cannot pass the subsequent mandatory receipt/evidence verification.
   scp "${ssh_args[@]}" -r "$host:$remote_dir/surefire-reports" "$local_dir/" >/dev/null 2>&1 || true
-  scp "${ssh_args[@]}" "$host:$remote_dir/test.log" "$host:$remote_dir/receipt.json" "$host:$remote_dir/complete.txt" "$local_dir/" >/dev/null 2>&1 || true
+  # Missing success-only files must not prevent transfer of the failure log.
+  for evidence in test.log receipt.json complete.txt; do
+    scp "${ssh_args[@]}" "$host:$remote_dir/$evidence" "$local_dir/" >/dev/null 2>&1 || true
+  done
   ssh "${ssh_args[@]}" "$host" "bash -s -- $remote_dir" <<'REMOTE_CLEAN' || true
 set -euo pipefail
 dir=$1
@@ -178,10 +181,11 @@ cd "$CI_GATEWAY_DIR"
 java -version
 mvn -version
 taskset -pc $$
-mvn -B test
-# Preserve the full-suite reports before mutation runs overwrite Surefire XML in this checkout.
-mkdir ../surefire-reports
-cp target/surefire-reports/TEST-*.xml ../surefire-reports/
+result=0
+mvn -B test || result=$?
+# Keep bounded failing reports too, before exiting or running mutations that overwrite XML.
+python3 scripts/jenkins/es4-test-receipt.py collect target/surefire-reports ..
+[ "$result" -eq 0 ] || exit "$result"
 scripts/footprint-reverify.sh
 scripts/footprint-reqstate.sh --check
 printf '%s\n' "$CI_SOURCE_SHA" > ../complete.txt
