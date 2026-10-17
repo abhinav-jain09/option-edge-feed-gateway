@@ -2609,6 +2609,15 @@ public class FeedGatewayService implements ReplayRunner {
         // below). Its strike is a decimal logical type, which AvroJson renders as a number — not the
         // base64 a bytes field would otherwise become.
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
+        if (settings.ibkrPreOpenEnabled()) {
+            // Pre-open IBKR GEX status/control stream (rev13 Phase 3): AVRO since its .v2 cutover,
+            // so it is consumed HERE and no longer on the string consumer below. NINE record types
+            // share this one topic under RecordNameStrategy, and AvroJson emits exactly the fields of
+            // whichever record arrived — which is what keeps the browser payload identical to the
+            // JSON era, since option-chain.js reads these by name (status.eventTimeMs, status.atMs,
+            // status.effectiveAtMs, status.heartbeatDeadlineMs).
+            topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
+        }
         // Indicator snapshots are AVRO (contracts IndicatorSnapshot, fixed id 2001, Kafka Serialization Rule):
         // consumed here, on the Avro consumer, and rendered through the owner's JSON writer (avroJson) so the
         // cached and broadcast text is byte-identical to the JSON era. r1 finding 1 still holds: dev/prod consume
@@ -2639,10 +2648,6 @@ public class FeedGatewayService implements ReplayRunner {
         // the UW gex/gex-history pairing above; the history record is a superset and wins via the
         // history-preservation gate in cacheRecord()).
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
-        if (settings.ibkrPreOpenEnabled()) {
-            // Pre-open IBKR GEX status/control stream (rev13 Phase 3) — JSON on the wire.
-            topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
-        }
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
         topicEvents.put(settings.databentoSpotBandTopic(), new TopicBinding("DATABENTO", "spot-band"));
@@ -2793,6 +2798,11 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         // Keep cache + live symmetric: per-strike OI-arrival status is AVRO since its .v2 cutover.
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
+        if (settings.ibkrPreOpenEnabled()) {
+            // Keep cache + live symmetric for the pre-open status stream too, or live statuses stop
+            // flowing after bootstrap — the exact asymmetry the retired JSON pair was careful about.
+            topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
+        }
         // Indicator snapshots are AVRO (contracts IndicatorSnapshot, fixed id 2001, Kafka Serialization Rule):
         // consumed here, on the Avro consumer, and rendered through the owner's JSON writer (avroJson) so the
         // cached and broadcast text is byte-identical to the JSON era. r1 finding 1 still holds: dev/prod consume
@@ -2806,11 +2816,6 @@ public class FeedGatewayService implements ReplayRunner {
     private void runJsonStateLiveConsumer() {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
-        if (settings.ibkrPreOpenEnabled()) {
-            // Pre-open IBKR GEX status/control stream (rev13 Phase 3) — keep the cache + live
-            // JSON consumer topic sets symmetric so live statuses actually flow post-bootstrap.
-            topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
-        }
         topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
         // Canonical SPX spot — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.

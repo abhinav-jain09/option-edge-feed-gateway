@@ -7613,15 +7613,75 @@ class FeedGatewayServiceTest {
         assertTrue(envelope.contains("\"gexByStrike\":[]"));
     }
 
+    /**
+     * The consumer methods a topic registration appears inside, in source order.
+     *
+     * <p>Counting registrations is not enough. Both of these topics must be bound on the AVRO
+     * consumers since their Avro cutovers, and a count of two is equally satisfied by two
+     * registrations on the JSON consumers — which is exactly the mistake that would hand an Avro
+     * topic to a string deserializer. This resolves each registration to its enclosing method so
+     * the placement itself is asserted.
+     */
+    private static List<String> consumersRegistering(String source, String settingAccessor) {
+        java.util.regex.Matcher methods = java.util.regex.Pattern
+                .compile("private void (run[A-Za-z]*Consumer)\\(\\)").matcher(source);
+        java.util.List<int[]> starts = new java.util.ArrayList<>();
+        java.util.List<String> names = new java.util.ArrayList<>();
+        while (methods.find()) {
+            starts.add(new int[]{methods.start()});
+            names.add(methods.group(1));
+        }
+        java.util.regex.Matcher regs = java.util.regex.Pattern
+                .compile("topicEvents\\.put\\(settings\\." + settingAccessor + "\\(\\),").matcher(source);
+        List<String> out = new java.util.ArrayList<>();
+        while (regs.find()) {
+            String enclosing = "(none)";
+            for (int i = 0; i < starts.size(); i++) {
+                if (starts.get(i)[0] < regs.start()) {
+                    enclosing = names.get(i);
+                }
+            }
+            out.add(enclosing);
+        }
+        return out;
+    }
+
     @Test
-    void gexOiStatusTopicBindsToGexOiStatusEventOnTheJsonConsumers() throws Exception {
+    void gexOiStatusTopicBindsToGexOiStatusEventOnTheAvroConsumers() throws Exception {
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
-        // gex-oi-status is DATABENTO-only JSON (gex watchdog): bound on BOTH JSON state consumers (cache +
-        // live symmetric), exempt from the cached-replay staleness + offset barriers like gex-by-strike.
-        assertEquals(2, source.split(
-                "topicEvents\\.put\\(settings\\.databentoGexOiStatusTopic\\(\\), new TopicBinding\\(\"DATABENTO\", \"gex-oi-status\"\\)\\);", -1).length - 1);
+        // gex-oi-status is AVRO since its .v2 cutover, bound on BOTH Avro consumers (cache + live
+        // symmetric), exempt from the cached-replay staleness + offset barriers like gex-by-strike.
+        // This test was named ...OnTheJsonConsumers and asserted only a COUNT of two, which stayed
+        // green straight through that cutover and said the opposite of the truth.
+        assertEquals(List.of("runAvroCacheConsumer", "runAvroLiveConsumer"),
+                consumersRegistering(source, "databentoGexOiStatusTopic"));
         assertFalse(FeedGatewayService.enforceCachedReplayMaxStale("gex-oi-status", "DATABENTO"));
         assertFalse(FeedGatewayService.enforceCachedReplayOffsetBarrier("gex-oi-status", "DATABENTO"));
+    }
+
+    /**
+     * The pre-open status stream is bound on BOTH Avro consumers and on NEITHER string consumer.
+     *
+     * <p>Cache-and-live symmetry is the property that matters: the retired JSON pair carried a
+     * comment warning that an asymmetric pair stops live statuses flowing after bootstrap. Placement
+     * on the Avro side is the other half — the topic's nine record types are Avro under
+     * RecordNameStrategy, and a string consumer would be handed bytes it cannot read.
+     */
+    @Test
+    void ibkrPreOpenStatusBindsOnBothAvroConsumersAndNeitherStringConsumer() throws Exception {
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        assertEquals(List.of("runAvroCacheConsumer", "runAvroLiveConsumer"),
+                consumersRegistering(source, "ibkrPreOpenStatusTopic"));
+    }
+
+    /** The gateway refuses a configuration that names the retired JSON topic. */
+    @Test
+    void theRetiredPreOpenStatusTopicIsRefusedByTheSetting() {
+        assertEquals("options.ibkr.gex.status.v2", new GatewaySettings().ibkrPreOpenStatusTopic());
+        IllegalStateException boom = org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalStateException.class,
+                () -> app.kafka.IbkrPreOpenStatusAvro.requireAvroTopic("options.ibkr.gex.status", "unit"));
+        assertTrue(boom.getMessage().contains("refusing the retired JSON topic"), boom.getMessage());
     }
 
     @Test
