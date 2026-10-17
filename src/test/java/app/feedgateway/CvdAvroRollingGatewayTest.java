@@ -170,6 +170,44 @@ class CvdAvroRollingGatewayTest {
         } finally { MockSchemaRegistry.dropScope(scope); }
     }
 
+    @Test void eavCacheDecoderKeepsExactEngineModelsAndRefusesWrongFramedSchemas() throws Exception {
+        var settings=new GatewaySettings();var mapper=new ObjectMapper();
+        var service=new FeedGatewayService(settings,mapper,new HpsfGatewayViewMapper(),null);
+        var method=FeedGatewayService.class.getDeclaredMethod("stringObjectConsumerProperties",String.class);method.setAccessible(true);
+        var properties=(Properties)method.invoke(service,"state");
+        String topic=settings.earlyAuctionVerdictTopic(),scope="eav-gateway-reader";
+        var schema=com.optionsedge.contracts.cvd.CvdRelatedSchemas.EARLY_AUCTION_LEDGER;
+        assertEquals(schema,service.cvdAvroBindings().get(topic));
+        assertEquals(CanonicalModelDeserializer.class,properties.get(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG));
+        assertEquals("read_committed",properties.get(ConsumerConfig.ISOLATION_LEVEL_CONFIG));
+        assertEquals("false",properties.get(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG));
+        properties.put("schema.registry.url","mock://"+scope);properties.put("auto.register.schemas",false);
+        var config=new HashMap<String,Object>();properties.forEach((key,value)->config.put((String)key,value));
+        var configured=(Class<?>)properties.get(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG);
+        var registry=MockSchemaRegistry.getClientForScope(scope);registry.register(topic+"-value",schema);
+        try(var reader=configured.asSubclass(org.apache.kafka.common.serialization.Deserializer.class).getDeclaredConstructor().newInstance();
+            var writer=new com.optionsedge.contracts.avro.CanonicalAvroSerializer(registry);
+            var input=getClass().getResourceAsStream("/cvd/eav-engine-emissions.json")) {
+            reader.configure(config,false);writer.configure(config,false);
+            var models=mapper.readTree(input).path("models");assertEquals(6,models.size());long offset=0;
+            for(var model:models) {
+                String expected=model.toString();
+                byte[] avro=writer.serialize(topic,CanonicalJsonAvro.record(schema,model));
+                assertEquals(0,avro[0]);
+                for(byte[] wire:List.of(expected.getBytes(StandardCharsets.UTF_8),avro,expected.getBytes(StandardCharsets.UTF_8))) {
+                    String decoded=(String)reader.deserialize(topic,wire);assertEquals(expected,decoded);
+                    assertEquals(model.path("tradeDate").asText(),service.validateEarlyAuctionVerdict(decoded));
+                    service.onEarlyAuctionVerdictRecord(decoded,offset++);
+                }
+                assertTrue(service.earlyAuctionVerdictPage(null,-1,100).events().stream().anyMatch(event->event.json().equals(expected)));
+                assertThrows(org.apache.kafka.common.errors.SerializationException.class,
+                        ()->reader.deserialize(settings.esCvdBarsTopic(),avro));
+            }
+            assertThrows(org.apache.kafka.common.errors.SerializationException.class,()->reader.deserialize(topic,null));
+            assertThrows(org.apache.kafka.common.errors.SerializationException.class,()->reader.deserialize(topic,new byte[]{0,0,0}));
+        } finally {MockSchemaRegistry.dropScope(scope);}
+    }
+
     private static List<String> fieldNames(JsonNode node) {
         var names=new ArrayList<String>();node.fieldNames().forEachRemaining(names::add);return names;
     }
@@ -177,6 +215,14 @@ class CvdAvroRollingGatewayTest {
     private static JsonNode populated(Schema schema) {
         var json=com.fasterxml.jackson.databind.node.JsonNodeFactory.instance;
         String payload=schema.getProp("optionsedge.api-model-field");if(payload!=null)return populated(schema.getField(payload).schema());
+        String scalar=schema.getProp("optionsedge.api-scalar");
+        if(scalar!=null)return switch(scalar) {
+            case "statistic","decimal-number" -> json.numberNode(new java.math.BigDecimal("7800.25"));
+            case "decimal-text","decimal-lexeme" -> json.textNode("7800.25");
+            default -> throw new AssertionError("Unsupported API scalar "+scalar);
+        };
+        if("true".equals(schema.getProp("optionsedge.api-ordered-map")))
+            return json.objectNode().set("key",populated(schema.getElementType().getField("value").schema()));
         if("v1".equals(schema.getProp("optionsedge.verbatim-evidence")))return json.objectNode().put("evidence",-0.0);
         if(schema.getType()==Schema.Type.UNION)return populated(schema.getTypes().stream().filter(t->t.getType()!=Schema.Type.NULL).findFirst().orElseThrow());
         if(schema.getLogicalType() instanceof org.apache.avro.LogicalTypes.Decimal)return json.numberNode(new java.math.BigDecimal("7800.25"));
