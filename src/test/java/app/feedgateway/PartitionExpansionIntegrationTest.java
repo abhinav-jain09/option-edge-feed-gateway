@@ -60,7 +60,9 @@ class PartitionExpansionIntegrationTest {
 
     @Container
     private static final KafkaContainer KAFKA =
-            new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"));
+            new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))
+                    .withCreateContainerCmdModifier(command -> command.getHostConfig()
+                            .withMemory(2L << 30).withMemorySwap(2L << 30).withNanoCPUs(1_000_000_000L));
 
     private static final String TOPIC = "partition-expansion-probe";
     private static final Duration POLL = Duration.ofMillis(250);

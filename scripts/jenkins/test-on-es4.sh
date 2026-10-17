@@ -5,8 +5,9 @@
 set -euo pipefail
 
 check_window() {
-  local weekday hhmm
-  read -r weekday hhmm < <(TZ=America/New_York date '+%u %H%M')
+  local weekday hhmm zone
+  read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
+  [[ $zone = EST || $zone = EDT ]] || { echo 'New York timezone unavailable' >&2; return 1; }
   # A test run is bounded to 40 minutes: do not start inside the 45-minute pre-open margin.
   if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0845 ] && [ "$hhmm" -lt 1600 ]; then
     echo 'Gateway es4 tests refused: cash-window exclusion is 08:45-16:00 America/New_York.' >&2
@@ -49,8 +50,13 @@ local_dir="$PWD/.jenkins-tmp/es4-tests-$BUILD_NUMBER"
 mkdir -p "$local_dir"
 [ -z "$(find "$PWD/.m2/repository" -type l -print -quit)" ] || { echo "Maven cache contains a symlink" >&2; exit 1; }
 [ "$(du -sk "$PWD/.m2/repository" | cut -f1)" -le 4194304 ] || { echo "Test cache exceeds 4 GiB" >&2; exit 1; }
+cleanup_local() {
+  rm -f "$local_dir/source.bundle" "$local_dir/maven-cache.tar.gz" "$local_dir/inputs.sha256" \
+    "$local_dir/.contracts-sha" "$local_dir/.contracts-version" "$local_dir/.contracts-jar-sha256"
+}
+trap cleanup_local EXIT
 git bundle create "$local_dir/source.bundle" HEAD
-tar -C "$PWD/.m2" -czf "$local_dir/maven-cache.tar.gz" repository
+COPYFILE_DISABLE=1 tar -C "$PWD/.m2" -czf "$local_dir/maven-cache.tar.gz" repository
 cp .contracts-sha .contracts-version .contracts-jar-sha256 "$local_dir/"
 (
   cd "$local_dir"
@@ -64,6 +70,12 @@ root=$1; build=$2
 umask 077
 mkdir -p "$root"
 [ ! -L "$root" ] || exit 1
+for tool in mvn git python3 systemd-run systemctl docker sha256sum tar; do command -v "$tool" >/dev/null; done
+[ -x /usr/lib/jvm/java-21-openjdk/bin/java ] || exit 1
+[ -r /usr/share/zoneinfo/America/New_York ] || exit 1
+systemctl --user is-system-running | grep -qx running
+docker info >/dev/null
+[ "$(df -Pk "$root" | awk 'NR==2 {print $4}')" -ge 41943040 ] || { echo '40 GiB free disk required' >&2; exit 1; }
 [ "$(find "$root" -mindepth 1 -maxdepth 1 -type d | wc -l)" -lt 4 ] || { echo 'Too many retained CI workspaces' >&2; exit 1; }
 [ "$(du -sm "$root" | cut -f1)" -lt 20480 ] || { echo 'CI retained-state budget exceeded (20 GiB)' >&2; exit 1; }
 mktemp -d "$root/run.$build.XXXXXXXX"
@@ -73,27 +85,22 @@ REMOTE_INIT
 finish() {
   local result=$?
   trap - EXIT INT TERM HUP
-  # Stop only this run's isolated process group, if it is still the process we recorded.
+  # Stop only this run's transient service, after proving its ExecStart ownership.
   ssh "${ssh_args[@]}" "$host" "bash -s -- $remote_dir" <<'REMOTE_FINISH' || true
 set -euo pipefail
 dir=$1
 [[ $dir =~ ^/home/abhinav/ci/gateway-tests/run\.[0-9]+\.[A-Za-z0-9]+$ ]] || exit 64
-if [ -f "$dir/test.pid" ]; then
-  pid=$(cat "$dir/test.pid")
-  if [[ $pid =~ ^[0-9]+$ ]] && [ -r "/proc/$pid/cmdline" ] \
-      && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq -- "$dir" \
-      && [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; then
-    kill -TERM -- "-$pid" || true
-    for i in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-    if kill -0 "$pid" 2>/dev/null && [ -r "/proc/$pid/cmdline" ] \
-        && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq -- "$dir" \
-        && [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; then kill -KILL -- "-$pid" || true; fi
-  fi
+# The unit name is derived exclusively from this validated private run directory.
+unit="oe-gateway-$(basename "$dir" | tr '.' '-')"
+# A unit belonging to a different command must never be stopped.
+exec_start=$(systemctl --user show "$unit" --property=ExecStart --value 2>/dev/null || true)
+if [[ $exec_start = *"$dir/run-tests.sh"* ]]; then
+  systemctl --user stop "$unit"
 fi
 REMOTE_FINISH
-  # Reports are supplementary; a missing report never turns a failed test command into success.
-  scp "${ssh_args[@]}" -r "$host:$remote_dir/gateway/target/surefire-reports" "$local_dir/" >/dev/null 2>&1 || true
-  scp "${ssh_args[@]}" "$host:$remote_dir/test.log" "$host:$remote_dir/receipt.txt" "$local_dir/" >/dev/null 2>&1 || true
+  # Transfer failures cannot pass the subsequent mandatory receipt/evidence verification.
+  scp "${ssh_args[@]}" -r "$host:$remote_dir/surefire-reports" "$local_dir/" >/dev/null 2>&1 || true
+  scp "${ssh_args[@]}" "$host:$remote_dir/test.log" "$host:$remote_dir/receipt.json" "$local_dir/" >/dev/null 2>&1 || true
   ssh "${ssh_args[@]}" "$host" "bash -s -- $remote_dir" <<'REMOTE_CLEAN' || true
 set -euo pipefail
 dir=$1
@@ -103,6 +110,8 @@ dir=$1
 find -P "$dir" -xdev -depth -mindepth 1 -delete
 rmdir "$dir"
 REMOTE_CLEAN
+  # Keep only bounded report/log evidence locally; source/cache snapshots are not retained per build.
+  cleanup_local
   exit "$result"
 }
 trap finish EXIT
@@ -119,7 +128,8 @@ dir=$1; source_sha=$2; contracts_sha=$3; java_home=$4; build=$5
 [[ $dir =~ ^/home/abhinav/ci/gateway-tests/run\.[0-9]+\.[A-Za-z0-9]+$ ]] || exit 64
 [[ $source_sha =~ ^[0-9a-f]{40}$ ]] && [[ $contracts_sha =~ ^[0-9a-f]{40}$ ]] || exit 64
 [ "$java_home" = /usr/lib/jvm/java-21-openjdk ] || exit 64
-read -r weekday hhmm < <(TZ=America/New_York date '+%u %H%M')
+read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
+[[ $zone = EST || $zone = EDT ]] || exit 1
 if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0845 ] && [ "$hhmm" -lt 1600 ]; then exit 1; fi
 cd "$dir"
 sha256sum -c inputs.sha256
@@ -144,26 +154,69 @@ cat > run-tests.sh <<'RUN'
 set -euo pipefail
 cd "$CI_GATEWAY_DIR"
 mvn -B test
+# Preserve the full-suite reports before mutation runs overwrite Surefire XML in this checkout.
+mkdir ../surefire-reports
+cp target/surefire-reports/TEST-*.xml ../surefire-reports/
 scripts/footprint-reverify.sh
 scripts/footprint-reqstate.sh --check
 RUN
-# Planned host budget: 8 GiB including the 1536 MiB Surefire heap, 1 GiB native headroom,
-# Maven (768 MiB heap plus 512 MiB headroom) and isolated Testcontainers Kafka resources.
-# This is an isolated CI process, with the source/Maven cache under this run's directory.
-read -r weekday hhmm < <(TZ=America/New_York date '+%u %H%M')
+# The complete sequence has an initial 40-minute deadline, not a claim of measured duration.
+# Successful execution is required before any image is packaged or deployed.
+unit="oe-gateway-$(basename "$dir" | tr '.' '-')"
+stop_unit() { systemctl --user stop "$unit" >/dev/null 2>&1 || true; }
+trap stop_unit EXIT
+trap 'exit 143' HUP INT TERM
+read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
+[[ $zone = EST || $zone = EDT ]] || exit 1
 if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0845 ] && [ "$hhmm" -lt 1600 ]; then exit 1; fi
-setsid timeout 2400s env -i PATH="$java_home/bin:/usr/bin:/bin" JAVA_HOME="$java_home" \
-  JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$dir/tmp" \
-  MAVEN_SKIP_RC=true MAVEN_OPTS="-Xmx768m -Dmaven.repo.local=$dir/cache/repository -Djava.io.tmpdir=$dir/tmp" \
-  CI_GATEWAY_DIR="$dir/gateway" JENKINS_URL=es4-test-transport CI=true \
-  bash "$dir/run-tests.sh" > test.log 2>&1 &
-pid=$!; printf '%s\n' "$pid" > test.pid
-result=0; wait "$pid" || result=$?
+# User-systemd owns every descendant, including TERM-resistant/orphaned processes.
+# The Kafka test container separately has 2 GiB / one CPU limits; planned total is 8 GiB.
+python3 - "$dir" "$unit" "$java_home" <<'SUPERVISE'
+import os, pathlib, selectors, subprocess, sys, time
+root, unit, java = sys.argv[1:]
+command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=" + unit,
+    "--property=MemoryMax=4G", "--property=MemorySwapMax=0", "--property=TasksMax=512",
+    "--property=CPUQuota=200%", "--property=RuntimeMaxSec=2400", "--property=TimeoutStopSec=10",
+    "--property=KillMode=control-group", "env", "-i", "PATH=" + java + "/bin:/usr/bin:/bin",
+    "JAVA_HOME=" + java, "JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=" + root + "/tmp",
+    "MAVEN_SKIP_RC=true", "MAVEN_OPTS=-Xmx768m -Dmaven.repo.local=" + root + "/cache/repository -Djava.io.tmpdir=" + root + "/tmp",
+    "CI_GATEWAY_DIR=" + root + "/gateway", "JENKINS_URL=es4-test-transport", "CI=true", "bash", root + "/run-tests.sh"]
+child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+selector = selectors.DefaultSelector()
+selector.register(child.stdout, selectors.EVENT_READ)
+size = 0
+next_disk_check = 0.0
+try:
+    with open(root + "/test.log", "wb") as log:
+        while selector.get_map():
+            if time.monotonic() >= next_disk_check:
+                used = subprocess.check_output(["du", "-sk", str(pathlib.Path(root).parent)], timeout=10)
+                if int(used.split()[0]) > 20 * 1024 * 1024:
+                    raise RuntimeError("CI retained-state threshold exceeds 20 GiB")
+                next_disk_check = time.monotonic() + 10
+            for key, _ in selector.select(timeout=5):
+                block = os.read(key.fileobj.fileno(), 65536)
+                if not block:
+                    selector.unregister(key.fileobj)
+                    continue
+                size += len(block)
+                if size > 128 << 20:
+                    raise RuntimeError("test log exceeds 128 MiB")
+                log.write(block)
+    if child.wait(timeout=15) != 0:
+        raise RuntimeError("remote full suite or campaign failed")
+finally:
+    selector.close()
+    # Stop is idempotent for a collected unit. KillMode kills ALL members, not only a leader PID.
+    subprocess.run(["systemctl", "--user", "stop", unit], timeout=20, check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if child.poll() is None:
+        child.terminate()
+        child.wait(timeout=15)
+SUPERVISE
 tail -n 40 test.log
-[ "$result" -eq 0 ] || exit "$result"
-printf 'source=%s\ncontracts_source=%s\ncontracts_jar_sha256=%s\nbuild_number=%s\nstatus=PASS\n' \
-  "$source_sha" "$contracts_sha" "$(cat .contracts-jar-sha256)" "$build" > receipt.txt
+PERMITTED_SHA="$source_sha" bash gateway/scripts/jenkins/verify-permitted-tree.sh --dir gateway --allow-ignored target --allow-ignored scripts/__pycache__
+python3 gateway/scripts/jenkins/es4-test-receipt.py write "$dir" "$source_sha" "$contracts_sha" "$(cat .contracts-jar-sha256)" "$build"
 REMOTE_TEST
-if [ -f "$local_dir/receipt.txt" ]; then echo 'Stale local test receipt exists' >&2; exit 1; fi
 # finish() fetches the receipt before returning this successful exit to Jenkins.
 exit 0

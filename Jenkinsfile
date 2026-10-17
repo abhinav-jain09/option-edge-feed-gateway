@@ -233,12 +233,14 @@ pipeline {
         timeout(time: 10, unit: 'MINUTES') {
           sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
         }
+        sh 'python3 scripts/jenkins/test-on-es4-test.py'
+        sh 'python3 scripts/jenkins/es4-test-receipt-test.py'
         sh 'bash scripts/jenkins/test-on-es4.sh'
       }
       post {
         always {
           junit testResults: ".jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/surefire-reports/*.xml", allowEmptyResults: true
-          archiveArtifacts artifacts: ".jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/test.log,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/receipt.txt", allowEmptyArchive: true
+          archiveArtifacts artifacts: ".jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/test.log,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/receipt.json", allowEmptyArchive: true
         }
       }
     }
@@ -249,11 +251,8 @@ pipeline {
           set -eu
           # Tests and the complete mutation campaign must have passed in THIS build against
           # both permitted sources and the exact contracts jar, before packaging can proceed.
-          grep -qx "source=${PERMITTED_SHA:?}" .jenkins-tmp/es4-tests-${BUILD_NUMBER}/receipt.txt
-          grep -qx "contracts_source=${CONTRACTS_PERMITTED_SHA:?}" .jenkins-tmp/es4-tests-${BUILD_NUMBER}/receipt.txt
-          grep -qx "contracts_jar_sha256=$(cat .contracts-jar-sha256)" .jenkins-tmp/es4-tests-${BUILD_NUMBER}/receipt.txt
-          grep -qx "build_number=${BUILD_NUMBER:?}" .jenkins-tmp/es4-tests-${BUILD_NUMBER}/receipt.txt
-          grep -qx "status=PASS" .jenkins-tmp/es4-tests-${BUILD_NUMBER}/receipt.txt
+          python3 scripts/jenkins/es4-test-receipt.py verify ".jenkins-tmp/es4-tests-${BUILD_NUMBER}" \
+            "${PERMITTED_SHA:?}" "${CONTRACTS_PERMITTED_SHA:?}" "$(cat .contracts-jar-sha256)" "${BUILD_NUMBER:?}"
           # Re-render the document from this checkout's record, as in the original gate.
           scripts/footprint-reqstate.sh --check
         '''
@@ -301,7 +300,7 @@ pipeline {
             timeout(time: 10, unit: 'MINUTES') {
               sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
             }
-            sh 'mvn -B package'
+            sh 'mvn -B -DskipTests package'
             // part 3: the packaged jar, by content, and the contracts jar INSIDE it (Spring Boot fat jar,
             // BOOT-INF/lib) must be the bound one. This is what proves what was consumed.
             sh '''
@@ -510,6 +509,23 @@ EOF
         }
       }
     }
+      }
+      post {
+        cleanup {
+          script {
+            if (env.PERMITTED_SHA_GUARD == 'PASSED') {
+              sh '''
+                set -eu
+                case "${BUILD_NUMBER:-}" in ''|*[!0-9]*) exit 64;; esac
+                dir=".jenkins-tmp/es4-tests-${BUILD_NUMBER}"
+                if [ -d "$dir" ] && [ ! -L "$dir" ]; then
+                  find -P "$dir" -xdev -depth -mindepth 1 -delete
+                  rmdir "$dir"
+                fi
+              '''
+            }
+          }
+        }
       }
     }   // end stage('Build')
 

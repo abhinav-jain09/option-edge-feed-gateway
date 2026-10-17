@@ -3,8 +3,6 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
-import signal
-import sys
 import subprocess
 import tempfile
 import unittest
@@ -36,7 +34,12 @@ test "$(git -C "$dir" rev-parse HEAD)" = "$PERMITTED_SHA"
             self.script(self.repo / "scripts" / name, 'echo footprint-check')
         self.script(self.jdk / "bin/java", 'echo \'openjdk version "21"\' >&2')
         self.maven(0)
-        self.script(self.bin / "date", 'printf "%s\\n" "${CI_FAKE_DATE:-6 0700}"')
+        self.script(self.bin / "date", 'printf "%s\\n" "${CI_FAKE_DATE:-6 0700 EDT}"')
+        self.script(self.bin / "docker", 'echo finite-docker-preflight')
+        self.script(self.bin / "df", 'printf "Filesystem 1024-blocks Used Available Capacity Mounted\\nfixture 999999999 0 999999999 0%% /\\n"')
+        self.script(self.bin / "systemctl", 'case "$*" in *is-system-running*) echo running;; *show*) cat "${CI_UNIT_EXEC}" 2>/dev/null || true;; *stop*) printf "%s\\n" "$*" >> "$CI_UNIT_STOPS";; esac')
+        self.script(self.bin / "systemd-run", 'while [[ $1 = --* ]]; do shift; done; exec "$@"')
+        self.write(self.repo / "scripts/jenkins/es4-test-receipt.py", SOURCE.with_name("es4-test-receipt.py").read_text())
         self.script(self.bin / "sha256sum", 'exec shasum -a 256 "$@"')
         self.write(self.bin / "setsid", "#!/usr/bin/env python3\nimport os,sys\nos.setsid()\nos.execvp(sys.argv[1],sys.argv[1:])\n", True)
         self.script(self.bin / "timeout", 'shift;exec "$@"')
@@ -62,7 +65,7 @@ for source in args[:-1]:
  if p.is_dir():shutil.copytree(p,target,dirs_exist_ok=True)
  else:shutil.copy2(p,target)
 ''', True)
-        # Only deployment-specific filesystem/JDK literals change in the test copy. Guard bodies are unchanged.
+        # The fixture replaces host filesystem/JDK literals; real guard commands are separately stubbed above.
         self.runner = self.root / "transport.sh"
         self.write(self.runner, SOURCE.read_text().replace("/home/abhinav/ci/gateway-tests", str(self.remote))
                    .replace("/usr/lib/jvm/java-21-openjdk", str(self.jdk)), True)
@@ -80,7 +83,8 @@ for source in args[:-1]:
         self.env = {**os.environ, "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
                     "JENKINS_URL": "unit-fixture", "PERMITTED_SHA": self.sha,
                     "CONTRACTS_PERMITTED_SHA": "c" * 40, "BUILD_NUMBER": "123",
-                    "CI_CALLS": str(self.root / "calls"), "CI_FAKE_DATE": "6 0700"}
+                    "CI_CALLS": str(self.root / "calls"), "CI_FAKE_DATE": "6 0700 EDT",
+                    "CI_UNIT_EXEC": str(self.root / "unit-exec"), "CI_UNIT_STOPS": str(self.root / "unit-stops")}
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -114,17 +118,22 @@ exit %d
     def test_success_binds_source_jar_and_build_and_collects_reports(self):
         self.run_transport()
         out = self.repo / ".jenkins-tmp/es4-tests-123"
-        receipt = (out / "receipt.txt").read_text()
-        self.assertIn("source=" + self.sha + "\n", receipt)
-        self.assertIn("contracts_source=" + "c" * 40 + "\n", receipt)
-        self.assertIn("build_number=123\nstatus=PASS\n", receipt)
+        import json
+        receipt = json.loads((out / "receipt.json").read_text())
+        self.assertEqual(self.sha, receipt["source"])
+        self.assertEqual("c" * 40, receipt["contracts_source"])
+        self.assertEqual("123", receipt["build_number"])
+        self.assertEqual("PASS", receipt["status"])
+        self.assertEqual(1, receipt["tests"])
+        self.assertFalse((out / "source.bundle").exists())
+        self.assertFalse((out / "maven-cache.tar.gz").exists())
         self.assertTrue((out / "surefire-reports/TEST-fixture.xml").is_file())
         self.assertEqual([], list(self.remote.iterdir()))
 
     def test_maven_failure_cannot_publish_a_pass_receipt(self):
         self.maven(2)
-        self.run_transport(2)
-        self.assertFalse((self.repo / ".jenkins-tmp/es4-tests-123/receipt.txt").exists())
+        self.run_transport(1)
+        self.assertFalse((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").exists())
         self.assertEqual([], list(self.remote.iterdir()))
 
     def test_wrong_artifact_or_source_fails_before_any_transport(self):
@@ -147,41 +156,31 @@ exit %d
         self.assertFalse((self.root / "calls").exists())
 
     def test_cash_window_refuses_before_any_transport(self):
-        self.env["CI_FAKE_DATE"] = "1 0900"
+        self.env["CI_FAKE_DATE"] = "1 0900 EDT"
         self.run_transport(1)
         self.assertFalse((self.root / "calls").exists())
 
-    def cancellation(self, matched, own_group):
+    def cancellation(self, command):
         run = self.remote / "run.123.fixture"
         run.mkdir(parents=True)
-        child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)", str(run)],
-                                 start_new_session=own_group)
-        try:
-            self.write(run / "test.pid", str(child.pid))
-            proc_root = self.root / "proc"
-            self.write(proc_root / str(child.pid) / "cmdline", "fixture " + (str(run) if matched else "unrelated-worker"))
-            body = SOURCE.read_text().split("<<'REMOTE_FINISH'", 1)[1].split("\n", 1)[1].split("\nREMOTE_FINISH", 1)[0]
-            body = body.replace("/home/abhinav/ci/gateway-tests", str(self.remote)).replace("/proc/", str(proc_root) + "/")
-            result = subprocess.run(["bash", "-s", "--", str(run)], input=body, text=True,
-                                    capture_output=True, timeout=15)
-            self.assertEqual(0, result.returncode, result.stderr)
-            if matched and own_group:
-                self.assertEqual(-signal.SIGTERM, child.wait(timeout=2))
-            else:
-                self.assertIsNone(child.poll(), "a different worker/group must survive")
-        finally:
-            if child.poll() is None:
-                child.terminate()
-            child.wait(timeout=3)
+        if command is not None:
+            self.write(self.root / "unit-exec", command.replace("RUN", str(run)))
+        body = SOURCE.read_text().split("<<'REMOTE_FINISH'", 1)[1].split("\n", 1)[1].split("\nREMOTE_FINISH", 1)[0]
+        body = body.replace("/home/abhinav/ci/gateway-tests", str(self.remote))
+        result = subprocess.run(["bash", "-s", "--", str(run)], input=body, text=True,
+                                capture_output=True, env=self.env, timeout=10)
+        self.assertEqual(0, result.returncode, result.stderr)
+        stopped = self.root / "unit-stops"
+        return stopped.read_text() if stopped.exists() else ""
 
-    def test_cancellation_stops_only_its_proven_process_group(self):
-        self.cancellation(True, True)
+    def test_cancellation_stops_only_its_proven_unit(self):
+        self.assertIn("stop oe-gateway-run-123-fixture", self.cancellation("bash RUN/run-tests.sh"))
 
-    def test_cancellation_does_not_stop_a_reused_unrelated_pid(self):
-        self.cancellation(False, True)
+    def test_cancellation_does_not_stop_an_unrelated_command(self):
+        self.assertEqual("", self.cancellation("unrelated-worker"))
 
-    def test_cancellation_does_not_signal_a_shared_process_group(self):
-        self.cancellation(True, False)
+    def test_cancellation_does_not_stop_an_absent_unit(self):
+        self.assertEqual("", self.cancellation(None))
 
     def test_existing_local_attempt_is_not_reused(self):
         (self.repo / ".jenkins-tmp/es4-tests-123").mkdir(parents=True)
