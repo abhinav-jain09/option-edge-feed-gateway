@@ -154,7 +154,12 @@ def main() -> int:
     # a source change inside that step, however spelled, is refused — on both real files.
     tq = chr(39) * 3
     install = "sh 'mvn -B -f .deps/options-edge-contracts/pom.xml install'"
-    package = "sh 'mvn -B -DskipTests clean package'"
+    # Derived, not pinned (same precedent as `image` below): the package step now carries
+    # -Doptions-edge-contracts.version so it builds against the contracts this pipeline installed,
+    # and a literal here would silently assert itself out of existence on the next such change.
+    # The template itself is enforced by the validator; this fixture only needs the real command
+    # to mutate, so it reads it from the file under test.
+    package = next(l.strip() for l in jf.split("\n") if l.strip().startswith("sh 'mvn -B -DskipTests clean package"))
     image = next(l.strip() for l in jf.split("\n") if l.strip().startswith("sh 'docker buildx build ") and '-t "${IMAGE_REF_2}"' not in l)
     for jname, src, old, new, say in [
         ("Jenkinsfile", jf, install, "sh 'cp -r /tmp/other/src .deps/options-edge-contracts/ && mvn -B -f .deps/options-edge-contracts/pom.xml install'", "does not fit the fixed `mvn` template"),
