@@ -1685,9 +1685,12 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.ibkrPreOpenEnabled() && ibkrPreOpenGexServingUp()) {
             replayIbkrPreOpenGexCached(session);
         }
-        // gex-oi-status rides the JSON state consumer only; replay once it has caught up so a reconnect
-        // during an OI_MISSING morning restores the badge (last-value-wins per strike).
-        if (stateCaughtUp.get()) {
+        // gex-oi-status rides the AVRO consumer since its .v2 cutover; replay once it has caught up so a
+        // reconnect during an OI_MISSING morning restores the badge (last-value-wins per strike).
+        // THE GATE MOVED WITH THE TOPIC: it was stateCaughtUp, the JSON state consumer's barrier, which
+        // after the cutover no longer carries this topic at all — replaying behind a barrier that is
+        // satisfied by an unrelated consumer would serve the badge before its cache is populated.
+        if (avroCaughtUp.get()) {
             sendCachedState(session, List.of("gex-oi-status"));
         }
         if (hpsfCaughtUp.get()) {
@@ -2598,6 +2601,10 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
         }
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
+        // Per-strike OI-arrival status: AVRO since its .v2 cutover (was JSON on the string consumer
+        // below). Its strike is a decimal logical type, which AvroJson renders as a number — not the
+        // base64 a bytes field would otherwise become.
+        topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2621,8 +2628,6 @@ public class FeedGatewayService implements ReplayRunner {
         // the UW gex/gex-history pairing above; the history record is a superset and wins via the
         // history-preservation gate in cacheRecord()).
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
-        // Per-strike OI-arrival status (JSON, gex watchdog): OI_MISSING/OI_OK badge rows for the UI.
-        topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         if (settings.ibkrPreOpenEnabled()) {
             // Pre-open IBKR GEX status/control stream (rev13 Phase 3) — JSON on the wire.
             topicEvents.put(settings.ibkrPreOpenStatusTopic(), new TopicBinding("IBKR", "ibkr-preopen-status"));
@@ -2780,6 +2785,8 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
         }
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
+        // Keep cache + live symmetric: per-strike OI-arrival status is AVRO since its .v2 cutover.
+        topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -2804,8 +2811,6 @@ public class FeedGatewayService implements ReplayRunner {
         // DATABENTO gex HISTORY topic IS JSON, so it lives here (keep the cache + live JSON consumer
         // topic sets symmetric, exactly as the UW gex/gex-history pair and the databento-gex Avro pair).
         topicEvents.put(settings.databentoGexHistoryTopic(), new TopicBinding("DATABENTO", "gex-by-strike"));
-        // Keep cache + live symmetric: per-strike OI-arrival status (JSON, gex watchdog).
-        topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         topicEvents.put(settings.databentoStrikeFlowTopic(), new TopicBinding("DATABENTO", "strike-flow"));
         topicEvents.put(settings.databentoSellerActivityTopic(), new TopicBinding("DATABENTO", "seller-activity"));
         topicEvents.put(settings.databentoSpotBandTopic(), new TopicBinding("DATABENTO", "spot-band"));
