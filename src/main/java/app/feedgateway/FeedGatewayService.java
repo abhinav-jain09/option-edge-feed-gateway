@@ -3302,7 +3302,12 @@ public class FeedGatewayService implements ReplayRunner {
                     // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
                     // stamping must never overwrite the service's own sessionDate (UI design §3).
                     String json;
-                    if (binding != null && "gamma-navigation".equals(binding.event())) {
+                    if (binding != null && "indicators".equals(binding.event())) {
+                        // Kafka Serialization Rule, plan section 2: the indicator CURRENT topics are the contracts
+                        // IndicatorSnapshot Avro record on EVERY consumer that carries them. A value that is not
+                        // that record fails this attempt loud — never a toString, never a generic rendering.
+                        json = enrichJson(indicatorJson(record.value()), binding);
+                    } else if (binding != null && "gamma-navigation".equals(binding.event())) {
                         // Avro on the wire, canonical JSON at REST. Skip enrichJson so the
                         // producer remains the only author of contract fields.
                         json = avroJson(record.value());
@@ -3730,7 +3735,10 @@ public class FeedGatewayService implements ReplayRunner {
                     // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
                     // stamping must never overwrite the service's own sessionDate (UI design §3).
                     String json;
-                    if (binding != null && "gamma-navigation".equals(binding.event())) {
+                    if (binding != null && "indicators".equals(binding.event())) {
+                        // the contracts IndicatorSnapshot record or a loud failure; see the cache-consumer twin
+                        json = enrichJson(indicatorJson(record.value()), binding);
+                    } else if (binding != null && "gamma-navigation".equals(binding.event())) {
                         // Avro on the wire, canonical JSON at REST; see the cache-consumer twin.
                         json = avroJson(record.value());
                     } else if (binding != null && isRawPassThroughEvent(binding.event())) {
@@ -12987,21 +12995,35 @@ public class FeedGatewayService implements ReplayRunner {
     /** The indicator family's record name: its JSON is the owner's writer over the contract record, never a generic rendering. */
     private static final String INDICATOR_SNAPSHOT_SCHEMA = "com.optionsedge.contracts.indicators.avro.IndicatorSnapshot";
 
+    /** The generic rendering of a non-indicator Avro record; the indicator bindings never come here. */
     private String avroJson(Object value) {
         if (!(value instanceof GenericRecord record)) {
             return null;
         }
         try {
-            if (INDICATOR_SNAPSHOT_SCHEMA.equals(record.getSchema().getFullName())) {
-                // Kafka Serialization Rule, plan section 2: the gateway re-emits the contract's JSON (decimals as the
-                // exact numbers they were, `final` as the JSON property), not AvroJson's generic rendering.
-                return com.optionsedge.contracts.indicators.IndicatorJson.writer().writeValueAsString(
-                        com.optionsedge.contracts.indicators.avro.AvroRecordMapper.fromAvro(record,
-                                com.optionsedge.contracts.indicators.IndicatorSnapshot.class));
-            }
             return mapper.writeValueAsString(AvroJson.toJsonNode(mapper, record));
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Could not serialize Avro record as JSON", e);
+        }
+    }
+
+    /**
+     * The indicator bindings' boundary (Kafka Serialization Rule, plan section 2): the value must be the contracts
+     * {@code IndicatorSnapshot} Avro record, re-emitted as the contract's JSON (decimals as the exact numbers they
+     * were, {@code final} as the JSON property) — never AvroJson's generic rendering and never a string's
+     * {@code toString}. Anything else (a JSON string, another record, null) fails loud.
+     */
+    private String indicatorJson(Object value) {
+        if (!(value instanceof GenericRecord record) || !INDICATOR_SNAPSHOT_SCHEMA.equals(record.getSchema().getFullName())) {
+            throw new IllegalStateException("indicators: value is not the " + INDICATOR_SNAPSHOT_SCHEMA + " Avro record ("
+                    + (value == null ? "null" : value instanceof GenericRecord r ? r.getSchema().getFullName() : value.getClass().getName()) + ")");
+        }
+        try {
+            return com.optionsedge.contracts.indicators.IndicatorJson.writer().writeValueAsString(
+                    com.optionsedge.contracts.indicators.avro.AvroRecordMapper.fromAvro(record,
+                            com.optionsedge.contracts.indicators.IndicatorSnapshot.class));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("indicators: could not render the IndicatorSnapshot record as JSON", e);
         }
     }
 

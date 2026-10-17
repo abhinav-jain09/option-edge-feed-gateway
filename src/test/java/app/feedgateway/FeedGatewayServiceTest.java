@@ -2033,6 +2033,87 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void indicatorsThroughTheCacheConsumerAreTheContractsJsonOfTheAvroRecord() throws Exception {
+        // Kafka Serialization Rule, plan section 2, through the PRODUCTION cache-consumer loop: the Avro
+        // IndicatorSnapshot record is cached as the contract's own JSON rendering (every property byte-identical to
+        // IndicatorJson's), plus the gateway's provenance stamp every cached record carries (enrichJson), and nothing else
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String topic = settings.indicatorsSnapshotTopic();
+        String wall = java.time.Instant.ofEpochMilli(System.currentTimeMillis()).toString();
+        org.apache.avro.generic.GenericRecord snapshot = IndicatorSnapshotFixture.generic(
+                "{\"symbol\":\"SPX\",\"runId\":\"run-A\",\"revision\":5,\"publishedAt\":\"" + wall + "\"}");
+        String golden = IndicatorSnapshotFixture.contractJson(snapshot);
+        VpBroker broker = new VpBroker().topic(topic, List.of(new VolPremiumFixtures.Row("SPX", snapshot)));
+        broker.onPoll = n -> {
+            if (n >= 2) {
+                service.setRunningForTest(false);
+            }
+        };
+        service.setRunningForTest(true);
+        service.runCacheConsumerAttemptForTest("state", Map.of(topic, new FeedGatewayService.TopicBinding("DATABENTO", "indicators")),
+                new java.util.concurrent.atomic.AtomicBoolean(true), broker.consumer());
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replayIndicatorsCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertEquals(1, sink.size(), "one cached snapshot; got: " + sink);
+        String envelope = sink.get(0);
+        assertTrue(envelope.startsWith("{\"type\":\"indicators\",\"data\":") && envelope.endsWith("}"), envelope);
+        JsonNode cached = new ObjectMapper().readTree(envelope).get("data");
+        JsonNode expected = new ObjectMapper().readTree(golden);
+        expected.fields().forEachRemaining(e -> assertEquals(e.getValue(), cached.get(e.getKey()), e.getKey() + " is the contract's rendering"));
+        java.util.Set<String> extra = new java.util.TreeSet<>();
+        cached.fieldNames().forEachRemaining(extra::add);
+        expected.fieldNames().forEachRemaining(extra::remove);
+        assertEquals(java.util.Set.of("marketDataSource", "sessionDate", "source"), extra, "only the provenance stamp was added");
+        assertTrue(golden.contains("\"revision\":5") && golden.contains("\"runId\":\"run-A\""), golden);
+    }
+
+    @Test
+    void indicatorsThatAreNotTheAvroRecordFailTheConsumerAttemptLoudAndCacheNothing() throws Exception {
+        // the JSON-era wire (a string), another Avro record and a null value: each ends the attempt with the reason,
+        // and the indicators cache stays empty — the gateway never guesses at bytes
+        GatewaySettings settings = new GatewaySettings();
+        String topic = settings.indicatorsSnapshotTopic();
+        org.apache.avro.Schema foreign = org.apache.avro.SchemaBuilder.record("MaxPainSnapshot").namespace("app.options.maxpain")
+                .fields().name("symbol").type().stringType().noDefault().endRecord();
+        org.apache.avro.generic.GenericRecord other = new org.apache.avro.generic.GenericData.Record(foreign);
+        other.put("symbol", "SPX");
+        String wall = java.time.Instant.ofEpochMilli(System.currentTimeMillis()).toString();
+        String jsonEra = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\"" + wall + "\",\"runId\":\"run-A\",\"revision\":5}";
+        Map<String, Object> values = new java.util.LinkedHashMap<>();
+        values.put("a JSON string", jsonEra);
+        values.put("another Avro record", other);
+        values.put("null", null);
+        for (Map.Entry<String, Object> v : values.entrySet()) {
+            FeedGatewayService service = service();
+            VpBroker broker = new VpBroker().topic(topic, List.of(new VolPremiumFixtures.Row("SPX", v.getValue())));
+            broker.onPoll = n -> {
+                if (n >= 2) {
+                    service.setRunningForTest(false);
+                }
+            };
+            service.setRunningForTest(true);
+            IllegalStateException e = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> service.runCacheConsumerAttemptForTest("state",
+                    Map.of(topic, new FeedGatewayService.TopicBinding("DATABENTO", "indicators")),
+                    new java.util.concurrent.atomic.AtomicBoolean(true), broker.consumer()), v.getKey());
+            assertTrue(e.getMessage().startsWith("indicators: value is not the com.optionsedge.contracts.indicators.avro.IndicatorSnapshot Avro record"), e.getMessage());
+            List<String> sink = new ArrayList<>();
+            Method replay = FeedGatewayService.class.getDeclaredMethod("replayIndicatorsCached", WebSocketSession.class);
+            replay.setAccessible(true);
+            replay.invoke(service, recordingSession(sink));
+            assertTrue(sink.isEmpty(), v.getKey() + " cached nothing; got: " + sink);
+        }
+        // and the live consumer carries the same boundary (its loop is the cache consumer's twin)
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        assertEquals(2, source.split("json = enrichJson\\(indicatorJson\\(record\\.value\\(\\)\\), binding\\);", -1).length - 1,
+                "both consumer loops decode indicators through indicatorJson");
+        assertFalse(source.contains("INDICATOR_SNAPSHOT_SCHEMA.equals(record.getSchema().getFullName())) {\n                // Kafka"),
+                "avroJson no longer special-cases the snapshot: the indicator bindings never reach it");
+    }
+
+    @Test
     void indicatorsConsumeBothLocalAndMirroredTopics() {
         // r1 finding 1 (§7.3): dev/prod bind the locally-computed SPX topic AND the
         // es4-mirrored ES topic; when the prefix makes them coincide (es4) the set
@@ -3181,7 +3262,7 @@ class FeedGatewayServiceTest {
                     List<ConsumerRecord<String, Object>> records = new ArrayList<>();
                     for (long o = at; o < to; o++) {
                         VolPremiumFixtures.Row row = log.get((int) o);
-                        records.add(new ConsumerRecord<>(p.topic(), 0, o, row.key(), (Object) row.json()));
+                        records.add(new ConsumerRecord<>(p.topic(), 0, o, row.key(), row.value()));
                     }
                     if (!records.isEmpty()) {
                         batch.put(p, records);
