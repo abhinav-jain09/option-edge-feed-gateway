@@ -111,3 +111,29 @@ Validation: the Maven property evaluator resolves `reuseForks` to `false` when
 supplied through MAVEN_OPTS. Transport fixtures require the property; a negative
 control removes it and cannot create a passing receipt. A fresh real Jenkins run
 still must qualify the full suite and campaign under the unchanged limits.
+
+## Campaign evidence capture
+
+Run 739 passed all 1,403 full-suite tests and ran all 50 mutations (49 KILLED,
+one known SURVIVED). Comparison refused an additional assertion witness for G-R10.10.
+The committed record also predates the CVD reader source changes, so its whole-file
+source hash is stale. Neither comparison nor source-hash validation is weakened.
+
+A full-gate invocation now saves its actual merged record as
+`target/footprint-reverify.json` before comparison, including on a comparison failure.
+The record is capped at 8 MiB, copied in 64 KiB blocks and published through a temporary
+file and atomic replace. Prior evidence is removed at entry, partial manual runs do
+not publish gate evidence, and a symlinked target directory is refused. Transport
+copies the record independently before remote cleanup; Jenkins archives it alongside
+the existing failure evidence. It is diagnostic evidence, not a successful receipt.
+
+The first preparation run is expected to stop at the existing stale-record gates.
+Request no image push for that run. Review the actual Jenkins-produced record, its
+baseline and source hashes; commit that evidence and regenerate the design document
+before the final image qualification. Never replace source hashes or baseline output
+with invented values. All runtime source writers remain gated.
+
+Small capture fixtures exercise success, failed comparison, malformed input, stale
+prior artifacts, partial runs, symlink refusal and the size bound. Negative controls
+remove capture or raise the limit, and the corresponding assertions then fail.
+The transport fixtures remain stubbed and do not qualify a real host or campaign.

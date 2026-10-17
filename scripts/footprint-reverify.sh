@@ -15,6 +15,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
+# A failed or partial invocation must never leave an earlier run's evidence behind.
+[ ! -L target ] || { echo "refusing symlinked target directory" >&2; exit 1; }
+rm -f target/footprint-reverify.json target/footprint-reverify.json.tmp
 # This repository's campaign is TWO runs with two different runners — the page's node suite and
 # the Java proxies/nav tests — and the record is their union. Re-running only one of them would
 # report every mutation of the other as missing, so both specs run unless one is named.
@@ -98,6 +101,32 @@ for p in sorted(glob.glob(tmpd + '/part-*.json')):
     merged.update(json.load(open(p)))
 json.dump(merged, open(out, 'w'), indent=1)
 MERGE
+
+# Preserve the actual full-gate rerun even when comparison refuses a stale committed record.
+# It is evidence for review, not a passing receipt or permission to package/deploy.
+if [ -n "$AS_THE_GATE" ]; then
+python3 - "$OUT" "$ROOT/target/footprint-reverify.json" <<'CAPTURE'
+import pathlib, sys
+source, target = map(pathlib.Path, sys.argv[1:])
+limit = 8 << 20
+if source.is_symlink() or not source.is_file() or source.stat().st_size > limit:
+    raise SystemExit('campaign record is not a regular file within the 8 MiB evidence budget')
+target.parent.mkdir(parents=True, exist_ok=True)
+temporary = target.with_name(target.name + '.tmp')
+size = 0
+try:
+    with source.open('rb') as reader, temporary.open('xb') as writer:
+        while block := reader.read(65536):
+            size += len(block)
+            if size > limit:
+                raise SystemExit('campaign record exceeds the 8 MiB evidence budget')
+            writer.write(block)
+    temporary.replace(target)
+finally:
+    temporary.unlink(missing_ok=True)
+print(f'Captured current campaign record ({size} bytes)')
+CAPTURE
+fi
 
 python3 - "$RECORD" "$OUT" "${SPECS[@]}" <<'COMPARE'
 import glob, json, sys

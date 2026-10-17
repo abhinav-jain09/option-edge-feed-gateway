@@ -126,6 +126,7 @@ REMOTE_FINISH
   for evidence in test.log receipt.json complete.txt; do
     scp "${ssh_args[@]}" "$host:$remote_dir/$evidence" "$local_dir/" >/dev/null 2>&1 || true
   done
+  scp "${ssh_args[@]}" "$host:$remote_dir/gateway/target/footprint-reverify.json" "$local_dir/" >/dev/null 2>&1 || true
   ssh "${ssh_args[@]}" "$host" "bash -s -- $remote_dir" <<'REMOTE_CLEAN' || true
 set -euo pipefail
 dir=$1
