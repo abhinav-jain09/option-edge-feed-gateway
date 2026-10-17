@@ -3,6 +3,8 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import signal
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -148,6 +150,38 @@ exit %d
         self.env["CI_FAKE_DATE"] = "1 0900"
         self.run_transport(1)
         self.assertFalse((self.root / "calls").exists())
+
+    def cancellation(self, matched, own_group):
+        run = self.remote / "run.123.fixture"
+        run.mkdir(parents=True)
+        child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)", str(run)],
+                                 start_new_session=own_group)
+        try:
+            self.write(run / "test.pid", str(child.pid))
+            proc_root = self.root / "proc"
+            self.write(proc_root / str(child.pid) / "cmdline", "fixture " + (str(run) if matched else "unrelated-worker"))
+            body = SOURCE.read_text().split("<<'REMOTE_FINISH'", 1)[1].split("\n", 1)[1].split("\nREMOTE_FINISH", 1)[0]
+            body = body.replace("/home/abhinav/ci/gateway-tests", str(self.remote)).replace("/proc/", str(proc_root) + "/")
+            result = subprocess.run(["bash", "-s", "--", str(run)], input=body, text=True,
+                                    capture_output=True, timeout=15)
+            self.assertEqual(0, result.returncode, result.stderr)
+            if matched and own_group:
+                self.assertEqual(-signal.SIGTERM, child.wait(timeout=2))
+            else:
+                self.assertIsNone(child.poll(), "a different worker/group must survive")
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=3)
+
+    def test_cancellation_stops_only_its_proven_process_group(self):
+        self.cancellation(True, True)
+
+    def test_cancellation_does_not_stop_a_reused_unrelated_pid(self):
+        self.cancellation(False, True)
+
+    def test_cancellation_does_not_signal_a_shared_process_group(self):
+        self.cancellation(True, False)
 
     def test_existing_local_attempt_is_not_reused(self):
         (self.repo / ".jenkins-tmp/es4-tests-123").mkdir(parents=True)

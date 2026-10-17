@@ -36,8 +36,8 @@ bash scripts/jenkins/validate-jenkinsfile-guard.sh Jenkinsfile
 bash -n scripts/jenkins/test-on-es4.sh
 ```
 
-The seven small tests stub SSH/SCP/Maven, replacing only host-specific filesystem/JDK
+The ten small tests stub SSH/SCP/Maven, replacing only host-specific filesystem/JDK
 literals in a test copy. They exercise source/artifact/pin integrity, command failure,
-receipt binding/report collection, cash-window refusal and prior-attempt refusal. They
+receipt binding/report collection, cash-window refusal, prior-attempt refusal and ownership-checked cancellation. They
 contact no host, broker or Docker daemon. Actual es4 execution and its reports must be
 verified from the Jenkins image build before a production rollout.

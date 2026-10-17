@@ -86,7 +86,8 @@ if [ -f "$dir/test.pid" ]; then
     kill -TERM -- "-$pid" || true
     for i in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
     if kill -0 "$pid" 2>/dev/null && [ -r "/proc/$pid/cmdline" ] \
-        && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq -- "$dir"; then kill -KILL -- "-$pid" || true; fi
+        && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq -- "$dir" \
+        && [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; then kill -KILL -- "-$pid" || true; fi
   fi
 fi
 REMOTE_FINISH
