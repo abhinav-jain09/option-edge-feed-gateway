@@ -303,7 +303,9 @@ pipeline {
             timeout(time: 10, unit: 'MINUTES') {
               sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
             }
-            sh 'mvn -B -DskipTests package'
+            // An unchanged source can still have a newly built bound contracts JAR. Drop the
+          // previous Boot archive so incremental packaging cannot retain an older dependency.
+          sh 'mvn -B -DskipTests clean package'
             // part 3: the packaged jar, by content, and the contracts jar INSIDE it (Spring Boot fat jar,
             // BOOT-INF/lib) must be the bound one. This is what proves what was consumed.
             sh '''
