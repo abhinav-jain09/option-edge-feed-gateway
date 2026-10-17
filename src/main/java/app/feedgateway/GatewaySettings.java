@@ -1071,7 +1071,7 @@ public final class GatewaySettings {
     }
 
     /**
-     * ES-on-SPX aligned GEX (JSON whole-book per symbol|expiry, compacted, roll-forward). Broadcast as event
+     * ES-on-SPX aligned GEX (retained JSON or canonical Avro whole-book per symbol|expiry, compacted, roll-forward). Broadcast as event
      * "es-gex". Default OFF — the whole ES-GEX-on-SPX feature ships dark until {@code GATEWAY_ES_GEX_ENABLED}.
      */
     public String esGexSpxAlignedTopic() {
@@ -1357,7 +1357,7 @@ public final class GatewaySettings {
         return longValue("GATEWAY_GEX_STRIKE_LIFECYCLE_TTL_MS", maxPainTtlMs(), 0L);
     }
 
-    /** Agent A short-premium recommendation output topic (JSON, key = trade_id). */
+    /** Agent A recommendation topic (retained JSON or canonical Avro, key = trade_id). */
     public String shortPremiumRecommendationTopic() {
         return value("KAFKA_SHORT_PREMIUM_RECOMMENDATION_TOPIC", "options.short-premium.recommendation");
     }

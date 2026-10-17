@@ -87,6 +87,56 @@ class CvdAvroRollingGatewayTest {
         } finally {MockSchemaRegistry.dropScope(scope);}
     }
 
+    @Test void derivedReadersAcceptRetainedJsonAndCanonicalAvroWithoutSchemaFallback() throws Exception {
+        var settings = new GatewaySettings();
+        var service = new FeedGatewayService(settings, new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+        var method = FeedGatewayService.class.getDeclaredMethod("stringObjectConsumerProperties", String.class);
+        method.setAccessible(true);
+        String scope = "cvd-derived-reader-closure";
+        var props = (Properties) method.invoke(service, "state");
+        props.put("schema.registry.url", "mock://" + scope);
+        props.put("auto.register.schemas", false);
+        var config = new HashMap<String, Object>();
+        props.forEach((k, v) -> config.put((String) k, v));
+        var models = Map.of(settings.esGexSpxAlignedTopic(), """
+                {"recordType":"book","source":"ES_ON_SPX","symbol":"SPX","expiry":"20261019",
+                 "settlementType":"PM","basisState":"FRESH","basis":25.25,"basisMeasuredAtMs":1000,
+                 "emitEventTimeMs":2000,"dataEventTimeMs":1000,"upstreamHeartbeatEventMs":1000,
+                 "upstreamHealth":"HEALTHY","buckets":[{"spxStrike":7800,"esNetGexSum":-123.5,
+                 "contributorCount":1,"truncated":false,"contributors":[{"esStrike":7825,"netGex":-123.5}]}]}
+                """, settings.shortPremiumRecommendationTopic(), """
+                {"type":"short-premium-recommendation","trade_id":"paper-1","emitted_at":"2026-10-19T14:00:00Z",
+                 "symbol":"SPX","expiry":"20261019","side":"bull_put","short_strike":7800.25,
+                 "long_strike":7795.25,"wing":5.0,"target_credit":2.55,"short_delta":-0.3,
+                 "confidence":0.8,"conviction_basis":null,"rationale":"fixture","mode":"PAPER"}
+                """);
+        var mapper = new ObjectMapper();
+        try (var writer = new KafkaAvroSerializer(); var reader = new CanonicalModelDeserializer()) {
+            writer.configure(config, false);
+            reader.configure(config, false);
+            for (var item : models.entrySet()) {
+                String topic = item.getKey();
+                Schema schema = service.cvdAvroBindings().get(topic);
+                assertNotNull(schema);
+                MockSchemaRegistry.getClientForScope(scope).register(topic + "-value", schema);
+                JsonNode model = mapper.readTree(item.getValue());
+                String legacy = model.toString();
+                assertEquals(legacy, reader.deserialize(topic, legacy.getBytes(StandardCharsets.UTF_8)));
+                byte[] frame = writer.serialize(topic, CanonicalJsonAvro.record(schema, model));
+                assertEquals(0, frame[0]);
+                String decoded = reader.deserialize(topic, frame);
+                assertEquals(legacy, decoded); // Exact API order and numeric spelling, including 5.0.
+                assertEquals(legacy, reader.deserialize(topic, legacy.getBytes(StandardCharsets.UTF_8)));
+                String other = models.keySet().stream().filter(key -> !key.equals(topic)).findFirst().orElseThrow();
+                assertThrows(Exception.class, () -> reader.deserialize(other, frame));
+                assertThrows(Exception.class, () -> reader.deserialize(topic, new byte[] {0, 0, 0}));
+                assertThrows(Exception.class, () -> reader.deserialize(topic, null));
+            }
+        } finally {
+            MockSchemaRegistry.dropScope(scope);
+        }
+    }
+
     private static List<String> fieldNames(JsonNode node) {
         var names=new ArrayList<String>();node.fieldNames().forEachRemaining(names::add);return names;
     }
