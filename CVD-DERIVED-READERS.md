@@ -41,8 +41,12 @@ Run-scoped replay now derives canonical bindings for the selected replay topics 
 the orchestrator's existing options/underlying namespace contract. The additional
 focused test reads a real aligned-book frame and retained JSON under its resolved
 run topic with the same schema. No replay is executed and no topic is copied here.
-The shared consumer still refuses an Avro failure without JSON fallback. Its
-existing counted skip policy for malformed retained values now also applies to the
-new bindings; the metric's historical CVD name covers those derived records too.
+The shared consumer still refuses an Avro failure without JSON fallback. The
+existing counted skip policy applies to the live-name derived bindings, including
+windowed replay. Run-scoped replay decode failures are fatal and uncounted: no
+failed offset is skipped, and the existing replay error handling reports REPLAY_FAILED.
+Four CvdRetainedPollTest cases cover the retained skip/fatal boundary, including
+that run-scoped policy. The metric's historical CVD name also covers live derived
+records; it does not count run-scoped failures.
 Reader-first runtime qualification must include the shared-consumer cold-registry
 failure behavior and replay namespace/registry provenance before writer enablement.

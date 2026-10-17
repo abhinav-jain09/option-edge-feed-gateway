@@ -148,6 +148,8 @@ class CvdAvroRollingGatewayTest {
         assertEquals(Set.of(topic), props.get("optionsedge.canonical.avro.retained-json-topics"));
         assertEquals("false", props.get(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG));
         assertEquals("false", props.get(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG));
+        assertEquals(Integer.toString(Math.min(settings.maxPollRecords(), 8)), props.getProperty(ConsumerConfig.MAX_POLL_RECORDS_CONFIG));
+        assertEquals(settings.groupIdBase() + "-replay-app:fixture-str", props.getProperty(ConsumerConfig.GROUP_ID_CONFIG));
         String scope = "aligned-book-run-replay";
         props.put("schema.registry.url", "mock://" + scope); props.put("auto.register.schemas", false);
         var config = new HashMap<String, Object>(); props.forEach((k, v) -> config.put((String) k, v));
@@ -161,6 +163,8 @@ class CvdAvroRollingGatewayTest {
             byte[] frame = writer.serialize(topic, CanonicalJsonAvro.record(schema, new ObjectMapper().readTree(json)));
             assertEquals(json, reader.deserialize(topic, json.getBytes(StandardCharsets.UTF_8)));
             assertEquals(json, reader.deserialize(topic, frame));
+            assertThrows(org.apache.kafka.common.errors.SerializationException.class,
+                    () -> reader.deserialize(topic, new byte[] {'[', ']'}));
             assertThrows(org.apache.kafka.common.errors.SerializationException.class,
                     () -> reader.deserialize(topic, new byte[] {0, 0, 0}));
         } finally { MockSchemaRegistry.dropScope(scope); }
