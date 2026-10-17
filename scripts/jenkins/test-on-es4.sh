@@ -28,15 +28,14 @@ PERMITTED_SHA="${PERMITTED_SHA:?}" bash scripts/jenkins/verify-permitted-tree.sh
   --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 \
   --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__
 [ "$(cat .contracts-sha)" = "$CONTRACTS_PERMITTED_SHA" ] || { echo 'Contracts provenance mismatch' >&2; exit 1; }
+# The pom's pin is deliberately NOT consulted. This pipeline installs contracts from main's tip and
+# builds against the version it installed, which it passes as -Doptions-edge-contracts.version; a pin
+# in the pom is only the local-dev default and is stale by design the moment contracts bumps. Requiring
+# the two to agree is what forced a pin-chasing commit on every contracts release. Provenance does not
+# rest on the pom: .contracts-sha is checked against CONTRACTS_PERMITTED_SHA above, and the jar at the
+# installed version has its sha256 verified below and again on es4 before any test runs.
 cv=$(cat .contracts-version)
 [[ $cv =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 64
-python3 - "$cv" <<'PIN'
-import sys, xml.etree.ElementTree as ET
-root=ET.parse('pom.xml').getroot()
-actual=root.find('{http://maven.apache.org/POM/4.0.0}properties/{http://maven.apache.org/POM/4.0.0}options-edge-contracts.version')
-if actual is None or (actual.text or "").strip()!=sys.argv[1]:
-    raise SystemExit('Gateway dependency pin differs from the installed contracts artifact')
-PIN
 contracts_jar="$PWD/.m2/repository/com/optionsedge/options-edge-contracts/$cv/options-edge-contracts-$cv.jar"
 [ "$(bash scripts/jenkins/permitted-sha-guard-version.sh "$contracts_jar")" = "$(cat .contracts-jar-sha256)" ] \
   || { echo 'Installed contracts jar changed' >&2; exit 1; }
@@ -183,7 +182,12 @@ java -version
 mvn -version
 taskset -pc $$
 result=0
-mvn -B test || result=$?
+# THE INSTALLED CONTRACTS VERSION, not this pom's pin. The workspace was built against the contracts
+# jar that Install Contracts compiled from main's tip; the pom's pin is only the local-dev default and
+# goes stale the moment contracts bumps. CI_CONTRACTS_VERSION is set from .contracts-version by the
+# supervisor below, and the sha256 of that exact jar is already verified before transfer.
+: "${CI_CONTRACTS_VERSION:?the supervisor did not pass the installed contracts version}"
+mvn -B test -Doptions-edge-contracts.version="$CI_CONTRACTS_VERSION" || result=$?
 # Keep bounded failing reports too, before exiting or running mutations that overwrite XML.
 python3 scripts/jenkins/es4-test-receipt.py collect target/surefire-reports ..
 [ "$result" -eq 0 ] || exit "$result"
@@ -204,16 +208,20 @@ if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then ex
 # The Kafka test container separately has 2 GiB / one CPU limits; planned total is 8 GiB.
 cpu_list=$(cat "$dir/cpus.txt")
 [[ $cpu_list =~ ^[0-9]+,[0-9]+$ ]] || exit 64
-python3 - "$dir" "$unit" "$java_home" "$source_sha" "$cpu_list" <<'SUPERVISE'
+python3 - "$dir" "$unit" "$java_home" "$source_sha" "$cpu_list" "$cv" <<'SUPERVISE'
 import os, pathlib, selectors, subprocess, sys, time
-root, unit, java, source, cpus = sys.argv[1:]
+root, unit, java, source, cpus, contracts_version = sys.argv[1:]
 command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=" + unit,
     "--property=MemoryMax=4G", "--property=MemorySwapMax=0", "--property=TasksMax=512",
     "--property=RuntimeMaxSec=2400", "--property=TimeoutStopSec=10",
     "--property=KillMode=control-group", "taskset", "--cpu-list", cpus, "env", "-i", "PATH=" + java + "/bin:/usr/bin:/bin",
     "JAVA_HOME=" + java, "JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=" + root + "/tmp",
     "MAVEN_SKIP_RC=true", "MAVEN_OPTS=-Xmx768m -DreuseForks=false -Dmaven.repo.local=" + root + "/cache/repository -Djava.io.tmpdir=" + root + "/tmp",
-    "CI_GATEWAY_DIR=" + root + "/gateway", "CI_SOURCE_SHA=" + source, "JENKINS_URL=es4-test-transport", "CI=true", "bash", root + "/run-tests.sh"]
+    "CI_GATEWAY_DIR=" + root + "/gateway", "CI_SOURCE_SHA=" + source,
+    # env -i wipes the environment, so the installed contracts version has to be named here or the
+    # remote mvn silently falls back to the pom's (possibly stale) pin.
+    "CI_CONTRACTS_VERSION=" + contracts_version,
+    "JENKINS_URL=es4-test-transport", "CI=true", "bash", root + "/run-tests.sh"]
 child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 selector = selectors.DefaultSelector()
 selector.register(child.stdout, selectors.EVENT_READ)

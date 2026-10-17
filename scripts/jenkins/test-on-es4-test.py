@@ -120,6 +120,11 @@ for source in args[:-1]:
         self.script(self.jdk / "bin/mvn", '''
 if [ "$*" = -version ]; then echo "Apache Maven fixture"; exit 0; fi
 [[ ${MAVEN_OPTS:-} = *-DreuseForks=false* ]] || { echo "Missing test-class JVM isolation"; exit 4; }
+# The remote test MUST be told the contracts version the build installed. Without this the mvn
+# here falls back to the pom's pin, which goes stale the moment contracts main bumps — the exact
+# failure this assertion exists to make impossible to reintroduce silently.
+[[ "$*" = *-Doptions-edge-contracts.version=0.8.0* ]] || { echo "Missing installed contracts version override: $*"; exit 5; }
+[[ ${CI_CONTRACTS_VERSION:-} = 0.8.0 ]] || { echo "CI_CONTRACTS_VERSION not passed through env -i"; exit 6; }
 mkdir -p "$CI_GATEWAY_DIR/target/surefire-reports"
 printf '<testsuite tests="1" failures="0"/>' > "$CI_GATEWAY_DIR/target/surefire-reports/TEST-fixture.xml"
 echo finite-maven-stub
@@ -201,14 +206,37 @@ exit %d
         self.run_transport(1)
         self.assertFalse((self.root / "calls").exists())
 
-    def test_wrong_dependency_pin_refuses_before_any_transport(self):
+    def stale_pom_pin(self):
+        """The real condition: contracts main bumped, so the installed version (.contracts-version,
+        0.8.0 here) is NOT the version pinned in this pom (0.9.0). The build must proceed and must
+        resolve the version it installed. Requiring the two to agree is what forced a pin-chasing
+        commit on every contracts release."""
         p = self.repo / "pom.xml"
         p.write_text(p.read_text().replace("0.8.0", "0.9.0"))
         self.git("add", "pom.xml")
-        self.git("commit", "-qm", "pin mismatch fixture")
+        self.git("commit", "-qm", "stale pom pin fixture")
         self.env["PERMITTED_SHA"] = self.git("rev-parse", "HEAD").strip()
+
+    def test_stale_pom_pin_builds_against_the_installed_version(self):
+        self.stale_pom_pin()
+        self.run_transport()
+        import json
+        receipt = json.loads((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").read_text())
+        self.assertEqual("PASS", receipt["status"])
+
+    def test_stale_pom_pin_without_the_override_resolves_the_stale_pin_and_fails(self):
+        """The negative control for the test above: with the override removed, the only version mvn
+        can see is the pom's stale 0.9.0, so the run must fail rather than silently test the wrong
+        contracts jar. Without this, a regression to the pin would pass unnoticed."""
+        self.stale_pom_pin()
+        body = self.runner.read_text()
+        self.assertIn('mvn -B test -Doptions-edge-contracts.version="$CI_CONTRACTS_VERSION"', body)
+        self.runner.write_text(body.replace(
+            'mvn -B test -Doptions-edge-contracts.version="$CI_CONTRACTS_VERSION"', 'mvn -B test'))
         self.run_transport(1)
-        self.assertFalse((self.root / "calls").exists())
+        out = self.repo / ".jenkins-tmp/es4-tests-123"
+        self.assertIn("Missing installed contracts version override", (out / "test.log").read_text())
+        self.assertFalse((out / "receipt.json").exists())
 
     def test_cash_window_refuses_before_any_transport(self):
         self.env["CI_FAKE_DATE"] = "1 0900 EDT"
