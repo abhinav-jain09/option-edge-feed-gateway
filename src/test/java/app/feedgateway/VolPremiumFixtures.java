@@ -49,7 +49,11 @@ final class VolPremiumFixtures {
             + com.optionsedge.contracts.volpremium.IvRvReading.MAX_AFTER_MIDNIGHT_MS;
 
     /** A Kafka record as the producer wrote it: the key, and the value's exact bytes. */
-    record Row(String key, String json) {
+    record Row(String key, Object value) {
+        /** The JSON text of a string-valued row (the vol-premium streams); an Avro row is read by {@link #value}. */
+        String json() {
+            return (String) value;
+        }
     }
 
     private static List<Row> readings;
