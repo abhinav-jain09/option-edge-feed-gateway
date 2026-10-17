@@ -2609,6 +2609,13 @@ public class FeedGatewayService implements ReplayRunner {
         // below). Its strike is a decimal logical type, which AvroJson renders as a number — not the
         // base64 a bytes field would otherwise become.
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
+        // Indicator snapshots are AVRO (contracts IndicatorSnapshot, fixed id 2001, Kafka Serialization Rule):
+        // consumed here, on the Avro consumer, and rendered through the owner's JSON writer (avroJson) so the
+        // cached and broadcast text is byte-identical to the JSON era. r1 finding 1 still holds: dev/prod consume
+        // BOTH the locally-computed SPX topic AND the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
+        for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
+            topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
+        }
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2728,11 +2735,6 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.directionAlertTopic(), new TopicBinding("DATABENTO", "direction-alert"));
         topicEvents.put(settings.directionScorecardTopic(), new TopicBinding("DATABENTO", "direction-scorecard"));
         topicEvents.put(settings.directionProgressTopic(), new TopicBinding("DATABENTO", "direction-progress"));
-        // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
-        // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
-        for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
-            topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
-        }
         // Tape-zones CURRENT board (plain JSON, key ES|sessionDate): standalone global advisory on
         // the SHORT tapeZonesTtlMs window, OPTIONAL topic — absent on dev/prod until the MM1 mirror
         // is installed and on es4 until the service first produces (§6.2).
@@ -2791,6 +2793,13 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
         // Keep cache + live symmetric: per-strike OI-arrival status is AVRO since its .v2 cutover.
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
+        // Indicator snapshots are AVRO (contracts IndicatorSnapshot, fixed id 2001, Kafka Serialization Rule):
+        // consumed here, on the Avro consumer, and rendered through the owner's JSON writer (avroJson) so the
+        // cached and broadcast text is byte-identical to the JSON era. r1 finding 1 still holds: dev/prod consume
+        // BOTH the locally-computed SPX topic AND the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
+        for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
+            topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
+        }
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -2897,11 +2906,6 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.directionAlertTopic(), new TopicBinding("DATABENTO", "direction-alert"));
         topicEvents.put(settings.directionScorecardTopic(), new TopicBinding("DATABENTO", "direction-scorecard"));
         topicEvents.put(settings.directionProgressTopic(), new TopicBinding("DATABENTO", "direction-progress"));
-        // r1 finding 1: dev/prod consume BOTH the locally-computed SPX topic AND
-        // the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
-        for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
-            topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
-        }
         // Tape-zones CURRENT board (plain JSON, key ES|sessionDate): standalone global advisory on
         // the SHORT tapeZonesTtlMs window, OPTIONAL topic — absent on dev/prod until the MM1 mirror
         // is installed and on es4 until the service first produces (§6.2).
@@ -3298,7 +3302,12 @@ public class FeedGatewayService implements ReplayRunner {
                     // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
                     // stamping must never overwrite the service's own sessionDate (UI design §3).
                     String json;
-                    if (binding != null && "gamma-navigation".equals(binding.event())) {
+                    if (binding != null && "indicators".equals(binding.event())) {
+                        // Kafka Serialization Rule, plan section 2: the indicator CURRENT topics are the contracts
+                        // IndicatorSnapshot Avro record on EVERY consumer that carries them. A value that is not
+                        // that record fails this attempt loud — never a toString, never a generic rendering.
+                        json = enrichJson(indicatorJson(record.value()), binding);
+                    } else if (binding != null && "gamma-navigation".equals(binding.event())) {
                         // Avro on the wire, canonical JSON at REST. Skip enrichJson so the
                         // producer remains the only author of contract fields.
                         json = avroJson(record.value());
@@ -3726,7 +3735,10 @@ public class FeedGatewayService implements ReplayRunner {
                     // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
                     // stamping must never overwrite the service's own sessionDate (UI design §3).
                     String json;
-                    if (binding != null && "gamma-navigation".equals(binding.event())) {
+                    if (binding != null && "indicators".equals(binding.event())) {
+                        // the contracts IndicatorSnapshot record or a loud failure; see the cache-consumer twin
+                        json = enrichJson(indicatorJson(record.value()), binding);
+                    } else if (binding != null && "gamma-navigation".equals(binding.event())) {
                         // Avro on the wire, canonical JSON at REST; see the cache-consumer twin.
                         json = avroJson(record.value());
                     } else if (binding != null && isRawPassThroughEvent(binding.event())) {
@@ -12980,6 +12992,10 @@ public class FeedGatewayService implements ReplayRunner {
         return separator <= 0 ? key : key.substring(0, separator);
     }
 
+    /** The indicator family's record name: its JSON is the owner's writer over the contract record, never a generic rendering. */
+    private static final String INDICATOR_SNAPSHOT_SCHEMA = "com.optionsedge.contracts.indicators.avro.IndicatorSnapshot";
+
+    /** The generic rendering of a non-indicator Avro record; the indicator bindings never come here. */
     private String avroJson(Object value) {
         if (!(value instanceof GenericRecord record)) {
             return null;
@@ -12988,6 +13004,26 @@ public class FeedGatewayService implements ReplayRunner {
             return mapper.writeValueAsString(AvroJson.toJsonNode(mapper, record));
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Could not serialize Avro record as JSON", e);
+        }
+    }
+
+    /**
+     * The indicator bindings' boundary (Kafka Serialization Rule, plan section 2): the value must be the contracts
+     * {@code IndicatorSnapshot} Avro record, re-emitted as the contract's JSON (decimals as the exact numbers they
+     * were, {@code final} as the JSON property) — never AvroJson's generic rendering and never a string's
+     * {@code toString}. Anything else (a JSON string, another record, null) fails loud.
+     */
+    private String indicatorJson(Object value) {
+        if (!(value instanceof GenericRecord record) || !INDICATOR_SNAPSHOT_SCHEMA.equals(record.getSchema().getFullName())) {
+            throw new IllegalStateException("indicators: value is not the " + INDICATOR_SNAPSHOT_SCHEMA + " Avro record ("
+                    + (value == null ? "null" : value instanceof GenericRecord r ? r.getSchema().getFullName() : value.getClass().getName()) + ")");
+        }
+        try {
+            return com.optionsedge.contracts.indicators.IndicatorJson.writer().writeValueAsString(
+                    com.optionsedge.contracts.indicators.avro.AvroRecordMapper.fromAvro(record,
+                            com.optionsedge.contracts.indicators.IndicatorSnapshot.class));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("indicators: could not render the IndicatorSnapshot record as JSON", e);
         }
     }
 
