@@ -225,43 +225,25 @@ pipeline {
       }
     }
     stage('Test') {
+      options { timeout(time: 45, unit: 'MINUTES') }
       when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
-        // `mvn test` COMPILES this repository's source and runs it. By the validator's effect definition it is
-        // not an effect — it installs, ships and publishes nothing, so there is no artifact to bind — and that
-        // is exactly why Codex M1 could replace a tracked file after the guard and have it compiled and executed
-        // here, before the first verify (which used to be in Package). The compile does not get to be the one
-        // step that reads an unproved tree: the toolchain is resolved in a step that consumes nothing, the
-        // workspace is verified, and then the test command runs ALONE, with nothing between the verification and
-        // the compile. The declared ignored paths are this build's own output.
-        sh '''
-          set -eu
-          if [ -x "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java" ]; then
-            JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
-          elif [ -x /usr/lib/jvm/java-21/bin/java ]; then
-            JAVA_HOME=/usr/lib/jvm/java-21
-          elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
-            JAVA_HOME="$JAVA_HOME"
-          else
-            echo "Java 21 was not found on this Jenkins agent" >&2
-            exit 1
-          fi
-          mkdir -p .jenkins-tmp
-          printf '%s\n' "$JAVA_HOME" > .jenkins-tmp/java-home
-          "$JAVA_HOME/bin/java" -version
-        '''
-        script {
-          def jh = readFile('.jenkins-tmp/java-home').trim()
-          // Per-WORKSPACE Maven repository (artifact identity): the contracts jar this build installed
-          // must be the one its tests, its footprint campaign and its packaging consume. A shared
-          // ~/.m2 lets ANY other job on this builder overwrite the same coordinate in between.
-          withEnv(["JAVA_HOME=${jh}", "PATH+JDK=${jh}/bin", 'MAVEN_SKIP_RC=true',
-                   "MAVEN_OPTS=-Dmaven.repo.local=${env.WORKSPACE}/.m2/repository${env.MAVEN_OPTS ? ' ' + env.MAVEN_OPTS : ''}"]) {
-            timeout(time: 10, unit: 'MINUTES') {
-              sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
-            }
-            sh 'mvn -B test'
-          }
+        // Full tests and the footprint campaign consume the exact source/artifact snapshot on es4.
+        // Native package/image stages retain their original source and artifact guards.
+        timeout(time: 10, unit: 'MINUTES') {
+          sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+        }
+        sh 'python3 scripts/jenkins/test-on-es4-test.py'
+        sh 'python3 scripts/jenkins/es4-test-receipt-test.py'
+        timeout(time: 10, unit: 'MINUTES') {
+          sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+        }
+        sh 'bash scripts/jenkins/test-on-es4.sh'
+      }
+      post {
+        always {
+          junit testResults: ".jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/surefire-reports/*.xml", allowEmptyResults: true
+          archiveArtifacts artifacts: ".jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/test.log,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/receipt.json,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/complete.txt", allowEmptyArchive: true
         }
       }
     }
@@ -270,37 +252,11 @@ pipeline {
       steps {
         sh '''
           set -eu
-          if [ -x "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java" ]; then
-            export JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
-          elif [ -x /usr/lib/jvm/java-21/bin/java ]; then
-            export JAVA_HOME=/usr/lib/jvm/java-21
-          elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
-            export JAVA_HOME="$JAVA_HOME"
-          else
-            echo "Java 21 was not found on this Jenkins agent" >&2
-            exit 1
-          fi
-          export MAVEN_SKIP_RC=true
-          export PATH="$JAVA_HOME/bin:$PATH"
-          # Per-WORKSPACE Maven repository (artifact identity): the contracts jar this build installs
-          # must be the one its tests, its footprint campaign and its packaging consume. A shared
-          # ~/.m2 lets ANY other job on this builder overwrite the same coordinate in between.
-          export MAVEN_OPTS="-Dmaven.repo.local=$WORKSPACE/.m2/repository${MAVEN_OPTS:+ $MAVEN_OPTS}"
-          # The pinned column of ES-FOOTPRINT-GATEWAY-DESIGN.md rests on ES-FOOTPRINT-CAMPAIGN.json,
-          # and that is a file: the generator's refusals compare the record against itself and
-          # against the source it names, which a self-consistent forgery satisfies. Only re-running
-          # the campaign settles it, so it runs HERE, where this repository is actually built. It
-          # cannot run in a GitHub check: this build needs options-edge-contracts installed from
-          # source (see the Install Contracts stage), which no hosted runner has.
-          #
-          # Unconditionally, not on a changeset predicate: a gate that decides for itself when to
-          # run is a gate that stops running.
-          scripts/footprint-reverify.sh
-          # ...and the DOCUMENT must be the one that record produces. Reverification compares the
-          # spec, the record and a fresh run; it never looks at the rendered section, so a pinned
-          # cell typed straight into ES-FOOTPRINT-GATEWAY-DESIGN.md by hand survives it untouched
-          # while every mutation in the record reproduces and the gate goes green. --check regenerates the
-          # section and refuses if what is committed is not byte-for-byte what the record yields.
+          # Tests and the complete mutation campaign must have passed in THIS build against
+          # both permitted sources and the exact contracts jar, before packaging can proceed.
+          python3 scripts/jenkins/es4-test-receipt.py verify ".jenkins-tmp/es4-tests-${BUILD_NUMBER}" \
+            "${PERMITTED_SHA:?}" "${CONTRACTS_PERMITTED_SHA:?}" "$(cat .contracts-jar-sha256)" "${BUILD_NUMBER:?}"
+          # Re-render the document from this checkout's record, as in the original gate.
           scripts/footprint-reqstate.sh --check
         '''
       }
@@ -347,7 +303,7 @@ pipeline {
             timeout(time: 10, unit: 'MINUTES') {
               sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
             }
-            sh 'mvn -B package'
+            sh 'mvn -B -DskipTests package'
             // part 3: the packaged jar, by content, and the contracts jar INSIDE it (Spring Boot fat jar,
             // BOOT-INF/lib) must be the bound one. This is what proves what was consumed.
             sh '''
@@ -556,6 +512,23 @@ EOF
         }
       }
     }
+      }
+      post {
+        cleanup {
+          script {
+            if (env.PERMITTED_SHA_GUARD == 'PASSED') {
+              sh '''
+                set -eu
+                case "${BUILD_NUMBER:-}" in ''|*[!0-9]*) exit 64;; esac
+                dir=".jenkins-tmp/es4-tests-${BUILD_NUMBER}"
+                if [ -d "$dir" ] && [ ! -L "$dir" ]; then
+                  find -P "$dir" -xdev -depth -mindepth 1 -delete
+                  rmdir "$dir"
+                fi
+              '''
+            }
+          }
+        }
       }
     }   // end stage('Build')
 
