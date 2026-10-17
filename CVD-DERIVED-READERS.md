@@ -16,26 +16,28 @@ binding. Its consumer inventory must be reconciled against runtime before enabli
 that optional writer. It is not evidence that recommendations currently reach users.
 The gateway has no Kafka writer on these paths.
 
-The dependency advances to contracts0.11.0, whose Java/schema contents are unchanged
-from0.10.0;0.11 adds the approved Python boundary. It must be released successfully
-before this PR can build a runtime image. The candidate JAR is used only for local
-unit preparation, never installed under an earlier version or deployed.
+The branch now includes latest gateway main and uses the qualified latest
+contracts artifact through the automatic main build flow. Current verification
+uses the official Jenkins87 JAR (digest8f5888c04786d0a409dd063c712166ef9068fb42b1340d4fce61ec941c60ef45),
+not the old candidate. Immutable coordinates and digests identify build evidence;
+they do not select a separate service release or topic identity.
 
-Validation: four focused CvdAvroRollingGatewayTest cases pass against the0.11
-candidate, using production Confluent classes with an in-memory registry. They
-cover retained JSON before and after real frames, exact aligned-book and
-recommendation API bytes, wrong-topic schema refusal, truncated frames and null
-refusal. The new test uses explicit source-shaped fixtures, not live captures.
-No algorithm or codec hot path changed; the existing configured codec is reused.
-The first lifecycle test command also executed the POM's separately pinned Spring
-context smoke with Kafka disabled; subsequent narrow validation used test-compile
-with skipped execution and surefire:test for this class only. Full suite/mutation
-qualification remains Jenkins/es4 work, not a local test claim.
+Current targeted validation passes five CvdAvroRollingGatewayTest cases, four
+CvdRetainedPollTest cases and thirteen EarlyAuctionVerdictWiringTest cases,
+plus the POM's mandatory separate mock Spring context smoke. These use actual
+configured codec classes and a mock registry. The earlier four-case candidate
+run is historical evidence only. EAV is now also bound to the canonical reader;
+see [EAV reader preparation](CVD-AVRO-READER-PREPARATION.md) for its six synthetic
+engine fixtures, exact API/cache assertions, assertion control, reused finite
+codec measurements and limitations. No full gateway campaign ran locally.
 
-This draft enables no writer or new topic. Remaining Direction/strike-intelligence
-contracts, actual reader inventory, destination registry compatibility and runtime
-qualification remain required before their writers are enabled. Do not merge this
-branch until the pending gateway0.10 image has finished and the0.11 release is ready.
+This draft enables no writer or new topic. Remaining Direction contracts,
+advanced Python readers, complete reader/runtime inventory, destination registry
+compatibility/seed and runtime qualification remain required before writers are
+enabled. Strike-intelligence contracts are already released but its reader/runtime
+closure remains open. The earlier production gateway image has completed; that
+does not qualify these new bindings. This branch remains held until the remaining
+coordinated gates and the single final es4 gateway campaign are complete.
 
 Run-scoped replay now derives canonical bindings for the selected replay topics in
 the orchestrator's existing options/underlying namespace contract. The additional
