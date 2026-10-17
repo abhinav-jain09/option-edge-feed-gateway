@@ -1115,7 +1115,15 @@ public final class GatewaySettings {
     }
 
     public String ibkrPreOpenStatusTopic() {
-        return value("KAFKA_IBKR_GEX_STATUS_TOPIC", "options.ibkr.gex.status");
+        // .v2 is the Avro topic. Its predecessor retains hand-built JSON forever (retention.ms=-1,
+        // no byte cap), so the cutover is a RENAME rather than a switch in place — see
+        // IbkrPreOpenConfig.fromEnv in options-edge-processing, which guards the producer side with
+        // the same check. requireAvroTopic fails closed if the override names that predecessor:
+        // this topic is read by the AVRO consumers here, so such a configuration would hand them
+        // JSON they cannot read, and would do it silently.
+        return app.kafka.IbkrPreOpenStatusAvro.requireAvroTopic(
+                value("KAFKA_IBKR_GEX_STATUS_TOPIC", app.kafka.IbkrPreOpenStatusAvro.AVRO_TOPIC),
+                "GatewaySettings.ibkrPreOpenStatusTopic (KAFKA_IBKR_GEX_STATUS_TOPIC)");
     }
 
     /** Status rows age out with the window: one full session covers restarts, never a stale next-day replay. */
