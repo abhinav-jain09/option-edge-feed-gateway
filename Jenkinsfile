@@ -235,6 +235,7 @@ pipeline {
         }
         sh 'python3 scripts/jenkins/test-on-es4-test.py'
         sh 'python3 scripts/jenkins/es4-test-receipt-test.py'
+        sh 'python3 scripts/footprint-reverify-capture-test.py'
         timeout(time: 10, unit: 'MINUTES') {
           sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
         }
@@ -242,7 +243,7 @@ pipeline {
       }
       post {
         always {
-          archiveArtifacts artifacts: ".jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/surefire-reports/TEST-*.xml,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/test.log,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/receipt.json,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/complete.txt", allowEmptyArchive: true
+          archiveArtifacts artifacts: ".jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/surefire-reports/TEST-*.xml,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/test.log,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/receipt.json,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/complete.txt,.jenkins-tmp/es4-tests-${env.BUILD_NUMBER}/footprint-reverify.json", allowEmptyArchive: true
         }
       }
     }
