@@ -3302,6 +3302,10 @@ public class FeedGatewayService implements ReplayRunner {
                         bootstrappingPartitions.keySet());
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
+                    if (binding != null && "direction-push".equals(binding.event())) {
+                        onDirectionPushRecord(record, false);
+                        continue;
+                    }
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
                     // pairing fields, control JSON): it reaches the browser byte-untouched —
                     // never enriched/reserialized. The tape-zones board is the same class: it is
@@ -3340,10 +3344,6 @@ public class FeedGatewayService implements ReplayRunner {
                             continue;
                         }
                         json = enrichJson(rawJson, binding);
-                    }
-                    if (binding != null && "direction-push".equals(binding.event())) {
-                        onDirectionPushRecord(record, json, false);
-                        continue;
                     }
                     if (binding == null || json == null || json.isBlank()) {
                         evictStrikeSrTombstone(binding, record);
@@ -3739,6 +3739,10 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 for (ConsumerRecord<String, Object> record : records) {
                     TopicBinding binding = topicEvents.get(record.topic());
+                    if (binding != null && "direction-push".equals(binding.event())) {
+                        onDirectionPushRecord(record, cacheCaughtUpFlag.get());
+                        continue;
+                    }
                     // The pre-open status payload is a PRODUCER-authored contract (revision-equal
                     // pairing fields, control JSON): it reaches the browser byte-untouched —
                     // never enriched/reserialized. The tape-zones board is the same class: it is
@@ -3777,10 +3781,6 @@ public class FeedGatewayService implements ReplayRunner {
                     }
                     if (binding != null && "market-structure-patterns".equals(binding.event()) && !patternsRecovery.end.isEmpty()) {
                         stageMarketStructurePatterns(patternsRecovery, record, json);
-                        continue;
-                    }
-                    if (binding != null && "direction-push".equals(binding.event())) {
-                        onDirectionPushRecord(record, json, cacheCaughtUpFlag.get());
                         continue;
                     }
                     if (binding == null || json == null || json.isBlank()) {
@@ -11174,7 +11174,8 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** Both ingestion paths share withdrawal ordering; the live path remains the sole emitter. */
-    void onDirectionPushRecord(ConsumerRecord<String, Object> record, String json, boolean forward) {
+    void onDirectionPushRecord(ConsumerRecord<String, Object> record, boolean forward) {
+        String json = stringJson(record.value());
         synchronized (directionPushEmitLock) {
             if (!settings.directionPushTopic().equals(record.topic()) || !"SPX".equals(record.key()) || record.offset() < 0) {
                 inactiveDroppedEvents.incrementAndGet();
@@ -11187,7 +11188,7 @@ public class FeedGatewayService implements ReplayRunner {
             boolean deletion = record.value() == null;
             if (!deletion && json != null && (json.contains("\"tombstone\"") || json.contains("\\u"))) {
                 try {
-                    JsonNode body = mapper.readTree(json);
+                    JsonNode body = mapper.reader().with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readTree(json);
                     if (body.has("tombstone")) {
                         if (json.length() > 4096 || !body.path("tombstone").isBoolean() || !body.path("tombstone").booleanValue()
                                 || !"SPX".equals(body.path("symbol").asText())) {

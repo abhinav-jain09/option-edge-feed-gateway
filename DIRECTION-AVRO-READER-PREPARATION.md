@@ -11,7 +11,7 @@ remains fatal. Null values are allowed only on the previously declared aligned C
 the projected strike topic's withdrawal boundary, and the Direction push topic's retained history.
 New push producers must use non-null typed deletions on the existing delete-retained topic.
 
-Both push ingestion paths use the same SPX withdrawal handler. The cache path hydrates without
+Both push ingestion paths hand the original record to the same SPX withdrawal handler before enrichment. The handler derives its own original text, and deletion parsing requires strict end-of-input. Whitespace-padded over-cap values, concatenated JSON and trailing garbage cannot be normalized into accepted deletions. The cache path hydrates without
 emitting; the live path sends updates after its existing caught-up gate. A withdrawal removes the
 cached state and records one topic/partition/offset marker for this source/key. It rejects older
 or equal upserts and another partition, so a second consumer cannot restore the withdrawn reading.

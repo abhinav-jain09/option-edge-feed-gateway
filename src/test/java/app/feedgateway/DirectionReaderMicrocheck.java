@@ -37,11 +37,11 @@ public final class DirectionReaderMicrocheck {
         for(String arm:List.of("upsert","legacy-null","typed-delete","stale-after-delete")) {
             var service=new FeedGatewayService(settings,json,new HpsfGatewayViewMapper(),null);var offset=new AtomicLong();
             sample(arm,()->{
-                long n=offset.addAndGet(3);service.onDirectionPushRecord(new ConsumerRecord<>(settings.directionPushTopic(),0,n,"SPX",push),push,false);
+                long n=offset.addAndGet(3);service.onDirectionPushRecord(new ConsumerRecord<>(settings.directionPushTopic(),0,n,"SPX",push),false);
                 if(!arm.equals("upsert")) {
-                    Object value=arm.equals("legacy-null")?null:deletion;String text=value==null?null:deletion;
-                    service.onDirectionPushRecord(new ConsumerRecord<>(settings.directionPushTopic(),0,n+2,"SPX",value),text,false);
-                    if(arm.equals("stale-after-delete"))service.onDirectionPushRecord(new ConsumerRecord<>(settings.directionPushTopic(),0,n+1,"SPX",push),push,false);
+                    Object value=arm.equals("legacy-null")?null:deletion;
+                    service.onDirectionPushRecord(new ConsumerRecord<>(settings.directionPushTopic(),0,n+2,"SPX",value),false);
+                    if(arm.equals("stale-after-delete"))service.onDirectionPushRecord(new ConsumerRecord<>(settings.directionPushTopic(),0,n+1,"SPX",push),false);
                 }
             });
         }

@@ -82,40 +82,42 @@ class DirectionAvroRollingGatewayTest {
     }
     @Test void legacyNullAndTypedDeletionClearWithoutOlderConsumerRecordsResurrectingState() throws Exception {
         var service=service();String push=push().toString();
-        service.onDirectionPushRecord(record(1,push),push,false);assertEquals(push,cache(service).get("DATABENTO|SPX"));
-        service.onDirectionPushRecord(record(3,null),null,false);assertTrue(cache(service).isEmpty());assertEquals(0,forwarded(service));
-        service.onDirectionPushRecord(record(2,push),push,true);assertTrue(cache(service).isEmpty());assertEquals(0,forwarded(service));
-        service.onDirectionPushRecord(record(3,null),null,true);assertEquals(1,forwarded(service));
-        service.onDirectionPushRecord(record(3,null),null,true);assertEquals(1,forwarded(service));
-        service.onDirectionPushRecord(record(4,push),push,true);assertEquals(push,cache(service).get("DATABENTO|SPX"));assertEquals(2,forwarded(service));
-        service.onDirectionPushRecord(record(3,null),null,true);assertEquals(push,cache(service).get("DATABENTO|SPX"));assertEquals(2,forwarded(service));
+        service.onDirectionPushRecord(record(1,push),false);assertEquals(push,cache(service).get("DATABENTO|SPX"));
+        service.onDirectionPushRecord(record(3,null),false);assertTrue(cache(service).isEmpty());assertEquals(0,forwarded(service));
+        service.onDirectionPushRecord(record(2,push),true);assertTrue(cache(service).isEmpty());assertEquals(0,forwarded(service));
+        service.onDirectionPushRecord(record(3,null),true);assertEquals(1,forwarded(service));
+        service.onDirectionPushRecord(record(3,null),true);assertEquals(1,forwarded(service));
+        service.onDirectionPushRecord(record(4,push),true);assertEquals(push,cache(service).get("DATABENTO|SPX"));assertEquals(2,forwarded(service));
+        service.onDirectionPushRecord(record(3,null),true);assertEquals(push,cache(service).get("DATABENTO|SPX"));assertEquals(2,forwarded(service));
         String deletion="{\"symbol\":\"SPX\",\"tombstone\":true}";
-        service.onDirectionPushRecord(record(5,deletion),deletion,true);assertTrue(cache(service).isEmpty());assertEquals(3,forwarded(service));
-        service.onDirectionPushRecord(record(4,push),push,true);assertTrue(cache(service).isEmpty());assertEquals(3,forwarded(service));
-        service.onDirectionPushRecord(new ConsumerRecord<>(settings.directionPushTopic(),1,6,"SPX",push),push,true);
+        service.onDirectionPushRecord(record(5,deletion),true);assertTrue(cache(service).isEmpty());assertEquals(3,forwarded(service));
+        service.onDirectionPushRecord(record(4,push),true);assertTrue(cache(service).isEmpty());assertEquals(3,forwarded(service));
+        service.onDirectionPushRecord(new ConsumerRecord<>(settings.directionPushTopic(),1,6,"SPX",push),true);
         assertTrue(cache(service).isEmpty());assertEquals(3,forwarded(service));
     }
     @Test void malformedFalseOversizeWrongIdentityAndEscapedDeletionHaveExplicitSemantics() throws Exception {
-        var service=service();String push=push().toString();service.onDirectionPushRecord(record(1,push),push,false);
+        var service=service();String push=push().toString();service.onDirectionPushRecord(record(1,push),false);
         for(String bad:List.of("{\"symbol\":\"SPX\",\"tombstone\":false}","{\"symbol\":\"SPX\",\"tombstone\":\"true\"}",
-                "{\"symbol\":\"ES\",\"tombstone\":true}","{\"symbol\":\"SPX\",\"tombstone\":true,\"x\":\""+"x".repeat(4096)+"\"}","{\"tombstone\":true")) {
-            service.onDirectionPushRecord(record(2,bad),bad,true);assertEquals(push,cache(service).get("DATABENTO|SPX"));
+                "{\"symbol\":\"ES\",\"tombstone\":true}","{\"symbol\":\"SPX\",\"tombstone\":true,\"x\":\""+"x".repeat(4096)+"\"}","{\"tombstone\":true", "{\"symbol\":\"SPX\",\"tombstone\":true} {}",
+                "{\"symbol\":\"SPX\",\"tombstone\":true} garbage", "{\"symbol\":\"SPX\",\"tombstone\":true} [1]",
+                " ".repeat(4096)+"{\"symbol\":\"SPX\",\"tombstone\":true}")) {
+            service.onDirectionPushRecord(record(2,bad),true);assertEquals(push,cache(service).get("DATABENTO|SPX"));
         }
-        service.onDirectionPushRecord(new ConsumerRecord<>(settings.directionPushTopic(),0,2,"ES",null),null,true);
-        service.onDirectionPushRecord(new ConsumerRecord<>("unrelated",0,2,"SPX",null),null,true);
+        service.onDirectionPushRecord(new ConsumerRecord<>(settings.directionPushTopic(),0,2,"ES",null),true);
+        service.onDirectionPushRecord(new ConsumerRecord<>("unrelated",0,2,"SPX",null),true);
         assertEquals(push,cache(service).get("DATABENTO|SPX"));assertEquals(0,forwarded(service));
         String escaped="{\"symbol\":\"SPX\",\""+"\\u0074ombstone\":true}";
-        service.onDirectionPushRecord(record(2,escaped),escaped,true);assertTrue(cache(service).isEmpty());assertEquals(1,forwarded(service));
+        service.onDirectionPushRecord(record(2,escaped),true);assertTrue(cache(service).isEmpty());assertEquals(1,forwarded(service));
     }
     @Test void markerExpiresWhenNoEarlierPushCanStillBeFresh() throws Exception {
-        var service=service();service.onDirectionPushRecord(record(1,null),null,false);
+        var service=service();service.onDirectionPushRecord(record(1,null),false);
         var field=FeedGatewayService.class.getDeclaredField("directionPushWithdrawal");field.setAccessible(true);assertNotNull(field.get(service));
         System.setProperty("GATEWAY_DIRECTION_PUSH_TTL_MS","0");
-        try {service.onDirectionPushRecord(record(2,""),"",false);assertNull(field.get(service));}
+        try {service.onDirectionPushRecord(record(2,""),false);assertNull(field.get(service));}
         finally{System.clearProperty("GATEWAY_DIRECTION_PUSH_TTL_MS");}
     }
     @Test void cachedReplayAndWithdrawalUseTheSameEmitLock() throws Exception {
-        var service=service();String push=push().toString();service.onDirectionPushRecord(record(1,push),push,false);
+        var service=service();String push=push().toString();service.onDirectionPushRecord(record(1,push),false);
         var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
         var failure=new java.util.concurrent.atomic.AtomicReference<Throwable>();
         var slow=new java.util.concurrent.ConcurrentHashMap<String,String>(cache(service)) {
@@ -136,7 +138,7 @@ class DirectionAvroRollingGatewayTest {
         var emit=FeedGatewayService.class.getDeclaredField("directionPushEmitLock");emit.setAccessible(true);Object lock=emit.get(service);
         var replay=FeedGatewayService.class.getDeclaredMethod("replayDirectionPushCached",org.springframework.web.socket.WebSocketSession.class);replay.setAccessible(true);
         Thread reader=new Thread(()->{try{replay.invoke(service,(Object)null);}catch(Throwable e){failure.set(e);}},"direction-replay-unit");
-        Thread deletion=new Thread(()->{try{service.onDirectionPushRecord(record(2,null),null,false);}catch(Throwable e){failure.set(e);}},"direction-delete-unit");
+        Thread deletion=new Thread(()->{try{service.onDirectionPushRecord(record(2,null),false);}catch(Throwable e){failure.set(e);}},"direction-delete-unit");
         try {
             reader.start();assertTrue(entered.await(3,java.util.concurrent.TimeUnit.SECONDS));deletion.start();
             var threads=java.lang.management.ManagementFactory.getThreadMXBean();long deadline=System.nanoTime()+3_000_000_000L;
@@ -148,6 +150,19 @@ class DirectionAvroRollingGatewayTest {
             assertNotNull(info.getLockInfo());assertEquals(System.identityHashCode(lock),info.getLockInfo().getIdentityHashCode());
         } finally {release.countDown();reader.join(4000);if(deletion.getState()!=Thread.State.NEW)deletion.join(4000);}
         assertFalse(reader.isAlive());assertFalse(deletion.isAlive());assertNull(failure.get());assertTrue(cache(service).isEmpty());
+    }
+
+    @Test void originalDeletionTextIsValidatedAndRetainedBeforeAnyEnrichment() throws Exception {
+        var service=service();String push=push().toString();service.onDirectionPushRecord(record(1,push),false);
+        String date=java.time.LocalDate.now(java.time.ZoneId.of("America/New_York")).toString();
+        String raw="  { \"symbol\": \"SPX\", \"sessionDate\": \""+date+"\", \"tombstone\": true }  ";
+        String oversized=" ".repeat(4096)+raw;
+        service.onDirectionPushRecord(record(2,oversized),false);assertEquals(push,cache(service).get("DATABENTO|SPX"));
+        service.onDirectionPushRecord(record(2,raw),false);assertTrue(cache(service).isEmpty());
+        var field=FeedGatewayService.class.getDeclaredField("directionPushWithdrawal");field.setAccessible(true);Object withdrawal=field.get(service);
+        var text=withdrawal.getClass().getDeclaredMethod("json");text.setAccessible(true);assertEquals(raw,text.invoke(withdrawal));
+        service.onDirectionPushRecord(record(2,raw),true);assertEquals(1,forwarded(service));
+        assertEquals(raw,text.invoke(field.get(service)));
     }
 
 }

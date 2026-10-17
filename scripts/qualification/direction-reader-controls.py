@@ -16,6 +16,7 @@ METHODS={
  'invalid':'malformedFalseOversizeWrongIdentityAndEscapedDeletionHaveExplicitSemantics',
  'expiry':'markerExpiresWhenNoEarlierPushCanStillBeFresh',
  'replay':'cachedReplayAndWithdrawalUseTheSameEmitLock',
+ 'original':'originalDeletionTextIsValidatedAndRetainedBeforeAnyEnrichment',
 }
 
 
@@ -48,6 +49,10 @@ def main():
     cases.append(('replay-emit-lock','''        synchronized (directionPushEmitLock) {
             long pushNowMs''','''        {
             long pushNowMs''','replay'))
+    cases.extend([
+      ('strict-trailing-json','JsonNode body = mapper.reader().with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readTree(json);','JsonNode body = mapper.readTree(json);','invalid'),
+      ('original-before-enrichment','String json = stringJson(record.value());','String json = enrichJson(stringJson(record.value()), DIRECTION_PUSH_BINDING);','original'),
+    ])
     basecp=os.pathsep.join([str(ROOT/'target/test-classes'),str(ROOT/'target/classes'),deps])
     def probe(cp,method,name):
         r=subprocess.run([str(JAVA/'java'),'-Xmx1536m','-cp',cp,'app.feedgateway.DirectionReaderNegativeProbe',method],cwd=ROOT,text=True,capture_output=True,timeout=20)
