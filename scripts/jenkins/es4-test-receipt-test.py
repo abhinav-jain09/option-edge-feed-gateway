@@ -19,6 +19,7 @@ class ReceiptTest(unittest.TestCase):
         self.xml = self.reports / "TEST-fixture.xml"
         self.xml.write_text('<testsuite tests="2" failures="0" errors="0" skipped="1"/>')
         (self.root / "test.log").write_text("finite successful test\n")
+        (self.root / "complete.txt").write_text("a" * 40 + "\n")
         self.args = [str(self.root), "a" * 40, "b" * 40, "c" * 64, "123"]
 
     def tearDown(self):
@@ -57,6 +58,11 @@ class ReceiptTest(unittest.TestCase):
             self.xml.write_text(xml)
             with self.assertRaises(ValueError):
                 receipt.main(["write", *self.args])
+
+    def test_missing_completion_marker_refuses_successful_test_reports(self):
+        (self.root / "complete.txt").unlink()
+        with self.assertRaises(ValueError):
+            receipt.main(["write", *self.args])
 
     def test_symlinked_evidence_is_not_accepted(self):
         other = self.root / "outside.xml"

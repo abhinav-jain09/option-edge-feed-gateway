@@ -57,7 +57,10 @@ def main(args):
     if mode not in ("write", "verify"):
         raise ValueError("write or verify required")
     root = Path(directory)
-    expected = {"source": source, "contracts_source": contracts, "contracts_jar_sha256": jar,
+    completion = digest(root / "complete.txt", 128)
+    if (root / "complete.txt").read_text() != source + "\n":
+        raise ValueError("full sequence did not complete for this source")
+    expected = {"completion_sha256": completion, "source": source, "contracts_source": contracts, "contracts_jar_sha256": jar,
                 "build_number": build, "status": "PASS", **evidence(root)}
     receipt = root / "receipt.json"
     if mode == "write":

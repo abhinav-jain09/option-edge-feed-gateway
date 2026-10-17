@@ -8,9 +8,9 @@ check_window() {
   local weekday hhmm zone
   read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
   [[ $zone = EST || $zone = EDT ]] || { echo 'New York timezone unavailable' >&2; return 1; }
-  # A test run is bounded to 40 minutes: do not start inside the 45-minute pre-open margin.
-  if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0845 ] && [ "$hhmm" -lt 1600 ]; then
-    echo 'Gateway es4 tests refused: cash-window exclusion is 08:45-16:00 America/New_York.' >&2
+  # A test run is bounded to 40 minutes: do not start inside the 60-minute pre-open margin.
+  if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then
+    echo 'Gateway es4 tests refused: cash-window exclusion is 08:30-16:00 America/New_York.' >&2
     return 1
   fi
 }
@@ -70,15 +70,36 @@ root=$1; build=$2
 umask 077
 mkdir -p "$root"
 [ ! -L "$root" ] || exit 1
-for tool in mvn git python3 systemd-run systemctl docker sha256sum tar; do command -v "$tool" >/dev/null; done
+for tool in mvn git python3 systemd-run systemctl docker sha256sum tar taskset; do command -v "$tool" >/dev/null; done
 [ -x /usr/lib/jvm/java-21-openjdk/bin/java ] || exit 1
 [ -r /usr/share/zoneinfo/America/New_York ] || exit 1
-systemctl --user is-system-running | grep -qx running
+systemctl --user is-system-running | grep -Eq '^(running|degraded)$'
 docker info >/dev/null
+# Verify the effective kernel limits and Docker access INSIDE the same clean unit context.
+cpu_list=$(python3 -c 'import os; cpus=sorted(os.sched_getaffinity(0)); assert len(cpus)>=2; print(str(cpus[0])+","+str(cpus[1]))')
+probe="oe-gateway-probe-$build-$RANDOM-$RANDOM"
+systemd-run --user --quiet --wait --pipe --collect --unit="$probe" \
+  --property=MemoryMax=4G --property=MemorySwapMax=0 --property=TasksMax=512 \
+  --property=RuntimeMaxSec=15 --property=TimeoutStopSec=5 \
+  --property=KillMode=control-group taskset --cpu-list "$cpu_list" env -i \
+  PATH=/usr/lib/jvm/java-21-openjdk/bin:/usr/bin:/bin CI_CPU_LIST="$cpu_list" \
+  bash -c '
+    set -euo pipefail
+    group=$(sed -n "s/^0:://p" /proc/self/cgroup)
+    base="/sys/fs/cgroup$group"
+    [ "$(cat "$base/memory.max")" = 4294967296 ]
+    [ "$(cat "$base/memory.swap.max")" = 0 ]
+    [ "$(cat "$base/pids.max")" = 512 ]
+    python3 -c "import os; assert os.sched_getaffinity(0)==set(map(int,os.environ[\"CI_CPU_LIST\"].split(\",\")))"
+    docker info >/dev/null
+    echo "Effective CI unit limits and clean-environment Docker access verified"
+  ' >&2
 [ "$(df -Pk "$root" | awk 'NR==2 {print $4}')" -ge 41943040 ] || { echo '40 GiB free disk required' >&2; exit 1; }
 [ "$(find "$root" -mindepth 1 -maxdepth 1 -type d | wc -l)" -lt 4 ] || { echo 'Too many retained CI workspaces' >&2; exit 1; }
 [ "$(du -sm "$root" | cut -f1)" -lt 20480 ] || { echo 'CI retained-state budget exceeded (20 GiB)' >&2; exit 1; }
-mktemp -d "$root/run.$build.XXXXXXXX"
+dir=$(mktemp -d "$root/run.$build.XXXXXXXX")
+printf '%s\n' "$cpu_list" > "$dir/cpus.txt"
+printf '%s\n' "$dir"
 REMOTE_INIT
 )
 [[ $remote_dir =~ ^/home/abhinav/ci/gateway-tests/run\.[0-9]+\.[A-Za-z0-9]+$ ]] || exit 64
@@ -100,14 +121,14 @@ fi
 REMOTE_FINISH
   # Transfer failures cannot pass the subsequent mandatory receipt/evidence verification.
   scp "${ssh_args[@]}" -r "$host:$remote_dir/surefire-reports" "$local_dir/" >/dev/null 2>&1 || true
-  scp "${ssh_args[@]}" "$host:$remote_dir/test.log" "$host:$remote_dir/receipt.json" "$local_dir/" >/dev/null 2>&1 || true
+  scp "${ssh_args[@]}" "$host:$remote_dir/test.log" "$host:$remote_dir/receipt.json" "$host:$remote_dir/complete.txt" "$local_dir/" >/dev/null 2>&1 || true
   ssh "${ssh_args[@]}" "$host" "bash -s -- $remote_dir" <<'REMOTE_CLEAN' || true
 set -euo pipefail
 dir=$1
 [[ $dir =~ ^/home/abhinav/ci/gateway-tests/run\.[0-9]+\.[A-Za-z0-9]+$ ]] || exit 64
 [ -d "$dir" ] && [ ! -L "$dir" ] || exit 1
 # -P never follows a symlink, including a concurrently replaced root; no recursive rm.
-find -P "$dir" -xdev -depth -mindepth 1 -delete
+timeout 120s find -P "$dir" -xdev -depth -mindepth 1 -delete
 rmdir "$dir"
 REMOTE_CLEAN
   # Keep only bounded report/log evidence locally; source/cache snapshots are not retained per build.
@@ -130,7 +151,7 @@ dir=$1; source_sha=$2; contracts_sha=$3; java_home=$4; build=$5
 [ "$java_home" = /usr/lib/jvm/java-21-openjdk ] || exit 64
 read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
 [[ $zone = EST || $zone = EDT ]] || exit 1
-if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0845 ] && [ "$hhmm" -lt 1600 ]; then exit 1; fi
+if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then exit 1; fi
 cd "$dir"
 sha256sum -c inputs.sha256
 [ "$(cat .contracts-sha)" = "$contracts_sha" ] || exit 1
@@ -153,12 +174,16 @@ cat > run-tests.sh <<'RUN'
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$CI_GATEWAY_DIR"
+java -version
+mvn -version
+taskset -pc $$
 mvn -B test
 # Preserve the full-suite reports before mutation runs overwrite Surefire XML in this checkout.
 mkdir ../surefire-reports
 cp target/surefire-reports/TEST-*.xml ../surefire-reports/
 scripts/footprint-reverify.sh
 scripts/footprint-reqstate.sh --check
+printf '%s\n' "$CI_SOURCE_SHA" > ../complete.txt
 RUN
 # The complete sequence has an initial 40-minute deadline, not a claim of measured duration.
 # Successful execution is required before any image is packaged or deployed.
@@ -168,32 +193,48 @@ trap stop_unit EXIT
 trap 'exit 143' HUP INT TERM
 read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
 [[ $zone = EST || $zone = EDT ]] || exit 1
-if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0845 ] && [ "$hhmm" -lt 1600 ]; then exit 1; fi
+if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then exit 1; fi
 # User-systemd owns every descendant, including TERM-resistant/orphaned processes.
 # The Kafka test container separately has 2 GiB / one CPU limits; planned total is 8 GiB.
-python3 - "$dir" "$unit" "$java_home" <<'SUPERVISE'
+cpu_list=$(cat "$dir/cpus.txt")
+[[ $cpu_list =~ ^[0-9]+,[0-9]+$ ]] || exit 64
+python3 - "$dir" "$unit" "$java_home" "$source_sha" "$cpu_list" <<'SUPERVISE'
 import os, pathlib, selectors, subprocess, sys, time
-root, unit, java = sys.argv[1:]
+root, unit, java, source, cpus = sys.argv[1:]
 command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=" + unit,
     "--property=MemoryMax=4G", "--property=MemorySwapMax=0", "--property=TasksMax=512",
-    "--property=CPUQuota=200%", "--property=RuntimeMaxSec=2400", "--property=TimeoutStopSec=10",
-    "--property=KillMode=control-group", "env", "-i", "PATH=" + java + "/bin:/usr/bin:/bin",
+    "--property=RuntimeMaxSec=2400", "--property=TimeoutStopSec=10",
+    "--property=KillMode=control-group", "taskset", "--cpu-list", cpus, "env", "-i", "PATH=" + java + "/bin:/usr/bin:/bin",
     "JAVA_HOME=" + java, "JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=" + root + "/tmp",
     "MAVEN_SKIP_RC=true", "MAVEN_OPTS=-Xmx768m -Dmaven.repo.local=" + root + "/cache/repository -Djava.io.tmpdir=" + root + "/tmp",
-    "CI_GATEWAY_DIR=" + root + "/gateway", "JENKINS_URL=es4-test-transport", "CI=true", "bash", root + "/run-tests.sh"]
+    "CI_GATEWAY_DIR=" + root + "/gateway", "CI_SOURCE_SHA=" + source, "JENKINS_URL=es4-test-transport", "CI=true", "bash", root + "/run-tests.sh"]
 child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 selector = selectors.DefaultSelector()
 selector.register(child.stdout, selectors.EVENT_READ)
 size = 0
 next_disk_check = 0.0
+disk_timeouts = 0
 try:
     with open(root + "/test.log", "wb") as log:
         while selector.get_map():
             if time.monotonic() >= next_disk_check:
-                used = subprocess.check_output(["du", "-sk", str(pathlib.Path(root).parent)], timeout=10)
-                if int(used.split()[0]) > 20 * 1024 * 1024:
-                    raise RuntimeError("CI retained-state threshold exceeds 20 GiB")
-                next_disk_check = time.monotonic() + 10
+                try:
+                    usage = subprocess.run(["du", "-sk", str(pathlib.Path(root).parent)],
+                        timeout=10, capture_output=True, env={**os.environ, "LC_ALL": "C"})
+                except subprocess.TimeoutExpired:
+                    disk_timeouts += 1
+                    if disk_timeouts >= 2:
+                        raise RuntimeError("CI disk watchdog timed out twice")
+                    next_disk_check = time.monotonic() + 1
+                else:
+                    disk_timeouts = 0
+                    errors = usage.stderr.decode(errors="replace").splitlines()
+                    if usage.returncode not in (0, 1) or not usage.stdout.split() or \
+                            (usage.returncode == 1 and any("No such file or directory" not in line for line in errors)):
+                        raise RuntimeError("CI disk watchdog could not measure private state")
+                    if int(usage.stdout.split()[0]) > 20 * 1024 * 1024:
+                        raise RuntimeError("CI retained-state threshold exceeds 20 GiB")
+                    next_disk_check = time.monotonic() + 10
             for key, _ in selector.select(timeout=5):
                 block = os.read(key.fileobj.fileno(), 65536)
                 if not block:
@@ -205,6 +246,8 @@ try:
                 log.write(block)
     if child.wait(timeout=15) != 0:
         raise RuntimeError("remote full suite or campaign failed")
+    if pathlib.Path(root, "complete.txt").read_text() != source + "\n":
+        raise RuntimeError("test sequence did not reach its final completion marker")
 finally:
     selector.close()
     # Stop is idempotent for a collected unit. KillMode kills ALL members, not only a leader PID.

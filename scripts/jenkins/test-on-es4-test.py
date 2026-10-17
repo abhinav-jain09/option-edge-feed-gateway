@@ -35,10 +35,22 @@ test "$(git -C "$dir" rev-parse HEAD)" = "$PERMITTED_SHA"
         self.script(self.jdk / "bin/java", 'echo \'openjdk version "21"\' >&2')
         self.maven(0)
         self.script(self.bin / "date", 'printf "%s\\n" "${CI_FAKE_DATE:-6 0700 EDT}"')
+        self.script(self.bin / "taskset", 'if [ "$1" = -pc ]; then echo "affinity: 0,1"; else shift 2; exec "$@"; fi')
+        self.script(self.jdk / "bin/taskset", 'echo "affinity: 0,1"')
         self.script(self.bin / "docker", 'echo finite-docker-preflight')
         self.script(self.bin / "df", 'printf "Filesystem 1024-blocks Used Available Capacity Mounted\\nfixture 999999999 0 999999999 0%% /\\n"')
         self.script(self.bin / "systemctl", 'case "$*" in *is-system-running*) echo running;; *show*) cat "${CI_UNIT_EXEC}" 2>/dev/null || true;; *stop*) printf "%s\\n" "$*" >> "$CI_UNIT_STOPS";; esac')
-        self.script(self.bin / "systemd-run", 'while [[ $1 = --* ]]; do shift; done; exec "$@"')
+        self.script(self.bin / "systemd-run", '''
+# The kernel probe is not a host operation in this fixture; the final command is exercised.
+case "$*" in *oe-gateway-probe-*) exit 0;; esac
+while [[ $1 = --* ]]; do shift; done
+if [ "${CI_FAKE_PARTIAL:-}" = 1 ]; then
+    last="${@: -1}"
+    sed '/complete.txt/d' "$last" > "$last.partial"
+    set -- "${@:1:$(($# - 1))}" "$last.partial"
+fi
+exec "$@"
+''')
         self.write(self.repo / "scripts/jenkins/es4-test-receipt.py", SOURCE.with_name("es4-test-receipt.py").read_text())
         self.script(self.bin / "sha256sum", 'exec shasum -a 256 "$@"')
         self.write(self.bin / "setsid", "#!/usr/bin/env python3\nimport os,sys\nos.setsid()\nos.execvp(sys.argv[1],sys.argv[1:])\n", True)
@@ -68,7 +80,7 @@ for source in args[:-1]:
         # The fixture replaces host filesystem/JDK literals; real guard commands are separately stubbed above.
         self.runner = self.root / "transport.sh"
         self.write(self.runner, SOURCE.read_text().replace("/home/abhinav/ci/gateway-tests", str(self.remote))
-                   .replace("/usr/lib/jvm/java-21-openjdk", str(self.jdk)), True)
+                   .replace("/usr/lib/jvm/java-21-openjdk", str(self.jdk)).replace("os.sched_getaffinity(0)", "range(2)"), True)
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.name", "CI unit fixture")
         self.git("config", "user.email", "fixture@example.invalid")
@@ -135,6 +147,13 @@ exit %d
         self.run_transport(1)
         self.assertFalse((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").exists())
         self.assertEqual([], list(self.remote.iterdir()))
+
+    def test_zero_status_without_sequence_completion_cannot_pass(self):
+        self.env["CI_FAKE_PARTIAL"] = "1"
+        self.run_transport(1)
+        out = self.repo / ".jenkins-tmp/es4-tests-123"
+        self.assertTrue((out / "surefire-reports/TEST-fixture.xml").is_file())
+        self.assertFalse((out / "receipt.json").exists())
 
     def test_wrong_artifact_or_source_fails_before_any_transport(self):
         self.jar.write_text("altered artifact")

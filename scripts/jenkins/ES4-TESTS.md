@@ -5,9 +5,9 @@ The Package stage uses `-DskipTests`: a source/artifact/build-bound test receipt
 first, so the large tests never run again during native packaging. Application hot paths
 and packaging/image/deployment source guards are unchanged.
 
-This intentionally prevents image builds during 08:45–16:00 America/New_York on weekdays,
-including cash-hours hotfix builds. There is no skip/override. The 45-minute pre-open margin
-covers the initial 40-minute test deadline plus cleanup. es4 is the test host named by the
+This intentionally prevents image builds during 08:30–16:00 America/New_York on weekdays,
+including cash-hours hotfix builds. There is no skip/override. The 60-minute pre-open margin
+reserves 20 minutes beyond the 40-minute test deadline for cleanup. es4 is the test host named by the
 Performance Rule; no Jenkins controller or agent is installed there. A successful real
 Jenkins sequence, with its measured duration and reports, is required before a production
 image rollout. Forty minutes is an initial fail-closed ceiling, not a duration benchmark.
@@ -24,18 +24,22 @@ credentials. The selected Jenkins agent must already have this SSH route and hos
 StrictHostKeyChecking refuses missing provisioning. No key or host-toolchain change occurs.
 
 Before upload, es4 must provide Java 21 at `/usr/lib/jvm/java-21-openjdk`, Maven, Python,
-Git, Docker on its default socket, a running user-systemd manager, New York timezone data,
+Git, Docker on its default socket, a reachable user-systemd manager (running or degraded), New York timezone data,
 and 40 GiB free disk. The remote rechecks the market window before test execution. Maven
-may resolve Linux dependencies/plugins from its configured upstream repositories: only the
-exact contracts JAR is source/hash-bound here, matching the prior native dependency trust.
-No claim is made that all Maven dependencies are preinstalled or independently pinned.
+may resolve Linux dependencies/plugins independently from native packaging, including the
+host Maven settings: only the exact contracts JAR is source/hash-bound here. The shipped JAR
+is packaged separately from the same source on Jenkins, rather than being the tested binary.
+Java and Maven versions are emitted inside the unit into the hashed log. Dependencies and
+plugins are neither all preinstalled nor independently pinned by this transport.
 The Mac cache tar suppresses Apple xattr metadata. A 4 GiB cache cap fails loudly; cached
 coordinates remain per Jenkins workspace, and a full cache requires deliberate maintenance
 through Jenkins rather than silently evicting the bound contracts dependency.
 
-The command runs in a unique transient user-systemd service with RuntimeMaxSec=2400,
-TimeoutStopSec=10, KillMode=control-group, MemoryMax=4 GiB, no swap, 512 tasks and two CPU
-cores. systemd stops every descendant even if the leader exits or TERM is ignored.
+Before upload, a short unit probe using the same clean environment reads back effective
+kernel memory/swap/pid limits and inherited two-core affinity and checks Docker access. Missing memory/pid delegation or
+unusable Docker fails before the cache transfer. The command runs in a unique transient user-systemd service with RuntimeMaxSec=2400,
+TimeoutStopSec=10, KillMode=control-group, MemoryMax=4 GiB, no swap, 512 tasks and an inherited two-core CPU affinity via `taskset`. CPU cgroup delegation
+is unavailable on the inspected host, so no CPU quota is claimed. systemd stops every descendant even if the leader exits or TERM is ignored.
 The isolated Kafka test container is limited separately to 2 GiB, no swap and one CPU.
 The planned total budget is 8 GiB including the service, Kafka, Ryuk and executor/native
 headroom. These are CI test bounds, not a measured throughput or capacity qualification.
@@ -46,14 +50,16 @@ The unique workspace root refuses four retained directories or 20 GiB existing d
 During execution a ten-second watchdog stops the run if total private-root usage exceeds
 20 GiB; growth can overshoot the threshold during that interval. A single log is limited to
 128 MiB, each report to 32 MiB and total XML to 128 MiB/512 files. Cleanup removes only this
-run's files without following symlinks. Local cache/source snapshots are removed in the
+run's files without following symlinks, under a two-minute remote deletion deadline. Local cache/source snapshots are removed in the
 transport trap. Jenkins archives bounded evidence, then removes the local evidence directory
 in the enclosing Build stage cleanup, after the receipt gate and packaging have used it.
 
 The source snapshot runs `mvn -B test`, `scripts/footprint-reverify.sh`, and the rendered
 requirement-state check. Full-suite Surefire reports are copied before mutation runs can
 overwrite them. A receipt requires positive executed-test count, no failures/errors and
-hashes of every XML report plus the log. The packaging gate recomputes those hashes and
+hashes of every XML report plus the log. The sequence writes a source-bound completion
+marker only after every test/campaign/render command succeeds; both supervision and receipt
+verification require it, independently of systemd exit status. The packaging gate recomputes those hashes and
 checks source SHA, contracts SHA/JAR and build number. Missing reports or failed transfer
 cannot become a pass. es4 is the trust root for the receipt; the receipt proves which
 reported evidence was accepted, not independent attestation against a compromised executor.
@@ -67,8 +73,9 @@ bash scripts/jenkins/validate-jenkinsfile-guard.sh Jenkinsfile
 bash -n scripts/jenkins/test-on-es4.sh
 ```
 
-The fixtures exercise the real bundle/checksum/cache/receipt flow with stubbed guard bodies.
+The fixtures exercise the real bundle/checksum/cache/receipt flow with stubbed guard bodies
+and the Linux CPU-affinity syscall replaced in the Mac fixture.
 The existing guard validator separately tests those real guards. Transport tests cover source,
-artifact and pin refusal, failed command, window, prior-attempt refusal and unit ownership.
+artifact and pin refusal, failed command, zero-status incomplete sequence, window, prior-attempt refusal and unit ownership.
 Receipt faults cover missing/empty/failed/all-skipped/altered evidence and source mismatch.
 They contact no host, broker or Docker daemon and do not prove real systemd/container limits.
