@@ -14962,15 +14962,32 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private Properties stringObjectConsumerProperties(String name) {
-        Properties properties = baseConsumerProperties(name);
-        properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
-        return properties;
+        return stringConsumerProperties(name);
     }
 
     private Properties stringConsumerProperties(String name) {
         Properties properties = baseConsumerProperties(name);
-        properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        com.optionsedge.contracts.avro.CanonicalAvroKafka.rollForwardConsumer(properties,
+                settings.schemaRegistryUrl(), cvdAvroBindings(), Set.of(settings.esCvdSpxLevelsTopic()));
+        // Avro omits field names and may expand substantially into the existing API model.
+        // Bound the number of decoded records simultaneously held by a state poll.
+        properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "1");
         return properties;
+    }
+
+    Map<String, org.apache.avro.Schema> cvdAvroBindings() {
+        return Map.ofEntries(
+                Map.entry(settings.esCvdTopic(), com.optionsedge.contracts.cvd.CvdSchemas.SNAPSHOT),
+                Map.entry(settings.esCvdBarsTopic(), com.optionsedge.contracts.cvd.CvdSchemas.BAR),
+                Map.entry(settings.esFootprintTopic(), com.optionsedge.contracts.cvd.CvdSchemas.FOOTPRINT),
+                Map.entry(settings.esFootprintEvidenceTopic(), com.optionsedge.contracts.cvd.CvdSchemas.FOOTPRINT_EVIDENCE),
+                Map.entry(settings.esFootprintBarsTopic(), com.optionsedge.contracts.cvd.CvdSchemas.FOOTPRINT_BAR),
+                Map.entry(settings.esFootprintOutcomesTopic(), com.optionsedge.contracts.cvd.CvdSchemas.FOOTPRINT_OUTCOME),
+                Map.entry(settings.esFootprintStrikeTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.FOOTPRINT_STRIKE),
+                Map.entry(settings.esCvdSpxLevelsTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_LEVELS),
+                Map.entry(settings.esOpenDirectionForecastTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.OPEN_DIRECTION_FORECAST),
+                Map.entry(settings.esOpenDirectionOutcomeTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.OPEN_DIRECTION_OUTCOME),
+                Map.entry(settings.esOpenDirectionStatusTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.OPEN_DIRECTION_STATUS));
     }
 
     private Properties baseConsumerProperties(String name) {
