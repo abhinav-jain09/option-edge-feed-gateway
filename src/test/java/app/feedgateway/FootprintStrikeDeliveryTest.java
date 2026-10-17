@@ -774,6 +774,7 @@ class FootprintStrikeDeliveryTest {
                     reports.incrementAndGet();
                     throw new OutOfMemoryError("Java heap space");            // the report runs out of heap as well
                 });
+        CountDownLatch overflowFinished = new CountDownLatch(1);
         try {
             FeedGatewayService s = FootprintWiringTest.on();
             List<String> a = sink(), b = sink();
@@ -801,7 +802,19 @@ class FootprintStrikeDeliveryTest {
                 when(ws.isOpen()).thenAnswer(inv -> !closed.contains(id));
                 slow.add(ws);
             }
-            s.outboundClosersForTest(closers);
+            // This case tests pool/report heap failures with concurrent queued closes. Start them after
+            // overflow hand-overs return; the next test explicitly forces the opposite race ordering.
+            java.util.concurrent.Executor afterOverflow = teardown -> closers.execute(() -> {
+                try {
+                    if (!overflowFinished.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                        throw new AssertionError("overflow did not finish before heap-failure teardown");
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("heap-failure teardown interrupted", interrupted);
+                }
+                teardown.run();
+            });
+            s.outboundClosersForTest(afterOverflow);
             withProperty("GATEWAY_WS_MAX_QUEUED_MESSAGES", "50", () -> { slow.forEach(s::addClient); return null; });
             s.outboundClosersForTest(null);
             List<String> records = strikeRecords(n);
@@ -814,6 +827,7 @@ class FootprintStrikeDeliveryTest {
                 live.join(10_000);
                 assertFalse(live.isAlive());
                 assertNull(thrown.get(), "nothing was thrown at the drainer: " + thrown.get());
+                overflowFinished.countDown();
                 long deadline = System.currentTimeMillis() + 10_000;
                 while ((closers.failures() < pairs || fineIds.stream().anyMatch(id -> s.outboundChannelForTest(id) != null))
                         && System.currentTimeMillis() < deadline) Thread.sleep(10);
@@ -849,10 +863,12 @@ class FootprintStrikeDeliveryTest {
                 assertEquals(pairs, closers.failures());
                 assertEquals(pairs, reports.get());
             } finally {
+                overflowFinished.countDown();
                 sendRelease.countDown();
                 live.join(10_000);
             }
         } finally {
+            overflowFinished.countDown();
             closers.shutdownNow();
         }
     }
