@@ -13618,12 +13618,12 @@ public class FeedGatewayService implements ReplayRunner {
         try {
             Map<TopicPartition, ReplayPartitionState> parts = new LinkedHashMap<>();
             if (!avroTopics.isEmpty()) {
-                avro = new KafkaConsumer<>(replayConsumerProps(appSessionId, true));
+                avro = new KafkaConsumer<>(replayConsumerProps(appSessionId, true, params, avroTopics));
                 handle.avroConsumer = avro; // publish for wakeup() before any blocking call
                 openReplayPartitions(appSessionId, avro, params, avroTopics, true, parts);
             }
             if (!stringTopics.isEmpty()) {
-                str = new KafkaConsumer<>(replayConsumerProps(appSessionId, false));
+                str = new KafkaConsumer<>(replayConsumerProps(appSessionId, false, params, stringTopics));
                 handle.stringConsumer = str;
                 openReplayPartitions(appSessionId, str, params, stringTopics, false, parts);
             }
@@ -13666,10 +13666,27 @@ public class FeedGatewayService implements ReplayRunner {
     record MergeRecord(ReplayChronology.Cursor cursor, String event, Object value, boolean avro) {
     }
 
-    private Properties replayConsumerProps(String appSessionId, boolean avro) {
+    Properties replayConsumerProps(String appSessionId, boolean avro, ReplayParams params,
+                                   Map<String, String> selectedTopics) {
         Properties props = avro
                 ? avroConsumerProperties("replay-" + appSessionId)
                 : stringObjectConsumerProperties("replay-" + appSessionId);
+        if (!avro && params.hasRun()) {
+            var bindings = new LinkedHashMap<String, org.apache.avro.Schema>();
+            var tombstones = new HashSet<String>();
+            for (var binding : cvdAvroBindings().entrySet()) {
+                // The orchestrator's existing replay contract contains only these namespaces.
+                String live = binding.getKey();
+                if (!live.startsWith("options.") && !live.startsWith("underlying.")) continue;
+                String replay = ReplayTopicResolver.toReplayTopic(live, params.runId());
+                if (!selectedTopics.containsKey(replay)) continue;
+                bindings.put(replay, binding.getValue());
+                if (live.equals(settings.esCvdSpxLevelsTopic())) tombstones.add(replay);
+            }
+            if (!bindings.isEmpty())
+                com.optionsedge.contracts.avro.CanonicalAvroKafka.rollForwardConsumer(props,
+                        settings.schemaRegistryUrl(), bindings, tombstones);
+        }
         // Unique group per run so the windowed read is independent and commits nothing (read-only).
         props.put(ConsumerConfig.GROUP_ID_CONFIG,
                 settings.groupIdBase() + "-replay-" + appSessionId + "-" + (avro ? "avro" : "str"));

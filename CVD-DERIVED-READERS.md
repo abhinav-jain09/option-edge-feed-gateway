@@ -21,7 +21,7 @@ from0.10.0;0.11 adds the approved Python boundary. It must be released successfu
 before this PR can build a runtime image. The candidate JAR is used only for local
 unit preparation, never installed under an earlier version or deployed.
 
-Validation: three focused CvdAvroRollingGatewayTest cases pass against the0.11
+Validation: four focused CvdAvroRollingGatewayTest cases pass against the0.11
 candidate, using production Confluent classes with an in-memory registry. They
 cover retained JSON before and after real frames, exact aligned-book and
 recommendation API bytes, wrong-topic schema refusal, truncated frames and null
@@ -36,3 +36,13 @@ This draft enables no writer or new topic. Remaining Direction/strike-intelligen
 contracts, actual reader inventory, destination registry compatibility and runtime
 qualification remain required before their writers are enabled. Do not merge this
 branch until the pending gateway0.10 image has finished and the0.11 release is ready.
+
+Run-scoped replay now derives canonical bindings for the selected replay topics in
+the orchestrator's existing options/underlying namespace contract. The additional
+focused test reads a real aligned-book frame and retained JSON under its resolved
+run topic with the same schema. No replay is executed and no topic is copied here.
+The shared consumer still refuses an Avro failure without JSON fallback. Its
+existing counted skip policy for malformed retained values now also applies to the
+new bindings; the metric's historical CVD name covers those derived records too.
+Reader-first runtime qualification must include the shared-consumer cold-registry
+failure behavior and replay namespace/registry provenance before writer enablement.

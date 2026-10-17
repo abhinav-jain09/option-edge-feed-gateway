@@ -128,13 +128,42 @@ class CvdAvroRollingGatewayTest {
                 assertEquals(legacy, decoded); // Exact API order and numeric spelling, including 5.0.
                 assertEquals(legacy, reader.deserialize(topic, legacy.getBytes(StandardCharsets.UTF_8)));
                 String other = models.keySet().stream().filter(key -> !key.equals(topic)).findFirst().orElseThrow();
-                assertThrows(Exception.class, () -> reader.deserialize(other, frame));
-                assertThrows(Exception.class, () -> reader.deserialize(topic, new byte[] {0, 0, 0}));
-                assertThrows(Exception.class, () -> reader.deserialize(topic, null));
+                assertThrows(org.apache.kafka.common.errors.SerializationException.class, () -> reader.deserialize(other, frame));
+                assertThrows(org.apache.kafka.common.errors.SerializationException.class, () -> reader.deserialize(topic, new byte[] {0, 0, 0}));
+                assertThrows(org.apache.kafka.common.errors.SerializationException.class, () -> reader.deserialize(topic, null));
             }
         } finally {
             MockSchemaRegistry.dropScope(scope);
         }
+    }
+
+    @Test void runScopedAlignedBookReplayUsesTheSameCanonicalBinding() throws Exception {
+        var settings = new GatewaySettings();
+        var service = new FeedGatewayService(settings, new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+        String topic = app.feedgateway.mtsession.gateway.ReplayTopicResolver.toReplayTopic(settings.esGexSpxAlignedTopic(), "fixture-run");
+        var params = new app.feedgateway.mtsession.gateway.ReplayParams("app:fixture", "SPX", "20261019", 1000L, 2000L, 10, "fixture-run");
+        var props = service.replayConsumerProps("app:fixture", false, params, Map.of(topic, "es-gex"));
+        assertEquals(Map.of(topic, com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_GEX_BOOK),
+                props.get("optionsedge.canonical.avro.bindings"));
+        assertEquals(Set.of(topic), props.get("optionsedge.canonical.avro.retained-json-topics"));
+        assertEquals("false", props.get(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG));
+        assertEquals("false", props.get(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG));
+        String scope = "aligned-book-run-replay";
+        props.put("schema.registry.url", "mock://" + scope); props.put("auto.register.schemas", false);
+        var config = new HashMap<String, Object>(); props.forEach((k, v) -> config.put((String) k, v));
+        Schema schema = com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_GEX_BOOK;
+        String json = "{\"recordType\":\"book\",\"source\":\"ES_ON_SPX\",\"symbol\":\"SPX\",\"expiry\":\"20261019\","
+                + "\"settlementType\":\"PM\",\"basisState\":\"INIT\",\"basis\":null,\"basisMeasuredAtMs\":null,"
+                + "\"emitEventTimeMs\":1000,\"dataEventTimeMs\":null,\"upstreamHeartbeatEventMs\":null,\"upstreamHealth\":\"UNAVAILABLE\",\"buckets\":[]}";
+        try (var writer = new KafkaAvroSerializer(); var reader = new CanonicalModelDeserializer()) {
+            MockSchemaRegistry.getClientForScope(scope).register(topic + "-value", schema);
+            writer.configure(config, false); reader.configure(config, false);
+            byte[] frame = writer.serialize(topic, CanonicalJsonAvro.record(schema, new ObjectMapper().readTree(json)));
+            assertEquals(json, reader.deserialize(topic, json.getBytes(StandardCharsets.UTF_8)));
+            assertEquals(json, reader.deserialize(topic, frame));
+            assertThrows(org.apache.kafka.common.errors.SerializationException.class,
+                    () -> reader.deserialize(topic, new byte[] {0, 0, 0}));
+        } finally { MockSchemaRegistry.dropScope(scope); }
     }
 
     private static List<String> fieldNames(JsonNode node) {
