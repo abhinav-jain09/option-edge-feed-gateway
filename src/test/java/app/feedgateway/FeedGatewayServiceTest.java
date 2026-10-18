@@ -7809,6 +7809,62 @@ class FeedGatewayServiceTest {
      * <p>GatewaySettings.value() gives System.getenv() precedence over System.getProperty(), so
      * each case is skipped if the real environment variable is set.
      */
+    /**
+     * The refusal has to happen at START-UP, not inside a consumer, and these two tests are the
+     * difference between a guard and a decoration.
+     *
+     * <p>Codex round 2 found that the version guard, as first written, threw where nothing reported
+     * it: these topic names were resolved inside the Avro consumers, on executor threads, under
+     * {@code runRetryingConsumer} — which catches RuntimeException, prints it and retries forever.
+     * The application would have started, reported healthy, and served with both Avro workers dead.
+     * That is the exact failure the change exists to remove, relocated rather than fixed.
+     *
+     * <p>So resolution moved into {@link FeedGatewayService#topicNamePreflight()}, called from
+     * {@code start()} BEFORE {@code running} is set and before any worker is submitted, so the
+     * {@code @PostConstruct} fails and the context does not come up.
+     */
+    @Test
+    void theTopicNamePreflightRefusesAVersionedOverride() {
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                System.getenv("KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC") == null);
+        String key = "KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC";
+        String previous = System.getProperty(key);
+        try {
+            System.setProperty(key, "options.databento.gex.oi-status.v2");
+            FeedGatewayService service = new FeedGatewayService(
+                    new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+            IllegalStateException boom = org.junit.jupiter.api.Assertions.assertThrows(
+                    IllegalStateException.class, service::topicNamePreflight);
+            assertTrue(boom.getMessage().contains("versioned topic name"), boom.getMessage());
+            // And it passes once the name is unversioned, so the test cannot be green by accident.
+            System.clearProperty(key);
+            new FeedGatewayService(new GatewaySettings(), new ObjectMapper(),
+                    new HpsfGatewayViewMapper(), null).topicNamePreflight();
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
+    }
+
+    /** start() must call the preflight BEFORE it sets running or submits any worker. */
+    @Test
+    void startRunsTheTopicNamePreflightBeforeAnyWorkerCanSwallowIt() throws Exception {
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int startAt = source.indexOf("public void start() {");
+        assertTrue(startAt > 0, "start() not found");
+        int preflight = source.indexOf("topicNamePreflight();", startAt);
+        int runningSet = source.indexOf("running.compareAndSet(false, true)", startAt);
+        int firstSubmit = source.indexOf("executor.submit(", startAt);
+        assertTrue(preflight > 0, "start() does not call topicNamePreflight()");
+        assertTrue(preflight < runningSet,
+                "the preflight must run before running is set, or a refusal leaves a half-started service");
+        assertTrue(preflight < firstSubmit,
+                "the preflight must run before any worker is submitted, or runRetryingConsumer swallows it");
+    }
+
     @Test
     void aVersionedTopicOverrideIsRefusedOnBothSettingsPaths() {
         record Case(String key, String versioned, String site,
