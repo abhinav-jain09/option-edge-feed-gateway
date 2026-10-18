@@ -26,7 +26,6 @@ import com.optionsedge.contracts.hpsf.HpsfSignal;
 import com.optionsedge.contracts.hpsf.HpsfTopics;
 import com.optionsedge.contracts.hpsf.MarketFlowSnapshot;
 import com.optionsedge.contracts.hpsf.StrikeScoreSnapshot;
-import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.apache.avro.generic.GenericRecord;
@@ -2674,6 +2673,9 @@ public class FeedGatewayService implements ReplayRunner {
         for (String signalsTopic : settings.indicatorsSignalsTopics()) {
             topicEvents.put(signalsTopic, new TopicBinding("DATABENTO", "indicator-signals"));
         }
+        // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
+        // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
+        topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2681,9 +2683,6 @@ public class FeedGatewayService implements ReplayRunner {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
         topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
-        // Canonical SPX spot — dedicated event, NOT index-price: its payload source names the cascade
-        // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
-        topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
         topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.databentoMissionSandwichTopic(), new TopicBinding("DATABENTO", "mission-sandwich"));
@@ -2862,6 +2861,9 @@ public class FeedGatewayService implements ReplayRunner {
         for (String signalsTopic : settings.indicatorsSignalsTopics()) {
             topicEvents.put(signalsTopic, new TopicBinding("DATABENTO", "indicator-signals"));
         }
+        // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
+        // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
+        topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -2869,9 +2871,6 @@ public class FeedGatewayService implements ReplayRunner {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
         topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
         topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
-        // Canonical SPX spot — dedicated event, NOT index-price: its payload source names the cascade
-        // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
-        topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
         topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
         topicEvents.put(settings.databentoMissionSandwichTopic(), new TopicBinding("DATABENTO", "mission-sandwich"));
@@ -3375,7 +3374,7 @@ public class FeedGatewayService implements ReplayRunner {
                     } else if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
-                        String rawJson = avro ? avroJson(record.value()) : stringJson(record.value());
+                        String rawJson = kafkaJson(binding == null ? null : binding.event(), avro, record.value());
                         // rev13 R-ARB (slice 2): the shared live gex topic carries TWO planes (USER
                         // D14). Arbitrate BEFORE enrichJson — a sessioned pre-open record must never
                         // be stamped with the binding's DATABENTO provenance nor enter the Databento
@@ -3809,7 +3808,7 @@ public class FeedGatewayService implements ReplayRunner {
                     } else if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
-                        String rawJson = avro ? avroJson(record.value()) : stringJson(record.value());
+                        String rawJson = kafkaJson(binding == null ? null : binding.event(), avro, record.value());
                         // rev13 R-ARB (slice 2): arbitrate the shared live gex topic BEFORE
                         // enrichJson (see the cache-consumer twin). This live consumer is the
                         // broadcasting side: liveBroadcast rides the caught-up flag, and the
@@ -13201,6 +13200,11 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** The browser JSON of one Kafka value: the canonical SPX spot is Avro rendered to its historical JSON text. */
+    private String kafkaJson(String event, boolean avro, Object value) {
+        return "spx-price".equals(event) ? SpxPriceJson.render(mapper, value) : avro ? avroJson(value) : stringJson(value);
+    }
+
     private String stringJson(Object value) {
         return value == null ? null : value.toString();
     }
@@ -13681,6 +13685,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.gammaRotationTopic(), "gamma-rotation");
                 avroTopics.put(settings.gammaFragilityTopic(), "gamma-fragility");
                 avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
+                avroTopics.put(settings.underlyingSpxPriceTopic(), "spx-price");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.strikeIntelByStrikeTopic(), "strike-intel");
@@ -13691,7 +13696,6 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics.put(settings.missionControlTopic(), "mission-control");
                 stringTopics.put(settings.spreadSkewTopic(), "spread-skew");
                 stringTopics.put(settings.databentoEsTradesTopic(), "index-price");
-                stringTopics.put(settings.underlyingSpxPriceTopic(), "spx-price");
                 if (settings.esGexEnabled()) {
                     stringTopics.put(settings.esGexSpxAlignedTopic(), "es-gex");
                 }
@@ -14131,7 +14135,7 @@ public class FeedGatewayService implements ReplayRunner {
                                      MergeRecord r, ReplayHandle handle) {
         // A single malformed/poison record must NOT abort the windowed replay (review finding #12).
         try {
-            String raw = r.avro() ? avroJson(r.value()) : stringJson(r.value());
+            String raw = kafkaJson(r.event(), r.avro(), r.value());
             // R-WIRE.1 on the REPLAY reader too (round-3 finding 3): the shared live topic
             // carries sessioned (IBKR/PREOPEN) records with the feature enabled, and replay must
             // apply the SAME classification the cache/live readers do. Disposition per class:
@@ -15181,7 +15185,8 @@ public class FeedGatewayService implements ReplayRunner {
 
     private Properties avroConsumerProperties(String name) {
         Properties properties = baseConsumerProperties(name);
-        properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, KafkaAvroDeserializer.class.getName());
+        properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, GatewayAvroDeserializer.class.getName());
+        properties.put(GatewayAvroDeserializer.SPX_PRICE_TOPIC, settings.underlyingSpxPriceTopic());
         properties.put("schema.registry.url", settings.schemaRegistryUrl());
         properties.put("specific.avro.reader", "false");
         // Every Avro topic this gateway consumes (display/pace/directional-pressure/gex/max-pain) registers
