@@ -1035,6 +1035,39 @@ public class FeedGatewayService implements ReplayRunner {
         footprintGate.validateExisting();
     }
 
+    /**
+     * Resolve every rolled-forward topic name SYNCHRONOUSLY, and throw to refuse start-up.
+     *
+     * <p>Runs before any lifecycle state moves, for the same reason as {@link #footprintPreflight()}:
+     * a refusal here leaves {@code running=false} with no executor, the {@code @PostConstruct} fails,
+     * and the Spring context does not come up — so the pod dies clean and visibly.
+     *
+     * <p>WITHOUT THIS THE GUARD IS COSMETIC, which is the whole point of the method. These topic
+     * names are otherwise first resolved inside {@link #runAvroCacheConsumer()} and
+     * {@link #runAvroLiveConsumer()}, while they build their topic maps — on an executor thread, and
+     * BEFORE either reaches {@code runRetryingConsumer}, so not even that method's catch-and-retry
+     * sees it. The task simply terminates, and {@code executor.submit} discards the exception into a
+     * Future nobody reads. The application reports itself started and healthy and serves, with both
+     * Avro workers silently absent. That is precisely the failure this change exists to remove: on
+     * 2026-10-18 the dev gateway ran ten hours with {@code avroCaughtUp=false} and no Avro consumers,
+     * and production was in the same state, both because a topic resolution threw on a background
+     * thread where nothing reported it. Refusing a bad name in a worker is the same silence in a new
+     * place.
+     *
+     * <p>Only names are checked, not brokers: this must not depend on Kafka being reachable, which is
+     * a liveness condition the consumers' own retry is the right answer to. A name is a configuration
+     * fact, and a wrong one is never going to become right by retrying.
+     */
+    void topicNamePreflight() {
+        // Exactly as strict as the usage, and no stricter: the pre-open status topic is only bound
+        // when the feature is on (see runAvroCacheConsumer/runAvroLiveConsumer), so refusing start-up
+        // over a value this gateway never reads would take a pod down for a setting that does nothing.
+        if (settings.ibkrPreOpenEnabled()) {
+            settings.ibkrPreOpenStatusTopic();
+        }
+        settings.databentoGexOiStatusTopic();
+    }
+
     boolean footprintEnabled() { return footprintViews != null; }
     boolean runningForTest() { return running.get(); }
     void setRunningForTest(boolean value) { running.set(value); }
@@ -1414,6 +1447,8 @@ public class FeedGatewayService implements ReplayRunner {
         if (footprintGate != null) {
             footprintPreflight();
         }
+        // Topic NAMES, before any worker exists to swallow the refusal. See topicNamePreflight().
+        topicNamePreflight();
         if (!running.compareAndSet(false, true)) {
             return;
         }
@@ -1697,7 +1732,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.ibkrPreOpenEnabled() && ibkrPreOpenGexServingUp()) {
             replayIbkrPreOpenGexCached(session);
         }
-        // gex-oi-status rides the AVRO consumer since its .v2 cutover; replay once it has caught up so a
+        // gex-oi-status rides the AVRO consumer since its 2026-10-17 cutover; replay once it has caught up so a
         // reconnect during an OI_MISSING morning restores the badge (last-value-wins per strike).
         // THE GATE MOVED WITH THE TOPIC: it was stateCaughtUp, the JSON state consumer's barrier, which
         // after the cutover no longer carries this topic at all — replaying behind a barrier that is
@@ -2616,12 +2651,12 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
         }
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
-        // Per-strike OI-arrival status: AVRO since its .v2 cutover (was JSON on the string consumer
+        // Per-strike OI-arrival status: AVRO since its 2026-10-17 cutover (was JSON on the string consumer
         // below). Its strike is a decimal logical type, which AvroJson renders as a number — not the
         // base64 a bytes field would otherwise become.
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         if (settings.ibkrPreOpenEnabled()) {
-            // Pre-open IBKR GEX status/control stream (rev13 Phase 3): AVRO since its .v2 cutover,
+            // Pre-open IBKR GEX status/control stream (rev13 Phase 3): AVRO since its 2026-10-18 cutover,
             // so it is consumed HERE and no longer on the string consumer below. NINE record types
             // share this one topic under RecordNameStrategy, and AvroJson emits exactly the fields of
             // whichever record arrived — which is what keeps the browser payload identical to the
@@ -2810,7 +2845,7 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
         }
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
-        // Keep cache + live symmetric: per-strike OI-arrival status is AVRO since its .v2 cutover.
+        // Keep cache + live symmetric: per-strike OI-arrival status is AVRO since its 2026-10-17 cutover.
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         if (settings.ibkrPreOpenEnabled()) {
             // Keep cache + live symmetric for the pre-open status stream too, or live statuses stop

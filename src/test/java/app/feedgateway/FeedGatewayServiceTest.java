@@ -7756,7 +7756,7 @@ class FeedGatewayServiceTest {
     @Test
     void gexOiStatusTopicBindsToGexOiStatusEventOnTheAvroConsumers() throws Exception {
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
-        // gex-oi-status is AVRO since its .v2 cutover, bound on BOTH Avro consumers (cache + live
+        // gex-oi-status is AVRO since its 2026-10-17 cutover, bound on BOTH Avro consumers (cache + live
         // symmetric), exempt from the cached-replay staleness + offset barriers like gex-by-strike.
         // This test was named ...OnTheJsonConsumers and asserted only a COUNT of two, which stayed
         // green straight through that cutover and said the opposite of the truth.
@@ -7781,14 +7781,161 @@ class FeedGatewayServiceTest {
                 consumersRegistering(source, "ibkrPreOpenStatusTopic"));
     }
 
-    /** The gateway refuses a configuration that names the retired JSON topic. */
+    /**
+     * The pre-open status topic the gateway reads carries NO version suffix: it was rolled forward
+     * in place, so a {@code .vN} sibling here would point the Avro consumers at a topic nothing
+     * writes — and the symptom would be an empty badge, not a startup failure.
+     */
     @Test
-    void theRetiredPreOpenStatusTopicIsRefusedByTheSetting() {
-        assertEquals("options.ibkr.gex.status.v2", new GatewaySettings().ibkrPreOpenStatusTopic());
+    void thePreOpenStatusTopicIsUnversioned() {
+        String topic = new GatewaySettings().ibkrPreOpenStatusTopic();
+        assertEquals("options.ibkr.gex.status", topic);
+        assertTrue(!topic.matches(".*\\.v[0-9]+$"), topic);
         IllegalStateException boom = org.junit.jupiter.api.Assertions.assertThrows(
                 IllegalStateException.class,
-                () -> app.kafka.IbkrPreOpenStatusAvro.requireAvroTopic("options.ibkr.gex.status", "unit"));
-        assertTrue(boom.getMessage().contains("refusing the retired JSON topic"), boom.getMessage());
+                () -> app.kafka.IbkrPreOpenStatusAvro.requireTopic("  ", "unit"));
+        assertTrue(boom.getMessage().contains("unit"), boom.getMessage());
+    }
+
+    /**
+     * BOTH settings paths REFUSE a versioned override, driven through GatewaySettings itself.
+     *
+     * <p>The default is a constant nobody edits; the override is a ConfigMap value, and a stale
+     * {@code .v2} in it is precisely what sat in the dev ConfigMap on 2026-10-18. Pointing these
+     * Avro consumers at a topic nothing writes produces an EMPTY PANEL, not an error — the same
+     * silent class as the ten-hour dev outage where avroCaughtUp stayed false with zero logged
+     * exceptions. So resolution must throw, and it must throw where a startup failure is visible.
+     *
+     * <p>GatewaySettings.value() gives System.getenv() precedence over System.getProperty(), so
+     * each case is skipped if the real environment variable is set.
+     */
+    /**
+     * The refusal has to happen at START-UP, not inside a consumer, and these two tests are the
+     * difference between a guard and a decoration.
+     *
+     * <p>Codex round 2 found that the version guard, as first written, threw where nothing reported
+     * it: these names were resolved inside runAvroCacheConsumer/runAvroLiveConsumer as they build
+     * their topic maps, on an executor thread and BEFORE either reaches {@code runRetryingConsumer},
+     * so the task just terminates and {@code executor.submit} discards the exception into a Future
+     * nobody reads. The application would have started, reported healthy, and served with both Avro
+     * workers silently absent — the exact failure the change exists to remove, relocated rather than
+     * fixed.
+     *
+     * <p>So resolution moved into {@link FeedGatewayService#topicNamePreflight()}, called from
+     * {@code start()} BEFORE {@code running} is set and before any worker is submitted, so the
+     * {@code @PostConstruct} fails and the context does not come up.
+     */
+    @Test
+    void theTopicNamePreflightRefusesAVersionedOverride() {
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                System.getenv("KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC") == null);
+        String key = "KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC";
+        String previous = System.getProperty(key);
+        try {
+            System.setProperty(key, "options.databento.gex.oi-status.v2");
+            FeedGatewayService service = new FeedGatewayService(
+                    new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+            IllegalStateException boom = org.junit.jupiter.api.Assertions.assertThrows(
+                    IllegalStateException.class, service::topicNamePreflight);
+            assertTrue(boom.getMessage().contains("versioned topic name"), boom.getMessage());
+            // And it passes once the name is unversioned, so the test cannot be green by accident.
+            System.clearProperty(key);
+            new FeedGatewayService(new GatewaySettings(), new ObjectMapper(),
+                    new HpsfGatewayViewMapper(), null).topicNamePreflight();
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
+    }
+
+    /**
+     * start() ITSELF refuses, and leaves nothing half-started.
+     *
+     * <p>The two tests beside this one check the method and the source order; this one checks the
+     * BEHAVIOUR Codex asked for — that a stale override actually stops the lifecycle. The message
+     * assertion is what stops it passing for the wrong reason: {@code start()} has an earlier
+     * refusal (the footprint preflight) whose exception would otherwise satisfy a bare assertThrows.
+     */
+    @Test
+    void startItselfRefusesAStaleOverrideAndLeavesRunningFalse() {
+        String key = "KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC";
+        org.junit.jupiter.api.Assumptions.assumeTrue(System.getenv(key) == null);
+        org.junit.jupiter.api.Assumptions.assumeTrue(System.getenv("KAFKA_ENABLED") == null);
+        String previous = System.getProperty(key);
+        try {
+            System.setProperty(key, "options.databento.gex.oi-status.v2");
+            FeedGatewayService service = new FeedGatewayService(
+                    new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+            IllegalStateException boom = org.junit.jupiter.api.Assertions.assertThrows(
+                    IllegalStateException.class, service::start);
+            assertTrue(boom.getMessage().contains("versioned topic name"),
+                    "start() refused for a different reason: " + boom.getMessage());
+            assertTrue(boom.getMessage().contains("options.databento.gex.oi-status.v2"), boom.getMessage());
+            assertFalse(service.runningForTest(),
+                    "a refused start() must leave running=false, or the service is half-started");
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
+    }
+
+    /** start() must call the preflight BEFORE it sets running or submits any worker. */
+    @Test
+    void startRunsTheTopicNamePreflightBeforeAnyWorkerCanSwallowIt() throws Exception {
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int startAt = source.indexOf("public void start() {");
+        assertTrue(startAt > 0, "start() not found");
+        int preflight = source.indexOf("topicNamePreflight();", startAt);
+        int runningSet = source.indexOf("running.compareAndSet(false, true)", startAt);
+        int firstSubmit = source.indexOf("executor.submit(", startAt);
+        assertTrue(preflight > 0, "start() does not call topicNamePreflight()");
+        assertTrue(preflight < runningSet,
+                "the preflight must run before running is set, or a refusal leaves a half-started service");
+        assertTrue(preflight < firstSubmit,
+                "the preflight must run before any worker is submitted, or runRetryingConsumer swallows it");
+    }
+
+    @Test
+    void aVersionedTopicOverrideIsRefusedOnBothSettingsPaths() {
+        record Case(String key, String versioned, String site,
+                java.util.function.Function<GatewaySettings, String> resolve) { }
+        for (Case c : List.of(
+                new Case("KAFKA_IBKR_GEX_STATUS_TOPIC", "options.ibkr.gex.status.v2",
+                        "GatewaySettings.ibkrPreOpenStatusTopic",
+                        GatewaySettings::ibkrPreOpenStatusTopic),
+                new Case("KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC", "dev.options.databento.gex.oi-status.v2",
+                        "GatewaySettings.databentoGexOiStatusTopic",
+                        GatewaySettings::databentoGexOiStatusTopic))) {
+            if (System.getenv(c.key()) != null) {
+                continue;
+            }
+            String previous = System.getProperty(c.key());
+            try {
+                System.setProperty(c.key(), c.versioned());
+                IllegalStateException boom = org.junit.jupiter.api.Assertions.assertThrows(
+                        IllegalStateException.class,
+                        () -> c.resolve().apply(new GatewaySettings()),
+                        c.versioned());
+                assertTrue(boom.getMessage().contains("versioned topic name"), boom.getMessage());
+                assertTrue(boom.getMessage().contains(c.versioned()), boom.getMessage());
+                assertTrue(boom.getMessage().contains(c.site()), boom.getMessage());
+                // An UNVERSIONED override on the same path is still honoured.
+                System.setProperty(c.key(), "some.other.topic");
+                assertEquals("some.other.topic", c.resolve().apply(new GatewaySettings()));
+            } finally {
+                if (previous == null) {
+                    System.clearProperty(c.key());
+                } else {
+                    System.setProperty(c.key(), previous);
+                }
+            }
+        }
     }
 
     @Test

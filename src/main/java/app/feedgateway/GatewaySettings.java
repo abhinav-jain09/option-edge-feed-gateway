@@ -989,19 +989,18 @@ public final class GatewaySettings {
     }
 
     /**
-     * Per-strike GEX OI-arrival status topic (JSON, from the gex service's OI-arrival watchdog). Carries
+     * Per-strike GEX OI-arrival status topic (Avro, from the gex service's OI-arrival watchdog). Carries
      * {@code status=OI_MISSING|OI_OK} per strike when TODAY's OI baseline has not arrived by the pre-open
      * deadline (fail-closed GEX = no records on {@link #databentoGexTopic()}, so this is the UI's only
      * explicit signal). Broadcast as event "gex-oi-status".
      */
     public String databentoGexOiStatusTopic() {
-        // .v2 is the Avro topic. Its predecessor retains hand-built JSON forever
-        // (cleanup.policy=delete, retention.ms=-1), so the cutover is a RENAME rather than a
-        // switch in place — see OiArrivalWatchdog.statusTopic() in options-edge-processing.
-        // requireAvroTopic fails closed if the override names that predecessor: this topic is read by
-        // the AVRO consumers here, so such a configuration would hand them JSON they cannot read.
-        return app.kafka.GexOiStatusAvro.requireAvroTopic(
-                value("KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC", app.kafka.GexOiStatusAvro.AVRO_TOPIC),
+        // Avro since the 2026-10-17 cutover, under the topic's OWN name: the topic was WIPED and
+        // recreated rather than renamed to a versioned sibling, so there is no JSON left in it for
+        // the AVRO consumers here to meet. See OiArrivalWatchdog.statusTopic() in
+        // options-edge-processing for the producer side of the same decision.
+        return app.kafka.GexOiStatusAvro.requireTopic(
+                value("KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC", app.kafka.GexOiStatusAvro.TOPIC),
                 "GatewaySettings.databentoGexOiStatusTopic (KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC)");
     }
 
@@ -1115,14 +1114,12 @@ public final class GatewaySettings {
     }
 
     public String ibkrPreOpenStatusTopic() {
-        // .v2 is the Avro topic. Its predecessor retains hand-built JSON forever (retention.ms=-1,
-        // no byte cap), so the cutover is a RENAME rather than a switch in place — see
-        // IbkrPreOpenConfig.fromEnv in options-edge-processing, which guards the producer side with
-        // the same check. requireAvroTopic fails closed if the override names that predecessor:
-        // this topic is read by the AVRO consumers here, so such a configuration would hand them
-        // JSON they cannot read, and would do it silently.
-        return app.kafka.IbkrPreOpenStatusAvro.requireAvroTopic(
-                value("KAFKA_IBKR_GEX_STATUS_TOPIC", app.kafka.IbkrPreOpenStatusAvro.AVRO_TOPIC),
+        // Avro since the 2026-10-18 cutover, under the topic's OWN name: the topic was WIPED and
+        // recreated rather than renamed to a versioned sibling, so the AVRO consumers here cannot
+        // meet a retained JSON record. See IbkrPreOpenConfig.fromEnv in options-edge-processing for
+        // the producer side of the same decision.
+        return app.kafka.IbkrPreOpenStatusAvro.requireTopic(
+                value("KAFKA_IBKR_GEX_STATUS_TOPIC", app.kafka.IbkrPreOpenStatusAvro.TOPIC),
                 "GatewaySettings.ibkrPreOpenStatusTopic (KAFKA_IBKR_GEX_STATUS_TOPIC)");
     }
 
