@@ -3374,7 +3374,7 @@ public class FeedGatewayService implements ReplayRunner {
                     } else if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
-                        String rawJson = kafkaJson(binding.event(), avro, record.value());
+                        String rawJson = kafkaJson(binding == null ? null : binding.event(), avro, record.value());
                         // rev13 R-ARB (slice 2): the shared live gex topic carries TWO planes (USER
                         // D14). Arbitrate BEFORE enrichJson — a sessioned pre-open record must never
                         // be stamped with the binding's DATABENTO provenance nor enter the Databento
@@ -3808,7 +3808,7 @@ public class FeedGatewayService implements ReplayRunner {
                     } else if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
-                        String rawJson = kafkaJson(binding.event(), avro, record.value());
+                        String rawJson = kafkaJson(binding == null ? null : binding.event(), avro, record.value());
                         // rev13 R-ARB (slice 2): arbitrate the shared live gex topic BEFORE
                         // enrichJson (see the cache-consumer twin). This live consumer is the
                         // broadcasting side: liveBroadcast rides the caught-up flag, and the
