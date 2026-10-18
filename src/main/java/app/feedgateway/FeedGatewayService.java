@@ -1043,14 +1043,16 @@ public class FeedGatewayService implements ReplayRunner {
      * and the Spring context does not come up — so the pod dies clean and visibly.
      *
      * <p>WITHOUT THIS THE GUARD IS COSMETIC, which is the whole point of the method. These topic
-     * names are otherwise first resolved inside the Avro consumers, on executor threads. Those run
-     * under {@code runRetryingConsumer}, which CATCHES RuntimeException, prints it and retries with
-     * backoff forever. A stale {@code .vN} override would therefore throw into a retry loop while the
-     * application reported itself started and healthy — the gateway would serve, with both Avro
-     * workers dead. That is precisely the failure this change exists to remove: on 2026-10-18 the dev
-     * gateway ran ten hours with {@code avroCaughtUp=false} and no Avro consumers, and production was
-     * in the same state, both because a topic resolution threw on a background thread where nothing
-     * reported it. Refusing a bad name in a worker is the same silence in a new place.
+     * names are otherwise first resolved inside {@link #runAvroCacheConsumer()} and
+     * {@link #runAvroLiveConsumer()}, while they build their topic maps — on an executor thread, and
+     * BEFORE either reaches {@code runRetryingConsumer}, so not even that method's catch-and-retry
+     * sees it. The task simply terminates, and {@code executor.submit} discards the exception into a
+     * Future nobody reads. The application reports itself started and healthy and serves, with both
+     * Avro workers silently absent. That is precisely the failure this change exists to remove: on
+     * 2026-10-18 the dev gateway ran ten hours with {@code avroCaughtUp=false} and no Avro consumers,
+     * and production was in the same state, both because a topic resolution threw on a background
+     * thread where nothing reported it. Refusing a bad name in a worker is the same silence in a new
+     * place.
      *
      * <p>Only names are checked, not brokers: this must not depend on Kafka being reachable, which is
      * a liveness condition the consumers' own retry is the right answer to. A name is a configuration

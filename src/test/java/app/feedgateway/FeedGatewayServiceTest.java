@@ -7814,10 +7814,12 @@ class FeedGatewayServiceTest {
      * difference between a guard and a decoration.
      *
      * <p>Codex round 2 found that the version guard, as first written, threw where nothing reported
-     * it: these topic names were resolved inside the Avro consumers, on executor threads, under
-     * {@code runRetryingConsumer} — which catches RuntimeException, prints it and retries forever.
-     * The application would have started, reported healthy, and served with both Avro workers dead.
-     * That is the exact failure the change exists to remove, relocated rather than fixed.
+     * it: these names were resolved inside runAvroCacheConsumer/runAvroLiveConsumer as they build
+     * their topic maps, on an executor thread and BEFORE either reaches {@code runRetryingConsumer},
+     * so the task just terminates and {@code executor.submit} discards the exception into a Future
+     * nobody reads. The application would have started, reported healthy, and served with both Avro
+     * workers silently absent — the exact failure the change exists to remove, relocated rather than
+     * fixed.
      *
      * <p>So resolution moved into {@link FeedGatewayService#topicNamePreflight()}, called from
      * {@code start()} BEFORE {@code running} is set and before any worker is submitted, so the
@@ -7840,6 +7842,40 @@ class FeedGatewayServiceTest {
             System.clearProperty(key);
             new FeedGatewayService(new GatewaySettings(), new ObjectMapper(),
                     new HpsfGatewayViewMapper(), null).topicNamePreflight();
+        } finally {
+            if (previous == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, previous);
+            }
+        }
+    }
+
+    /**
+     * start() ITSELF refuses, and leaves nothing half-started.
+     *
+     * <p>The two tests beside this one check the method and the source order; this one checks the
+     * BEHAVIOUR Codex asked for — that a stale override actually stops the lifecycle. The message
+     * assertion is what stops it passing for the wrong reason: {@code start()} has an earlier
+     * refusal (the footprint preflight) whose exception would otherwise satisfy a bare assertThrows.
+     */
+    @Test
+    void startItselfRefusesAStaleOverrideAndLeavesRunningFalse() {
+        String key = "KAFKA_DATABENTO_GEX_OI_STATUS_TOPIC";
+        org.junit.jupiter.api.Assumptions.assumeTrue(System.getenv(key) == null);
+        org.junit.jupiter.api.Assumptions.assumeTrue(System.getenv("KAFKA_ENABLED") == null);
+        String previous = System.getProperty(key);
+        try {
+            System.setProperty(key, "options.databento.gex.oi-status.v2");
+            FeedGatewayService service = new FeedGatewayService(
+                    new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+            IllegalStateException boom = org.junit.jupiter.api.Assertions.assertThrows(
+                    IllegalStateException.class, service::start);
+            assertTrue(boom.getMessage().contains("versioned topic name"),
+                    "start() refused for a different reason: " + boom.getMessage());
+            assertTrue(boom.getMessage().contains("options.databento.gex.oi-status.v2"), boom.getMessage());
+            assertFalse(service.runningForTest(),
+                    "a refused start() must leave running=false, or the service is half-started");
         } finally {
             if (previous == null) {
                 System.clearProperty(key);
