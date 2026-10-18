@@ -1660,6 +1660,22 @@ public final class GatewaySettings {
     }
 
     /**
+     * Compacted CURRENT topic of the indicator-service SIGNALS family ({@code IndicatorSignals}, Avro fixed id
+     * 2004): the regime block, validation, the open signals and the ones closed today, one record per symbol.
+     */
+    public String indicatorsSignalsTopic() {
+        return value("KAFKA_INDICATORS_SIGNALS_TOPIC", "options.indicators.signals.current");
+    }
+
+    /** BOTH signals CURRENT topics, local and the es4 mirror, exactly like {@link #indicatorsSnapshotTopics()}. */
+    public java.util.Set<String> indicatorsSignalsTopics() {
+        java.util.LinkedHashSet<String> topics = new java.util.LinkedHashSet<>();
+        topics.add(indicatorsSignalsTopic());
+        topics.add("es.options.indicators.signals.current");
+        return topics;
+    }
+
+    /**
      * Freshness TTL for the indicators CURRENT cache — same SHORT class as
      * {@link #spotVolRegimeTtlMs()}: a minutes-old snapshot (dead producer) must
      * read as absent on late-join, never replay as live. The page's own

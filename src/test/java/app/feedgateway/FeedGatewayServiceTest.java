@@ -2085,6 +2085,113 @@ class FeedGatewayServiceTest {
     }
 
     @Test
+    void indicatorSignalsAreAnIndicatorFamilyEventGlobalAndOnTheShortWindow() throws Exception {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        assertEquals("options.indicators.signals.current", settings.indicatorsSignalsTopic());
+        assertEquals(java.util.Set.of("options.indicators.signals.current", "es.options.indicators.signals.current"),
+                settings.indicatorsSignalsTopics(), "local and the es4 mirror, like the snapshot topics");
+        assertTrue(FeedGatewayService.isIndicatorFamilyEvent("indicator-signals"));
+        assertTrue(FeedGatewayService.isIndicatorFamilyEvent("indicators"));
+        assertFalse(FeedGatewayService.isIndicatorFamilyEvent("tapeZones"));
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("indicator-signals"),
+                "the signals record fans out in per-session (auth) mode like the snapshot");
+        long now = System.currentTimeMillis();
+        assertFalse(isExpired(service, "indicator-signals", now - 2L * 60_000L, now));
+        assertTrue(isExpired(service, "indicator-signals", now - 6L * 60_000L, now),
+                "a 6-min-old signals record is STALE — never replayed as current");
+    }
+
+    @Test
+    void indicatorSignalsSupersedeIndependentlyOfTheSnapshotRun() throws Exception {
+        // the signals record shares the service run (runId) with the snapshot but counts its OWN revisions: a
+        // snapshot at revision 5 must not reject the signals record at revision 2, and vice versa
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        long now = System.currentTimeMillis();
+        String base = "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"publishedAt\":\""
+                + java.time.Instant.ofEpochMilli(now) + "\",\"runId\":\"run-A\",";
+        var snapshot = topicBinding("DATABENTO", "indicators");
+        var signals = topicBinding("DATABENTO", "indicator-signals");
+        assertEquals("DATABENTO|SPX", updateCache(service, snapshot,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 1L, "SPX", base + "\"revision\":5}", now), base + "\"revision\":5}"));
+        assertEquals("DATABENTO|SPX", updateCache(service, signals,
+                recordAt(settings.indicatorsSignalsTopic(), 0, 1L, "SPX", base + "\"revision\":2}", now), base + "\"revision\":2}"),
+                "signals revision 2 is not behind the snapshot's revision 5");
+        assertNull(updateCache(service, signals,
+                recordAt(settings.indicatorsSignalsTopic(), 0, 2L, "SPX", base + "\"revision\":1}", now), base + "\"revision\":1}"),
+                "a signals revision regression is rejected on its own track");
+        assertEquals("DATABENTO|SPX", updateCache(service, snapshot,
+                recordAt(settings.indicatorsSnapshotTopic(), 0, 2L, "SPX", base + "\"revision\":6}", now), base + "\"revision\":6}"),
+                "the snapshot track is untouched by the signals track");
+    }
+
+    @Test
+    void indicatorSignalsThroughTheCacheConsumerAreTheContractsJsonOfTheAvroRecord() throws Exception {
+        // the signals twin of the snapshot test: the Avro IndicatorSignals record is cached and replayed as the
+        // contract's own JSON rendering plus the provenance stamp, in the indicator-signals envelope
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+        String topic = settings.indicatorsSignalsTopic();
+        String wall = java.time.Instant.ofEpochMilli(System.currentTimeMillis()).toString();
+        com.optionsedge.contracts.indicators.SignalContracts.IndicatorSignals produced = IndicatorSnapshotFixture.signals(
+                "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"runId\":\"run-A\",\"revision\":5,\"publishedAt\":\"" + wall + "\",\"quality\":\"READY\"}");
+        String jsonEraWire = com.optionsedge.contracts.indicators.IndicatorJson.writer().writeValueAsString(produced);
+        Method enrich = FeedGatewayService.class.getDeclaredMethod("enrichJson", String.class, FeedGatewayService.TopicBinding.class);
+        enrich.setAccessible(true);
+        FeedGatewayService.TopicBinding binding = new FeedGatewayService.TopicBinding("DATABENTO", "indicator-signals");
+        String expectedEnvelope = "{\"type\":\"indicator-signals\",\"data\":" + enrich.invoke(service, jsonEraWire, binding) + "}";
+        org.apache.avro.generic.GenericRecord record = IndicatorSnapshotFixture.generic(produced);
+        assertEquals(jsonEraWire, IndicatorSnapshotFixture.signalsContractJson(record), "the Avro record re-emits the contract JSON byte for byte");
+        VpBroker broker = new VpBroker().topic(topic, List.of(new VolPremiumFixtures.Row("SPX", record)));
+        broker.onPoll = n -> {
+            if (n >= 2) {
+                service.setRunningForTest(false);
+            }
+        };
+        service.setRunningForTest(true);
+        service.runCacheConsumerAttemptForTest("state", Map.of(topic, binding),
+                new java.util.concurrent.atomic.AtomicBoolean(true), broker.consumer());
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replayIndicatorSignalsCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertEquals(List.of(expectedEnvelope), sink);
+        Method snapshotReplay = FeedGatewayService.class.getDeclaredMethod("replayIndicatorsCached", WebSocketSession.class);
+        snapshotReplay.setAccessible(true);
+        List<String> snapshots = new ArrayList<>();
+        snapshotReplay.invoke(service, recordingSession(snapshots));
+        assertTrue(snapshots.isEmpty(), "a signals record never lands in the snapshot cache");
+        JsonNode data = new ObjectMapper().readTree(sink.get(0)).get("data");
+        assertEquals("READY", data.get("quality").asText());
+        assertTrue(data.get("regime").isObject() && data.get("open").isArray() && data.get("closedToday").isArray()
+                && data.get("validation").isObject(), data.toString());
+    }
+
+    @Test
+    void aSnapshotOnTheSignalsBindingFailsTheConsumerAttemptLoud() throws Exception {
+        GatewaySettings settings = new GatewaySettings();
+        String topic = settings.indicatorsSignalsTopic();
+        String wall = java.time.Instant.ofEpochMilli(System.currentTimeMillis()).toString();
+        org.apache.avro.generic.GenericRecord snapshot = IndicatorSnapshotFixture.generic(
+                "{\"symbol\":\"SPX\",\"runId\":\"run-A\",\"revision\":5,\"publishedAt\":\"" + wall + "\"}");
+        FeedGatewayService service = service();
+        VpBroker broker = new VpBroker().topic(topic, List.of(new VolPremiumFixtures.Row("SPX", snapshot)));
+        broker.onPoll = n -> {
+            if (n >= 2) {
+                service.setRunningForTest(false);
+            }
+        };
+        service.setRunningForTest(true);
+        IllegalStateException e = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> service.runCacheConsumerAttemptForTest("state",
+                        Map.of(topic, new FeedGatewayService.TopicBinding("DATABENTO", "indicator-signals")),
+                        new java.util.concurrent.atomic.AtomicBoolean(true), broker.consumer()));
+        assertTrue(e.getMessage().startsWith("indicator-signals: value is not the com.optionsedge.contracts.indicators.avro.IndicatorSignals Avro record"),
+                e.getMessage());
+    }
+
+    @Test
     void indicatorsThatAreNotTheAvroRecordFailTheConsumerAttemptLoudAndCacheNothing() throws Exception {
         // the JSON-era wire (a string), another Avro record and a null value: each ends the attempt with the reason,
         // and the indicators cache stays empty — the gateway never guesses at bytes
@@ -2121,8 +2228,8 @@ class FeedGatewayServiceTest {
         }
         // and the live consumer carries the same boundary (its loop is the cache consumer's twin)
         String source = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
-        assertEquals(2, source.split("json = enrichJson\\(indicatorJson\\(record\\.value\\(\\)\\), binding\\);", -1).length - 1,
-                "both consumer loops decode indicators through indicatorJson");
+        assertEquals(2, source.split("json = enrichJson\\(indicatorJson\\(record\\.value\\(\\), binding\\.event\\(\\)\\), binding\\);", -1).length - 1,
+                "both consumer loops decode the indicator family through indicatorJson");
         assertFalse(source.contains("INDICATOR_SNAPSHOT_SCHEMA.equals(record.getSchema().getFullName())) {\n                // Kafka"),
                 "avroJson no longer special-cases the snapshot: the indicator bindings never reach it");
     }
