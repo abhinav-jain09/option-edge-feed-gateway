@@ -76,6 +76,46 @@ class SpxPriceJsonTest {
         {0x40bb57ffffffffffL, "6999.999999999999"}, {0x4341c37937e08001L, "1.0000000000000002e+16"},
         {0x40b388028f5c28f6L, "5000.01"}, {0x40b387ffffffffffL, "4999.999999999999"}, {0x40b98f35c28f5c29L, "6543.21"},
         {0x3f50624dd2f1a9fcL, "0.001"}, {0x3f202c9dedbc309dL, "0.0001234"}, {0x42dc12218377de66L, "123456789012345.6"},
+        // adversarial values inside decimal(38,18): |x| < 1e20, at most 18 fractional digits (CPython-printed)
+        {0x43e158e460913d00L, "1e+19"},
+        {0x43e158e460913d00L, "1e+19"},
+        {0x43e0000000000000L, "9.223372036854776e+18"},
+        {0x3c570ef54646d497L, "5e-18"},
+        {0x3c670ef54646d497L, "1e-17"},
+        {0x437b69b4ba630f35L, "1.2345678901234568e+17"},
+        {0x4011666666666666L, "4.35"},
+        {0x3fd3333333333333L, "0.3"},
+        {0x4005666666666666L, "2.675"},
+        {0x3ff0000000000001L, "1.0000000000000002"},
+        {0x3fd3333333333334L, "0.30000000000000004"},
+        {0xc3e158e460913d00L, "-1e+19"},
+        {0xbee4f8b588e368f1L, "-1e-05"},
+        {0xbfd3333333333334L, "-0.30000000000000004"},
+        {0x43a757aa16a03500L, "8.41e+17"},
+        {0x43a757aa16a03501L, "8.410000000000001e+17"},
+        {0x43a757aa16a034ffL, "8.409999999999999e+17"},
+        {0x43abc16d674ec800L, "1e+18"},
+        {0x4415af1d78b58c03L, "9.9999999999999e+19"},
+        {0x43c679a067967f28L, "3.2390038155667907e+18"},
+        {0x40953692db3e40c5L, "1357.6434144713432"},
+        {0x43d695c5011fad06L, "6.509693795925498e+18"},
+        {0x40845f6b8916f673L, "651.9275075715981"},
+        {0x43d29800232fa0d1L, "5.359284161062585e+18"},
+        {0x40a9b666da99389bL, "3291.200886524353"},
+        {0x43a01fc3c929f427L, "5.809312488222934e+17"},
+        {0x40b1d6ec0e2c647eL, "4566.922091269049"},
+        {0x4394de21ad97a616L, "3.7591908876140685e+17"},
+        {0x40ae7d9f99ac95b1L, "3902.811719315789"},
+        {0x43a36a22acfe209cL, "6.994843803226148e+17"},
+        {0x408983581fc9dbd4L, "816.4180293817722"},
+        {0x43cd75ff770a8900L, "4.245767372235997e+18"},
+        {0x40bd11ab56ee1320L, "7441.669295196218"},
+        {0x43b131712cc1126aL, "1.2388958095353062e+18"},
+        {0x409f649b17dd5e04L, "2009.1514582241662"},
+        {0x43d5c50eb0cc0498L, "6.274704790833488e+18"},
+        {0x40c0a8b0b559f253L, "8529.380534404108"},
+        {0x43d40614574d1285L, "5.771452383226369e+18"},
+        {0x40abe43fefa39eb4L, "3570.124875176547"},
     };
 
     private static UnderlyingPriceEvent event(double px, Long size) {
@@ -107,6 +147,12 @@ class SpxPriceJsonTest {
                 assertEquals(typed, replay.deserialize(replayTopic, wire), "run-scoped replay binding");
             }
         }
+    }
+
+    @Test
+    void doubleToStringIsTheShortestRoundTripOnlyFromJdk19() {
+        // JDK-4511638: Double.toString yields CPython's shortest digits from JDK 19; pythonRepr relies on it.
+        org.junit.jupiter.api.Assertions.assertTrue(Runtime.version().feature() >= 19);
     }
 
     @Test
