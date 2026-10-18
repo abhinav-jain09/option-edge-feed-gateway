@@ -74,6 +74,46 @@ final class IndicatorSnapshotFixture {
         }
     }
 
+    /** The signals twin of {@link #record(String)}: a complete {@code IndicatorSignals} with the test's values merged in. */
+    static com.optionsedge.contracts.indicators.SignalContracts.IndicatorSignals signals(String json) {
+        try {
+            com.fasterxml.jackson.databind.ObjectMapper exact = IndicatorJson.reader().copy()
+                    .setNodeFactory(com.fasterxml.jackson.databind.node.JsonNodeFactory.withExactBigDecimals(true))
+                    .enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
+            ObjectNode full = exact.valueToTree(build(com.optionsedge.contracts.indicators.SignalContracts.IndicatorSignals.class));
+            merge(full, (ObjectNode) exact.readTree(json));
+            return exact.treeToValue(full, com.optionsedge.contracts.indicators.SignalContracts.IndicatorSignals.class);
+        } catch (IOException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /** The generic {@code IndicatorSignals} record the gateway's Avro consumer yields for a producer's record. */
+    static GenericRecord generic(com.optionsedge.contracts.indicators.SignalContracts.IndicatorSignals record) {
+        try {
+            com.optionsedge.contracts.indicators.avro.IndicatorSignals specific = AvroRecordMapper.toAvro(record,
+                    com.optionsedge.contracts.indicators.avro.IndicatorSignals.class);
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            BinaryEncoder enc = EncoderFactory.get().binaryEncoder(bos, null);
+            new SpecificDatumWriter<>(com.optionsedge.contracts.indicators.avro.IndicatorSignals.class).write(specific, enc);
+            enc.flush();
+            return new GenericDatumReader<GenericRecord>(specific.getSchema(), specific.getSchema(), GenericData.get())
+                    .read(null, DecoderFactory.get().binaryDecoder(bos.toByteArray(), null));
+        } catch (IOException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /** The contract's own JSON rendering of a signals record. */
+    static String signalsContractJson(GenericRecord record) {
+        try {
+            return IndicatorJson.writer().writeValueAsString(AvroRecordMapper.fromAvro(record,
+                    com.optionsedge.contracts.indicators.SignalContracts.IndicatorSignals.class));
+        } catch (IOException e) {
+            throw new AssertionError(e);
+        }
+    }
+
     /** The contract's own JSON rendering of the record: what every reader of the topic re-emits. */
     static String contractJson(GenericRecord record) {
         try {

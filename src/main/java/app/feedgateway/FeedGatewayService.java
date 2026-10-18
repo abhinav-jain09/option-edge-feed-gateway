@@ -183,6 +183,7 @@ public class FeedGatewayService implements ReplayRunner {
             // a slow socket, so the page silently lost the observations in between and drew a straight
             // line across them — the continuity the frame ordinal exists to make provable (VP-345).
             "indicators",
+            "indicator-signals",
             "tapeZones",
             "opb-by-option", "opb-session",
             "index-price", "vix-price", "spx-price", "hpsf-latest-signal", "hpsf-market-flow", "hpsf-top-candidates",
@@ -528,6 +529,8 @@ public class FeedGatewayService implements ReplayRunner {
     // retires the prior; within a run, revisions must strictly increase; retired-run
     // returns are rejected.
     private final Map<String, String> indicatorsCurrent = new ConcurrentHashMap<>();
+    /** The signals CURRENT record per canonical symbol: same identity, supersession and freshness class. */
+    private final Map<String, String> indicatorSignalsCurrent = new ConcurrentHashMap<>();
     private final Map<String, String> indicatorsRunId = new ConcurrentHashMap<>();
     private final Map<String, Long> indicatorsRevision = new ConcurrentHashMap<>();
     /** r1 finding 7 / r2 finding 4: retirement memory is bounded at a cap no real
@@ -1631,6 +1634,7 @@ public class FeedGatewayService implements ReplayRunner {
             // client-side) — the production auth mode owes the connect replay too
             // (r1 finding 5).
             replayIndicatorsCached(session);
+            replayIndicatorSignalsCached(session);
             // Tape-zones board is the same GLOBAL advisory class — auth mode owes it too.
             replayTapeZonesCached(session);
             return;
@@ -1666,6 +1670,7 @@ public class FeedGatewayService implements ReplayRunner {
             replayDirectionCached(session);
             replayDirectionPushCached(session);
             replayIndicatorsCached(session);
+            replayIndicatorSignalsCached(session);
             replayTapeZonesCached(session);
             replayIbkrPreOpenCached(session);
             // Close-direction: replay the session's frozen verdict (or the current interim) so a page
@@ -2631,6 +2636,9 @@ public class FeedGatewayService implements ReplayRunner {
         for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
             topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
         }
+        for (String signalsTopic : settings.indicatorsSignalsTopics()) {
+            topicEvents.put(signalsTopic, new TopicBinding("DATABENTO", "indicator-signals"));
+        }
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2815,6 +2823,9 @@ public class FeedGatewayService implements ReplayRunner {
         // BOTH the locally-computed SPX topic AND the es4-mirrored ES topic (§7.3); on es4 the set collapses to one.
         for (String indicatorTopic : settings.indicatorsSnapshotTopics()) {
             topicEvents.put(indicatorTopic, new TopicBinding("DATABENTO", "indicators"));
+        }
+        for (String signalsTopic : settings.indicatorsSignalsTopics()) {
+            topicEvents.put(signalsTopic, new TopicBinding("DATABENTO", "indicator-signals"));
         }
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
@@ -3317,11 +3328,11 @@ public class FeedGatewayService implements ReplayRunner {
                     // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
                     // stamping must never overwrite the service's own sessionDate (UI design §3).
                     String json;
-                    if (binding != null && "indicators".equals(binding.event())) {
+                    if (binding != null && isIndicatorFamilyEvent(binding.event())) {
                         // Kafka Serialization Rule, plan section 2: the indicator CURRENT topics are the contracts
-                        // IndicatorSnapshot Avro record on EVERY consumer that carries them. A value that is not
-                        // that record fails this attempt loud — never a toString, never a generic rendering.
-                        json = enrichJson(indicatorJson(record.value()), binding);
+                        // IndicatorSnapshot / IndicatorSignals Avro records on EVERY consumer that carries them. A
+                        // value that is not that record fails this attempt loud — never a toString, never a generic rendering.
+                        json = enrichJson(indicatorJson(record.value(), binding.event()), binding);
                     } else if (binding != null && "gamma-navigation".equals(binding.event())) {
                         // Avro on the wire, canonical JSON at REST. Skip enrichJson so the
                         // producer remains the only author of contract fields.
@@ -3373,7 +3384,7 @@ public class FeedGatewayService implements ReplayRunner {
                         relayVolPremium(binding, record, json);
                         continue;
                     }
-                    if (binding != null && "indicators".equals(binding.event())) {
+                    if (binding != null && isIndicatorFamilyEvent(binding.event())) {
                         // r2 findings 1+2: the cache consumer consumes this offset —
                         // if it wins the CAS gate it must also BROADCAST, or the
                         // live consumer's duplicate is suppressed and clients starve.
@@ -3381,7 +3392,7 @@ public class FeedGatewayService implements ReplayRunner {
                         synchronized (indicatorsEmitLock) {
                             String indicatorKey = updateCache(binding, record, json);
                             if (indicatorKey != null && caughtUpFlag.get()
-                                    && shouldBroadcastIndicators(indicatorKey, record.offset())) {
+                                    && shouldBroadcastIndicators(binding.event() + ":" + indicatorKey, record.offset())) {
                                 broadcast(binding.event(), json);
                                 forwardedEvents.incrementAndGet();
                             }
@@ -3754,9 +3765,9 @@ public class FeedGatewayService implements ReplayRunner {
                     // the SSOT for the card, so enrichJson's marketDataSource/source/sessionDate
                     // stamping must never overwrite the service's own sessionDate (UI design §3).
                     String json;
-                    if (binding != null && "indicators".equals(binding.event())) {
-                        // the contracts IndicatorSnapshot record or a loud failure; see the cache-consumer twin
-                        json = enrichJson(indicatorJson(record.value()), binding);
+                    if (binding != null && isIndicatorFamilyEvent(binding.event())) {
+                        // the contracts IndicatorSnapshot / IndicatorSignals record or a loud failure; see the cache-consumer twin
+                        json = enrichJson(indicatorJson(record.value(), binding.event()), binding);
                     } else if (binding != null && "gamma-navigation".equals(binding.event())) {
                         // Avro on the wire, canonical JSON at REST; see the cache-consumer twin.
                         json = avroJson(record.value());
@@ -3973,14 +3984,14 @@ public class FeedGatewayService implements ReplayRunner {
                         // later, at one record per 5 s cadence tick.
                         continue;
                     }
-                    if ("indicators".equals(binding.event())) {
+                    if (isIndicatorFamilyEvent(binding.event())) {
                         // r2 findings 1+2: the whole supersede→cache→CAS→enqueue
                         // decision is ONE unit under the emit lock, and the offset
                         // CAS gate makes whichever consumer wins the broadcaster.
                         synchronized (indicatorsEmitLock) {
                             String indicatorsKey = updateCache(binding, record, json);
                             if (indicatorsKey != null && cacheCaughtUpFlag.get()
-                                    && shouldBroadcastIndicators(indicatorsKey,
+                                    && shouldBroadcastIndicators(binding.event() + ":" + indicatorsKey,
                                             record.offset())) {
                                 broadcast(binding.event(), json);
                                 forwardedEvents.incrementAndGet();
@@ -4927,7 +4938,7 @@ public class FeedGatewayService implements ReplayRunner {
             }
             if ("ibkr-preopen-status".equals(binding.event())
                     || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
-                    || "indicators".equals(binding.event())
+                    || isIndicatorFamilyEvent(binding.event())
                     || "tapeZones".equals(binding.event())
                     || "es-auction".equals(binding.event())
                     || isVolPremiumEvent(binding.event())
@@ -4966,7 +4977,7 @@ public class FeedGatewayService implements ReplayRunner {
             TopicBinding preOpenBinding = topicEvents.get(entry.getKey().topic());
             if (preOpenBinding != null && ("ibkr-preopen-status".equals(preOpenBinding.event())
                     || isIbkrPreOpenSharedGexTopic(entry.getKey().topic())
-                    || "indicators".equals(preOpenBinding.event())
+                    || isIndicatorFamilyEvent(preOpenBinding.event())
                     || "tapeZones".equals(preOpenBinding.event())
                     || "es-auction".equals(preOpenBinding.event())
                     || isVolPremiumEvent(preOpenBinding.event()))) {
@@ -5176,6 +5187,11 @@ public class FeedGatewayService implements ReplayRunner {
             if (events.contains("indicators")) {
                 for (WebSocketSession client : clients) {
                     replayIndicatorsCached(client);
+                }
+            }
+            if (events.contains("indicator-signals")) {
+                for (WebSocketSession client : clients) {
+                    replayIndicatorSignalsCached(client);
                 }
             }
             // Tape-zones board is STANDALONE too: explicit re-push once caught up.
@@ -6192,7 +6208,7 @@ public class FeedGatewayService implements ReplayRunner {
             key = spotVolRegimeCacheKey(json, key);
         } else if (EVENT_VOL_PREMIUM_FRAME.equals(event)) {
             key = volPremiumFrameCacheKey(json, key);
-        } else if ("indicators".equals(event)) {
+        } else if (isIndicatorFamilyEvent(event)) {
             key = indicatorsCacheKey(json, key);
         } else if ("tapeZones".equals(event)) {
             key = tapeZonesCacheKey(json, key);
@@ -6245,7 +6261,7 @@ public class FeedGatewayService implements ReplayRunner {
             key = binding.source() + "|" + key;
         }
         String versionKey = event + ":" + key;
-        if ("ibkr-preopen-status".equals(event) || "indicators".equals(event)
+        if ("ibkr-preopen-status".equals(event) || isIndicatorFamilyEvent(event)
                 || "tapeZones".equals(event)) {
             // OFFSET-ordered last-value-wins (rev13 R-WIRE.2/.5; indicators rev 14
             // §6.9 r1 finding 2): these topics are single-partition per symbol and
@@ -6453,12 +6469,23 @@ public class FeedGatewayService implements ReplayRunner {
                 // (runId, revision) supersession (rev 14 §6.9): accept a NEW runId in
                 // arrival order and retire the prior; require strictly increasing
                 // revision within the active run; reject retired-run returns.
-                if (!indicatorsSupersedes(key, json)) {
+                if (!indicatorsSupersedes(event + ":" + key, json)) {
                     return null; // regression/retired-run — never cached or broadcast
                 }
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 indicatorsCurrent.put(key, json);
+                return key;
+            }
+            case "indicator-signals" -> {
+                // the same supersession, tracked per EVENT: the signals record shares the service run
+                // (runId) with the snapshot but counts its own revisions
+                if (!indicatorsSupersedes(event + ":" + key, json)) {
+                    return null;
+                }
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                indicatorSignalsCurrent.put(key, json);
                 return key;
             }
             case "close-direction" -> {
@@ -7413,9 +7440,9 @@ public class FeedGatewayService implements ReplayRunner {
             // by record age.
             return CachePolicy.noEviction(VOL_PREMIUM_SESSION_SEEK_BACK_MS);
         }
-        if ("indicators".equals(event)) {
-            // Indicator CURRENT snapshot: same SHORT freshness class — a dead
-            // producer's snapshot must read as ABSENT on late-join, never as live.
+        if (isIndicatorFamilyEvent(event)) {
+            // Indicator CURRENT snapshot and signals: same SHORT freshness class — a dead
+            // producer's record must read as ABSENT on late-join, never as live.
             return CachePolicy.expiring(settings.indicatorsTtlMs());
         }
         if ("close-direction".equals(event)) {
@@ -7691,7 +7718,7 @@ public class FeedGatewayService implements ReplayRunner {
             // would render one of them as the current read.
             return volPremiumFrameTimestamp(json);
         }
-        if ("indicators".equals(event)) {
+        if (isIndicatorFamilyEvent(event)) {
             return indicatorsTimestamp(json);
         }
         if ("liquidity-heatmap".equals(event)) {
@@ -8034,6 +8061,8 @@ public class FeedGatewayService implements ReplayRunner {
             directionProgress.remove(versionKey.substring("direction-progress:".length()));
         } else if (versionKey.startsWith("indicators:")) {
             indicatorsCurrent.remove(versionKey.substring("indicators:".length()));
+        } else if (versionKey.startsWith("indicator-signals:")) {
+            indicatorSignalsCurrent.remove(versionKey.substring("indicator-signals:".length()));
         } else if (versionKey.startsWith("close-direction:")) {
             String cdKey = versionKey.substring("close-direction:".length());
             if (cdKey.contains("|V|")) {
@@ -9236,6 +9265,29 @@ public class FeedGatewayService implements ReplayRunner {
                 send(session, "indicators", json);
             }
         }
+    }
+
+    /** The signals twin of {@link #replayIndicatorsCached}: per symbol, fresh-gated, under the same emit lock. */
+    private void replayIndicatorSignalsCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        synchronized (indicatorsEmitLock) {
+            for (Map.Entry<String, String> entry : indicatorSignalsCurrent.entrySet()) {
+                String json = entry.getValue();
+                if (json == null || json.isBlank()) {
+                    continue;
+                }
+                if (!isCacheFresh("indicator-signals:" + entry.getKey(), nowMs)) {
+                    continue;
+                }
+                send(session, "indicator-signals", json);
+            }
+        }
+    }
+
+    /** The two indicator CURRENT events share identity, supersession, freshness, replay and coalescing rules. */
+    static boolean isIndicatorFamilyEvent(String event) {
+        return "indicators".equals(event) || "indicator-signals".equals(event);
     }
 
     /**
@@ -13075,6 +13127,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The indicator family's record name: its JSON is the owner's writer over the contract record, never a generic rendering. */
     private static final String INDICATOR_SNAPSHOT_SCHEMA = "com.optionsedge.contracts.indicators.avro.IndicatorSnapshot";
+    private static final String INDICATOR_SIGNALS_SCHEMA = "com.optionsedge.contracts.indicators.avro.IndicatorSignals";
 
     /** The generic rendering of a non-indicator Avro record; the indicator bindings never come here. */
     private String avroJson(Object value) {
@@ -13094,17 +13147,22 @@ public class FeedGatewayService implements ReplayRunner {
      * were, {@code final} as the JSON property) — never AvroJson's generic rendering and never a string's
      * {@code toString}. Anything else (a JSON string, another record, null) fails loud.
      */
-    private String indicatorJson(Object value) {
-        if (!(value instanceof GenericRecord record) || !INDICATOR_SNAPSHOT_SCHEMA.equals(record.getSchema().getFullName())) {
-            throw new IllegalStateException("indicators: value is not the " + INDICATOR_SNAPSHOT_SCHEMA + " Avro record ("
+    private String indicatorJson(Object value, String event) {
+        boolean signals = "indicator-signals".equals(event);
+        String schema = signals ? INDICATOR_SIGNALS_SCHEMA : INDICATOR_SNAPSHOT_SCHEMA;
+        if (!(value instanceof GenericRecord record) || !schema.equals(record.getSchema().getFullName())) {
+            throw new IllegalStateException(event + ": value is not the " + schema + " Avro record ("
                     + (value == null ? "null" : value instanceof GenericRecord r ? r.getSchema().getFullName() : value.getClass().getName()) + ")");
         }
         try {
-            return com.optionsedge.contracts.indicators.IndicatorJson.writer().writeValueAsString(
-                    com.optionsedge.contracts.indicators.avro.AvroRecordMapper.fromAvro(record,
-                            com.optionsedge.contracts.indicators.IndicatorSnapshot.class));
+            Object contract = signals
+                    ? com.optionsedge.contracts.indicators.avro.AvroRecordMapper.fromAvro(record,
+                            com.optionsedge.contracts.indicators.SignalContracts.IndicatorSignals.class)
+                    : com.optionsedge.contracts.indicators.avro.AvroRecordMapper.fromAvro(record,
+                            com.optionsedge.contracts.indicators.IndicatorSnapshot.class);
+            return com.optionsedge.contracts.indicators.IndicatorJson.writer().writeValueAsString(contract);
         } catch (JsonProcessingException e) {
-            throw new IllegalStateException("indicators: could not render the IndicatorSnapshot record as JSON", e);
+            throw new IllegalStateException(event + ": could not render the " + schema + " record as JSON", e);
         }
     }
 
@@ -14265,6 +14323,8 @@ public class FeedGatewayService implements ReplayRunner {
             // spotVolRegimeTtlMs window in updateCache.
             "spot-vol-regime",
             "indicators",
+            // The signals CURRENT record is the same class (per symbol, symbol-filtered client-side).
+            "indicator-signals",
             // The tape-zones board is ES-global session truth rendered in its own card — the same
             // GLOBAL advisory class. Allowlist it so the standalone broadcast reaches sockets in
             // per-session (auth) mode too; GatewayRecordMapper deliberately has no route for it.
@@ -14455,8 +14515,8 @@ public class FeedGatewayService implements ReplayRunner {
                 // DEV's for a slow or joining client (r8 #9). The identity is the environment.
                 return event + "|" + root.path("env").asText("").toUpperCase();
             }
-            if ("indicators".equals(event)) {
-                // r3 finding 3: the frozen key is literally `indicators|symbol` —
+            if (isIndicatorFamilyEvent(event)) {
+                // r3 finding 3: the frozen key is literally `<event>|symbol` —
                 // additive fields must never split the coalescing identity.
                 return event + "|" + symbol;
             }
