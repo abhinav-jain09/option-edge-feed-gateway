@@ -26,7 +26,6 @@ import com.optionsedge.contracts.hpsf.HpsfSignal;
 import com.optionsedge.contracts.hpsf.HpsfTopics;
 import com.optionsedge.contracts.hpsf.MarketFlowSnapshot;
 import com.optionsedge.contracts.hpsf.StrikeScoreSnapshot;
-import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.apache.avro.generic.GenericRecord;
@@ -15186,7 +15185,8 @@ public class FeedGatewayService implements ReplayRunner {
 
     private Properties avroConsumerProperties(String name) {
         Properties properties = baseConsumerProperties(name);
-        properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, KafkaAvroDeserializer.class.getName());
+        properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, GatewayAvroDeserializer.class.getName());
+        properties.put(GatewayAvroDeserializer.SPX_PRICE_TOPIC, settings.underlyingSpxPriceTopic());
         properties.put("schema.registry.url", settings.schemaRegistryUrl());
         properties.put("specific.avro.reader", "false");
         // Every Avro topic this gateway consumes (display/pace/directional-pressure/gex/max-pain) registers

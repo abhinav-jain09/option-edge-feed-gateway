@@ -2,25 +2,21 @@ package app.feedgateway;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.optionsedge.contracts.hpsf.UnderlyingPriceAvro;
 import com.optionsedge.contracts.hpsf.UnderlyingPriceEvent;
-import org.apache.avro.generic.GenericRecord;
 
 /**
- * The browser JSON of {@code underlying.spx.price}. The topic is Avro only; the browser contract is unchanged, so a
+ * The browser JSON of {@code underlying.spx.price}. The topic is Avro only (decoded by UnderlyingPriceAvro.EventDeserializer); the browser contract is unchanged, so a
  * decoded record is re-emitted with the field names, order and number formatting of the JSON era
  * ({@code price}/{@code canonicalSpot} as {@code 7335.0}/{@code 6012.5}, {@code size} as {@code null}).
  */
 final class SpxPriceJson {
     private SpxPriceJson() {}
 
-    /** The JSON text of an Avro value of the canonical schema; {@code null} for a tombstone, a loud failure for anything else. */
+    /** The JSON text of a decoded event; {@code null} for a tombstone, a loud failure for anything that is not the typed event. */
     static String render(ObjectMapper mapper, Object value) {
         if (value == null) return null;
-        if (!(value instanceof GenericRecord record))
-            throw new IllegalStateException("spx-price: value is not the " + UnderlyingPriceAvro.SUBJECT + " Avro record ("
-                    + value.getClass().getName() + ")");
-        UnderlyingPriceEvent e = UnderlyingPriceAvro.fromRecord(record);
+        if (!(value instanceof UnderlyingPriceEvent e))
+            throw new IllegalStateException("spx-price: value is not an UnderlyingPriceEvent (" + value.getClass().getName() + ")");
         ObjectNode n = mapper.createObjectNode();
         n.put("schemaVersion", e.schemaVersion());
         n.put("symbol", e.symbol());
