@@ -1697,7 +1697,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.ibkrPreOpenEnabled() && ibkrPreOpenGexServingUp()) {
             replayIbkrPreOpenGexCached(session);
         }
-        // gex-oi-status rides the AVRO consumer since its .v2 cutover; replay once it has caught up so a
+        // gex-oi-status rides the AVRO consumer since its 2026-10-17 cutover; replay once it has caught up so a
         // reconnect during an OI_MISSING morning restores the badge (last-value-wins per strike).
         // THE GATE MOVED WITH THE TOPIC: it was stateCaughtUp, the JSON state consumer's barrier, which
         // after the cutover no longer carries this topic at all — replaying behind a barrier that is
@@ -2616,12 +2616,12 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
         }
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
-        // Per-strike OI-arrival status: AVRO since its .v2 cutover (was JSON on the string consumer
+        // Per-strike OI-arrival status: AVRO since its 2026-10-17 cutover (was JSON on the string consumer
         // below). Its strike is a decimal logical type, which AvroJson renders as a number — not the
         // base64 a bytes field would otherwise become.
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         if (settings.ibkrPreOpenEnabled()) {
-            // Pre-open IBKR GEX status/control stream (rev13 Phase 3): AVRO since its .v2 cutover,
+            // Pre-open IBKR GEX status/control stream (rev13 Phase 3): AVRO since its 2026-10-18 cutover,
             // so it is consumed HERE and no longer on the string consumer below. NINE record types
             // share this one topic under RecordNameStrategy, and AvroJson emits exactly the fields of
             // whichever record arrived — which is what keeps the browser payload identical to the
@@ -2810,7 +2810,7 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.gammaNavigationTopic(), new TopicBinding("DATABENTO", "gamma-navigation"));
         }
         topicEvents.put(settings.databentoGexStrikeLifecycleTopic(), new TopicBinding("DATABENTO", "gex-strike-lifecycle"));
-        // Keep cache + live symmetric: per-strike OI-arrival status is AVRO since its .v2 cutover.
+        // Keep cache + live symmetric: per-strike OI-arrival status is AVRO since its 2026-10-17 cutover.
         topicEvents.put(settings.databentoGexOiStatusTopic(), new TopicBinding("DATABENTO", "gex-oi-status"));
         if (settings.ibkrPreOpenEnabled()) {
             // Keep cache + live symmetric for the pre-open status stream too, or live statuses stop
