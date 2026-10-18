@@ -65,13 +65,26 @@ class SpxPriceJsonTest {
         return consumerValueDeserializer(service.replayConsumerProps("app:x", true, params, java.util.Map.of()));
     }
 
+    /** (double bits, CPython repr(float)) pairs printed by a real CPython 3 interpreter. */
+    private static final Object[][] GOLDEN = {
+        {0x40bca70000000000L, "7335.0"}, {0x40b77c8000000000L, "6012.5"}, {0x40bd4bdf97edc7efL, "7499.873412"},
+        {0x3fd3333333333334L, "0.30000000000000004"}, {0x3ee4f8b588e368f1L, "1e-05"}, {0x3f1a36e2eb1c432dL, "0.0001"},
+        {0x3f1a36371ea531a8L, "9.999e-05"}, {0x4132d68700000000L, "1234567.0"}, {0x416312cfe0000000L, "9999999.0"},
+        {0x416312d000000000L, "10000000.0"}, {0x41678c29dccccccdL, "12345678.9"}, {0x430c6bf526340000L, "1000000000000000.0"},
+        {0x4341c37937e07fffL, "9999999999999998.0"}, {0x4341c37937e08000L, "1e+16"}, {0x434aa535d3d0c000L, "1.5e+16"},
+        {0x40fe240c9fcb689fL, "123456.789012345"}, {0x40bb580000000001L, "7000.000000000001"},
+        {0x40bb57ffffffffffL, "6999.999999999999"}, {0x4341c37937e08001L, "1.0000000000000002e+16"},
+        {0x40b388028f5c28f6L, "5000.01"}, {0x40b387ffffffffffL, "4999.999999999999"}, {0x40b98f35c28f5c29L, "6543.21"},
+        {0x3f50624dd2f1a9fcL, "0.001"}, {0x3f202c9dedbc309dL, "0.0001234"}, {0x42dc12218377de66L, "123456789012345.6"},
+    };
+
     private static UnderlyingPriceEvent event(double px, Long size) {
         return new UnderlyingPriceEvent(1, "SPX", "2026-10-16T14:30:00.123Z", px, size, "NATIVE_SPX_INDEX",
                 "LIVE_INDEX", px, 1_760_625_000_123_000_000L, "epoch-1", 42L, "LIVE_INDEX");
     }
 
     /** The JSON era's text: field order of the record, compact, doubles as Jackson/Python repr print them. */
-    private static String oldJson(double px, Long size) {
+    private static String oldJson(String px, Long size) {
         return "{\"schemaVersion\":1,\"symbol\":\"SPX\",\"eventTime\":\"2026-10-16T14:30:00.123Z\",\"price\":" + px
                 + ",\"size\":" + size + ",\"source\":\"NATIVE_SPX_INDEX\",\"quality\":\"LIVE_INDEX\",\"canonicalSpot\":" + px
                 + ",\"spotEventTimeNs\":1760625000123000000,\"feedEpochId\":\"epoch-1\",\"epochSeq\":42,\"spotQuality\":\"LIVE_INDEX\"}";
@@ -79,19 +92,18 @@ class SpxPriceJsonTest {
 
     @Test
     void wireBytesThroughTheConfiguredConsumerRenderByteIdenticalJsonForAGridOfPrices() throws Exception {
-        double[] grid = {7335.0, 6012.5, 7499.873412, 5000.01, 4999.999999999999, 6000.0, 7000.25, 6543.21, 123456.789012345,
-                Math.nextUp(7000.0), Math.nextDown(7000.0), 0.1 + 0.2, 6899.999, 7100.1};
         Deserializer<?> live = liveOrCache();
         Deserializer<?> replay = replay("run-1");
         String replayTopic = app.feedgateway.mtsession.gateway.ReplayTopicResolver.toReplayTopic(topic, "run-1");
-        for (double px : grid) {
+        for (Object[] g : GOLDEN) {
+            double px = Double.longBitsToDouble((Long) g[0]);
+            String repr = (String) g[1];
             for (Long size : new Long[] {null, 5L}) {
                 byte[] wire = writer.serialize(topic, event(px, size));
-                String old = oldJson(px, size);
+                String old = oldJson(repr, size);
                 Object typed = live.deserialize(topic, wire);
                 assertEquals(event(px, size), typed, "the typed event reaches the code, price " + px);
                 assertEquals(old, SpxPriceJson.render(mapper, typed), "price " + px);
-                assertEquals(mapper.writeValueAsString(mapper.readTree(old)), SpxPriceJson.render(mapper, typed));
                 assertEquals(typed, replay.deserialize(replayTopic, wire), "run-scoped replay binding");
             }
         }
@@ -108,7 +120,7 @@ class SpxPriceJsonTest {
                 "use.latest.version", true, "value.subject.name.strategy",
                 "io.confluent.kafka.serializers.subject.RecordNameStrategy"), false);
         byte[] foreignFrame = foreignWriter.serialize(topic, foreign);
-        byte[] json = oldJson(6012.5, null).getBytes(StandardCharsets.UTF_8);
+        byte[] json = oldJson("6012.5", null).getBytes(StandardCharsets.UTF_8);
         byte[] garbage = {1, 2, 3, 4, 5, 6, 7};
         String replayTopic = app.feedgateway.mtsession.gateway.ReplayTopicResolver.toReplayTopic(topic, "run-1");
         for (Deserializer<?> d : new Deserializer<?>[] {liveOrCache(), replay("run-1")}) {
@@ -135,6 +147,6 @@ class SpxPriceJsonTest {
     @Test
     void tombstoneIsNullAndATypedValueIsRequired() {
         assertNull(SpxPriceJson.render(mapper, null));
-        assertThrows(IllegalStateException.class, () -> SpxPriceJson.render(mapper, oldJson(6012.5, null)));
+        assertThrows(IllegalStateException.class, () -> SpxPriceJson.render(mapper, oldJson("6012.5", null)));
     }
 }
