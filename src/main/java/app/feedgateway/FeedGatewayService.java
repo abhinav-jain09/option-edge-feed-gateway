@@ -2676,6 +2676,9 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // Greek-move-authenticity CURRENT verdict (AVRO, key = symbol; browsers still get the identical JSON, see
+        // GreekMoveAuthJson): standalone global advisory, OPTIONAL topic, on the SHORT greekMoveAuthTtlMs window.
+        topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2760,10 +2763,6 @@ public class FeedGatewayService implements ReplayRunner {
         // advisory like its siblings, OPTIONAL topic — but on the SHORT esOpenDirectionStatusTtlMs
         // window (default 5 min), which also bounds its seek-back here to the last few minutes.
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
-        // Greek-move-authenticity CURRENT verdict (JSON, key = symbol): standalone global advisory like the
-        // open-direction siblings, OPTIONAL topic — on the SHORT greekMoveAuthTtlMs window (default 5 min),
-        // which also bounds its seek-back here to the last few minutes.
-        topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
@@ -2864,6 +2863,8 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // Keep cache + live symmetric: the greek-move-authenticity CURRENT verdict is AVRO.
+        topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -2935,9 +2936,6 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the ES open-direction live STATUS
         // heartbeat (JSON, standalone/optional — same rule as the forecast/outcome siblings above).
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
-        // Keep the cache + live JSON consumer topic sets symmetric: the greek-move-authenticity CURRENT
-        // verdict (JSON, key = symbol, standalone/optional — same rule as the open-direction siblings above).
-        topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
@@ -13202,6 +13200,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The browser JSON of one Kafka value: the canonical SPX spot is Avro rendered to its historical JSON text. */
     private String kafkaJson(String event, boolean avro, Object value) {
+        if ("greek-move-auth".equals(event)) return GreekMoveAuthJson.render(value);
         return "spx-price".equals(event) ? SpxPriceJson.render(mapper, value) : avro ? avroJson(value) : stringJson(value);
     }
 
