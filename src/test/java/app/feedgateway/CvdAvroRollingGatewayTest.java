@@ -143,7 +143,7 @@ class CvdAvroRollingGatewayTest {
         String topic = app.feedgateway.mtsession.gateway.ReplayTopicResolver.toReplayTopic(settings.esGexSpxAlignedTopic(), "fixture-run");
         var params = new app.feedgateway.mtsession.gateway.ReplayParams("app:fixture", "SPX", "20261019", 1000L, 2000L, 10, "fixture-run");
         var props = service.replayConsumerProps("app:fixture", false, params, Map.of(topic, "es-gex"));
-        assertEquals(Map.of(topic, com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_GEX_BOOK),
+        assertEquals(Map.of(topic, com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_GEX_BOOK_EXTENDED),
                 props.get("optionsedge.canonical.avro.bindings"));
         assertEquals(Set.of(topic), props.get("optionsedge.canonical.avro.retained-json-topics"));
         assertEquals("false", props.get(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG));
@@ -153,10 +153,14 @@ class CvdAvroRollingGatewayTest {
         String scope = "aligned-book-run-replay";
         props.put("schema.registry.url", "mock://" + scope); props.put("auto.register.schemas", false);
         var config = new HashMap<String, Object>(); props.forEach((k, v) -> config.put((String) k, v));
-        Schema schema = com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_GEX_BOOK;
+        Schema schema = com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_GEX_BOOK_EXTENDED;
+        // A measured book with one bucket: the Extended price/statistic records must render to the same
+        // plain numbers the browser's es-gex model reads (spxStrike, esNetGexSum, esStrike, netGex, basis).
         String json = "{\"recordType\":\"book\",\"source\":\"ES_ON_SPX\",\"symbol\":\"SPX\",\"expiry\":\"20261019\","
-                + "\"settlementType\":\"PM\",\"basisState\":\"INIT\",\"basis\":null,\"basisMeasuredAtMs\":null,"
-                + "\"emitEventTimeMs\":1000,\"dataEventTimeMs\":null,\"upstreamHeartbeatEventMs\":null,\"upstreamHealth\":\"UNAVAILABLE\",\"buckets\":[]}";
+                + "\"settlementType\":\"PM\",\"basisState\":\"MEASURED\",\"basis\":40,\"basisMeasuredAtMs\":900,"
+                + "\"emitEventTimeMs\":1000,\"dataEventTimeMs\":950,\"upstreamHeartbeatEventMs\":990,\"upstreamHealth\":\"OK\","
+                + "\"buckets\":[{\"spxStrike\":6760,\"esNetGexSum\":-125.5,\"contributorCount\":1,\"truncated\":false,"
+                + "\"contributors\":[{\"esStrike\":6800.25,\"netGex\":-125.5}]}]}";
         try (var writer = new KafkaAvroSerializer(); var reader = new CanonicalModelDeserializer()) {
             MockSchemaRegistry.getClientForScope(scope).register(topic + "-value", schema);
             writer.configure(config, false); reader.configure(config, false);
