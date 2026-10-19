@@ -236,7 +236,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> spotBandSwitchDelivered = new ConcurrentHashMap<>();
     private final SellerActivityDiskStore sellerActivityStore = new SellerActivityDiskStore();
     // Per-strike delta-flow snapshots, keyed by source|symbol|expiry|strike (last-value-wins per
-    // strike). JSON on the wire (DeltaFlowStrikeSnapshot) — lives on the JSON-state consumer.
+    // strike). Avro on the wire (DeltaFlowStrikeSnapshot), cached as its rendered JSON text — lives on the Avro consumer.
     private final Map<String, String> deltaFlows = new ConcurrentHashMap<>();
     // Last StrikeIntelligenceDashboard per symbol ("strike-cluster" event): replayed on connect so a
     // refreshed page repaints the recent-signals trail instantly instead of waiting for the next
@@ -1675,10 +1675,10 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (avroCaughtUp.get()) {
             // max-pain + strike-sr are DATABENTO-only Avro, so they bootstrap purely via the Avro consumer.
-            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gamma-migration", "gex-strike-lifecycle"));
+            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gamma-migration", "gex-strike-lifecycle", "delta-flow"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "spot-band", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
+            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "spot-band", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
             replayOptionTruthCachedLegacy(session);
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
@@ -2676,6 +2676,10 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // delta-flow-by-strike is AVRO (contracts DeltaFlowStrikeSnapshot, per-strike keyed symbol|date|expiry|strike; a null
+        // value is a tombstone). Rendered back to the exact JSON text of the JSON era (DeltaFlowJson) before the unchanged
+        // JSON pipeline, so the browser payload is identical. delta-flow-accel (web monolith) stays on the JSON consumer.
+        topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2705,14 +2709,11 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.esStrikeIntelEnabled()) {
             topicEvents.put(settings.esStrikeIntelSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-strike-intel"));
         }
-        // delta-flow-by-strike is plain JSON (DeltaFlowStrikeSnapshot), per-strike keyed
-        // (symbol|date|expiry|strike) — this JSON-state consumer, never the Avro one.
-        topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
         // Server-rated Δ-flow acceleration verdicts: one JSON frame per second from the web tier,
         // chain-global for the active symbol — standalone broadcast, same delivery class as es-cvd.
         topicEvents.put(settings.deltaFlowAccelTopic(), new TopicBinding("DATABENTO", "delta-flow-accel"));
         // strike-intelligence-by-strike is plain JSON (StrikeIntelligenceSignal), per-strike keyed
-        // (symbol|expiry|strike) — this JSON-state consumer, never the Avro one (mirrors delta-flow).
+        // (symbol|expiry|strike) — this JSON-state consumer, never the Avro one.
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
         topicEvents.put(settings.optionTruthByStrikeTopic(), new TopicBinding("DATABENTO", "option-truth"));
         // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
@@ -2864,6 +2865,8 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // Keep cache + live symmetric: delta-flow-by-strike is AVRO (see runAvroCacheConsumer).
+        topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -2889,13 +2892,10 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.esStrikeIntelEnabled()) {
             topicEvents.put(settings.esStrikeIntelSpxAlignedTopic(), new TopicBinding("DATABENTO", "es-strike-intel"));
         }
-        // delta-flow-by-strike is plain JSON, per-strike keyed — keep the cache + live JSON consumer
-        // topic sets symmetric (same rule as gex-history/strike-flow above).
-        topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
-        // Δ-flow acceleration — cache/live symmetry, same rule as delta-flow above.
+        // Δ-flow acceleration — cache/live symmetry (JSON, produced by the web monolith).
         topicEvents.put(settings.deltaFlowAccelTopic(), new TopicBinding("DATABENTO", "delta-flow-accel"));
         // strike-intelligence-by-strike is plain JSON, per-strike keyed — keep the cache + live JSON
-        // consumer topic sets symmetric (same rule as delta-flow above).
+        // consumer topic sets symmetric (same rule as strike-flow above).
         topicEvents.put(settings.strikeIntelByStrikeTopic(), new TopicBinding("DATABENTO", "strike-intel"));
         topicEvents.put(settings.optionTruthByStrikeTopic(), new TopicBinding("DATABENTO", "option-truth"));
         // strike-intelligence-turn-alert: discrete START/STOP turn events, broadcast STANDALONE (never cached).
@@ -13202,7 +13202,30 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The browser JSON of one Kafka value: the canonical SPX spot is Avro rendered to its historical JSON text. */
     private String kafkaJson(String event, boolean avro, Object value) {
-        return "spx-price".equals(event) ? SpxPriceJson.render(mapper, value) : avro ? avroJson(value) : stringJson(value);
+        if ("spx-price".equals(event)) {
+            return SpxPriceJson.render(mapper, value);
+        }
+        if ("delta-flow".equals(event)) {
+            return deltaFlowJson(value);
+        }
+        return avro ? avroJson(value) : stringJson(value);
+    }
+
+    /**
+     * The browser JSON of one delta-flow-by-strike value: the contracts {@code DeltaFlowStrikeSnapshot} Avro record rendered
+     * to the exact text the retired JSON producer wrote. A null value is a tombstone (no JSON); anything else that is not that
+     * record fails loud — never a toString, never a generic rendering.
+     */
+    private String deltaFlowJson(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof GenericRecord record)
+                || !com.optionsedge.contracts.deltaflow.DeltaFlowAvro.STRIKE_SNAPSHOT_SUBJECT.equals(record.getSchema().getFullName())) {
+            throw new IllegalStateException("delta-flow: value is not the " + com.optionsedge.contracts.deltaflow.DeltaFlowAvro.STRIKE_SNAPSHOT_SUBJECT
+                    + " Avro record (" + (value instanceof GenericRecord r ? r.getSchema().getFullName() : value.getClass().getName()) + ")");
+        }
+        return com.optionsedge.contracts.deltaflow.DeltaFlowJson.toJson(record);
     }
 
     private String stringJson(Object value) {
@@ -13686,8 +13709,8 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.gammaFragilityTopic(), "gamma-fragility");
                 avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
                 avroTopics.put(settings.underlyingSpxPriceTopic(), "spx-price");
+                avroTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
-                stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.strikeIntelByStrikeTopic(), "strike-intel");
                 stringTopics.put(settings.strikeInvasionTopic(), "strike-invasion");
                 stringTopics.put(settings.corridorGaugeTopic(), "corridor-gauge");
@@ -13719,7 +13742,7 @@ public class FeedGatewayService implements ReplayRunner {
                 stringTopics.remove(settings.strikeLiquidityTopic());
                 // delta-flow-by-strike is likewise NOT in the per-run replay contract and its dotless
                 // name has no namespace segment for ReplayTopicResolver — drop it before resolution too.
-                stringTopics.remove(settings.databentoDeltaFlowByStrikeTopic());
+                avroTopics.remove(settings.databentoDeltaFlowByStrikeTopic());
                 // strike-intelligence-by-strike is likewise NOT in the per-run replay contract and its
                 // dotless name has no namespace segment for ReplayTopicResolver — drop it too.
                 stringTopics.remove(settings.strikeIntelByStrikeTopic());
