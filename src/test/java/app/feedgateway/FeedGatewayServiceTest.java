@@ -6812,7 +6812,7 @@ class FeedGatewayServiceTest {
         // Legacy caught-up gating: max-pain (DATABENTO-only Avro) under avroCaughtUp; gex-by-strike
         // (multi-source) under BOTH flags.
         assertTrue(source.contains(
-                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"pace-rank\", \"directional-pressure\", \"max-pain\", \"strike-sr\", \"gex-magnet\", \"gamma-migration\", \"gex-strike-lifecycle\"));"));
+                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"pace-rank\", \"directional-pressure\", \"max-pain\", \"strike-sr\", \"gex-magnet\", \"gamma-migration\", \"gex-strike-lifecycle\", \"delta-flow\"));"));
         assertTrue(source.contains("if (avroCaughtUp.get() && stateCaughtUp.get()) {"));
         // gex legacy cached replay is source-aware (no hard IBKR-only filter).
         assertFalse(source.contains(".filter(entry -> \"IBKR\".equals(selection.source()))"));
