@@ -519,7 +519,7 @@ public final class GatewaySettings {
     }
 
     /**
-     * Per-strike delta-flow topic (JSON {@code DeltaFlowStrikeSnapshot}, one record per
+     * Per-strike delta-flow topic (Avro {@code DeltaFlowStrikeSnapshot}, one record per
      * {@code symbol|date|expiry|strike}) from delta-flow-service. Broadcast as event
      * {@code "delta-flow"}. NB: unlike the {@code options.databento.*} topics, the delta-flow
      * topics are UNPREFIXED — the default is the bare name {@code delta-flow-by-strike}.
