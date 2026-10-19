@@ -15261,7 +15261,7 @@ public class FeedGatewayService implements ReplayRunner {
                 Map.entry(settings.esOpenDirectionForecastTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.OPEN_DIRECTION_FORECAST),
                 Map.entry(settings.esOpenDirectionOutcomeTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.OPEN_DIRECTION_OUTCOME),
                 Map.entry(settings.esOpenDirectionStatusTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.OPEN_DIRECTION_STATUS),
-                Map.entry(settings.esGexSpxAlignedTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_GEX_BOOK),
+                Map.entry(settings.esGexSpxAlignedTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_GEX_BOOK_EXTENDED),
                 Map.entry(settings.earlyAuctionVerdictTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.EARLY_AUCTION_LEDGER),
                 Map.entry(settings.shortPremiumRecommendationTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.SHORT_PREMIUM_RECOMMENDATION),
                 Map.entry(settings.esStrikeIntelSpxAlignedTopic(), com.optionsedge.contracts.cvd.CvdRelatedSchemas.ALIGNED_STRIKE_INTELLIGENCE),
