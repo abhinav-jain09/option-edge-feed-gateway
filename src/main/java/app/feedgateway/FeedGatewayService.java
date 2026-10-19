@@ -2676,6 +2676,9 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // Spot-vol-regime CURRENT (AVRO since its 2026-10-19 cutover; browsers still get the identical JSON, see
+        // SpotVolRegimeJson): the same optional/standalone GLOBAL advisory class as before, only the wire changed.
+        topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2764,10 +2767,10 @@ public class FeedGatewayService implements ReplayRunner {
         // open-direction siblings, OPTIONAL topic — on the SHORT greekMoveAuthTtlMs window (default 5 min),
         // which also bounds its seek-back here to the last few minutes.
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
-        // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
-        topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
+        // (Spot-vol-regime CURRENT is AVRO since its 2026-10-19 cutover: it is consumed by the Avro cache and live
+        // consumers, not here.)
         // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
-        // JSON class as spot-vol-regime. Both consumers are ASSIGNED both topics (the two maps stay
+        // JSON class as greek-move-auth. Both consumers are ASSIGNED both topics (the two maps stay
         // symmetric), but only the CACHE consumer ingests them (relayVolPremium); the live consumer's
         // vol-premium branch says why.
         topicEvents.put(settings.volPremiumIvrvTopic(),
@@ -2864,6 +2867,8 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // Spot-vol-regime CURRENT: AVRO (see the cache twin); symmetric topic sets.
+        topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -2938,10 +2943,10 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the greek-move-authenticity CURRENT
         // verdict (JSON, key = symbol, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
-        // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
-        topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
+        // (Spot-vol-regime CURRENT is AVRO since its 2026-10-19 cutover: it is consumed by the Avro cache and live
+        // consumers, not here.)
         // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
-        // JSON class as spot-vol-regime. Both consumers are ASSIGNED both topics (the two maps stay
+        // JSON class as greek-move-auth. Both consumers are ASSIGNED both topics (the two maps stay
         // symmetric), but only the CACHE consumer ingests them (relayVolPremium); the live consumer's
         // vol-premium branch says why.
         topicEvents.put(settings.volPremiumIvrvTopic(),
@@ -13202,7 +13207,10 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The browser JSON of one Kafka value: the canonical SPX spot is Avro rendered to its historical JSON text. */
     private String kafkaJson(String event, boolean avro, Object value) {
-        return "spx-price".equals(event) ? SpxPriceJson.render(mapper, value) : avro ? avroJson(value) : stringJson(value);
+        if ("spx-price".equals(event)) {
+            return SpxPriceJson.render(mapper, value);
+        }
+        return "spot-vol-regime".equals(event) ? SpotVolRegimeJson.render(value) : avro ? avroJson(value) : stringJson(value);
     }
 
     private String stringJson(Object value) {
@@ -15187,6 +15195,7 @@ public class FeedGatewayService implements ReplayRunner {
         Properties properties = baseConsumerProperties(name);
         properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, GatewayAvroDeserializer.class.getName());
         properties.put(GatewayAvroDeserializer.SPX_PRICE_TOPIC, settings.underlyingSpxPriceTopic());
+        properties.put(GatewayAvroDeserializer.SPOT_VOL_REGIME_TOPIC, settings.spotVolRegimeTopic());
         properties.put("schema.registry.url", settings.schemaRegistryUrl());
         properties.put("specific.avro.reader", "false");
         // Every Avro topic this gateway consumes (display/pace/directional-pressure/gex/max-pain) registers

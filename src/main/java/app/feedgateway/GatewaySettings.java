@@ -1472,8 +1472,8 @@ public final class GatewaySettings {
     }
 
     /**
-     * Compacted CURRENT topic of the standalone spot-vol-regime service (JSON
-     * {@code SpotVolRegimeSnapshot} — see {@link SpotVolRegimeTopics#SPOT_VOL_REGIME_CURRENT}). One
+     * Compacted CURRENT topic of the standalone spot-vol-regime service (Avro
+     * {@code SpotVolRegimeSnapshot}, rendered to the browser as the JSON-era text by {@code SpotVolRegimeJson} — see {@link SpotVolRegimeTopics#SPOT_VOL_REGIME_CURRENT}). One
      * record per symbol ("SPX"); the service heartbeats it every frame. Resolved through the platform
      * topic-prefix helper at deploy time, matching the greek-move-auth sibling above.
      */
