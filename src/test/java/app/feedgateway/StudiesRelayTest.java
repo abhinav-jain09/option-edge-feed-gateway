@@ -432,4 +432,26 @@ class StudiesRelayTest {
         assertFalse(FeedGatewayService.studiesRecordIsRecovery(end, "t", 4, 0), "another partition, already caught up: live");
         assertFalse(FeedGatewayService.studiesRecordIsRecovery(java.util.Map.of(), "t", 3, 0), "no recovery pending: live");
     }
+
+    @Test
+    void aBarWithAnImpossibleClockOrAMislabelledIdIsRefused() throws Exception {
+        GenericRecord endBeforeStart = bar("SPX", "T5M", 0);
+        endBeforeStart.put("barEnd", java.time.Instant.ofEpochMilli(StudiesFixtures.T0 - 1).toString());
+        GenericRecord tooLong = bar("SPX", "T1M", 1);
+        tooLong.put("barEnd", java.time.Instant.ofEpochMilli(StudiesFixtures.T0 + 60_000L + 120_000L).toString());   // 3 minutes on a 1m bar
+        GenericRecord wrongTimeframeInId = bar("SPX", "T5M", 2);
+        wrongTimeframeInId.put("barId", ((String) wrongTimeframeInId.get("barId").toString()).replace("|5m|", "|15m|"));
+        GenericRecord wrongSymbolInId = bar("SPX", "T5M", 3);
+        wrongSymbolInId.put("barId", wrongSymbolInId.get("barId").toString().replaceFirst("^SPX", "ES"));
+        GenericRecord idNotEndingInBarStart = bar("SPX", "T5M", 4);
+        idNotEndingInBarStart.put("barId", idNotEndingInBarStart.get("barId").toString().replace("T13:", "T14:"));
+        GenericRecord idTooLong = bar("SPX", "T5M", 5);
+        idTooLong.put("barId", idTooLong.get("barId").toString().replace("|ESZ6|", "|" + "X".repeat(40) + "|"));
+        for (GenericRecord bad : List.of(endBeforeStart, tooLong, wrongTimeframeInId, wrongSymbolInId, idNotEndingInBarStart, idTooLong)) {
+            assertNull(live(bad), bad.get("barId") + " / " + bad.get("barEnd"));
+        }
+        assertEquals(6L, relay.dropsForTest());
+        assertEquals(0, hello().get("studyBars").get("5m").size() + hello().get("studyBars").get("1m").size());
+        assertNotNull(live(bar("SPX", "T5M", 6)), "a well-formed bar is still accepted");
+    }
 }

@@ -12841,8 +12841,14 @@ public class FeedGatewayService implements ReplayRunner {
                 : "";
     }
 
-    /** The compacted current topic is re-read from its tail: one symbol per topic, so the last records hold the latest state. */
-    private static final long STUDIES_CURRENT_TAIL_RECORDS = 8L;
+    /**
+     * The current-state topic is re-read from its tail. It has ONE partition and each topic carries one symbol (SPX locally, ES on the
+     * es. mirror; the relay refuses a record whose key is not its symbol), written about every 5 s, and neither compaction nor the log
+     * reorders records, so the last record is the latest state. 64 records leave room for both symbols should a topic ever carry them.
+     * Should the tail still hold no state for a symbol, the next live record (seconds) supplies it and the page treats a missing
+     * current as bars-only, which ages by the bars' own clock.
+     */
+    private static final long STUDIES_CURRENT_TAIL_RECORDS = 64L;
 
     /** Cold start, retry and late adoption: the bars are re-read from a window back, the current state from its tail. */
     void seekStudies(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions, Map<String, TopicBinding> topicEvents) {

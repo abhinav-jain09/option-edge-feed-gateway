@@ -45,6 +45,9 @@ final class StudiesRelay {
     private static final String[] BARS_FIELD = {"studyBars", "esStudyBars"};
     private static final String[] TF = {"1m", "5m", "15m"};
     private static final String[] TF_ENUM = {"T1M", "T5M", "T15M"};
+    private static final long[] TF_MS = {60_000L, 300_000L, 900_000L};
+    /** The producer's own bound (StudyWireValidator): a barId is at most 64 characters. */
+    private static final int BAR_ID_MAX = 64;
 
     /** One retained finalized bar: its identity, its clock and the frame data it will be sent as. */
     record Bar(String barId, long startMs, String json, int bytes) { }
@@ -207,7 +210,16 @@ final class StudiesRelay {
             drops.incrementAndGet();
             return null;
         }
-        long startMs = Instant.parse(str(r, "barStart")).toEpochMilli();
+        String barStart = str(r, "barStart");
+        long startMs = Instant.parse(barStart).toEpochMilli();
+        long span = Instant.parse(str(r, "barEnd")).toEpochMilli() - startMs;
+        // the bar's own clock and identity, as the producer's validator states them: a positive span of at most one timeframe, and a
+        // barId of the form symbol|…|tf|barStart (at most 64 characters), so a mislabelled record cannot enter the history
+        if (span <= 0 || span > TF_MS[t] || barId.length() > BAR_ID_MAX || !barId.startsWith(symbol + "|")
+                || !barId.endsWith("|" + TF[t] + "|" + barStart)) {
+            drops.incrementAndGet();
+            return null;
+        }
         String json = mapper.writeValueAsString(AvroJson.toJsonNode(mapper, r));
         int bytes = utf8Length(json);
         if (bytes > BAR_MAX_BYTES) {

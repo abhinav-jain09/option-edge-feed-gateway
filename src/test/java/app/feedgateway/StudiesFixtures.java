@@ -47,7 +47,7 @@ final class StudiesFixtures {
         r.put("symbol", symbol);
         r.put("tradeDate", "2026-10-20");
         r.put("timeframe", enumOf(BAR, "timeframe", timeframe));
-        r.put("barId", symbol + "|" + timeframe.toLowerCase() + "|" + start);
+        r.put("barId", symbol + "|ESZ6|2026-10-20|" + timeframe.substring(1).toLowerCase() + "|" + Instant.ofEpochMilli(start).toString());
         r.put("barStart", Instant.ofEpochMilli(start).toString());
         r.put("barEnd", Instant.ofEpochMilli(start + 60_000L).toString());
         r.put("status", enumOf(BAR, "status", status));
