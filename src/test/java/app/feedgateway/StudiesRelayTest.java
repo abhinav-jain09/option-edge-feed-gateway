@@ -219,7 +219,7 @@ class StudiesRelayTest {
             }
         }
         String fields = relay.helloFields();
-        assertTrue(fields.length() < StudiesRelay.HELLO_MAX_BYTES, "full hello is " + fields.length() + " chars");
+        assertTrue(StudiesRelay.utf8Length(fields) < StudiesRelay.HELLO_MAX_BYTES, "full hello is " + StudiesRelay.utf8Length(fields) + " bytes");
         JsonNode h = hello();
         for (String f : List.of("studyBars", "esStudyBars")) {
             for (String tf : List.of("1m", "5m", "15m")) {
@@ -240,7 +240,7 @@ class StudiesRelayTest {
             }
         }
         String fields = relay.helloFields();
-        assertTrue(fields.length() <= StudiesRelay.HELLO_MAX_BYTES, "length " + fields.length());
+        assertTrue(StudiesRelay.utf8Length(fields) <= StudiesRelay.HELLO_MAX_BYTES, "bytes " + StudiesRelay.utf8Length(fields));
         JsonNode h = hello();
         int kept1m = h.get("studyBars").get("1m").size(), kept5m = h.get("studyBars").get("5m").size();
         assertTrue(kept1m + kept5m < 2 * StudiesRelay.HISTORY_BARS && kept1m > 0 && kept5m > 0);
@@ -356,5 +356,35 @@ class StudiesRelayTest {
         assertTrue(first == relay.helloFields(), "same cached string: no rebuild for a duplicate or a refused record");
         live(bar("SPX", "T5M", 2));
         assertFalse(first == relay.helloFields(), "a new bar changes the hello");
+    }
+
+    @Test
+    void theEmittedHelloNeverExceedsTheBudgetEvenWhenTheContentAloneIsJustUnderIt() throws Exception {
+        // 24 equal bars whose summed JSON (plus one comma each) is 100 bytes under the budget: the framing (field names, keys,
+        // braces) pushes the rendered fragment over it unless the budget accounts for the framing too
+        int target = (StudiesRelay.HELLO_MAX_BYTES - 100) / 24 - 1;
+        String probe = live(bar("SPX", "T1M", 0));
+        int pad = target - StudiesRelay.utf8Length(probe) + "UNVALIDATED".length();   // the fixture bar carries calibration UNVALIDATED
+        assertTrue(pad > 0 && target < StudiesRelay.BAR_MAX_BYTES);
+        int symbolIndex = 0;
+        for (String symbol : List.of("SPX", "ES")) {
+            for (String tf : List.of("T1M", "T5M", "T15M")) {
+                for (int i = 0; i < 4 && symbolIndex < 24; i++, symbolIndex++) {
+                    GenericRecord b = bar(symbol, tf, 100 + i);
+                    b.put("calibration", "p".repeat(pad));
+                    relay.onLive(StudiesRelay.BAR_EVENT, barKey(b), b);
+                }
+            }
+        }
+        String fields = relay.helloFields();
+        assertTrue(StudiesRelay.utf8Length(fields) <= StudiesRelay.HELLO_MAX_BYTES, "bytes " + StudiesRelay.utf8Length(fields));
+        JsonNode h = hello();
+        int kept = 0;
+        for (String f : List.of("studyBars", "esStudyBars")) {
+            for (String tf : List.of("1m", "5m", "15m")) {
+                kept += h.get(f).get(tf).size();
+            }
+        }
+        assertTrue(kept < 24, "the framing pushed the content over the budget, so the oldest bar went: " + kept);
     }
 }

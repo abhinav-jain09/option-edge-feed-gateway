@@ -295,7 +295,8 @@ final class StudiesRelay {
     /**
      * The hello's studies fields, ready to append after a comma-less prefix: {@code ,"studies":{...},"studyBars":{...},
      * "esStudies":{...},"esStudyBars":{...}}. Cached until the retained state changes; the oldest history bars are dropped
-     * (longest list first) when the part would exceed {@link #HELLO_MAX_CHARS}, the current entries never.
+     * (longest list first) when the part would exceed {@link #HELLO_MAX_BYTES}; only when no history is left does the largest current
+     * entry degrade to {@code null}.
      */
     synchronized String helloFields() {
         if (helloCache == null || helloCacheVersion != live.version) {
@@ -305,10 +306,17 @@ final class StudiesRelay {
         return helloCache;
     }
 
+    /**
+     * The bytes of the hello part that are not content: the four field names, the timeframe keys, braces, brackets, colons and
+     * commas, measured on an empty store (all entries {@code null}). An entry replaces a 4-byte {@code null} and every bar is
+     * counted with one comma, so framing + entries + bars is an UPPER bound of the rendered size: the budget below is never exceeded.
+     */
+    private static final int FRAMING_BYTES = utf8Length(render(new Store(), new int[SYMBOLS.length * TF.length], new boolean[SYMBOLS.length][TF.length], 512));
+
     private static String buildHello(Store st) {
         int[] from = new int[st.bars.length];
         boolean[][] nulled = new boolean[SYMBOLS.length][TF.length];
-        long total = 0;
+        long total = FRAMING_BYTES;
         for (int s = 0; s < SYMBOLS.length; s++) {
             if (st.current[s] != null) {
                 for (int t = 0; t < TF.length; t++) {
@@ -350,7 +358,11 @@ final class StudiesRelay {
             }
             total -= st.bars[longest].get(from[longest]++).bytes() + 1;
         }
-        StringBuilder sb = new StringBuilder((int) Math.min(total + 256, Integer.MAX_VALUE));
+        return render(st, from, nulled, (int) Math.min(total + 256, Integer.MAX_VALUE));
+    }
+
+    private static String render(Store st, int[] from, boolean[][] nulled, int capacity) {
+        StringBuilder sb = new StringBuilder(capacity);
         for (int s = 0; s < SYMBOLS.length; s++) {
             sb.append(",\"").append(CURRENT_FIELD[s]).append("\":{");
             for (int t = 0; t < TF.length; t++) {
