@@ -12893,10 +12893,16 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** A record is staged only when its OWN partition is still recovering and the record lies below that partition's captured end. */
+    static boolean studiesRecordIsRecovery(Map<TopicPartition, Long> end, String topic, int partition, long offset) {
+        Long limit = end.get(new TopicPartition(topic, partition));
+        return limit != null && offset < limit;
+    }
+
     private void onStudiesRecord(StudiesRecovery recovery, String event, ConsumerRecord<String, Object> record) {
         if (record.value() == null) {
             studies.onDrop();   // a tombstone retains nothing and withdraws nothing
-        } else if (!recovery.end.isEmpty()) {
+        } else if (studiesRecordIsRecovery(recovery.end, record.topic(), record.partition(), record.offset())) {
             studies.onStaged(recovery.staged, event, record.key(), record.value());
         } else {
             String frame = studies.onLive(event, record.key(), record.value());

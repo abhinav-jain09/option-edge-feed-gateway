@@ -387,4 +387,49 @@ class StudiesRelayTest {
         }
         assertTrue(kept < 24, "the framing pushed the content over the budget, so the oldest bar went: " + kept);
     }
+
+    @Test
+    void recordsAppliedLiveWhileARecoveryIsPendingSurviveItsPromotion() throws Exception {
+        live(bar("SPX", "T5M", 1));
+        StudiesRelay.Store staged = relay.newStaging();
+        relay.onStaged(staged, StudiesRelay.BAR_EVENT, "SPX|5m", bar("SPX", "T5M", 2));      // history read during recovery
+        assertNotNull(live(bar("SPX", "T5M", 9)));                                              // a caught-up partition keeps delivering live
+        List<String[]> frames = relay.promote(staged);
+        assertTrue(frames.isEmpty(), "the staged bar is older than the live tail: history only, no frame");
+        JsonNode bars = hello().get("studyBars").get("5m");
+        assertEquals(List.of(1L, 2L, 9L), List.of(minute(bars.get(0)), minute(bars.get(1)), minute(bars.get(2))),
+                "the live bar was not lost to the promotion, the recovered one joined the history");
+    }
+
+    @Test
+    void aSameInstantRevisionIsBroadcastByThePromotionButAnIdenticalRepublishIsNot() throws Exception {
+        relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5));
+        StudiesRelay.Store staged = relay.newStaging();
+        assertTrue(relay.promote(staged).isEmpty(), "identical to what is live: nothing owed");
+        GenericRecord revised = current("SPX", 5);
+        revised.put("runId", "run-2");
+        relay.onStaged(staged, StudiesRelay.CURRENT_EVENT, "SPX", revised);
+        List<String[]> frames = relay.promote(staged);
+        assertEquals(1, frames.size());
+        assertEquals(StudiesRelay.CURRENT_EVENT, frames.get(0)[0]);
+        assertEquals("run-2", JSON.readTree(frames.get(0)[1]).get("runId").asText());
+        assertEquals("run-2", hello().get("studies").get("1m").get("runId").asText(), "the hello and the sockets agree");
+    }
+
+    @Test
+    void anIdenticalCurrentRepublishDoesNotRebuildTheHello() throws Exception {
+        relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5));
+        String first = relay.helloFields();
+        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5)), "accepted and forwarded");
+        assertTrue(first == relay.helloFields(), "nothing retained changed: the cached hello is reused");
+    }
+
+    @Test
+    void onlyARecordBelowItsOwnPartitionsCapturedEndIsStaged() {
+        java.util.Map<org.apache.kafka.common.TopicPartition, Long> end = java.util.Map.of(new org.apache.kafka.common.TopicPartition("t", 3), 10L);
+        assertTrue(FeedGatewayService.studiesRecordIsRecovery(end, "t", 3, 9));
+        assertFalse(FeedGatewayService.studiesRecordIsRecovery(end, "t", 3, 10), "at the end offset: live");
+        assertFalse(FeedGatewayService.studiesRecordIsRecovery(end, "t", 4, 0), "another partition, already caught up: live");
+        assertFalse(FeedGatewayService.studiesRecordIsRecovery(java.util.Map.of(), "t", 3, 0), "no recovery pending: live");
+    }
 }

@@ -146,28 +146,33 @@ final class StudiesRelay {
     }
 
     /**
-     * Makes the staged store the live one and returns the frames recovery owes the connected sockets, as
-     * {event, data} pairs in order: every bar newer than the live tail of its (symbol, timeframe), then each symbol's current
-     * state when it is newer than the live one.
+     * Folds the staged recovery store into the live one and returns the frames recovery owes the connected sockets, as
+     * {event, data} pairs in order: every staged bar that becomes the newest of its (symbol, timeframe), then each symbol's current
+     * state when it is newer than the live one (or revised at the same instant). Records that arrived live while the recovery was
+     * pending are already in the live store and are kept: a merge, never a replacement.
      */
     synchronized List<String[]> promote(Store staged) {
         List<String[]> frames = new ArrayList<>();
+        AtomicLong notCounted = new AtomicLong();   // the staged copy re-presents bars the live store already holds
         for (int i = 0; i < staged.bars.length; i++) {
-            ArrayList<Bar> was = live.bars[i];
-            long tail = was.isEmpty() ? Long.MIN_VALUE : was.get(was.size() - 1).startMs();
             for (Bar b : staged.bars[i]) {
-                if (b.startMs() > tail) {
+                if (live.merge(i, b, notCounted)) {
                     frames.add(new String[] {BAR_EVENT, b.json()});
                 }
             }
         }
         for (int s = 0; s < SYMBOLS.length; s++) {
-            if (staged.currentFrame[s] != null && staged.currentMs[s] > live.currentMs[s]) {
-                frames.add(new String[] {CURRENT_EVENT, staged.currentFrame[s]});
+            String frame = staged.currentFrame[s];
+            if (frame != null && (staged.currentMs[s] > live.currentMs[s]
+                    || (staged.currentMs[s] == live.currentMs[s] && !frame.equals(live.currentFrame[s])))) {
+                live.current[s] = staged.current[s];
+                live.currentBytes[s] = staged.currentBytes[s];
+                live.currentFrame[s] = frame;
+                live.currentMs[s] = staged.currentMs[s];
+                live.version++;
+                frames.add(new String[] {CURRENT_EVENT, frame});
             }
         }
-        live = staged;
-        helloCache = null;   // a different store: the version counters of the two are unrelated
         return frames;
     }
 
@@ -283,6 +288,10 @@ final class StudiesRelay {
             singleBytes[t] = headBytes + pieceBytes[t] + 8;
         }
         String frame = all.append("}}").toString();
+        if (publishedMs == target.currentMs[s] && frame.equals(target.currentFrame[s])) {
+            accepted.incrementAndGet();
+            return frame;   // an identical republish: accepted and forwarded, nothing retained changes (the hello cache stays valid)
+        }
         target.version++;
         target.current[s] = single;
         target.currentBytes[s] = singleBytes;
