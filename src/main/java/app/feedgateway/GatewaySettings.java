@@ -340,6 +340,37 @@ public final class GatewaySettings {
     }
 
     /**
+     * Phase A studies relay (frames {@code indicator-studies} / {@code indicator-studies-current} and the hello's study
+     * fields; ta-books-catalog/03_STUDIES_FRAME_CONTRACT.md). OFF by default: absent study fields in the hello are how the
+     * page learns this gateway has no study stream.
+     */
+    public boolean studiesEnabled() {
+        return boolValue("GATEWAY_STUDIES_ENABLED", false);
+    }
+
+    /** StudyBar topics: the locally computed SPX one and the es4-mirrored ES one, exactly like the signals topics. */
+    public java.util.Set<String> studiesBarsTopics() {
+        return studiesTopics("KAFKA_INDICATORS_STUDIES_BARS_TOPIC", "options.indicators.studies.bars");
+    }
+
+    /** StudiesCurrent topics (compacted last value per symbol): local SPX and the mirrored ES one. */
+    public java.util.Set<String> studiesCurrentTopics() {
+        return studiesTopics("KAFKA_INDICATORS_STUDIES_CURRENT_TOPIC", "options.indicators.studies.current");
+    }
+
+    private java.util.Set<String> studiesTopics(String variable, String defaultName) {
+        java.util.LinkedHashSet<String> topics = new java.util.LinkedHashSet<>();
+        topics.add(value(variable, defaultName));
+        topics.add("es." + defaultName);
+        return topics;
+    }
+
+    /** How far back the bars topic is re-read on a cold start to rebuild the hello history (a weekend plus a margin). */
+    public long studiesRecoveryMs() {
+        return longValue("GATEWAY_STUDIES_RECOVERY_HOURS", 72L, 1L) * 3_600_000L;
+    }
+
+    /**
      * Early-auction verdict evidence ledger (EARLY-AUCTION-VERDICT-STAGE1-GATE1.md:
      * {@code early-auction.verdicts.shadow}, JSON, ONE partition, one immutable record per line —
      * PREDICTION / OUTCOME / MISS / terminals). Feeds the read-only {@code /early-auction} web panel

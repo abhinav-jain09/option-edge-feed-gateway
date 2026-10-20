@@ -804,6 +804,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong marketStructurePatternsDrops = new AtomicLong();
     /** PATTERNS: sets refused because their asOfMs REGRESSED against what is retained for that timeframe. */
     private final AtomicLong marketStructurePatternsRegressions = new AtomicLong();
+    /** Phase A studies: the relay's retained bars and current states, validated and rendered at the gateway boundary. */
+    private final StudiesRelay studies;
     static final java.util.List<String> MARKET_STRUCTURE_PATTERN_TIMEFRAMES = java.util.List.of("1m", "5m", "15m");
     /** U16 retention baseline: the provenance of the retained record; guarded by the retain lock. */
     private CvdSpxLevelsProvenance cvdSpxLevelsProvenance;
@@ -972,6 +974,7 @@ public class FeedGatewayService implements ReplayRunner {
                               @Nullable SessionRoutingEngine routingEngine) {
         this.settings = settings;
         this.mapper = mapper;
+        this.studies = new StudiesRelay(mapper);
         this.hpsfViewMapper = hpsfViewMapper;
         this.routingEngine = routingEngine;
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
@@ -1001,6 +1004,7 @@ public class FeedGatewayService implements ReplayRunner {
                        @Nullable SessionRoutingEngine routingEngine, FootprintTopicGate.ConfigReader footprintReader) {
         this.settings = settings;
         this.mapper = mapper;
+        this.studies = new StudiesRelay(mapper);
         this.hpsfViewMapper = hpsfViewMapper;
         this.routingEngine = routingEngine;
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
@@ -1165,6 +1169,7 @@ public class FeedGatewayService implements ReplayRunner {
             seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
         }
         seekMarketStructureSnapshot(consumer, partitions, topicEvents);
+        seekStudies(consumer, partitions, topicEvents);
         // The auction is positioned by ONE rule on both paths: the live cursor, then the frozen handoff,
         // and with neither the partition is PAUSED rather than consumed from a guessed position. It runs
         // AFTER the generic seek above, whose lazy seekToEnd it deliberately overrides.
@@ -1176,6 +1181,7 @@ public class FeedGatewayService implements ReplayRunner {
         seekAddedLivePartitions(consumer, refresh, topicEvents);
         seekFootprintToEnd(consumer, refresh.added());
         seekMarketStructureSnapshot(consumer, refresh.added(), topicEvents);
+        seekStudies(consumer, refresh.added(), topicEvents);
     }
 
     /** The live-only structure snapshot — and the pattern sets beside it — may be quiet all night or over a
@@ -2246,6 +2252,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# TYPE gateway_market_structure_patterns_enabled gauge\n"
                 + "gateway_market_structure_patterns_enabled " + boolMetric(settings.marketStructurePatternsEnabled()) + "\n"
                 + marketStructurePatternsCounterMetrics()
+                + studiesMetrics()
                 + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
                 + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
                 + "gateway_cvd_spx_levels_enabled " + boolMetric(settings.esCvdSpxLevelsEnabled()) + "\n"
@@ -2861,6 +2868,16 @@ public class FeedGatewayService implements ReplayRunner {
         for (String signalsTopic : settings.indicatorsSignalsTopics()) {
             topicEvents.put(signalsTopic, new TopicBinding("DATABENTO", "indicator-signals"));
         }
+        if (settings.studiesEnabled()) {
+            // Phase A studies: Avro, LIVE consumer only (the cache consumer has no case for them; the relay keeps its own
+            // bounded history and last states and recovers them with a seek-back, see seekStudies).
+            for (String barsTopic : settings.studiesBarsTopics()) {
+                topicEvents.put(barsTopic, new TopicBinding("DATABENTO", StudiesRelay.BAR_EVENT));
+            }
+            for (String currentTopic : settings.studiesCurrentTopics()) {
+                topicEvents.put(currentTopic, new TopicBinding("DATABENTO", StudiesRelay.CURRENT_EVENT));
+            }
+        }
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
@@ -3371,6 +3388,8 @@ public class FeedGatewayService implements ReplayRunner {
                         // Avro on the wire, canonical JSON at REST. Skip enrichJson so the
                         // producer remains the only author of contract fields.
                         json = avroJson(record.value());
+                    } else if (binding != null && isStudiesEvent(binding.event())) {
+                        json = null;   // the studies relay renders and validates the record itself, below
                     } else if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
@@ -3742,6 +3761,8 @@ public class FeedGatewayService implements ReplayRunner {
             structureRecovery.end.putAll(marketStructureEndOffsets(consumer, partitions, topicEvents));
             MarketStructurePatternsRecovery patternsRecovery = newMarketStructurePatternsRecovery();
             patternsRecovery.end.putAll(marketStructurePatternsEndOffsets(consumer, partitions, topicEvents));
+            StudiesRecovery studiesRecovery = new StudiesRecovery();
+            studiesRecovery.begin(studiesEndOffsets(consumer, partitions, topicEvents));
             liveBootstrapSeek(consumer, partitions, topicEvents, retry);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             PollMaintenance canonicalMaintenance = new PollMaintenance(settings.pollMs());
@@ -3762,6 +3783,7 @@ public class FeedGatewayService implements ReplayRunner {
                         if (patternsRecovery.end.isEmpty()) patternsRecovery = newMarketStructurePatternsRecovery();
                         patternsRecovery.end.putAll(addedPatternsEnd);
                     }
+                    studiesRecovery.begin(studiesEndOffsets(consumer, refresh.added(), topicEvents));
                     liveAdoptionSeek(consumer, refresh, topicEvents);
                 }
                 // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
@@ -3831,6 +3853,10 @@ public class FeedGatewayService implements ReplayRunner {
                     }
                     if (binding != null && "market-structure-patterns".equals(binding.event()) && !patternsRecovery.end.isEmpty()) {
                         stageMarketStructurePatterns(patternsRecovery, record, json);
+                        continue;
+                    }
+                    if (binding != null && isStudiesEvent(binding.event())) {
+                        onStudiesRecord(studiesRecovery, binding.event(), record);
                         continue;
                     }
                     if (binding == null || json == null || json.isBlank()) {
@@ -4357,6 +4383,7 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 finishMarketStructureRecovery(consumer, structureRecovery);
                 finishMarketStructurePatternsRecovery(consumer, patternsRecovery);
+                finishStudiesRecovery(consumer, studiesRecovery);
                 if (avro || canonicalMaintenance.due(System.nanoTime())) purgeExpiredCache(System.currentTimeMillis());
                 if (settings.ibkrPreOpenEnabled()) {
                     // Consumer-local window transitions fire from the live loop too — either
@@ -12802,6 +12829,97 @@ public class FeedGatewayService implements ReplayRunner {
         return marketStructureRegressions.get();
     }
 
+    // ── Phase A studies: consumer glue (the data and the decisions live in StudiesRelay) ───────────────
+    static boolean isStudiesEvent(String event) {
+        return StudiesRelay.BAR_EVENT.equals(event) || StudiesRelay.CURRENT_EVENT.equals(event);
+    }
+
+    private String studiesMetrics() {
+        return settings.studiesEnabled()
+                ? "# HELP gateway_studies_enabled Whether the Phase A studies relay is enabled.\n"
+                        + "# TYPE gateway_studies_enabled gauge\ngateway_studies_enabled 1\n" + studies.metrics()
+                : "";
+    }
+
+    /** The compacted current topic is re-read from its tail: one symbol per topic, so the last records hold the latest state. */
+    private static final long STUDIES_CURRENT_TAIL_RECORDS = 8L;
+
+    /** Cold start, retry and late adoption: the bars are re-read from a window back, the current state from its tail. */
+    void seekStudies(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions, Map<String, TopicBinding> topicEvents) {
+        Map<TopicPartition, Long> timestamps = new HashMap<>();
+        List<TopicPartition> tails = new ArrayList<>();
+        long cutoff = System.currentTimeMillis() - settings.studiesRecoveryMs();
+        for (TopicPartition partition : partitions) {
+            TopicBinding binding = topicEvents.get(partition.topic());
+            if (binding == null) {
+                continue;
+            }
+            if (StudiesRelay.BAR_EVENT.equals(binding.event())) {
+                timestamps.put(partition, cutoff);
+            } else if (StudiesRelay.CURRENT_EVENT.equals(binding.event())) {
+                tails.add(partition);
+            }
+        }
+        seekToTimestampsOrEnd(consumer, timestamps, new ArrayList<>());
+        if (!tails.isEmpty()) {
+            Map<TopicPartition, Long> begin = consumer.beginningOffsets(tails);
+            Map<TopicPartition, Long> end = consumer.endOffsets(tails);
+            for (TopicPartition p : tails) {
+                consumer.seek(p, Math.max(begin.get(p), end.get(p) - STUDIES_CURRENT_TAIL_RECORDS));
+            }
+        }
+    }
+
+    private Map<TopicPartition, Long> studiesEndOffsets(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions,
+                                                        Map<String, TopicBinding> topicEvents) {
+        Map<TopicPartition, Long> end = new HashMap<>(recoveryEndOffsets(consumer, partitions, topicEvents, StudiesRelay.BAR_EVENT));
+        end.putAll(recoveryEndOffsets(consumer, partitions, topicEvents, StudiesRelay.CURRENT_EVENT));
+        return end;
+    }
+
+    /** Records read up to the captured end offsets go into a private copy; one promotion then broadcasts what is new. */
+    final class StudiesRecovery {
+        final Map<TopicPartition, Long> end = new HashMap<>();
+        StudiesRelay.Store staged;
+
+        void begin(Map<TopicPartition, Long> captured) {
+            if (captured.isEmpty()) {
+                return;
+            }
+            if (end.isEmpty()) {
+                staged = studies.newStaging();
+            }
+            end.putAll(captured);
+        }
+    }
+
+    private void onStudiesRecord(StudiesRecovery recovery, String event, ConsumerRecord<String, Object> record) {
+        if (record.value() == null) {
+            studies.onDrop();   // a tombstone retains nothing and withdraws nothing
+        } else if (!recovery.end.isEmpty()) {
+            studies.onStaged(recovery.staged, event, record.key(), record.value());
+        } else {
+            String frame = studies.onLive(event, record.key(), record.value());
+            if (frame != null) {
+                broadcast(event, frame);
+                forwardedEvents.incrementAndGet();
+            }
+        }
+    }
+
+    private void finishStudiesRecovery(KafkaConsumer<?, ?> consumer, StudiesRecovery recovery) {
+        if (recovery.end.isEmpty() || !caughtUp(consumer, recovery.end)) {
+            return;
+        }
+        List<String[]> frames = studies.promote(recovery.staged);
+        recovery.end.clear();
+        recovery.staged = null;
+        for (String[] frame : frames) {
+            broadcast(frame[0], frame[1]);
+            forwardedEvents.incrementAndGet();
+        }
+    }
+
     // ── PATTERNS (market-structure PatternAnnotationSet v1) boundary + retention ──────────────────
     /** With the stream OFF the only pattern metric is the enabled gauge — the metrics text is otherwise what it was (R6.4 flag-off contract). */
     private String marketStructurePatternsCounterMetrics() {
@@ -12997,6 +13115,7 @@ public class FeedGatewayService implements ReplayRunner {
         // G-R6.2 mutation (which drops the footprint term from the line below) still applies verbatim.
         if (settings.marketStructureEnabled()) return true;
         if (settings.marketStructurePatternsEnabled()) return true;      // PATTERNS joins the hello too
+        if (settings.studiesEnabled()) return true;                      // so do the Phase A studies
         return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || footprintViews != null;
     }
 
@@ -13039,6 +13158,11 @@ public class FeedGatewayService implements ReplayRunner {
                 sb.append('"').append(tf).append("\":").append(e == null ? "null" : e.json());
             }
             sb.append('}');
+        }
+        if (settings.studiesEnabled()) {
+            // Phase A studies (03_STUDIES_FRAME_CONTRACT.md): the latest current state and the recent finalized bars per
+            // timeframe, SPX in studies/studyBars and ES in esStudies/esStudyBars; the fields' presence = flag on.
+            sb.append(studies.helloFields());
         }
         if (footprintViews != null) {
             // G-R6: ONE atomic snapshot of the footprint coordinator rides the SAME hello; the field's
@@ -14300,6 +14424,8 @@ public class FeedGatewayService implements ReplayRunner {
             "status", "reset", "source-switching", "source-ready", "source-stale",
             // Candlestick pattern annotation sets (market-structure service): global, verbatim, flag-gated.
             "market-structure-patterns",
+            // Phase A study frames (indicator-service): global, per symbol, symbol-filtered client-side, flag-gated.
+            StudiesRelay.BAR_EVENT, StudiesRelay.CURRENT_EVENT,
             // Pre-open IBKR GEX window state (rev13 R-STATE): a GLOBAL control/status stream —
             // identical for all users, sessionId-gated client-side. Allowlisted so the
             // standalone broadcast reaches sockets in per-session (auth) mode too
