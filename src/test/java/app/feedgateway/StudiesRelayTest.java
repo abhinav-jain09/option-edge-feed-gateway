@@ -96,7 +96,7 @@ class StudiesRelayTest {
         bad.add(new Object[] {null, ok, "null key"});
         bad.add(new Object[] {"SPX|5m", current("SPX", 0), "a StudiesCurrent on the bars event"});
         bad.add(new Object[] {"SPX|5m", "not a record", "a non-record value"});
-        r = bar("SPX", "T5M", 0); r.put("calibration", "x".repeat(StudiesRelay.BAR_MAX_CHARS));
+        r = bar("SPX", "T5M", 0); r.put("calibration", "x".repeat(StudiesRelay.BAR_MAX_BYTES));
         bad.add(new Object[] {"SPX|5m", r, "oversize"});
         int n = 0;
         for (Object[] b : bad) {
@@ -173,7 +173,7 @@ class StudiesRelayTest {
         assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "NDX", current("NDX", 9)));
         assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", bar("SPX", "T5M", 0)), "a StudyBar on the current event");
         GenericRecord oversize = current("SPX", 9);
-        oversize.put("runId", "x".repeat(StudiesRelay.CURRENT_MAX_CHARS));
+        oversize.put("runId", "x".repeat(StudiesRelay.CURRENT_MAX_BYTES));
         assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", oversize));
         assertEquals(5L, relay.dropsForTest());
         assertEquals("5", hello().get("studies").get("1m").get("revision").asText(), "the retained state is the last accepted one");
@@ -219,7 +219,7 @@ class StudiesRelayTest {
             }
         }
         String fields = relay.helloFields();
-        assertTrue(fields.length() < StudiesRelay.HELLO_MAX_CHARS, "full hello is " + fields.length() + " chars");
+        assertTrue(fields.length() < StudiesRelay.HELLO_MAX_BYTES, "full hello is " + fields.length() + " chars");
         JsonNode h = hello();
         for (String f : List.of("studyBars", "esStudyBars")) {
             for (String tf : List.of("1m", "5m", "15m")) {
@@ -235,12 +235,12 @@ class StudiesRelayTest {
         for (String tf : List.of("T1M", "T5M")) {
             for (int i = 0; i < StudiesRelay.HISTORY_BARS; i++) {
                 GenericRecord big = bar("SPX", tf, i);
-                big.put("calibration", "x".repeat(StudiesRelay.BAR_MAX_CHARS - 12_000));   // under the per-bar bound, far over the hello budget in sum
+                big.put("calibration", "x".repeat(StudiesRelay.BAR_MAX_BYTES - 12_000));   // under the per-bar bound, far over the hello budget in sum
                 assertNotNull(relay.onLive(StudiesRelay.BAR_EVENT, barKey(big), big));
             }
         }
         String fields = relay.helloFields();
-        assertTrue(fields.length() <= StudiesRelay.HELLO_MAX_CHARS, "length " + fields.length());
+        assertTrue(fields.length() <= StudiesRelay.HELLO_MAX_BYTES, "length " + fields.length());
         JsonNode h = hello();
         int kept1m = h.get("studyBars").get("1m").size(), kept5m = h.get("studyBars").get("5m").size();
         assertTrue(kept1m + kept5m < 2 * StudiesRelay.HISTORY_BARS && kept1m > 0 && kept5m > 0);
@@ -291,5 +291,70 @@ class StudiesRelayTest {
         for (String c : List.of("accepted_total", "drops_total", "regressions_total", "duplicates_total")) {
             assertTrue(m.contains("gateway_studies_" + c + " "), c);
         }
+    }
+
+    @Test
+    void theHelloBudgetIsMeasuredInUtf8BytesNotCharacters() throws Exception {
+        // 22k two-byte characters = 44 KB per bar: under the 64 KiB per-bar bound, 24 bars = ~1.1 MB, far over the hello budget
+        for (String tf : List.of("T1M", "T5M", "T15M")) {
+            for (int i = 0; i < StudiesRelay.HISTORY_BARS; i++) {
+                GenericRecord big = bar("SPX", tf, i);
+                big.put("calibration", "\u00e9".repeat(22_000));
+                assertNotNull(relay.onLive(StudiesRelay.BAR_EVENT, barKey(big), big));
+            }
+        }
+        String fields = relay.helloFields();
+        assertEquals(fields.getBytes(java.nio.charset.StandardCharsets.UTF_8).length, StudiesRelay.utf8Length(fields));
+        assertTrue(StudiesRelay.utf8Length(fields) <= StudiesRelay.HELLO_MAX_BYTES, "bytes " + StudiesRelay.utf8Length(fields));
+        GenericRecord tooBigInBytes = bar("SPX", "T5M", 50);
+        tooBigInBytes.put("calibration", "\u00e9".repeat(StudiesRelay.BAR_MAX_BYTES / 2));   // 32 KiB characters, over the bound only in bytes
+        assertNull(live(tooBigInBytes));
+    }
+
+    @Test
+    void anOverBudgetSetOfCurrentEntriesDegradesToNullLargestFirstNeverAnOversizedHello() throws Exception {
+        for (String symbol : List.of("SPX", "ES")) {
+            GenericRecord c = current(symbol, 1);
+            c.put("runId", "r".repeat(100_000));   // the header repeats in every one of the three entries of each symbol
+            assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, symbol, c));
+        }
+        String fields = relay.helloFields();
+        assertTrue(StudiesRelay.utf8Length(fields) <= StudiesRelay.HELLO_MAX_BYTES, "bytes " + StudiesRelay.utf8Length(fields));
+        JsonNode h = hello();
+        int nulls = 0;
+        int objects = 0;
+        for (String f : List.of("studies", "esStudies")) {
+            for (String tf : List.of("1m", "5m", "15m")) {
+                if (h.get(f).get(tf).isNull()) {
+                    nulls++;
+                } else {
+                    objects++;
+                }
+            }
+        }
+        assertTrue(nulls > 0 && objects > 0, "some entries degrade to null, not all: " + nulls + "/" + objects);
+    }
+
+    @Test
+    void aRecordWithAbsurdCollectionsIsRefusedBeforeItIsRendered() throws Exception {
+        GenericRecord b = bar("SPX", "T5M", 0);
+        java.util.Map<String, Object> values = new java.util.HashMap<>();
+        for (int i = 0; i <= StudiesRelay.MAX_VALUES; i++) {
+            values.put("v" + i, StudiesFixtures.minimal(StudiesFixtures.BAR.getField("values").schema().getValueType()));
+        }
+        b.put("values", values);
+        assertNull(live(b));
+        assertEquals(1L, relay.dropsForTest());
+    }
+
+    @Test
+    void theHelloIsNotRebuiltByRecordsThatChangeNothing() throws Exception {
+        live(bar("SPX", "T5M", 1));
+        String first = relay.helloFields();
+        assertNull(live(bar("SPX", "T5M", 1)), "a duplicate");
+        assertNull(relay.onLive(StudiesRelay.BAR_EVENT, "NDX|5m", bar("NDX", "T5M", 2)), "refused");
+        assertTrue(first == relay.helloFields(), "same cached string: no rebuild for a duplicate or a refused record");
+        live(bar("SPX", "T5M", 2));
+        assertFalse(first == relay.helloFields(), "a new bar changes the hello");
     }
 }

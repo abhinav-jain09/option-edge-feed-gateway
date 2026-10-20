@@ -45,7 +45,18 @@
   },
   {
    "name": "quality",
-   "type": "com.optionsedge.contracts.indicators.avro.QualityState"
+   "type": {
+    "type": "enum",
+    "namespace": "com.optionsedge.contracts.indicators.avro",
+    "name": "QualityState",
+    "symbols": [
+     "WARMING_UP",
+     "READY",
+     "STALE",
+     "INCOMPLETE",
+     "ABSENT"
+    ]
+   }
   },
   {
    "name": "restored",
@@ -95,18 +106,7 @@
           },
           {
            "name": "state",
-           "type": {
-            "type": "enum",
-            "namespace": "com.optionsedge.contracts.indicators.avro",
-            "name": "QualityState",
-            "symbols": [
-             "WARMING_UP",
-             "READY",
-             "STALE",
-             "INCOMPLETE",
-             "ABSENT"
-            ]
-           }
+           "type": "com.optionsedge.contracts.indicators.avro.QualityState"
           },
           {
            "name": "reason",
