@@ -407,13 +407,14 @@ class StudiesRelayTest {
         StudiesRelay.Store staged = relay.newStaging();
         assertTrue(relay.promote(staged).isEmpty(), "identical to what is live: nothing owed");
         GenericRecord revised = current("SPX", 5);
-        revised.put("runId", "run-2");
+        revised.put("revision", 6L);   // same run, same instant, higher revision
+        revised.put("calibration", "UNVALIDATED");
         relay.onStaged(staged, StudiesRelay.CURRENT_EVENT, "SPX", revised);
         List<String[]> frames = relay.promote(staged);
         assertEquals(1, frames.size());
         assertEquals(StudiesRelay.CURRENT_EVENT, frames.get(0)[0]);
-        assertEquals("run-2", JSON.readTree(frames.get(0)[1]).get("runId").asText());
-        assertEquals("run-2", hello().get("studies").get("1m").get("runId").asText(), "the hello and the sockets agree");
+        assertEquals(6L, JSON.readTree(frames.get(0)[1]).get("revision").asLong());
+        assertEquals(6L, hello().get("studies").get("1m").get("revision").asLong(), "the hello and the sockets agree");
     }
 
     @Test
@@ -453,5 +454,42 @@ class StudiesRelayTest {
         assertEquals(6L, relay.dropsForTest());
         assertEquals(0, hello().get("studyBars").get("5m").size() + hello().get("studyBars").get("1m").size());
         assertNotNull(live(bar("SPX", "T5M", 6)), "a well-formed bar is still accepted");
+    }
+
+    @Test
+    void aSameInstantStateNeedsAHigherRevisionFromTheSameRunToReplaceTheHeldOne() throws Exception {
+        GenericRecord first = current("SPX", 5);
+        first.put("revision", 10L);
+        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", first));
+        GenericRecord delayedOlder = current("SPX", 5);
+        delayedOlder.put("revision", 9L);
+        delayedOlder.put("quality", StudiesFixtures.CURRENT.getField("quality").schema().getEnumSymbols().get(0));   // differs from the held content
+        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", delayedOlder), "an older revision of the same instant is a regression");
+        GenericRecord otherRun = current("SPX", 5);
+        otherRun.put("runId", "run-2");
+        otherRun.put("revision", 99L);
+        otherRun.put("calibration", "UNVALIDATED");
+        otherRun.put("restored", true);
+        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", otherRun), "another run does not displace the held state of that instant");
+        assertEquals(2L, relay.regressionsForTest());
+        assertEquals("10", hello().get("studies").get("1m").get("revision").asText());
+        GenericRecord newer = current("SPX", 5);
+        newer.put("revision", 11L);
+        newer.put("restored", true);
+        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", newer));
+        assertEquals("11", hello().get("studies").get("1m").get("revision").asText());
+    }
+
+    @Test
+    void anAbsurdStringOrMapKeyIsRefusedBeforeAnythingIsRendered() throws Exception {
+        GenericRecord hugeString = bar("SPX", "T5M", 0);
+        hugeString.put("calibration", "x".repeat(StudiesRelay.BAR_MAX_BYTES + 1));
+        GenericRecord hugeKey = bar("SPX", "T5M", 1);
+        @SuppressWarnings("unchecked") java.util.Map<String, Object> values = (java.util.Map<String, Object>) hugeKey.get("values");
+        values.put("k".repeat(StudiesRelay.BAR_MAX_BYTES + 1), StudiesFixtures.minimal(StudiesFixtures.BAR.getField("values").schema().getValueType()));
+        assertNull(live(hugeString));
+        assertNull(live(hugeKey));
+        assertEquals(2L, relay.dropsForTest());
+        assertTrue(StudiesRelay.withinBytes(bar("SPX", "T5M", 2), new int[] {StudiesRelay.BAR_MAX_BYTES}), "a normal bar is within its bound");
     }
 }

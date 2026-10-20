@@ -65,6 +65,9 @@ final class StudiesRelay {
         /** Per symbol: the frame data of the latest current state (timeframes reduced to the three forwarded keys). */
         final String[] currentFrame = new String[SYMBOLS.length];
         final long[] currentMs = new long[SYMBOLS.length];
+        /** The producer run and revision of the retained current state: the tie-break between two states of the same instant. */
+        final String[] currentRun = new String[SYMBOLS.length];
+        final long[] currentRevision = new long[SYMBOLS.length];
 
         Store() {
             for (int i = 0; i < bars.length; i++) {
@@ -85,6 +88,8 @@ final class StudiesRelay {
             c.version = version;
             System.arraycopy(currentFrame, 0, c.currentFrame, 0, currentFrame.length);
             System.arraycopy(currentMs, 0, c.currentMs, 0, currentMs.length);
+            System.arraycopy(currentRun, 0, c.currentRun, 0, currentRun.length);
+            System.arraycopy(currentRevision, 0, c.currentRevision, 0, currentRevision.length);
             return c;
         }
 
@@ -166,9 +171,10 @@ final class StudiesRelay {
         }
         for (int s = 0; s < SYMBOLS.length; s++) {
             String frame = staged.currentFrame[s];
-            if (frame != null && (staged.currentMs[s] > live.currentMs[s]
-                    || (staged.currentMs[s] == live.currentMs[s] && !frame.equals(live.currentFrame[s])))) {
+            if (frame != null && supersedes(live, s, staged.currentMs[s], staged.currentRun[s], staged.currentRevision[s])) {
                 live.current[s] = staged.current[s];
+                live.currentRun[s] = staged.currentRun[s];
+                live.currentRevision[s] = staged.currentRevision[s];
                 live.currentBytes[s] = staged.currentBytes[s];
                 live.currentFrame[s] = frame;
                 live.currentMs[s] = staged.currentMs[s];
@@ -208,6 +214,10 @@ final class StudiesRelay {
                 || !Integer.valueOf(1).equals(r.get("schemaVersion")) || "EMPTY".equals(status) || barId.isEmpty()
                 || !(symbol + "|" + TF[t]).equals(String.valueOf(key)) || !withinBarBounds(r)) {
             drops.incrementAndGet();
+            return null;
+        }
+        if (!withinBytes(r, new int[] {BAR_MAX_BYTES})) {
+            drops.incrementAndGet();   // an absurd string or key is refused by a read-only walk, before anything is rendered
             return null;
         }
         String barStart = str(r, "barStart");
@@ -254,6 +264,12 @@ final class StudiesRelay {
             regressions.incrementAndGet();
             return null;
         }
+        if (!withinBytes(r, new int[] {CURRENT_MAX_BYTES})) {
+            drops.incrementAndGet();
+            return null;
+        }
+        String runId = str(r, "runId");
+        long revision = ((Number) r.get("revision")).longValue();
         Schema.Field timeframes = r.getSchema().getField("timeframes");
         Map<?, ?> byTf = (Map<?, ?>) r.get("timeframes");
         if (byTf.size() > MAX_TIMEFRAMES || !withinCurrentBounds(byTf)) {
@@ -304,7 +320,13 @@ final class StudiesRelay {
             accepted.incrementAndGet();
             return frame;   // an identical republish: accepted and forwarded, nothing retained changes (the hello cache stays valid)
         }
+        if (!supersedes(target, s, publishedMs, runId, revision)) {
+            regressions.incrementAndGet();   // the same instant from the same run needs a higher revision; another run does not displace the held one
+            return null;
+        }
         target.version++;
+        target.currentRun[s] = runId;
+        target.currentRevision[s] = revision;
         target.current[s] = single;
         target.currentBytes[s] = singleBytes;
         target.currentFrame[s] = frame;
@@ -429,6 +451,52 @@ final class StudiesRelay {
 
     long duplicatesForTest() {
         return duplicates.get();
+    }
+
+    /**
+     * Whether a state of {@code publishedMs} / {@code run} / {@code revision} replaces the one {@code held} retains for symbol
+     * {@code s}: a later instant always; the same instant only from the same run with a higher revision (a delayed older revision
+     * of the same instant, or another run's state of that instant, never rolls the retained state back or sideways).
+     */
+    private static boolean supersedes(Store held, int s, long publishedMs, String run, long revision) {
+        return held.currentFrame[s] == null || publishedMs > held.currentMs[s]
+                || (publishedMs == held.currentMs[s] && run.equals(held.currentRun[s]) && revision > held.currentRevision[s]);
+    }
+
+    /**
+     * A read-only walk of a decoded record that spends {@code budget[0]} on every string (its length), map key, number and element and
+     * returns false once it is exhausted: an absurdly long string or key is refused here, before any JSON is rendered. A lower bound of
+     * the rendered size, so it never refuses a record the rendered-size check would accept.
+     */
+    static boolean withinBytes(Object v, int[] budget) {
+        if (v == null) {
+            return true;
+        }
+        if (v instanceof CharSequence cs) {
+            budget[0] -= cs.length();
+        } else if (v instanceof GenericRecord rec) {
+            for (Schema.Field f : rec.getSchema().getFields()) {
+                if (!withinBytes(rec.get(f.pos()), budget)) {
+                    return false;
+                }
+            }
+            budget[0] -= 2;
+        } else if (v instanceof Map<?, ?> m) {
+            for (Map.Entry<?, ?> e : m.entrySet()) {
+                if (!withinBytes(e.getKey(), budget) || !withinBytes(e.getValue(), budget)) {
+                    return false;
+                }
+            }
+        } else if (v instanceof java.util.Collection<?> c) {
+            for (Object x : c) {
+                if (!withinBytes(x, budget)) {
+                    return false;
+                }
+            }
+        } else {
+            budget[0] -= 1;   // a number, a boolean or an enum symbol
+        }
+        return budget[0] >= 0;
     }
 
     /** Bar bounds before rendering: the value/state maps and the two lists are the only unbounded parts of a StudyBar. */
