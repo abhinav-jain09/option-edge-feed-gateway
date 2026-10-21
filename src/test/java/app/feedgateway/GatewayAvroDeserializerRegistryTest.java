@@ -14,7 +14,13 @@ class GatewayAvroDeserializerRegistryTest {
     @Test
     void anUnreachableRegistryFailsThePollInsteadOfDroppingTheRecord() {
         Map<String, Object> config = new HashMap<>();
-        config.put("schema.registry.url", "http://127.0.0.1:1");   // nothing listens there: connection refused
+        int closedPort;
+        try (java.net.ServerSocket probe = new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+            closedPort = probe.getLocalPort();   // bound, then closed: nothing listens there, a refused connection (deterministic)
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException(e);
+        }
+        config.put("schema.registry.url", "http://127.0.0.1:" + closedPort);
         config.put(GatewayAvroDeserializer.SPX_PRICE_TOPIC, "underlying.spx.price");
         config.put(GatewayAvroDeserializer.TOLERANT_TOPICS, "chart.topic");
         try (GatewayAvroDeserializer d = new GatewayAvroDeserializer()) {

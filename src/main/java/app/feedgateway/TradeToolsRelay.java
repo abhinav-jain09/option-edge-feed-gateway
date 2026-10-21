@@ -187,7 +187,11 @@ final class TradeToolsRelay extends TaRelay {
                 if (t == null) {
                     return -1;
                 }
-                if (h.kind() >= 2 && !h.epoch().equals(charts[t].get(h.chartId()).epoch())) {
+                Held retained = charts[t].get(h.chartId());
+                if (h.kind() == 1 && !h.epoch().equals(retained.epoch()) && h.asOf() < retained.asOf()) {
+                    return -1;   // a column of another epoch published BEFORE the retained chart state is the old epoch's late column; one published at or after it is the new epoch's, ahead of its chart state
+                }
+                if (h.kind() >= 2 && !h.epoch().equals(retained.epoch())) {
                     return -1;   // an event of another contract epoch than the retained chart: a stale one is refused, a newer one waits (staging) for its chart
                 }
                 h = h.at(t);

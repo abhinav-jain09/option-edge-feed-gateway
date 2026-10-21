@@ -214,6 +214,16 @@ class TradeToolsRelayTest {
     }
 
     @Test
+    void aLateColumnOfTheOldEpochIsRefusedWhileTheNewEpochsColumnIsNot() throws Exception {
+        var relay = new TradeToolsRelay();
+        relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("c", "M5", 100), "contractEpoch", "ESH7"));
+        // published BEFORE the retained chart state (asOf 50 < 100) under the old epoch: late, refused
+        assertNull(relay.onLive(COLUMN, TaFixtures.put(TaFixtures.column("c", 1, 50), "contractEpoch", "ESZ6")));
+        // published at or after it under the new epoch: the new epoch's column, ahead of (or equal to) its chart state: kept
+        assertNotNull(relay.onLive(COLUMN, TaFixtures.put(TaFixtures.column("c", 2, 120), "contractEpoch", "ESM7")));
+    }
+
+    @Test
     void aDelayedRecordThatWouldBeEvictedAtOnceIsRefusedNotForwarded() throws Exception {
         var relay = new TradeToolsRelay();
         for (int i = 0; i < TradeToolsRelay.FLOW_BARS; i++) {

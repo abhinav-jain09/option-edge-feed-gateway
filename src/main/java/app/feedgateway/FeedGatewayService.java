@@ -2840,7 +2840,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void runAvroLiveConsumer() {
-        Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
+        Map<String, TopicBinding> topicEvents = new UniqueBindings();
         topicEvents.put(settings.ibkrDisplayTopic(), new TopicBinding("IBKR", "snapshot"));
         topicEvents.put(settings.ibkrPaceTopic(), new TopicBinding("IBKR", "pace"));
         topicEvents.put(settings.ibkrPaceRankTopic(), new TopicBinding("IBKR", "pace-rank"));
@@ -2926,6 +2926,18 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** Binds one chart relay topic; two roles (or a chart topic and another stream) on one topic would silently route records to the wrong relay, so it refuses to start. */
+    /** The Avro consumer's bindings: a topic bound to one stream can never be silently re-bound to another (a misrouting configuration refuses to start). */
+    static final class UniqueBindings extends LinkedHashMap<String, TopicBinding> {
+        @Override
+        public TopicBinding put(String topic, TopicBinding binding) {
+            TopicBinding old = get(topic);
+            if (old != null && !old.equals(binding)) {
+                throw new IllegalStateException("topic " + topic + " is configured for two gateway streams (" + old.event() + ", " + binding.event() + "); refusing to start with a misrouting binding");
+            }
+            return super.put(topic, binding);
+        }
+    }
+
     /** A topic already bound to another stream must never be silently re-bound. */
     static void requireUnbound(Map<String, TopicBinding> topicEvents, String topic) {
         if (topicEvents.containsKey(topic)) {
