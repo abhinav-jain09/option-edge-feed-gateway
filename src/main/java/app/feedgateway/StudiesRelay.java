@@ -67,6 +67,8 @@ final class StudiesRelay {
     private static final String[] CURRENT_FIELD = {"studies", "esStudies"};
     private static final String[] BARS_FIELD = {"studyBars", "esStudyBars"};
     private static final String[] TF = {"1m", "5m", "15m"};
+    /** The producer's whole timeframe key set of a StudiesCurrent (its validator requires exactly these six); three are forwarded. */
+    private static final java.util.Set<String> PRODUCER_TIMEFRAMES = java.util.Set.of("30s", "1m", "5m", "15m", "1h", "4h");
     private static final String[] TF_ENUM = {"T1M", "T5M", "T15M"};
     private static final long[] TF_MS = {60_000L, 300_000L, 900_000L};
     /** The producer's own bound (StudyWireValidator): a barId is at most 64 characters. */
@@ -400,7 +402,7 @@ final class StudiesRelay {
         long revision = ((Number) r.get("revision")).longValue();
         Schema.Field timeframes = r.getSchema().getField("timeframes");
         Map<?, ?> byTf = (Map<?, ?>) r.get("timeframes");
-        if (byTf.size() > MAX_TIMEFRAMES || !withinCurrentBounds(byTf)) {
+        if (byTf.size() > MAX_TIMEFRAMES || !withinCurrentBounds(byTf) || !PRODUCER_TIMEFRAMES.equals(keySet(byTf))) {
             drops.incrementAndGet();
             return null;
         }
@@ -492,10 +494,12 @@ final class StudiesRelay {
     }
 
     /**
-     * The exact UTF-8 size of the hello part with nothing retained (every current entry {@code null}, every history {@code []}): the
+     * The UTF-8 size of the hello part with nothing retained (every current entry {@code null}, every history {@code []}): the
      * field names, timeframe keys, braces, colons and commas. Everything retained adds to it exactly: a current entry replaces a
      * 4-byte {@code null} (adds its bytes - 4) and a history of k >= 1 bars replaces a 2-byte {@code []} (adds the bars' bytes plus k - 1
-     * commas), so the size of any retained set is known by arithmetic, without rendering.
+     * commas), so the size of any retained set is known by arithmetic, without rendering. The arithmetic is exact for valid Unicode and
+     * an upper bound otherwise ({@link #utf8Length} counts an unpaired surrogate as 3 bytes, the encoder's replacement is 1), so a
+     * rendered fragment is never larger than the figure the budget was checked against.
      */
     private static final int SKELETON_BYTES = utf8Length(render(new Store(), new int[SYMBOLS.length * TF.length], new boolean[SYMBOLS.length][TF.length]));
 
@@ -683,6 +687,14 @@ final class StudiesRelay {
             }
         }
         return true;
+    }
+
+    private static java.util.Set<String> keySet(Map<?, ?> m) {
+        java.util.Set<String> keys = new java.util.HashSet<>();
+        for (Object k : m.keySet()) {
+            keys.add(String.valueOf(k));
+        }
+        return keys;
     }
 
     private static int size(Object collectionOrMap) {

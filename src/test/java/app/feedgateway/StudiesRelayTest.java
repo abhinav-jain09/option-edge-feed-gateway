@@ -667,4 +667,15 @@ class StudiesRelayTest {
         relay.helloFields(full / 3);
         assertEquals(before, relay.rendersForTest(), "hello rendering is not bar rendering: bars are rendered once, at ingestion");
     }
+
+    @Test
+    void aCurrentStateMustCarryExactlyTheProducersSixTimeframes() throws Exception {
+        GenericRecord extra = current("SPX", 1);
+        @SuppressWarnings("unchecked") java.util.Map<String, Object> m = (java.util.Map<String, Object>) extra.get("timeframes");
+        m.put("2h", m.get("1h"));
+        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", extra, false), "an extra key is producer/schema drift");
+        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", StudiesFixtures.currentWithout("SPX", 2, "30s"), false), "a missing unforwarded key too");
+        assertEquals(2L, relay.dropsForTest());
+        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 3), false));
+    }
 }
