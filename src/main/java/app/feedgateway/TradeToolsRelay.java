@@ -46,8 +46,15 @@ final class TradeToolsRelay extends TaRelay {
     static final int ORPHANS = 2048;
     /** Live orphans parked until their chart arrives. */
     static final int LIVE_ORPHANS = 512;
+    /**
+     * Columns topic re-read depth: as far back as this cap (from the beginning of the retained log when it is shorter). The producer republishes the
+     * open column of every chart on each tick (about 1 400 copies per key on a live dev day, 184 000 records for 128 keys), so a short tail holds only
+     * copies of the newest columns of the busiest chart and a restart showed a handful of columns instead of 24 per chart. State stays bounded by the
+     * series caps and the parked-key cap; the depth only bounds the read.
+     */
+    static final int COLUMNS_TAIL = 262_144;
     /** Records re-read from the end of each partition per role: the retained depth above plus the republished open items. */
-    private static final int[] TAIL = {512, 2048, 1024, 32, 1024, 256};   // charts: 12 retained keys, so 512 reaches the latest record of a quiet chart behind many republications of the busy ones
+    private static final int[] TAIL = {512, COLUMNS_TAIL, 1024, 32, 1024, 256};   // charts: 12 retained keys, so 512 reaches the latest record of a quiet chart behind many republications of the busy ones
 
     /** One accepted record: its routing, its ordering clock and the frame data it is sent as. */
     private record Held(int kind, int tf, String key, String chartId, String epoch, String json, int bytes, long asOf, long order, long sort) {
@@ -107,7 +114,7 @@ final class TradeToolsRelay extends TaRelay {
         final Series[] climax = new Series[TF.length];
         final Series nodes = new Series(NODES);
         /** Dependent records (columns, events) read before their chart: parked, bounded, retried when the chart arrives (live and staging alike). */
-        final List<Held> orphans = new ArrayList<>();
+        final Map<String, Held> orphans = new LinkedHashMap<>();
         /** Live store only: orphans released by the arrival of their chart, owed to the sockets after the chart's own frame. */
         final List<Held> released = new ArrayList<>();
         final boolean staging;
@@ -244,8 +251,26 @@ final class TradeToolsRelay extends TaRelay {
             return result;
         }
 
+        /**
+         * Parks a record read before its chart, one entry per record key (a republished copy replaces its older one in place): a deep recovery read
+         * meets thousands of copies of a few open-column keys, and the bound must count distinct keys. -1 when {@code cap} distinct keys are already
+         * parked, 0 when a newer copy is parked, 1 when parked or replaced.
+         */
+        int park(Held h, int cap) {
+            String id = h.kind() + "|" + h.key();
+            Held old = orphans.get(id);
+            if (old != null && h.asOf() < old.asOf()) {
+                return 0;
+            }
+            if (old == null && orphans.size() >= cap) {
+                return -1;
+            }
+            orphans.put(id, h);
+            return 1;
+        }
+
         private void retryOrphans(String chartId) {
-            for (var it = orphans.iterator(); it.hasNext();) {
+            for (var it = orphans.values().iterator(); it.hasNext();) {
                 Held o = it.next();
                 if (o.chartId().equals(chartId)) {
                     it.remove();
@@ -315,11 +340,12 @@ final class TradeToolsRelay extends TaRelay {
         drainOrphanCounts();
         if (result < 0) {
             if (h.kind() >= 1 && h.kind() <= 8 && !live.chartTf.containsKey(h.chartId())) {
-                if (live.orphans.size() >= LIVE_ORPHANS) {
-                    live.orphans.remove(0);
+                // its chart state may still be on its way (the producer publishes the two on separate throttled schedules)
+                if (live.park(h, LIVE_ORPHANS) < 0) {
+                    live.orphans.remove(live.orphans.keySet().iterator().next());
                     onDrop();   // the oldest parked record leaves when the bounded buffer is full: counted, never silent
+                    live.park(h, LIVE_ORPHANS);
                 }
-                live.orphans.add(h);   // its chart state may still be on its way (the producer publishes the two on separate throttled schedules)
                 return null;
             }
             onDrop();   // a record of the wrong epoch for its chart: never guessed
@@ -345,10 +371,13 @@ final class TradeToolsRelay extends TaRelay {
             return;
         }
         int result = staged.insert(h);
-        if (result < 0 && staged.orphans.size() < ORPHANS) {
-            staged.orphans.add(h);   // its chart may still be read later in this recovery
-        } else if (result < 0) {
-            onDrop();
+        if (result < 0) {
+            int parked = staged.park(h, ORPHANS);   // its chart may still be read later in this recovery
+            if (parked < 0) {
+                onDrop();
+            } else if (parked == 0) {
+                regressed();
+            }
         } else if (result == 0) {
             regressed();
         } else {

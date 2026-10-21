@@ -349,6 +349,78 @@ class TradeToolsRelayTest {
                 "the staged chart, then what was waiting for it, then nodes and flow; the orphan and the live chart (unchanged) send nothing");
         assertEquals(1, relay.dropsForTest(), "the orphan whose chart never came");
         assertTrue(relay.promote().isEmpty());
-        assertEquals(List.of(512, 2048, 1024, 32, 1024, 256), java.util.Arrays.stream(TradeToolsRelay.ROLES).map(relay::tailRecords).toList());
+        assertEquals(List.of(512, TradeToolsRelay.COLUMNS_TAIL, 1024, 32, 1024, 256), java.util.Arrays.stream(TradeToolsRelay.ROLES).map(relay::tailRecords).toList());
+    }
+
+    /** The producer's log of one chart: columns 1..{@code closed} each published once closed, after many republished copies of each while it was open. */
+    private static List<org.apache.avro.generic.GenericRecord> republishedLog(String chart, int columns, int copies, long[] clock) {
+        List<org.apache.avro.generic.GenericRecord> log = new ArrayList<>();
+        for (int c = 1; c <= columns; c++) {
+            for (int k = 0; k < copies; k++) {
+                log.add(TaFixtures.column(chart, c, ++clock[0]));
+            }
+        }
+        return log;
+    }
+
+    @Test
+    void aRecoveryOverATailDominatedByRepublishedOpenColumnsRetainsTheSameColumnsAsTheLiveRelayDid() throws Exception {
+        long[] clock = {100};
+        var chart1 = TaFixtures.chart("busy", "M1", 1);
+        var chart2 = TaFixtures.chart("quiet", "M5", 2);
+        List<org.apache.avro.generic.GenericRecord> log = new ArrayList<>(republishedLog("quiet", 30, 3, clock));   // quiet chart: older, few copies
+        log.addAll(republishedLog("busy", 30, 400, clock));                                                        // busy chart: 12 000 records, 24 columns do not fit any 2 048 tail
+        var before = new TradeToolsRelay();
+        before.onLive(CHART, chart1);
+        before.onLive(CHART, chart2);
+        log.forEach(r -> before.onLive(COLUMN, r));
+        String expected = before.helloField(1 << 22);
+        JsonNode m1 = bundles(before, 1 << 22).get("1m").get("pfColumns");
+        assertEquals(24, m1.size());
+        assertEquals(7, m1.get(0).get("columnIndex").asLong());
+        assertEquals(30, m1.get(23).get("columnIndex").asLong());
+        // restart: the charts are read AFTER thousands of their columns, and only the last COLUMNS_TAIL records of the log are read
+        assertTrue(log.size() < TradeToolsRelay.COLUMNS_TAIL);
+        var after = new TradeToolsRelay();
+        after.beginRecovery();
+        log.forEach(r -> after.onStaged(COLUMN, r));
+        after.onStaged(CHART, chart1);
+        after.onStaged(CHART, chart2);
+        after.promote();
+        assertEquals(expected, after.helloField(1 << 22), "the retained P&F columns after a restart equal those before it");
+        assertEquals(0, after.dropsForTest(), "republished copies of one key are one parked record, not a drop per copy");
+    }
+
+    @Test
+    void aTailThatReachesOnlyRepublishedCopiesOfTheNewestColumnsKeepsOnlyThoseAndNeverGuessesTheRest() throws Exception {
+        long[] clock = {100};
+        List<org.apache.avro.generic.GenericRecord> log = republishedLog("busy", 30, 400, clock);
+        List<org.apache.avro.generic.GenericRecord> shortTail = log.subList(log.size() - 2048, log.size());   // the former 2 048 record tail: 5.12 columns
+        var relay = new TradeToolsRelay();
+        relay.beginRecovery();
+        relay.onStaged(CHART, TaFixtures.chart("busy", "M1", 1));
+        shortTail.forEach(r -> relay.onStaged(COLUMN, r));
+        relay.promote();
+        JsonNode cols = bundles(relay, 1 << 22).get("1m").get("pfColumns");
+        assertEquals(6, cols.size(), "the defect: a tail that is all copies of the newest few columns shows only those");
+        assertEquals(25, cols.get(0).get("columnIndex").asLong());
+    }
+
+    @Test
+    void theParkedBufferOfARecoveryCountsDistinctKeysNotCopiesAndABoundedOverflowIsCounted() {
+        var relay = new TradeToolsRelay();
+        relay.beginRecovery();
+        for (int copy = 0; copy < 3 * TradeToolsRelay.ORPHANS; copy++) {
+            relay.onStaged(COLUMN, TaFixtures.column("c", copy % 5, 10 + copy));   // 5 keys, 6 144 copies, chart never read
+        }
+        relay.onStaged(COLUMN, TaFixtures.column("c", 2, 3));                        // an older copy than the parked one: a regression
+        assertEquals(1, relay.regressionsForTest());
+        assertEquals(0, relay.dropsForTest(), "5 distinct keys fit the bound");
+        for (int i = 0; i < TradeToolsRelay.ORPHANS; i++) {
+            relay.onStaged(COLUMN, TaFixtures.column("d", i, 5));                    // 2 048 more distinct keys: the first 2 043 fit, five do not
+        }
+        assertEquals(5, relay.dropsForTest(), "distinct keys past the bound are counted");
+        relay.promote();
+        assertEquals(5 + TradeToolsRelay.ORPHANS, relay.dropsForTest(), "the five overflowed keys plus the parked ones whose chart never came");
     }
 }
