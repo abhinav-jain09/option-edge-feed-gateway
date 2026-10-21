@@ -435,6 +435,23 @@ class StudiesRelayTest {
     }
 
     @Test
+    void aBarIdOfTheProducersRealLengthIsAcceptedAndOneOverNinetySixIsNot() throws Exception {
+        GenericRecord real = bar("SPX", "T1M", 0);
+        assertEquals(StudiesFixtures.SEGMENT, real.get("barId").toString().split("\\|")[1]);
+        assertTrue(real.get("barId").toString().length() > 64 && real.get("barId").toString().length() <= 96, real.get("barId").toString());
+        assertNotNull(live(real), "the real 71-72 character barId is a valid bar, not a drop");
+        GenericRecord ninetySix = bar("SPX", "T1M", 2);
+        ninetySix.put("barId", ninetySix.get("barId").toString().replace("|" + StudiesFixtures.SEGMENT + "|", "|" + "X".repeat(57) + "|"));
+        assertEquals(96, ninetySix.get("barId").toString().length());
+        assertNotNull(live(ninetySix), "exactly 96 characters is accepted: the ceiling is 96, not lower");
+        GenericRecord ninetySeven = bar("SPX", "T1M", 1);
+        ninetySeven.put("barId", ninetySeven.get("barId").toString().replace("|" + StudiesFixtures.SEGMENT + "|", "|" + "X".repeat(58) + "|"));
+        assertEquals(97, ninetySeven.get("barId").toString().length());
+        assertNull(live(ninetySeven), "one character over the 96 bound is refused");
+        assertEquals(1L, relay.dropsForTest());
+    }
+
+    @Test
     void aBarWithAnImpossibleClockOrAMislabelledIdIsRefused() throws Exception {
         GenericRecord endBeforeStart = bar("SPX", "T5M", 0);
         endBeforeStart.put("barEnd", java.time.Instant.ofEpochMilli(StudiesFixtures.T0 - 1).toString());
@@ -447,7 +464,7 @@ class StudiesRelayTest {
         GenericRecord idNotEndingInBarStart = bar("SPX", "T5M", 4);
         idNotEndingInBarStart.put("barId", idNotEndingInBarStart.get("barId").toString().replace("T13:", "T14:"));
         GenericRecord idTooLong = bar("SPX", "T5M", 5);
-        idTooLong.put("barId", idTooLong.get("barId").toString().replace("|ESZ6|", "|" + "X".repeat(40) + "|"));
+        idTooLong.put("barId", idTooLong.get("barId").toString().replace("|" + StudiesFixtures.SEGMENT + "|", "|" + "X".repeat(70) + "|"));
         for (GenericRecord bad : List.of(endBeforeStart, tooLong, wrongTimeframeInId, wrongSymbolInId, idNotEndingInBarStart, idTooLong)) {
             assertNull(live(bad), bad.get("barId") + " / " + bad.get("barEnd"));
         }

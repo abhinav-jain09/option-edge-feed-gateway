@@ -71,8 +71,8 @@ final class StudiesRelay {
     private static final java.util.Set<String> PRODUCER_TIMEFRAMES = java.util.Set.of("30s", "1m", "5m", "15m", "1h", "4h");
     private static final String[] TF_ENUM = {"T1M", "T5M", "T15M"};
     private static final long[] TF_MS = {60_000L, 300_000L, 900_000L};
-    /** The producer's own bound (StudyWireValidator): a barId is at most 64 characters. */
-    private static final int BAR_ID_MAX = 64;
+    /** The producer's own bound (StudyWireValidator): a barId is at most 96 characters; the real one is symbol|32-hex segment|date|timeframe|start, 71-72. */
+    private static final int BAR_ID_MAX = 96;
 
     /** One retained finalized bar: its identity, its clock and the frame data it will be sent as. */
     static final class Bar {
@@ -329,7 +329,7 @@ final class StudiesRelay {
         long startMs = Instant.parse(barStart).toEpochMilli();
         long span = Instant.parse(str(r, "barEnd")).toEpochMilli() - startMs;
         // the bar's own clock and identity, as the producer's validator states them: a positive span of at most one timeframe, and a
-        // barId of the form symbol|…|tf|barStart (at most 64 characters), so a mislabelled record cannot enter the history
+        // barId of the form symbol|…|tf|barStart (at most 96 characters), so a mislabelled record cannot enter the history
         if (span <= 0 || span > TF_MS[t] || barId.length() > BAR_ID_MAX || !barId.startsWith(symbol + "|")
                 || !barId.endsWith("|" + TF[t] + "|" + barStart)) {
             drops.incrementAndGet();
