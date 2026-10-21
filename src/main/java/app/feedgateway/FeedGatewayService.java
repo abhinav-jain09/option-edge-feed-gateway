@@ -13112,8 +13112,13 @@ public class FeedGatewayService implements ReplayRunner {
         }
         Map<TopicPartition, Long> begin = consumer.beginningOffsets(tails.keySet());
         Map<TopicPartition, Long> end = consumer.endOffsets(tails.keySet());
-        tails.forEach((partition, records) -> consumer.seek(partition, Math.max(begin.get(partition), end.get(partition) - records)));
+        // the tail is measured from the end offsets TaRecovery CAPTURED (the recovery boundary), not from a newer end: under sustained
+        // production a fresh end could start the seek past records below the boundary that the recovery must still read
+        tails.forEach((partition, records) -> consumer.seek(partition, Math.max(begin.get(partition), taCapturedEnd.getOrDefault(partition, end.get(partition)) - records)));
     }
+
+    /** The end offsets the chart relays' recovery captured per partition (see {@link TaRecovery#begin}); the seek reads from the same boundary. */
+    private final Map<TopicPartition, Long> taCapturedEnd = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Per relay: the captured end offsets of its partitions while it recovers; its records below them are staged privately. */
     final class TaRecovery {
@@ -13140,6 +13145,7 @@ public class FeedGatewayService implements ReplayRunner {
                     r.beginRecovery();
                     return new HashMap<>();
                 }).putAll(captured);
+                taCapturedEnd.putAll(captured);
             }
         }
 

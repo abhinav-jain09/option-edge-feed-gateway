@@ -142,4 +142,18 @@ class TaRelaysLoopTest {
         verify(consumer).seek(TOOLS, 0L);
         verify(consumer).seek(COLUMNS, 0L);
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void theSeekIsMeasuredFromTheCapturedEndNotFromANewerOne() {
+        var s = service();
+        KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
+        Map<TopicPartition, Long> first = Map.of(TOOLS, 10_000L), later = Map.of(TOOLS, 12_500L);
+        when(consumer.endOffsets(anyCollection(), any(Duration.class))).thenReturn(first);
+        when(consumer.endOffsets(anyCollection())).thenReturn(later);
+        when(consumer.beginningOffsets(anyCollection())).thenReturn(Map.of(TOOLS, 0L));
+        s.new TaRecovery().begin(consumer, java.util.Set.of(TOOLS), BINDINGS);   // captures 10000
+        s.seekTaRelays(consumer, java.util.Set.of(TOOLS), BINDINGS);                // the producer is at 12500 by now
+        verify(consumer).seek(TOOLS, 10_000L - TimeframeSetRelay.structureTools().tailRecords(TimeframeSetRelay.TOOLS_EVENT));
+    }
 }
