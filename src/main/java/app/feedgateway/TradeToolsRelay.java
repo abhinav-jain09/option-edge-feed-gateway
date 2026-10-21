@@ -108,6 +108,7 @@ final class TradeToolsRelay extends TaRelay {
         final List<Held> orphans;
         /** Orphans that found their chart but not a home (another contract epoch): counted as drops when the staging is promoted. */
         int refusedOrphans;
+        int regressedOrphans;
         long version;
 
         Store(boolean staging) {
@@ -165,7 +166,7 @@ final class TradeToolsRelay extends TaRelay {
                 inTf.sort(Comparator.comparing(Held::key));   // HashMap order is not deterministic: the same Kafka input must promote the same chart set
                 out.addAll(inTf);
             }
-            columns.values().forEach(s -> out.addAll(s.sorted()));
+            columns.entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(e -> out.addAll(e.getValue().sorted()));   // by chart id: HashMap order must not leak into the promotion order
             for (int t = 0; t < TF.length; t++) {
                 for (int k = 2; k <= 8; k++) {
                     out.addAll(events[t][k].sorted());
@@ -243,7 +244,10 @@ final class TradeToolsRelay extends TaRelay {
                 Held o = it.next();
                 if (o.chartId().equals(chartId)) {
                     it.remove();
-                    if (insert(o) < 0) {
+                    int result = insert(o);
+                    if (result == 0) {
+                        regressedOrphans++;   // an orphan that found its chart but lost to a newer record of its key: a regression, counted at promotion
+                    } else if (result < 0) {
                         refusedOrphans++;   // still no home (another contract epoch than its chart): the relay counts it at promotion, never silent
                     }
                 }
@@ -321,6 +325,9 @@ final class TradeToolsRelay extends TaRelay {
         // so on an equal ordering key the live record is the later one in log order and stays.
         List<String[]> frames = new ArrayList<>();
         if (staged != null) {
+            for (int i = 0; i < staged.regressedOrphans; i++) {
+                regressed();
+            }
             for (int i = 0; i < staged.orphans.size() + staged.refusedOrphans; i++) {
                 onDrop();   // the chart never arrived within the recovery read, or arrived under another contract epoch
             }
