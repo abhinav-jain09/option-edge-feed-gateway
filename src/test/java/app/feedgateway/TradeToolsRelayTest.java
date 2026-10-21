@@ -32,6 +32,20 @@ class TradeToolsRelayTest {
     }
 
     @Test
+    void aChartThatHasNoColumnYetIsRelayedWithItsMinusOneIndex() throws Exception {
+        // the producer's first state of a chart (Wire: currentColumnIndex = nextIndex - 1): integration check finding F1
+        var relay = new TradeToolsRelay();
+        org.apache.avro.generic.GenericRecord chart = TaFixtures.chart("c5", "M5", 10);
+        chart.put("currentColumnIndex", -1L);
+        chart.put("columnsRetained", 0);
+        String[] frame = relay.onLive(CHART, chart);
+        assertNotNull(frame, "the gateway never judges the index: the page does");
+        assertEquals(-1, JSON.readTree(frame[1]).get("currentColumnIndex").asLong());
+        assertEquals(0, relay.dropsForTest());
+        assertEquals(1, bundles(relay, Long.MAX_VALUE).get("5m").get("pfCharts").size());
+    }
+
+    @Test
     void theTwelveRecordsEachMakeTheirOwnFrameTypeAndAreRoutedToTheirTimeframe() {
         var relay = new TradeToolsRelay();
         assertEquals(CHART, relay.onLive(CHART, TaFixtures.chart("c5", "M5", 10))[0]);
