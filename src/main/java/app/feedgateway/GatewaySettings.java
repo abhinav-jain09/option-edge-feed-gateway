@@ -340,6 +340,37 @@ public final class GatewaySettings {
     }
 
     /**
+     * Phase A studies relay (frames {@code indicator-studies} / {@code indicator-studies-current} and the hello's study
+     * fields; ta-books-catalog/03_STUDIES_FRAME_CONTRACT.md). OFF by default: absent study fields in the hello are how the
+     * page learns this gateway has no study stream.
+     */
+    public boolean studiesEnabled() {
+        return boolValue("GATEWAY_STUDIES_ENABLED", false);
+    }
+
+    /**
+     * The StudyBar topics: the locally computed SPX one and the es4-mirrored ES one. The names are FIXED, not environment-overridable:
+     * the producer's default names are declared in scripts/kafka/topics.env and the mirror job's allow-list, and the source topic
+     * decides which symbol a record may carry (local = SPX, es. = ES), so an override of one half could only misroute the other.
+     */
+    public java.util.Set<String> studiesBarsTopics() {
+        return new java.util.LinkedHashSet<>(java.util.List.of("options.indicators.studies.bars", "es.options.indicators.studies.bars"));
+    }
+
+    /** The StudiesCurrent topics (one partition, one symbol each, written about every 5 s): local SPX and the mirrored ES one; fixed names. */
+    public java.util.Set<String> studiesCurrentTopics() {
+        return new java.util.LinkedHashSet<>(java.util.List.of("options.indicators.studies.current", "es.options.indicators.studies.current"));
+    }
+
+    /** The longest seek-back accepted: 30 days (the bars topic itself keeps 45).*/
+    private static final long STUDIES_RECOVERY_MAX_HOURS = 720L;
+
+    /** How far back the bars topic is re-read on a cold start to rebuild the hello history (a weekend plus a margin). */
+    public long studiesRecoveryMs() {
+        return Math.min(longValue("GATEWAY_STUDIES_RECOVERY_HOURS", 72L, 1L), STUDIES_RECOVERY_MAX_HOURS) * 3_600_000L;   // clamped: no overflow, no absurd seek-back
+    }
+
+    /**
      * Early-auction verdict evidence ledger (EARLY-AUCTION-VERDICT-STAGE1-GATE1.md:
      * {@code early-auction.verdicts.shadow}, JSON, ONE partition, one immutable record per line —
      * PREDICTION / OUTCOME / MISS / terminals). Feeds the read-only {@code /early-auction} web panel
