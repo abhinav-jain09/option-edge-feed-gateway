@@ -1,0 +1,121 @@
+{
+ "type": "record",
+ "name": "SeriesCheckpoint",
+ "namespace": "com.optionsedge.contracts.wavecycle",
+ "fields": [
+  {
+   "name": "epoch",
+   "type": "int"
+  },
+  {
+   "name": "chunk",
+   "type": "int"
+  },
+  {
+   "name": "daily",
+   "type": {
+    "type": "array",
+    "items": {
+     "type": "record",
+     "name": "BarRec",
+     "namespace": "com.optionsedge.contracts.wavecycle",
+     "fields": [
+      {
+       "name": "idx",
+       "type": "long"
+      },
+      {
+       "name": "sessionSeq",
+       "type": "int"
+      },
+      {
+       "name": "tradeDay",
+       "type": "int"
+      },
+      {
+       "name": "gap",
+       "type": "boolean"
+      },
+      {
+       "name": "timeMs",
+       "type": "long"
+      },
+      {
+       "name": "o",
+       "type": "long"
+      },
+      {
+       "name": "h",
+       "type": "long"
+      },
+      {
+       "name": "l",
+       "type": "long"
+      },
+      {
+       "name": "c",
+       "type": "long"
+      },
+      {
+       "name": "atr",
+       "type": "long"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "weekly",
+   "type": {
+    "type": "array",
+    "items": "com.optionsedge.contracts.wavecycle.BarRec"
+   }
+  },
+  {
+   "name": "openWeek",
+   "type": [
+    "null",
+    "com.optionsedge.contracts.wavecycle.BarRec"
+   ],
+   "default": null
+  },
+  {
+   "name": "dailyAtr",
+   "type": {
+    "type": "record",
+    "name": "AtrStateRec",
+    "namespace": "com.optionsedge.contracts.wavecycle",
+    "fields": [
+     {
+      "name": "value12",
+      "type": [
+       "null",
+       "string"
+      ],
+      "default": null
+     },
+     {
+      "name": "seedCount",
+      "type": "int"
+     },
+     {
+      "name": "seedTrSum",
+      "type": "string"
+     },
+     {
+      "name": "prevClose",
+      "type": [
+       "null",
+       "long"
+      ],
+      "default": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "weeklyAtr",
+   "type": "com.optionsedge.contracts.wavecycle.AtrStateRec"
+  }
+ ]
+}
