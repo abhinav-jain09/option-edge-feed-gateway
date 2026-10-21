@@ -27,12 +27,13 @@ class StudiesWiringTest {
     }
 
     @Test
-    void theTopicNamesAreOverridableAndTheEsMirrorKeepsItsFixedName() {
+    void theTopicNamesAreFixedSoNoOverrideCanMisrouteTheMirror() {
         System.setProperty("KAFKA_INDICATORS_STUDIES_BARS_TOPIC", "x.bars");
         System.setProperty("GATEWAY_STUDIES_RECOVERY_HOURS", "5");
         try {
             GatewaySettings s = new GatewaySettings();
-            assertEquals(List.of("x.bars", "es.options.indicators.studies.bars"), List.copyOf(s.studiesBarsTopics()));
+            assertEquals(List.of("options.indicators.studies.bars", "es.options.indicators.studies.bars"), List.copyOf(s.studiesBarsTopics()),
+                    "the local name is not overridable: the es. half could not follow it");
             assertEquals(5L * 3_600_000L, s.studiesRecoveryMs());
         } finally {
             System.clearProperty("KAFKA_INDICATORS_STUDIES_BARS_TOPIC");
@@ -55,6 +56,7 @@ class StudiesWiringTest {
         var off = service();
         assertFalse(off.sendsCvdHello(), "no stream enabled: no hello at all");
         assertFalse(off.cvdHelloJson().contains("tudies"));
+        assertFalse(off.metrics().contains("gateway_studies"), "flag off: not one study metric line");
     }
 
     @Test

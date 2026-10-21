@@ -348,21 +348,18 @@ public final class GatewaySettings {
         return boolValue("GATEWAY_STUDIES_ENABLED", false);
     }
 
-    /** StudyBar topics: the locally computed SPX one and the es4-mirrored ES one, exactly like the signals topics. */
+    /**
+     * The StudyBar topics: the locally computed SPX one and the es4-mirrored ES one. The names are FIXED, not environment-overridable:
+     * the producer's default names are declared in scripts/kafka/topics.env and the mirror job's allow-list, and the source topic
+     * decides which symbol a record may carry (local = SPX, es. = ES), so an override of one half could only misroute the other.
+     */
     public java.util.Set<String> studiesBarsTopics() {
-        return studiesTopics("KAFKA_INDICATORS_STUDIES_BARS_TOPIC", "options.indicators.studies.bars");
+        return new java.util.LinkedHashSet<>(java.util.List.of("options.indicators.studies.bars", "es.options.indicators.studies.bars"));
     }
 
-    /** StudiesCurrent topics (compacted last value per symbol): local SPX and the mirrored ES one. */
+    /** The StudiesCurrent topics (one partition, one symbol each, written about every 5 s): local SPX and the mirrored ES one; fixed names. */
     public java.util.Set<String> studiesCurrentTopics() {
-        return studiesTopics("KAFKA_INDICATORS_STUDIES_CURRENT_TOPIC", "options.indicators.studies.current");
-    }
-
-    private java.util.Set<String> studiesTopics(String variable, String defaultName) {
-        java.util.LinkedHashSet<String> topics = new java.util.LinkedHashSet<>();
-        topics.add(value(variable, defaultName));
-        topics.add("es." + defaultName);
-        return topics;
+        return new java.util.LinkedHashSet<>(java.util.List.of("options.indicators.studies.current", "es.options.indicators.studies.current"));
     }
 
     /** How far back the bars topic is re-read on a cold start to rebuild the hello history (a weekend plus a margin). */

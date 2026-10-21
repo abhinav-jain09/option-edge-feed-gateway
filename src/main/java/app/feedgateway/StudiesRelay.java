@@ -438,7 +438,7 @@ final class StudiesRelay {
                 + "# HELP gateway_studies_drops_total Study records refused at the gateway boundary (invalid, oversize, tombstone).\n"
                 + "# TYPE gateway_studies_drops_total counter\n"
                 + "gateway_studies_drops_total " + drops.get() + "\n"
-                + "# HELP gateway_studies_regressions_total Study current states refused because publishedAt regressed.\n"
+                + "# HELP gateway_studies_regressions_total Study current states refused as out of order (an older publishedAt, or the same instant without a higher revision from the same run).\n"
                 + "# TYPE gateway_studies_regressions_total counter\n"
                 + "gateway_studies_regressions_total " + regressions.get() + "\n"
                 + "# HELP gateway_studies_duplicates_total Study bars already held (replay re-emits identical keys and values).\n"
