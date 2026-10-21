@@ -362,9 +362,12 @@ public final class GatewaySettings {
         return new java.util.LinkedHashSet<>(java.util.List.of("options.indicators.studies.current", "es.options.indicators.studies.current"));
     }
 
+    /** The longest seek-back accepted: 30 days (the bars topic itself keeps 45).*/
+    private static final long STUDIES_RECOVERY_MAX_HOURS = 720L;
+
     /** How far back the bars topic is re-read on a cold start to rebuild the hello history (a weekend plus a margin). */
     public long studiesRecoveryMs() {
-        return longValue("GATEWAY_STUDIES_RECOVERY_HOURS", 72L, 1L) * 3_600_000L;
+        return Math.min(longValue("GATEWAY_STUDIES_RECOVERY_HOURS", 72L, 1L), STUDIES_RECOVERY_MAX_HOURS) * 3_600_000L;   // clamped: no overflow, no absurd seek-back
     }
 
     /**

@@ -108,4 +108,14 @@ class StudiesWiringTest {
             return root.get(name).toString();
         }
     }
+
+    @Test
+    void theRecoveryWindowIsClampedAgainstAnAbsurdConfiguration() {
+        System.setProperty("GATEWAY_STUDIES_RECOVERY_HOURS", String.valueOf(Long.MAX_VALUE));
+        try {
+            assertEquals(720L * 3_600_000L, new GatewaySettings().studiesRecoveryMs(), "no overflow, at most 30 days");
+        } finally {
+            System.clearProperty("GATEWAY_STUDIES_RECOVERY_HOURS");
+        }
+    }
 }
