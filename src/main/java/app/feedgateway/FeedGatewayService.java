@@ -13087,7 +13087,8 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** Per relay: the captured end offsets of its partitions while it recovers; its records below them are staged privately. */
     final class TaRecovery {
-        private final Map<TaRelay, Map<TopicPartition, Long>> end = new java.util.IdentityHashMap<>();
+        // relays use identity equality; the insertion order is the fixed relay order, so the promotion order is deterministic
+        private final Map<TaRelay, Map<TopicPartition, Long>> end = new java.util.LinkedHashMap<>();
 
         void begin(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions, Map<String, TopicBinding> topicEvents) {
             for (TaRelay relay : taRelays) {
