@@ -161,7 +161,9 @@ final class TradeToolsRelay extends TaRelay {
         List<Held> all() {
             List<Held> out = new ArrayList<>();
             for (int t = 0; t < TF.length; t++) {
-                out.addAll(charts[t].values());
+                List<Held> inTf = new ArrayList<>(charts[t].values());
+                inTf.sort(Comparator.comparing(Held::key));   // HashMap order is not deterministic: the same Kafka input must promote the same chart set
+                out.addAll(inTf);
             }
             columns.values().forEach(s -> out.addAll(s.sorted()));
             for (int t = 0; t < TF.length; t++) {

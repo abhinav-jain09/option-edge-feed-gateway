@@ -79,7 +79,13 @@ public final class GatewayAvroDeserializer implements Deserializer<Object> {
         try {
             return generic.deserialize(topic, data);
         } catch (SerializationException e) {
-            if (e.getCause() instanceof RestClientException registry) {
+            RestClientException registry = null;
+            for (Throwable c = e.getCause(); c != null && registry == null; c = c.getCause() == c ? null : c.getCause()) {
+                if (c instanceof RestClientException r) {
+                    registry = r;   // however deeply the client wrapped it
+                }
+            }
+            if (registry != null) {
                 if (registry.getStatus() != 404) {
                     throw e;   // the registry is failing, not the record: fail the poll and retry rather than lose data
                 }

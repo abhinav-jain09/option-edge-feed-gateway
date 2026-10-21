@@ -136,8 +136,11 @@ final class AvroFrameJson {
         return out;
     }
 
-    private static BigDecimal unscaled(LogicalTypes.Decimal d, Object v) {
+    private static BigDecimal unscaled(LogicalTypes.Decimal d, Object v) throws IOException {
         ByteBuffer b = ((ByteBuffer) v).duplicate();
+        if (!b.hasRemaining()) {
+            throw new IOException("a decimal with no bytes");
+        }
         byte[] raw = new byte[b.remaining()];
         b.get(raw);
         return new BigDecimal(new BigInteger(raw), d.getScale());
