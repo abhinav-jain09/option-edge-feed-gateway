@@ -55,6 +55,8 @@ final class TradeToolsRelay extends TaRelay {
      * (about 4 us each, in memory); a log longer than the cap is an ACCEPTED degradation: the columns the capped read reaches are exact (the latest copy of each key it meets), the older
      * columns it does not reach are absent (a shorter panel that live frames then extend), never invented or stale-substituted. The staging figure excludes Kafka polling and Avro decode.
      */
+    // The cap applies PER PARTITION (seekTaRelays). The producer declares the topic with exactly 1 partition (TICK-TRADE-TOOLS D-R14, table O1), so the read is
+    // at most COLUMNS_TAIL records; a topic with N partitions would read up to N times that, bounded all the same (state and parked keys do not grow).
     static final int COLUMNS_TAIL = 262_144;
     /** Records re-read from the end of each partition per role: the retained depth above plus the republished open items. */
     private static final int[] TAIL = {512, COLUMNS_TAIL, 1024, 32, 1024, 256};   // charts: 12 retained keys, so 512 reaches the latest record of a quiet chart behind many republications of the busy ones
