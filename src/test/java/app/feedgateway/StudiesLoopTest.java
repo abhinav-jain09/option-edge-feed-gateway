@@ -78,7 +78,7 @@ class StudiesLoopTest {
         when(consumer.listTopics(any(Duration.class))).thenReturn(Map.of(
                 BARS.topic(), List.of(new PartitionInfo(BARS.topic(), 0, node, new Node[] {node}, new Node[] {node})),
                 CURRENT.topic(), List.of(new PartitionInfo(CURRENT.topic(), 0, node, new Node[] {node}, new Node[] {node}))));
-        when(consumer.offsetsForTimes(anyMap())).thenReturn(Map.of(BARS, new OffsetAndTimestamp(0, 1)));
+        when(consumer.offsetsForTimes(anyMap())).thenReturn(Map.of(BARS, new OffsetAndTimestamp(0, 1), CURRENT, new OffsetAndTimestamp(0, 1)));
         Map<TopicPartition, Long> end = Map.of(BARS, 3L, CURRENT, 1L);
         when(consumer.endOffsets(anyCollection(), any(Duration.class))).thenReturn(end);
         when(consumer.endOffsets(anyCollection())).thenReturn(end);
@@ -129,12 +129,13 @@ class StudiesLoopTest {
         assertEquals(4, hello.get("studyBars").get("5m").size(), "the recovered history plus the live bar");
         assertEquals("2", hello.get("studies").get("15m").get("revision").asText());
 
-        // the cut-off is the recovery window back from now, for the bars partition only
+        // the cut-offs: the recovery window back from now for the bars partition, 15 minutes for the current-state partition
         var times = mockingDetails(consumer).getInvocations().stream().filter(c -> c.getMethod().getName().equals("offsetsForTimes")).toList();
         Map<TopicPartition, Long> cut = (Map<TopicPartition, Long>) times.get(times.size() - 1).getArgument(0);
-        assertEquals(List.of(BARS), List.copyOf(cut.keySet()));
+        assertEquals(java.util.Set.of(BARS, CURRENT), cut.keySet());
         assertTrue(Math.abs(cut.get(BARS) - (System.currentTimeMillis() - 72L * 3_600_000L)) < 60_000L);
-        verify(consumer).seek(eq(CURRENT), eq(0L));   // the compacted current topic is read from (end - 8) bounded by its beginning
+        assertTrue(Math.abs(cut.get(CURRENT) - (System.currentTimeMillis() - 15L * 60_000L)) < 60_000L);
+        verify(consumer).seek(eq(CURRENT), eq(0L));   // the offset the time lookup returned
     }
 
     @Test

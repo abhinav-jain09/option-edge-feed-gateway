@@ -12842,38 +12842,31 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * The current-state topic is re-read from its tail. It has ONE partition and each topic carries one symbol (SPX locally, ES on the
-     * es. mirror; the relay refuses a record whose key is not its symbol), written about every 5 s, and neither compaction nor the log
-     * reorders records, so the last record is the latest state. 64 records leave room for both symbols should a topic ever carry them.
-     * Should the tail still hold no state for a symbol, the next live record (seconds) supplies it and the page treats a missing
-     * current as bars-only, which ages by the bars' own clock.
+     * The current-state topic is re-read from a TIME window, not from a record count: the records of the last
+     * {@value #STUDIES_CURRENT_WINDOW_MS} ms, in the topic's order, each judged by the relay's own rule (a state replaces the held one
+     * only with a later publishedAt, or the same instant from the same run with a higher revision). That makes recovery independent of
+     * append order and of how many stale or replayed records sit at the tail. A window of minutes is enough by construction: the page
+     * hides any current older than 180 s, so an older one would never be shown. A topic quiet for the whole window yields no current
+     * (the page then ages the bars by their own clock) until the producer's next record, seconds after it restarts.
      */
-    private static final long STUDIES_CURRENT_TAIL_RECORDS = 64L;
+    private static final long STUDIES_CURRENT_WINDOW_MS = 15L * 60_000L;
 
-    /** Cold start, retry and late adoption: the bars are re-read from a window back, the current state from its tail. */
+    /** Cold start, retry and late adoption: the bars are re-read from a window back, the current state from a short one. */
     void seekStudies(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions, Map<String, TopicBinding> topicEvents) {
         Map<TopicPartition, Long> timestamps = new HashMap<>();
-        List<TopicPartition> tails = new ArrayList<>();
-        long cutoff = System.currentTimeMillis() - settings.studiesRecoveryMs();
+        long now = System.currentTimeMillis();
         for (TopicPartition partition : partitions) {
             TopicBinding binding = topicEvents.get(partition.topic());
             if (binding == null) {
                 continue;
             }
             if (StudiesRelay.BAR_EVENT.equals(binding.event())) {
-                timestamps.put(partition, cutoff);
+                timestamps.put(partition, now - settings.studiesRecoveryMs());
             } else if (StudiesRelay.CURRENT_EVENT.equals(binding.event())) {
-                tails.add(partition);
+                timestamps.put(partition, now - STUDIES_CURRENT_WINDOW_MS);
             }
         }
         seekToTimestampsOrEnd(consumer, timestamps, new ArrayList<>());
-        if (!tails.isEmpty()) {
-            Map<TopicPartition, Long> begin = consumer.beginningOffsets(tails);
-            Map<TopicPartition, Long> end = consumer.endOffsets(tails);
-            for (TopicPartition p : tails) {
-                consumer.seek(p, Math.max(begin.get(p), end.get(p) - STUDIES_CURRENT_TAIL_RECORDS));
-            }
-        }
     }
 
     private Map<TopicPartition, Long> studiesEndOffsets(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions,
