@@ -34,11 +34,12 @@ class MarketStructurePatternsRecoveryTest {
         return new FeedGatewayService(settings, new ObjectMapper(), new HpsfGatewayViewMapper(), null);
     }
 
-    private static String set(String tf, long asOfMs) {
-        return "{\"schemaVersion\":1,\"service\":\"market-structure\",\"state\":\"OK\",\"sessionDate\":\"2026-10-16\","
-                + "\"asOfMs\":" + asOfMs + ",\"scheduleId\":\"2026-10-16.r0000000000\",\"timeframe\":\"" + tf + "\","
-                + "\"decisionOrdinal\":7,\"parameterSetHash\":\"" + "a".repeat(64) + "\","
-                + "\"effectiveLimits\":{\"maxPatternBars\":24,\"maxAnnotations\":64},\"annotations\":[]}";
+    private static org.apache.avro.generic.GenericRecord set(String tf, long asOfMs) {
+        return TaFixtures.patternSet(tf, asOfMs);
+    }
+
+    private static String text(org.apache.avro.generic.GenericRecord record) {
+        return TaFixtures.frame(record);
     }
 
     @Test
@@ -63,9 +64,11 @@ class MarketStructurePatternsRecoveryTest {
     void recoveryPublishesOnlyTheFinalSetPerTimeframeAndKeepsTombstonesPrivate() throws Exception {
         for (boolean retry : List.of(false, true)) {
             var s = service();
-            String older1m = set("1m", 1791921500000L), final1m = set("1m", 1791921600000L), live1m = set("1m", 1791921600001L);
-            String only5m = set("5m", 1791921550000L);
-            if (retry) s.retainMarketStructurePatterns("1m", 1791921500000L, older1m);
+            var older1m = set("1m", 1791921500000L);
+            var final1m = set("1m", 1791921600000L);
+            var live1m = set("1m", 1791921600001L);
+            var only5m = set("5m", 1791921550000L);
+            if (retry) s.retainMarketStructurePatterns("1m", 1791921500000L, text(older1m));
             s.runOutboundWritesInline();
             var socket = mock(org.springframework.web.socket.WebSocketSession.class);
             when(socket.getId()).thenReturn("patterns-recovery");
@@ -89,12 +92,12 @@ class MarketStructurePatternsRecoveryTest {
             when(consumer.poll(any(Duration.class))).thenAnswer(call -> {
                 int poll = polls.incrementAndGet();
                 if (poll <= capturedEnd) {
-                    assertEquals(retry ? older1m : null, s.marketStructurePatternsLatestForTest("1m"), "partial history never changes a connect hello");
+                    assertEquals(retry ? text(older1m) : null, s.marketStructurePatternsLatestForTest("1m"), "partial history never changes a connect hello");
                     assertNull(s.marketStructurePatternsLatestForTest("5m"));
                     verify(socket, never()).sendMessage(any());
                 }
                 if (poll == capturedEnd + 1) {
-                    assertEquals(final1m, s.marketStructurePatternsLatestForTest("1m"), "the final committed 1m set is recovered");
+                    assertEquals(text(final1m), s.marketStructurePatternsLatestForTest("1m"), "the final committed 1m set is recovered");
                     assertNull(s.marketStructurePatternsLatestForTest("5m"), "the 5m set was withdrawn by its keyed tombstone");
                     assertNull(s.marketStructurePatternsLatestForTest("15m"));
                     verify(socket, times(1)).sendMessage(any());
@@ -102,7 +105,7 @@ class MarketStructurePatternsRecoveryTest {
                 if (poll <= capturedEnd + 1 && position.get() < poll) {
                     position.set(poll);
                     String key = switch (poll) { case 2, 4 -> "2026-10-16.r0000000000|5m"; case 3 -> "2026-10-16.r0000000000|15m"; default -> "2026-10-16.r0000000000|1m"; };
-                    String value = switch (poll) { case 1 -> older1m; case 2 -> only5m; case 3, 4 -> null; case 5 -> final1m; default -> live1m; };
+                    Object value = switch (poll) { case 1 -> older1m; case 2 -> only5m; case 3, 4 -> null; case 5 -> final1m; default -> live1m; };
                     return new ConsumerRecords<>(Map.of(PATTERNS, List.of(
                         new ConsumerRecord<String, Object>(PATTERNS.topic(), 0, poll - 1, key, value))));
                 }
@@ -110,9 +113,9 @@ class MarketStructurePatternsRecoveryTest {
                 return ConsumerRecords.empty();
             });
             s.setRunningForTest(true);
-            s.runLiveConsumerAttemptForTest("state-live", Map.of(PATTERNS.topic(), BINDINGS.get(PATTERNS.topic())),
+            s.runLiveConsumerAttemptForTest("avro-live", Map.of(PATTERNS.topic(), BINDINGS.get(PATTERNS.topic())),
                 new java.util.concurrent.atomic.AtomicBoolean(), consumer, retry);
-            assertEquals(live1m, s.marketStructurePatternsLatestForTest("1m"), "continuous live delivery resumes after recovery");
+            assertEquals(text(live1m), s.marketStructurePatternsLatestForTest("1m"), "continuous live delivery resumes after recovery");
             verify(socket, times(2)).sendMessage(any());
         }
     }

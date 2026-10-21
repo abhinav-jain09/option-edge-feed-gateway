@@ -152,7 +152,7 @@ class MarketStructureWiringTest {
     @Test
     void liveConsumerBindsTheTopicBehindTheFlagAndCacheConsumerDoesNot() throws Exception {
         String src = source();
-        int live = src.indexOf("private void runJsonStateLiveConsumer()");
+        int live = src.indexOf("private void runAvroLiveConsumer()");
         int cache = src.indexOf("private void runJsonStateCacheConsumer()");
         assertTrue(live > 0 && cache > 0);
         String binding = "topicEvents.put(settings.marketStructureTopic(), new TopicBinding(\"DATABENTO\", \"market-structure\"));";

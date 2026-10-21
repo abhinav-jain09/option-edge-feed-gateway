@@ -1,0 +1,1 @@
+{"schemaVersion":1,"dlqId":"options.indicators.bars|0|5","reason":"KEY_MALFORMED","detail":"key:null","sessionFatal":true,"scheduleId":null,"timeframe":null,"ordinal":null,"topic":"options.indicators.bars","partition":0,"offset":5,"sourceKey":null,"payloadHash":"cafe","payloadBytes":12,"payloadPrefixBase64":null}
