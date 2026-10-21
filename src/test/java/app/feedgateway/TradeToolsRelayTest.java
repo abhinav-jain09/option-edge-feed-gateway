@@ -423,4 +423,23 @@ class TradeToolsRelayTest {
         relay.promote();
         assertEquals(5 + TradeToolsRelay.ORPHANS, relay.dropsForTest(), "the five overflowed keys plus the parked ones whose chart never came");
     }
+
+    @Test
+    void aFullDepthRecoveryReadStaysBoundedAndKeepsTheLatest24ColumnsPerChart() throws Exception {
+        var copies = new org.apache.avro.generic.GenericRecord[132];
+        for (int c = 0; c < copies.length; c++) {
+            copies[c] = TaFixtures.column("busy", 1 + c, 100 + c);
+        }
+        var relay = new TradeToolsRelay();
+        relay.beginRecovery();
+        relay.onStaged(CHART, TaFixtures.chart("busy", "M1", 1));
+        for (int i = 0; i < TradeToolsRelay.COLUMNS_TAIL; i++) {
+            relay.onStaged(COLUMN, copies[i / 2_000]);   // 132 columns of 2 000 republished copies each, oldest first
+        }
+        relay.promote();
+        JsonNode cols = bundles(relay, 1 << 22).get("1m").get("pfColumns");
+        assertEquals(TradeToolsRelay.COLUMNS_PER_CHART, cols.size());
+        assertEquals(132, cols.get(cols.size() - 1).get("columnIndex").asLong());
+        assertEquals(109, cols.get(0).get("columnIndex").asLong());
+    }
 }

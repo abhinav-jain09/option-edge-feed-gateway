@@ -50,7 +50,9 @@ final class TradeToolsRelay extends TaRelay {
      * Columns topic re-read depth: as far back as this cap (from the beginning of the retained log when it is shorter). The producer republishes the
      * open column of every chart on each tick (about 1 400 copies per key on a live dev day, 184 000 records for 128 keys), so a short tail holds only
      * copies of the newest columns of the busiest chart and a restart showed a handful of columns instead of 24 per chart. State stays bounded by the
-     * series caps and the parked-key cap; the depth only bounds the read.
+     * series caps and the parked-key cap; the depth only bounds the read. The producer's per-key republish count is bounded by its event-time cadence
+     * (PF_COLUMN_PUBLISH_MIN_S) and the topic is compacted, so the log shrinks toward one record per key; 262 144 records is about 2 000 copies per key for the 128 keys seen. Cost: staging a full-depth read measured 1.07 s for 262 144 records
+     * (about 4 us each, in-memory, before the consumer's Avro decode); a recovery that outgrows the cap degrades to the older, shorter view, never to a wrong one.
      */
     static final int COLUMNS_TAIL = 262_144;
     /** Records re-read from the end of each partition per role: the retained depth above plus the republished open items. */
@@ -254,7 +256,7 @@ final class TradeToolsRelay extends TaRelay {
         /**
          * Parks a record read before its chart, one entry per record key (a republished copy replaces its older one in place): a deep recovery read
          * meets thousands of copies of a few open-column keys, and the bound must count distinct keys. -1 when {@code cap} distinct keys are already
-         * parked, 0 when a newer copy is parked, 1 when parked or replaced.
+         * parked, 0 when the parked copy is newer than this one (a regression), 1 when parked or replaced.
          */
         int park(Held h, int cap) {
             String id = h.kind() + "|" + h.key();
