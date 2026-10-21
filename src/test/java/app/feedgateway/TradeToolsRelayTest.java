@@ -272,6 +272,6 @@ class TradeToolsRelayTest {
                 "the staged chart, then what was waiting for it, then nodes and flow; the orphan and the live chart (unchanged) send nothing");
         assertEquals(1, relay.dropsForTest(), "the orphan whose chart never came");
         assertTrue(relay.promote().isEmpty());
-        assertEquals(List.of(64, 2048, 1024, 32, 1024, 256), java.util.Arrays.stream(TradeToolsRelay.ROLES).map(relay::tailRecords).toList());
+        assertEquals(List.of(512, 2048, 1024, 32, 1024, 256), java.util.Arrays.stream(TradeToolsRelay.ROLES).map(relay::tailRecords).toList());
     }
 }

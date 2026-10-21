@@ -45,7 +45,7 @@ final class TradeToolsRelay extends TaRelay {
     /** Records read before their chart during a recovery wait here until the chart arrives (bounded; a live record never waits). */
     static final int ORPHANS = 2048;
     /** Records re-read from the end of each partition per role: the retained depth above plus the republished open items. */
-    private static final int[] TAIL = {64, 2048, 1024, 32, 1024, 256};
+    private static final int[] TAIL = {512, 2048, 1024, 32, 1024, 256};   // charts: 12 retained keys, so 512 reaches the latest record of a quiet chart behind many republications of the busy ones
 
     /** One accepted record: its routing, its ordering clock and the frame data it is sent as. */
     private record Held(int kind, int tf, String key, String chartId, String epoch, String json, int bytes, long asOf, long order, long sort) {
