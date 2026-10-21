@@ -44,6 +44,8 @@ final class TradeToolsRelay extends TaRelay {
     static final int NODES = 4;
     /** Records read before their chart during a recovery wait here until the chart arrives (bounded; a live record never waits). */
     static final int ORPHANS = 2048;
+    /** Live orphans parked until their chart arrives. */
+    static final int LIVE_ORPHANS = 512;
     /** Records re-read from the end of each partition per role: the retained depth above plus the republished open items. */
     private static final int[] TAIL = {512, 2048, 1024, 32, 1024, 256};   // charts: 12 retained keys, so 512 reaches the latest record of a quiet chart behind many republications of the busy ones
 
@@ -104,15 +106,18 @@ final class TradeToolsRelay extends TaRelay {
         final Series[] flow = new Series[TF.length];
         final Series[] climax = new Series[TF.length];
         final Series nodes = new Series(NODES);
-        /** Only a recovery staging copy holds orphans. */
-        final List<Held> orphans;
+        /** Dependent records (columns, events) read before their chart: parked, bounded, retried when the chart arrives (live and staging alike). */
+        final List<Held> orphans = new ArrayList<>();
+        /** Live store only: orphans released by the arrival of their chart, owed to the sockets after the chart's own frame. */
+        final List<Held> released = new ArrayList<>();
+        final boolean staging;
         /** Orphans that found their chart but not a home (another contract epoch): counted as drops when the staging is promoted. */
         int refusedOrphans;
         int regressedOrphans;
         long version;
 
         Store(boolean staging) {
-            orphans = staging ? new ArrayList<>() : null;
+            this.staging = staging;
             for (int t = 0; t < TF.length; t++) {
                 charts[t] = new HashMap<>();
                 flow[t] = new Series(FLOW_BARS);
@@ -232,7 +237,7 @@ final class TradeToolsRelay extends TaRelay {
             }
             if (result > 0) {
                 version++;
-                if (h.kind() == 0 && orphans != null) {
+                if (h.kind() == 0) {
                     retryOrphans(h.key());
                 }
             }
@@ -245,6 +250,9 @@ final class TradeToolsRelay extends TaRelay {
                 if (o.chartId().equals(chartId)) {
                     it.remove();
                     int result = insert(o);
+                    if (result > 0 && !staging) {
+                        released.add(o);
+                    }
                     if (result == 0) {
                         regressedOrphans++;   // an orphan that found its chart but lost to a newer record of its key: a regression, counted at promotion
                     } else if (result < 0) {
@@ -277,6 +285,26 @@ final class TradeToolsRelay extends TaRelay {
         return TAIL[indexOf(ROLES, bindingEvent)];
     }
 
+    private void drainOrphanCounts() {
+        for (; live.refusedOrphans > 0; live.refusedOrphans--) {
+            onDrop();
+        }
+        for (; live.regressedOrphans > 0; live.regressedOrphans--) {
+            regressed();
+        }
+    }
+
+    @Override
+    synchronized List<String[]> released() {
+        List<String[]> out = new ArrayList<>(live.released.size());
+        for (Held h : live.released) {
+            accepted();
+            out.add(new String[] {FRAME[h.kind()], h.json()});
+        }
+        live.released.clear();
+        return out;
+    }
+
     @Override
     synchronized String[] onLive(String bindingEvent, Object value) {
         Held h = parse(bindingEvent, value);
@@ -284,8 +312,17 @@ final class TradeToolsRelay extends TaRelay {
             return null;
         }
         int result = live.insert(h);
+        drainOrphanCounts();
         if (result < 0) {
-            onDrop();   // a column or event of a chart the gateway does not hold: never guessed
+            if (h.kind() >= 1 && h.kind() <= 8 && !live.chartTf.containsKey(h.chartId())) {
+                if (live.orphans.size() >= LIVE_ORPHANS) {
+                    live.orphans.remove(0);
+                    onDrop();   // the oldest parked record leaves when the bounded buffer is full: counted, never silent
+                }
+                live.orphans.add(h);   // its chart state may still be on its way (the producer publishes the two on separate throttled schedules)
+                return null;
+            }
+            onDrop();   // a record of the wrong epoch for its chart: never guessed
             return null;
         }
         if (result == 0) {
@@ -338,6 +375,8 @@ final class TradeToolsRelay extends TaRelay {
             }
         }
         staged = null;
+        drainOrphanCounts();
+        frames.addAll(released());   // live orphans a promoted chart has just released
         return frames;
     }
 

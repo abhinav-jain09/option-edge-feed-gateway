@@ -30,6 +30,11 @@ abstract class TaRelay {
     /** The live path: {@code {frame event, frame data}} to broadcast, or null (dropped, regression, history only). */
     abstract String[] onLive(String bindingEvent, Object value);
 
+    /** Frames a relay owes the sockets BECAUSE of the last live record (a parked record released by its chart's arrival), in order; default none. */
+    List<String[]> released() {
+        return List.of();
+    }
+
     /** Starts a recovery read: a private copy of the retained state; nothing in it is visible until {@link #promote}. */
     abstract void beginRecovery();
 

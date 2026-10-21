@@ -71,7 +71,7 @@ class TradeToolsRelayTest {
         assertNull(relay.onLive(CHART, TaFixtures.chart("h4", "H4", 1)));
         assertNull(relay.onLive(FLOW, TaFixtures.flowBar("H1", 1, 1)));
         assertNull(relay.onLive(CLIMAX, TaFixtures.climax("k", "H4", 1, 1)));
-        assertNull(relay.onLive(COLUMN, TaFixtures.column("never-seen", 1, 1)), "no retained chart: dropped, not guessed from the text of the chart id");
+        assertNull(relay.onLive(COLUMN, TaFixtures.column("never-seen", 1, 1)), "no retained chart yet: parked (bounded), not guessed from the text of the chart id and not broadcast");
         assertNull(relay.onLive(EVENTS, TaFixtures.pfEvent("PfBreakEvent", "never-seen", "e", 1, 1)));
         assertNull(relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("c", "M1", 1), "validation", "VALIDATED")), "only UNVALIDATED is relayed");
         assertNull(relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("c", "M1", 1), "schemaVersion", 2)));
@@ -82,7 +82,7 @@ class TradeToolsRelayTest {
         assertNull(relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("big", "M1", 1), "contractEpoch", "e".repeat(TradeToolsRelay.RECORD_MAX_BYTES))), "over 64 KiB");
         assertNull(relay.onLive(CHART, GatewayAvroDeserializer.UNDECODABLE));
         assertNull(relay.onLive(CHART, TaFixtures.waveSet("M1", 1, 1, "OK")), "a record of another family");
-        assertEquals(15, relay.dropsForTest());
+        assertEquals(13, relay.dropsForTest(), "the two parked records are not drops");
         assertEquals(0, relay.acceptedForTest());
     }
 
@@ -233,6 +233,30 @@ class TradeToolsRelayTest {
             JsonNode charts = bundles(relay, 1 << 20).get("1m").get("pfCharts");
             assertEquals(List.of("b", "c", "d", "e"), java.util.stream.StreamSupport.stream(charts.spliterator(), false).map(n -> n.get("chartId").asText()).sorted().toList(), String.join("", order));
         }
+    }
+
+    @Test
+    void aColumnAndAnEventThatPrecedeTheirChartAreParkedAndReleasedRightAfterItsFrame() {
+        var relay = new TradeToolsRelay();
+        assertNull(relay.onLive(COLUMN, TaFixtures.column("late", 1, 11)));
+        assertNull(relay.onLive(EVENTS, TaFixtures.pfEvent("PfBreakEvent", "late", "e", 12, 12)));
+        assertEquals(0, relay.dropsForTest());
+        String[] chart = relay.onLive(CHART, TaFixtures.chart("late", "M5", 10));
+        assertEquals("trade-tools-pf-chart", chart[0]);
+        var released = relay.released();
+        assertEquals(2, released.size(), "both parked records follow the chart frame");
+        assertEquals(List.of("trade-tools-pf-column", "trade-tools-pf-break"), released.stream().map(f -> f[0]).toList());
+        assertEquals(0, relay.released().size(), "released once");
+        assertEquals(0, relay.dropsForTest());
+    }
+
+    @Test
+    void theParkedBufferIsBoundedAndTheOldestLeavesCounted() {
+        var relay = new TradeToolsRelay();
+        for (int i = 0; i < TradeToolsRelay.LIVE_ORPHANS + 3; i++) {
+            relay.onLive(COLUMN, TaFixtures.column("none-" + i, 1, 10 + i));
+        }
+        assertEquals(3, relay.dropsForTest(), "three records past the bound were counted as drops");
     }
 
     @Test

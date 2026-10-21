@@ -13168,6 +13168,10 @@ public class FeedGatewayService implements ReplayRunner {
                 broadcast(frame[0], frame[1]);
                 forwardedEvents.incrementAndGet();
             }
+            for (String[] released : relay.released()) {
+                broadcast(released[0], released[1]);
+                forwardedEvents.incrementAndGet();
+            }
         }
     }
 
