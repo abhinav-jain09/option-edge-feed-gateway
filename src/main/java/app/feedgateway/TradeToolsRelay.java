@@ -52,7 +52,8 @@ final class TradeToolsRelay extends TaRelay {
      * copies of the newest columns of the busiest chart and a restart showed a handful of columns instead of 24 per chart. State stays bounded by the
      * series caps and the parked-key cap; the depth only bounds the read. The producer's per-key republish count is bounded by its event-time cadence
      * (PF_COLUMN_PUBLISH_MIN_S) and the topic is compacted, so the log shrinks toward one record per key; 262 144 records is about 2 000 copies per key for the 128 keys seen. Cost: staging a full-depth read measured 1.07 s for 262 144 records
-     * (about 4 us each, in-memory, before the consumer's Avro decode); a recovery that outgrows the cap degrades to the older, shorter view, never to a wrong one.
+     * (about 4 us each, in memory); a log longer than the cap is an ACCEPTED degradation: the columns the capped read reaches are exact (the latest copy of each key it meets), the older
+     * columns it does not reach are absent (a shorter panel that live frames then extend), never invented or stale-substituted. The staging figure excludes Kafka polling and Avro decode.
      */
     static final int COLUMNS_TAIL = 262_144;
     /** Records re-read from the end of each partition per role: the retained depth above plus the republished open items. */
@@ -343,7 +344,10 @@ final class TradeToolsRelay extends TaRelay {
         if (result < 0) {
             if (h.kind() >= 1 && h.kind() <= 8 && !live.chartTf.containsKey(h.chartId())) {
                 // its chart state may still be on its way (the producer publishes the two on separate throttled schedules)
-                if (live.park(h, LIVE_ORPHANS) < 0) {
+                int parked = live.park(h, LIVE_ORPHANS);
+                if (parked == 0) {
+                    regressed();   // an older copy of a parked record: counted, as when it was retried
+                } else if (parked < 0) {
                     live.orphans.remove(live.orphans.keySet().iterator().next());
                     onDrop();   // the oldest parked record leaves when the bounded buffer is full: counted, never silent
                     live.park(h, LIVE_ORPHANS);

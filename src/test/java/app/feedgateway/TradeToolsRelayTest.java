@@ -442,4 +442,35 @@ class TradeToolsRelayTest {
         assertEquals(132, cols.get(cols.size() - 1).get("columnIndex").asLong());
         assertEquals(109, cols.get(0).get("columnIndex").asLong());
     }
+
+    @Test
+    void aLogLongerThanTheCapRecoversOnlyWhatTheCappedReadReachesAndNeverInventsTheRest() throws Exception {
+        int busyCopies = TradeToolsRelay.COLUMNS_TAIL / 30 + 10;                  // the busy chart alone is longer than the cap, so the quiet chart's records lie below it
+        var perColumn = new org.apache.avro.generic.GenericRecord[30];
+        for (int c = 0; c < perColumn.length; c++) {
+            perColumn[c] = TaFixtures.column("busy", 1 + c, 1_000 + c);
+        }
+        var relay = new TradeToolsRelay();
+        relay.beginRecovery();
+        relay.onStaged(CHART, TaFixtures.chart("busy", "M1", 1));
+        relay.onStaged(CHART, TaFixtures.chart("quiet", "M5", 2));
+        for (long i = 30L * busyCopies - TradeToolsRelay.COLUMNS_TAIL; i < 30L * busyCopies; i++) {   // what the capped seek reads: the last COLUMNS_TAIL of the log
+            relay.onStaged(COLUMN, perColumn[(int) (i / busyCopies)]);
+        }
+        relay.promote();
+        JsonNode hello = bundles(relay, 1 << 22);
+        assertEquals(24, hello.get("1m").get("pfColumns").size(), "the busy chart's cap-reached tail still holds its latest 24 columns");
+        assertEquals(30, hello.get("1m").get("pfColumns").get(23).get("columnIndex").asLong());
+        assertEquals(0, hello.get("5m").get("pfColumns").size(), "the quiet chart lies below the cap: absent, not guessed");
+        assertEquals(1, hello.get("5m").get("pfCharts").size());
+    }
+
+    @Test
+    void anOlderCopyOfAParkedLiveRecordIsACountedRegression() {
+        var relay = new TradeToolsRelay();
+        assertNull(relay.onLive(COLUMN, TaFixtures.column("late", 1, 20)));
+        assertNull(relay.onLive(COLUMN, TaFixtures.column("late", 1, 10)));
+        assertEquals(1, relay.regressionsForTest());
+        assertEquals(0, relay.dropsForTest());
+    }
 }
