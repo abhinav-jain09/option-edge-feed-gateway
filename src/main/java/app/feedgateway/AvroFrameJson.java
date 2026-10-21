@@ -107,9 +107,14 @@ final class AvroFrameJson {
     private static void writeKeyed(JsonGenerator g, Schema entry, java.util.List<?> entries, boolean rejectUnknown) throws IOException {
         g.writeStartObject();
         Schema value = entry.getField("value").schema();
+        java.util.Set<String> keys = new java.util.HashSet<>();
         for (Object e : entries) {
             GenericRecord r = (GenericRecord) e;
-            g.writeFieldName(r.get("key").toString());
+            String name = r.get("key").toString();
+            if (!keys.add(name)) {
+                throw new IOException("a keyed collection repeats the key " + name);
+            }
+            g.writeFieldName(name);
             write(g, value, r.get("value"), rejectUnknown);
         }
         g.writeEndObject();
@@ -164,16 +169,20 @@ final class AvroFrameJson {
     private static final class BoundedWriter extends Writer {
         private final StringBuilder text = new StringBuilder(2048);
         private final int maxChars;
+        private long bytes;
 
         BoundedWriter(int maxChars) {
             this.maxChars = maxChars;
         }
 
+        /** The bound is a UTF-8 BYTE bound (every caller passes a byte limit): each chunk is charged its encoded size before it is kept. */
         @Override
         public void write(char[] buffer, int offset, int length) throws IOException {
-            if (text.length() + length > maxChars) {
-                throw new IOException("frame exceeds " + maxChars + " characters");
+            long add = StudiesRelay.utf8Length(java.nio.CharBuffer.wrap(buffer, offset, length));
+            if (bytes + add > maxChars) {
+                throw new IOException("frame exceeds " + maxChars + " bytes");
             }
+            bytes += add;
             text.append(buffer, offset, length);
         }
 

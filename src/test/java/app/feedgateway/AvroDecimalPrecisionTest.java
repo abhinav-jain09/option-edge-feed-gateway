@@ -50,4 +50,26 @@ class AvroDecimalPrecisionTest {
         assertEquals("{\"m\":{\"a\":1}}", AvroFrameJson.render(ok, 100000, true));
         assertNull(AvroFrameJson.render(big, 10_000_000, true));
     }
+
+    @Test
+    void aKeyedCollectionWithARepeatedKeyIsRefused() {
+        Schema ks = new Schema.Parser().parse("{\"type\":\"record\",\"name\":\"K\",\"namespace\":\"t\",\"fields\":[{\"name\":\"m\",\"jsonKeyed\":true,\"type\":{\"type\":\"array\",\"items\":{\"type\":\"record\",\"name\":\"E\",\"fields\":[{\"name\":\"key\",\"type\":\"string\"},{\"name\":\"value\",\"type\":\"long\"}]}}}]}");
+        Schema es = ks.getField("m").schema().getElementType();
+        java.util.function.BiFunction<String, Long, GenericRecord> entry = (k, v) -> { GenericRecord e = new GenericData.Record(es); e.put("key", k); e.put("value", v); return e; };
+        GenericRecord ok = new GenericData.Record(ks);
+        ok.put("m", java.util.List.of(entry.apply("x", 1L), entry.apply("y", 2L)));
+        GenericRecord dup = new GenericData.Record(ks);
+        dup.put("m", java.util.List.of(entry.apply("x", 1L), entry.apply("x", 2L)));
+        assertEquals("{\"m\":{\"x\":1,\"y\":2}}", AvroFrameJson.render(ok, 1000, true));
+        assertNull(AvroFrameJson.render(dup, 1000, true));
+    }
+
+    @Test
+    void theFrameBoundIsInUtf8BytesNotCharacters() {
+        Schema ss = new Schema.Parser().parse("{\"type\":\"record\",\"name\":\"S\",\"namespace\":\"t\",\"fields\":[{\"name\":\"s\",\"type\":\"string\"}]}");
+        GenericRecord r = new GenericData.Record(ss);
+        r.put("s", "\u20ac".repeat(400));   // 400 characters, 1200 bytes
+        assertNull(AvroFrameJson.render(r, 1000, true), "400 characters but 1200 bytes: over a 1000-byte bound");
+        assertEquals(true, AvroFrameJson.render(r, 1300, true) != null);
+    }
 }
