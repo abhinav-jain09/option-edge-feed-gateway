@@ -2892,20 +2892,20 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.marketStructurePatternsTopic(), new TopicBinding("DATABENTO", "market-structure-patterns"));
         }
         if (settings.structureToolsEnabled()) {
-            topicEvents.put(settings.structureToolsTopic(), new TopicBinding("DATABENTO", TimeframeSetRelay.TOOLS_EVENT));
+            bindChartTopic(topicEvents, settings.structureToolsTopic(), TimeframeSetRelay.TOOLS_EVENT);
         }
         if (settings.geometryEnabled()) {
-            topicEvents.put(settings.geometryTopic(), new TopicBinding("DATABENTO", TimeframeSetRelay.GEOMETRY_EVENT));
+            bindChartTopic(topicEvents, settings.geometryTopic(), TimeframeSetRelay.GEOMETRY_EVENT);
         }
         if (settings.tradeToolsEnabled()) {
             List<String> tradeToolsTopics = settings.tradeToolsTopics();
             for (int role = 0; role < TradeToolsRelay.ROLES.length; role++) {
-                topicEvents.put(tradeToolsTopics.get(role), new TopicBinding("DATABENTO", TradeToolsRelay.ROLES[role]));
+                bindChartTopic(topicEvents, tradeToolsTopics.get(role), TradeToolsRelay.ROLES[role]);
             }
         }
         if (settings.waveCycleEnabled()) {
-            topicEvents.put(settings.waveCycleWavesTopic(), new TopicBinding("DATABENTO", WaveCycleRelay.WAVES_EVENT));
-            topicEvents.put(settings.waveCycleCyclesTopic(), new TopicBinding("DATABENTO", WaveCycleRelay.CYCLES_EVENT));
+            bindChartTopic(topicEvents, settings.waveCycleWavesTopic(), WaveCycleRelay.WAVES_EVENT);
+            bindChartTopic(topicEvents, settings.waveCycleCyclesTopic(), WaveCycleRelay.CYCLES_EVENT);
         }
         if (settings.studiesEnabled()) {
             // Phase A studies: Avro, LIVE consumer only (the cache consumer has no case for them; the relay keeps its own
@@ -2921,6 +2921,13 @@ public class FeedGatewayService implements ReplayRunner {
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
+    }
+
+    /** Binds one chart relay topic; two roles (or a chart topic and another stream) on one topic would silently route records to the wrong relay, so it refuses to start. */
+    static void bindChartTopic(Map<String, TopicBinding> topicEvents, String topic, String event) {
+        if (topicEvents.putIfAbsent(topic, new TopicBinding("DATABENTO", event)) != null) {
+            throw new IllegalStateException("topic " + topic + " is configured for two gateway streams; refusing to start with a misrouting binding (event " + event + ")");
+        }
     }
 
     private void runJsonStateLiveConsumer() {

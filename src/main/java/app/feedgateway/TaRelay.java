@@ -68,7 +68,7 @@ abstract class TaRelay {
                 + p + "accepted_total " + accepted.get() + "\n"
                 + "# HELP " + p + "drops_total Records refused at the gateway boundary (invalid, oversize, unknown record, tombstone).\n"
                 + "# TYPE " + p + "drops_total counter\n" + p + "drops_total " + drops.get() + "\n"
-                + "# HELP " + p + "regressions_total Records refused because their ordering key regressed.\n# TYPE " + p + "regressions_total counter\n"
+                + "# HELP " + p + "regressions_total Records refused because their ordering key regressed, or because retention depth outranks them (a delayed record older than everything a full bounded set holds).\n# TYPE " + p + "regressions_total counter\n"
                 + p + "regressions_total " + regressions.get() + "\n";
     }
 
