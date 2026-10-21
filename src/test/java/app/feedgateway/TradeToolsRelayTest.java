@@ -263,13 +263,15 @@ class TradeToolsRelayTest {
             assertNotNull(relay.onLive(CHART, TaFixtures.chart("c-" + i, "M5", 5)));
             assertEquals(0, relay.released().size(), "c-" + i + " was evicted from the buffer, there is nothing to release");
         }
-        // a survivor is released exactly once, right after its chart
-        assertNotNull(relay.onLive(CHART, TaFixtures.chart("c-" + extra, "M5", 5)));
-        var released = relay.released();
-        assertEquals(1, released.size());
-        assertEquals("trade-tools-pf-column", released.get(0)[0]);
-        assertTrue(released.get(0)[1].contains("c-" + extra), "it is the survivor's own column");
-        assertEquals(0, relay.released().size());
+        // every survivor is released exactly once, right after its OWN chart, and never twice
+        for (int i = extra; i < TradeToolsRelay.LIVE_ORPHANS + extra; i++) {
+            assertNotNull(relay.onLive(CHART, TaFixtures.chart("c-" + i, "M5", 1000 + i)), "a newer chart is accepted (the timeframe keeps its newest four)");
+            var released = relay.released();
+            assertEquals(1, released.size(), "c-" + i);
+            assertEquals("trade-tools-pf-column", released.get(0)[0]);
+            assertTrue(released.get(0)[1].contains("\"c-" + i + "\""), "it is c-" + i + "'s own column");
+            assertEquals(0, relay.released().size(), "c-" + i + " is released once");
+        }
         assertEquals(extra, relay.dropsForTest(), "no further drops");
     }
 
