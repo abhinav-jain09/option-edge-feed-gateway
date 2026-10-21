@@ -251,12 +251,26 @@ class TradeToolsRelayTest {
     }
 
     @Test
-    void theParkedBufferIsBoundedAndTheOldestLeavesCounted() {
+    void theParkedBufferIsBoundedTheOldestLeavesCountedAndOnlyTheSurvivorsAreReleased() {
         var relay = new TradeToolsRelay();
-        for (int i = 0; i < TradeToolsRelay.LIVE_ORPHANS + 3; i++) {
-            relay.onLive(COLUMN, TaFixtures.column("none-" + i, 1, 10 + i));
+        int extra = 3;
+        for (int i = 0; i < TradeToolsRelay.LIVE_ORPHANS + extra; i++) {
+            assertNull(relay.onLive(COLUMN, TaFixtures.column("c-" + i, 1, 10 + i)), "parked, never broadcast");
         }
-        assertEquals(3, relay.dropsForTest(), "three records past the bound were counted as drops");
+        assertEquals(extra, relay.dropsForTest(), "three records past the bound were counted as drops");
+        // the first `extra` chart ids were the oldest: their records left; their charts release nothing
+        for (int i = 0; i < extra; i++) {
+            assertNotNull(relay.onLive(CHART, TaFixtures.chart("c-" + i, "M5", 5)));
+            assertEquals(0, relay.released().size(), "c-" + i + " was evicted from the buffer, there is nothing to release");
+        }
+        // a survivor is released exactly once, right after its chart
+        assertNotNull(relay.onLive(CHART, TaFixtures.chart("c-" + extra, "M5", 5)));
+        var released = relay.released();
+        assertEquals(1, released.size());
+        assertEquals("trade-tools-pf-column", released.get(0)[0]);
+        assertTrue(released.get(0)[1].contains("c-" + extra), "it is the survivor's own column");
+        assertEquals(0, relay.released().size());
+        assertEquals(extra, relay.dropsForTest(), "no further drops");
     }
 
     @Test
