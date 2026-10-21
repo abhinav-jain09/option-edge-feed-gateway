@@ -50,7 +50,49 @@ final class StudiesRelay {
     private static final int BAR_ID_MAX = 64;
 
     /** One retained finalized bar: its identity, its clock and the frame data it will be sent as. */
-    record Bar(String barId, long startMs, String json, int bytes) { }
+    static final class Bar {
+        private final String barId;
+        private final long startMs;
+        /** The decoded record while the bar is only staged (not yet rendered); released once rendered. */
+        private GenericRecord pending;
+        private String json;
+        private int bytes;
+
+        /** A rendered bar (the live path). */
+        Bar(String barId, long startMs, String json, int bytes) {
+            this.barId = barId;
+            this.startMs = startMs;
+            this.json = json;
+            this.bytes = bytes;
+        }
+
+        /** A staged bar: validated and ordered, rendered only if recovery retains it. */
+        Bar(String barId, long startMs, GenericRecord pending) {
+            this.barId = barId;
+            this.startMs = startMs;
+            this.pending = pending;
+        }
+
+        String barId() {
+            return barId;
+        }
+
+        long startMs() {
+            return startMs;
+        }
+
+        String json() {
+            return json;
+        }
+
+        int bytes() {
+            return bytes;
+        }
+
+        boolean rendered() {
+            return json != null;
+        }
+    }
 
     /** The retained state of the stream. Not thread-safe: the relay mutates the live store under its lock. */
     static final class Store {
@@ -127,6 +169,7 @@ final class StudiesRelay {
 
     private final ObjectMapper mapper;
     private final AtomicLong accepted = new AtomicLong();
+    private final AtomicLong renders = new AtomicLong();
     private final AtomicLong drops = new AtomicLong();
     private final AtomicLong regressions = new AtomicLong();
     private final AtomicLong duplicates = new AtomicLong();
@@ -140,7 +183,7 @@ final class StudiesRelay {
 
     /** The live path: returns the frame data to broadcast for the event, or null (dropped, duplicate, regression, history only). */
     synchronized String onLive(String event, String key, Object value, boolean esTopic) {
-        return apply(live, event, key, value, esTopic);
+        return apply(live, event, key, value, esTopic, false);
     }
 
     /** A private copy of the retained state for a recovery read; nothing in it is visible until {@link #promote}. */
@@ -150,7 +193,7 @@ final class StudiesRelay {
 
     /** The recovery path: the record is merged into the private store; nothing is broadcast. */
     void onStaged(Store staged, String event, String key, Object value, boolean esTopic) {
-        apply(staged, event, key, value, esTopic);
+        apply(staged, event, key, value, esTopic, true);
     }
 
     /**
@@ -164,7 +207,11 @@ final class StudiesRelay {
         AtomicLong notCounted = new AtomicLong();   // the staged copy re-presents bars the live store already holds
         for (int i = 0; i < staged.bars.length; i++) {
             for (Bar b : staged.bars[i]) {
+                if (!render(b)) {
+                    continue;   // an unrenderable staged bar is never retained or sent
+                }
                 if (live.merge(i, b, notCounted)) {
+                    accepted.incrementAndGet();
                     frames.add(new String[] {BAR_EVENT, b.json()});
                 }
             }
@@ -195,20 +242,20 @@ final class StudiesRelay {
         return topic != null && topic.startsWith("es.");
     }
 
-    private String apply(Store target, String event, Object key, Object value, boolean esTopic) {
+    private String apply(Store target, String event, Object key, Object value, boolean esTopic, boolean staging) {
         if (!(value instanceof GenericRecord record)) {
             drops.incrementAndGet();
             return null;
         }
         try {
-            return BAR_EVENT.equals(event) ? applyBar(target, key, record, esTopic ? 1 : 0) : applyCurrent(target, key, record, esTopic ? 1 : 0);
+            return BAR_EVENT.equals(event) ? applyBar(target, key, record, esTopic ? 1 : 0, staging) : applyCurrent(target, key, record, esTopic ? 1 : 0);
         } catch (RuntimeException | JsonProcessingException e) {
             drops.incrementAndGet();   // a malformed record (a missing field, an unparseable instant) is refused, never repaired
             return null;
         }
     }
 
-    private String applyBar(Store target, Object key, GenericRecord r, int topicSymbol) throws JsonProcessingException {
+    private String applyBar(Store target, Object key, GenericRecord r, int topicSymbol, boolean staging) throws JsonProcessingException {
         Schema schema = r.getSchema();
         String symbol = str(r, "symbol");
         int s = indexOf(SYMBOLS, symbol);
@@ -235,13 +282,6 @@ final class StudiesRelay {
             drops.incrementAndGet();
             return null;
         }
-        String json = mapper.writeValueAsString(AvroJson.toJsonNode(mapper, r));
-        int bytes = utf8Length(json);
-        if (bytes > BAR_MAX_BYTES) {
-            drops.incrementAndGet();
-            return null;
-        }
-        Bar bar = new Bar(barId, startMs, json, bytes);
         ArrayList<Bar> held = target.bars[s * TF.length + t];
         for (int i = held.size() - 1; i >= 0; i--) {
             if (held.get(i).barId().equals(barId)) {
@@ -249,11 +289,47 @@ final class StudiesRelay {
                 return null;
             }
         }
-        boolean newest = target.merge(s * TF.length + t, bar, duplicates);
+        if (staging) {
+            // Recovery reads days of history to keep eight bars per series: a staged bar is validated and ordered here and rendered to
+            // JSON only if it is still retained when recovery is promoted, so the work is bounded by what is kept, not by what was read.
+            target.merge(s * TF.length + t, new Bar(barId, startMs, r), duplicates);
+            return null;
+        }
+        String json = mapper.writeValueAsString(AvroJson.toJsonNode(mapper, r));
+        renders.incrementAndGet();
+        int bytes = utf8Length(json);
+        if (bytes > BAR_MAX_BYTES) {
+            drops.incrementAndGet();
+            return null;
+        }
+        boolean newest = target.merge(s * TF.length + t, new Bar(barId, startMs, json, bytes), duplicates);
         if (newest) {
             accepted.incrementAndGet();
         }
         return newest ? json : null;
+    }
+
+    /** Renders a staged bar at promotion; false (counted as a drop) when it cannot be rendered or exceeds the per-bar bound. */
+    private boolean render(Bar b) {
+        if (b.rendered()) {
+            return true;
+        }
+        try {
+            String json = mapper.writeValueAsString(AvroJson.toJsonNode(mapper, b.pending));
+            renders.incrementAndGet();
+            int bytes = utf8Length(json);
+            if (bytes > BAR_MAX_BYTES) {
+                drops.incrementAndGet();
+                return false;
+            }
+            b.json = json;
+            b.bytes = bytes;
+            b.pending = null;
+            return true;
+        } catch (RuntimeException | JsonProcessingException e) {
+            drops.incrementAndGet();
+            return false;
+        }
     }
 
     private String applyCurrent(Store target, Object key, GenericRecord r, int topicSymbol) throws JsonProcessingException {
@@ -429,6 +505,14 @@ final class StudiesRelay {
                 + "# HELP gateway_studies_duplicates_total Study bars already held (replay re-emits identical keys and values).\n"
                 + "# TYPE gateway_studies_duplicates_total counter\n"
                 + "gateway_studies_duplicates_total " + duplicates.get() + "\n";
+    }
+
+    long rendersForTest() {
+        return renders.get();
+    }
+
+    long acceptedForTest() {
+        return accepted.get();
     }
 
     long dropsForTest() {

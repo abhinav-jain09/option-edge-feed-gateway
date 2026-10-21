@@ -560,4 +560,21 @@ class StudiesRelayTest {
         }
         assertEquals(23, kept2, "exactly one bar went");
     }
+
+    @Test
+    void recoveryRendersOnlyWhatPromotionRetainsAndCountsOnlyWhatItSends() throws Exception {
+        StudiesRelay.Store staged = relay.newStaging();
+        for (int i = 0; i < 300; i++) {   // a long history read during recovery, ascending
+            GenericRecord b = bar("SPX", "T1M", i);
+            StudiesFixtures.onStaged(relay, staged, StudiesRelay.BAR_EVENT, barKey(b), b);
+        }
+        assertEquals(0L, relay.rendersForTest(), "nothing is rendered while staging");
+        assertEquals(0L, relay.acceptedForTest(), "staged bars are not 'accepted' yet");
+        List<String[]> frames = relay.promote(staged);
+        assertEquals(StudiesRelay.HISTORY_BARS, relay.rendersForTest(), "only the eight retained bars were rendered");
+        assertEquals((long) StudiesRelay.HISTORY_BARS, relay.acceptedForTest());
+        assertEquals(StudiesRelay.HISTORY_BARS, frames.size());
+        assertEquals(StudiesRelay.HISTORY_BARS, hello().get("studyBars").get("1m").size());
+        assertEquals(299L, minute(hello().get("studyBars").get("1m").get(StudiesRelay.HISTORY_BARS - 1)));
+    }
 }
