@@ -140,7 +140,8 @@ class ChartHelloBudgetTest {
         System.setProperty("GATEWAY_MARKET_STRUCTURE_ENABLED", "true");
         try {
             var t = new FeedGatewayService(spyAll(), JSON, new HpsfGatewayViewMapper(), null);
-            t.retainMarketStructure(1L, record);
+            assertTrue(t.retainMarketStructure(1L, record), "the fixed field is really retained (the precondition of the whole scenario)");
+            assertTrue(t.cvdHelloJson().contains("\"structure\":{\"x\":"), "and it rides the hello");
             fill(t, 8, 100, 1_000, 1, 1_000);
             String hello = t.cvdHelloJson();
             JsonNode node = JSON.readTree(hello);
