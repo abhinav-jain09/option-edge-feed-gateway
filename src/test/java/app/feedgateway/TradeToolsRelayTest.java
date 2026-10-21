@@ -224,6 +224,18 @@ class TradeToolsRelayTest {
     }
 
     @Test
+    void equalClocksAreResolvedByKeySoTheSameInputKeepsTheSameCharts() throws Exception {
+        for (String[] order : new String[][] {{"a", "b", "c", "d", "e"}, {"e", "d", "c", "b", "a"}, {"c", "e", "a", "d", "b"}}) {
+            var relay = new TradeToolsRelay();
+            for (String id : order) {
+                relay.onLive(CHART, TaFixtures.chart(id, "M1", 7));
+            }
+            JsonNode charts = bundles(relay, 1 << 20).get("1m").get("pfCharts");
+            assertEquals(List.of("b", "c", "d", "e"), java.util.stream.StreamSupport.stream(charts.spliterator(), false).map(n -> n.get("chartId").asText()).sorted().toList(), String.join("", order));
+        }
+    }
+
+    @Test
     void aDelayedRecordThatWouldBeEvictedAtOnceIsRefusedNotForwarded() throws Exception {
         var relay = new TradeToolsRelay();
         for (int i = 0; i < TradeToolsRelay.FLOW_BARS; i++) {

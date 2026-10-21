@@ -209,8 +209,8 @@ final class TradeToolsRelay extends TaRelay {
                         old = null;
                     }
                     if (old == null && charts[h.tf()].size() == CHARTS_PER_TF) {
-                        Held oldest = charts[h.tf()].values().stream().min(Comparator.comparingLong(Held::asOf)).orElseThrow();
-                        if (h.asOf() < oldest.asOf()) {
+                        Held oldest = charts[h.tf()].values().stream().min(Comparator.comparingLong(Held::asOf).thenComparing(Held::key)).orElseThrow();   // rank = (asOf, key): the lowest rank leaves, so the same input always keeps the same charts
+                        if (h.asOf() < oldest.asOf() || (h.asOf() == oldest.asOf() && h.key().compareTo(oldest.key()) < 0)) {
                             return 0;   // a delayed chart older than every retained one never evicts a newer chart
                         }
                         removeChart(oldest.key());
