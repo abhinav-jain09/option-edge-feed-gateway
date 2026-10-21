@@ -577,4 +577,38 @@ class StudiesRelayTest {
         assertEquals(StudiesRelay.HISTORY_BARS, hello().get("studyBars").get("1m").size());
         assertEquals(299L, minute(hello().get("studyBars").get("1m").get(StudiesRelay.HISTORY_BARS - 1)));
     }
+
+    @Test
+    void theBudgetTheServiceCanSpareBindsTheFragmentAndTheSkeletonIsTheFloor() throws Exception {
+        for (String tf : List.of("T1M", "T5M", "T15M")) {
+            for (int i = 0; i < StudiesRelay.HISTORY_BARS; i++) {
+                live(bar("SPX", tf, i));
+            }
+        }
+        relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1), false);
+        int full = StudiesRelay.utf8Length(relay.helloFields());
+        int spare = full / 2;
+        String half = relay.helloFields(spare);
+        assertTrue(StudiesRelay.utf8Length(half) <= spare, "bytes " + StudiesRelay.utf8Length(half) + " of " + spare);
+        assertTrue(half.length() < relay.helloFields().length(), "a smaller budget gives up history");
+        assertTrue(relay.helloFields() == relay.helloFields(), "the full budget's rendering is cached again");
+        String floor = relay.helloFields(0);
+        JsonNode h = JSON.readTree("{\"hello\":1" + floor + "}");
+        for (String f : List.of("studies", "esStudies")) {
+            h.get(f).forEach(v -> assertTrue(v.isNull()));
+        }
+        for (String f : List.of("studyBars", "esStudyBars")) {
+            h.get(f).forEach(v -> assertEquals(0, v.size()));
+        }
+    }
+
+    @Test
+    void stagedBarsAreIndependentCopiesOfTheDeserializersRecords() throws Exception {
+        StudiesRelay.Store staged = relay.newStaging();
+        GenericRecord b = bar("SPX", "T5M", 4);
+        StudiesFixtures.onStaged(relay, staged, StudiesRelay.BAR_EVENT, barKey(b), b);
+        b.put("closesSeen", 987654321L);   // the deserializer reuses or mutates its object after the poll
+        relay.promote(staged);
+        assertEquals(104L, hello().get("studyBars").get("5m").get(0).get("closesSeen").asLong(), "the staged bar kept the values it was validated with");
+    }
 }

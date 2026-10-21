@@ -12930,6 +12930,8 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The requirement's PATTERN_SET_MAX_BYTES (R6.4): 1 048 576 − 4 096. */
     static final int MARKET_STRUCTURE_PATTERNS_MAX_BYTES = 1_048_576 - 4_096;
+    /** The whole cvd-hello frame: the 1 MiB guard less the margin every relay keeps. */
+    static final int HELLO_FRAME_MAX_BYTES = 1_048_576 - 4_096;
 
     /** What the boundary learned about an accepted set: its timeframe and its clock. */
     record PatternSetBoundary(String timeframe, long asOfMs) { }
@@ -13155,11 +13157,6 @@ public class FeedGatewayService implements ReplayRunner {
             }
             sb.append('}');
         }
-        if (settings.studiesEnabled()) {
-            // Phase A studies (03_STUDIES_FRAME_CONTRACT.md): the latest current state and the recent finalized bars per
-            // timeframe, SPX in studies/studyBars and ES in esStudies/esStudyBars; the fields' presence = flag on.
-            sb.append(studies.helloFields());
-        }
         if (footprintViews != null) {
             // G-R6: ONE atomic snapshot of the footprint coordinator rides the SAME hello; the field's
             // ABSENCE (flag off) tells the page this gateway has no footprint stream.
@@ -13167,6 +13164,14 @@ public class FeedGatewayService implements ReplayRunner {
             // ES-FOOTPRINT-STRIKE-INTERACTION.md R14: the episode high-water mark rides the SAME hello, so
             // the ladder can tell LOADING from a folded value from NO DATA.
             sb.append(",\"footprintStrike\":").append(footprintStrikeField);
+        }
+        if (settings.studiesEnabled()) {
+            // Phase A studies (03_STUDIES_FRAME_CONTRACT.md): the latest current state and the recent finalized bars per timeframe, SPX in
+            // studies/studyBars and ES in esStudies/esStudyBars; the fields' presence = flag on. Appended LAST, with exactly the bytes the
+            // rest of the hello leaves under the 1 MiB frame guard (minus the 4 KiB margin the other relays use and the closing brace),
+            // so the transmitted hello stays within it whatever the other streams hold.
+            int rest = HELLO_FRAME_MAX_BYTES - StudiesRelay.utf8Length(sb.toString()) - 1;
+            sb.append(studies.helloFields(Math.max(0, rest)));
         }
         return sb.append('}').toString();
     }

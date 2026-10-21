@@ -176,6 +176,7 @@ final class StudiesRelay {
     private Store live = new Store();
     private String helloCache;
     private long helloCacheVersion;
+    private int helloCacheBudget;
 
     StudiesRelay(ObjectMapper mapper) {
         this.mapper = mapper;
@@ -292,7 +293,8 @@ final class StudiesRelay {
         if (staging) {
             // Recovery reads days of history to keep eight bars per series: a staged bar is validated and ordered here and rendered to
             // JSON only if it is still retained when recovery is promoted, so the work is bounded by what is kept, not by what was read.
-            target.merge(s * TF.length + t, new Bar(barId, startMs, r), duplicates);
+            // an independent copy: the deserializer's object is not ours to hold across the polls of a recovery
+            target.merge(s * TF.length + t, new Bar(barId, startMs, org.apache.avro.generic.GenericData.get().deepCopy(r.getSchema(), r)), duplicates);
             return null;
         }
         String json = mapper.writeValueAsString(AvroJson.toJsonNode(mapper, r));
@@ -423,9 +425,19 @@ final class StudiesRelay {
      * entry degrade to {@code null}.
      */
     synchronized String helloFields() {
-        if (helloCache == null || helloCacheVersion != live.version) {
-            helloCache = buildHello(live);
+        return helloFields(HELLO_MAX_BYTES);
+    }
+
+    /**
+     * The same with the byte budget the caller can spare: the service passes what is left of the whole hello's cap after every other
+     * field, so the transmitted hello (not only this fragment) stays within it. A smaller budget gives up history sooner.
+     */
+    synchronized String helloFields(int budgetBytes) {
+        int budget = Math.min(HELLO_MAX_BYTES, budgetBytes);
+        if (helloCache == null || helloCacheVersion != live.version || helloCacheBudget != budget) {
+            helloCache = buildHello(live, budget);
             helloCacheVersion = live.version;
+            helloCacheBudget = budget;
         }
         return helloCache;
     }
@@ -436,11 +448,11 @@ final class StudiesRelay {
      * exceeds the budget); only when no history is left does the largest current entry degrade to {@code null}. The common case is a
      * single render. The result is cached until the retained state changes, so the extra renders of an over-budget hello are paid once.
      */
-    private static String buildHello(Store st) {
+    private static String buildHello(Store st, int budget) {
         int[] from = new int[st.bars.length];
         boolean[][] nulled = new boolean[SYMBOLS.length][TF.length];
         String out = render(st, from, nulled);
-        while (utf8Length(out) > HELLO_MAX_BYTES) {
+        while (utf8Length(out) > budget) {
             int longest = -1;
             for (int i = 0; i < st.bars.length; i++) {
                 if (st.bars[i].size() - from[i] > 0 && (longest < 0 || st.bars[i].size() - from[i] > st.bars[longest].size() - from[longest])) {
@@ -461,7 +473,9 @@ final class StudiesRelay {
                     }
                 }
                 if (ws < 0) {
-                    break;
+                    // nothing left to give up: the bare skeleton (every entry null / empty) is the least this hello can carry; the flag
+                    // being on, the fields must be present. If even that exceeds the budget the OTHER fields already filled the hello.
+                    return render(new Store(), new int[st.bars.length], new boolean[SYMBOLS.length][TF.length]);
                 }
                 nulled[ws][wt] = true;
             }

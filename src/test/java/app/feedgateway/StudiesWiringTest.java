@@ -118,4 +118,15 @@ class StudiesWiringTest {
             System.clearProperty("GATEWAY_STUDIES_RECOVERY_HOURS");
         }
     }
+
+    @Test
+    void theStudiesAreAppendedLastWithWhatTheRestOfTheHelloLeavesUnderTheFrameGuard() throws Exception {
+        String src = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        int hello = src.indexOf("String cvdHelloJson(String footprintStrikeField)");
+        int footprint = src.indexOf("sb.append(\",\\\"footprintStrike\\\":\")", hello);
+        int studies = src.indexOf("studies.helloFields(Math.max(0, rest))", hello);
+        assertTrue(hello > 0 && footprint > hello && studies > footprint, "appended after every other field");
+        assertTrue(src.contains("HELLO_FRAME_MAX_BYTES - StudiesRelay.utf8Length(sb.toString()) - 1"));
+        assertEquals(1_048_576 - 4_096, FeedGatewayService.HELLO_FRAME_MAX_BYTES);
+    }
 }
