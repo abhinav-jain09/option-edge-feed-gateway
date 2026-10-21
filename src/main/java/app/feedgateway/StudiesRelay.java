@@ -759,7 +759,7 @@ final class StudiesRelay {
     }
 
     /** The UTF-8 length of {@code s} without allocating the bytes. */
-    static int utf8Length(String s) {
+    static int utf8Length(CharSequence s) {
         int n = 0;
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);

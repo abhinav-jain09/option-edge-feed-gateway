@@ -371,6 +371,60 @@ public final class GatewaySettings {
     }
 
     /**
+     * Phase B structure tools (frame {@code market-structure-tools}, hello field {@code tools};
+     * ta-books-catalog/05_GEOMETRY_FRAME_CONTRACT.md). OFF by default: an absent {@code tools} field is how the page learns this
+     * gateway has no tools stream.
+     */
+    public boolean structureToolsEnabled() {
+        return boolValue("GATEWAY_STRUCTURE_TOOLS_ENABLED", false);
+    }
+
+    public String structureToolsTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_TOOLS_TOPIC", "options.spx.market-structure.tools");
+    }
+
+    /** Phase C classical geometry (frame {@code market-structure-geometry}, hello field {@code geometry}); OFF by default. */
+    public boolean geometryEnabled() {
+        return boolValue("GATEWAY_GEOMETRY_ENABLED", false);
+    }
+
+    public String geometryTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_GEOMETRY_TOPIC", "options.spx.market-structure.geometry");
+    }
+
+    /**
+     * Phase D trade-level tools (twelve {@code trade-tools-*} frames, hello field {@code tradeTools};
+     * 06_TRADE_TOOLS_FRAME_CONTRACT.md). OFF by default. The producer's topic names are the keys of {@link #tradeToolsTopics()}.
+     */
+    public boolean tradeToolsEnabled() {
+        return boolValue("GATEWAY_TRADE_TOOLS_ENABLED", false);
+    }
+
+    /** The six display topics of es-trade-tools-service by role, in the order {@link TradeToolsRelay#ROLES} names them. */
+    public java.util.List<String> tradeToolsTopics() {
+        return java.util.List.of(
+                value("KAFKA_TT_PF_CHART_TOPIC", "futures.pf.chart"),
+                value("KAFKA_TT_PF_COLUMNS_TOPIC", "futures.pf.columns"),
+                value("KAFKA_TT_PF_EVENTS_TOPIC", "futures.pf.events"),
+                value("KAFKA_TT_VOLUME_NODES_TOPIC", "futures.volume-nodes"),
+                value("KAFKA_TT_FLOW_BARS_TOPIC", "futures.flow.bars"),
+                value("KAFKA_TT_FLOW_EVENTS_TOPIC", "futures.flow.events"));
+    }
+
+    /** Phase E Elliott counts, Fibonacci, channels and cycles (frames {@code wave-cycle-waves}/{@code wave-cycle-cycles}, hello field {@code waves}); OFF by default. */
+    public boolean waveCycleEnabled() {
+        return boolValue("GATEWAY_WAVE_CYCLE_ENABLED", false);
+    }
+
+    public String waveCycleWavesTopic() {
+        return value("KAFKA_WAVE_CYCLE_WAVES_TOPIC", "options.spx.wave-cycle.waves");
+    }
+
+    public String waveCycleCyclesTopic() {
+        return value("KAFKA_WAVE_CYCLE_CYCLES_TOPIC", "options.spx.wave-cycle.cycles");
+    }
+
+    /**
      * Early-auction verdict evidence ledger (EARLY-AUCTION-VERDICT-STAGE1-GATE1.md:
      * {@code early-auction.verdicts.shadow}, JSON, ONE partition, one immutable record per line —
      * PREDICTION / OUTCOME / MISS / terminals). Feeds the read-only {@code /early-auction} web panel
