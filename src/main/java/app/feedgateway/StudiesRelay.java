@@ -198,6 +198,7 @@ final class StudiesRelay {
     private final AtomicLong accepted = new AtomicLong();
     private final AtomicLong renders = new AtomicLong();
     private final AtomicLong copies = new AtomicLong();
+    private final AtomicLong aliased = new AtomicLong();
     private final AtomicLong helloSuppressed = new AtomicLong();
     private final AtomicLong drops = new AtomicLong();
     private final AtomicLong regressions = new AtomicLong();
@@ -358,9 +359,27 @@ final class StudiesRelay {
      * copies. At most eight bars per series are retained, so at most 48 copies per poll however many records were read.
      */
     synchronized void seal(Store staged) {
+        // A deserializer that REUSED one record object for several messages (the Kafka consumer API does not allow it: a poll's
+        // ConsumerRecords holds all its values at once) would show up here as one object held by several bars. Such bars carry the data
+        // of the last message, not their own: they are discarded, counted, and never retained or rendered.
+        java.util.IdentityHashMap<GenericRecord, Integer> holders = new java.util.IdentityHashMap<>();
         for (ArrayList<Bar> list : staged.bars) {
             for (Bar b : list) {
                 if (!b.rendered() && !b.sealed) {
+                    holders.merge(b.pending, 1, Integer::sum);
+                }
+            }
+        }
+        for (ArrayList<Bar> list : staged.bars) {
+            for (java.util.Iterator<Bar> it = list.iterator(); it.hasNext();) {
+                Bar b = it.next();
+                if (b.rendered() || b.sealed) {
+                    continue;
+                }
+                if (holders.get(b.pending) > 1) {
+                    it.remove();
+                    aliased.incrementAndGet();
+                } else {
                     b.pending = org.apache.avro.generic.GenericData.get().deepCopy(b.pending.getSchema(), b.pending);
                     b.sealed = true;
                     copies.incrementAndGet();
@@ -610,9 +629,16 @@ final class StudiesRelay {
                 + "# HELP gateway_studies_hello_suppressed_total Hellos sent without the studies fields because the other fields left no room for even their skeleton.\n"
                 + "# TYPE gateway_studies_hello_suppressed_total counter\n"
                 + "gateway_studies_hello_suppressed_total " + helloSuppressed.get() + "\n"
+                + "# HELP gateway_studies_aliased_records_total Staged study bars discarded because one record object backed several of them (a reusing deserializer).\n"
+                + "# TYPE gateway_studies_aliased_records_total counter\n"
+                + "gateway_studies_aliased_records_total " + aliased.get() + "\n"
                 + "# HELP gateway_studies_duplicates_total Study bars already held (replay re-emits identical keys and values).\n"
                 + "# TYPE gateway_studies_duplicates_total counter\n"
                 + "gateway_studies_duplicates_total " + duplicates.get() + "\n";
+    }
+
+    long aliasedForTest() {
+        return aliased.get();
     }
 
     long copiesForTest() {
@@ -653,7 +679,9 @@ final class StudiesRelay {
      * A read-only walk of a decoded record that spends {@code budget[0]} on every string (its UTF-8 length), map key, number and
      * element and returns false once it is exhausted: an absurdly long string or key is refused here, before any JSON is rendered or
      * retained. It bounds the RENDERING and retention cost; the decoded record itself already exists (its size is bounded by the Kafka
-     * message limit, not by this walk). A lower bound of the rendered size, so it never refuses a record the rendered-size check accepts.
+     * message limit, not by this walk). A lower bound of the rendered size for
+     * valid Unicode (an unpaired surrogate is counted 3 bytes, the encoder's replacement is 1: such a string can be refused here although
+     * it would render under the cap, which is the safe direction).
      */
     static boolean withinBytes(Object v, int[] budget) {
         if (v == null) {

@@ -678,4 +678,25 @@ class StudiesRelayTest {
         assertEquals(2L, relay.dropsForTest());
         assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 3), false));
     }
+
+    @Test
+    void oneRecordObjectBackingSeveralStagedBarsIsDiscardedNotSealedAsTheLastMessage() throws Exception {
+        StudiesRelay.Store staged = relay.newStaging();
+        GenericRecord reused = bar("SPX", "T5M", 1);
+        StudiesFixtures.onStaged(relay, staged, StudiesRelay.BAR_EVENT, barKey(reused), reused);
+        // a (forbidden) reusing deserializer: the same object, overwritten with the next message
+        GenericRecord next = bar("SPX", "T5M", 2);
+        for (org.apache.avro.Schema.Field f : StudiesFixtures.BAR.getFields()) {
+            reused.put(f.name(), next.get(f.name()));
+        }
+        StudiesFixtures.onStaged(relay, staged, StudiesRelay.BAR_EVENT, barKey(reused), reused);
+        GenericRecord honest = bar("SPX", "T5M", 3);
+        StudiesFixtures.onStaged(relay, staged, StudiesRelay.BAR_EVENT, barKey(honest), honest);
+        relay.seal(staged);
+        assertEquals(2L, relay.aliasedForTest(), "both bars that shared the object are discarded");
+        relay.promote(staged);
+        JsonNode bars = hello().get("studyBars").get("5m");
+        assertEquals(1, bars.size());
+        assertEquals(3L, minute(bars.get(0)), "only the honest bar survives");
+    }
 }
