@@ -190,6 +190,15 @@ class TradeToolsRelayTest {
     }
 
     @Test
+    void anEventOfAnotherContractEpochThanItsRetainedChartIsRefused() throws Exception {
+        var relay = new TradeToolsRelay();
+        relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("c", "M1", 10), "contractEpoch", "ESH7"));
+        assertNull(relay.onLive(EVENTS, TaFixtures.pfEvent("PfBreakEvent", "c", "old", 1000, 11)), "the default fixture epoch is not ESH7: a stale epoch is refused");
+        assertNotNull(relay.onLive(EVENTS, TaFixtures.put(TaFixtures.pfEvent("PfBreakEvent", "c", "now", 2000, 12), "contractEpoch", "ESH7")));
+        assertEquals(1, bundles(relay, 1 << 20).get("1m").get("pfBreaks").size());
+    }
+
+    @Test
     void aDelayedRecordThatWouldBeEvictedAtOnceIsRefusedNotForwarded() throws Exception {
         var relay = new TradeToolsRelay();
         for (int i = 0; i < TradeToolsRelay.FLOW_BARS; i++) {
@@ -238,7 +247,7 @@ class TradeToolsRelayTest {
         }
         JsonNode all = bundles(relay, 1 << 20);
         assertFalse(all.get("15m").isNull());
-        long one = relay.helloField(1 << 20).length() / 3;
+        long one = StudiesRelay.utf8Length(relay.helloField(1 << 20)) / 3;   // bytes, not characters
         JsonNode two = bundles(relay, one * 2 + 2000);
         assertFalse(two.get("1m").isNull());
         assertTrue(two.get("15m").isNull(), "the budget ended before the third bundle: null, never a thinned bundle");

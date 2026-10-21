@@ -183,6 +183,9 @@ final class TradeToolsRelay extends TaRelay {
                 if (t == null) {
                     return -1;
                 }
+                if (h.kind() >= 2 && !h.epoch().equals(charts[t].get(h.chartId()).epoch())) {
+                    return -1;   // an event of another contract epoch than the retained chart: a stale one is refused, a newer one waits (staging) for its chart
+                }
                 h = h.at(t);
             }
             int result;

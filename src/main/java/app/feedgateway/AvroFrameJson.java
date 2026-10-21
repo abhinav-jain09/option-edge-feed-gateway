@@ -117,11 +117,15 @@ final class AvroFrameJson {
 
     /** {@code new BigDecimal(new BigInteger(bytes), scale)}: never through a double, so 6000.50 keeps its trailing zero (R7). */
     private static BigDecimal decimal(Schema s, Object v) throws IOException {
-        if (v instanceof BigDecimal d) {
-            return d;
-        }
         if (!(s.getLogicalType() instanceof LogicalTypes.Decimal d)) {
             throw new IOException("bytes without a decimal logical type");
+        }
+        if (v instanceof BigDecimal given) {   // already converted by the reader: still rendered at the SCHEMA's scale (6000.5 at scale 2 is 6000.50)
+            try {
+                return given.scale() == d.getScale() ? given : given.setScale(d.getScale(), java.math.RoundingMode.UNNECESSARY);
+            } catch (ArithmeticException e) {
+                throw new IOException("a decimal that does not fit its schema scale " + d.getScale());
+            }
         }
         ByteBuffer b = ((ByteBuffer) v).duplicate();
         byte[] raw = new byte[b.remaining()];
