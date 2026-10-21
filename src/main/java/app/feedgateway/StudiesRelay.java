@@ -492,16 +492,44 @@ final class StudiesRelay {
     }
 
     /**
-     * The hello part, rendered in full and measured: while its UTF-8 size exceeds {@link #HELLO_MAX_BYTES} the oldest bar of the
-     * longest history is given up (one at a time, re-rendered and re-measured, so history is dropped only when the fragment REALLY
-     * exceeds the budget); only when no history is left does the largest current entry degrade to {@code null}. The common case is a
-     * single render. The result is cached until the retained state changes, so the extra renders of an over-budget hello are paid once.
+     * The exact UTF-8 size of the hello part with nothing retained (every current entry {@code null}, every history {@code []}): the
+     * field names, timeframe keys, braces, colons and commas. Everything retained adds to it exactly: a current entry replaces a
+     * 4-byte {@code null} (adds its bytes - 4) and a history of k >= 1 bars replaces a 2-byte {@code []} (adds the bars' bytes plus k - 1
+     * commas), so the size of any retained set is known by arithmetic, without rendering.
+     */
+    private static final int SKELETON_BYTES = utf8Length(render(new Store(), new int[SYMBOLS.length * TF.length], new boolean[SYMBOLS.length][TF.length]));
+
+    private static long sizeOf(Store st, int[] from, boolean[][] nulled) {
+        long total = SKELETON_BYTES;
+        for (int s = 0; s < SYMBOLS.length; s++) {
+            for (int t = 0; t < TF.length && st.current[s] != null; t++) {
+                if (!nulled[s][t]) {
+                    total += st.currentBytes[s][t] - 4;
+                }
+            }
+        }
+        for (int i = 0; i < st.bars.length; i++) {
+            int k = st.bars[i].size() - from[i];
+            if (k > 0) {
+                total += k - 1;
+                for (int j = from[i]; j < st.bars[i].size(); j++) {
+                    total += st.bars[i].get(j).bytes();
+                }
+            }
+        }
+        return total;
+    }
+
+    /**
+     * The hello part for a byte budget. The retained set is chosen by exact arithmetic ({@link #sizeOf}): while its size exceeds the
+     * budget the oldest bar of the longest history is given up (then, with no history left, the largest current entry degrades to
+     * {@code null}); the fragment is rendered ONCE, for the chosen set. Cached until the retained state changes, so an over-budget
+     * hello costs an O(entries) selection and one render per state change, never a render per eviction.
      */
     private static String buildHello(Store st, int budget) {
         int[] from = new int[st.bars.length];
         boolean[][] nulled = new boolean[SYMBOLS.length][TF.length];
-        String out = render(st, from, nulled);
-        while (utf8Length(out) > budget) {
+        while (sizeOf(st, from, nulled) > budget) {
             int longest = -1;
             for (int i = 0; i < st.bars.length; i++) {
                 if (st.bars[i].size() - from[i] > 0 && (longest < 0 || st.bars[i].size() - from[i] > st.bars[longest].size() - from[longest])) {
@@ -510,28 +538,26 @@ final class StudiesRelay {
             }
             if (longest >= 0) {
                 from[longest]++;
-            } else {
-                int ws = -1, wt = -1, most = -1;
-                for (int s = 0; s < SYMBOLS.length; s++) {
-                    for (int t = 0; st.current[s] != null && t < TF.length; t++) {
-                        if (!nulled[s][t] && st.currentBytes[s][t] > most) {
-                            most = st.currentBytes[s][t];
-                            ws = s;
-                            wt = t;
-                        }
+                continue;
+            }
+            int ws = -1, wt = -1, most = -1;
+            for (int s = 0; s < SYMBOLS.length; s++) {
+                for (int t = 0; st.current[s] != null && t < TF.length; t++) {
+                    if (!nulled[s][t] && st.currentBytes[s][t] > most) {
+                        most = st.currentBytes[s][t];
+                        ws = s;
+                        wt = t;
                     }
                 }
-                if (ws < 0) {
-                    // nothing left to give up: the bare skeleton (every entry null / empty, about 300 bytes) is the least this hello can carry;
-                    // the flag being on, the fields must be present. The service's cap already leaves a 4 KiB margin below the 1 MiB guard,
-                    // which is what absorbs the skeleton when the OTHER fields alone fill the hello to the margin.
-                    return render(new Store(), new int[st.bars.length], new boolean[SYMBOLS.length][TF.length]);
-                }
-                nulled[ws][wt] = true;
             }
-            out = render(st, from, nulled);
+            if (ws < 0) {
+                // nothing left to give up: the bare skeleton (about 300 bytes) is the least this hello can carry; the flag being on, the
+                // fields must be present. The service's cap leaves a 4 KiB margin below the 1 MiB guard, which absorbs the skeleton.
+                return render(new Store(), new int[st.bars.length], new boolean[SYMBOLS.length][TF.length]);
+            }
+            nulled[ws][wt] = true;
         }
-        return out;
+        return render(st, from, nulled);
     }
 
     private static String render(Store st, int[] from, boolean[][] nulled) {

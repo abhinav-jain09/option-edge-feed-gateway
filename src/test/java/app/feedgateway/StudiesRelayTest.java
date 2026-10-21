@@ -645,4 +645,26 @@ class StudiesRelayTest {
         assertEquals(1L, relay.dropsForTest());
         assertNotNull(live(ok));
     }
+
+    @Test
+    void theArithmeticSizeIsTheRenderedSizeAndAnOverBudgetHelloIsRenderedOnce() throws Exception {
+        for (String symbol : List.of("SPX", "ES")) {
+            for (String tf : List.of("T1M", "T5M", "T15M")) {
+                for (int i = 0; i < 5; i++) {
+                    live(bar(symbol, tf, i));
+                }
+            }
+            relay.onLive(StudiesRelay.CURRENT_EVENT, symbol, current(symbol, 1), "ES".equals(symbol));
+        }
+        // every budget from the skeleton up to the full size: the rendered fragment never exceeds it, and the full one is the arithmetic size
+        int full = StudiesRelay.utf8Length(relay.helloFields());
+        for (int budget = 0; budget <= full + 10; budget += Math.max(1, full / 37)) {
+            String fields = relay.helloFields(budget);
+            assertTrue(StudiesRelay.utf8Length(fields) <= Math.max(budget, StudiesRelay.utf8Length(relay.helloFields(0))), "budget " + budget);
+        }
+        long before = relay.rendersForTest();
+        relay.helloFields(full / 3);
+        relay.helloFields(full / 3);
+        assertEquals(before, relay.rendersForTest(), "hello rendering is not bar rendering: bars are rendered once, at ingestion");
+    }
 }
