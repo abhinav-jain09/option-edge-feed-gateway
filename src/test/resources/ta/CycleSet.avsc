@@ -482,6 +482,10 @@
       {
        "name": "troughWindowActive",
        "type": "boolean"
+      },
+      {
+       "name": "longerTrend",
+       "type": "com.optionsedge.contracts.wavecycle.LongerTrend"
       }
      ]
     }

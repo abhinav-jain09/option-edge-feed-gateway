@@ -3,6 +3,7 @@ package app.feedgateway;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.spy;
@@ -45,10 +46,10 @@ class ChartHelloBudgetTest {
         for (String symbol : new String[] {"SPX", "ES"}) {
             for (String tf : new String[] {"T1M", "T5M", "T15M"}) {
                 for (int i = 0; i < studiesBars; i++) {
-                    s.studiesForTest().onLive(StudiesRelay.BAR_EVENT, symbol + "|" + tf.substring(1).toLowerCase(), StudiesFixtures.bar(symbol, tf, i));
+                    StudiesFixtures.onLive(s.studiesForTest(), StudiesRelay.BAR_EVENT, symbol + "|" + tf.substring(1).toLowerCase(), StudiesFixtures.bar(symbol, tf, i));
                 }
             }
-            s.studiesForTest().onLive(StudiesRelay.CURRENT_EVENT, symbol, StudiesFixtures.current(symbol, 1));
+            StudiesFixtures.onLive(s.studiesForTest(), StudiesRelay.CURRENT_EVENT, symbol, StudiesFixtures.current(symbol, 1));
         }
         String[] tools = {"M1", "M5", "M15"}, geometry = {"TF_1M", "TF_5M", "TF_15M"};
         for (int t = 0; t < 3; t++) {
@@ -139,8 +140,8 @@ class ChartHelloBudgetTest {
             for (String field : List.of("geometry", "tools", "waves", "tradeTools")) {
                 assertEquals("{\"1m\":null,\"5m\":null,\"15m\":null}", node.get(field).toString(), field);
             }
-            assertTrue(node.get("studies").get("5m").isNull(), "the studies degrade to null last and only with no budget left");
-            assertTrue(bytes(t.cvdHelloJson()) < FeedGatewayService.HELLO_FRAME_HARD_BYTES + 100,
+            assertNull(node.get("studies"), "the fixed fields leave no room even for the studies skeleton: the hello goes without them (studiesHelloBudget)");
+            assertTrue(bytes(t.cvdHelloJson()) < FeedGatewayService.HELLO_FRAME_HARD_BYTES + 512,   // the four chart skeletons (~55 bytes each) over the fixed field
                     "only the fixed field and the skeletons remain");
         } finally {
             System.clearProperty("GATEWAY_MARKET_STRUCTURE_ENABLED");

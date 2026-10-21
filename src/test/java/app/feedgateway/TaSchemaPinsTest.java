@@ -22,7 +22,7 @@ class TaSchemaPinsTest {
         String[] pins = {
             "ClimaxEvent", "494a9e8e45e50da4b64e056a820557b6261797349f32de1f59137facd11bf2a0",
             "ControlCheckpoint", "8de4bb1b10281f18deaaa2ed8fe098046f0a469da5f9ec39db0e6686afd13f39",
-            "CycleSet", "9eb889a2bebeb740f4e9a257c9f18575d7cea9393bef4d9f3fb4d0ab4e7d3134",
+            "CycleSet", "48e70d6ff1aac5336ac083a5ff5607e341ac0e4f2a782520d3fe51badcc3b230",
             "DlqRecord", "1dbd98fbae1ccbe1ad9278c43905e7bbb24d2c94cf3acf6aeca8ef2413867a31",
             "FlowBar", "27d78217d39ab9e71caa7853216bd0dddcc0ee81e962fd092e6f89e4074d2b53",
             "GeometryAnnotationSet", "7df6d75aab13cfa943ef3b7cd10a7fc3da78f7e54c24dcedba4664fec2b023a8",
