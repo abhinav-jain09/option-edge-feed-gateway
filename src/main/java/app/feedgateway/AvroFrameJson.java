@@ -120,13 +120,23 @@ final class AvroFrameJson {
         if (!(s.getLogicalType() instanceof LogicalTypes.Decimal d)) {
             throw new IOException("bytes without a decimal logical type");
         }
+        BigDecimal out;
         if (v instanceof BigDecimal given) {   // already converted by the reader: still rendered at the SCHEMA's scale (6000.5 at scale 2 is 6000.50)
             try {
-                return given.scale() == d.getScale() ? given : given.setScale(d.getScale(), java.math.RoundingMode.UNNECESSARY);
+                out = given.scale() == d.getScale() ? given : given.setScale(d.getScale(), java.math.RoundingMode.UNNECESSARY);
             } catch (ArithmeticException e) {
                 throw new IOException("a decimal that does not fit its schema scale " + d.getScale());
             }
+        } else {
+            out = unscaled(d, v);
         }
+        if (out.precision() > d.getPrecision()) {
+            throw new IOException("a decimal of precision " + out.precision() + " exceeds its schema precision " + d.getPrecision());
+        }
+        return out;
+    }
+
+    private static BigDecimal unscaled(LogicalTypes.Decimal d, Object v) {
         ByteBuffer b = ((ByteBuffer) v).duplicate();
         byte[] raw = new byte[b.remaining()];
         b.get(raw);

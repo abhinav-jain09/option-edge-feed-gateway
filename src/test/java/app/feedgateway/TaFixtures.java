@@ -40,7 +40,7 @@ final class TaFixtures {
     private static Object value(Schema s) {
         return switch (s.getType()) {
             case RECORD -> minimal(s);
-            case ENUM -> symbol(s, s.getEnumSymbols().get(0).equals("UNKNOWN") ? s.getEnumSymbols().get(1) : s.getEnumSymbols().get(0));
+            case ENUM -> symbol(s, s.getEnumSymbols().get(0).equals("UNKNOWN") && s.getEnumSymbols().size() > 1 ? s.getEnumSymbols().get(1) : s.getEnumSymbols().get(0));
             case ARRAY -> new GenericData.Array<>(0, s);
             case MAP -> Map.of();
             case UNION -> s.getTypes().get(0).getType() == Schema.Type.NULL ? null : value(s.getTypes().get(0));
