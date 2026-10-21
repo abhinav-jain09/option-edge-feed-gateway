@@ -440,6 +440,10 @@ class StudiesRelayTest {
         assertEquals(StudiesFixtures.SEGMENT, real.get("barId").toString().split("\\|")[1]);
         assertTrue(real.get("barId").toString().length() > 64 && real.get("barId").toString().length() <= 96, real.get("barId").toString());
         assertNotNull(live(real), "the real 71-72 character barId is a valid bar, not a drop");
+        GenericRecord ninetySix = bar("SPX", "T1M", 2);
+        ninetySix.put("barId", ninetySix.get("barId").toString().replace("|" + StudiesFixtures.SEGMENT + "|", "|" + "X".repeat(57) + "|"));
+        assertEquals(96, ninetySix.get("barId").toString().length());
+        assertNotNull(live(ninetySix), "exactly 96 characters is accepted: the ceiling is 96, not lower");
         GenericRecord ninetySeven = bar("SPX", "T1M", 1);
         ninetySeven.put("barId", ninetySeven.get("barId").toString().replace("|" + StudiesFixtures.SEGMENT + "|", "|" + "X".repeat(58) + "|"));
         assertEquals(97, ninetySeven.get("barId").toString().length());
