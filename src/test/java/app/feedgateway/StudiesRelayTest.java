@@ -23,7 +23,7 @@ class StudiesRelayTest {
     private final StudiesRelay relay = new StudiesRelay(JSON);
 
     private String live(GenericRecord bar) {
-        return relay.onLive(StudiesRelay.BAR_EVENT, barKey(bar), bar);
+        return StudiesFixtures.onLive(relay, StudiesRelay.BAR_EVENT, barKey(bar), bar);
     }
 
     private JsonNode hello() throws Exception {
@@ -69,7 +69,7 @@ class StudiesRelayTest {
         }
         assertEquals(0L, relay.dropsForTest());
         for (String tf : List.of("T30S", "T1H", "T4H")) {
-            assertNull(relay.onLive(StudiesRelay.BAR_EVENT, "SPX|" + tf.substring(1).toLowerCase(), bar("SPX", tf, 1)), tf);
+            assertNull(StudiesFixtures.onLive(relay, StudiesRelay.BAR_EVENT, "SPX|" + tf.substring(1).toLowerCase(), bar("SPX", tf, 1)), tf);
         }
         assertEquals(3L, relay.dropsForTest());
         assertNull(live(bar("NDX", "T5M", 1)), "a symbol outside SPX/ES");
@@ -100,7 +100,7 @@ class StudiesRelayTest {
         bad.add(new Object[] {"SPX|5m", r, "oversize"});
         int n = 0;
         for (Object[] b : bad) {
-            assertNull(relay.onLive(StudiesRelay.BAR_EVENT, (String) b[0], b[1]), (String) b[2]);
+            assertNull(StudiesFixtures.onLive(relay, StudiesRelay.BAR_EVENT, (String) b[0], b[1]), (String) b[2]);
             assertEquals(++n, relay.dropsForTest(), (String) b[2]);
         }
         assertEquals("[]", hello().get("studyBars").get("5m").toString(), "nothing was retained");
@@ -146,7 +146,7 @@ class StudiesRelayTest {
 
     @Test
     void aCurrentStateKeepsOnlyTheThreeForwardedTimeframesAndHelloEntriesTheirOwn() throws Exception {
-        String frame = relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1));
+        String frame = StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1));
         JsonNode n = JSON.readTree(frame);
         assertEquals(List.of("schemaVersion", "methodVersion", "parameterSetHash", "symbol", "tradeDate", "runId", "revision",
                 "publishedAt", "asOfEventTime", "quality", "restored", "calibration", "timeframes"), iterator(n.fieldNames()));
@@ -163,18 +163,18 @@ class StudiesRelayTest {
 
     @Test
     void aCurrentStateIsRefusedWhenOlderMalformedOrIncompleteAndAnEqualOneIsAccepted() throws Exception {
-        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5)));
-        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 4)));
+        assertNotNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5)));
+        assertNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 4)));
         assertEquals(1L, relay.regressionsForTest());
-        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5)), "an equal publishedAt is an idempotent republish");
-        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "ES", current("ES", 1)), "each symbol has its own baseline");
-        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "ES", StudiesFixtures.currentWithout("ES", 2, "15m")), "a forwarded timeframe is missing");
-        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("ES", 9)), "key differs from the symbol");
-        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "NDX", current("NDX", 9)));
-        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", bar("SPX", "T5M", 0)), "a StudyBar on the current event");
+        assertNotNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5)), "an equal publishedAt is an idempotent republish");
+        assertNotNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "ES", current("ES", 1)), "each symbol has its own baseline");
+        assertNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "ES", StudiesFixtures.currentWithout("ES", 2, "15m")), "a forwarded timeframe is missing");
+        assertNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("ES", 9)), "key differs from the symbol");
+        assertNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "NDX", current("NDX", 9)));
+        assertNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", bar("SPX", "T5M", 0)), "a StudyBar on the current event");
         GenericRecord oversize = current("SPX", 9);
         oversize.put("runId", "x".repeat(StudiesRelay.CURRENT_MAX_BYTES));
-        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", oversize));
+        assertNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", oversize));
         assertEquals(5L, relay.dropsForTest());
         assertEquals("5", hello().get("studies").get("1m").get("revision").asText(), "the retained state is the last accepted one");
     }
@@ -211,10 +211,10 @@ class StudiesRelayTest {
     @Test
     void theRealisticFullHelloFitsTheBudgetWithAllFortyEightBarsAndSixCurrentEntries() throws Exception {
         for (String symbol : List.of("SPX", "ES")) {
-            relay.onLive(StudiesRelay.CURRENT_EVENT, symbol, current(symbol, 1));
+            StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, symbol, current(symbol, 1));
             for (String tf : List.of("T1M", "T5M", "T15M")) {
                 for (int i = 0; i < StudiesRelay.HISTORY_BARS; i++) {
-                    relay.onLive(StudiesRelay.BAR_EVENT, symbol + "|" + tf.substring(1).toLowerCase(), bar(symbol, tf, i));
+                    StudiesFixtures.onLive(relay, StudiesRelay.BAR_EVENT, symbol + "|" + tf.substring(1).toLowerCase(), bar(symbol, tf, i));
                 }
             }
         }
@@ -231,12 +231,12 @@ class StudiesRelayTest {
 
     @Test
     void anOverBudgetHelloDropsTheOldestHistoryFirstAndNeverTheCurrentEntries() throws Exception {
-        relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1));
+        StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1));
         for (String tf : List.of("T1M", "T5M")) {
             for (int i = 0; i < StudiesRelay.HISTORY_BARS; i++) {
                 GenericRecord big = bar("SPX", tf, i);
                 big.put("calibration", "x".repeat(StudiesRelay.BAR_MAX_BYTES - 12_000));   // under the per-bar bound, far over the hello budget in sum
-                assertNotNull(relay.onLive(StudiesRelay.BAR_EVENT, barKey(big), big));
+                assertNotNull(StudiesFixtures.onLive(relay, StudiesRelay.BAR_EVENT, barKey(big), big));
             }
         }
         String fields = relay.helloFields();
@@ -255,15 +255,15 @@ class StudiesRelayTest {
     @Test
     void stagedRecordsStayPrivateUntilPromotedAndPromotionReturnsOnlyWhatIsNew() throws Exception {
         live(bar("SPX", "T5M", 1));
-        relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1));
+        StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1));
         String before = relay.helloFields();
         StudiesRelay.Store staged = relay.newStaging();
         for (int i = 0; i < 4; i++) {
             GenericRecord b = bar("SPX", "T5M", i);
-            relay.onStaged(staged, StudiesRelay.BAR_EVENT, barKey(b), b);
+            StudiesFixtures.onStaged(relay, staged, StudiesRelay.BAR_EVENT, barKey(b), b);
         }
-        relay.onStaged(staged, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 3));
-        relay.onStaged(staged, StudiesRelay.CURRENT_EVENT, "ES", current("ES", 3));
+        StudiesFixtures.onStaged(relay, staged, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 3));
+        StudiesFixtures.onStaged(relay, staged, StudiesRelay.CURRENT_EVENT, "ES", current("ES", 3));
         assertEquals(before, relay.helloFields(), "nothing staged is visible");
         List<String[]> frames = relay.promote(staged);
         List<String> events = frames.stream().map(f -> f[0]).toList();
@@ -277,9 +277,9 @@ class StudiesRelayTest {
 
     @Test
     void aStagedCurrentOlderThanTheLiveOneIsNotBroadcastAndNeverReplacesIt() throws Exception {
-        relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 9));
+        StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 9));
         StudiesRelay.Store staged = relay.newStaging();
-        relay.onStaged(staged, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 2));
+        StudiesFixtures.onStaged(relay, staged, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 2));
         assertTrue(relay.promote(staged).isEmpty());
         assertEquals("9", hello().get("studies").get("1m").get("revision").asText());
         assertEquals(1L, relay.regressionsForTest());
@@ -300,7 +300,7 @@ class StudiesRelayTest {
             for (int i = 0; i < StudiesRelay.HISTORY_BARS; i++) {
                 GenericRecord big = bar("SPX", tf, i);
                 big.put("calibration", "\u00e9".repeat(22_000));
-                assertNotNull(relay.onLive(StudiesRelay.BAR_EVENT, barKey(big), big));
+                assertNotNull(StudiesFixtures.onLive(relay, StudiesRelay.BAR_EVENT, barKey(big), big));
             }
         }
         String fields = relay.helloFields();
@@ -316,7 +316,7 @@ class StudiesRelayTest {
         for (String symbol : List.of("SPX", "ES")) {
             GenericRecord c = current(symbol, 1);
             c.put("runId", "r".repeat(100_000));   // the header repeats in every one of the three entries of each symbol
-            assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, symbol, c));
+            assertNotNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, symbol, c));
         }
         String fields = relay.helloFields();
         assertTrue(StudiesRelay.utf8Length(fields) <= StudiesRelay.HELLO_MAX_BYTES, "bytes " + StudiesRelay.utf8Length(fields));
@@ -352,7 +352,7 @@ class StudiesRelayTest {
         live(bar("SPX", "T5M", 1));
         String first = relay.helloFields();
         assertNull(live(bar("SPX", "T5M", 1)), "a duplicate");
-        assertNull(relay.onLive(StudiesRelay.BAR_EVENT, "NDX|5m", bar("NDX", "T5M", 2)), "refused");
+        assertNull(StudiesFixtures.onLive(relay, StudiesRelay.BAR_EVENT, "NDX|5m", bar("NDX", "T5M", 2)), "refused");
         assertTrue(first == relay.helloFields(), "same cached string: no rebuild for a duplicate or a refused record");
         live(bar("SPX", "T5M", 2));
         assertFalse(first == relay.helloFields(), "a new bar changes the hello");
@@ -372,7 +372,7 @@ class StudiesRelayTest {
                 for (int i = 0; i < 4 && symbolIndex < 24; i++, symbolIndex++) {
                     GenericRecord b = bar(symbol, tf, 100 + i);
                     b.put("calibration", "p".repeat(pad));
-                    relay.onLive(StudiesRelay.BAR_EVENT, barKey(b), b);
+                    StudiesFixtures.onLive(relay, StudiesRelay.BAR_EVENT, barKey(b), b);
                 }
             }
         }
@@ -392,7 +392,7 @@ class StudiesRelayTest {
     void recordsAppliedLiveWhileARecoveryIsPendingSurviveItsPromotion() throws Exception {
         live(bar("SPX", "T5M", 1));
         StudiesRelay.Store staged = relay.newStaging();
-        relay.onStaged(staged, StudiesRelay.BAR_EVENT, "SPX|5m", bar("SPX", "T5M", 2));      // history read during recovery
+        StudiesFixtures.onStaged(relay, staged, StudiesRelay.BAR_EVENT, "SPX|5m", bar("SPX", "T5M", 2));      // history read during recovery
         assertNotNull(live(bar("SPX", "T5M", 9)));                                              // a caught-up partition keeps delivering live
         List<String[]> frames = relay.promote(staged);
         assertTrue(frames.isEmpty(), "the staged bar is older than the live tail: history only, no frame");
@@ -403,13 +403,13 @@ class StudiesRelayTest {
 
     @Test
     void aSameInstantRevisionIsBroadcastByThePromotionButAnIdenticalRepublishIsNot() throws Exception {
-        relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5));
+        StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5));
         StudiesRelay.Store staged = relay.newStaging();
         assertTrue(relay.promote(staged).isEmpty(), "identical to what is live: nothing owed");
         GenericRecord revised = current("SPX", 5);
         revised.put("revision", 6L);   // same run, same instant, higher revision
         revised.put("calibration", "UNVALIDATED");
-        relay.onStaged(staged, StudiesRelay.CURRENT_EVENT, "SPX", revised);
+        StudiesFixtures.onStaged(relay, staged, StudiesRelay.CURRENT_EVENT, "SPX", revised);
         List<String[]> frames = relay.promote(staged);
         assertEquals(1, frames.size());
         assertEquals(StudiesRelay.CURRENT_EVENT, frames.get(0)[0]);
@@ -419,9 +419,9 @@ class StudiesRelayTest {
 
     @Test
     void anIdenticalCurrentRepublishDoesNotRebuildTheHello() throws Exception {
-        relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5));
+        StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5));
         String first = relay.helloFields();
-        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5)), "accepted and forwarded");
+        assertNotNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 5)), "accepted and forwarded");
         assertTrue(first == relay.helloFields(), "nothing retained changed: the cached hello is reused");
     }
 
@@ -460,23 +460,23 @@ class StudiesRelayTest {
     void aSameInstantStateNeedsAHigherRevisionFromTheSameRunToReplaceTheHeldOne() throws Exception {
         GenericRecord first = current("SPX", 5);
         first.put("revision", 10L);
-        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", first));
+        assertNotNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", first));
         GenericRecord delayedOlder = current("SPX", 5);
         delayedOlder.put("revision", 9L);
         delayedOlder.put("quality", StudiesFixtures.CURRENT.getField("quality").schema().getEnumSymbols().get(0));   // differs from the held content
-        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", delayedOlder), "an older revision of the same instant is a regression");
+        assertNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", delayedOlder), "an older revision of the same instant is a regression");
         GenericRecord otherRun = current("SPX", 5);
         otherRun.put("runId", "run-2");
         otherRun.put("revision", 99L);
         otherRun.put("calibration", "UNVALIDATED");
         otherRun.put("restored", true);
-        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", otherRun), "another run does not displace the held state of that instant");
+        assertNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", otherRun), "another run does not displace the held state of that instant");
         assertEquals(2L, relay.regressionsForTest());
         assertEquals("10", hello().get("studies").get("1m").get("revision").asText());
         GenericRecord newer = current("SPX", 5);
         newer.put("revision", 11L);
         newer.put("restored", true);
-        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", newer));
+        assertNotNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", newer));
         assertEquals("11", hello().get("studies").get("1m").get("revision").asText());
     }
 
@@ -491,5 +491,29 @@ class StudiesRelayTest {
         assertNull(live(hugeKey));
         assertEquals(2L, relay.dropsForTest());
         assertTrue(StudiesRelay.withinBytes(bar("SPX", "T5M", 2), new int[] {StudiesRelay.BAR_MAX_BYTES}), "a normal bar is within its bound");
+    }
+
+    @Test
+    void theTopicFixesTheSymbolAMisroutedRecordIsRefused() throws Exception {
+        GenericRecord es = bar("ES", "T5M", 0);
+        assertNull(relay.onLive(StudiesRelay.BAR_EVENT, "ES|5m", es, false), "an ES record on a local (SPX) topic");
+        GenericRecord spx = bar("SPX", "T5M", 0);
+        assertNull(relay.onLive(StudiesRelay.BAR_EVENT, "SPX|5m", spx, true), "an SPX record on an es. mirror topic");
+        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "ES", current("ES", 1), false));
+        assertNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1), true));
+        assertEquals(4L, relay.dropsForTest());
+        assertNotNull(relay.onLive(StudiesRelay.BAR_EVENT, "ES|5m", es, true));
+        assertNotNull(relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1), false));
+        assertTrue(StudiesRelay.isEsTopic("es.options.indicators.studies.bars"));
+        assertFalse(StudiesRelay.isEsTopic("options.indicators.studies.bars"));
+    }
+
+    @Test
+    void thePreRenderWalkChargesUtf8BytesNotCharacters() throws Exception {
+        GenericRecord b = bar("SPX", "T5M", 0);
+        b.put("calibration", "\u00e9".repeat(StudiesRelay.BAR_MAX_BYTES / 2 - 3_000));   // fewer characters than the bound, more bytes than it once added up
+        assertTrue(StudiesRelay.withinBytes(b, new int[] {StudiesRelay.BAR_MAX_BYTES}));
+        b.put("calibration", "\u00e9".repeat(StudiesRelay.BAR_MAX_BYTES / 2 + 1_000));   // over in bytes, under in characters
+        assertFalse(StudiesRelay.withinBytes(b, new int[] {StudiesRelay.BAR_MAX_BYTES}));
     }
 }

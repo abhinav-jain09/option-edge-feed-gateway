@@ -139,8 +139,8 @@ final class StudiesRelay {
     }
 
     /** The live path: returns the frame data to broadcast for the event, or null (dropped, duplicate, regression, history only). */
-    synchronized String onLive(String event, String key, Object value) {
-        return apply(live, event, key, value);
+    synchronized String onLive(String event, String key, Object value, boolean esTopic) {
+        return apply(live, event, key, value, esTopic);
     }
 
     /** A private copy of the retained state for a recovery read; nothing in it is visible until {@link #promote}. */
@@ -149,8 +149,8 @@ final class StudiesRelay {
     }
 
     /** The recovery path: the record is merged into the private store; nothing is broadcast. */
-    void onStaged(Store staged, String event, String key, Object value) {
-        apply(staged, event, key, value);
+    void onStaged(Store staged, String event, String key, Object value, boolean esTopic) {
+        apply(staged, event, key, value, esTopic);
     }
 
     /**
@@ -190,27 +190,32 @@ final class StudiesRelay {
         drops.incrementAndGet();
     }
 
-    private String apply(Store target, String event, Object key, Object value) {
+    /** The mirrored ES topics carry the ES producer's records and the local topics the SPX producer's: the topic fixes the symbol. */
+    static boolean isEsTopic(String topic) {
+        return topic != null && topic.startsWith("es.");
+    }
+
+    private String apply(Store target, String event, Object key, Object value, boolean esTopic) {
         if (!(value instanceof GenericRecord record)) {
             drops.incrementAndGet();
             return null;
         }
         try {
-            return BAR_EVENT.equals(event) ? applyBar(target, key, record) : applyCurrent(target, key, record);
+            return BAR_EVENT.equals(event) ? applyBar(target, key, record, esTopic ? 1 : 0) : applyCurrent(target, key, record, esTopic ? 1 : 0);
         } catch (RuntimeException | JsonProcessingException e) {
             drops.incrementAndGet();   // a malformed record (a missing field, an unparseable instant) is refused, never repaired
             return null;
         }
     }
 
-    private String applyBar(Store target, Object key, GenericRecord r) throws JsonProcessingException {
+    private String applyBar(Store target, Object key, GenericRecord r, int topicSymbol) throws JsonProcessingException {
         Schema schema = r.getSchema();
         String symbol = str(r, "symbol");
         int s = indexOf(SYMBOLS, symbol);
         int t = indexOf(TF_ENUM, str(r, "timeframe"));
         String status = str(r, "status");
         String barId = str(r, "barId");
-        if (!BAR_SCHEMA.equals(schema.getFullName()) || s < 0 || t < 0 || !"STUDIES_V1".equals(str(r, "methodVersion"))
+        if (!BAR_SCHEMA.equals(schema.getFullName()) || s != topicSymbol || t < 0 || !"STUDIES_V1".equals(str(r, "methodVersion"))
                 || !Integer.valueOf(1).equals(r.get("schemaVersion")) || "EMPTY".equals(status) || barId.isEmpty()
                 || !(symbol + "|" + TF[t]).equals(String.valueOf(key)) || !withinBarBounds(r)) {
             drops.incrementAndGet();
@@ -251,10 +256,10 @@ final class StudiesRelay {
         return newest ? json : null;
     }
 
-    private String applyCurrent(Store target, Object key, GenericRecord r) throws JsonProcessingException {
+    private String applyCurrent(Store target, Object key, GenericRecord r, int topicSymbol) throws JsonProcessingException {
         String symbol = str(r, "symbol");
         int s = indexOf(SYMBOLS, symbol);
-        if (!CURRENT_SCHEMA.equals(r.getSchema().getFullName()) || s < 0 || !symbol.equals(String.valueOf(key))
+        if (!CURRENT_SCHEMA.equals(r.getSchema().getFullName()) || s != topicSymbol || !symbol.equals(String.valueOf(key))
                 || !"STUDIES_V1".equals(str(r, "methodVersion")) || !Integer.valueOf(1).equals(r.get("schemaVersion"))) {
             drops.incrementAndGet();
             return null;
@@ -473,7 +478,7 @@ final class StudiesRelay {
             return true;
         }
         if (v instanceof CharSequence cs) {
-            budget[0] -= cs.length();
+            budget[0] -= utf8Length(cs.toString());
         } else if (v instanceof GenericRecord rec) {
             for (Schema.Field f : rec.getSchema().getFields()) {
                 if (!withinBytes(rec.get(f.pos()), budget)) {

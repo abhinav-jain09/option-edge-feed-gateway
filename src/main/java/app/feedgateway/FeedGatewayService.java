@@ -12909,9 +12909,9 @@ public class FeedGatewayService implements ReplayRunner {
         if (record.value() == null) {
             studies.onDrop();   // a tombstone retains nothing and withdraws nothing
         } else if (studiesRecordIsRecovery(recovery.end, record.topic(), record.partition(), record.offset())) {
-            studies.onStaged(recovery.staged, event, record.key(), record.value());
+            studies.onStaged(recovery.staged, event, record.key(), record.value(), StudiesRelay.isEsTopic(record.topic()));
         } else {
-            String frame = studies.onLive(event, record.key(), record.value());
+            String frame = studies.onLive(event, record.key(), record.value(), StudiesRelay.isEsTopic(record.topic()));
             if (frame != null) {
                 broadcast(event, frame);
                 forwardedEvents.incrementAndGet();

@@ -61,6 +61,15 @@ final class StudiesFixtures {
         return r;
     }
 
+    /** The relay call as the service makes it: the topic family follows the record's symbol (ES records arrive on the es. topics). */
+    static String onLive(StudiesRelay relay, String event, String key, Object value) {
+        return relay.onLive(event, key, value, value instanceof GenericRecord r && "ES".equals(String.valueOf(r.get("symbol"))));
+    }
+
+    static void onStaged(StudiesRelay relay, StudiesRelay.Store staged, String event, String key, Object value) {
+        relay.onStaged(staged, event, key, value, value instanceof GenericRecord r && "ES".equals(String.valueOf(r.get("symbol"))));
+    }
+
     static String barKey(GenericRecord bar) {
         String tf = String.valueOf(bar.get("timeframe"));
         return bar.get("symbol") + "|" + tf.substring(1).toLowerCase();
