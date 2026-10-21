@@ -12842,38 +12842,29 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * The current-state topic is re-read from a TIME window, not from a record count: the records of the last
-     * {@value #STUDIES_CURRENT_WINDOW_MS} ms, in the topic's order, each judged by the relay's own rule (a state replaces the held one
-     * only with a later publishedAt, or the same instant from the same run with a higher revision). That makes recovery independent of
-     * append order and of how many stale or replayed records sit at the tail. A window of minutes is enough by construction: the page
-     * hides any current older than 180 s, so an older one would never be shown. A topic quiet for the whole window yields no current
-     * (the page then ages the bars by their own clock) until the producer's next record, seconds after it restarts.
+     * Cold start, retry and late adoption: the BARS are re-read from a window back (record timestamps; the bars carry their own clock and
+     * are merged by it). The CURRENT-state topic is deliberately NOT re-read: the producer rewrites it about every 5 s, so the first live
+     * record after a start supplies it within seconds, and until then the hello carries null (the page treats a missing current as
+     * bars-only, which ages by the bars' own clock). Recovery of a state would otherwise rest on an assumption about Kafka record
+     * timestamps or append order that nothing enforces; a state is only ever trusted from the live stream, judged by the relay's own
+     * ordering rule (later publishedAt, or the same instant from the same run with a higher revision).
      */
-    private static final long STUDIES_CURRENT_WINDOW_MS = 15L * 60_000L;
-
-    /** Cold start, retry and late adoption: the bars are re-read from a window back, the current state from a short one. */
     void seekStudies(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions, Map<String, TopicBinding> topicEvents) {
         Map<TopicPartition, Long> timestamps = new HashMap<>();
-        long now = System.currentTimeMillis();
+        long cutoff = System.currentTimeMillis() - settings.studiesRecoveryMs();
         for (TopicPartition partition : partitions) {
             TopicBinding binding = topicEvents.get(partition.topic());
-            if (binding == null) {
-                continue;
-            }
-            if (StudiesRelay.BAR_EVENT.equals(binding.event())) {
-                timestamps.put(partition, now - settings.studiesRecoveryMs());
-            } else if (StudiesRelay.CURRENT_EVENT.equals(binding.event())) {
-                timestamps.put(partition, now - STUDIES_CURRENT_WINDOW_MS);
+            if (binding != null && StudiesRelay.BAR_EVENT.equals(binding.event())) {
+                timestamps.put(partition, cutoff);
             }
         }
         seekToTimestampsOrEnd(consumer, timestamps, new ArrayList<>());
     }
 
+    /** Only the bars are recovered, so only their partitions have a captured end to catch up to. */
     private Map<TopicPartition, Long> studiesEndOffsets(KafkaConsumer<?, ?> consumer, Collection<TopicPartition> partitions,
                                                         Map<String, TopicBinding> topicEvents) {
-        Map<TopicPartition, Long> end = new HashMap<>(recoveryEndOffsets(consumer, partitions, topicEvents, StudiesRelay.BAR_EVENT));
-        end.putAll(recoveryEndOffsets(consumer, partitions, topicEvents, StudiesRelay.CURRENT_EVENT));
-        return end;
+        return new HashMap<>(recoveryEndOffsets(consumer, partitions, topicEvents, StudiesRelay.BAR_EVENT));
     }
 
     /** Records read up to the captured end offsets go into a private copy; one promotion then broadcasts what is new. */

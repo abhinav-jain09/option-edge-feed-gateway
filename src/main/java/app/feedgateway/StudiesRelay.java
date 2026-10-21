@@ -454,9 +454,10 @@ final class StudiesRelay {
     }
 
     /**
-     * A read-only walk of a decoded record that spends {@code budget[0]} on every string (its length), map key, number and element and
-     * returns false once it is exhausted: an absurdly long string or key is refused here, before any JSON is rendered. A lower bound of
-     * the rendered size, so it never refuses a record the rendered-size check would accept.
+     * A read-only walk of a decoded record that spends {@code budget[0]} on every string (its UTF-8 length), map key, number and
+     * element and returns false once it is exhausted: an absurdly long string or key is refused here, before any JSON is rendered or
+     * retained. It bounds the RENDERING and retention cost; the decoded record itself already exists (its size is bounded by the Kafka
+     * message limit, not by this walk). A lower bound of the rendered size, so it never refuses a record the rendered-size check accepts.
      */
     static boolean withinBytes(Object v, int[] budget) {
         if (v == null) {

@@ -93,8 +93,8 @@ class StudiesLoopTest {
         GenericRecord b0 = StudiesFixtures.bar("SPX", "T5M", 0), b1 = StudiesFixtures.bar("SPX", "T5M", 1), b2 = StudiesFixtures.bar("SPX", "T5M", 2);
         script.add(records(BARS, 0, "SPX|5m", b0));
         script.add(records(BARS, 1, "SPX|5m", b1));
-        script.add(records(CURRENT, 0, "SPX", StudiesFixtures.current("SPX", 2)));
         script.add(records(BARS, 2, "SPX|5m", b2));
+        script.add(records(CURRENT, 0, "SPX", StudiesFixtures.current("SPX", 2)));   // a state is only ever taken live
         GenericRecord live = StudiesFixtures.bar("SPX", "T5M", 3);
         script.add(records(BARS, 3, "SPX|5m", live));
         AtomicInteger poll = new AtomicInteger();
@@ -103,7 +103,7 @@ class StudiesLoopTest {
             if (n < script.size()) {
                 ConsumerRecords<String, Object> batch = script.get(n);
                 batch.partitions().forEach(tp -> position.merge(tp, 1L, (old, one) -> Math.max(old, batch.records(tp).get(0).offset() + 1)));
-                if (n < 4) {   // recovery polls: nothing is visible to a connecting page or a socket yet
+                if (n < 3) {   // recovery polls: nothing is visible to a connecting page or a socket yet
                     JsonNode hello = JSON.readTree(s.cvdHelloJson());
                     assertEquals(0, hello.get("studyBars").get("5m").size(), "partial history never changes a connect hello (poll " + n + ")");
                     assertTrue(hello.get("studies").get("5m").isNull());
@@ -118,24 +118,23 @@ class StudiesLoopTest {
         s.runLiveConsumerAttemptForTest("avro-live", BINDINGS, new AtomicBoolean(), consumer, false);
 
         var sent = org.mockito.ArgumentCaptor.forClass(org.springframework.web.socket.WebSocketMessage.class);
-        verify(socket, times(5)).sendMessage(sent.capture());   // promotion: 3 bars + 1 current, then the live bar
+        verify(socket, times(5)).sendMessage(sent.capture());   // promotion: 3 bars, then the live current, then the live bar
         List<String> types = new ArrayList<>();
         for (var m : sent.getAllValues()) {
             types.add(JSON.readTree(((TextMessage) m).getPayload()).get("type").asText());
         }
         assertEquals(List.of("indicator-studies", "indicator-studies", "indicator-studies", "indicator-studies-current", "indicator-studies"), types,
-                "promotion sends the bars then the current state, then the live bar follows");
+                "promotion sends the bars, then the live current state, then the live bar follows");
         JsonNode hello = JSON.readTree(s.cvdHelloJson());
         assertEquals(4, hello.get("studyBars").get("5m").size(), "the recovered history plus the live bar");
         assertEquals("2", hello.get("studies").get("15m").get("revision").asText());
 
-        // the cut-offs: the recovery window back from now for the bars partition, 15 minutes for the current-state partition
+        // the cut-off is the recovery window back from now, for the bars partition ONLY: the current-state topic is never re-read
         var times = mockingDetails(consumer).getInvocations().stream().filter(c -> c.getMethod().getName().equals("offsetsForTimes")).toList();
         Map<TopicPartition, Long> cut = (Map<TopicPartition, Long>) times.get(times.size() - 1).getArgument(0);
-        assertEquals(java.util.Set.of(BARS, CURRENT), cut.keySet());
+        assertEquals(List.of(BARS), List.copyOf(cut.keySet()));
         assertTrue(Math.abs(cut.get(BARS) - (System.currentTimeMillis() - 72L * 3_600_000L)) < 60_000L);
-        assertTrue(Math.abs(cut.get(CURRENT) - (System.currentTimeMillis() - 15L * 60_000L)) < 60_000L);
-        verify(consumer).seek(eq(CURRENT), eq(0L));   // the offset the time lookup returned
+        org.mockito.Mockito.verify(consumer, org.mockito.Mockito.never()).seek(eq(CURRENT), anyLong());
     }
 
     @Test
