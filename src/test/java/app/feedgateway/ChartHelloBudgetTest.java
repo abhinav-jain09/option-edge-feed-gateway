@@ -3,7 +3,6 @@ package app.feedgateway;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.spy;
@@ -42,11 +41,13 @@ class ChartHelloBudgetTest {
     }
 
     /** Fills every part; {@code perSet} is the size of one tools / geometry set, one wave record and one trade-tools flow bar (all in characters). */
-    private static void fill(FeedGatewayService s, int studiesBars, int perSet, int flowBars, int flowBarChars) {
+    private static void fill(FeedGatewayService s, int studiesBars, int studiesBarChars, int perSet, int flowBars, int flowBarChars) {
         for (String symbol : new String[] {"SPX", "ES"}) {
             for (String tf : new String[] {"T1M", "T5M", "T15M"}) {
                 for (int i = 0; i < studiesBars; i++) {
-                    StudiesFixtures.onLive(s.studiesForTest(), StudiesRelay.BAR_EVENT, symbol + "|" + tf.substring(1).toLowerCase(), StudiesFixtures.bar(symbol, tf, i));
+                    GenericRecord bar = StudiesFixtures.bar(symbol, tf, i);
+                    bar.put("calibration", "p".repeat(studiesBarChars));   // pads the bar so the studies reach their share of the hello
+                    StudiesFixtures.onLive(s.studiesForTest(), StudiesRelay.BAR_EVENT, symbol + "|" + tf.substring(1).toLowerCase(), bar);
                 }
             }
             StudiesFixtures.onLive(s.studiesForTest(), StudiesRelay.CURRENT_EVENT, symbol, StudiesFixtures.current(symbol, 1));
@@ -80,7 +81,7 @@ class ChartHelloBudgetTest {
     void theWorstCaseEveryPartAtItsCapStaysUnderTheGuardAndLosesTheLowestPriorityFirst() throws Exception {
         var s = service(true);
         // 8 bars x 6 series of ~8 KiB fill the studies cap; 190 KB sets: two of a part's three fit its 384 KiB; 50 KB flow bars x 4 per timeframe
-        fill(s, 8, 190_000, 4, 50_000);
+        fill(s, 8, 11_000, 190_000, 4, 50_000);
         long sumOfCaps = (StudiesRelay.HELLO_MAX_BYTES + 3 * TimeframeSetRelay.HELLO_PART_BYTES + TradeToolsRelay.HELLO_PART_BYTES) / 1024;
         assertEquals(2176, sumOfCaps - 0, "512 + 384 + 384 + 384 + 512 KiB of content before arbitration");
         String hello = s.cvdHelloJson();
@@ -100,20 +101,22 @@ class ChartHelloBudgetTest {
                 ended |= none;
             }
         }
+        long studiesBytes = bytesOf(node, "studyBars") + bytesOf(node, "esStudyBars") + bytesOf(node, "studies") + bytesOf(node, "esStudies");
+        assertTrue(studiesBytes > StudiesRelay.HELLO_MAX_BYTES * 0.7 && studiesBytes <= StudiesRelay.HELLO_MAX_BYTES, "the studies really fill their share: " + studiesBytes + " bytes");
         assertNotEquals(0, bytesOf(node, "studies"));
         assertFalse(node.get("studies").get("5m").isNull(), "the studies' current states are never traded for a newer layer");
     }
 
     private String fillAndHello(boolean tradeTools) {
         var s = service(tradeTools);
-        fill(s, 8, 190_000, tradeTools ? 4 : 0, 50_000);
+        fill(s, 8, 11_000, 190_000, tradeTools ? 4 : 0, 50_000);
         return s.cvdHelloJson();
     }
 
     @Test
     void aTypicalDayFillsSixHundredThousandBytesOfSetsAndStillFitsOrTrimsDeterministically() throws Exception {
         var s = service(true);
-        fill(s, 8, 40_000, 3, 53_000);   // tools / geometry / waves ~40 KB, a trade-tools bundle ~160 KB
+        fill(s, 8, 4_000, 40_000, 3, 53_000);   // tools / geometry / waves ~40 KB, a trade-tools bundle ~160 KB
         String hello = s.cvdHelloJson();
         JsonNode node = JSON.readTree(hello);
         long parts = 0;
@@ -126,23 +129,21 @@ class ChartHelloBudgetTest {
     }
 
     @Test
-    void whenTheFixedFieldsAlreadyFillTheGuardEveryPartKeepsOnlyItsSkeleton() throws Exception {
-        var s = service(true);
-        fill(s, 8, 1_000, 1, 1_000);
-        // a retained structure record of ~1 MiB (the pre-existing fixed field) leaves no budget
-        s.retainMarketStructure(1L, "{\"x\":\"" + "y".repeat(FeedGatewayService.HELLO_FRAME_HARD_BYTES) + "\"}");
+    void whenTheFixedFieldsLeaveNoBudgetEveryChartPartKeepsOnlyItsSkeletonAndTheHelloStaysUnderTheHardGuard() throws Exception {
+        // a retained structure record at its own cap (one frame guard less the 4 KiB margin) leaves the hello no budget beyond the margin
+        String record = "{\"x\":\"" + "y".repeat(FeedGatewayService.HELLO_FRAME_TARGET_BYTES - 64) + "\"}";
         System.setProperty("GATEWAY_MARKET_STRUCTURE_ENABLED", "true");
         try {
             var t = new FeedGatewayService(spyAll(), JSON, new HpsfGatewayViewMapper(), null);
-            t.retainMarketStructure(1L, "{\"x\":\"" + "y".repeat(FeedGatewayService.HELLO_FRAME_HARD_BYTES) + "\"}");
-            fill(t, 8, 1_000, 1, 1_000);
-            JsonNode node = JSON.readTree(t.cvdHelloJson());
+            t.retainMarketStructure(1L, record);
+            fill(t, 8, 100, 1_000, 1, 1_000);
+            String hello = t.cvdHelloJson();
+            JsonNode node = JSON.readTree(hello);
             for (String field : List.of("geometry", "tools", "waves", "tradeTools")) {
                 assertEquals("{\"1m\":null,\"5m\":null,\"15m\":null}", node.get(field).toString(), field);
             }
-            assertNull(node.get("studies"), "the fixed fields leave no room even for the studies skeleton: the hello goes without them (studiesHelloBudget)");
-            assertTrue(bytes(t.cvdHelloJson()) < FeedGatewayService.HELLO_FRAME_HARD_BYTES + 512,   // the four chart skeletons (~55 bytes each) over the fixed field
-                    "only the fixed field and the skeletons remain");
+            assertTrue(node.get("studies").get("5m").isNull(), "the studies degrade to null last and only with no budget left");
+            assertTrue(bytes(hello) < FeedGatewayService.HELLO_FRAME_HARD_BYTES, "only the fixed field and the skeletons remain, inside the margin: " + bytes(hello));
         } finally {
             System.clearProperty("GATEWAY_MARKET_STRUCTURE_ENABLED");
         }
