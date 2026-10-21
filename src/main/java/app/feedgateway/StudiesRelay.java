@@ -355,38 +355,25 @@ final class StudiesRelay {
     }
 
     /**
-     * The bytes of the hello part that are not content: the four field names, the timeframe keys, braces, brackets, colons and
-     * commas, measured on an empty store (all entries {@code null}). An entry replaces a 4-byte {@code null} and every bar is
-     * counted with one comma, so framing + entries + bars is an UPPER bound of the rendered size: the budget below is never exceeded.
+     * The hello part, rendered in full and measured: while its UTF-8 size exceeds {@link #HELLO_MAX_BYTES} the oldest bar of the
+     * longest history is given up (one at a time, re-rendered and re-measured, so history is dropped only when the fragment REALLY
+     * exceeds the budget); only when no history is left does the largest current entry degrade to {@code null}. The common case is a
+     * single render. The result is cached until the retained state changes, so the extra renders of an over-budget hello are paid once.
      */
-    private static final int FRAMING_BYTES = utf8Length(render(new Store(), new int[SYMBOLS.length * TF.length], new boolean[SYMBOLS.length][TF.length], 512));
-
     private static String buildHello(Store st) {
         int[] from = new int[st.bars.length];
         boolean[][] nulled = new boolean[SYMBOLS.length][TF.length];
-        long total = FRAMING_BYTES;
-        for (int s = 0; s < SYMBOLS.length; s++) {
-            if (st.current[s] != null) {
-                for (int t = 0; t < TF.length; t++) {
-                    total += st.currentBytes[s][t];
-                }
-            }
-        }
-        for (ArrayList<Bar> list : st.bars) {
-            for (Bar b : list) {
-                total += b.bytes() + 1;
-            }
-        }
-        while (total > HELLO_MAX_BYTES) {
+        String out = render(st, from, nulled);
+        while (utf8Length(out) > HELLO_MAX_BYTES) {
             int longest = -1;
             for (int i = 0; i < st.bars.length; i++) {
                 if (st.bars[i].size() - from[i] > 0 && (longest < 0 || st.bars[i].size() - from[i] > st.bars[longest].size() - from[longest])) {
                     longest = i;
                 }
             }
-            if (longest < 0) {
-                // no history left to give up: the budget now binds the current entries, the largest goes first (null = nothing
-                // retained for that timeframe, which the page reads as no data; deterministic, never an oversized hello)
+            if (longest >= 0) {
+                from[longest]++;
+            } else {
                 int ws = -1, wt = -1, most = -1;
                 for (int s = 0; s < SYMBOLS.length; s++) {
                     for (int t = 0; st.current[s] != null && t < TF.length; t++) {
@@ -401,16 +388,14 @@ final class StudiesRelay {
                     break;
                 }
                 nulled[ws][wt] = true;
-                total -= most;
-                continue;
             }
-            total -= st.bars[longest].get(from[longest]++).bytes() + 1;
+            out = render(st, from, nulled);
         }
-        return render(st, from, nulled, (int) Math.min(total + 256, Integer.MAX_VALUE));
+        return out;
     }
 
-    private static String render(Store st, int[] from, boolean[][] nulled, int capacity) {
-        StringBuilder sb = new StringBuilder(capacity);
+    private static String render(Store st, int[] from, boolean[][] nulled) {
+        StringBuilder sb = new StringBuilder(64 * 1024);
         for (int s = 0; s < SYMBOLS.length; s++) {
             sb.append(",\"").append(CURRENT_FIELD[s]).append("\":{");
             for (int t = 0; t < TF.length; t++) {

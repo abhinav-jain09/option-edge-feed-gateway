@@ -516,4 +516,48 @@ class StudiesRelayTest {
         b.put("calibration", "\u00e9".repeat(StudiesRelay.BAR_MAX_BYTES / 2 + 1_000));   // over in bytes, under in characters
         assertFalse(StudiesRelay.withinBytes(b, new int[] {StudiesRelay.BAR_MAX_BYTES}));
     }
+
+    private StudiesRelay relayWith24BarsPadded(int pad) throws Exception {
+        StudiesRelay r = new StudiesRelay(JSON);
+        int n = 0;
+        for (String symbol : List.of("SPX", "ES")) {
+            for (String tf : List.of("T1M", "T5M", "T15M")) {
+                for (int i = 0; i < 4; i++, n++) {
+                    GenericRecord b = bar(symbol, tf, 100 + i);
+                    b.put("calibration", "p".repeat(pad));
+                    StudiesFixtures.onLive(r, StudiesRelay.BAR_EVENT, barKey(b), b);
+                }
+            }
+        }
+        assertEquals(24, n);
+        return r;
+    }
+
+    @Test
+    void historyIsGivenUpOnlyWhenTheRenderedFragmentReallyExceedsTheBudget() throws Exception {
+        int pad0 = 12_000;
+        int a0 = StudiesRelay.utf8Length(relayWith24BarsPadded(pad0).helloFields());
+        int pad1 = pad0 + (StudiesRelay.HELLO_MAX_BYTES - 40 - a0) / 24;   // lands within 24 + 40 bytes UNDER the budget
+        StudiesRelay fits = relayWith24BarsPadded(pad1);
+        int actual = StudiesRelay.utf8Length(fits.helloFields());
+        assertTrue(actual <= StudiesRelay.HELLO_MAX_BYTES && actual > StudiesRelay.HELLO_MAX_BYTES - 100, "bytes " + actual);
+        int kept = 0;
+        JsonNode h = JSON.readTree("{\"hello\":1" + fits.helloFields() + "}");
+        for (String f : List.of("studyBars", "esStudyBars")) {
+            for (String tf : List.of("1m", "5m", "15m")) {
+                kept += h.get(f).get(tf).size();
+            }
+        }
+        assertEquals(24, kept, "everything that really fits is kept: no early eviction from conservative accounting");
+        StudiesRelay over = relayWith24BarsPadded(pad1 + 10);   // 24 * 10 bytes more: now it really exceeds
+        assertTrue(StudiesRelay.utf8Length(over.helloFields()) <= StudiesRelay.HELLO_MAX_BYTES);
+        JsonNode h2 = JSON.readTree("{\"hello\":1" + over.helloFields() + "}");
+        int kept2 = 0;
+        for (String f : List.of("studyBars", "esStudyBars")) {
+            for (String tf : List.of("1m", "5m", "15m")) {
+                kept2 += h2.get(f).get(tf).size();
+            }
+        }
+        assertEquals(23, kept2, "exactly one bar went");
+    }
 }
