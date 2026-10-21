@@ -78,6 +78,8 @@ final class StudiesRelay {
         private final long startMs;
         /** The decoded record while the bar is only staged (not yet rendered); released once rendered. */
         private GenericRecord pending;
+        /** Whether {@code pending} is this relay's own copy (taken at the end of the poll that delivered it). */
+        private boolean sealed;
         private String json;
         private int bytes;
 
@@ -193,6 +195,7 @@ final class StudiesRelay {
     private final ObjectMapper mapper;
     private final AtomicLong accepted = new AtomicLong();
     private final AtomicLong renders = new AtomicLong();
+    private final AtomicLong copies = new AtomicLong();
     private final AtomicLong drops = new AtomicLong();
     private final AtomicLong regressions = new AtomicLong();
     private final AtomicLong duplicates = new AtomicLong();
@@ -227,6 +230,7 @@ final class StudiesRelay {
      * pending are already in the live store and are kept: a merge, never a replacement.
      */
     synchronized List<String[]> promote(Store staged) {
+        seal(staged);   // the poll that completed the recovery may have delivered bars not yet sealed
         List<String[]> frames = new ArrayList<>();
         AtomicLong notCounted = new AtomicLong();   // the staged copy re-presents bars the live store already holds
         for (int i = 0; i < staged.bars.length; i++) {
@@ -316,8 +320,10 @@ final class StudiesRelay {
         if (staging) {
             // Recovery reads days of history to keep eight bars per series: a staged bar is validated and ordered here and rendered to
             // JSON only if it is still retained when recovery is promoted, so the work is bounded by what is kept, not by what was read.
-            // an independent copy: the deserializer's object is not ours to hold across the polls of a recovery
-            target.merge(s * TF.length + t, new Bar(barId, startMs, org.apache.avro.generic.GenericData.get().deepCopy(r.getSchema(), r)), duplicates);
+            // the deserializer's object is valid for the poll that delivered it and not ours to hold across polls: seal(staged) takes an
+            // independent copy at the end of each poll, and only of the bars still retained (at most eight per series), never of those a
+            // newer bar of the same poll already evicted
+            target.merge(s * TF.length + t, new Bar(barId, startMs, r), duplicates);
             return null;
         }
         String json = mapper.writeValueAsString(AvroJson.toJsonNode(mapper, r));
@@ -332,6 +338,22 @@ final class StudiesRelay {
             accepted.incrementAndGet();
         }
         return newest ? json : null;
+    }
+
+    /**
+     * End of a poll during recovery: replaces the deserializer's objects of the bars the staged store still retains by independent
+     * copies. At most eight bars per series are retained, so at most 48 copies per poll however many records were read.
+     */
+    synchronized void seal(Store staged) {
+        for (ArrayList<Bar> list : staged.bars) {
+            for (Bar b : list) {
+                if (!b.rendered() && !b.sealed) {
+                    b.pending = org.apache.avro.generic.GenericData.get().deepCopy(b.pending.getSchema(), b.pending);
+                    b.sealed = true;
+                    copies.incrementAndGet();
+                }
+            }
+        }
     }
 
     /** Renders a staged bar at promotion; false (counted as a drop) when it cannot be rendered or exceeds the per-bar bound. */
@@ -409,7 +431,7 @@ final class StudiesRelay {
             pieceBytes[t] = utf8Length(pieces[t]);
             size += pieceBytes[t] + 8;
         }
-        if (size > CURRENT_MAX_BYTES) {
+        if (size > CURRENT_MAX_BYTES) {   // a cheap upper bound first: an absurd record is refused before the frames are assembled
             drops.incrementAndGet();
             return null;
         }
@@ -419,9 +441,13 @@ final class StudiesRelay {
         for (int t = 0; t < TF.length; t++) {
             all.append(t == 0 ? "" : ",").append('"').append(TF[t]).append("\":").append(pieces[t]);
             single[t] = head + "\"" + TF[t] + "\":" + pieces[t] + "}}";
-            singleBytes[t] = headBytes + pieceBytes[t] + 8;
+            singleBytes[t] = utf8Length(single[t]);   // measured, not estimated: it picks the largest entry to degrade
         }
         String frame = all.append("}}").toString();
+        if (utf8Length(frame) > CURRENT_MAX_BYTES) {   // the exact bound is the assembled frame
+            drops.incrementAndGet();
+            return null;
+        }
         if (publishedMs == target.currentMs[s] && frame.equals(target.currentFrame[s])) {
             accepted.incrementAndGet();
             return frame;   // an identical republish: accepted and forwarded, nothing retained changes (the hello cache stays valid)
@@ -543,6 +569,10 @@ final class StudiesRelay {
                 + "# HELP gateway_studies_duplicates_total Study bars already held (replay re-emits identical keys and values).\n"
                 + "# TYPE gateway_studies_duplicates_total counter\n"
                 + "gateway_studies_duplicates_total " + duplicates.get() + "\n";
+    }
+
+    long copiesForTest() {
+        return copies.get();
     }
 
     long rendersForTest() {

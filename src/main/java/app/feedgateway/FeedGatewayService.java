@@ -12904,6 +12904,9 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void finishStudiesRecovery(KafkaConsumer<?, ?> consumer, StudiesRecovery recovery) {
+        if (recovery.staged != null) {
+            studies.seal(recovery.staged);   // the poll is over: the staged bars still retained stop pointing at the deserializer's objects
+        }
         if (recovery.end.isEmpty() || !caughtUp(consumer, recovery.end)) {
             return;
         }

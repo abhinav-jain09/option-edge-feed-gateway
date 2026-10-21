@@ -604,17 +604,27 @@ class StudiesRelayTest {
     }
 
     @Test
-    void stagedBarsAreIndependentCopiesOfTheDeserializersRecords() throws Exception {
+    void stagedBarsAreSealedIntoIndependentCopiesAtTheEndOfThePollAndOnlyTheRetainedOnes() throws Exception {
         StudiesRelay.Store staged = relay.newStaging();
-        GenericRecord b = bar("SPX", "T5M", 4);
-        StudiesFixtures.onStaged(relay, staged, StudiesRelay.BAR_EVENT, barKey(b), b);
-        b.put("closesSeen", 987654321L);   // the deserializer reuses or mutates its object after the poll
+        GenericRecord first = bar("SPX", "T5M", 4);
+        StudiesFixtures.onStaged(relay, staged, StudiesRelay.BAR_EVENT, barKey(first), first);
+        relay.seal(staged);   // the end of the poll that delivered it
+        first.put("closesSeen", 987654321L);   // the deserializer reuses or mutates its object afterwards
+        for (int i = 10; i < 310; i++) {   // one big poll: 300 more records, 8 retained
+            GenericRecord b = bar("SPX", "T1M", i);
+            StudiesFixtures.onStaged(relay, staged, StudiesRelay.BAR_EVENT, barKey(b), b);
+        }
+        assertEquals(1L, relay.copiesForTest(), "nothing copied while a poll is being processed");
+        relay.seal(staged);
+        assertEquals(1L + StudiesRelay.HISTORY_BARS, relay.copiesForTest(), "one poll of 300 records costs the 8 retained copies, not 300");
         relay.promote(staged);
-        assertEquals(104L, hello().get("studyBars").get("5m").get(0).get("closesSeen").asLong(), "the staged bar kept the values it was validated with");
+        assertEquals(104L, hello().get("studyBars").get("5m").get(0).get("closesSeen").asLong(), "the sealed bar kept the values it was validated with");
     }
 
     @Test
-    void theApprovedWriterSchemasAreTheContractsFilesAndASameNamedOtherShapeIsRefused() throws Exception {
+    void theApprovedWriterSchemasAreThePinnedFingerprintsOfTheContractsSchemasAndASameNamedOtherShapeIsRefused() throws Exception {
+        // parsing-form fingerprints of the test copies; that those copies are byte-identical to the contracts registry files is pinned by
+        // the SHA-256 test in the contracts repository (StudySubjectsTest), not here
         assertEquals(StudiesRelay.BAR_FINGERPRINT, org.apache.avro.SchemaNormalization.parsingFingerprint64(StudiesFixtures.BAR), "StudyBar.avsc changed: re-pin");
         assertEquals(StudiesRelay.CURRENT_FINGERPRINT, org.apache.avro.SchemaNormalization.parsingFingerprint64(StudiesFixtures.CURRENT), "StudiesCurrent.avsc changed: re-pin");
         // a record of the same full name with one extra field
