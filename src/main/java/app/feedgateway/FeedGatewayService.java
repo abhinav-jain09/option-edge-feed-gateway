@@ -12937,8 +12937,13 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The requirement's PATTERN_SET_MAX_BYTES (R6.4): 1 048 576 − 4 096. */
     static final int MARKET_STRUCTURE_PATTERNS_MAX_BYTES = 1_048_576 - 4_096;
-    /** The whole cvd-hello frame: the 1 MiB guard less the margin every relay keeps. */
-    static final int HELLO_FRAME_MAX_BYTES = 1_048_576 - 4_096;
+    /**
+     * The TARGET size of the whole cvd-hello frame: the 1 MiB transport guard less the 4 KiB margin every relay keeps. The studies
+     * history is shed to fit this target; the mandatory skeleton of the studies fields (about 300 bytes, always present when the flag is
+     * on) is the one part that is never shed, and it is the margin that absorbs it: the HARD limit stays the 1 MiB guard, which holds
+     * whenever the other fields leave at least the skeleton's size below it (asserted: the skeleton is smaller than the margin).
+     */
+    static final int HELLO_FRAME_TARGET_BYTES = 1_048_576 - 4_096;
 
     /** What the boundary learned about an accepted set: its timeframe and its clock. */
     record PatternSetBoundary(String timeframe, long asOfMs) { }
@@ -13177,7 +13182,7 @@ public class FeedGatewayService implements ReplayRunner {
             // studies/studyBars and ES in esStudies/esStudyBars; the fields' presence = flag on. Appended LAST, with exactly the bytes the
             // rest of the hello leaves under the 1 MiB frame guard (minus the 4 KiB margin the other relays use and the closing brace),
             // so the transmitted hello stays within it whatever the other streams hold.
-            int rest = HELLO_FRAME_MAX_BYTES - StudiesRelay.utf8Length(sb.toString()) - 1;
+            int rest = HELLO_FRAME_TARGET_BYTES - StudiesRelay.utf8Length(sb.toString()) - 1;
             sb.append(studies.helloFields(Math.max(0, rest)));
         }
         return sb.append('}').toString();

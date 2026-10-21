@@ -126,7 +126,20 @@ class StudiesWiringTest {
         int footprint = src.indexOf("sb.append(\",\\\"footprintStrike\\\":\")", hello);
         int studies = src.indexOf("studies.helloFields(Math.max(0, rest))", hello);
         assertTrue(hello > 0 && footprint > hello && studies > footprint, "appended after every other field");
-        assertTrue(src.contains("HELLO_FRAME_MAX_BYTES - StudiesRelay.utf8Length(sb.toString()) - 1"));
-        assertEquals(1_048_576 - 4_096, FeedGatewayService.HELLO_FRAME_MAX_BYTES);
+        assertTrue(src.contains("HELLO_FRAME_TARGET_BYTES - StudiesRelay.utf8Length(sb.toString()) - 1"));
+        assertEquals(1_048_576 - 4_096, FeedGatewayService.HELLO_FRAME_TARGET_BYTES);
+    }
+
+    @Test
+    void theMandatorySkeletonIsSmallerThanTheMarginThatAbsorbsIt() {
+        StudiesRelay relay = new StudiesRelay(new com.fasterxml.jackson.databind.ObjectMapper());
+        int skeleton = StudiesRelay.utf8Length(relay.helloFields(0));
+        int margin = 1_048_576 - FeedGatewayService.HELLO_FRAME_TARGET_BYTES;
+        assertTrue(skeleton < margin / 8, "skeleton " + skeleton + " B vs margin " + margin + " B");
+        // a non-study prefix that leaves LESS than the skeleton under the target still yields a hello under the 1 MiB transport guard
+        int prefix = FeedGatewayService.HELLO_FRAME_TARGET_BYTES - skeleton / 2;
+        int rest = FeedGatewayService.HELLO_FRAME_TARGET_BYTES - prefix - 1;
+        assertTrue(rest < skeleton);
+        assertTrue(prefix + 1 + StudiesRelay.utf8Length(relay.helloFields(Math.max(0, rest))) < 1_048_576, "the hard guard holds");
     }
 }
