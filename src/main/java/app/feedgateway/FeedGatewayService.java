@@ -12910,6 +12910,10 @@ public class FeedGatewayService implements ReplayRunner {
         if (recovery.end.isEmpty() || !caughtUp(consumer, recovery.end)) {
             return;
         }
+        if (recovery.staged == null) {   // unreachable by construction (begin() stages whenever it captures); an optional feature must not fault the consumer
+            recovery.end.clear();
+            return;
+        }
         List<String[]> frames = studies.promote(recovery.staged);
         recovery.end.clear();
         recovery.staged = null;

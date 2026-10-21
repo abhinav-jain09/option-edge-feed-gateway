@@ -189,4 +189,43 @@ class StudiesLoopTest {
         assertTrue(metrics.contains("gateway_studies_regressions_total 1\n"), metrics);
         assertTrue(metrics.contains("gateway_studies_enabled 1\n"));
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void onlyTheCurrentStatePartitionAssignedStillRunsAndDeliversLive() throws Exception {
+        var s = service();
+        s.runOutboundWritesInline();
+        var socket = mock(WebSocketSession.class);
+        when(socket.getId()).thenReturn("studies-current-only");
+        when(socket.isOpen()).thenReturn(true);
+        s.addClient(socket);
+        clearInvocations(socket);
+        KafkaConsumer<String, Object> consumer = mock(KafkaConsumer.class);
+        Node node = new Node(1, "b", 9092);
+        when(consumer.listTopics(any(Duration.class))).thenReturn(Map.of(
+                CURRENT.topic(), List.of(new PartitionInfo(CURRENT.topic(), 0, node, new Node[] {node}, new Node[] {node}))));
+        Map<TopicPartition, Long> end = Map.of(CURRENT, 1L);
+        when(consumer.endOffsets(anyCollection(), any(Duration.class))).thenReturn(end);
+        when(consumer.endOffsets(anyCollection())).thenReturn(end);
+        when(consumer.beginningOffsets(anyCollection())).thenReturn(Map.of(CURRENT, 0L));
+        Map<TopicPartition, Long> position = new HashMap<>();
+        doAnswer(call -> { position.putAll(end); return null; }).when(consumer).seekToEnd(anyCollection());
+        doAnswer(call -> { position.put(call.getArgument(0), call.getArgument(1)); return null; }).when(consumer).seek(any(TopicPartition.class), anyLong());
+        when(consumer.assignment()).thenReturn(java.util.Set.of(CURRENT));
+        when(consumer.position(any(TopicPartition.class))).thenAnswer(call -> position.getOrDefault(call.<TopicPartition>getArgument(0), 0L));
+        AtomicInteger poll = new AtomicInteger();
+        when(consumer.poll(any(Duration.class))).thenAnswer(call -> {
+            if (poll.getAndIncrement() == 0) {
+                position.put(CURRENT, 1L);
+                return records(CURRENT, 0, "SPX", StudiesFixtures.current("SPX", 2));
+            }
+            s.setRunningForTest(false);
+            return ConsumerRecords.empty();
+        });
+        s.setRunningForTest(true);
+        s.runLiveConsumerAttemptForTest("avro-live", BINDINGS, new AtomicBoolean(), consumer, false);
+        var sent = org.mockito.ArgumentCaptor.forClass(org.springframework.web.socket.WebSocketMessage.class);
+        verify(socket, times(1)).sendMessage(sent.capture());
+        assertEquals("indicator-studies-current", JSON.readTree(((TextMessage) sent.getValue()).getPayload()).get("type").asText());
+    }
 }
