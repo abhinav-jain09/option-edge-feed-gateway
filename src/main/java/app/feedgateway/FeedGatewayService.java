@@ -2911,9 +2911,11 @@ public class FeedGatewayService implements ReplayRunner {
             // Phase A studies: Avro, LIVE consumer only (the cache consumer has no case for them; the relay keeps its own
             // bounded history and last states and recovers them with a seek-back, see seekStudies).
             for (String barsTopic : settings.studiesBarsTopics()) {
+                requireUnbound(topicEvents, barsTopic);
                 topicEvents.put(barsTopic, new TopicBinding("DATABENTO", StudiesRelay.BAR_EVENT));
             }
             for (String currentTopic : settings.studiesCurrentTopics()) {
+                requireUnbound(topicEvents, currentTopic);
                 topicEvents.put(currentTopic, new TopicBinding("DATABENTO", StudiesRelay.CURRENT_EVENT));
             }
         }
@@ -2924,6 +2926,13 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** Binds one chart relay topic; two roles (or a chart topic and another stream) on one topic would silently route records to the wrong relay, so it refuses to start. */
+    /** A topic already bound to another stream must never be silently re-bound. */
+    static void requireUnbound(Map<String, TopicBinding> topicEvents, String topic) {
+        if (topicEvents.containsKey(topic)) {
+            throw new IllegalStateException("topic " + topic + " is configured for two gateway streams; refusing to start with a misrouting binding");
+        }
+    }
+
     static void bindChartTopic(Map<String, TopicBinding> topicEvents, String topic, String event) {
         if (topicEvents.putIfAbsent(topic, new TopicBinding("DATABENTO", event)) != null) {
             throw new IllegalStateException("topic " + topic + " is configured for two gateway streams; refusing to start with a misrouting binding (event " + event + ")");

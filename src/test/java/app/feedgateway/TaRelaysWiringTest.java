@@ -143,4 +143,11 @@ class TaRelaysWiringTest {
         org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> FeedGatewayService.bindChartTopic(bindings, "t.one", TimeframeSetRelay.GEOMETRY_EVENT));
         assertEquals(1, bindings.size());
     }
+
+    @Test
+    void aStudiesTopicEqualToAChartTopicRefusesToBind() {
+        java.util.Map<String, FeedGatewayService.TopicBinding> bindings = new java.util.LinkedHashMap<>();
+        FeedGatewayService.bindChartTopic(bindings, "t.shared", TimeframeSetRelay.TOOLS_EVENT);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> FeedGatewayService.requireUnbound(bindings, "t.shared"));
+    }
 }

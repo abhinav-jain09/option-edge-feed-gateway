@@ -83,6 +83,8 @@ public final class GatewayAvroDeserializer implements Deserializer<Object> {
             for (Throwable c = e.getCause(); c != null && registry == null; c = c.getCause() == c ? null : c.getCause()) {
                 if (c instanceof RestClientException r) {
                     registry = r;   // however deeply the client wrapped it
+                } else if (c instanceof java.net.SocketException || c instanceof java.io.InterruptedIOException || c instanceof java.net.UnknownHostException) {
+                    throw e;   // the registry is unreachable (connect, read timeout, DNS): an infrastructure failure, never a poison record: fail the poll and retry
                 }
             }
             if (registry != null) {
