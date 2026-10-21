@@ -12944,6 +12944,21 @@ public class FeedGatewayService implements ReplayRunner {
      * whenever the other fields leave at least the skeleton's size below it (asserted: the skeleton is smaller than the margin).
      */
     static final int HELLO_FRAME_TARGET_BYTES = 1_048_576 - 4_096;
+    /** The transport guard itself: a cvd-hello frame never exceeds it. */
+    static final int HELLO_FRAME_HARD_BYTES = 1_048_576;
+
+    /**
+     * The byte budget for the studies fields of a hello whose other fields already take {@code used} bytes (the opening of the object
+     * through the last other field; one more byte closes it), or -1 when even the mandatory skeleton would breach the HARD guard, in
+     * which case the studies fields are left out of that hello (counted) rather than the frame being oversized. Otherwise the history
+     * is shed to the TARGET (guard less margin); only the skeleton may use the margin.
+     */
+    static int studiesHelloBudget(int used) {
+        if (used + 1 + StudiesRelay.skeletonBytes() > HELLO_FRAME_HARD_BYTES) {
+            return -1;
+        }
+        return Math.max(0, HELLO_FRAME_TARGET_BYTES - used - 1);
+    }
 
     /** What the boundary learned about an accepted set: its timeframe and its clock. */
     record PatternSetBoundary(String timeframe, long asOfMs) { }
@@ -13179,11 +13194,14 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (settings.studiesEnabled()) {
             // Phase A studies (03_STUDIES_FRAME_CONTRACT.md): the latest current state and the recent finalized bars per timeframe, SPX in
-            // studies/studyBars and ES in esStudies/esStudyBars; the fields' presence = flag on. Appended LAST, with exactly the bytes the
-            // rest of the hello leaves under the 1 MiB frame guard (minus the 4 KiB margin the other relays use and the closing brace),
-            // so the transmitted hello stays within it whatever the other streams hold.
-            int rest = HELLO_FRAME_TARGET_BYTES - StudiesRelay.utf8Length(sb.toString()) - 1;
-            sb.append(studies.helloFields(Math.max(0, rest)));
+            // studies/studyBars and ES in esStudies/esStudyBars; the fields' presence = flag on. Appended LAST, with the bytes the rest of
+            // the hello leaves, so the transmitted hello stays within the 1 MiB guard (see studiesHelloBudget for the exact rule).
+            int budget = studiesHelloBudget(StudiesRelay.utf8Length(sb.toString()));
+            if (budget >= 0) {
+                sb.append(studies.helloFields(budget));
+            } else {
+                studies.onHelloSuppressed();   // the other fields leave no room even for the skeleton: the hello goes without the studies
+            }
         }
         return sb.append('}').toString();
     }

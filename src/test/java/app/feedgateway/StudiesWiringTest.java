@@ -124,22 +124,24 @@ class StudiesWiringTest {
         String src = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         int hello = src.indexOf("String cvdHelloJson(String footprintStrikeField)");
         int footprint = src.indexOf("sb.append(\",\\\"footprintStrike\\\":\")", hello);
-        int studies = src.indexOf("studies.helloFields(Math.max(0, rest))", hello);
+        int studies = src.indexOf("sb.append(studies.helloFields(budget))", hello);
         assertTrue(hello > 0 && footprint > hello && studies > footprint, "appended after every other field");
-        assertTrue(src.contains("HELLO_FRAME_TARGET_BYTES - StudiesRelay.utf8Length(sb.toString()) - 1"));
+        assertTrue(src.contains("studiesHelloBudget(StudiesRelay.utf8Length(sb.toString()))"));
         assertEquals(1_048_576 - 4_096, FeedGatewayService.HELLO_FRAME_TARGET_BYTES);
     }
 
     @Test
-    void theMandatorySkeletonIsSmallerThanTheMarginThatAbsorbsIt() {
+    void theHardGuardHoldsAtTheExactBoundary() {
+        int skeleton = StudiesRelay.skeletonBytes();
+        int hard = FeedGatewayService.HELLO_FRAME_HARD_BYTES;
+        assertTrue(skeleton < (hard - FeedGatewayService.HELLO_FRAME_TARGET_BYTES) / 8, "the margin absorbs the skeleton many times over");
+        int lastAllowed = hard - 1 - skeleton;
+        assertEquals(0, FeedGatewayService.studiesHelloBudget(lastAllowed), "past the target the budget is the floor: the skeleton alone");
+        assertEquals(-1, FeedGatewayService.studiesHelloBudget(lastAllowed + 1), "one byte more and even the skeleton would breach the guard: leave the studies out");
+        assertEquals(-1, FeedGatewayService.studiesHelloBudget(hard - 100));
+        assertTrue(FeedGatewayService.studiesHelloBudget(1000) > 500_000, "an ordinary hello leaves the studies their full share");
         StudiesRelay relay = new StudiesRelay(new com.fasterxml.jackson.databind.ObjectMapper());
-        int skeleton = StudiesRelay.utf8Length(relay.helloFields(0));
-        int margin = 1_048_576 - FeedGatewayService.HELLO_FRAME_TARGET_BYTES;
-        assertTrue(skeleton < margin / 8, "skeleton " + skeleton + " B vs margin " + margin + " B");
-        // a non-study prefix that leaves LESS than the skeleton under the target still yields a hello under the 1 MiB transport guard
-        int prefix = FeedGatewayService.HELLO_FRAME_TARGET_BYTES - skeleton / 2;
-        int rest = FeedGatewayService.HELLO_FRAME_TARGET_BYTES - prefix - 1;
-        assertTrue(rest < skeleton);
-        assertTrue(prefix + 1 + StudiesRelay.utf8Length(relay.helloFields(Math.max(0, rest))) < 1_048_576, "the hard guard holds");
+        assertTrue(lastAllowed + 1 + StudiesRelay.utf8Length(relay.helloFields(FeedGatewayService.studiesHelloBudget(lastAllowed))) <= hard,
+                "the whole frame at the last allowed prefix is within the hard guard");
     }
 }
