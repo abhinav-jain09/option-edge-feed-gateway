@@ -146,7 +146,13 @@ final class AvroFrameJson {
         return new BigDecimal(new BigInteger(raw), d.getScale());
     }
 
-    private static Map<String, Object> sorted(Map<?, ?> map) {
+    /** No contract map is larger than the parameter set (a few dozen entries): a bigger one is refused before anything is copied or sorted. */
+    static final int MAX_MAP_ENTRIES = 1024;
+
+    private static Map<String, Object> sorted(Map<?, ?> map) throws IOException {
+        if (map.size() > MAX_MAP_ENTRIES) {
+            throw new IOException("a map of " + map.size() + " entries exceeds " + MAX_MAP_ENTRIES);
+        }
         Map<String, Object> out = new TreeMap<>();
         for (Map.Entry<?, ?> e : map.entrySet()) {
             out.put(e.getKey().toString(), e.getValue());

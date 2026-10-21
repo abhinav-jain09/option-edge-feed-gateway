@@ -34,4 +34,20 @@ class AvroDecimalPrecisionTest {
         assertNull(AvroFrameJson.render(of(new BigDecimal("60.555")), 1000, true), "a value that does not fit the scale is refused, never rounded");
         assertNull(AvroFrameJson.render(of(new BigDecimal("12345.67")), 1000, true), "precision 7");
     }
+
+    @Test
+    void aMapBeyondTheContractIsRefusedBeforeAnythingIsCopied() {
+        Schema ms = new Schema.Parser().parse("{\"type\":\"record\",\"name\":\"M\",\"namespace\":\"t\",\"fields\":[{\"name\":\"m\",\"type\":{\"type\":\"map\",\"values\":\"long\"}}]}");
+        java.util.Map<String, Long> small = new java.util.HashMap<>(), huge = new java.util.HashMap<>();
+        small.put("a", 1L);
+        for (int i = 0; i <= AvroFrameJson.MAX_MAP_ENTRIES; i++) {
+            huge.put("k" + i, (long) i);
+        }
+        GenericRecord ok = new GenericData.Record(ms);
+        ok.put("m", small);
+        GenericRecord big = new GenericData.Record(ms);
+        big.put("m", huge);
+        assertEquals("{\"m\":{\"a\":1}}", AvroFrameJson.render(ok, 100000, true));
+        assertNull(AvroFrameJson.render(big, 10_000_000, true));
+    }
 }
