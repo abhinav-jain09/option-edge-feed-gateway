@@ -138,6 +138,16 @@ final class TradeToolsRelay extends TaRelay {
             if (t != null) {
                 charts[t].remove(chartId);
                 columns.remove(chartId);
+                purgeEvents(chartId, null);
+            }
+        }
+
+        /** Drops the P&F events of {@code chartId} (of every epoch but {@code keepEpoch}, when given): an event never outlives the chart or contract epoch it belongs to. */
+        void purgeEvents(String chartId, String keepEpoch) {
+            for (int t = 0; t < TF.length; t++) {
+                for (int k = 2; k <= 8; k++) {
+                    events[t][k].held.values().removeIf(e -> e.chartId().equals(chartId) && (keepEpoch == null || !e.epoch().equals(keepEpoch)));
+                }
             }
         }
 
@@ -188,6 +198,7 @@ final class TradeToolsRelay extends TaRelay {
                     }
                     if (old != null && !old.epoch().equals(h.epoch())) {
                         columns.remove(h.key());   // a new contract epoch starts the chart's columns afresh
+                        purgeEvents(h.key(), h.epoch());   // and its events
                     }
                     charts[h.tf()].put(h.key(), h);
                     chartTf.put(h.key(), h.tf());

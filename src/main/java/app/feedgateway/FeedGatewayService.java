@@ -13057,7 +13057,9 @@ public class FeedGatewayService implements ReplayRunner {
         if (taRelays.isEmpty()) {
             return sb;
         }
-        // what the fixed fields and the studies (appended before, under studiesHelloBudget) leave of the TARGET; one more byte closes the object
+        // what the fixed fields and the studies (appended before, under studiesHelloBudget) leave of the TARGET; one more byte closes the object.
+        // A part counts its records' bytes against this budget; its own field skeleton (field name, braces, timeframe keys: under 60 bytes per part)
+        // is NOT counted and is absorbed by the 4 KiB between the TARGET and the HARD guard (ChartHelloBudgetTest pins the worst case under the HARD guard).
         long budget = (long) HELLO_FRAME_TARGET_BYTES - StudiesRelay.utf8Length(sb) - 1L;
         for (TaRelay relay : taRelays) {
             String part = relay.helloField(budget);

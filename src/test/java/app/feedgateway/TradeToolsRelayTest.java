@@ -103,13 +103,31 @@ class TradeToolsRelayTest {
         var relay = new TradeToolsRelay();
         relay.onLive(CHART, TaFixtures.chart("c", "M5", 100));
         relay.onLive(COLUMN, TaFixtures.column("c", 1, 101));
+        relay.onLive(EVENTS, TaFixtures.pfEvent("PfBreakEvent", "c", "b1", 1000, 102));
         assertNull(relay.onLive(CHART, TaFixtures.chart("c", "M15", 99)), "older: a regression, nothing moves");
         assertEquals(1, bundles(relay, 1 << 20).get("5m").get("pfColumns").size());
+        assertEquals(1, bundles(relay, 1 << 20).get("5m").get("pfBreaks").size());
         assertNotNull(relay.onLive(CHART, TaFixtures.chart("c", "M15", 102)));
         JsonNode hello = bundles(relay, 1 << 20);
-        assertTrue(hello.get("5m").isNull(), "the chart left the 5m bundle with its columns");
+        assertTrue(hello.get("5m").isNull(), "the chart left the 5m bundle with its columns and its events");
+        assertEquals(0, hello.get("15m").get("pfBreaks").size(), "an event never outlives its chart's horizon");
         assertEquals(1, hello.get("15m").get("pfCharts").size());
         assertEquals(0, hello.get("15m").get("pfColumns").size());
+    }
+
+    @Test
+    void anEvictedChartAndAnEpochChangeTakeTheirEventsWithThem() throws Exception {
+        var relay = new TradeToolsRelay();
+        relay.onLive(CHART, TaFixtures.chart("old", "M1", 1));
+        relay.onLive(EVENTS, TaFixtures.pfEvent("PfBreakEvent", "old", "b", 1000, 2));
+        for (int i = 2; i <= 5; i++) {
+            relay.onLive(CHART, TaFixtures.chart("c" + i, "M1", i));
+        }
+        assertEquals(0, bundles(relay, 1 << 20).get("1m").get("pfBreaks").size(), "the evicted chart's event left with it");
+        relay.onLive(EVENTS, TaFixtures.pfEvent("PfBreakEvent", "c5", "e", 2000, 10));
+        assertEquals(1, bundles(relay, 1 << 20).get("1m").get("pfBreaks").size());
+        relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("c5", "M1", 20), "contractEpoch", "ESH7"));
+        assertEquals(0, bundles(relay, 1 << 20).get("1m").get("pfBreaks").size(), "a new contract epoch starts the chart's events afresh");
     }
 
     @Test
