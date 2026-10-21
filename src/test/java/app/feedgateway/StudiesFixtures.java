@@ -22,6 +22,9 @@ final class StudiesFixtures {
     static final Schema CURRENT = load("StudiesCurrent");
     static final long T0 = Instant.parse("2026-10-20T13:30:00Z").toEpochMilli();
 
+    /** The real segment id of the dev SPX series (32 hex): the barId is then 71-72 characters, as the producer really emits it (a 4-character fixture segment hid the 64 bound). */
+    static final String SEGMENT = "c5c51360e1554b3b9e7fd8ab6644914d";
+
     private StudiesFixtures() {
     }
 
@@ -47,7 +50,7 @@ final class StudiesFixtures {
         r.put("symbol", symbol);
         r.put("tradeDate", "2026-10-20");
         r.put("timeframe", enumOf(BAR, "timeframe", timeframe));
-        r.put("barId", symbol + "|ESZ6|2026-10-20|" + timeframe.substring(1).toLowerCase() + "|" + Instant.ofEpochMilli(start).toString());
+        r.put("barId", symbol + "|" + SEGMENT + "|2026-10-20|" + timeframe.substring(1).toLowerCase() + "|" + Instant.ofEpochMilli(start).toString());
         r.put("barStart", Instant.ofEpochMilli(start).toString());
         r.put("barEnd", Instant.ofEpochMilli(start + 60_000L).toString());
         r.put("status", enumOf(BAR, "status", status));
