@@ -1169,7 +1169,9 @@ public class FeedGatewayService implements ReplayRunner {
             seekCvdSpxLevelsToHandoff(consumer, partitions);   // U16: continuous consumption
         }
         seekMarketStructureSnapshot(consumer, partitions, topicEvents);
-        seekStudies(consumer, partitions, topicEvents);
+        if (settings.studiesEnabled()) {
+            seekStudies(consumer, partitions, topicEvents);
+        }
         // The auction is positioned by ONE rule on both paths: the live cursor, then the frozen handoff,
         // and with neither the partition is PAUSED rather than consumed from a guessed position. It runs
         // AFTER the generic seek above, whose lazy seekToEnd it deliberately overrides.
@@ -1181,7 +1183,9 @@ public class FeedGatewayService implements ReplayRunner {
         seekAddedLivePartitions(consumer, refresh, topicEvents);
         seekFootprintToEnd(consumer, refresh.added());
         seekMarketStructureSnapshot(consumer, refresh.added(), topicEvents);
-        seekStudies(consumer, refresh.added(), topicEvents);
+        if (settings.studiesEnabled()) {
+            seekStudies(consumer, refresh.added(), topicEvents);
+        }
     }
 
     /** The live-only structure snapshot — and the pattern sets beside it — may be quiet all night or over a
@@ -3762,7 +3766,9 @@ public class FeedGatewayService implements ReplayRunner {
             MarketStructurePatternsRecovery patternsRecovery = newMarketStructurePatternsRecovery();
             patternsRecovery.end.putAll(marketStructurePatternsEndOffsets(consumer, partitions, topicEvents));
             StudiesRecovery studiesRecovery = new StudiesRecovery();
-            studiesRecovery.begin(studiesEndOffsets(consumer, partitions, topicEvents));
+            if (settings.studiesEnabled()) {
+                studiesRecovery.begin(studiesEndOffsets(consumer, partitions, topicEvents));
+            }
             liveBootstrapSeek(consumer, partitions, topicEvents, retry);
             PartitionRefresh partitionRefresh = new PartitionRefresh(name, topicEvents.keySet(), footprintTopicAdmit());
             PollMaintenance canonicalMaintenance = new PollMaintenance(settings.pollMs());
@@ -3783,7 +3789,9 @@ public class FeedGatewayService implements ReplayRunner {
                         if (patternsRecovery.end.isEmpty()) patternsRecovery = newMarketStructurePatternsRecovery();
                         patternsRecovery.end.putAll(addedPatternsEnd);
                     }
-                    studiesRecovery.begin(studiesEndOffsets(consumer, refresh.added(), topicEvents));
+                    if (settings.studiesEnabled()) {
+                        studiesRecovery.begin(studiesEndOffsets(consumer, refresh.added(), topicEvents));
+                    }
                     liveAdoptionSeek(consumer, refresh, topicEvents);
                 }
                 // Rollover-diagnostics: record that a live consumer is advancing. Additive; the counter
@@ -4383,7 +4391,9 @@ public class FeedGatewayService implements ReplayRunner {
                 }
                 finishMarketStructureRecovery(consumer, structureRecovery);
                 finishMarketStructurePatternsRecovery(consumer, patternsRecovery);
-                finishStudiesRecovery(consumer, studiesRecovery);
+                if (settings.studiesEnabled()) {
+                    finishStudiesRecovery(consumer, studiesRecovery);
+                }
                 if (avro || canonicalMaintenance.due(System.nanoTime())) purgeExpiredCache(System.currentTimeMillis());
                 if (settings.ibkrPreOpenEnabled()) {
                     // Consumer-local window transitions fire from the live loop too — either
@@ -12954,10 +12964,10 @@ public class FeedGatewayService implements ReplayRunner {
      * is shed to the TARGET (guard less margin); only the skeleton may use the margin.
      */
     static int studiesHelloBudget(int used) {
-        if (used + 1 + StudiesRelay.skeletonBytes() > HELLO_FRAME_HARD_BYTES) {
+        if ((long) used + 1L + StudiesRelay.skeletonBytes() > HELLO_FRAME_HARD_BYTES) {   // long: no int overflow can bypass the guard
             return -1;
         }
-        return Math.max(0, HELLO_FRAME_TARGET_BYTES - used - 1);
+        return (int) Math.max(0L, (long) HELLO_FRAME_TARGET_BYTES - used - 1L);
     }
 
     /** What the boundary learned about an accepted set: its timeframe and its clock. */

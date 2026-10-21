@@ -139,9 +139,24 @@ class StudiesWiringTest {
         assertEquals(0, FeedGatewayService.studiesHelloBudget(lastAllowed), "past the target the budget is the floor: the skeleton alone");
         assertEquals(-1, FeedGatewayService.studiesHelloBudget(lastAllowed + 1), "one byte more and even the skeleton would breach the guard: leave the studies out");
         assertEquals(-1, FeedGatewayService.studiesHelloBudget(hard - 100));
+        assertEquals(-1, FeedGatewayService.studiesHelloBudget(Integer.MAX_VALUE), "no int overflow bypasses the guard");
+        assertEquals(-1, FeedGatewayService.studiesHelloBudget(Integer.MAX_VALUE - 10));
         assertTrue(FeedGatewayService.studiesHelloBudget(1000) > 500_000, "an ordinary hello leaves the studies their full share");
         StudiesRelay relay = new StudiesRelay(new com.fasterxml.jackson.databind.ObjectMapper());
         assertTrue(lastAllowed + 1 + StudiesRelay.utf8Length(relay.helloFields(FeedGatewayService.studiesHelloBudget(lastAllowed))) <= hard,
                 "the whole frame at the last allowed prefix is within the hard guard");
+    }
+
+    @Test
+    void everyStudiesCallOnTheSharedConsumerPathSitsBehindTheFlag() throws Exception {
+        String src = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        for (String call : List.of("seekStudies(consumer, partitions, topicEvents);", "seekStudies(consumer, refresh.added(), topicEvents);",
+                "studiesRecovery.begin(studiesEndOffsets(consumer, partitions, topicEvents));",
+                "studiesRecovery.begin(studiesEndOffsets(consumer, refresh.added(), topicEvents));", "finishStudiesRecovery(consumer, studiesRecovery);")) {
+            int at = src.indexOf(call);
+            assertTrue(at > 0, call);
+            assertEquals(src.indexOf(call, at + 1), -1, "one site: " + call);
+            assertTrue(src.substring(Math.max(0, at - 90), at).contains("if (settings.studiesEnabled()) {"), "guarded: " + call);
+        }
     }
 }
