@@ -35,7 +35,7 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
 /**
- * The live loop end to end for the chart relays of Phases B, D and E: each relay re-reads its topic from a bounded number of records
+ * The live loop end to end for the chart relays of CHART-STRUCTURE-TOOLS, TICK-TRADE-TOOLS and ELLIOTT-FIB-CYCLE-TOOLS: each relay re-reads its topic from a bounded number of records
  * before the end, holds what is below the captured end offsets privately (a column read before its chart waits for it), promotes once,
  * and live delivery continues; an undecodable value and a tombstone are counted and reach no socket.
  */

@@ -340,8 +340,8 @@ public final class GatewaySettings {
     }
 
     /**
-     * Phase A studies relay (frames {@code indicator-studies} / {@code indicator-studies-current} and the hello's study
-     * fields; ta-books-catalog/03_STUDIES_FRAME_CONTRACT.md). OFF by default: absent study fields in the hello are how the
+     * INDICATOR-STUDIES studies relay (frames {@code indicator-studies} / {@code indicator-studies-current} and the hello's study
+     * fields; options-edge-processing docs/ta-books/catalog/STUDIES-FRAME-CONTRACT.md). OFF by default: absent study fields in the hello are how the
      * page learns this gateway has no study stream.
      */
     public boolean studiesEnabled() {
@@ -371,8 +371,8 @@ public final class GatewaySettings {
     }
 
     /**
-     * Phase B structure tools (frame {@code market-structure-tools}, hello field {@code tools};
-     * ta-books-catalog/05_GEOMETRY_FRAME_CONTRACT.md). OFF by default: an absent {@code tools} field is how the page learns this
+     * CHART-STRUCTURE-TOOLS structure tools (frame {@code market-structure-tools}, hello field {@code tools};
+     * options-edge-processing docs/ta-books/catalog/GEOMETRY-FRAME-CONTRACT.md). OFF by default: an absent {@code tools} field is how the page learns this
      * gateway has no tools stream.
      */
     public boolean structureToolsEnabled() {
@@ -383,7 +383,7 @@ public final class GatewaySettings {
         return value("KAFKA_MARKET_STRUCTURE_TOOLS_TOPIC", "options.spx.market-structure.tools");
     }
 
-    /** Phase C classical geometry (frame {@code market-structure-geometry}, hello field {@code geometry}); OFF by default. */
+    /** CLASSICAL-CHART-PATTERNS classical geometry (frame {@code market-structure-geometry}, hello field {@code geometry}); OFF by default. */
     public boolean geometryEnabled() {
         return boolValue("GATEWAY_GEOMETRY_ENABLED", false);
     }
@@ -393,8 +393,8 @@ public final class GatewaySettings {
     }
 
     /**
-     * Phase D trade-level tools (twelve {@code trade-tools-*} frames, hello field {@code tradeTools};
-     * 06_TRADE_TOOLS_FRAME_CONTRACT.md). OFF by default. The producer's topic names are the keys of {@link #tradeToolsTopics()}.
+     * TICK-TRADE-TOOLS trade-level tools (twelve {@code trade-tools-*} frames, hello field {@code tradeTools};
+     * options-edge-processing docs/ta-books/catalog/TRADE-TOOLS-FRAME-CONTRACT.md). OFF by default. The producer's topic names are the keys of {@link #tradeToolsTopics()}.
      */
     public boolean tradeToolsEnabled() {
         return boolValue("GATEWAY_TRADE_TOOLS_ENABLED", false);
@@ -411,7 +411,7 @@ public final class GatewaySettings {
                 value("KAFKA_TT_FLOW_EVENTS_TOPIC", "futures.flow.events"));
     }
 
-    /** Phase E Elliott counts, Fibonacci, channels and cycles (frames {@code wave-cycle-waves}/{@code wave-cycle-cycles}, hello field {@code waves}); OFF by default. */
+    /** ELLIOTT-FIB-CYCLE-TOOLS Elliott counts, Fibonacci, channels and cycles (frames {@code wave-cycle-waves}/{@code wave-cycle-cycles}, hello field {@code waves}); OFF by default. */
     public boolean waveCycleEnabled() {
         return boolValue("GATEWAY_WAVE_CYCLE_ENABLED", false);
     }

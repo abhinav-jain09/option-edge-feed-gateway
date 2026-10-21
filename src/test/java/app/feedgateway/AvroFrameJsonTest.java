@@ -13,7 +13,7 @@ import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.junit.jupiter.api.Test;
 
-/** The rendering rules R1-R9 of W0-FRAME-EQUIVALENCE.md plus the contract rules of 05/06/07, one rule per test, on a crafted schema. */
+/** The rendering rules R1-R9 of MARKET-STRUCTURE-FRAME-EQUIVALENCE.md plus the contract rules of the GEOMETRY-/TRADE-TOOLS-/WAVES-FRAME-CONTRACT.md documents, one rule per test, on a crafted schema. */
 class AvroFrameJsonTest {
     private static final Schema SCHEMA = new Schema.Parser().parse("""
             {"type":"record","name":"R","namespace":"t","fields":[

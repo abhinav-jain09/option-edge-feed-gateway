@@ -9,7 +9,7 @@ import java.util.Map;
 import org.apache.avro.generic.GenericRecord;
 
 /**
- * Phase D trade-level tools (ta-books-catalog/06_TRADE_TOOLS_FRAME_CONTRACT.md): twelve display records of es-trade-tools-service, one frame
+ * TICK-TRADE-TOOLS trade-level tools (options-edge-processing docs/ta-books/catalog/TRADE-TOOLS-FRAME-CONTRACT.md): twelve display records of es-trade-tools-service, one frame
  * type each, dispatched on the WRITER schema's record name. The gateway checks the boundary only (record type for the topic, schema
  * version 1, a symbol, {@code validation == UNVALIDATED}, a horizon or width of 1m/5m/15m, size under 64 KiB, per-key ordering by
  * {@code asOfMs}); the page is the full validator. Records are keyed upserts. A column or event is routed to the timeframe of the retained

@@ -804,7 +804,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong marketStructurePatternsDrops = new AtomicLong();
     /** PATTERNS: sets refused because their asOfMs REGRESSED against what is retained for that timeframe. */
     private final AtomicLong marketStructurePatternsRegressions = new AtomicLong();
-    /** Phase A studies: the relay's retained bars and current states, validated and rendered at the gateway boundary. */
+    /** INDICATOR-STUDIES studies: the relay's retained bars and current states, validated and rendered at the gateway boundary. */
     private final StudiesRelay studies;
     /** The enabled technical-analysis chart relays (structure tools, geometry, trade tools, waves and cycles), in hello priority order. */
     private final List<TaRelay> taRelays;
@@ -2908,7 +2908,7 @@ public class FeedGatewayService implements ReplayRunner {
             bindChartTopic(topicEvents, settings.waveCycleCyclesTopic(), WaveCycleRelay.CYCLES_EVENT);
         }
         if (settings.studiesEnabled()) {
-            // Phase A studies: Avro, LIVE consumer only (the cache consumer has no case for them; the relay keeps its own
+            // INDICATOR-STUDIES studies: Avro, LIVE consumer only (the cache consumer has no case for them; the relay keeps its own
             // bounded history and last states and recovers them with a seek-back, see seekStudies).
             for (String barsTopic : settings.studiesBarsTopics()) {
                 requireUnbound(topicEvents, barsTopic);
@@ -12904,14 +12904,14 @@ public class FeedGatewayService implements ReplayRunner {
         return marketStructureRegressions.get();
     }
 
-    // ── Phase A studies: consumer glue (the data and the decisions live in StudiesRelay) ───────────────
+    // ── INDICATOR-STUDIES studies: consumer glue (the data and the decisions live in StudiesRelay) ───────────────
     static boolean isStudiesEvent(String event) {
         return StudiesRelay.BAR_EVENT.equals(event) || StudiesRelay.CURRENT_EVENT.equals(event);
     }
 
     private String studiesMetrics() {
         return settings.studiesEnabled()
-                ? "# HELP gateway_studies_enabled Whether the Phase A studies relay is enabled.\n"
+                ? "# HELP gateway_studies_enabled Whether the INDICATOR-STUDIES studies relay is enabled.\n"
                         + "# TYPE gateway_studies_enabled gauge\ngateway_studies_enabled 1\n" + studies.metrics()
                 : "";
     }
@@ -12998,7 +12998,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
-    // ── Phases B-E: technical-analysis chart relays (structure tools, geometry, trade tools, waves and cycles) ───────
+    // ── CHART-STRUCTURE-TOOLS to ELLIOTT-FIB-CYCLE-TOOLS: technical-analysis chart relays (structure tools, geometry, trade tools, waves and cycles) ───────
     // The consumer glue only: the data and the decisions live in the TaRelay implementations.
 
     /** The enabled relays in hello priority order: after the studies, the geometry, the tools, the waves, then the trade tools. */
@@ -13407,7 +13407,7 @@ public class FeedGatewayService implements ReplayRunner {
         // G-R6.2 mutation (which drops the footprint term from the line below) still applies verbatim.
         if (settings.marketStructureEnabled()) return true;
         if (settings.marketStructurePatternsEnabled()) return true;      // PATTERNS joins the hello too
-        if (settings.studiesEnabled()) return true;                      // so do the Phase A studies
+        if (settings.studiesEnabled()) return true;                      // so do the INDICATOR-STUDIES studies
         if (!taRelays.isEmpty()) return true;                            // and the structure tools, geometry, trade tools and waves
         return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || footprintViews != null;
     }
@@ -13461,7 +13461,7 @@ public class FeedGatewayService implements ReplayRunner {
             sb.append(",\"footprintStrike\":").append(footprintStrikeField);
         }
         if (settings.studiesEnabled()) {
-            // Phase A studies (03_STUDIES_FRAME_CONTRACT.md): the latest current state and the recent finalized bars per timeframe, SPX in
+            // INDICATOR-STUDIES studies (options-edge-processing docs/ta-books/catalog/STUDIES-FRAME-CONTRACT.md): the latest current state and the recent finalized bars per timeframe, SPX in
             // studies/studyBars and ES in esStudies/esStudyBars; the fields' presence = flag on. Appended after the fixed fields (the chart relay parts follow, see appendChartParts), with the bytes the rest of
             // the hello leaves, so the transmitted hello stays within the 1 MiB guard (see studiesHelloBudget for the exact rule).
             int budget = studiesHelloBudget(StudiesRelay.utf8Length(sb.toString()));
@@ -14723,9 +14723,9 @@ public class FeedGatewayService implements ReplayRunner {
             "status", "reset", "source-switching", "source-ready", "source-stale",
             // Candlestick pattern annotation sets (market-structure service): global, verbatim, flag-gated.
             "market-structure-patterns",
-            // Phase A study frames (indicator-service): global, per symbol, symbol-filtered client-side, flag-gated.
+            // INDICATOR-STUDIES study frames (indicator-service): global, per symbol, symbol-filtered client-side, flag-gated.
             StudiesRelay.BAR_EVENT, StudiesRelay.CURRENT_EVENT,
-            // Phase B-E chart frames (market-structure-service, es-trade-tools-service, wave-cycle-service): global, SPX/ES only, flag-gated.
+            // CHART-STRUCTURE-TOOLS .. ELLIOTT-FIB-CYCLE-TOOLS chart frames (market-structure-service, es-trade-tools-service, wave-cycle-service): global, SPX/ES only, flag-gated.
             TimeframeSetRelay.TOOLS_EVENT, TimeframeSetRelay.GEOMETRY_EVENT, WaveCycleRelay.WAVES_EVENT, WaveCycleRelay.CYCLES_EVENT,
             "trade-tools-pf-chart", "trade-tools-pf-column", "trade-tools-pf-break", "trade-tools-pf-line", "trade-tools-pf-count",
             "trade-tools-pf-macross", "trade-tools-pf-voldiv", "trade-tools-pf-mfdiv", "trade-tools-pf-volcheck", "trade-tools-volume-nodes",

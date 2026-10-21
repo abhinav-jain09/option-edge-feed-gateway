@@ -12,8 +12,8 @@ import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 
 /**
- * The Phase A studies relay (PHASE-A-INDICATORS-REQUIREMENT.md A-R10.1/A-R10.4; browser contract:
- * ta-books-catalog/03_STUDIES_FRAME_CONTRACT.md). Validates the two Avro record types at the gateway boundary, renders them
+ * The INDICATOR-STUDIES studies relay (INDICATOR-STUDIES-REQUIREMENT.md A-R10.1/A-R10.4; browser contract:
+ * options-edge-processing docs/ta-books/catalog/STUDIES-FRAME-CONTRACT.md). Validates the two Avro record types at the gateway boundary, renders them
  * once to the browser JSON (the Avro field names exactly), keeps a bounded recent history of finalized bars and the latest
  * current state per symbol for the hello, and tells the caller which frames to broadcast. No Kafka types: the service owns the
  * consumer, the recovery staging and the broadcast, this class owns the data and the decisions.
