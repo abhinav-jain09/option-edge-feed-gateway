@@ -28,7 +28,7 @@ import org.junit.jupiter.api.Test;
  * W0 acceptance (W0-FRAME-EQUIVALENCE.md FE-5): for every golden fixture the committed Avro datum, decoded under the schema file the
  * manifest names, renders to the committed frame BYTE FOR BYTE and by SHA-256; the same holds through the production wire path
  * (Confluent framing, a registry, {@link GatewayAvroDeserializer}); the hello and tombstone vectors hold through the retention paths.
- * The fixtures are a copy of market-structure-service/src/test/resources/avro-golden at processing commit 2e887bae2.
+ * The fixtures are a copy of market-structure-service/src/test/resources/avro-golden at processing commit 3447c51e9.
  */
 class W0GoldenFramesTest {
     private static final Path GOLDEN = Path.of("src", "test", "resources", "avro-golden");
@@ -163,15 +163,17 @@ class W0GoldenFramesTest {
                 }
                 assertTrue(p.cvdHelloJson().contains(fragment), vector);
             }
-            // The UNAVAILABLE member is retained and relayed like any other set. NOTE: the committed vector file puts this 15m set under the
-            // key "1m"; the gateway keys the hello by the set's own timeframe, so the member appears under "15m" (reported to the W0 owner).
+            // The UNAVAILABLE member is retained and relayed like any other set, under the key of its own timeframe (this set is 15m; the
+            // vector once put it under "1m", corrected in processing 3447c51e9).
             String unavailable = Files.readString(GOLDEN.resolve("patterns-set-unavailable.frame.json"));
             var u = new FeedGatewayService(new GatewaySettings(), JSON, new HpsfGatewayViewMapper(), null);
             var boundary = u.validateMarketStructurePatterns(unavailable);
             assertNotNull(boundary);
             assertTrue(u.retainMarketStructurePatterns(boundary.timeframe(), boundary.asOfMs(), unavailable));
             assertTrue(u.cvdHelloJson().contains(",\"patterns\":{\"1m\":null,\"5m\":null,\"15m\":" + unavailable + "}"));
-            assertTrue(Files.readString(GOLDEN.resolve("hello-patterns-unavailable-member.hello.json")).contains(unavailable));
+            assertEquals(",\"patterns\":{\"1m\":null,\"5m\":null,\"15m\":" + unavailable + "}", Files.readString(GOLDEN.resolve("hello-patterns-unavailable-member.hello.json")),
+                    "the committed vector is exactly the fragment the gateway builds");
+            assertTrue(u.cvdHelloJson().contains(Files.readString(GOLDEN.resolve("hello-patterns-unavailable-member.hello.json"))));
         } finally {
             System.clearProperty("GATEWAY_MARKET_STRUCTURE_ENABLED");
             System.clearProperty("GATEWAY_MARKET_STRUCTURE_PATTERNS_ENABLED");

@@ -199,8 +199,8 @@
   }, {
     "name" : "hello-patterns-unavailable-member",
     "file" : "hello-patterns-unavailable-member.hello.json",
-    "sha256" : "d7fb33c2dc04515a2832abea4032a037bbb39e028637d2b875494c95069011c9",
-    "note" : "an UNAVAILABLE set is retained and relayed like any other set"
+    "sha256" : "68f3f572fd3e1f15f07512e94d34623356ed9734bbcc643d81df564467dd6161",
+    "note" : "an UNAVAILABLE set is retained and relayed like any other set, under the key of its own timeframe (this set is 15m)"
   } ],
   "tombstones" : [ {
     "topic" : "options.spx.market-structure.ui",

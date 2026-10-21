@@ -1,1 +1,1 @@
-,"patterns":{"1m":{"schemaVersion":1,"service":"market-structure","state":"UNAVAILABLE","reason":"OVERSIZED","sessionDate":"2026-10-02","asOfMs":1790947860000,"timeframe":"15m"},"5m":null,"15m":null}
+,"patterns":{"1m":null,"5m":null,"15m":{"schemaVersion":1,"service":"market-structure","state":"UNAVAILABLE","reason":"OVERSIZED","sessionDate":"2026-10-02","asOfMs":1790947860000,"timeframe":"15m"}}
