@@ -29,7 +29,11 @@ final class MarketStructureAvro {
     }
 
     private static String frame(Object value, Set<String> records, int maxBytes) {
-        return value instanceof GenericRecord record && records.contains(record.getSchema().getFullName())
-                ? AvroFrameJson.render(record, maxBytes, true) : null;
+        if (!(value instanceof GenericRecord record) || !records.contains(record.getSchema().getFullName())) {
+            return null;
+        }
+        // render() bounds work by UTF-16 units (a lower bound of the UTF-8 size); the byte limit itself is enforced here, before retention
+        String frame = AvroFrameJson.render(record, maxBytes, true);
+        return frame != null && StudiesRelay.utf8Length(frame) <= maxBytes ? frame : null;
     }
 }

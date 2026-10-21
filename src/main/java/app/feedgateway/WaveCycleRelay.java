@@ -92,6 +92,8 @@ final class WaveCycleRelay extends TaRelay {
 
     @Override
     synchronized List<String[]> promote() {
+        // Only a record AFTER live promotes (an equal one never does): staged is a copy of live plus the history below the captured end offsets,
+        // so on an equal ordering key the live record is the later one in log order and stays.
         List<String[]> frames = new ArrayList<>(SLOTS);
         for (int slot = 0; staged != null && slot < SLOTS; slot++) {
             if (staged.json[slot] != null && live.after(slot, staged.epoch[slot], staged.seq[slot])) {

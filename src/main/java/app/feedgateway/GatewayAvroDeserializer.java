@@ -4,7 +4,6 @@ import com.optionsedge.contracts.hpsf.UnderlyingPriceAvro;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException;
 import java.nio.ByteBuffer;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -39,7 +38,12 @@ public final class GatewayAvroDeserializer implements Deserializer<Object> {
     private String replaySuffix;
     private Set<String> tolerant = Set.of();
     /** Schema id -> the time until which it is treated as unknown; touched by the consumer thread only. */
-    private final Map<Integer, Long> unknownIds = new HashMap<>();
+    private final Map<Integer, Long> unknownIds = new java.util.LinkedHashMap<>() {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Integer, Long> eldest) {
+            return size() > UNKNOWN_IDS_MAX;   // bounded: the oldest unknown id leaves, the others keep their backoff
+        }
+    };
 
     @Override
     public void configure(Map<String, ?> configs, boolean isKey) {
@@ -78,9 +82,6 @@ public final class GatewayAvroDeserializer implements Deserializer<Object> {
             if (e.getCause() instanceof RestClientException registry) {
                 if (registry.getStatus() != 404) {
                     throw e;   // the registry is failing, not the record: fail the poll and retry rather than lose data
-                }
-                if (unknownIds.size() >= UNKNOWN_IDS_MAX) {
-                    unknownIds.clear();
                 }
                 unknownIds.put(id, now + UNKNOWN_ID_BACKOFF_MS);
             }

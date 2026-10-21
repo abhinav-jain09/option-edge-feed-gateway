@@ -98,6 +98,8 @@ final class TimeframeSetRelay extends TaRelay {
 
     @Override
     synchronized List<String[]> promote() {
+        // STRICTLY newer only: staged starts as a copy of live and receives just the history below the captured end offsets, so on an equal
+        // clock the live record is the LATER one in log order and must stay; an equal-clock staged record would let an older entry replace it.
         List<String[]> frames = new ArrayList<>(TF.length);
         for (int t = 0; staged != null && t < TF.length; t++) {
             if (staged.json[t] != null && staged.asOf[t] > live.asOf[t]) {

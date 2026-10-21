@@ -20,6 +20,9 @@ final class TaFixtures {
 
     static Schema schema(String name) {
         try (InputStream in = TaFixtures.class.getResourceAsStream("/ta/" + name + ".avsc")) {
+            if (in == null) {
+                throw new IllegalStateException("test resource /ta/" + name + ".avsc is missing");
+            }
             return new Schema.Parser().parse(new String(in.readAllBytes(), StandardCharsets.UTF_8));
         } catch (IOException e) {
             throw new IllegalStateException(e);

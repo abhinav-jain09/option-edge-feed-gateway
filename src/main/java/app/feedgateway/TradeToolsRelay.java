@@ -296,6 +296,8 @@ final class TradeToolsRelay extends TaRelay {
 
     @Override
     synchronized List<String[]> promote() {
+        // Only a record AFTER live promotes (an equal one never does): staged is a copy of live plus the history below the captured end offsets,
+        // so on an equal ordering key the live record is the later one in log order and stays.
         List<String[]> frames = new ArrayList<>();
         if (staged != null) {
             for (int i = 0; i < staged.orphans.size(); i++) {
