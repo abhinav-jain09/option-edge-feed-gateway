@@ -592,6 +592,7 @@ class StudiesRelayTest {
         assertTrue(StudiesRelay.utf8Length(half) <= spare, "bytes " + StudiesRelay.utf8Length(half) + " of " + spare);
         assertTrue(half.length() < relay.helloFields().length(), "a smaller budget gives up history");
         assertTrue(relay.helloFields() == relay.helloFields(), "the full budget's rendering is cached again");
+        assertEquals(relay.helloFields(0), relay.helloFields(-5), "a negative budget is the floor too");
         String floor = relay.helloFields(0);
         JsonNode h = JSON.readTree("{\"hello\":1" + floor + "}");
         for (String f : List.of("studies", "esStudies")) {
@@ -610,5 +611,28 @@ class StudiesRelayTest {
         b.put("closesSeen", 987654321L);   // the deserializer reuses or mutates its object after the poll
         relay.promote(staged);
         assertEquals(104L, hello().get("studyBars").get("5m").get(0).get("closesSeen").asLong(), "the staged bar kept the values it was validated with");
+    }
+
+    @Test
+    void theApprovedWriterSchemasAreTheContractsFilesAndASameNamedOtherShapeIsRefused() throws Exception {
+        assertEquals(StudiesRelay.BAR_FINGERPRINT, org.apache.avro.SchemaNormalization.parsingFingerprint64(StudiesFixtures.BAR), "StudyBar.avsc changed: re-pin");
+        assertEquals(StudiesRelay.CURRENT_FINGERPRINT, org.apache.avro.SchemaNormalization.parsingFingerprint64(StudiesFixtures.CURRENT), "StudiesCurrent.avsc changed: re-pin");
+        // a record of the same full name with one extra field
+        org.apache.avro.Schema base = StudiesFixtures.BAR;
+        java.util.List<org.apache.avro.Schema.Field> fields = new java.util.ArrayList<>();
+        for (org.apache.avro.Schema.Field f : base.getFields()) {
+            fields.add(new org.apache.avro.Schema.Field(f.name(), f.schema(), f.doc(), (Object) null));
+        }
+        fields.add(new org.apache.avro.Schema.Field("extra", org.apache.avro.Schema.create(org.apache.avro.Schema.Type.STRING), null, (Object) null));
+        org.apache.avro.Schema altered = org.apache.avro.Schema.createRecord(base.getName(), null, base.getNamespace(), false, fields);
+        GenericRecord r = new org.apache.avro.generic.GenericData.Record(altered);
+        GenericRecord ok = bar("SPX", "T5M", 0);
+        for (org.apache.avro.Schema.Field f : base.getFields()) {
+            r.put(f.name(), ok.get(f.name()));
+        }
+        r.put("extra", "leak");
+        assertNull(live(r), "same name, other shape");
+        assertEquals(1L, relay.dropsForTest());
+        assertNotNull(live(ok));
     }
 }

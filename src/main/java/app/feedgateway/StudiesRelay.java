@@ -37,6 +37,29 @@ final class StudiesRelay {
     static final int MAX_DIVERGENCES = 64;
     static final int MAX_TIMEFRAMES = 12;
 
+    /**
+     * The writer schemas this relay forwards, pinned by their Avro parsing-form fingerprints (contracts 0.30.0 registry files
+     * StudyBar.avsc / StudiesCurrent.avsc; pinned in StudiesRelayTest against the byte-identical test copies). A record written under a
+     * schema of the same name but another shape is refused: the browser contract is exact, and the page rejects an altered field set.
+     */
+    static final long BAR_FINGERPRINT = 2213339975127789770L;
+    static final long CURRENT_FINGERPRINT = -2671074147627402471L;
+    private final java.util.IdentityHashMap<Schema, Boolean> approvedSchemas = new java.util.IdentityHashMap<>();
+
+    private boolean approvedSchema(Schema schema, long expected) {
+        synchronized (approvedSchemas) {
+            Boolean known = approvedSchemas.get(schema);
+            if (known == null) {
+                if (approvedSchemas.size() > 32) {
+                    approvedSchemas.clear();   // a bounded identity cache: a deserializer hands out one Schema object per writer id
+                }
+                known = org.apache.avro.SchemaNormalization.parsingFingerprint64(schema) == expected;
+                approvedSchemas.put(schema, known);
+            }
+            return known;
+        }
+    }
+
     private static final String BAR_SCHEMA = "com.optionsedge.contracts.indicators.avro.StudyBar";
     private static final String CURRENT_SCHEMA = "com.optionsedge.contracts.indicators.avro.StudiesCurrent";
     private static final String[] SYMBOLS = {"SPX", "ES"};
@@ -263,7 +286,7 @@ final class StudiesRelay {
         int t = indexOf(TF_ENUM, str(r, "timeframe"));
         String status = str(r, "status");
         String barId = str(r, "barId");
-        if (!BAR_SCHEMA.equals(schema.getFullName()) || s != topicSymbol || t < 0 || !"STUDIES_V1".equals(str(r, "methodVersion"))
+        if (!BAR_SCHEMA.equals(schema.getFullName()) || !approvedSchema(schema, BAR_FINGERPRINT) || s != topicSymbol || t < 0 || !"STUDIES_V1".equals(str(r, "methodVersion"))
                 || !Integer.valueOf(1).equals(r.get("schemaVersion")) || "EMPTY".equals(status) || barId.isEmpty()
                 || !(symbol + "|" + TF[t]).equals(String.valueOf(key)) || !withinBarBounds(r)) {
             drops.incrementAndGet();
@@ -337,7 +360,7 @@ final class StudiesRelay {
     private String applyCurrent(Store target, Object key, GenericRecord r, int topicSymbol) throws JsonProcessingException {
         String symbol = str(r, "symbol");
         int s = indexOf(SYMBOLS, symbol);
-        if (!CURRENT_SCHEMA.equals(r.getSchema().getFullName()) || s != topicSymbol || !symbol.equals(String.valueOf(key))
+        if (!CURRENT_SCHEMA.equals(r.getSchema().getFullName()) || !approvedSchema(r.getSchema(), CURRENT_FINGERPRINT) || s != topicSymbol || !symbol.equals(String.valueOf(key))
                 || !"STUDIES_V1".equals(str(r, "methodVersion")) || !Integer.valueOf(1).equals(r.get("schemaVersion"))) {
             drops.incrementAndGet();
             return null;
@@ -433,7 +456,7 @@ final class StudiesRelay {
      * field, so the transmitted hello (not only this fragment) stays within it. A smaller budget gives up history sooner.
      */
     synchronized String helloFields(int budgetBytes) {
-        int budget = Math.min(HELLO_MAX_BYTES, budgetBytes);
+        int budget = Math.max(0, Math.min(HELLO_MAX_BYTES, budgetBytes));
         if (helloCache == null || helloCacheVersion != live.version || helloCacheBudget != budget) {
             helloCache = buildHello(live, budget);
             helloCacheVersion = live.version;
@@ -473,8 +496,9 @@ final class StudiesRelay {
                     }
                 }
                 if (ws < 0) {
-                    // nothing left to give up: the bare skeleton (every entry null / empty) is the least this hello can carry; the flag
-                    // being on, the fields must be present. If even that exceeds the budget the OTHER fields already filled the hello.
+                    // nothing left to give up: the bare skeleton (every entry null / empty, about 300 bytes) is the least this hello can carry;
+                    // the flag being on, the fields must be present. The service's cap already leaves a 4 KiB margin below the 1 MiB guard,
+                    // which is what absorbs the skeleton when the OTHER fields alone fill the hello to the margin.
                     return render(new Store(), new int[st.bars.length], new boolean[SYMBOLS.length][TF.length]);
                 }
                 nulled[ws][wt] = true;
