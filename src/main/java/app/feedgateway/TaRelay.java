@@ -64,7 +64,7 @@ abstract class TaRelay {
     final String metrics() {
         String p = "gateway_" + name + "_";
         return "# HELP " + p + "enabled Whether the " + name + " relay is enabled.\n# TYPE " + p + "enabled gauge\n" + p + "enabled 1\n"
-                + "# HELP " + p + "accepted_total Records accepted at the gateway boundary and forwarded.\n# TYPE " + p + "accepted_total counter\n"
+                + "# HELP " + p + "accepted_total Records that passed the gateway boundary and were retained or forwarded (a record staged in a recovery read counts when it is staged, not when it is promoted).\n# TYPE " + p + "accepted_total counter\n"
                 + p + "accepted_total " + accepted.get() + "\n"
                 + "# HELP " + p + "drops_total Records refused at the gateway boundary (invalid, oversize, unknown record, tombstone).\n"
                 + "# TYPE " + p + "drops_total counter\n" + p + "drops_total " + drops.get() + "\n"

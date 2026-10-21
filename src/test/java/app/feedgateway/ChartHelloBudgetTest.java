@@ -84,6 +84,11 @@ class ChartHelloBudgetTest {
         fill(s, 8, 11_000, 190_000, 4, 50_000);
         long sumOfCaps = (StudiesRelay.HELLO_MAX_BYTES + 3 * TimeframeSetRelay.HELLO_PART_BYTES + TradeToolsRelay.HELLO_PART_BYTES) / 1024;
         assertEquals(2176, sumOfCaps - 0, "512 + 384 + 384 + 384 + 512 KiB of content before arbitration");
+        // before arbitration every chart part really holds at least half of its own cap (two of three 190 KB sets; four 50 KB flow bars x 3)
+        for (TaRelay relay : s.taRelaysForTest()) {
+            long own = StudiesRelay.utf8Length(relay.helloField(Long.MAX_VALUE));
+            assertTrue(own > TimeframeSetRelay.HELLO_PART_BYTES / 2 && own <= TradeToolsRelay.HELLO_PART_BYTES, relay.getClass().getSimpleName() + " holds " + own + " bytes of its own cap");
+        }
         String hello = s.cvdHelloJson();
         assertTrue(bytes(hello) <= FeedGatewayService.HELLO_FRAME_HARD_BYTES, "the hello is " + bytes(hello) + " bytes");
         JsonNode node = JSON.readTree(hello);
