@@ -73,7 +73,11 @@ final class TradeToolsRelay extends TaRelay {
             }
             held.put(h.key(), h);
             if (held.size() > cap) {
-                held.remove(held.values().stream().min(BY_ORDER).orElseThrow().key());
+                Held evicted = held.values().stream().min(BY_ORDER).orElseThrow();
+                held.remove(evicted.key());
+                if (evicted == h) {
+                    return 0;   // outranked by everything retained: not kept, so not forwarded either (a retained record that was replaced stays replaced)
+                }
             }
             return old == null || h.asOf() > old.asOf() ? 2 : 1;
         }
@@ -194,7 +198,11 @@ final class TradeToolsRelay extends TaRelay {
                         old = null;
                     }
                     if (old == null && charts[h.tf()].size() == CHARTS_PER_TF) {
-                        removeChart(charts[h.tf()].values().stream().min(Comparator.comparingLong(Held::asOf)).orElseThrow().key());
+                        Held oldest = charts[h.tf()].values().stream().min(Comparator.comparingLong(Held::asOf)).orElseThrow();
+                        if (h.asOf() < oldest.asOf()) {
+                            return 0;   // a delayed chart older than every retained one never evicts a newer chart
+                        }
+                        removeChart(oldest.key());
                     }
                     if (old != null && !old.epoch().equals(h.epoch())) {
                         columns.remove(h.key());   // a new contract epoch starts the chart's columns afresh

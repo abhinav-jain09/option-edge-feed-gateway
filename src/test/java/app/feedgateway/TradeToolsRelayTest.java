@@ -190,6 +190,25 @@ class TradeToolsRelayTest {
     }
 
     @Test
+    void aDelayedRecordThatWouldBeEvictedAtOnceIsRefusedNotForwarded() throws Exception {
+        var relay = new TradeToolsRelay();
+        for (int i = 0; i < TradeToolsRelay.FLOW_BARS; i++) {
+            relay.onLive(FLOW, TaFixtures.flowBar("M1", 60_000L * (100 + i), 10 + i));
+        }
+        // a new bar that is newer to the gateway (asOfMs) but OLDER than every retained bar: it would be evicted on arrival
+        assertNull(relay.onLive(FLOW, TaFixtures.flowBar("M1", 60_000L, 500)), "not retained, so not broadcast");
+        assertEquals(TradeToolsRelay.FLOW_BARS, bundles(relay, 1 << 20).get("1m").get("flowBars").size());
+        assertEquals(6_000_000L, bundles(relay, 1 << 20).get("1m").get("flowBars").get(0).get("barStartMs").asLong(), "the oldest retained bar is untouched");
+        // a delayed chart older than all four retained ones does not evict a newer chart
+        for (int i = 1; i <= 4; i++) {
+            relay.onLive(CHART, TaFixtures.chart("c" + i, "M1", 10 + i));
+        }
+        assertNull(relay.onLive(CHART, TaFixtures.chart("late", "M1", 1)));
+        JsonNode charts = bundles(relay, 1 << 20).get("1m").get("pfCharts");
+        assertEquals(List.of("c1", "c2", "c3", "c4"), java.util.stream.StreamSupport.stream(charts.spliterator(), false).map(n -> n.get("chartId").asText()).toList());
+    }
+
+    @Test
     void aFifthChartEvictsTheOldestWithItsColumnsAndAFifthNodeSetEvictsTheOldest() throws Exception {
         var relay = new TradeToolsRelay();
         for (int i = 1; i <= 4; i++) {

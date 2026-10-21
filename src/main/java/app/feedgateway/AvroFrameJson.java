@@ -52,12 +52,12 @@ final class AvroFrameJson {
                 g.writeStartObject();
                 for (Schema.Field f : s.getFields()) {
                     Object x = r.get(f.pos());
-                    if (x == null && f.getObjectProp("jsonOmitNull") != null) {
+                    if (x == null && Boolean.TRUE.equals(f.getObjectProp("jsonOmitNull"))) {
                         continue;
                     }
                     String name = f.getProp("jsonName");
                     g.writeFieldName(name == null ? f.name() : name);
-                    if (f.getObjectProp("jsonKeyed") != null) {
+                    if (Boolean.TRUE.equals(f.getObjectProp("jsonKeyed"))) {
                         writeKeyed(g, f.schema().getElementType(), (java.util.List<?>) x, rejectUnknown);
                     } else {
                         write(g, f.schema(), x, rejectUnknown);
