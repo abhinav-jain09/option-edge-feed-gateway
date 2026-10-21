@@ -199,6 +199,21 @@ class TradeToolsRelayTest {
     }
 
     @Test
+    void columnsLeaveByTheirLowestIndexEvenWhenAnOldOneWasRepublished() throws Exception {
+        var relay = new TradeToolsRelay();
+        relay.onLive(CHART, TaFixtures.chart("c", "M1", 1));
+        for (int i = 0; i < TradeToolsRelay.COLUMNS_PER_CHART; i++) {
+            relay.onLive(COLUMN, TaFixtures.column("c", 100 + i, 10 + i));
+        }
+        relay.onLive(COLUMN, TaFixtures.column("c", 100, 500));   // the oldest column republished: newest by asOfMs, still the lowest index
+        relay.onLive(COLUMN, TaFixtures.column("c", 100 + TradeToolsRelay.COLUMNS_PER_CHART, 501));
+        JsonNode cols = bundles(relay, 1 << 20).get("1m").get("pfColumns");
+        assertEquals(TradeToolsRelay.COLUMNS_PER_CHART, cols.size());
+        assertEquals(101, cols.get(0).get("columnIndex").asInt(), "index 100 left, 101 stays: the retained history is contiguous");
+        assertEquals(100 + TradeToolsRelay.COLUMNS_PER_CHART, cols.get(cols.size() - 1).get("columnIndex").asInt());
+    }
+
+    @Test
     void aDelayedRecordThatWouldBeEvictedAtOnceIsRefusedNotForwarded() throws Exception {
         var relay = new TradeToolsRelay();
         for (int i = 0; i < TradeToolsRelay.FLOW_BARS; i++) {

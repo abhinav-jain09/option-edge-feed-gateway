@@ -106,6 +106,8 @@ final class TradeToolsRelay extends TaRelay {
         final Series nodes = new Series(NODES);
         /** Only a recovery staging copy holds orphans. */
         final List<Held> orphans;
+        /** Orphans that found their chart but not a home (another contract epoch): counted as drops when the staging is promoted. */
+        int refusedOrphans;
         long version;
 
         Store(boolean staging) {
@@ -235,7 +237,9 @@ final class TradeToolsRelay extends TaRelay {
                 Held o = it.next();
                 if (o.chartId().equals(chartId)) {
                     it.remove();
-                    insert(o);
+                    if (insert(o) < 0) {
+                        refusedOrphans++;   // still no home (another contract epoch than its chart): the relay counts it at promotion, never silent
+                    }
                 }
             }
         }
@@ -311,8 +315,8 @@ final class TradeToolsRelay extends TaRelay {
         // so on an equal ordering key the live record is the later one in log order and stays.
         List<String[]> frames = new ArrayList<>();
         if (staged != null) {
-            for (int i = 0; i < staged.orphans.size(); i++) {
-                onDrop();   // the chart never arrived within the recovery read
+            for (int i = 0; i < staged.orphans.size() + staged.refusedOrphans; i++) {
+                onDrop();   // the chart never arrived within the recovery read, or arrived under another contract epoch
             }
             for (Held h : staged.all()) {
                 if (live.insert(h) == 2) {
@@ -441,7 +445,7 @@ final class TradeToolsRelay extends TaRelay {
             return switch (kind) {
                 case 0 -> new Held(kind, tf, r.get("chartId").toString(), null, epoch, json, bytes, asOf, asOf, asOf);
                 case 1 -> new Held(kind, -1, r.get("chartId") + "|" + epoch + "|" + r.get("columnIndex"), r.get("chartId").toString(), epoch,
-                        json, bytes, asOf, asOf, (Long) r.get("columnIndex"));
+                        json, bytes, asOf, (Long) r.get("columnIndex"), (Long) r.get("columnIndex"));   // retention order = the column index: the lowest index leaves first, however recently it was republished
                 case 9 -> new Held(kind, -1, r.get("scope") + "|" + r.get("windowSessions"), null, epoch, json, bytes, asOf, asOf,
                         ("GLOBEX".equals(r.get("scope").toString()) ? 0L : 1L) * 1_000_000L + (Integer) r.get("windowSessions"));
                 case 10 -> new Held(kind, tf, r.get("width") + "|" + epoch + "|" + r.get("barStartMs"), null, epoch, json, bytes, asOf,
