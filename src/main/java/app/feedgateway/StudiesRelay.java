@@ -204,9 +204,20 @@ final class StudiesRelay {
     private final AtomicLong regressions = new AtomicLong();
     private final AtomicLong duplicates = new AtomicLong();
     private Store live = new Store();
-    private String helloCache;
-    private long helloCacheVersion;
-    private int helloCacheBudget;
+    /**
+     * The hello fragment cache, valid for one retained-state version: the FULL rendering (the common case: any budget that holds it gets
+     * this one string) and, for tighter budgets, a few renderings keyed by budget (a small LRU). A different non-study prefix therefore
+     * never forces a rebuild unless it squeezes the studies.
+     */
+    private String helloFull;
+    private int helloFullBytes;
+    private long helloCacheVersion = -1;
+    private final java.util.LinkedHashMap<Integer, String> helloByBudget = new java.util.LinkedHashMap<>(8, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(java.util.Map.Entry<Integer, String> eldest) {
+            return size() > 4;
+        }
+    };
 
     StudiesRelay(ObjectMapper mapper) {
         this.mapper = mapper;
@@ -515,12 +526,16 @@ final class StudiesRelay {
      */
     synchronized String helloFields(int budgetBytes) {
         int budget = Math.max(0, Math.min(HELLO_MAX_BYTES, budgetBytes));
-        if (helloCache == null || helloCacheVersion != live.version || helloCacheBudget != budget) {
-            helloCache = buildHello(live, budget);
+        if (helloFull == null || helloCacheVersion != live.version) {
+            helloFull = buildHello(live, HELLO_MAX_BYTES);
+            helloFullBytes = utf8Length(helloFull);
             helloCacheVersion = live.version;
-            helloCacheBudget = budget;
+            helloByBudget.clear();
         }
-        return helloCache;
+        if (helloFullBytes <= budget) {
+            return helloFull;   // the whole retained state fits: one string for every caller with room
+        }
+        return helloByBudget.computeIfAbsent(budget, b -> buildHello(live, b));
     }
 
     /**

@@ -699,4 +699,24 @@ class StudiesRelayTest {
         assertEquals(1, bars.size());
         assertEquals(3L, minute(bars.get(0)), "only the honest bar survives");
     }
+
+    @Test
+    void differentPrefixBudgetsShareOneCachedStringWhenTheWholeStateFitsAndTightOnesAreCachedPerBudget() throws Exception {
+        for (String tf : List.of("T1M", "T5M", "T15M")) {
+            for (int i = 0; i < 4; i++) {
+                live(bar("SPX", tf, i));
+            }
+        }
+        relay.onLive(StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1), false);
+        String a = relay.helloFields(900_000);
+        String b = relay.helloFields(700_000);
+        String c = relay.helloFields(StudiesRelay.HELLO_MAX_BYTES);
+        assertTrue(a == b && b == c, "every caller with room gets the same cached string, whatever its prefix");
+        int full = StudiesRelay.utf8Length(a);
+        String tight1 = relay.helloFields(full / 2);
+        String tight2 = relay.helloFields(full / 3);
+        assertTrue(tight1 == relay.helloFields(full / 2) && tight2 == relay.helloFields(full / 3), "tight budgets are cached per budget");
+        live(bar("SPX", "T5M", 9));
+        assertFalse(a == relay.helloFields(900_000), "a state change rebuilds");
+    }
 }
