@@ -100,9 +100,9 @@ class TaRelaysWiringTest {
     void theTopicsAreBoundOnTheAvroLiveConsumerOnlyBehindTheirFlags() throws Exception {
         String src = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         int avro = src.indexOf("private void runAvroLiveConsumer()");
-        int avroEnd = src.indexOf("\n    }\n", avro);
+        int avroEnd = methodEnd(src, avro);
         int json = src.indexOf("private void runJsonStateLiveConsumer()");
-        int jsonEnd = src.indexOf("\n    }\n", json);
+        int jsonEnd = methodEnd(src, json);
         for (String binding : List.of("settings.structureToolsEnabled()", "settings.geometryEnabled()", "settings.tradeToolsEnabled()", "settings.waveCycleEnabled()",
                 "settings.marketStructureEnabled()", "settings.marketStructurePatternsEnabled()")) {
             int at = src.indexOf("if (" + binding + ") {", avro);
@@ -110,5 +110,29 @@ class TaRelaysWiringTest {
             assertFalse(src.substring(json, jsonEnd).contains(binding), binding + " is not bound on the JSON state consumer: the converted topics are Avro only");
         }
         assertTrue(src.indexOf("properties.put(GatewayAvroDeserializer.TOLERANT_TOPICS", 0) > 0, "the converted and chart topics never fail the poll");
+    }
+
+    /** The index of the brace that closes the method whose signature starts at {@code from} (string and char literals and comments are skipped). */
+    private static int methodEnd(String src, int from) {
+        int i = src.indexOf('{', from), depth = 0;
+        for (; i < src.length(); i++) {
+            char c = src.charAt(i);
+            if (c == '"' || c == '\'') {
+                for (i++; src.charAt(i) != c; i++) {
+                    if (src.charAt(i) == '\\') {
+                        i++;
+                    }
+                }
+            } else if (c == '/' && src.charAt(i + 1) == '/') {
+                i = src.indexOf('\n', i);
+            } else if (c == '/' && src.charAt(i + 1) == '*') {
+                i = src.indexOf("*/", i) + 1;
+            } else if (c == '{') {
+                depth++;
+            } else if (c == '}' && --depth == 0) {
+                return i;
+            }
+        }
+        throw new IllegalStateException("unbalanced braces");
     }
 }
