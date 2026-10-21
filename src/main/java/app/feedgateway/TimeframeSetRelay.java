@@ -5,8 +5,8 @@ import java.util.List;
 import org.apache.avro.generic.GenericRecord;
 
 /**
- * The latest record per timeframe (1m, 5m, 15m) of one stream: the Phase B structure tools and the Phase C geometry
- * (ta-books-catalog/05_GEOMETRY_FRAME_CONTRACT.md). The gateway checks only the boundary (record type, schema version, service, state,
+ * The latest record per timeframe (1m, 5m, 15m) of one stream: the CHART-STRUCTURE-TOOLS structure tools and the CLASSICAL-CHART-PATTERNS geometry
+ * (options-edge-processing docs/ta-books/catalog/GEOMETRY-FRAME-CONTRACT.md). The gateway checks only the boundary (record type, schema version, service, state,
  * timeframe, size); the page is the full validator. Per timeframe the set with the greatest {@code asOfMs} is retained, a smaller one
  * is a counted regression and an equal one replaces. The hello carries the retained sets whole, in the order 1m, 5m, 15m, while they
  * fit the part budget and {@code null} for the rest: a set is never truncated or thinned.

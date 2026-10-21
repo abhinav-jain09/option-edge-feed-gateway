@@ -25,7 +25,7 @@ import org.apache.avro.io.DecoderFactory;
 import org.junit.jupiter.api.Test;
 
 /**
- * W0 acceptance (W0-FRAME-EQUIVALENCE.md FE-5): for every golden fixture the committed Avro datum, decoded under the schema file the
+ * W0 acceptance (MARKET-STRUCTURE-FRAME-EQUIVALENCE.md FE-5): for every golden fixture the committed Avro datum, decoded under the schema file the
  * manifest names, renders to the committed frame BYTE FOR BYTE and by SHA-256; the same holds through the production wire path
  * (Confluent framing, a registry, {@link GatewayAvroDeserializer}); the hello and tombstone vectors hold through the retention paths.
  * The fixtures are a copy of market-structure-service/src/test/resources/avro-golden at processing commit 3447c51e9.

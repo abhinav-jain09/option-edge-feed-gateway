@@ -4,7 +4,7 @@ import java.util.Set;
 import org.apache.avro.generic.GenericRecord;
 
 /**
- * W0 (ta-books-catalog W0-FRAME-EQUIVALENCE.md FE-1/FE-2): the market-structure {@code ui} and {@code patterns} topics are Confluent Avro.
+ * W0 (options-edge-processing docs/ta-books/MARKET-STRUCTURE-FRAME-EQUIVALENCE.md FE-1/FE-2): the market-structure {@code ui} and {@code patterns} topics are Confluent Avro.
  * A decoded value is accepted only as one of the two records of its topic and is rendered by {@link AvroFrameJson} to the exact text the
  * JSON producer used to write, which then flows through the unchanged validation, retention, recovery and hello paths. Anything else (a
  * tombstone, an undecodable value, another record, an {@code UNKNOWN} enum symbol, an oversize frame) yields null: counted by the caller,

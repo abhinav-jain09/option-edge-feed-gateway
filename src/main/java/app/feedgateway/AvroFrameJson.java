@@ -15,8 +15,8 @@ import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 
 /**
- * The browser frame of a decoded Avro record, by the rules of ta-books-catalog/W0-FRAME-EQUIVALENCE.md section 2 (R1-R9; reference
- * renderer {@code FrameJson} of market-structure-service) and of the geometry, trade-tool and wave frame contracts (05/06/07 section 1):
+ * The browser frame of a decoded Avro record, by the rules of options-edge-processing docs/ta-books/MARKET-STRUCTURE-FRAME-EQUIVALENCE.md section 2 (R1-R9; reference
+ * renderer {@code FrameJson} of market-structure-service) and of the geometry, trade-tool and wave frame contracts (GEOMETRY-/TRADE-TOOLS-/WAVES-FRAME-CONTRACT.md section 1):
  * fields in schema order under their {@code jsonName}, a {@code jsonOmitNull} field omitted when null, a {@code jsonKeyed} array of
  * {@code {key, value}} entries as one object, an enum as its symbol, int and long as JSON integers, a decimal as a plain number at the
  * schema's scale, a union as {@code null} or its bare value, a map as an object (keys sorted: the bytes are a function of the record),

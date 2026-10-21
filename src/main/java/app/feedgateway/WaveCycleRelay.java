@@ -5,7 +5,7 @@ import java.util.List;
 import org.apache.avro.generic.GenericRecord;
 
 /**
- * Phase E Elliott counts, Fibonacci price and time, channels and cycle bands (ta-books-catalog/07_WAVES_FRAME_CONTRACT.md): the
+ * ELLIOTT-FIB-CYCLE-TOOLS Elliott counts, Fibonacci price and time, channels and cycle bands (options-edge-processing docs/ta-books/catalog/WAVES-FRAME-CONTRACT.md): the
  * {@code WaveSet} and the {@code CycleSet} of the timeframes 1m, 5m and 15m (H1, D1 and W1 are dropped and counted, so seasonality and
  * the daily cycle tables never reach the page). Each type is retained independently per timeframe by {@code (env.epoch, env.seq)},
  * lexicographically: a smaller pair is a counted regression, an equal pair replaces ({@code asOfMs} is NOT the order: the single

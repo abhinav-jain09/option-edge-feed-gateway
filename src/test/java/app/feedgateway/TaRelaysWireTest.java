@@ -15,7 +15,7 @@ import org.apache.avro.generic.GenericRecord;
 import org.junit.jupiter.api.Test;
 
 /**
- * The production wire path for every displayed record of Phases B to E: Confluent framing, a registry, {@link GatewayAvroDeserializer}
+ * The production wire path for every displayed record of CHART-STRUCTURE-TOOLS to ELLIOTT-FIB-CYCLE-TOOLS: Confluent framing, a registry, {@link GatewayAvroDeserializer}
  * (Utf8 strings, generic enum symbols, generic arrays and maps), then the relay: the frame is the rendering of the record that was
  * written, so decoding changes nothing the browser sees.
  */

@@ -97,7 +97,7 @@ final class TaFixtures {
         return r;
     }
 
-    // ── Phase B / C ────────────────────────────────────────────────────────────────────────────
+    // ── CHART-STRUCTURE-TOOLS / CLASSICAL-CHART-PATTERNS ────────────────────────────────────────────────────────────────────────────
 
     static GenericRecord tools(String timeframe, long asOfMs, String state) {
         GenericRecord r = minimal(schema("StructureToolsSet"));
@@ -131,7 +131,7 @@ final class TaFixtures {
         return r;
     }
 
-    // ── Phase D ────────────────────────────────────────────────────────────────────────────────
+    // ── TICK-TRADE-TOOLS ────────────────────────────────────────────────────────────────────────────────
 
     private static GenericRecord header(String record, long asOfMs) {
         GenericRecord r = minimal(schema(record));
@@ -188,7 +188,7 @@ final class TaFixtures {
         return r;
     }
 
-    // ── Phase E ────────────────────────────────────────────────────────────────────────────────
+    // ── ELLIOTT-FIB-CYCLE-TOOLS ────────────────────────────────────────────────────────────────────────────────
 
     static GenericRecord waveSet(String timeframe, int epoch, long seq, String state) {
         return envelope(schema("WaveSet"), timeframe, epoch, seq, state);
