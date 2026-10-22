@@ -493,12 +493,12 @@ class TradeToolsRelayTest {
         assertTrue(ev.get("reconComparedBars").isNull(), "an absent optional is JSON null, never omitted, never a tagged union");
     }
 
-    /** The contract's full retained depth for one timeframe: 2 charts, 24 columns each, 10 events of each of the 7 kinds, 32 bars, 8 climax, 4 node sets. */
-    private static TradeToolsRelay fullDepth(boolean calibrated, String... horizons) {
+    /** The contract's retained depth for one timeframe with {@code charts} charts (the contract allows 4; a real day has 1-2):  24 columns each, 10 events of each of the 7 kinds, 32 bars, 8 climax, 4 node sets. */
+    private static TradeToolsRelay fullDepth(boolean calibrated, int charts, String... horizons) {
         var relay = new TradeToolsRelay();
         String[] kinds = {"PfBreakEvent", "PfLineEvent", "PfCountEvent", "PfMaCrossEvent", "PfVolumeDivergenceEvent", "PfMoneyFlowDivergenceEvent", "PfBreakVolumeCheck"};
         for (String h : horizons.length == 0 ? new String[] {"M1", "M5", "M15"} : horizons) {
-            for (int c = 0; c < 2; c++) {
+            for (int c = 0; c < charts; c++) {
                 String id = "c" + h + c;
                 relay.onLive(CHART, pad(TaFixtures.chart(id, h, 1 + c), calibrated));
                 for (int i = 0; i < 24; i++) {
@@ -536,17 +536,34 @@ class TradeToolsRelayTest {
     }
 
     @Test
+    void atTheContractsMaximumDepthOfFourChartsOnlyTheOneMinuteBundleFitsThePartCapAndNothingIsThinned() throws Exception {
+        assertEquals(4, TradeToolsRelay.CHARTS_PER_TF);
+        var worst = fullDepth(true, TradeToolsRelay.CHARTS_PER_TF);
+        JsonNode fitted = bundles(worst, TradeToolsRelay.HELLO_PART_BYTES);
+        String[] horizon = {"M1", "M5", "M15"};
+        JsonNode oneMinute = bundles(fullDepth(true, TradeToolsRelay.CHARTS_PER_TF, horizon[0]), Long.MAX_VALUE).get("1m");
+        long bytes = StudiesRelay.utf8Length(oneMinute.toString());
+        assertTrue(bytes > TradeToolsRelay.HELLO_PART_BYTES / 2 && bytes <= TradeToolsRelay.HELLO_PART_BYTES, "4 charts x 24 columns, 70 events, 32 bars, 8 climax, 4 nodes with evidence at its caps: " + bytes + " bytes");
+        assertEquals(oneMinute, fitted.get("1m"), "whole, as retained");
+        assertTrue(fitted.get("5m").isNull() && fitted.get("15m").isNull(), "two such bundles do not fit 512 KiB: whole or null, never thinned");
+        assertTrue(StudiesRelay.utf8Length(worst.helloField(TradeToolsRelay.HELLO_PART_BYTES)) <= TradeToolsRelay.HELLO_PART_BYTES + 64);
+        // the same depth without evidence (the pre-revision-21 shape) is smaller by the evidence
+        long without = StudiesRelay.utf8Length(bundles(fullDepth(false, TradeToolsRelay.CHARTS_PER_TF, horizon[0]), Long.MAX_VALUE).get("1m").toString());
+        assertTrue(bytes > without * 1.2, "evidence grew the bundle from " + without + " to " + bytes);
+    }
+
+    @Test
     void evidenceAtItsCapsGrowsARecordByUnderOneKiBAndTheFullDepthBundlesStillSendWholeTimeframesInOrderUnderTheCap() throws Exception {
         org.apache.avro.generic.GenericRecord bare = pad(TaFixtures.flowBar("M1", 60_000, 1), false);
         org.apache.avro.generic.GenericRecord full = pad(TaFixtures.flowBar("M1", 60_000, 1), true);
         int grow = StudiesRelay.utf8Length(new TradeToolsRelay().onLive(FLOW, full)[1]) - StudiesRelay.utf8Length(new TradeToolsRelay().onLive(FLOW, bare)[1]);
         assertTrue(grow > 400 && grow < 1024, "the JSON growth of a record is " + grow + " bytes");
-        var after = fullDepth(true);
+        var after = fullDepth(true, 2);
         String[] horizon = {"M1", "M5", "M15"};
         JsonNode a = JSON.createObjectNode();
         for (int i = 0; i < 3; i++) {   // each timeframe alone, so the part cap does not hide its size
             String tf = List.of("1m", "5m", "15m").get(i);
-            JsonNode b = bundles(fullDepth(false, horizon[i]), Long.MAX_VALUE).get(tf), n = bundles(fullDepth(true, horizon[i]), Long.MAX_VALUE).get(tf);
+            JsonNode b = bundles(fullDepth(false, 2, horizon[i]), Long.MAX_VALUE).get(tf), n = bundles(fullDepth(true, 2, horizon[i]), Long.MAX_VALUE).get(tf);
             ((com.fasterxml.jackson.databind.node.ObjectNode) a).set(tf, n);
             int was = StudiesRelay.utf8Length(b.toString()), now = StudiesRelay.utf8Length(n.toString());
             assertTrue(now > was * 1.2 && now < was * 2.5, tf + " grew from " + was + " to " + now + " bytes with the evidence");
