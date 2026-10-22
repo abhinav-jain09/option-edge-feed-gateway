@@ -4,7 +4,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * What the four technical-analysis chart relays (structure tools, geometry, trade tools, waves and cycles) share with the service: the
+ * What the technical-analysis chart relays (structure tools, geometry, trade tools, waves and cycles, break classification) share with the service: the
  * Kafka glue lives in {@link FeedGatewayService}, the data and the decisions live in the relay. A relay validates a decoded Avro record
  * at the gateway boundary, renders it once to the browser JSON, keeps a bounded retained state for the hello, tells the caller which
  * frame to broadcast, and recovers its state from a seek-back through a private staging copy that becomes visible in one promotion.
@@ -66,7 +66,7 @@ abstract class TaRelay {
         regressions.incrementAndGet();
     }
 
-    final String metrics() {
+    String metrics() {
         String p = "gateway_" + name + "_";
         return "# HELP " + p + "enabled Whether the " + name + " relay is enabled.\n# TYPE " + p + "enabled gauge\n" + p + "enabled 1\n"
                 + "# HELP " + p + "accepted_total Records that passed the gateway boundary and were retained or forwarded (a record staged in a recovery read counts when it is staged, not when it is promoted).\n# TYPE " + p + "accepted_total counter\n"

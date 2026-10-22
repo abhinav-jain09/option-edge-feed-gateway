@@ -41,7 +41,7 @@ class ChartHelloBudgetTest {
     }
 
     /** Fills every part; {@code perSet} is the size of one tools / geometry set, one wave record and one trade-tools flow bar (all in characters). */
-    private static void fill(FeedGatewayService s, int studiesBars, int studiesBarChars, int perSet, int flowBars, int flowBarChars) {
+    static void fill(FeedGatewayService s, int studiesBars, int studiesBarChars, int perSet, int flowBars, int flowBarChars) {
         for (String symbol : new String[] {"SPX", "ES"}) {
             for (String tf : new String[] {"T1M", "T5M", "T15M"}) {
                 for (int i = 0; i < studiesBars; i++) {
