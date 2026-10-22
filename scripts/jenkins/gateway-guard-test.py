@@ -450,7 +450,7 @@ def main() -> int:
 
     # ---- the Jib image is the Dockerfile's image: read both files and compare what the runtime sees ----
     import re
-    dockerfile = [l.strip() for l in read("Dockerfile").splitlines() if l.strip()]
+    dockerfile = [l.strip() for l in read("Dockerfile").splitlines() if l.strip() and not l.strip().startswith("#")]
     pom = read("ci/jib-image/pom.xml")
     base = re.search(r"<from><image>([^<]+)</image></from>", pom).group(1)
     entry = re.search(r"<entrypoint>(.*?)</entrypoint>", pom, re.S).group(1)
@@ -463,8 +463,10 @@ def main() -> int:
     check("Jib image == Dockerfile: the jar lands at /app/app.jar (staged under app/, extra-directory root is /)",
           "COPY target/options-edge-feed-gateway-*.jar /app/app.jar" in dockerfile and "/app/app.jar" in jib_entry
           and ".jenkins-tmp/jib-options-edge-feed-gateway/app/app.jar" in jf, str(dockerfile))
-    check("Jib image == Dockerfile: the Dockerfile declares no ENV, EXPOSE, USER or ARG that Jib would have to reproduce",
-          not any(l.split()[0] in ("ENV", "EXPOSE", "USER", "ARG", "LABEL", "VOLUME", "HEALTHCHECK", "CMD") for l in dockerfile), str(dockerfile))
+    # EXACT grammar: the Dockerfile is these four instructions and nothing else (any added RUN/ADD/COPY/ENV/EXPOSE/USER/... fails here
+    # until the Jib recipe is taught to reproduce it)
+    check("Jib image == Dockerfile: the Dockerfile is exactly FROM, WORKDIR, one jar COPY and the ENTRYPOINT (no other instruction, no continuation)",
+          [l.split()[0] for l in dockerfile] == ["FROM", "WORKDIR", "COPY", "ENTRYPOINT"] and not any(l.endswith("\\") for l in dockerfile), str(dockerfile))
     check("Jib: the pom checks the staged jar's sha256 before Jib reads it (enforcer requireFileChecksum, validate phase, fail=true)",
           "<requireFileChecksum>" in pom and "<type>sha256</type>" in pom and "<phase>validate</phase>" in pom and "<fail>true</fail>" in pom
           and "${jib.jar.sha256}" in pom and "<requireProperty><property>jib.jar.sha256</property>" in pom, pom)
