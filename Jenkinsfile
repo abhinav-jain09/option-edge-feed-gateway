@@ -341,15 +341,7 @@ pipeline {
         // its environment, because the build is a DEDICATED step whose whole body is the one docker command.
         sh '''
           set -eu
-          # Preflight: this stage may run on a builder whose Docker is not always up (the .74
-          # agents use Docker Desktop, which needs a GUI session and does not survive reboot).
-          # Fail here with something actionable rather than obscurely mid-buildx.
           # All environments build here on the resolved CI agent, including production.
-          if ! docker info >/dev/null 2>&1; then
-            echo "Docker daemon is not reachable on this build agent ($(hostname))." >&2
-            echo "If this is the .74 builder, start Docker Desktop on it and re-run." >&2
-            exit 1
-          fi
           # <build-number>-<git-sha>: unique per run (git-sha alone repeats across rebuilds of
           # one commit); :dev (DEV_TAG) pushed alongside. Deploy pins by digest of :dev.
           # Clean replace: prod publishes ONLY :prod, NOT :dev — the deploy resolves :prod, so
@@ -387,21 +379,11 @@ pipeline {
           BUILDER_NAME="options-edge-feed-gateway-${BUILD_NUMBER:-local}"
           mkdir -p .jenkins-tmp
           BUILDKITD_CONFIG=".jenkins-tmp/buildkitd-$BUILD_ID.toml"
-          # A failure below removes what this step created; on success the builder and its config stay for the build
-          # step, and the stage's finally removes them.
-          cleanup() {
-            docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-            rm -f "$BUILDKITD_CONFIG"
-          }
-          trap 'rc=$?; [ "$rc" -eq 0 ] || cleanup' EXIT
-          # Write a buildkit insecure-registry entry for the registry we actually PUSH to
-          # (normalized: scheme stripped, trailing slash stripped, lowercased) iff it matches
-          # any entry in $INSECURE_REGISTRIES (derived from oeProfile in Resolve profile,
-          # normalized the same way). Without this, pushes via docker buildx fail with
-          # 'http: server gave HTTP response to HTTPS client'.
-          # This MUST test and emit PUSH_REGISTRY, not IMAGE_REGISTRY: when the builder is
-          # not the registry host they differ, and a stanza written for the pull-side name
-          # leaves the push endpoint unconfigured, failing before anything is uploaded.
+          # Is the registry we PUSH to one of the plain-http registries? Its address is normalized (scheme stripped,
+          # trailing slash stripped, lowercased) and compared with $INSECURE_REGISTRIES (derived from oeProfile in
+          # Resolve profile, normalized the same way). This MUST test PUSH_REGISTRY, not IMAGE_REGISTRY: when the builder
+          # is not the registry host they differ, and a stanza written for the pull-side name leaves the push endpoint
+          # unconfigured, failing before anything is uploaded.
           normalize() {
             printf '%s' "$1" | tr 'A-Z' 'a-z' \
               | sed -e 's#^http://##' -e 's#^https://##' \
@@ -412,18 +394,45 @@ pipeline {
           for r in $INSECURE_REGISTRIES; do
             if [ "$effective_norm" = "$(normalize "$r")" ]; then registry_insecure=true; break; fi
           done
-          if [ "$registry_insecure" = "true" ]; then
-            cat > "$BUILDKITD_CONFIG" <<EOF
+          # IMAGE ENGINE (owner rule 2026-10-22: no Docker daemon on the laptop that runs the native Jenkins). The gateway
+          # Dockerfile is only "FROM a JRE, COPY one jar, ENTRYPOINT", so a PUSH to a plain-http registry (dev and production
+          # both are) is built natively with Jib (ci/jib-image/pom.xml, `mvn package -Pjib-image`): no docker info, no
+          # buildx builder. The jar is platform independent, so production (linux/amd64) and dev (linux/arm64) differ only
+          # by BUILD_PLATFORM. A build that pushes nothing, or pushes to a registry outside the plain-http set, keeps the
+          # docker path below.
+          IMAGE_ENGINE=docker
+          if [ "$PUSH_IMAGE" = "true" ] && [ "$registry_insecure" = "true" ]; then IMAGE_ENGINE=jib; fi
+          if [ "$IMAGE_ENGINE" = "docker" ]; then
+            # Preflight: this stage may run on a builder whose Docker is not always up (the .74
+            # agents use Docker Desktop, which needs a GUI session and does not survive reboot).
+            # Fail here with something actionable rather than obscurely mid-buildx.
+            if ! docker info >/dev/null 2>&1; then
+              echo "Docker daemon is not reachable on this build agent ($(hostname))." >&2
+              echo "If this is the .74 builder, start Docker Desktop on it and re-run." >&2
+              exit 1
+            fi
+            # A failure below removes what this step created; on success the builder and its config stay for the build
+            # step, and the stage's finally removes them.
+            cleanup() {
+              docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
+              rm -f "$BUILDKITD_CONFIG"
+            }
+            trap 'rc=$?; [ "$rc" -eq 0 ] || cleanup' EXIT
+            # A buildkit insecure-registry entry for the registry we PUSH to. Without it, pushes via docker buildx
+            # fail with 'http: server gave HTTP response to HTTPS client'.
+            if [ "$registry_insecure" = "true" ]; then
+              cat > "$BUILDKITD_CONFIG" <<EOF
 [registry."$PUSH_REGISTRY"]
   http = true
   insecure = true
 EOF
-          else
-            : > "$BUILDKITD_CONFIG"
+            else
+              : > "$BUILDKITD_CONFIG"
+            fi
+            # Own the builder explicitly so concurrent jobs cannot change our selection.
+            docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
+            docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" >/dev/null
           fi
-          # Own the builder explicitly so concurrent jobs cannot change our selection.
-          docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-          docker buildx create --name "$BUILDER_NAME" --driver docker-container --config "$BUILDKITD_CONFIG" >/dev/null
           # ARTIFACT IDENTITY, part 4: the jar about to become the image is the one packaged and
           # verified above — by content, again — and its provenance travels as labels.
           JAR="$(ls target/options-edge-feed-gateway-*.jar | grep -v '\\.original$' | head -1)"
@@ -431,6 +440,29 @@ EOF
             || { echo "the packaged jar changed since it was verified — refusing to build the image" >&2; exit 1; }
           bash scripts/jenkins/verify-embedded-contracts.sh "$JAR" "$(cat .contracts-jar-sha256)"
           rm -f ".jenkins-tmp/push-metadata-$BUILD_ID.json" ".jenkins-tmp/image-lock-$BUILD_ID.env" ".jenkins-tmp/required-image-$BUILD_ID"
+          JIB_LABELS=""
+          JIB_EXTRA_TAGS=""
+          if [ "$IMAGE_ENGINE" = "jib" ]; then
+            # Jib's inputs, every one proven here because the Jib step itself is a DEDICATED single mvn command. The platform
+            # and each label/tag value must be exactly what is expected (a comma or space would split a Jib list property).
+            printf '%s' "$BUILD_PLATFORM" | grep -Eq '^linux/(amd64|arm64)$' || { echo "BUILD_PLATFORM '$BUILD_PLATFORM' is not linux/amd64 or linux/arm64 — refusing the Jib build" >&2; exit 1; }
+            for v in "$(cat .contracts-sha)" "$(git rev-parse HEAD)" "$(cat .jar-sha256)" "$(cat .contracts-jar-sha256)" "${PERMITTED_SHA_GUARD_VERSION:-}"; do
+              printf '%s' "$v" | grep -Eq '^[0-9a-f]{40,64}$' || { echo "an image label value is not a 40-64 digit lowercase hex id ('$v') — refusing the Jib build" >&2; exit 1; }
+            done
+            JIB_LABELS="options-edge.contracts-revision=$(cat .contracts-sha),options-edge.source-revision=$(git rev-parse HEAD),options-edge.jar-sha256=$(cat .jar-sha256),options-edge.contracts-jar-sha256=$(cat .contracts-jar-sha256),options-edge.guard-version=${PERMITTED_SHA_GUARD_VERSION:-}"
+            # The moving tag (:dev or :prod) is the tag part of SECOND_IMAGE; the per-build tag is the image name Jib pushes.
+            if [ -n "$SECOND_IMAGE" ]; then
+              JIB_EXTRA_TAGS="${SECOND_IMAGE##*:}"
+              printf '%s' "$JIB_EXTRA_TAGS" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$' || { echo "the moving image tag '$JIB_EXTRA_TAGS' is not a plain tag — refusing the Jib build" >&2; exit 1; }
+            fi
+            # Stage the verified jar as /app/app.jar (the Dockerfile's layout) in a fresh directory, and start Jib from an
+            # empty ci/jib-image/target so no earlier build's digest file or staging can be read as this one's.
+            rm -rf .jenkins-tmp/jib-options-edge-feed-gateway ci/jib-image/target
+            mkdir -p .jenkins-tmp/jib-options-edge-feed-gateway/app ci/jib-image/target/classes
+            cp "$JAR" .jenkins-tmp/jib-options-edge-feed-gateway/app/app.jar
+            [ "$(bash scripts/jenkins/permitted-sha-guard-version.sh .jenkins-tmp/jib-options-edge-feed-gateway/app/app.jar)" = "$(cat .jar-sha256)" ] \
+              || { echo "the staged jar is not the verified jar — refusing the Jib build" >&2; exit 1; }
+          fi
           # push = a registry export; no push = load into the local daemon (the same --output either way)
           if [ "$PUSH_IMAGE" = "true" ]; then BUILD_OUTPUT="type=image,push=true"; else BUILD_OUTPUT="type=docker"; fi
           # LABELS, so the revisions and contents travel with the image rather than only with the
@@ -440,6 +472,9 @@ EOF
             echo "BUILD_PLATFORM=$BUILD_PLATFORM"
             echo "BUILDER_NAME=$BUILDER_NAME"
             echo "BUILDKITD_CONFIG=$BUILDKITD_CONFIG"
+            echo "IMAGE_ENGINE=$IMAGE_ENGINE"
+            echo "JIB_LABELS=$JIB_LABELS"
+            echo "JIB_EXTRA_TAGS=$JIB_EXTRA_TAGS"
             echo "IMAGE_REF_1=$IMAGE"
             echo "IMAGE_REF_2=$SECOND_IMAGE"
             echo "BUILD_OUTPUT=$BUILD_OUTPUT"
@@ -456,6 +491,34 @@ EOF
           def imageEnv = readFile(".jenkins-tmp/image-env-${env.BUILD_ID}").split('\n').collect { it.trim() }.findAll { it }
           def secondTag = imageEnv.any { it.startsWith('IMAGE_REF_2=') && it.length() > 'IMAGE_REF_2='.length() }
           withEnv(imageEnv) {
+            if (env.IMAGE_ENGINE == 'jib') {
+              // IMAGE_ENGINE=jib (a push to a plain-http registry, dev and production): the verified jar staged by the prepare step
+              // is containerized and pushed natively by Jib, with no Docker daemon. The Dockerfile's image, exactly: eclipse-temurin:21-jre,
+              // /app/app.jar, WORKDIR /app, ENTRYPOINT java -jar /app/app.jar (ci/jib-image/pom.xml). The build is a DEDICATED mvn step
+              // (`mvn package -Pjib-image`, validator rule 9b) right after the verify of BOTH checkouts it can consume: the primary
+              // workspace (which holds ci/jib-image/pom.xml and the staged jar) and the contracts clone.
+              def jh = readFile('.jenkins-tmp/java-home').trim()
+              withEnv(["JAVA_HOME=${jh}", "PATH+JDK=${jh}/bin", 'MAVEN_SKIP_RC=true',
+                       "MAVEN_OPTS=-Dmaven.repo.local=${env.WORKSPACE}/.m2/repository${env.MAVEN_OPTS ? ' ' + env.MAVEN_OPTS : ''}"]) {
+                if (secondTag) {
+                  timeout(time: 10, unit: 'MINUTES') {
+                    sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
+                  }
+                  timeout(time: 10, unit: 'MINUTES') {
+                    sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__ --allow-ignored ci/jib-image/target'
+                  }
+                  sh 'mvn -B -q -f ci/jib-image/pom.xml package -Pjib-image -Djib.from.platforms="${BUILD_PLATFORM}" -Djib.jar.sha256="${LABEL_JAR_SHA256}" -Djib.extraDirectories.paths="${WORKSPACE}/.jenkins-tmp/jib-options-edge-feed-gateway" -Djib.to.image="${IMAGE_REF_1}" -Djib.to.tags="${JIB_EXTRA_TAGS}" -Djib.container.labels="${JIB_LABELS}"'
+                } else {
+                  timeout(time: 10, unit: 'MINUTES') {
+                    sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
+                  }
+                  timeout(time: 10, unit: 'MINUTES') {
+                    sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__ --allow-ignored ci/jib-image/target'
+                  }
+                  sh 'mvn -B -q -f ci/jib-image/pom.xml package -Pjib-image -Djib.from.platforms="${BUILD_PLATFORM}" -Djib.jar.sha256="${LABEL_JAR_SHA256}" -Djib.extraDirectories.paths="${WORKSPACE}/.jenkins-tmp/jib-options-edge-feed-gateway" -Djib.to.image="${IMAGE_REF_1}" -Djib.container.labels="${JIB_LABELS}"'
+                }
+              }
+            } else {
             try {
               // PROVENANCE (Deployment Permission Rule, validator rule 9b): the image is built from the whole workspace
               // context, which holds the primary checkout AND the contracts clone — so both are re-verified immediately
@@ -480,6 +543,7 @@ EOF
             } finally {
               sh 'docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true; rm -f "$BUILDKITD_CONFIG"'
             }
+            }
             // Image: lock — from THIS build's own push result.
             sh '''
               set -eu
@@ -488,6 +552,14 @@ EOF
                 # the digest it pushed; the registry must serve that same digest for the unique per-build tag.
                 # The dev rollout below forwards it as REQUIRED_IMAGE so service-deploy rolls THIS image.
                 PUSH_REGISTRY="${PUSH_REGISTRY:-$IMAGE_REGISTRY}"
+                if [ "${IMAGE_ENGINE:-docker}" = "jib" ]; then
+                  # Jib reports the digest it pushed in ci/jib-image/target/jib-image.digest (emptied before the build); it is written
+                  # into the metadata file in buildx's shape, and refused unless it is a sha256 digest. The jar Jib containerized
+                  # (the staged copy) must still be the verified jar, so the lock never names an image of another jar.
+                  [ "$(bash scripts/jenkins/permitted-sha-guard-version.sh .jenkins-tmp/jib-options-edge-feed-gateway/app/app.jar)" = "$LABEL_JAR_SHA256" ] \
+                    || { echo "the staged jar changed since it was verified — no image lock" >&2; exit 1; }
+                  bash scripts/jenkins/write-jib-metadata.sh ci/jib-image/target/jib-image.digest "$PUSH_METADATA"
+                fi
                 PUSHED="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("containerimage.digest",""))' "$PUSH_METADATA")"
                 printf '%s' "$PUSHED" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "this build's push reported no image digest ('$PUSHED') — no image lock" >&2; exit 1; }
                 DIGEST="$(bash scripts/jenkins/resolve-pushed-digest.sh "$PUSH_REGISTRY" options-edge-feed-gateway "$TAG")"
