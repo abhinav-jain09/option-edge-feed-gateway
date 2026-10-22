@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -30,6 +31,14 @@ import org.junit.jupiter.api.Test;
 class WaveCycleProducerRecordsTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String WAVE_SUBJECT = "com.optionsedge.contracts.wavecycle.WaveSet", CYCLE_SUBJECT = "com.optionsedge.contracts.wavecycle.CycleSet";
+
+    private static final List<String> SCOPES = List.of("e21-real", "e21-evidence", "e21-size", "e21-v1");
+
+    /** The mock registry keeps its scopes in static state: drop them so nothing leaks into another test of the JVM. */
+    @AfterAll
+    static void dropScopes() {
+        SCOPES.forEach(io.confluent.kafka.schemaregistry.testutil.MockSchemaRegistry::dropScope);
+    }
 
     private static JsonNode records() throws Exception {
         try (InputStream in = WaveCycleProducerRecordsTest.class.getResourceAsStream("/ta-producer/wave-cycle-records.json")) {
