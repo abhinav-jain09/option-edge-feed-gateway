@@ -17,8 +17,8 @@ import org.junit.jupiter.api.Test;
 class TaRelaysWiringTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final List<String> FLAGS = List.of("GATEWAY_STRUCTURE_TOOLS_ENABLED", "GATEWAY_GEOMETRY_ENABLED", "GATEWAY_TRADE_TOOLS_ENABLED",
-            "GATEWAY_WAVE_CYCLE_ENABLED");
-    private static final List<String> FIELDS = List.of("tools", "geometry", "tradeTools", "waves");
+            "GATEWAY_WAVE_CYCLE_ENABLED", "GATEWAY_BREAK_CLASSIFICATION_ENABLED");
+    private static final List<String> FIELDS = List.of("tools", "geometry", "tradeTools", "waves", "breaks");
 
     private static FeedGatewayService service() {
         return new FeedGatewayService(new GatewaySettings(), JSON, new HpsfGatewayViewMapper(), null);
@@ -31,6 +31,8 @@ class TaRelaysWiringTest {
         assertFalse(s.geometryEnabled());
         assertFalse(s.tradeToolsEnabled());
         assertFalse(s.waveCycleEnabled());
+        assertFalse(s.breakClassificationEnabled());
+        assertEquals("options.spx.break-classification", s.breakClassificationTopic());
         assertEquals("options.spx.market-structure.tools", s.structureToolsTopic());
         assertEquals("options.spx.market-structure.geometry", s.geometryTopic());
         assertEquals(List.of("futures.pf.chart", "futures.pf.columns", "futures.pf.events", "futures.volume-nodes", "futures.flow.bars", "futures.flow.events"),
@@ -44,11 +46,14 @@ class TaRelaysWiringTest {
     void theTopicNamesAreOverridable() {
         System.setProperty("KAFKA_TT_PF_EVENTS_TOPIC", "x.events");
         System.setProperty("KAFKA_WAVE_CYCLE_WAVES_TOPIC", "x.waves");
+        System.setProperty("KAFKA_BREAK_CLASSIFICATION_TOPIC", "x.breaks");
         try {
             GatewaySettings s = new GatewaySettings();
             assertEquals("x.events", s.tradeToolsTopics().get(2));
             assertEquals("x.waves", s.waveCycleWavesTopic());
+            assertEquals("x.breaks", s.breakClassificationTopic());
         } finally {
+            System.clearProperty("KAFKA_BREAK_CLASSIFICATION_TOPIC");
             System.clearProperty("KAFKA_TT_PF_EVENTS_TOPIC");
             System.clearProperty("KAFKA_WAVE_CYCLE_WAVES_TOPIC");
         }
@@ -58,13 +63,14 @@ class TaRelaysWiringTest {
     void everyFrameTypeIsAGlobalBroadcastEventAndNothingElseIsAddedByAccident() {
         Set<String> frames = new HashSet<>(List.of(TimeframeSetRelay.TOOLS_EVENT, TimeframeSetRelay.GEOMETRY_EVENT, WaveCycleRelay.WAVES_EVENT, WaveCycleRelay.CYCLES_EVENT));
         frames.addAll(List.of(TradeToolsRelay.FRAME));
-        assertEquals(16, frames.size());
+        frames.addAll(List.of(BreakClassificationRelay.MARK_FRAME, BreakClassificationRelay.OUTCOME_FRAME, BreakClassificationRelay.STATUS_FRAME));
+        assertEquals(19, frames.size());
         for (String frame : frames) {
             assertTrue(FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains(frame), frame);
         }
         long chartFrames = FeedGatewayService.GLOBAL_BROADCAST_EVENTS.stream()
-                .filter(e -> e.startsWith("trade-tools-") || e.startsWith("wave-cycle-") || e.equals("market-structure-tools") || e.equals("market-structure-geometry")).count();
-        assertEquals(16, chartFrames);
+                .filter(e -> e.startsWith("trade-tools-") || e.startsWith("wave-cycle-") || e.startsWith("break-classification-") || e.equals("market-structure-tools") || e.equals("market-structure-geometry")).count();
+        assertEquals(19, chartFrames);
     }
 
     @Test
@@ -76,6 +82,8 @@ class TaRelaysWiringTest {
         }
         assertFalse(off.metrics().contains("gateway_trade_tools_"));
         assertFalse(off.metrics().contains("gateway_wave_cycle_"));
+        assertFalse(off.metrics().contains("gateway_break_classification_"));
+        assertTrue(off.taRelaysForTest().isEmpty(), "flag off: no relay, so no frame of any of the three types can be sent");
     }
 
     @Test
@@ -89,7 +97,8 @@ class TaRelaysWiringTest {
                 for (int j = 0; j < FIELDS.size(); j++) {
                     assertEquals(i == j, hello.has(FIELDS.get(j)), FLAGS.get(i) + " / " + FIELDS.get(j) + ": independent layers");
                 }
-                assertEquals("{\"1m\":null,\"5m\":null,\"15m\":null}", hello.get(FIELDS.get(i)).toString(), "null = none retained; the field's presence = flag on");
+                assertEquals(FIELDS.get(i).equals("breaks") ? "{\"1m\":null,\"5m\":null,\"15m\":null,\"status\":null}" : "{\"1m\":null,\"5m\":null,\"15m\":null}",
+                        hello.get(FIELDS.get(i)).toString(), "null = none retained; the field's presence = flag on");
             } finally {
                 System.clearProperty(FLAGS.get(i));
             }
@@ -104,7 +113,7 @@ class TaRelaysWiringTest {
         int json = src.indexOf("private void runJsonStateLiveConsumer()");
         int jsonEnd = methodEnd(src, json);
         for (String binding : List.of("settings.structureToolsEnabled()", "settings.geometryEnabled()", "settings.tradeToolsEnabled()", "settings.waveCycleEnabled()",
-                "settings.marketStructureEnabled()", "settings.marketStructurePatternsEnabled()")) {
+                "settings.breakClassificationEnabled()", "settings.marketStructureEnabled()", "settings.marketStructurePatternsEnabled()")) {
             int at = src.indexOf("if (" + binding + ") {", avro);
             assertTrue(at > avro && at < avroEnd, binding + " guards a binding of the AVRO live consumer");
             assertFalse(src.substring(json, jsonEnd).contains(binding), binding + " is not bound on the JSON state consumer: the converted topics are Avro only");

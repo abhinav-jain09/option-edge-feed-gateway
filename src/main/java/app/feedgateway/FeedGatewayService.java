@@ -2907,6 +2907,9 @@ public class FeedGatewayService implements ReplayRunner {
             bindChartTopic(topicEvents, settings.waveCycleWavesTopic(), WaveCycleRelay.WAVES_EVENT);
             bindChartTopic(topicEvents, settings.waveCycleCyclesTopic(), WaveCycleRelay.CYCLES_EVENT);
         }
+        if (settings.breakClassificationEnabled()) {
+            bindChartTopic(topicEvents, settings.breakClassificationTopic(), BreakClassificationRelay.EVENT);
+        }
         if (settings.studiesEnabled()) {
             // INDICATOR-STUDIES studies: Avro, LIVE consumer only (the cache consumer has no case for them; the relay keeps its own
             // bounded history and last states and recovers them with a seek-back, see seekStudies).
@@ -13001,9 +13004,9 @@ public class FeedGatewayService implements ReplayRunner {
     // ── CHART-STRUCTURE-TOOLS to ELLIOTT-FIB-CYCLE-TOOLS: technical-analysis chart relays (structure tools, geometry, trade tools, waves and cycles) ───────
     // The consumer glue only: the data and the decisions live in the TaRelay implementations.
 
-    /** The enabled relays in hello priority order: after the studies, the geometry, the tools, the waves, then the trade tools. */
+    /** The enabled relays in hello priority order: after the studies, the geometry, the tools, the waves, the trade tools, then the break classification. */
     private static List<TaRelay> taRelays(GatewaySettings settings) {
-        List<TaRelay> relays = new ArrayList<>(4);
+        List<TaRelay> relays = new ArrayList<>(5);
         if (settings.geometryEnabled()) {
             relays.add(TimeframeSetRelay.geometry());
         }
@@ -13015,6 +13018,9 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (settings.tradeToolsEnabled()) {
             relays.add(new TradeToolsRelay());
+        }
+        if (settings.breakClassificationEnabled()) {
+            relays.add(new BreakClassificationRelay());
         }
         return List.copyOf(relays);
     }
@@ -13063,6 +13069,9 @@ public class FeedGatewayService implements ReplayRunner {
             topics.add(settings.waveCycleWavesTopic());
             topics.add(settings.waveCycleCyclesTopic());
         }
+        if (settings.breakClassificationEnabled()) {
+            topics.add(settings.breakClassificationTopic());
+        }
         return topics;
     }
 
@@ -13076,7 +13085,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     /**
      * The hello's chart relay parts, appended after the studies (their contract is deployed and they keep their own budget rule,
-     * {@link #studiesHelloBudget}): the geometry, the tools, the waves, then the trade tools. Each part is rendered under the budget
+     * {@link #studiesHelloBudget}): the geometry, the tools, the waves, the trade tools, then the break classification. Each part is rendered under the budget
      * that is left of {@link #HELLO_FRAME_TARGET_BYTES} after the fixed fields, the studies and the parts before it, and trims itself:
      * it sends whole timeframes in the order 1m, 5m, 15m while they fit and {@code null} for the rest. So the lowest-priority part's
      * newest timeframes are the first to give way, and the hello never exceeds the HARD guard by more than the field skeletons.
@@ -13408,7 +13417,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.marketStructureEnabled()) return true;
         if (settings.marketStructurePatternsEnabled()) return true;      // PATTERNS joins the hello too
         if (settings.studiesEnabled()) return true;                      // so do the INDICATOR-STUDIES studies
-        if (!taRelays.isEmpty()) return true;                            // and the structure tools, geometry, trade tools and waves
+        if (!taRelays.isEmpty()) return true;                            // and the structure tools, geometry, trade tools, waves and break classification
         return settings.esCvdEnabled() || settings.esCvdSpxLevelsEnabled() || footprintViews != null;
     }
 
@@ -14730,6 +14739,8 @@ public class FeedGatewayService implements ReplayRunner {
             "trade-tools-pf-chart", "trade-tools-pf-column", "trade-tools-pf-break", "trade-tools-pf-line", "trade-tools-pf-count",
             "trade-tools-pf-macross", "trade-tools-pf-voldiv", "trade-tools-pf-mfdiv", "trade-tools-pf-volcheck", "trade-tools-volume-nodes",
             "trade-tools-flow-bar", "trade-tools-climax",
+            // Phase F break classification (break-classifier-service): global, SPX only, flag-gated.
+            BreakClassificationRelay.MARK_FRAME, BreakClassificationRelay.OUTCOME_FRAME, BreakClassificationRelay.STATUS_FRAME,
             // Pre-open IBKR GEX window state (rev13 R-STATE): a GLOBAL control/status stream —
             // identical for all users, sessionId-gated client-side. Allowlisted so the
             // standalone broadcast reaches sockets in per-session (auth) mode too

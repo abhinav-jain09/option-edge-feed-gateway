@@ -425,6 +425,19 @@ public final class GatewaySettings {
     }
 
     /**
+     * Phase F break classification, trap or real (frames {@code break-classification-mark}/{@code -outcome}/{@code -status}, hello field {@code breaks};
+     * ta-books-catalog 17_BREAK_CLASSIFICATION_FRAME_CONTRACT.md). OFF by default: an absent {@code breaks} field is how the page knows this gateway has no such stream.
+     */
+    public boolean breakClassificationEnabled() {
+        return boolValue("GATEWAY_BREAK_CLASSIFICATION_ENABLED", false);
+    }
+
+    /** The one topic of break-classifier-service (marks, outcomes and the status, told apart by their writer schema). */
+    public String breakClassificationTopic() {
+        return value("KAFKA_BREAK_CLASSIFICATION_TOPIC", "options.spx.break-classification");
+    }
+
+    /**
      * Early-auction verdict evidence ledger (EARLY-AUCTION-VERDICT-STAGE1-GATE1.md:
      * {@code early-auction.verdicts.shadow}, JSON, ONE partition, one immutable record per line —
      * PREDICTION / OUTCOME / MISS / terminals). Feeds the read-only {@code /early-auction} web panel
