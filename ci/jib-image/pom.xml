@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- A Dockerfile-free image recipe for the services whose Dockerfile is only "FROM a JRE, COPY one jar, set an entrypoint".
      The jar (built earlier in the pipeline) is handed in through -Djib.extraDirectories.paths; nothing here is compiled or resolved,
-     so the build needs no Docker daemon and no sibling module in the local Maven repository. Driven by the Jenkinsfile's DEV image steps. -->
+     so the build needs no Docker daemon and no sibling module in the local Maven repository. Driven by the Jenkinsfile's Image stage (a push to the dev or production registry). -->
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
   <groupId>com.optionsedge.ci</groupId>
@@ -17,6 +17,28 @@
       <id>jib-image</id>
       <build>
         <plugins>
+          <!-- The staged jar must be byte-for-byte the jar the pipeline verified (-Djib.jar.sha256 is its sha256). The check runs inside this same
+               Maven run, in `validate`, seconds before Jib reads the file, so the window between the pipeline's last hash and the image is the
+               length of one JVM start rather than the gap between two Jenkins steps. A missing or malformed value fails the build too. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <version>3.5.0</version>
+            <executions>
+              <execution>
+                <id>jar-is-the-verified-jar</id>
+                <phase>validate</phase>
+                <goals><goal>enforce</goal></goals>
+                <configuration>
+                  <rules>
+                    <requireProperty><property>jib.jar.sha256</property><regex>[0-9a-f]{64}</regex></requireProperty>
+                    <requireFileChecksum><file>${jib.extraDirectories.paths}/app/app.jar</file><checksum>${jib.jar.sha256}</checksum><type>sha256</type></requireFileChecksum>
+                  </rules>
+                  <fail>true</fail>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
           <plugin>
             <groupId>com.google.cloud.tools</groupId>
             <artifactId>jib-maven-plugin</artifactId>

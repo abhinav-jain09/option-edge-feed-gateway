@@ -507,7 +507,7 @@ EOF
                   timeout(time: 10, unit: 'MINUTES') {
                     sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__ --allow-ignored ci/jib-image/target'
                   }
-                  sh 'mvn -B -q -f ci/jib-image/pom.xml package -Pjib-image -Djib.from.platforms="${BUILD_PLATFORM}" -Djib.extraDirectories.paths="${WORKSPACE}/.jenkins-tmp/jib-options-edge-feed-gateway" -Djib.to.image="${IMAGE_REF_1}" -Djib.to.tags="${JIB_EXTRA_TAGS}" -Djib.container.labels="${JIB_LABELS}"'
+                  sh 'mvn -B -q -f ci/jib-image/pom.xml package -Pjib-image -Djib.from.platforms="${BUILD_PLATFORM}" -Djib.jar.sha256="${LABEL_JAR_SHA256}" -Djib.extraDirectories.paths="${WORKSPACE}/.jenkins-tmp/jib-options-edge-feed-gateway" -Djib.to.image="${IMAGE_REF_1}" -Djib.to.tags="${JIB_EXTRA_TAGS}" -Djib.container.labels="${JIB_LABELS}"'
                 } else {
                   timeout(time: 10, unit: 'MINUTES') {
                     sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
@@ -515,7 +515,7 @@ EOF
                   timeout(time: 10, unit: 'MINUTES') {
                     sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__ --allow-ignored ci/jib-image/target'
                   }
-                  sh 'mvn -B -q -f ci/jib-image/pom.xml package -Pjib-image -Djib.from.platforms="${BUILD_PLATFORM}" -Djib.extraDirectories.paths="${WORKSPACE}/.jenkins-tmp/jib-options-edge-feed-gateway" -Djib.to.image="${IMAGE_REF_1}" -Djib.container.labels="${JIB_LABELS}"'
+                  sh 'mvn -B -q -f ci/jib-image/pom.xml package -Pjib-image -Djib.from.platforms="${BUILD_PLATFORM}" -Djib.jar.sha256="${LABEL_JAR_SHA256}" -Djib.extraDirectories.paths="${WORKSPACE}/.jenkins-tmp/jib-options-edge-feed-gateway" -Djib.to.image="${IMAGE_REF_1}" -Djib.container.labels="${JIB_LABELS}"'
                 }
               }
             } else {

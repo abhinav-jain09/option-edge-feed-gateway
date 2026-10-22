@@ -391,7 +391,7 @@ def main() -> int:
               and not os.path.exists(os.path.join(tmp, "docker.log")) and f"FEED_GATEWAY_IMAGE=localhost:5001/options-edge-feed-gateway:57-{sha[:12]}@{DIGEST}\n" in lock
               and "OPTIONS_EDGE_IMAGE_LOCK_PLATFORM=linux/arm64\n" in lock, r.stdout + r.stderr + margs)
         check("Jib push (dev): both tags, the platform, all five provenance labels and the staged jar reach Jib exactly",
-              f"-Djib.to.image=localhost:5001/options-edge-feed-gateway:57-{sha[:12]}" in margs and "-Djib.to.tags=dev" in margs and "-Djib.from.platforms=linux/arm64" in margs
+              f"-Djib.to.image=localhost:5001/options-edge-feed-gateway:57-{sha[:12]}" in margs and "-Djib.to.tags=dev" in margs and f"-Djib.jar.sha256={hashlib.sha256(b'jar').hexdigest()}" in margs and "-Djib.from.platforms=linux/arm64" in margs
               and f"-Djib.extraDirectories.paths={ws}/.jenkins-tmp/jib-options-edge-feed-gateway" in margs and "-Pjib-image" in margs
               and f"-Djib.container.labels=options-edge.contracts-revision={'d' * 40},options-edge.source-revision={sha},options-edge.jar-sha256={hashlib.sha256(b'jar').hexdigest()},"
                   f"options-edge.contracts-jar-sha256={'c' * 64},options-edge.guard-version={GV}" in margs, margs)
@@ -447,6 +447,27 @@ def main() -> int:
             check(f"docker path kept: {label}", r.returncode == 0, r.stdout + r.stderr)
     finally:
         shutil.rmtree(tmp, True)
+
+    # ---- the Jib image is the Dockerfile's image: read both files and compare what the runtime sees ----
+    import re
+    dockerfile = [l.strip() for l in read("Dockerfile").splitlines() if l.strip()]
+    pom = read("ci/jib-image/pom.xml")
+    base = re.search(r"<from><image>([^<]+)</image></from>", pom).group(1)
+    entry = re.search(r"<entrypoint>(.*?)</entrypoint>", pom, re.S).group(1)
+    jib_entry = re.findall(r"<arg>([^<]*)</arg>", entry)
+    workdir = re.search(r"<workingDirectory>([^<]+)</workingDirectory>", pom).group(1)
+    check("Jib image == Dockerfile: base image", dockerfile[0] == f"FROM {base}", f"{dockerfile[0]} vs {base}")
+    check("Jib image == Dockerfile: WORKDIR", f"WORKDIR {workdir}" in dockerfile, f"{workdir}")
+    d_entry = [json.loads(l[len("ENTRYPOINT "):]) for l in dockerfile if l.startswith("ENTRYPOINT ")]
+    check("Jib image == Dockerfile: ENTRYPOINT", d_entry == [jib_entry], f"{d_entry} vs {jib_entry}")
+    check("Jib image == Dockerfile: the jar lands at /app/app.jar (staged under app/, extra-directory root is /)",
+          "COPY target/options-edge-feed-gateway-*.jar /app/app.jar" in dockerfile and "/app/app.jar" in jib_entry
+          and ".jenkins-tmp/jib-options-edge-feed-gateway/app/app.jar" in jf, str(dockerfile))
+    check("Jib image == Dockerfile: the Dockerfile declares no ENV, EXPOSE, USER or ARG that Jib would have to reproduce",
+          not any(l.split()[0] in ("ENV", "EXPOSE", "USER", "ARG", "LABEL", "VOLUME", "HEALTHCHECK", "CMD") for l in dockerfile), str(dockerfile))
+    check("Jib: the pom checks the staged jar's sha256 before Jib reads it (enforcer requireFileChecksum, validate phase, fail=true)",
+          "<requireFileChecksum>" in pom and "<type>sha256</type>" in pom and "<phase>validate</phase>" in pom and "<fail>true</fail>" in pom
+          and "${jib.jar.sha256}" in pom and "<requireProperty><property>jib.jar.sha256</property>" in pom, pom)
     g = jf[jf.index("// Only THIS build's lock (keyed by BUILD_ID"):jf.index("end stage('Build')")]
     check("Groovy publishes and forwards only the BUILD_ID-keyed lock", 'fileExists(".jenkins-tmp/image-lock-${env.BUILD_ID}.env")' in g
           and 'readFile(".jenkins-tmp/required-image-${env.BUILD_ID}")' in g and "readFile('.jenkins-tmp/required-image')" not in jf, g)
