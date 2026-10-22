@@ -11,7 +11,7 @@ import java.util.TreeMap;
 import org.junit.jupiter.api.Test;
 
 /**
- * The test schemas (src/test/resources/ta) are byte-identical copies of the contracts registry files (options-edge-contracts 0.31.0,
+ * The test schemas (src/test/resources/ta) are byte-identical copies of the contracts registry files (options-edge-contracts 0.36.0 for WaveSet and CycleSet version 2, 0.31.0 otherwise,
  * schemas-registry/ta, SHA-256 pinned there against the producers' resources). The gateway needs no contracts class for them: it renders
  * from the writer schema the registry returns. If a producer schema changes, the contracts pin, this copy and the fixtures change together.
  */
@@ -22,7 +22,7 @@ class TaSchemaPinsTest {
         String[] pins = {
             "ClimaxEvent", "494a9e8e45e50da4b64e056a820557b6261797349f32de1f59137facd11bf2a0",
             "ControlCheckpoint", "8de4bb1b10281f18deaaa2ed8fe098046f0a469da5f9ec39db0e6686afd13f39",
-            "CycleSet", "48e70d6ff1aac5336ac083a5ff5607e341ac0e4f2a782520d3fe51badcc3b230",
+            "CycleSet", "00fd1f9fb68b9aca1ee0e7622ea5e26184d490d2df5377c84562721e74e9ef7b",
             "DlqRecord", "1dbd98fbae1ccbe1ad9278c43905e7bbb24d2c94cf3acf6aeca8ef2413867a31",
             "FlowBar", "27d78217d39ab9e71caa7853216bd0dddcc0ee81e962fd092e6f89e4074d2b53",
             "GeometryAnnotationSet", "7df6d75aab13cfa943ef3b7cd10a7fc3da78f7e54c24dcedba4664fec2b023a8",
@@ -50,7 +50,7 @@ class TaSchemaPinsTest {
             "UiProjection", "e77f05135fdbf99b39cfae491c613c956b3605fe6156661d084821423ae448f5",
             "UiUnavailable", "7b4d518b830fc8b2ecb932f4728b733264c2c89d58de1acb1b731b90d79d39ba",
             "VolumeNodeSet", "ff7c43fc12aa67643d14b0750dc7e57ff308ee49cf3f9d2a6fe7bd235d7b80be",
-            "WaveSet", "2d28adcf2ca2683383e6d2959651a03830a16da2b696f653062abb1319ca3644"
+            "WaveSet", "167d6adf36c95d1a58342c36b09fbd0297161fd9ac23acde1d67f12efb0aff33"
         };
         for (int i = 0; i < pins.length; i += 2) {
             SHA256.put(pins[i], pins[i + 1]);
@@ -65,6 +65,20 @@ class TaSchemaPinsTest {
         for (Map.Entry<String, String> e : SHA256.entrySet()) {
             byte[] bytes = Files.readAllBytes(Path.of("src", "test", "resources", "ta", e.getKey() + ".avsc"));
             assertEquals(e.getValue(), HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)), e.getKey());
+        }
+    }
+
+    /** The registered version 1 of WaveSet and CycleSet (contracts schemas-registry/ta/v1): a producer that has not been upgraded still writes it, and the relay renders it from its own writer schema. */
+    @Test
+    void theVersion1WaveAndCycleSchemasAreTheFrozenRegistryFiles() throws Exception {
+        Map<String, String> v1 = Map.of("CycleSet", "48e70d6ff1aac5336ac083a5ff5607e341ac0e4f2a782520d3fe51badcc3b230",
+                "WaveSet", "2d28adcf2ca2683383e6d2959651a03830a16da2b696f653062abb1319ca3644");
+        try (var files = Files.list(Path.of("src", "test", "resources", "ta-v1"))) {
+            assertEquals(v1.keySet(), files.map(p -> p.getFileName().toString().replace(".avsc", "")).collect(java.util.stream.Collectors.toCollection(java.util.TreeSet::new)));
+        }
+        for (Map.Entry<String, String> e : v1.entrySet()) {
+            byte[] bytes = Files.readAllBytes(Path.of("src", "test", "resources", "ta-v1", e.getKey() + ".avsc"));
+            assertEquals(e.getValue(), HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)), e.getKey() + " version 1");
         }
     }
 }

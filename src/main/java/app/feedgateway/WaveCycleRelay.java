@@ -11,6 +11,10 @@ import org.apache.avro.generic.GenericRecord;
  * lexicographically: a smaller pair is a counted regression, an equal pair replaces ({@code asOfMs} is NOT the order: the single
  * {@code PARAMETER_SET_CHANGED} announcement carries 0). The hello carries per timeframe an object with the latest {@code waves} and
  * {@code cycles} (each possibly {@code null}), the whole timeframe or {@code null}, in the order 1m, 5m, 15m while they fit the part budget.
+ * <p>
+ * Version 2 of both records (ELLIOTT-FIB-CYCLE-TOOLS revision 21: {@code WaveCount.measurement}, {@code WaveSet.calibration}, {@code CycleSet.calibration}, all optional) needs no code here: a
+ * frame is the rendering of the WRITER schema of the record, so a version-2 record carries the measured evidence and its fixed statements verbatim and a version-1 record carries none. The
+ * gateway judges none of the new vocabularies (the boundary check below is unchanged); the page is the validator. WaveCycleProducerRecordsTest pins this with the bytes the real producer published.
  */
 final class WaveCycleRelay extends TaRelay {
     static final String WAVES_EVENT = "wave-cycle-waves";
