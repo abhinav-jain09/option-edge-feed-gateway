@@ -1,9 +1,11 @@
 package app.feedgateway;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.avro.generic.GenericRecord;
 
@@ -77,6 +79,8 @@ final class BreakClassificationRelay extends TaRelay {
     private Store staged;
     /** The live status when the recovery began: a live status that arrived since is later in log order than anything staged. */
     private Held statusAtBegin;
+    /** Live outcomes parked in the staging because their mark is only staged: counted accepted when the promotion adopts them, orphans when it does not. */
+    private final Set<String> parked = new HashSet<>();
     private String helloCache;
     private long helloVersion = -1L;
     private long helloCap = -1L;
@@ -99,6 +103,7 @@ final class BreakClassificationRelay extends TaRelay {
     synchronized void beginRecovery() {
         staged = live.copy();
         statusAtBegin = live.status;
+        parked.clear();
     }
 
     @Override
@@ -144,6 +149,9 @@ final class BreakClassificationRelay extends TaRelay {
             for (Map.Entry<String, Held> e : staged.outcomes[t].entrySet()) {
                 if (live.marks[t].containsKey(e.getKey()) && live.outcomes[t].putIfAbsent(e.getKey(), e.getValue()) == null) {
                     frames.add(new String[] {OUTCOME_FRAME, e.getValue().json()});
+                    if (parked.remove(e.getKey())) {
+                        accepted();
+                    }
                 }
             }
         }
@@ -154,6 +162,8 @@ final class BreakClassificationRelay extends TaRelay {
         if (!frames.isEmpty()) {
             live.version++;
         }
+        orphan.addAndGet(parked.size());   // a parked outcome whose mark the promotion did not adopt (no room, or a newer live session): its mark is not retained
+        parked.clear();
         staged = null;
         statusAtBegin = null;
         return frames;
@@ -300,8 +310,12 @@ final class BreakClassificationRelay extends TaRelay {
             return null;
         }
         st.version++;
-        accepted();
-        return relay ? new String[] {OUTCOME_FRAME, held.json()} : null;
+        if (relay) {
+            accepted();
+            return new String[] {OUTCOME_FRAME, held.json()};
+        }
+        parked.add(id);
+        return null;
     }
 
     private String[] status(Store st, GenericRecord r, Held held) {

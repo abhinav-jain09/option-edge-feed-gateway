@@ -403,6 +403,37 @@ class BreakClassificationRelayTest {
         JsonNode part = hello(relay, 1 << 20).get("5m");
         assertEquals("RECLAIMED", part.get("outcomes").get(0).get("label").asText());
         assertEquals(1, part.get("marks").size());
+        assertEquals(2, relay.acceptedForTest(), "the staged mark and the adopted outcome, once each");
+        assertEquals(0, counter(relay, "orphan"));
+    }
+
+    @Test
+    void aParkedOutcomeWhoseStagedMarkTheLiveCapacityLeavesNoRoomForIsAnOrphanAtThePromotion() throws Exception {
+        var relay = new BreakClassificationRelay();
+        relay.beginRecovery();
+        relay.onStaged(E, BreakFixtures.mark("M1", D1, 9));
+        for (int i = 100; i < 164; i++) {
+            live(relay, BreakFixtures.mark("M1", D1, i));          // 64 live marks fill the timeframe
+        }
+        assertNull(live(relay, BreakFixtures.outcome(9, "RECLAIMED")));
+        assertEquals(0, counter(relay, "orphan"), "not decided before the promotion");
+        assertTrue(relay.promote().isEmpty(), "the older mark finds no room, so neither it nor its outcome is relayed");
+        assertEquals(1, counter(relay, "orphan"));
+        assertEquals(65, relay.acceptedForTest(), "64 live marks and the staged mark; the parked outcome was never accepted");
+        JsonNode part = hello(relay, 1 << 20).get("1m");
+        assertEquals(64, part.get("marks").size());
+        assertEquals(0, part.get("outcomes").size());
+    }
+
+    @Test
+    void aParkedOutcomeWhoseStagedMarkIsOfAnEarlierSessionThanTheLiveOneIsAnOrphanAtThePromotion() {
+        var relay = new BreakClassificationRelay();
+        relay.beginRecovery();
+        relay.onStaged(E, BreakFixtures.mark("M1", D1, 9));
+        live(relay, BreakFixtures.mark("M1", D2, 10));
+        assertNull(live(relay, BreakFixtures.outcome(9, "RECLAIMED")));
+        assertTrue(relay.promote().isEmpty());
+        assertEquals(1, counter(relay, "orphan"));
     }
 
     @Test
