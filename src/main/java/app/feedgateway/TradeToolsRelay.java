@@ -11,7 +11,7 @@ import org.apache.avro.generic.GenericRecord;
 /**
  * TICK-TRADE-TOOLS trade-level tools (options-edge-processing docs/ta-books/catalog/TRADE-TOOLS-FRAME-CONTRACT.md): twelve display records of es-trade-tools-service, one frame
  * type each, dispatched on the WRITER schema's record name. The gateway checks the boundary only (record type for the topic, schema
- * version 1, a symbol, {@code validation == UNVALIDATED}, a horizon or width of 1m/5m/15m, size under 64 KiB, per-key ordering by
+ * version 1, a symbol, {@code validation} one of {@code UNVALIDATED} or {@code MEASURED} (revision 21: the producer writes MEASURED for the calibrated configuration; the nullable header record {@code evidence} is relayed field for field, unaltered), a horizon or width of 1m/5m/15m, size under 64 KiB, per-key ordering by
  * {@code asOfMs}); the page is the full validator. Records are keyed upserts. A column or event is routed to the timeframe of the retained
  * {@code PfChartState} of its {@code chartId} and dropped (counted) when there is none; volume node sets belong to all three timeframes.
  * Retained per timeframe, bounded: 4 charts, 24 columns per chart, 10 events per kind, 32 flow bars, 8 climax events; 4 node sets overall.
@@ -505,6 +505,14 @@ final class TradeToolsRelay extends TaRelay {
         return out;
     }
 
+    /**
+     * Revision 21 of the producer: {@code MEASURED} for the calibrated configuration (a historical validation result is attached in {@code evidence}), {@code UNVALIDATED} for
+     * any other. Anything else, including the enum default {@code UNKNOWN} a reader sees for a symbol it does not know, is not relayed.
+     */
+    private static boolean validationAdmitted(String validation) {
+        return "MEASURED".equals(validation) || "UNVALIDATED".equals(validation);
+    }
+
     /** The boundary: null (counted) for anything the gateway must not relay, else the rendered record with its routing and clock. */
     private Held parse(String bindingEvent, Object value) {
         GenericRecord r = recordOrDrop(value);
@@ -515,7 +523,7 @@ final class TradeToolsRelay extends TaRelay {
             int kind = NAMESPACE.equals(r.getSchema().getNamespace()) ? indexOf(RECORD, r.getSchema().getName()) : -1;
             long asOf = (Long) r.get("asOfMs");
             if (kind < 0 || !roleHas(indexOf(ROLES, bindingEvent), kind) || !Integer.valueOf(1).equals(r.get("schemaVersion"))
-                    || r.get("symbol").toString().isEmpty() || !"UNVALIDATED".equals(r.get("validation").toString()) || asOf < 0) {
+                    || r.get("symbol").toString().isEmpty() || !validationAdmitted(r.get("validation").toString()) || asOf < 0) {
                 onDrop();
                 return null;
             }

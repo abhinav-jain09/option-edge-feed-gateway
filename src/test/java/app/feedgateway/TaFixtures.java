@@ -139,7 +139,40 @@ final class TaFixtures {
         put(r, "symbol", "ES");
         put(r, "contractEpoch", "ESZ6");
         put(r, "asOfMs", asOfMs);
+        put(r, "calibration", "CALIBRATED");
+        put(r, "validation", "MEASURED");
+        put(r, "evidence", evidence(r, "NONE"));
+        return r;
+    }
+
+    /** The producer's {@code Evidence} record of a header-bearing record's schema, filled like a real row (revision 21); {@code edge} is the MeasuredEdge symbol. */
+    static GenericRecord evidence(GenericRecord header, String edge) {
+        Schema union = header.getSchema().getField("evidence").schema();
+        GenericRecord e = minimal(union.getTypes().get(1));
+        put(e, "validationResultId", "TT-CAL-1#C8:rv2500-rg2000");
+        put(e, "claim", "climax candidate, direction of price 30 minutes later");
+        put(e, "measuredEdge", edge);
+        put(e, "calibrationFrom", "2025-08-08");
+        put(e, "calibrationTo", "2026-04-30");
+        put(e, "validationFrom", "2026-05-01");
+        put(e, "validationTo", "2026-08-07");
+        put(e, "datasetSha256", "3ef872c451a70837e6c7e90b9036fd5748d57305ca56173a922e76e3f5125e0c");
+        put(e, "statement", "climax: no measured edge beyond baseline (n=119, adjusted p=0.94, history 2025-08-08..2026-08-07)");
+        if (edge.equals("NONE")) {
+            put(e, "n", 119L);
+            put(e, "effectMilli", 8820L);
+            put(e, "effectUnit", "ticks");
+            put(e, "pAdjPpm", 942529);
+            put(e, "horizonMinutes", 30);
+        }
+        return e;
+    }
+
+    /** The record of a configuration other than the calibrated one: SEED_UNCALIBRATED, UNVALIDATED, no evidence (what the producer writes then). */
+    static GenericRecord uncalibrated(GenericRecord r) {
+        put(r, "calibration", "SEED_UNCALIBRATED");
         put(r, "validation", "UNVALIDATED");
+        put(r, "evidence", null);
         return r;
     }
 
