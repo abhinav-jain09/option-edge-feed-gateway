@@ -281,18 +281,27 @@ final class BreakClassificationRelay extends TaRelay {
         }
         for (int t = 0; t < TF.length; t++) {
             if (st.marks[t].containsKey(id)) {
-                Held old = st.outcomes[t].putIfAbsent(id, held);
-                if (old != null && !old.json().equals(held.json())) {
-                    conflict.incrementAndGet();
-                    return null;
-                }
-                st.version++;
-                accepted();
-                return new String[] {OUTCOME_FRAME, held.json()};
+                return keep(st, t, id, held, true);
+            }
+        }
+        for (int t = 0; st == live && staged != null && t < TF.length; t++) {
+            if (staged.marks[t].containsKey(id)) {
+                return keep(staged, t, id, held, false);   // its mark is still being staged below the captured end: the outcome waits in the staging for the promotion
             }
         }
         orphan.incrementAndGet();
         return null;
+    }
+
+    private String[] keep(Store st, int t, String id, Held held, boolean relay) {
+        Held old = st.outcomes[t].putIfAbsent(id, held);
+        if (old != null && !old.json().equals(held.json())) {
+            conflict.incrementAndGet();
+            return null;
+        }
+        st.version++;
+        accepted();
+        return relay ? new String[] {OUTCOME_FRAME, held.json()} : null;
     }
 
     private String[] status(Store st, GenericRecord r, Held held) {

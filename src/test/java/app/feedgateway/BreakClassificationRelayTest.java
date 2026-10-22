@@ -389,6 +389,32 @@ class BreakClassificationRelayTest {
     }
 
     @Test
+    void aLiveOutcomeWhoseMarkIsStillBeingStagedWaitsForThePromotionAndIsNeitherAnOrphanNorLost() throws Exception {
+        var relay = new BreakClassificationRelay();
+        relay.beginRecovery();
+        relay.onStaged(E, BreakFixtures.mark("M5", D1, 9));               // offset 9, below the captured end
+        assertNull(live(relay, BreakFixtures.outcome(9, "RECLAIMED")));   // offset 10, at the captured end: live path, its mark is only staged
+        assertEquals(0, counter(relay, "orphan"));
+        assertEquals("{\"1m\":null,\"5m\":null,\"15m\":null,\"status\":null}", hello(relay, 1 << 20).toString(), "nothing is visible before the promotion");
+        assertNull(live(relay, BreakFixtures.outcome(9, "STALL")), "a different second outcome is still a conflict");
+        assertEquals(1, counter(relay, "conflict"));
+        List<String[]> frames = relay.promote();
+        assertEquals(List.of("break-classification-mark", "break-classification-outcome"), frames.stream().map(f -> f[0]).toList());
+        JsonNode part = hello(relay, 1 << 20).get("5m");
+        assertEquals("RECLAIMED", part.get("outcomes").get(0).get("label").asText());
+        assertEquals(1, part.get("marks").size());
+    }
+
+    @Test
+    void aLiveOutcomeForAMarkThatIsNeitherLiveNorStagedIsStillAnOrphanDuringARecovery() {
+        var relay = new BreakClassificationRelay();
+        relay.beginRecovery();
+        assertNull(live(relay, BreakFixtures.outcome(9, "RECLAIMED")));
+        assertEquals(1, counter(relay, "orphan"));
+        assertTrue(relay.promote().isEmpty());
+    }
+
+    @Test
     void anOutcomeInTheHistoryForAMarkLiveEvictedOrNeverHeldIsNotResurrected() throws Exception {
         var relay = new BreakClassificationRelay();
         relay.beginRecovery();
