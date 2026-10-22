@@ -1,0 +1,791 @@
+{
+ "type": "record",
+ "name": "CycleSet",
+ "namespace": "com.optionsedge.contracts.wavecycle",
+ "fields": [
+  {
+   "name": "env",
+   "type": {
+    "type": "record",
+    "name": "Envelope",
+    "namespace": "com.optionsedge.contracts.wavecycle",
+    "fields": [
+     {
+      "name": "schemaVersion",
+      "type": "int"
+     },
+     {
+      "name": "service",
+      "type": {
+       "type": "enum",
+       "name": "Service",
+       "namespace": "com.optionsedge.contracts.wavecycle",
+       "symbols": [
+        "WAVE_CYCLE"
+       ]
+      }
+     },
+     {
+      "name": "symbol",
+      "type": {
+       "type": "enum",
+       "name": "Symbol",
+       "namespace": "com.optionsedge.contracts.wavecycle",
+       "symbols": [
+        "SPX"
+       ]
+      }
+     },
+     {
+      "name": "timeframe",
+      "type": {
+       "type": "enum",
+       "name": "Tf",
+       "namespace": "com.optionsedge.contracts.wavecycle",
+       "symbols": [
+        "M1",
+        "M5",
+        "M15",
+        "H1",
+        "D1",
+        "W1"
+       ]
+      }
+     },
+     {
+      "name": "asOfMs",
+      "type": "long"
+     },
+     {
+      "name": "lastIdx",
+      "type": "long"
+     },
+     {
+      "name": "epoch",
+      "type": "int"
+     },
+     {
+      "name": "seq",
+      "type": "long"
+     },
+     {
+      "name": "parameterSetHash",
+      "type": "string"
+     },
+     {
+      "name": "state",
+      "type": {
+       "type": "enum",
+       "name": "EnvState",
+       "namespace": "com.optionsedge.contracts.wavecycle",
+       "symbols": [
+        "OK",
+        "UNAVAILABLE"
+       ]
+      }
+     },
+     {
+      "name": "unavailableReason",
+      "type": [
+       "null",
+       {
+        "type": "enum",
+        "name": "UnavailableReason",
+        "namespace": "com.optionsedge.contracts.wavecycle",
+        "symbols": [
+         "NOT_READY",
+         "INSUFFICIENT_HISTORY",
+         "PARAMETER_SET_CHANGED",
+         "QUARANTINE",
+         "OVERSIZED",
+         "FOLD_FAILURE"
+        ]
+       }
+      ],
+      "default": null
+     },
+     {
+      "name": "historyBars",
+      "type": "int"
+     },
+     {
+      "name": "historySessions",
+      "type": "int"
+     }
+    ]
+   }
+  },
+  {
+   "name": "bands",
+   "type": {
+    "type": "array",
+    "items": {
+     "type": "record",
+     "name": "CycleBand",
+     "namespace": "com.optionsedge.contracts.wavecycle",
+     "fields": [
+      {
+       "name": "band",
+       "type": {
+        "type": "enum",
+        "name": "Band",
+        "namespace": "com.optionsedge.contracts.wavecycle",
+        "symbols": [
+         "ALPHA_BETA",
+         "TRADING",
+         "PRIMARY"
+        ]
+       }
+      },
+      {
+       "name": "degree",
+       "type": {
+        "type": "enum",
+        "name": "Degree",
+        "namespace": "com.optionsedge.contracts.wavecycle",
+        "symbols": [
+         "D1",
+         "D2",
+         "D3"
+        ]
+       }
+      },
+      {
+       "name": "estimates",
+       "type": {
+        "type": "array",
+        "items": {
+         "type": "record",
+         "name": "Estimate",
+         "namespace": "com.optionsedge.contracts.wavecycle",
+         "fields": [
+          {
+           "name": "method",
+           "type": {
+            "type": "enum",
+            "name": "Method",
+            "namespace": "com.optionsedge.contracts.wavecycle",
+            "symbols": [
+             "TROUGH_SPACING",
+             "GRID_FIT",
+             "MESA_MEM"
+            ]
+           }
+          },
+          {
+           "name": "periodBars",
+           "type": [
+            "null",
+            "int"
+           ],
+           "default": null
+          },
+          {
+           "name": "qualityMilli",
+           "type": [
+            "null",
+            "int"
+           ],
+           "default": null
+          },
+          {
+           "name": "reason",
+           "type": [
+            "null",
+            {
+             "type": "enum",
+             "name": "EstimateReason",
+             "namespace": "com.optionsedge.contracts.wavecycle",
+             "symbols": [
+              "OUT_OF_BAND",
+              "INSUFFICIENT_TROUGHS",
+              "IRREGULAR_SPACING",
+              "TOO_FEW_GRID_POINTS",
+              "LOW_EXCESS",
+              "GAP_IN_WINDOW",
+              "ZERO_VARIANCE",
+              "UNSTABLE_FIT",
+              "ZERO_DENOMINATOR",
+              "NOT_EVALUATED"
+             ]
+            }
+           ],
+           "default": null
+          }
+         ]
+        }
+       }
+      },
+      {
+       "name": "status",
+       "type": {
+        "type": "enum",
+        "name": "BandStatus",
+        "namespace": "com.optionsedge.contracts.wavecycle",
+        "symbols": [
+         "CONSENSUS",
+         "NO_CONSENSUS",
+         "INSUFFICIENT_TROUGHS",
+         "INSUFFICIENT_HISTORY"
+        ]
+       }
+      },
+      {
+       "name": "agreeing",
+       "type": "int"
+      },
+      {
+       "name": "dominantPeriod",
+       "type": [
+        "null",
+        "int"
+       ],
+       "default": null
+      },
+      {
+       "name": "lastTroughIdx",
+       "type": [
+        "null",
+        "long"
+       ],
+       "default": null
+      },
+      {
+       "name": "barsSinceTrough",
+       "type": [
+        "null",
+        "int"
+       ],
+       "default": null
+      },
+      {
+       "name": "phaseMilli",
+       "type": [
+        "null",
+        "int"
+       ],
+       "default": null
+      },
+      {
+       "name": "nextTroughIdx",
+       "type": [
+        "null",
+        "long"
+       ],
+       "default": null
+      },
+      {
+       "name": "windowLoIdx",
+       "type": [
+        "null",
+        "long"
+       ],
+       "default": null
+      },
+      {
+       "name": "windowHiIdx",
+       "type": [
+        "null",
+        "long"
+       ],
+       "default": null
+      },
+      {
+       "name": "amplitudeTicks",
+       "type": [
+        "null",
+        "long"
+       ],
+       "default": null
+      },
+      {
+       "name": "translations",
+       "type": {
+        "type": "array",
+        "items": {
+         "type": "record",
+         "name": "Translation",
+         "namespace": "com.optionsedge.contracts.wavecycle",
+         "fields": [
+          {
+           "name": "startIdx",
+           "type": "long"
+          },
+          {
+           "name": "crestIdx",
+           "type": "long"
+          },
+          {
+           "name": "endIdx",
+           "type": "long"
+          },
+          {
+           "name": "ratioMilli",
+           "type": "int"
+          },
+          {
+           "name": "label",
+           "type": {
+            "type": "enum",
+            "name": "TranslationLabel",
+            "namespace": "com.optionsedge.contracts.wavecycle",
+            "symbols": [
+             "RIGHT",
+             "LEFT",
+             "MIDPOINT"
+            ]
+           }
+          },
+          {
+           "name": "longerTrend",
+           "type": {
+            "type": "enum",
+            "name": "LongerTrend",
+            "namespace": "com.optionsedge.contracts.wavecycle",
+            "symbols": [
+             "UP",
+             "DOWN",
+             "UNKNOWN"
+            ]
+           }
+          },
+          {
+           "name": "consistent",
+           "type": [
+            "null",
+            "boolean"
+           ],
+           "default": null
+          }
+         ]
+        }
+       }
+      },
+      {
+       "name": "harmonicity",
+       "type": [
+        "null",
+        {
+         "type": "record",
+         "name": "Harmonicity",
+         "namespace": "com.optionsedge.contracts.wavecycle",
+         "fields": [
+          {
+           "name": "neighbour",
+           "type": "com.optionsedge.contracts.wavecycle.Band"
+          },
+          {
+           "name": "ratioMilli",
+           "type": "int"
+          },
+          {
+           "name": "harmonic",
+           "type": "boolean"
+          }
+         ]
+        }
+       ],
+       "default": null
+      },
+      {
+       "name": "synchronicity",
+       "type": [
+        "null",
+        {
+         "type": "record",
+         "name": "Synchronicity",
+         "namespace": "com.optionsedge.contracts.wavecycle",
+         "fields": [
+          {
+           "name": "rateMilli",
+           "type": [
+            "null",
+            "int"
+           ],
+           "default": null
+          },
+          {
+           "name": "n",
+           "type": "int"
+          }
+         ]
+        }
+       ],
+       "default": null
+      },
+      {
+       "name": "proportionality",
+       "type": [
+        "null",
+        {
+         "type": "record",
+         "name": "Proportionality",
+         "namespace": "com.optionsedge.contracts.wavecycle",
+         "fields": [
+          {
+           "name": "quotientMilli",
+           "type": "int"
+          }
+         ]
+        }
+       ],
+       "default": null
+      },
+      {
+       "name": "variation",
+       "type": [
+        "null",
+        {
+         "type": "record",
+         "name": "Variation",
+         "namespace": "com.optionsedge.contracts.wavecycle",
+         "fields": [
+          {
+           "name": "driftMilli",
+           "type": "int"
+          },
+          {
+           "name": "flag",
+           "type": "boolean"
+          }
+         ]
+        }
+       ],
+       "default": null
+      },
+      {
+       "name": "nominalMatch",
+       "type": {
+        "type": "enum",
+        "name": "NominalMatch",
+        "namespace": "com.optionsedge.contracts.wavecycle",
+        "symbols": [
+         "YES",
+         "NO",
+         "NOT_APPLICABLE"
+        ]
+       }
+      },
+      {
+       "name": "mode",
+       "type": {
+        "type": "enum",
+        "name": "Mode",
+        "namespace": "com.optionsedge.contracts.wavecycle",
+        "symbols": [
+         "CYCLE",
+         "TREND",
+         "UNDETERMINED"
+        ]
+       }
+      },
+      {
+       "name": "troughWindowActive",
+       "type": "boolean"
+      },
+      {
+       "name": "longerTrend",
+       "type": "com.optionsedge.contracts.wavecycle.LongerTrend"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "tuned",
+   "type": {
+    "type": "array",
+    "items": {
+     "type": "record",
+     "name": "Tuned",
+     "namespace": "com.optionsedge.contracts.wavecycle",
+     "fields": [
+      {
+       "name": "band",
+       "type": "com.optionsedge.contracts.wavecycle.Band"
+      },
+      {
+       "name": "oscLen",
+       "type": "int"
+      },
+      {
+       "name": "maLong",
+       "type": "int"
+      },
+      {
+       "name": "maShort",
+       "type": "int"
+      },
+      {
+       "name": "maShortAlt",
+       "type": "int"
+      },
+      {
+       "name": "tunedStochRaw",
+       "type": [
+        "null",
+        "string"
+       ],
+       "default": null
+      },
+      {
+       "name": "tunedSmaShort",
+       "type": [
+        "null",
+        "string"
+       ],
+       "default": null
+      },
+      {
+       "name": "tunedSmaLong",
+       "type": [
+        "null",
+        "string"
+       ],
+       "default": null
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "trading20",
+   "type": [
+    "null",
+    {
+     "type": "record",
+     "name": "Trading20",
+     "namespace": "com.optionsedge.contracts.wavecycle",
+     "fields": [
+      {
+       "name": "anchorIdx",
+       "type": "long"
+      },
+      {
+       "name": "nextIdx",
+       "type": "long"
+      },
+      {
+       "name": "excessMilli",
+       "type": "int"
+      },
+      {
+       "name": "closeAboveDonHigh",
+       "type": "boolean"
+      },
+      {
+       "name": "closeBelowDonLow",
+       "type": "boolean"
+      }
+     ]
+    }
+   ],
+   "default": null
+  },
+  {
+   "name": "fibMa",
+   "type": {
+    "type": "array",
+    "items": {
+     "type": "record",
+     "name": "FibMa",
+     "namespace": "com.optionsedge.contracts.wavecycle",
+     "fields": [
+      {
+       "name": "length",
+       "type": "int"
+      },
+      {
+       "name": "value",
+       "type": [
+        "null",
+        "string"
+       ],
+       "default": null
+      },
+      {
+       "name": "bookNamed",
+       "type": "boolean"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "summationWindows",
+   "type": {
+    "type": "array",
+    "items": {
+     "type": "record",
+     "name": "SummationWindow",
+     "namespace": "com.optionsedge.contracts.wavecycle",
+     "fields": [
+      {
+       "name": "loIdx",
+       "type": "long"
+      },
+      {
+       "name": "hiIdx",
+       "type": "long"
+      },
+      {
+       "name": "bands",
+       "type": "int"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "seasonality",
+   "type": [
+    "null",
+    {
+     "type": "record",
+     "name": "Seasonality",
+     "namespace": "com.optionsedge.contracts.wavecycle",
+     "fields": [
+      {
+       "name": "monthOfYear",
+       "type": {
+        "type": "enum",
+        "name": "MonthOfYear",
+        "namespace": "com.optionsedge.contracts.wavecycle",
+        "symbols": [
+         "JAN",
+         "FEB",
+         "MAR",
+         "APR",
+         "MAY",
+         "JUN",
+         "JUL",
+         "AUG",
+         "SEP",
+         "OCT",
+         "NOV",
+         "DEC"
+        ]
+       }
+      },
+      {
+       "name": "presidentialYear",
+       "type": {
+        "type": "enum",
+        "name": "PresYear",
+        "namespace": "com.optionsedge.contracts.wavecycle",
+        "symbols": [
+         "Y1",
+         "Y2",
+         "Y3",
+         "Y4"
+        ]
+       }
+      },
+      {
+       "name": "janReturnSign",
+       "type": {
+        "type": "enum",
+        "name": "Sign",
+        "namespace": "com.optionsedge.contracts.wavecycle",
+        "symbols": [
+         "UP",
+         "DOWN",
+         "FLAT",
+         "PENDING",
+         "NO_BASE"
+        ]
+       }
+      },
+      {
+       "name": "first5Sign",
+       "type": "com.optionsedge.contracts.wavecycle.Sign"
+      },
+      {
+       "name": "monthlyTable",
+       "type": {
+        "type": "enum",
+        "name": "TableStatus",
+        "namespace": "com.optionsedge.contracts.wavecycle",
+        "symbols": [
+         "PUBLISHED",
+         "WITHHELD_INSUFFICIENT_N"
+        ]
+       }
+      },
+      {
+       "name": "presidentialTable",
+       "type": "com.optionsedge.contracts.wavecycle.TableStatus"
+      },
+      {
+       "name": "monthlyMinN",
+       "type": "int"
+      },
+      {
+       "name": "presidentialMinN",
+       "type": "int"
+      },
+      {
+       "name": "monthlyRows",
+       "type": {
+        "type": "array",
+        "items": {
+         "type": "record",
+         "name": "SeasonRow",
+         "namespace": "com.optionsedge.contracts.wavecycle",
+         "fields": [
+          {
+           "name": "key",
+           "type": {
+            "type": "enum",
+            "name": "RowKey",
+            "namespace": "com.optionsedge.contracts.wavecycle",
+            "symbols": [
+             "M01",
+             "M02",
+             "M03",
+             "M04",
+             "M05",
+             "M06",
+             "M07",
+             "M08",
+             "M09",
+             "M10",
+             "M11",
+             "M12",
+             "P1",
+             "P2",
+             "P3",
+             "P4"
+            ]
+           }
+          },
+          {
+           "name": "n",
+           "type": "int"
+          },
+          {
+           "name": "meanBp",
+           "type": "int"
+          },
+          {
+           "name": "sdBp",
+           "type": "int"
+          }
+         ]
+        }
+       }
+      },
+      {
+       "name": "presidentialRows",
+       "type": {
+        "type": "array",
+        "items": "com.optionsedge.contracts.wavecycle.SeasonRow"
+       }
+      }
+     ]
+    }
+   ],
+   "default": null
+  }
+ ]
+}

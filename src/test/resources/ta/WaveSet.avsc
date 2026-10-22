@@ -774,6 +774,32 @@
          }
         ]
        }
+      },
+      {
+       "name": "measurement",
+       "type": [
+        "null",
+        {
+         "type": "record",
+         "name": "Measurement",
+         "namespace": "com.optionsedge.contracts.wavecycle",
+         "fields": [
+          {
+           "name": "state",
+           "type": "string"
+          },
+          {
+           "name": "measuredEdge",
+           "type": "string"
+          },
+          {
+           "name": "statement",
+           "type": "string"
+          }
+         ]
+        }
+       ],
+       "default": null
       }
      ]
     }
@@ -1192,6 +1218,113 @@
      }
     ]
    }
+  },
+  {
+   "name": "calibration",
+   "type": [
+    "null",
+    {
+     "type": "record",
+     "name": "CalibrationSummary",
+     "namespace": "com.optionsedge.contracts.wavecycle",
+     "fields": [
+      {
+       "name": "state",
+       "type": "string"
+      },
+      {
+       "name": "parameterSetHash",
+       "type": "string"
+      },
+      {
+       "name": "validationResultId",
+       "type": "string"
+      },
+      {
+       "name": "ledgerSha256",
+       "type": "string"
+      },
+      {
+       "name": "developmentFromDay",
+       "type": "int"
+      },
+      {
+       "name": "developmentToDay",
+       "type": "int"
+      },
+      {
+       "name": "validationFromDay",
+       "type": "int"
+      },
+      {
+       "name": "validationToDay",
+       "type": "int"
+      },
+      {
+       "name": "results",
+       "type": {
+        "type": "array",
+        "items": {
+         "type": "record",
+         "name": "FamilyResult",
+         "namespace": "com.optionsedge.contracts.wavecycle",
+         "fields": [
+          {
+           "name": "family",
+           "type": "string"
+          },
+          {
+           "name": "measuredEdge",
+           "type": "string"
+          },
+          {
+           "name": "hypothesis",
+           "type": "string"
+          },
+          {
+           "name": "realCells",
+           "type": "int"
+          },
+          {
+           "name": "testableCells",
+           "type": "int"
+          },
+          {
+           "name": "passingCells",
+           "type": "int"
+          },
+          {
+           "name": "nCases",
+           "type": "long"
+          },
+          {
+           "name": "effectMilli",
+           "type": [
+            "null",
+            "int"
+           ],
+           "default": null
+          },
+          {
+           "name": "pAdjMilli",
+           "type": [
+            "null",
+            "int"
+           ],
+           "default": null
+          },
+          {
+           "name": "statement",
+           "type": "string"
+          }
+         ]
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "default": null
   }
  ]
 }
