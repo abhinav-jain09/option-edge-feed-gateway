@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A Dockerfile-free image recipe for the services whose Dockerfile is only "FROM a JRE, COPY one jar, set an entrypoint".
+     The jar (built earlier in the pipeline) is handed in through -Djib.extraDirectories.paths; nothing here is compiled or resolved,
+     so the build needs no Docker daemon and no sibling module in the local Maven repository. Driven by the Jenkinsfile's DEV image steps. -->
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.optionsedge.ci</groupId>
+  <artifactId>jib-image</artifactId>
+  <version>0</version>
+  <packaging>jar</packaging>
+  <properties><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>
+  <profiles>
+    <!-- `mvn -f ci/jib-image/pom.xml package -Pjib-image` containerizes the jar staged under -Djib.extraDirectories.paths (at /app/app.jar) and pushes
+         it to -Djib.to.image (platform -Djib.from.platforms, extra tags -Djib.to.tags, labels -Djib.container.labels). Running Jib as an ordinary
+         `mvn package` step keeps it under the pipeline's provenance rules for package steps (a dedicated verify before it, a fixed mvn template). -->
+    <profile>
+      <id>jib-image</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>com.google.cloud.tools</groupId>
+            <artifactId>jib-maven-plugin</artifactId>
+            <version>3.4.5</version>
+            <configuration>
+              <from><image>eclipse-temurin:21-jre</image></from>
+              <allowInsecureRegistries>true</allowInsecureRegistries>
+              <container>
+                <entrypoint><arg>java</arg><arg>-jar</arg><arg>/app/app.jar</arg></entrypoint>
+                <workingDirectory>/app</workingDirectory>
+                <creationTime>USE_CURRENT_TIMESTAMP</creationTime>
+              </container>
+            </configuration>
+            <executions>
+              <execution>
+                <id>jib-image</id>
+                <phase>package</phase>
+                <goals><goal>build</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>
