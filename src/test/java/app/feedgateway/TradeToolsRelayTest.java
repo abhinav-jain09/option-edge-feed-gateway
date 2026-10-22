@@ -494,10 +494,10 @@ class TradeToolsRelayTest {
     }
 
     /** The contract's full retained depth for one timeframe: 2 charts, 24 columns each, 10 events of each of the 7 kinds, 32 bars, 8 climax, 4 node sets. */
-    private static TradeToolsRelay fullDepth(boolean calibrated) {
+    private static TradeToolsRelay fullDepth(boolean calibrated, String... horizons) {
         var relay = new TradeToolsRelay();
         String[] kinds = {"PfBreakEvent", "PfLineEvent", "PfCountEvent", "PfMaCrossEvent", "PfVolumeDivergenceEvent", "PfMoneyFlowDivergenceEvent", "PfBreakVolumeCheck"};
-        for (String h : List.of("M1", "M5", "M15")) {
+        for (String h : horizons.length == 0 ? new String[] {"M1", "M5", "M15"} : horizons) {
             for (int c = 0; c < 2; c++) {
                 String id = "c" + h + c;
                 relay.onLive(CHART, pad(TaFixtures.chart(id, h, 1 + c), calibrated));
@@ -541,13 +541,17 @@ class TradeToolsRelayTest {
         org.apache.avro.generic.GenericRecord full = pad(TaFixtures.flowBar("M1", 60_000, 1), true);
         int grow = StudiesRelay.utf8Length(new TradeToolsRelay().onLive(FLOW, full)[1]) - StudiesRelay.utf8Length(new TradeToolsRelay().onLive(FLOW, bare)[1]);
         assertTrue(grow > 400 && grow < 1024, "the JSON growth of a record is " + grow + " bytes");
-        var before = fullDepth(false);
         var after = fullDepth(true);
-        JsonNode b = bundles(before, Long.MAX_VALUE), a = bundles(after, Long.MAX_VALUE);
-        for (String tf : List.of("1m", "5m", "15m")) {
-            int was = StudiesRelay.utf8Length(b.get(tf).toString()), now = StudiesRelay.utf8Length(a.get(tf).toString());
+        String[] horizon = {"M1", "M5", "M15"};
+        JsonNode a = JSON.createObjectNode();
+        for (int i = 0; i < 3; i++) {   // each timeframe alone, so the part cap does not hide its size
+            String tf = List.of("1m", "5m", "15m").get(i);
+            JsonNode b = bundles(fullDepth(false, horizon[i]), Long.MAX_VALUE).get(tf), n = bundles(fullDepth(true, horizon[i]), Long.MAX_VALUE).get(tf);
+            ((com.fasterxml.jackson.databind.node.ObjectNode) a).set(tf, n);
+            int was = StudiesRelay.utf8Length(b.toString()), now = StudiesRelay.utf8Length(n.toString());
             assertTrue(now > was * 1.2 && now < was * 2.5, tf + " grew from " + was + " to " + now + " bytes with the evidence");
-            assertEquals(ARRAYS, names(a.get(tf).fieldNames()));
+            assertEquals(ARRAYS, names(n.fieldNames()));
+            assertTrue(now < TradeToolsRelay.HELLO_PART_BYTES, tf + " alone fits the cap");
         }
         // the part cap: whole timeframes in the order 1m, 5m, 15m while they fit; a timeframe that does not fit is null, never thinned; the part stays under its cap
         JsonNode fitted = bundles(after, TradeToolsRelay.HELLO_PART_BYTES);
