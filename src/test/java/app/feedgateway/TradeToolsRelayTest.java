@@ -567,6 +567,12 @@ class TradeToolsRelayTest {
             }
         }
         assertTrue(total <= TradeToolsRelay.HELLO_PART_BYTES);
+        // the exact outcome at the production cap for this worst case (full depth, every evidence text at its cap): 1m whole, 5m and 15m null (each bundle is ~290 KB, two
+        // do not fit 512 KiB); with the real producer records (~0.6 KB of evidence JSON per record, bundles of 181 / 242 / 286 KB) 1m and 5m fit and 15m is null
+        assertEquals(a.get("1m"), fitted.get("1m"));
+        assertTrue(fitted.get("5m").isNull() && fitted.get("15m").isNull());
+        assertTrue(StudiesRelay.utf8Length(a.get("1m").toString()) + StudiesRelay.utf8Length(a.get("5m").toString()) > TradeToolsRelay.HELLO_PART_BYTES);
+        assertTrue(StudiesRelay.utf8Length(a.get("1m").toString()) <= TradeToolsRelay.HELLO_PART_BYTES);
         assertTrue(StudiesRelay.utf8Length(after.helloField(TradeToolsRelay.HELLO_PART_BYTES)) <= TradeToolsRelay.HELLO_PART_BYTES + 64);
         // a budget of exactly the 1m bundle keeps 1m whole and nulls the others
         JsonNode tight = bundles(after, StudiesRelay.utf8Length(a.get("1m").toString()) + 128);
