@@ -73,7 +73,8 @@ class TradeToolsRelayTest {
         assertNull(relay.onLive(CLIMAX, TaFixtures.climax("k", "H4", 1, 1)));
         assertNull(relay.onLive(COLUMN, TaFixtures.column("never-seen", 1, 1)), "no retained chart yet: parked (bounded), not guessed from the text of the chart id and not broadcast");
         assertNull(relay.onLive(EVENTS, TaFixtures.pfEvent("PfBreakEvent", "never-seen", "e", 1, 1)));
-        assertNull(relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("c", "M1", 1), "validation", "VALIDATED")), "only UNVALIDATED is relayed");
+        assertNull(relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("c", "M1", 1), "validation", "VALIDATED")), "only UNVALIDATED and MEASURED are relayed");
+        assertNull(relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("c", "M1", 1), "validation", "UNKNOWN")), "a symbol the reader does not know arrives as the enum default");
         assertNull(relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("c", "M1", 1), "schemaVersion", 2)));
         assertNull(relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("c", "M1", 1), "symbol", "")));
         assertNull(relay.onLive(COLUMN, TaFixtures.chart("c", "M1", 1)), "a chart record on the columns topic");
@@ -82,7 +83,7 @@ class TradeToolsRelayTest {
         assertNull(relay.onLive(CHART, TaFixtures.put(TaFixtures.chart("big", "M1", 1), "contractEpoch", "e".repeat(TradeToolsRelay.RECORD_MAX_BYTES))), "over 64 KiB");
         assertNull(relay.onLive(CHART, GatewayAvroDeserializer.UNDECODABLE));
         assertNull(relay.onLive(CHART, TaFixtures.waveSet("M1", 1, 1, "OK")), "a record of another family");
-        assertEquals(13, relay.dropsForTest(), "the two parked records are not drops");
+        assertEquals(14, relay.dropsForTest(), "the two parked records are not drops");
         assertEquals(0, relay.acceptedForTest());
     }
 
@@ -472,5 +473,51 @@ class TradeToolsRelayTest {
         assertNull(relay.onLive(COLUMN, TaFixtures.column("late", 1, 10)));
         assertEquals(1, relay.regressionsForTest());
         assertEquals(0, relay.dropsForTest());
+    }
+
+    @Test
+    void anUncalibratedRecordWithoutEvidenceAndAMeasuredOneWithItAreBothRelayedWithTheEvidenceUnaltered() throws Exception {
+        var relay = new TradeToolsRelay();
+        org.apache.avro.generic.GenericRecord plain = TaFixtures.uncalibrated(TaFixtures.chart("u", "M1", 1));
+        JsonNode u = JSON.readTree(relay.onLive(CHART, plain)[1]);
+        assertEquals("SEED_UNCALIBRATED", u.get("calibration").asText());
+        assertEquals("UNVALIDATED", u.get("validation").asText());
+        assertTrue(u.get("evidence").isNull());
+        JsonNode m = JSON.readTree(relay.onLive(CHART, TaFixtures.chart("m", "M1", 2))[1]);
+        assertEquals("CALIBRATED", m.get("calibration").asText());
+        assertEquals("MEASURED", m.get("validation").asText());
+        JsonNode ev = m.get("evidence");
+        assertEquals(17, ev.size());
+        assertEquals("NONE", ev.get("measuredEdge").asText());
+        assertEquals(119, ev.get("n").asLong());
+        assertTrue(ev.get("reconComparedBars").isNull(), "an absent optional is JSON null, never omitted, never a tagged union");
+    }
+
+    @Test
+    void evidenceAtItsCapsGrowsARecordByUnderOneKiBAndTheBundleStillSendsWholeTimeframesWhileTheyFit() throws Exception {
+        org.apache.avro.generic.GenericRecord bare = TaFixtures.uncalibrated(TaFixtures.flowBar("M1", 60_000, 1));
+        org.apache.avro.generic.GenericRecord full = TaFixtures.flowBar("M1", 60_000, 1);
+        org.apache.avro.generic.GenericRecord ev = TaFixtures.child(full, "evidence");
+        ev.put("validationResultId", "i".repeat(80));
+        ev.put("claim", "c".repeat(100));
+        ev.put("statement", "s".repeat(300));
+        int grow = StudiesRelay.utf8Length(new TradeToolsRelay().onLive(FLOW, full)[1]) - StudiesRelay.utf8Length(new TradeToolsRelay().onLive(FLOW, bare)[1]);
+        assertTrue(grow > 400 && grow < 1024, "the JSON growth of a record is " + grow + " bytes");
+        // a bundle of the contract's depth with evidence (24 columns x 2 charts, 70 events, 32 bars, 8 climax, 4 nodes) is far under the 512 KiB part cap and
+        // the part stays under its cap for any number of timeframes: a timeframe that does not fit whole is null, never thinned
+        var relay = new TradeToolsRelay();
+        for (String h : List.of("M1", "M5", "M15")) {
+            relay.onLive(CHART, TaFixtures.chart("c" + h, h, 1));
+            for (int i = 0; i < 24; i++) {
+                relay.onLive(COLUMN, TaFixtures.column("c" + h, i, 2 + i));
+            }
+            for (int i = 0; i < 32; i++) {
+                relay.onLive(FLOW, TaFixtures.flowBar(h, 60_000L * (i + 1), 100 + i));
+            }
+        }
+        String part = relay.helloField(TradeToolsRelay.HELLO_PART_BYTES);
+        assertTrue(StudiesRelay.utf8Length(part) <= TradeToolsRelay.HELLO_PART_BYTES);
+        assertFalse(bundles(relay, TradeToolsRelay.HELLO_PART_BYTES).get("15m").isNull(), "this depth fits all three");
+        assertTrue(bundles(relay, StudiesRelay.utf8Length(bundles(relay, Long.MAX_VALUE).get("1m").toString()) + 200).get("5m").isNull(), "a tight budget keeps 1m whole and nulls the rest");
     }
 }

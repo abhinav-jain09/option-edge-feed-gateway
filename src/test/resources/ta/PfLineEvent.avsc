@@ -85,6 +85,7 @@
      "SEED_UNCALIBRATED",
      "MEASURED",
      "MIXED",
+     "CALIBRATED",
      "UNKNOWN"
     ],
     "default": "UNKNOWN"
@@ -97,6 +98,7 @@
     "name": "Validation",
     "symbols": [
      "UNVALIDATED",
+     "MEASURED",
      "UNKNOWN"
     ],
     "default": "UNKNOWN"
@@ -114,6 +116,130 @@
       "UNKNOWN"
      ],
      "default": "UNKNOWN"
+    }
+   ],
+   "default": null
+  },
+  {
+   "name": "evidence",
+   "type": [
+    "null",
+    {
+     "type": "record",
+     "name": "Evidence",
+     "fields": [
+      {
+       "name": "validationResultId",
+       "type": "string"
+      },
+      {
+       "name": "claim",
+       "type": "string"
+      },
+      {
+       "name": "measuredEdge",
+       "type": {
+        "type": "enum",
+        "name": "MeasuredEdge",
+        "symbols": [
+         "NONE",
+         "POSITIVE",
+         "NOT_TESTABLE",
+         "EXACT_CONSTRUCT",
+         "UNKNOWN"
+        ],
+        "default": "UNKNOWN"
+       }
+      },
+      {
+       "name": "n",
+       "type": [
+        "null",
+        "long"
+       ],
+       "default": null
+      },
+      {
+       "name": "effectMilli",
+       "type": [
+        "null",
+        "long"
+       ],
+       "default": null
+      },
+      {
+       "name": "effectUnit",
+       "type": [
+        "null",
+        "string"
+       ],
+       "default": null
+      },
+      {
+       "name": "pAdjPpm",
+       "type": [
+        "null",
+        "int"
+       ],
+       "default": null
+      },
+      {
+       "name": "horizonMinutes",
+       "type": [
+        "null",
+        "int"
+       ],
+       "default": null
+      },
+      {
+       "name": "calibrationFrom",
+       "type": "string"
+      },
+      {
+       "name": "calibrationTo",
+       "type": "string"
+      },
+      {
+       "name": "validationFrom",
+       "type": "string"
+      },
+      {
+       "name": "validationTo",
+       "type": "string"
+      },
+      {
+       "name": "datasetSha256",
+       "type": "string"
+      },
+      {
+       "name": "reconComparedBars",
+       "type": [
+        "null",
+        "long"
+       ],
+       "default": null
+      },
+      {
+       "name": "reconEqualBars",
+       "type": [
+        "null",
+        "long"
+       ],
+       "default": null
+      },
+      {
+       "name": "reconUnexplainedBars",
+       "type": [
+        "null",
+        "long"
+       ],
+       "default": null
+      },
+      {
+       "name": "statement",
+       "type": "string"
+      }
+     ]
     }
    ],
    "default": null
