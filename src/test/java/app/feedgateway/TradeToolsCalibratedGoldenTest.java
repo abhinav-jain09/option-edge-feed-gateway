@@ -31,7 +31,7 @@ class TradeToolsCalibratedGoldenTest {
     private static final String[] ROLE_OF_FRAME_PREFIX = {"trade-tools-pf-chart", "trade-tools-pf-column", "trade-tools-pf-events", "trade-tools-volume-nodes",
         "trade-tools-flow-bar", "trade-tools-climax"};
 
-    private record Entry(String name, String record, String frame, String edge, String sha256) {
+    private record Entry(String name, String record, String frame, String edge, String sha256, String jsonSha256) {
     }
 
     private static List<Entry> manifest() throws Exception {
@@ -39,7 +39,7 @@ class TradeToolsCalibratedGoldenTest {
         for (String line : Files.readAllLines(DIR.resolve("MANIFEST.tsv"))) {
             if (!line.isBlank()) {
                 String[] f = line.split("\t");
-                out.add(new Entry(f[0], f[1], f[2], f[3], f[4]));
+                out.add(new Entry(f[0], f[1], f[2], f[3], f[4], f[5]));
             }
         }
         return out;
@@ -78,7 +78,9 @@ class TradeToolsCalibratedGoldenTest {
             String[] frame = relay.onLive(role(e.frame()), r);
             assertNotNull(frame, e.name() + " (" + e.record() + ") must be relayed: a MEASURED record is not malformed");
             assertEquals(e.frame(), frame[0], e.name());
-            JsonNode expected = JSON.readTree(Files.readString(DIR.resolve(e.name() + ".json")));
+            byte[] expectedBytes = Files.readAllBytes(DIR.resolve(e.name() + ".json"));
+            assertEquals(e.jsonSha256(), HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(expectedBytes)), e.name() + ": the expected JSON drifted from the manifest");
+            JsonNode expected = JSON.readTree(expectedBytes);
             JsonNode got = JSON.readTree(frame[1]);
             assertEquals(expected, got, e.name() + ": the frame is the contract's JSON, every field, evidence unaltered");
             JsonNode ev = got.get("evidence");

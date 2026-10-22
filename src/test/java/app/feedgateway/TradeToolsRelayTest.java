@@ -493,31 +493,80 @@ class TradeToolsRelayTest {
         assertTrue(ev.get("reconComparedBars").isNull(), "an absent optional is JSON null, never omitted, never a tagged union");
     }
 
-    @Test
-    void evidenceAtItsCapsGrowsARecordByUnderOneKiBAndTheBundleStillSendsWholeTimeframesWhileTheyFit() throws Exception {
-        org.apache.avro.generic.GenericRecord bare = TaFixtures.uncalibrated(TaFixtures.flowBar("M1", 60_000, 1));
-        org.apache.avro.generic.GenericRecord full = TaFixtures.flowBar("M1", 60_000, 1);
-        org.apache.avro.generic.GenericRecord ev = TaFixtures.child(full, "evidence");
+    /** The contract's full retained depth for one timeframe: 2 charts, 24 columns each, 10 events of each of the 7 kinds, 32 bars, 8 climax, 4 node sets. */
+    private static TradeToolsRelay fullDepth(boolean calibrated) {
+        var relay = new TradeToolsRelay();
+        String[] kinds = {"PfBreakEvent", "PfLineEvent", "PfCountEvent", "PfMaCrossEvent", "PfVolumeDivergenceEvent", "PfMoneyFlowDivergenceEvent", "PfBreakVolumeCheck"};
+        for (String h : List.of("M1", "M5", "M15")) {
+            for (int c = 0; c < 2; c++) {
+                String id = "c" + h + c;
+                relay.onLive(CHART, pad(TaFixtures.chart(id, h, 1 + c), calibrated));
+                for (int i = 0; i < 24; i++) {
+                    relay.onLive(COLUMN, pad(TaFixtures.column(id, i, 10 + i), calibrated));
+                }
+                for (int k = 0; k < kinds.length; k++) {
+                    for (int i = 0; i < 10; i++) {
+                        relay.onLive(EVENTS, pad(TaFixtures.pfEvent(kinds[k], id, kinds[k] + i, 1000 + i, 100 + i), calibrated));
+                    }
+                }
+            }
+            for (int i = 0; i < 32; i++) {
+                relay.onLive(FLOW, pad(TaFixtures.flowBar(h, 60_000L * (i + 1), 200 + i), calibrated));
+            }
+            for (int i = 0; i < 8; i++) {
+                relay.onLive(CLIMAX, pad(TaFixtures.climax(h + "k" + i, h, 60_000L * (i + 1), 300 + i), calibrated));
+            }
+        }
+        for (int s = 0; s < 4; s++) {
+            relay.onLive(NODES, pad(TaFixtures.nodes(s % 2 == 0 ? "RTH" : "GLOBEX", s < 2 ? 5 : 20, 400 + s), calibrated));
+        }
+        return relay;
+    }
+
+    /** A record as the producer writes it: evidence at its text caps (calibrated), or the seed configuration without any (the pre-revision-21 shape). */
+    private static org.apache.avro.generic.GenericRecord pad(org.apache.avro.generic.GenericRecord r, boolean calibrated) {
+        if (!calibrated) {
+            return TaFixtures.uncalibrated(r);
+        }
+        org.apache.avro.generic.GenericRecord ev = TaFixtures.child(r, "evidence");
         ev.put("validationResultId", "i".repeat(80));
         ev.put("claim", "c".repeat(100));
         ev.put("statement", "s".repeat(300));
+        return r;
+    }
+
+    @Test
+    void evidenceAtItsCapsGrowsARecordByUnderOneKiBAndTheFullDepthBundlesStillSendWholeTimeframesInOrderUnderTheCap() throws Exception {
+        org.apache.avro.generic.GenericRecord bare = pad(TaFixtures.flowBar("M1", 60_000, 1), false);
+        org.apache.avro.generic.GenericRecord full = pad(TaFixtures.flowBar("M1", 60_000, 1), true);
         int grow = StudiesRelay.utf8Length(new TradeToolsRelay().onLive(FLOW, full)[1]) - StudiesRelay.utf8Length(new TradeToolsRelay().onLive(FLOW, bare)[1]);
         assertTrue(grow > 400 && grow < 1024, "the JSON growth of a record is " + grow + " bytes");
-        // a bundle of the contract's depth with evidence (24 columns x 2 charts, 70 events, 32 bars, 8 climax, 4 nodes) is far under the 512 KiB part cap and
-        // the part stays under its cap for any number of timeframes: a timeframe that does not fit whole is null, never thinned
-        var relay = new TradeToolsRelay();
-        for (String h : List.of("M1", "M5", "M15")) {
-            relay.onLive(CHART, TaFixtures.chart("c" + h, h, 1));
-            for (int i = 0; i < 24; i++) {
-                relay.onLive(COLUMN, TaFixtures.column("c" + h, i, 2 + i));
-            }
-            for (int i = 0; i < 32; i++) {
-                relay.onLive(FLOW, TaFixtures.flowBar(h, 60_000L * (i + 1), 100 + i));
+        var before = fullDepth(false);
+        var after = fullDepth(true);
+        JsonNode b = bundles(before, Long.MAX_VALUE), a = bundles(after, Long.MAX_VALUE);
+        for (String tf : List.of("1m", "5m", "15m")) {
+            int was = StudiesRelay.utf8Length(b.get(tf).toString()), now = StudiesRelay.utf8Length(a.get(tf).toString());
+            assertTrue(now > was * 1.2 && now < was * 2.5, tf + " grew from " + was + " to " + now + " bytes with the evidence");
+            assertEquals(ARRAYS, names(a.get(tf).fieldNames()));
+        }
+        // the part cap: whole timeframes in the order 1m, 5m, 15m while they fit; a timeframe that does not fit is null, never thinned; the part stays under its cap
+        JsonNode fitted = bundles(after, TradeToolsRelay.HELLO_PART_BYTES);
+        boolean ended = false;
+        long total = 0;
+        for (String tf : List.of("1m", "5m", "15m")) {
+            boolean none = fitted.get(tf).isNull();
+            assertFalse(ended && !none, tf + " follows a null");
+            ended |= none;
+            if (!none) {
+                assertEquals(a.get(tf), fitted.get(tf), tf + " is whole");
+                total += StudiesRelay.utf8Length(fitted.get(tf).toString());
             }
         }
-        String part = relay.helloField(TradeToolsRelay.HELLO_PART_BYTES);
-        assertTrue(StudiesRelay.utf8Length(part) <= TradeToolsRelay.HELLO_PART_BYTES);
-        assertFalse(bundles(relay, TradeToolsRelay.HELLO_PART_BYTES).get("15m").isNull(), "this depth fits all three");
-        assertTrue(bundles(relay, StudiesRelay.utf8Length(bundles(relay, Long.MAX_VALUE).get("1m").toString()) + 200).get("5m").isNull(), "a tight budget keeps 1m whole and nulls the rest");
+        assertTrue(total <= TradeToolsRelay.HELLO_PART_BYTES);
+        assertTrue(StudiesRelay.utf8Length(after.helloField(TradeToolsRelay.HELLO_PART_BYTES)) <= TradeToolsRelay.HELLO_PART_BYTES + 64);
+        // a budget of exactly the 1m bundle keeps 1m whole and nulls the others
+        JsonNode tight = bundles(after, StudiesRelay.utf8Length(a.get("1m").toString()) + 128);
+        assertFalse(tight.get("1m").isNull());
+        assertTrue(tight.get("5m").isNull() && tight.get("15m").isNull());
     }
 }
