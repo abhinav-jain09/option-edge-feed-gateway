@@ -256,8 +256,7 @@ public class FeedGatewayService implements ReplayRunner {
     // (SPX-only — NO expiry; last-value-wins per strike+direction). One strike can legitimately carry
     // BOTH a live UP record (SHORT_CALL_CANDIDATE domain) and a DOWN record (SHORT_PUT_CANDIDATE
     // domain) at once, so the key must separate them or one verdict silently overwrites the other.
-    // JSON on the wire (StrikeInvasionSnapshot) — lives on the JSON-state consumer (mirrors
-    // strike-intel, minus the expiry segment).
+    // Avro on the wire (StrikeInvasionSnapshot), cached as its rendered JSON text — lives on the Avro consumer.
     private final Map<String, String> strikeInvasions = new ConcurrentHashMap<>();
     // Latest liquidity-heatmap column frame per symbol|expiry (last-value-wins; short TTL —
     // see GatewaySettings.liquidityHeatmapTtlMs()). History accumulates client-side.
@@ -1691,10 +1690,10 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (avroCaughtUp.get()) {
             // max-pain + strike-sr are DATABENTO-only Avro, so they bootstrap purely via the Avro consumer.
-            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gamma-migration", "gex-strike-lifecycle"));
+            sendCachedState(session, List.of("snapshot", "pace", "pace-rank", "directional-pressure", "max-pain", "strike-sr", "gex-magnet", "gamma-migration", "gex-strike-lifecycle", "strike-invasion"));
         }
         if (stateCaughtUp.get()) {
-            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "spot-band", "delta-flow", "strike-intel", "strike-invasion", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
+            sendCachedState(session, List.of("vix-price", "index-price", "spx-price", "strike-flow", "spot-band", "delta-flow", "strike-intel", "liquidity-heatmap", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "option-price-behavior", "opb-by-option", "opb-session", "es-gex", "es-strike-intel"));
             replayOptionTruthCachedLegacy(session);
             // dealer-ledger is delivered STANDALONE (its own message.type), never inside the ui-batch,
             // so it replays via its own path rather than sendCachedState's batch envelope.
@@ -2694,6 +2693,10 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // strike-invasion is AVRO (contracts StrikeInvasionSnapshot, per-strike+direction keyed symbol|strike|direction,
+        // SPX-only, NO expiry; a null value is a compaction tombstone). It is rendered back to the exact JSON text of
+        // the JSON era (StrikeInvasionJson) before the unchanged JSON pipeline, so the browser payload is identical.
+        topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2742,10 +2745,6 @@ public class FeedGatewayService implements ReplayRunner {
         // snapshots), broadcast as "hot-strike", cached per symbol + replayed on connect
         // (the strike-cluster idiom; §4.4 gold mark).
         topicEvents.put(settings.hotStrikeTopic(), new TopicBinding("DATABENTO", "hot-strike"));
-        // strike-invasion is plain JSON (StrikeInvasionSnapshot), per-strike+direction keyed
-        // (symbol|strike|direction, SPX-only — NO expiry) — this JSON-state consumer, never the Avro one
-        // (mirrors strike-intel).
-        topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
         // Both dealer-ledger topics bind to ONE event; updateCache tells profile from state by topic name
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
@@ -2925,6 +2924,8 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // Keep cache + live symmetric: strike-invasion is AVRO (see runAvroCacheConsumer).
+        topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -2991,9 +2992,6 @@ public class FeedGatewayService implements ReplayRunner {
         // "strike-cluster" STANDALONE (never cached; re-emitted each dashboard interval).
         topicEvents.put(settings.strikeIntelDashboardTopic(), new TopicBinding("DATABENTO", "strike-cluster"));
         topicEvents.put(settings.hotStrikeTopic(), new TopicBinding("DATABENTO", "hot-strike"));
-        // strike-invasion is plain JSON, per-strike+direction keyed (symbol|strike|direction, no expiry)
-        // — keep the cache + live JSON consumer topic sets symmetric (same rule as strike-intel above).
-        topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
         // Both dealer-ledger topics bind to ONE event; updateCache tells profile from state by topic name
         // and joins them into the single `dealer-ledger` envelope (DealerLedgerJoiner).
         topicEvents.put(settings.dealerLedgerProfileTopic(), new TopicBinding("DATABENTO", "dealer-ledger"));
@@ -13634,7 +13632,30 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The browser JSON of one Kafka value: the canonical SPX spot is Avro rendered to its historical JSON text. */
     private String kafkaJson(String event, boolean avro, Object value) {
-        return "spx-price".equals(event) ? SpxPriceJson.render(mapper, value) : avro ? avroJson(value) : stringJson(value);
+        if ("spx-price".equals(event)) {
+            return SpxPriceJson.render(mapper, value);
+        }
+        if ("strike-invasion".equals(event)) {
+            return strikeInvasionJson(value);
+        }
+        return avro ? avroJson(value) : stringJson(value);
+    }
+
+    /**
+     * The browser JSON of one strike-invasion value: the contracts {@code StrikeInvasionSnapshot} Avro record rendered
+     * to the exact text the retired JSON producer wrote. A null value is the session-boundary compaction tombstone
+     * (no JSON); anything else that is not that record fails loud — never a toString, never a generic rendering.
+     */
+    private String strikeInvasionJson(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof GenericRecord record)
+                || !com.optionsedge.contracts.strikeinvasion.StrikeInvasionAvro.SNAPSHOT_SUBJECT.equals(record.getSchema().getFullName())) {
+            throw new IllegalStateException("strike-invasion: value is not the " + com.optionsedge.contracts.strikeinvasion.StrikeInvasionAvro.SNAPSHOT_SUBJECT
+                    + " Avro record (" + (value instanceof GenericRecord r ? r.getSchema().getFullName() : value.getClass().getName()) + ")");
+        }
+        return com.optionsedge.contracts.strikeinvasion.StrikeInvasionJson.snapshotJson(record);
     }
 
     private String stringJson(Object value) {
@@ -14118,10 +14139,10 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.gammaFragilityTopic(), "gamma-fragility");
                 avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
                 avroTopics.put(settings.underlyingSpxPriceTopic(), "spx-price");
+                avroTopics.put(settings.strikeInvasionTopic(), "strike-invasion");
                 stringTopics.put(settings.databentoStrikeFlowTopic(), "strike-flow");
                 stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), "delta-flow");
                 stringTopics.put(settings.strikeIntelByStrikeTopic(), "strike-intel");
-                stringTopics.put(settings.strikeInvasionTopic(), "strike-invasion");
                 stringTopics.put(settings.corridorGaugeTopic(), "corridor-gauge");
                 stringTopics.put(settings.strikeLiquidityTopic(), "liquidity-heatmap");
                 stringTopics.put(settings.databentoPaceMissionTopic(), "mission-pace");
@@ -14159,7 +14180,7 @@ public class FeedGatewayService implements ReplayRunner {
                 // produces no replay.<runId> strike-invasion topic) — drop it too, so an orchestrated
                 // Databento run never dies waiting on a topic the run does not provide. Windowed
                 // (non-run) historical replay still consumes the live topic above.
-                stringTopics.remove(settings.strikeInvasionTopic());
+                avroTopics.remove(settings.strikeInvasionTopic());
                 // Read the orchestrated run's LOCAL replay topics instead of the live topics.
                 avroTopics = toReplayTopics(avroTopics, params.runId());
                 stringTopics = toReplayTopics(stringTopics, params.runId());

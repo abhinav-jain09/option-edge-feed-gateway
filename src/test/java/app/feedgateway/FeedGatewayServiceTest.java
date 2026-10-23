@@ -6790,29 +6790,28 @@ class FeedGatewayServiceTest {
             assertFalse(methodBody(source, method).contains("strike-sr"),
                     method + " must NOT bind the unified S/R topic (it is Avro, not JSON)");
         }
-        // strike-invasion is genuinely JSON (StrikeInvasionSnapshot), like strike-intel: it must be a
-        // stringTopic in windowed replay (NOT Avro), and bound on the JSON consumers only.
-        assertTrue(source.contains("stringTopics.put(settings.strikeInvasionTopic(), \"strike-invasion\");"),
-                "windowed replay must consume strike-invasion as a JSON stringTopic");
-        assertFalse(source.contains("avroTopics.put(settings.strikeInvasionTopic(), \"strike-invasion\");"),
-                "strike-invasion must never be read via the Avro path");
-        // Run-scoped (orchestrated) replay must DROP it (not in the per-run replicator contract), mirroring
-        // strike-intel / delta-flow / liquidity-heatmap.
-        assertTrue(source.contains("stringTopics.remove(settings.strikeInvasionTopic());"),
+        // strike-invasion is AVRO (StrikeInvasionSnapshot): an avroTopic in windowed replay (never a JSON
+        // stringTopic), bound on the Avro consumers only.
+        assertTrue(source.contains("avroTopics.put(settings.strikeInvasionTopic(), \"strike-invasion\");"),
+                "windowed replay must consume strike-invasion as an Avro topic");
+        assertFalse(source.contains("stringTopics.put(settings.strikeInvasionTopic(), \"strike-invasion\");"),
+                "strike-invasion must never be read via the JSON string path");
+        // Run-scoped (orchestrated) replay must DROP it (not in the per-run replicator contract).
+        assertTrue(source.contains("avroTopics.remove(settings.strikeInvasionTopic());"),
                 "run-scoped replay must exclude strike-invasion (no replay.<runId> topic for it)");
-        for (String method : List.of("runJsonStateCacheConsumer", "runJsonStateLiveConsumer")) {
+        for (String method : List.of("runAvroCacheConsumer", "runAvroLiveConsumer")) {
             assertTrue(methodBody(source, method).contains(
                     "topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding(\"DATABENTO\", \"strike-invasion\"));"),
-                    method + " must bind the DATABENTO strike-invasion topic (JSON)");
+                    method + " must bind the DATABENTO strike-invasion topic (Avro)");
         }
-        for (String method : List.of("runAvroCacheConsumer", "runAvroLiveConsumer")) {
+        for (String method : List.of("runJsonStateCacheConsumer", "runJsonStateLiveConsumer")) {
             assertFalse(methodBody(source, method).contains("strike-invasion"),
-                    method + " must NOT bind strike-invasion (it is JSON, not Avro)");
+                    method + " must NOT bind strike-invasion (it is Avro, not JSON)");
         }
         // Legacy caught-up gating: max-pain (DATABENTO-only Avro) under avroCaughtUp; gex-by-strike
         // (multi-source) under BOTH flags.
         assertTrue(source.contains(
-                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"pace-rank\", \"directional-pressure\", \"max-pain\", \"strike-sr\", \"gex-magnet\", \"gamma-migration\", \"gex-strike-lifecycle\"));"));
+                "sendCachedState(session, List.of(\"snapshot\", \"pace\", \"pace-rank\", \"directional-pressure\", \"max-pain\", \"strike-sr\", \"gex-magnet\", \"gamma-migration\", \"gex-strike-lifecycle\", \"strike-invasion\"));"));
         assertTrue(source.contains("if (avroCaughtUp.get() && stateCaughtUp.get()) {"));
         // gex legacy cached replay is source-aware (no hard IBKR-only filter).
         assertFalse(source.contains(".filter(entry -> \"IBKR\".equals(selection.source()))"));
