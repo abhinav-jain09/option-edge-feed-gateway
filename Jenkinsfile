@@ -239,7 +239,8 @@ pipeline {
       }
     }
     stage('Test') {
-      options { timeout(time: 45, unit: 'MINUTES') }
+      // The worker is bounded to 50 minutes; leave time for setup and evidence collection.
+      options { timeout(time: 60, unit: 'MINUTES') }
       when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
         // Full tests and the footprint campaign consume the exact source/artifact snapshot on es4.
