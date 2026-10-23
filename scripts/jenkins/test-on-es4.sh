@@ -8,7 +8,7 @@ check_window() {
   local weekday hhmm zone
   read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
   [[ $zone = EST || $zone = EDT ]] || { echo 'New York timezone unavailable' >&2; return 1; }
-  # A test run is bounded to 40 minutes: do not start inside the 60-minute pre-open margin.
+  # A test run is bounded to 50 minutes: do not start inside the 60-minute pre-open margin.
   if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then
     echo 'Gateway es4 tests refused: cash-window exclusion is 08:30-16:00 America/New_York.' >&2
     return 1
@@ -195,7 +195,9 @@ scripts/footprint-reverify.sh
 scripts/footprint-reqstate.sh --check
 printf '%s\n' "$CI_SOURCE_SHA" > ../complete.txt
 RUN
-# The complete sequence has an initial 40-minute deadline, not a claim of measured duration.
+# Build #800 passed all 1,617 tests but hit the 40-minute cap near the end of
+# its 50-case mutation campaign. Allow 50 minutes, still below the 60-minute
+# pre-open exclusion margin; retain the CPU, memory, disk and log watchdogs.
 # Successful execution is required before any image is packaged or deployed.
 unit="oe-gateway-$(basename "$dir" | tr '.' '-')"
 stop_unit() { systemctl --user stop "$unit" >/dev/null 2>&1 || true; }
@@ -213,7 +215,7 @@ import os, pathlib, selectors, subprocess, sys, time
 root, unit, java, source, cpus, contracts_version = sys.argv[1:]
 command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=" + unit,
     "--property=MemoryMax=4G", "--property=MemorySwapMax=0", "--property=TasksMax=512",
-    "--property=RuntimeMaxSec=2400", "--property=TimeoutStopSec=10",
+    "--property=RuntimeMaxSec=3000", "--property=TimeoutStopSec=10",
     "--property=KillMode=control-group", "taskset", "--cpu-list", cpus, "env", "-i", "PATH=" + java + "/bin:/usr/bin:/bin",
     "JAVA_HOME=" + java, "JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=" + root + "/tmp",
     "MAVEN_SKIP_RC=true", "MAVEN_OPTS=-Xmx768m -DreuseForks=false -Dmaven.repo.local=" + root + "/cache/repository -Djava.io.tmpdir=" + root + "/tmp",
