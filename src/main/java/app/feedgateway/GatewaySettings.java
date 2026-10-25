@@ -701,7 +701,7 @@ public final class GatewaySettings {
     }
 
     /**
-     * Per-strike strike-invasion topic (JSON {@code StrikeInvasionSnapshot}, one record per
+     * Per-strike strike-invasion topic (Avro {@code StrikeInvasionSnapshot}, one record per
      * {@code symbol|strike} — SPX-only, so there is NO expiry). Broadcast as event
      * {@code "strike-invasion"}. Mirrors the strike-intel topic getter.
      */
