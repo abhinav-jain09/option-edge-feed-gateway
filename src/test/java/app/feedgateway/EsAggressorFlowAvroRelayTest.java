@@ -70,6 +70,13 @@ class EsAggressorFlowAvroRelayTest {
     }
 
     @Test
+    void validAvroOfAnotherRecordIsNotRelayed() throws Exception {
+        String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
+        String k = body(source, "private String kafkaJson(");
+        assertTrue(k.contains("EsAggressorFlowAvro.SUBJECT.equals(r.getSchema().getFullName())") && k.contains(": null;"));
+    }
+
+    @Test
     void theBindingLivesOnTheAvroConsumersOnly() throws Exception {
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         String json1 = body(source, "private void runJsonStateCacheConsumer()");
