@@ -250,7 +250,7 @@ public final class GatewaySettings {
         return value("KAFKA_UNDERLYING_SPX_PRICE_TOPIC", "underlying.spx.price");
     }
 
-    /** Latest continuous ES futures aggressor-flow snapshot (JSON, keyed by ES.v.0). */
+    /** Latest continuous ES futures aggressor-flow snapshot (Avro EsAggressorFlowSnapshot, id 2701, keyed by ES.v.0). */
     public String esAggressorFlowTopic() {
         return value("KAFKA_ES_AGGRESSOR_FLOW_TOPIC", "futures.aggressor-flow");
     }

@@ -2694,6 +2694,7 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        addEsAggressorFlowTopic(topicEvents);
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2814,9 +2815,6 @@ public class FeedGatewayService implements ReplayRunner {
         // advisory, OPTIONAL topic — LONG closeDirectionTtlMs window (verdict class) bounds the seek-back;
         // interim replay freshness is separately bounded (closeDirectionInterimFreshMs).
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
-        if (settings.esAggressorFlowEnabled()) {
-            topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
-        }
         addEsCvdTopics(topicEvents);
         addEsFootprintTopics(topicEvents);
         addEsAuctionTopics(topicEvents);
@@ -2925,7 +2923,21 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        addEsAggressorFlowTopic(topicEvents);
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
+    }
+
+    /**
+     * ES futures aggressor-flow snapshot: AVRO since its 2026-10-25 conversion (contracts 0.38.0, record
+     * {@code com.optionsedge.contracts.esflow.EsAggressorFlowSnapshot}, fixed id 2701), so it is consumed by the Avro
+     * consumers only and rendered through {@link AvroJson}; the browser keeps receiving the JSON snapshot it always has.
+     * The topic is tolerant (see {@link #tolerantTopics()}): a retained or foreign value is dropped, it never stalls the
+     * consumer that carries every other Avro topic.
+     */
+    private void addEsAggressorFlowTopic(Map<String, TopicBinding> topicEvents) {
+        if (settings.esAggressorFlowEnabled()) {
+            topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
+        }
     }
 
     /** Binds one chart relay topic; two roles (or a chart topic and another stream) on one topic would silently route records to the wrong relay, so it refuses to start. */
@@ -3056,9 +3068,6 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the SPX close-direction signal
         // (JSON, standalone/optional — same rule as the open-direction siblings above).
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
-        if (settings.esAggressorFlowEnabled()) {
-            topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
-        }
         addEsCvdTopics(topicEvents);
         addEsFootprintTopics(topicEvents);
         addEsAuctionTopics(topicEvents);
@@ -13071,6 +13080,9 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (settings.breakClassificationEnabled()) {
             topics.add(settings.breakClassificationTopic());
+        }
+        if (settings.esAggressorFlowEnabled()) {
+            topics.add(settings.esAggressorFlowTopic());
         }
         return topics;
     }
