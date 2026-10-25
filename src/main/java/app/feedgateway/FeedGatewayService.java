@@ -13647,8 +13647,8 @@ public class FeedGatewayService implements ReplayRunner {
     /** The browser JSON of one Kafka value: the canonical SPX spot is Avro rendered to its historical JSON text. */
     private String kafkaJson(String event, boolean avro, Object value) {
         if ("es-aggressor-flow".equals(event)) {
-            // ONE fixed contract (id 2701, record name = subject): valid Avro of any other record is dropped, never relayed
-            return value instanceof GenericRecord r && com.optionsedge.contracts.esflow.EsAggressorFlowAvro.SUBJECT.equals(r.getSchema().getFullName())
+            // ONE fixed contract (id 2701 = exactly this schema; a later version is its own reviewed change): any other schema is dropped, never relayed
+            return value instanceof GenericRecord r && com.optionsedge.contracts.esflow.EsAggressorFlowAvro.schema().equals(r.getSchema())
                     ? avroJson(value) : null;
         }
         return "spx-price".equals(event) ? SpxPriceJson.render(mapper, value) : avro ? avroJson(value) : stringJson(value);
