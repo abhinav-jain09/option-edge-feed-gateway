@@ -243,16 +243,21 @@ pipeline {
       options { timeout(time: 60, unit: 'MINUTES') }
       when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
+        // A previous build's Jib run leaves its cache and digest under ci/jib-image/target (gitignored, so
+        // the checkout keeps it). Only the Image stage's own verify may admit that directory; every earlier
+        // verify of the primary checkout refuses it as undeclared output (#804, #808). Clear it before the
+        // first verify so the tree is exactly what THIS build has written so far.
+        sh 'rm -rf ci/jib-image/target'
         // Full tests and the footprint campaign consume the exact source/artifact snapshot on es4.
         // Native package/image stages retain their original source and artifact guards.
         timeout(time: 10, unit: 'MINUTES') {
-          sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored ci/jib-image/target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+          sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
         }
         sh 'python3 scripts/jenkins/test-on-es4-test.py'
         sh 'python3 scripts/jenkins/es4-test-receipt-test.py'
         sh 'python3 scripts/footprint-reverify-capture-test.py'
         timeout(time: 10, unit: 'MINUTES') {
-          sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored ci/jib-image/target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+          sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
         }
         sh 'bash scripts/jenkins/test-on-es4.sh'
       }
@@ -316,7 +321,7 @@ pipeline {
             // output, the per-workspace Maven repository, the contracts clone (verified on its own before its install),
             // the provenance files, .jenkins-tmp/ and Python bytecode from the footprint scripts.
             timeout(time: 10, unit: 'MINUTES') {
-              sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored ci/jib-image/target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+              sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
             }
             // An unchanged source can still have a newly built bound contracts JAR. Drop the
           // previous Boot archive so incremental packaging cannot retain an older dependency.
@@ -529,7 +534,7 @@ EOF
                   sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
                 }
                 timeout(time: 10, unit: 'MINUTES') {
-                  sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored ci/jib-image/target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+                  sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
                 }
                 sh 'docker buildx build --builder "${BUILDER_NAME}" --platform "${BUILD_PLATFORM}" --no-cache --label "options-edge.contracts-revision=${LABEL_CONTRACTS_REVISION}" --label "options-edge.source-revision=${LABEL_SOURCE_REVISION}" --label "options-edge.jar-sha256=${LABEL_JAR_SHA256}" --label "options-edge.contracts-jar-sha256=${LABEL_CONTRACTS_JAR_SHA256}" --label "options-edge.guard-version=${LABEL_GUARD_VERSION}" -t "${IMAGE_REF_1}" -t "${IMAGE_REF_2}" --metadata-file "${PUSH_METADATA}" --output "${BUILD_OUTPUT}" .'
               } else {
@@ -537,7 +542,7 @@ EOF
                   sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
                 }
                 timeout(time: 10, unit: 'MINUTES') {
-                  sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored ci/jib-image/target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+                  sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
                 }
                 sh 'docker buildx build --builder "${BUILDER_NAME}" --platform "${BUILD_PLATFORM}" --no-cache --label "options-edge.contracts-revision=${LABEL_CONTRACTS_REVISION}" --label "options-edge.source-revision=${LABEL_SOURCE_REVISION}" --label "options-edge.jar-sha256=${LABEL_JAR_SHA256}" --label "options-edge.contracts-jar-sha256=${LABEL_CONTRACTS_JAR_SHA256}" --label "options-edge.guard-version=${LABEL_GUARD_VERSION}" -t "${IMAGE_REF_1}" --metadata-file "${PUSH_METADATA}" --output "${BUILD_OUTPUT}" .'
               }
