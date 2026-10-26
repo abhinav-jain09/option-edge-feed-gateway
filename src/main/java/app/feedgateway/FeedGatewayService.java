@@ -2888,6 +2888,11 @@ public class FeedGatewayService implements ReplayRunner {
             // per-timeframe latest-record retention for the hello and recovers it the way the structure record does: a seek-back
             // on cold start / retry / adoption, private staging until the captured end offsets are consumed, then one promotion.
             topicEvents.put(settings.marketStructurePatternsTopic(), new TopicBinding("DATABENTO", "market-structure-patterns"));
+            if (settings.marketStructureEstimatePatternsEnabled()) {
+                // dev only: the pre-market estimate sets join the SAME event and retention (newest asOfMs per timeframe wins), so the
+                // regular sets replace them at the cash open; the staged recovery below compares asOfMs the same way across both topics
+                topicEvents.put(settings.marketStructureEstimatePatternsTopic(), new TopicBinding("DATABENTO", "market-structure-patterns"));
+            }
         }
         if (settings.structureToolsEnabled()) {
             bindChartTopic(topicEvents, settings.structureToolsTopic(), TimeframeSetRelay.TOOLS_EVENT);
@@ -13060,6 +13065,9 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (settings.marketStructurePatternsEnabled()) {
             topics.add(settings.marketStructurePatternsTopic());
+            if (settings.marketStructureEstimatePatternsEnabled()) {
+                topics.add(settings.marketStructureEstimatePatternsTopic());
+            }
         }
         if (settings.studiesEnabled()) {
             topics.addAll(settings.studiesBarsTopics());
@@ -13215,7 +13223,8 @@ public class FeedGatewayService implements ReplayRunner {
     /** With the stream OFF the only pattern metric is the enabled gauge — the metrics text is otherwise what it was (R6.4 flag-off contract). */
     private String marketStructurePatternsCounterMetrics() {
         if (!settings.marketStructurePatternsEnabled()) return "";
-        return "# HELP gateway_market_structure_patterns_drops_total market-structure-patterns sets dropped at the gateway boundary (invalid, oversize, tombstone).\n"
+        return (settings.marketStructureEstimatePatternsEnabled() ? "gateway_market_structure_estimate_patterns_enabled 1\n" : "")
+                + "# HELP gateway_market_structure_patterns_drops_total market-structure-patterns sets dropped at the gateway boundary (invalid, oversize, tombstone).\n"
                 + "# TYPE gateway_market_structure_patterns_drops_total counter\n"
                 + "gateway_market_structure_patterns_drops_total " + marketStructurePatternsDrops.get() + "\n"
                 + "# HELP gateway_market_structure_patterns_regressions_total market-structure-patterns sets refused because their asOfMs regressed.\n"
