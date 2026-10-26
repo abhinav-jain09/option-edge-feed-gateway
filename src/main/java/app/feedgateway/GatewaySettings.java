@@ -340,6 +340,22 @@ public final class GatewaySettings {
     }
 
     /**
+     * The dev-only pre-market estimate pattern sets (processing market-structure-service
+     * PREMARKET-ESTIMATE-CANDLESTICK-PATTERNS-REQUIREMENT.md P6): the same {@code PatternAnnotationSet} records, built on the ES estimate
+     * candles, on a topic of their own so that no reader of the regular topic ever sees one. They feed the SAME per-timeframe retention
+     * and the SAME {@code market-structure-patterns} event as the regular sets, so the set with the newest {@code asOfMs} wins and the
+     * regular sets take over from the estimate at the cash open without the page doing anything. OFF by default, needs the patterns
+     * stream itself, and is never set on production.
+     */
+    public String marketStructureEstimatePatternsTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_ESTIMATE_PATTERNS_TOPIC", "options.spx.market-structure.estimate.patterns");
+    }
+
+    public boolean marketStructureEstimatePatternsEnabled() {
+        return marketStructurePatternsEnabled() && boolValue("GATEWAY_MARKET_STRUCTURE_ESTIMATE_PATTERNS_ENABLED", false);
+    }
+
+    /**
      * INDICATOR-STUDIES studies relay (frames {@code indicator-studies} / {@code indicator-studies-current} and the hello's study
      * fields; options-edge-processing docs/ta-books/catalog/STUDIES-FRAME-CONTRACT.md). OFF by default: absent study fields in the hello are how the
      * page learns this gateway has no study stream.
