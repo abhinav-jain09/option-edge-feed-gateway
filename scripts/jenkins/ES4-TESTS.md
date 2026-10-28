@@ -112,6 +112,28 @@ supplied through MAVEN_OPTS. Transport fixtures require the property; a negative
 control removes it and cannot create a passing receipt. A fresh real Jenkins run
 still must qualify the full suite and campaign under the unchanged limits.
 
+## The contracts version every maven resolves
+
+The transport installs contracts from main's tip, so the version it carries is not the version this
+pom pins, and the pin goes stale on every contracts release. `run-tests.sh` names the installed
+version on the full suite's own `mvn` command line. The footprint campaign's `mvn` cannot be told
+that way: its argv comes from the committed `scripts/footprint-campaign.spec.json` and is part of
+the claim each row of `ES-FOOTPRINT-CAMPAIGN.json` makes, so it carries no per-build version. Until
+build #826 nothing supplied one, and the campaign's BASELINE resolved the pin, missed it in this
+build's private repository, went to the network and reported `BASELINE IS RED` before a single
+mutation ran — with nothing in the console log, because run-tests.sh writes to `test.log`.
+
+So the version is supplied as environment, beside the repository that holds the jar: the transport
+writes `.mvn/maven.config` in the RUN ROOT, which maven finds by walking up from the project
+directory, so the verified checkout is untouched. The two mechanisms that look obvious do not work
+and were measured, not argued: a `-D` in `MAVEN_OPTS` is a JVM system property and LOSES to a pom
+property, and `MAVEN_ARGS` needs maven 3.9 where es4 has 3.6.3.
+
+Validation: the fixture runs the campaign's unqualified `mvn` exactly as the spec does, and the stub
+resolves the version the way maven does — command line, then the nearest `.mvn/maven.config` walking
+up, then the pom — and refuses any version that is not an artifact in the run's own repository. With
+the run-root write removed, three of the eighteen cases go red on the message build #825 died on.
+
 ## Campaign evidence capture
 
 Run 739 passed all 1,403 full-suite tests and ran all 50 mutations (49 KILLED,

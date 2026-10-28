@@ -30,8 +30,13 @@ while [ $# -gt 0 ]; do case "$1" in --dir) dir=$2;shift 2;; --allow-ignored) shi
 test "$(git -C "$dir" rev-parse HEAD)" = "$PERMITTED_SHA"
 ''')
         self.script(self.repo / "scripts/jenkins/permitted-sha-guard-version.sh", 'shasum -a 256 "$1" | cut -d" " -f1')
-        for name in ("footprint-reverify.sh", "footprint-reqstate.sh"):
-            self.script(self.repo / "scripts" / name, 'echo footprint-check')
+        # The campaign's maven is the one that broke: scripts/footprint-campaign.spec.json names
+        # `mvn -B test -Dtest=Footprint*,...` and NOTHING else, because that argv is part of the
+        # committed campaign record. The fixture runs it the same way, so the stub below is asked
+        # the real question — what does a maven with no version of its own resolve?
+        self.script(self.repo / "scripts/footprint-reverify.sh",
+                    'echo footprint-check\nmvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false')
+        self.script(self.repo / "scripts/footprint-reqstate.sh", 'echo footprint-check')
         self.script(self.jdk / "bin/java", 'echo \'openjdk version "21"\' >&2')
         self.maven(0)
         self.script(self.bin / "date", 'printf "%s\\n" "${CI_FAKE_DATE:-6 0700 EDT}"')
@@ -123,8 +128,34 @@ if [ "$*" = -version ]; then echo "Apache Maven fixture"; exit 0; fi
 # The remote test MUST be told the contracts version the build installed. Without this the mvn
 # here falls back to the pom's pin, which goes stale the moment contracts main bumps — the exact
 # failure this assertion exists to make impossible to reintroduce silently.
-[[ "$*" = *-Doptions-edge-contracts.version=0.8.0* ]] || { echo "Missing installed contracts version override: $*"; exit 5; }
 [[ ${CI_CONTRACTS_VERSION:-} = 0.8.0 ]] || { echo "CI_CONTRACTS_VERSION not passed through env -i"; exit 6; }
+# TWO invocations with different obligations. The full suite is run by run-tests.sh, which names the
+# installed version itself — that is asserted outright. The campaign's comes from the committed spec
+# and names nothing, so it is resolved the way maven resolves it: a -D on the command line wins,
+# else the nearest .mvn/maven.config walking UP from the project directory, else the pom's own
+# property. Whatever that yields must be an artifact in this run's private repository, or this stub
+# fails with the message real maven gave in build #825.
+if [[ "$*" = *-Dtest=Footprint* ]]; then
+    version=""
+    for arg in "$@"; do case "$arg" in -Doptions-edge-contracts.version=*) version=${arg#*=};; esac; done
+    if [ -z "$version" ]; then
+        dir=$PWD
+        while [ "$dir" != / ]; do
+            if [ -f "$dir/.mvn/maven.config" ]; then
+                version=$(sed -n 's/^-Doptions-edge-contracts[.]version=//p' "$dir/.mvn/maven.config" | tail -1)
+                break
+            fi
+            dir=$(dirname "$dir")
+        done
+    fi
+    [ -n "$version" ] || version=$(tr -d ' \t\n' < pom.xml | sed -e 's|.*<options-edge-contracts[.]version>||' -e 's|<.*||')
+    repository=${MAVEN_OPTS#*-Dmaven.repo.local=}; repository=${repository%% *}
+    [ -f "$repository/com/optionsedge/options-edge-contracts/$version/options-edge-contracts-$version.jar" ] || {
+        echo "[ERROR] Could not resolve dependencies: Could not find artifact com.optionsedge:options-edge-contracts:jar:$version"
+        exit 1; }
+else
+    [[ "$*" = *-Doptions-edge-contracts.version=0.8.0* ]] || { echo "Missing installed contracts version override: $*"; exit 5; }
+fi
 mkdir -p "$CI_GATEWAY_DIR/target/surefire-reports"
 printf '<testsuite tests="1" failures="0"/>' > "$CI_GATEWAY_DIR/target/surefire-reports/TEST-fixture.xml"
 echo finite-maven-stub
@@ -237,6 +268,32 @@ exit %d
         out = self.repo / ".jenkins-tmp/es4-tests-123"
         self.assertIn("Missing installed contracts version override", (out / "test.log").read_text())
         self.assertFalse((out / "receipt.json").exists())
+
+    def test_the_campaigns_unqualified_maven_resolves_the_installed_version(self):
+        """The campaign's maven carries no version of its own, so the run root's .mvn/maven.config is the
+        only thing that can point it at the jar this build installed. The pom here pins 0.9.0 and only
+        0.8.0 exists in the private repository, so a run that completes is a run whose campaign maven
+        resolved 0.8.0 — the stub resolves it exactly as maven does and refuses otherwise."""
+        self.stale_pom_pin()
+        self.run_transport()
+        import json
+        receipt = json.loads((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").read_text())
+        self.assertEqual("PASS", receipt["status"])
+        self.assertIn("footprint-check", (self.repo / ".jenkins-tmp/es4-tests-123/test.log").read_text())
+
+    def test_without_the_run_root_pin_the_campaigns_maven_resolves_the_stale_pin(self):
+        """The negative control, and it reproduces build #825 exactly: with the write removed, the
+        campaign's maven falls back to the pom's 0.9.0, which is not in this build's repository."""
+        self.stale_pom_pin()
+        body = self.runner.read_text()
+        needle = """printf -- '-Doptions-edge-contracts.version=%s\\n' "$cv" > .mvn/maven.config"""
+        self.assertIn(needle, body)
+        self.runner.write_text(body.replace(needle, ":"))
+        self.run_transport(1)
+        out = self.repo / ".jenkins-tmp/es4-tests-123"
+        log = (out / "test.log").read_text()
+        self.assertIn("Could not find artifact com.optionsedge:options-edge-contracts:jar:0.9.0", log)
+        self.assertFalse((out / "complete.txt").exists())
 
     def test_cash_window_refuses_before_any_transport(self):
         self.env["CI_FAKE_DATE"] = "1 0900 EDT"

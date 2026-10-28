@@ -173,6 +173,21 @@ cv=$(cat .contracts-version)
 [[ $cv =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 64
 jar="cache/repository/com/optionsedge/options-edge-contracts/$cv/options-edge-contracts-$cv.jar"
 [ "$(sha256sum "$jar" | cut -d' ' -f1)" = "$(cat .contracts-jar-sha256)" ] || exit 1
+# EVERY maven in this run must resolve the contracts jar this build INSTALLED, not the pom's pin.
+# The suite names the version on its own command line, but the footprint campaign's maven comes from a
+# COMMITTED spec whose argv is part of the campaign record and so cannot carry a per-build version. With
+# nothing else to tell it, the campaign's BASELINE resolved the stale pin, found no such jar in this
+# build's private repository, went to the network and reported "BASELINE IS RED — refusing to run a
+# campaign against a failing suite" before a single mutation ran. Every gateway build failed that way
+# from the moment contracts main moved past the pin, and the console log showed none of it, because
+# run-tests.sh writes to test.log.
+#
+# maven.config goes in the RUN ROOT, not in the gateway checkout: maven walks UP from the project
+# directory to find .mvn, so the checkout stays exactly the tree verify-permitted-tree just passed.
+# MAVEN_OPTS cannot carry it (a JVM system property loses to a pom property) and MAVEN_ARGS needs
+# maven 3.9, where es4 has 3.6.3 — both measured, neither assumed.
+mkdir -p .mvn
+printf -- '-Doptions-edge-contracts.version=%s\n' "$cv" > .mvn/maven.config
 "$java_home/bin/java" -version
 cat > run-tests.sh <<'RUN'
 #!/usr/bin/env bash
