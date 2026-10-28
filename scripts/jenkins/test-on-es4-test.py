@@ -311,26 +311,18 @@ exit %d
         self.run_transport(1)
         self.assertFalse((self.root / "calls").exists())
 
-    def test_an_unwaived_run_is_bounded_to_the_fifty_minutes_the_pre_open_margin_allows(self):
-        # 50 minutes is not a taste: it is what fits inside the 60-minute pre-open margin, so an
-        # out-of-hours run that starts at the last permitted moment still ends before the open.
-        self.run_transport()
-        self.assertIn("--property=RuntimeMaxSec=3000", (self.root / "unit-argv").read_text())
-
-    def test_a_waived_run_is_bounded_to_the_ninety_minutes_the_work_actually_needs(self):
-        # Builds 812 and 813 passed all 1,632 tests and then died at 50 minutes with the campaign
-        # at 48 and 38 of its 50 cases. A waived run is already inside the session, so the margin
-        # has nothing left to protect and the bound can cover the measured ~52 minutes with room.
-        self.env["CI_FAKE_DATE"] = "1 0900 EDT"
-        self.env["ALLOW_CASH_WINDOW"] = "true"
+    def test_the_run_is_bounded_to_the_ninety_minutes_the_work_measures(self):
+        # 90 is from the record, not from a margin: 12.4 minutes for the suite and 37.6 for the
+        # 50-case campaign in build 815 is 50.0 measured, and #800 at 40 and 812/813 at 50 are the
+        # three builds that died at a cap with every test passing.
         self.run_transport()
         self.assertIn("--property=RuntimeMaxSec=5400", (self.root / "unit-argv").read_text())
 
-    def test_the_bound_is_the_only_unit_property_the_waiver_changes(self):
-        # A longer run must not quietly come with a larger memory, task or swap allowance: the
-        # waiver answers one question, and every other limit on the live box stays as shipped.
-        # Only the properties are compared: the unit name and the private run directory carry a
-        # fresh random component per run, so the raw argv differs for reasons that are not limits.
+    def test_the_waiver_changes_no_unit_property_at_all(self):
+        # The waiver says a run may START inside the session. It says nothing about how long the work
+        # takes, so it must not reach the bound, nor the memory, task or swap allowance. Only the
+        # properties are compared: the unit name and the private run directory carry a fresh random
+        # component per run, so the raw argv differs for reasons that are not limits.
         def properties():
             words = (self.root / "unit-argv").read_text().split()
             return [w for w in words if w.startswith("--property=")]
@@ -341,12 +333,60 @@ exit %d
         self.env["ALLOW_CASH_WINDOW"] = "true"
         self.run_transport()
         waived = properties()
-        self.assertNotEqual(plain, waived)
-        self.assertEqual(["--property=RuntimeMaxSec=3000"], [w for w in plain if "RuntimeMaxSec" in w])
-        self.assertEqual(["--property=RuntimeMaxSec=5400"], [w for w in waived if "RuntimeMaxSec" in w])
-        strip = lambda ws: [w for w in ws if "RuntimeMaxSec" not in w]
-        self.assertEqual(strip(plain), strip(waived))
+        self.assertEqual(plain, waived)
+        self.assertEqual(["--property=RuntimeMaxSec=5400"], [w for w in plain if "RuntimeMaxSec" in w])
         self.assertIn("--property=MemoryMax=4G", plain)
+
+    def test_the_exclusion_starts_a_full_bound_plus_margin_before_the_open(self):
+        # The bound and the boundary are one fact stated twice. 07:29 is the last permitted start, and
+        # a run that takes the whole 90 minutes from there releases es4 at 08:59 — half an hour before
+        # the 09:30 open. 07:30 is already refused, so the margin can never be less than that.
+        # --check-window is the script's own entry point for this and runs no transport, so each case
+        # is a verdict on the clock alone rather than a run that would claim this build's directory.
+        for hhmm, refused in (("0729", False), ("0730", True), ("0829", True), ("1559", True),
+                              ("1600", False), ("2359", False)):
+            with self.subTest(hhmm=hhmm):
+                env = dict(self.env, CI_FAKE_DATE=f"1 {hhmm} EDT")
+                result = subprocess.run(["bash", str(self.runner), "--check-window"], cwd=self.repo,
+                                        env=env, text=True, capture_output=True, timeout=30)
+                self.assertEqual(1 if refused else 0, result.returncode, result.stderr[-500:])
+                self.assertEqual(refused, "cash-window exclusion is 07:30-16:00" in result.stderr)
+
+    def test_every_copy_of_the_exclusion_compares_against_the_same_boundary(self):
+        # The boundary is written three times: once on the caller and twice inside the es4 heredoc. The
+        # --check-window test above exercises only the caller, so a remote copy left at 08:30 would pass
+        # it. Every weekday-window comparison in the script is extracted here instead, so a copy that
+        # moves alone is a failure wherever it lives.
+        hhmm = re.findall(r'"\$hhmm" -ge (\d{4})', SOURCE.read_text())
+        self.assertEqual(3, len(hhmm), hhmm)
+        self.assertEqual({"0730"}, set(hhmm))
+        ends = re.findall(r'"\$hhmm" -lt (\d{4})', SOURCE.read_text())
+        self.assertEqual(["1600"] * 3, ends)
+
+    def test_the_es4_side_refuses_the_window_with_the_callers_check_removed(self):
+        # The caller refuses first, so nothing else would ever reach the two copies on es4. With the
+        # caller's call deleted the transport runs into them, and a weekday 07:30 without the waiver has
+        # to die there rather than start a unit that would still be running into the pre-open margin.
+        body = self.runner.read_text()
+        self.assertIn("\ncheck_window\n", body)
+        self.runner.write_text(body.replace("\ncheck_window\n", "\n", 1))
+        self.env["CI_FAKE_DATE"] = "1 0730 EDT"
+        self.run_transport(1)
+        # No receipt and no completion marker: the refusal happened before anything ran, not after.
+        out = self.repo / ".jenkins-tmp/es4-tests-123"
+        self.assertFalse((out / "complete.txt").exists())
+        self.assertFalse((out / "receipt.json").exists())
+
+    def test_a_weekend_start_is_never_in_the_exclusion_however_the_clock_reads(self):
+        # The exclusion is a weekday fact. A Saturday 09:00 looks exactly like the refused weekday
+        # case on the clock alone, so a boundary check that dropped the weekday test would still pass
+        # every case above and refuse every weekend build.
+        for day in ("6", "7"):
+            with self.subTest(day=day):
+                env = dict(self.env, CI_FAKE_DATE=f"{day} 0900 EDT")
+                result = subprocess.run(["bash", str(self.runner), "--check-window"], cwd=self.repo,
+                                        env=env, text=True, capture_output=True, timeout=30)
+                self.assertEqual(0, result.returncode, result.stderr[-500:])
 
     def test_an_explicit_waiver_runs_inside_the_cash_window_on_both_sides_of_the_transport(self):
         # The es4 side checks the window twice more, with the waiver carried as a positional, so a run
@@ -418,7 +458,7 @@ class StageBackstopTest(unittest.TestCase):
     JENKINSFILE = Path(__file__).resolve().parents[2] / "Jenkinsfile"
 
     def worker_bounds(self):
-        # Both literals, as the script assigns them: whichever is larger is what the stage has to outlast.
+        # Every literal the script assigns, so a bound added later is still what the stage must outlast.
         return [int(m) for m in re.findall(r"run_bound_sec=(\d+)", SOURCE.read_text())]
 
     def stage_backstop(self):
@@ -441,10 +481,11 @@ class StageBackstopTest(unittest.TestCase):
         # 90 leaves 25, so the number may be raised to what is measured without the test moving.
         self.assertGreaterEqual(self.stage_backstop() - max(self.worker_bounds()), 20 * 60)
 
-    def test_both_bounds_are_still_readable_where_the_backstop_reads_them(self):
-        # A negative control for the two assertions above: if either literal stops being found, the max()
-        # silently narrows or raises, and a vacuous pass would be worse than a failure.
-        self.assertEqual([3000, 5400], sorted(self.worker_bounds()))
+    def test_the_bound_is_still_readable_where_the_backstop_reads_it(self):
+        # A negative control for the two assertions above: if the literal stops being found, the max()
+        # raises or narrows, and a vacuous pass would be worse than a failure. It is one bound, so a
+        # second one appearing is a finding too — that is the shape build 814 came from.
+        self.assertEqual([5400], self.worker_bounds())
 
 
 if __name__ == "__main__":

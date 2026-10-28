@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # es4 carries the live session: it runs the one auction tracker, and a published auction minute can
-# never be re-admitted, so the default is to keep a 50-minute two-core test run off it until the close.
+# never be re-admitted, so the default is to keep a 90-minute two-core test run off it until the close.
 # ALLOW_CASH_WINDOW=true is an explicit per-build waiver, for the case where an image is needed INSIDE
 # the session; it is never a default and never inferred from anything else. Any other value is a
 # refusal rather than a fallback to either one: reading a typo as false would pass a build whose
@@ -20,10 +20,15 @@ check_window() {
   local weekday hhmm zone
   read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
   [[ $zone = EST || $zone = EDT ]] || { echo 'New York timezone unavailable' >&2; return 1; }
-  # An unwaived run is bounded to 50 minutes: do not start inside the 60-minute pre-open margin.
-  if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then
+  # The run is bounded to 90 minutes everywhere, so the exclusion starts 120 minutes before the 09:30
+  # open: a start at the last permitted moment, 07:29, releases the box by 08:59. The bound and this
+  # boundary are the SAME fact stated twice and have to move together — 2 hours of margin for a 90
+  # minute run. Keeping the bound at what the margin allowed instead is what failed: at 50 minutes it
+  # was under the 50.0 the work measures (12.4 for the suite, 37.6 for the campaign, build 815), so
+  # every ordinary run was a coin flip on how loaded es4 happened to be.
+  if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0730 ] && [ "$hhmm" -lt 1600 ]; then
     [ "$allow_cash_window" = true ] || {
-      echo 'Gateway es4 tests refused: cash-window exclusion is 08:30-16:00 America/New_York.' >&2
+      echo 'Gateway es4 tests refused: cash-window exclusion is 07:30-16:00 America/New_York.' >&2
       return 1
     }
     echo 'Gateway es4 tests START INSIDE the cash window on an explicit ALLOW_CASH_WINDOW=true waiver.' >&2
@@ -173,7 +178,7 @@ case $allow_cash_window in true|false) ;; *) exit 64 ;; esac
 [ "$java_home" = /usr/lib/jvm/java-21-openjdk ] || exit 64
 read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
 [[ $zone = EST || $zone = EDT ]] || exit 1
-if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ] && [ "$allow_cash_window" != true ]; then exit 1; fi
+if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0730 ] && [ "$hhmm" -lt 1600 ] && [ "$allow_cash_window" != true ]; then exit 1; fi
 cd "$dir"
 sha256sum -c inputs.sha256
 [ "$(cat .contracts-sha)" = "$contracts_sha" ] || exit 1
@@ -228,34 +233,31 @@ scripts/footprint-reverify.sh
 scripts/footprint-reqstate.sh --check
 printf '%s\n' "$CI_SOURCE_SHA" > ../complete.txt
 RUN
-# Two caps, because they answer two different questions. An ordinary out-of-hours run must finish
-# before the open, so it keeps the 50 minutes that sit inside the 60-minute pre-open margin: that
-# margin is the ONLY reason the number is 50, and build #800 showed 40 was too few. Measured on
-# builds 812 and 813 the work does not fit 50 either: the suite takes 9-11 minutes and the 50-case
-# campaign ran 48 of 50 in the 39 minutes left, so ~52 minutes is the honest figure, and both builds
-# died at the cap with every one of the 1,632 tests passing. A WAIVED run is already inside the
-# session by explicit decision, so the pre-open margin has nothing left to protect and the cap can
-# be what the work needs: 90 minutes, with real headroom over the measured 52 rather than another
-# number the campaign will grow past. The CPU, memory, disk and log watchdogs are unchanged in
-# both cases, and successful execution is still required before any image is packaged or deployed.
-if [ "$allow_cash_window" = true ]; then run_bound_sec=5400; else run_bound_sec=3000; fi
+# ONE cap, because the work takes what it takes and the waiver is not a statement about that. The
+# number comes from the record: 12.4 minutes for the 1,632-test suite and 37.6 for the 50-case
+# campaign in build 815, so 50.0 is the measured figure, and build #800 at 40 and builds 812 and 813
+# at 50 are the three that died at a cap with every test passing. 90 leaves real headroom instead of
+# another number the campaign grows past. A cap below what the work needs buys nothing: it does not
+# protect the open, which the start-time exclusion above does, it just converts a slow box into a
+# failed build 50 minutes later with no verdict. The CPU, memory, disk and log watchdogs are
+# unchanged, and successful execution is still required before any image is packaged or deployed.
+run_bound_sec=5400
 unit="oe-gateway-$(basename "$dir" | tr '.' '-')"
 stop_unit() { systemctl --user stop "$unit" >/dev/null 2>&1 || true; }
 trap stop_unit EXIT
 trap 'exit 143' HUP INT TERM
 read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
 [[ $zone = EST || $zone = EDT ]] || exit 1
-if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ] && [ "$allow_cash_window" != true ]; then exit 1; fi
+if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0730 ] && [ "$hhmm" -lt 1600 ] && [ "$allow_cash_window" != true ]; then exit 1; fi
 # User-systemd owns every descendant, including TERM-resistant/orphaned processes.
 # The Kafka test container separately has 2 GiB / one CPU limits; planned total is 8 GiB.
 cpu_list=$(cat "$dir/cpus.txt")
 [[ $cpu_list =~ ^[0-9]+,[0-9]+$ ]] || exit 64
 python3 - "$dir" "$unit" "$java_home" "$source_sha" "$cpu_list" "$cv" "$run_bound_sec" <<'SUPERVISE'
 import os, pathlib, selectors, subprocess, sys, time
-# The bound is not validated here: it is one of two literals assigned a few lines above, from an
-# allow_cash_window this side already refused unless it was exactly true or false. A check for a
-# third value would be a guard against a state that cannot occur, and reading it as a promise of
-# one would be worse than having none.
+# The bound is not validated here: it is a single literal assigned a few lines above, with nothing
+# between that assignment and this argv that could change it. A check would be a guard against a
+# state that cannot occur, and reading it as a promise of one would be worse than having none.
 root, unit, java, source, cpus, contracts_version, run_bound_sec = sys.argv[1:]
 command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=" + unit,
     "--property=MemoryMax=4G", "--property=MemorySwapMax=0", "--property=TasksMax=512",
