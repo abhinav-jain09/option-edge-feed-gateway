@@ -1250,6 +1250,10 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void stageMarketStructure(MarketStructureRecovery recovery, ConsumerRecord<?, ?> record, String json) {
+        if (record.value() == null && isEstimateStructureTopic(record.topic())) {
+            marketStructureDrops.incrementAndGet();   // a withdrawal on the estimate topic never erases the shared retention
+            return;
+        }
         if (record.value() == null) {
             recovery.json = null;
             recovery.asOf = -1L;
@@ -12903,11 +12907,16 @@ public class FeedGatewayService implements ReplayRunner {
         if (!"market-structure".equals(event)) {
             return;
         }
-        if (record.value() == null) {
+        if (record.value() == null && !isEstimateStructureTopic(record.topic())) {
             marketStructureLatest.set(null);
             marketStructureAsOfMs = -1L;
         }
         marketStructureDrops.incrementAndGet();
+    }
+
+    /** The dev-only estimate structure topic shares the regular retention, so only its records (never its withdrawals) may enter it. */
+    private boolean isEstimateStructureTopic(String topic) {
+        return settings.marketStructureEstimateEnabled() && settings.marketStructureEstimateTopic().equals(topic);
     }
 
     LevelSignalView.Reading levelSignals(String date, String tf) {

@@ -68,6 +68,18 @@ class MarketStructureEstimateUiTest {
     }
 
     @Test
+    void aWithdrawalOnTheEstimateTopicNeverErasesTheSharedRetentionButTheRegularOneStill() {
+        var s = service();
+        String regular = TaFixtures.frame(TaFixtures.uiProjection(2000L));
+        assertTrue(s.retainMarketStructure(2000L, regular));
+        s.evictMarketStructureTombstone("market-structure", new ConsumerRecord<>(ESTIMATE.topic(), 0, 1L, "k", null));
+        assertEquals(regular, s.marketStructureLatestForTest().get(), "the estimate topic's tombstone is only counted");
+        assertFalse(s.retainMarketStructure(1000L, TaFixtures.frame(TaFixtures.uiProjection(1000L))), "the baseline survived: an old estimate record is still refused");
+        s.evictMarketStructureTombstone("market-structure", new ConsumerRecord<>(REGULAR.topic(), 0, 1L, "k", null));
+        assertNull(s.marketStructureLatestForTest().get(), "the regular topic's tombstone still withdraws");
+    }
+
+    @Test
     void bothTopicsAreBoundToTheSameEventOnlyWhenTheEstimateFlagIsOn() throws Exception {
         String source = Files.readString(Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
         assertTrue(source.contains("if (settings.marketStructureEstimateEnabled()) {\n                // dev only"));
