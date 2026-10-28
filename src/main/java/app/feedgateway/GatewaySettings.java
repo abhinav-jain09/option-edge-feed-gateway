@@ -326,6 +326,21 @@ public final class GatewaySettings {
     }
 
     /**
+     * The dev-only pre-market estimate structure record (processing market-structure-service, session profile PREMARKET_ESTIMATE): the
+     * same {@code market-structure.levels} record, built on the ES estimate candles, on a topic of its own so that no reader of the
+     * regular topic ever sees one. It feeds the SAME retention and the SAME {@code market-structure} event as the regular record, so the
+     * record with the newest {@code asOfMs} wins and the regular record takes over from the estimate at the cash open without the page
+     * doing anything. OFF by default, needs the structure stream itself, and is never set on production.
+     */
+    public String marketStructureEstimateTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_ESTIMATE_TOPIC", "options.spx.market-structure.estimate.ui");
+    }
+
+    public boolean marketStructureEstimateEnabled() {
+        return marketStructureEnabled() && boolValue("GATEWAY_MARKET_STRUCTURE_ESTIMATE_ENABLED", false);
+    }
+
+    /**
      * Candlestick pattern annotations for the Context Tape PATTERNS layer (processing
      * CANDLESTICK-PATTERN-REQUIREMENT.md R6.2/R6.4: one {@code PatternAnnotationSet} per timeframe per 1m fold
      * from the market-structure service, keyed {@code <scheduleId>|<tf>}). OFF by default, the last rollout step;

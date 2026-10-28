@@ -1250,6 +1250,10 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void stageMarketStructure(MarketStructureRecovery recovery, ConsumerRecord<?, ?> record, String json) {
+        if (record.value() == null && isEstimateStructureTopic(record.topic())) {
+            marketStructureDrops.incrementAndGet();   // a withdrawal on the estimate topic never erases the shared retention
+            return;
+        }
         if (record.value() == null) {
             recovery.json = null;
             recovery.asOf = -1L;
@@ -2252,6 +2256,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP gateway_market_structure_enabled Whether the market-structure stream is enabled.\n"
                 + "# TYPE gateway_market_structure_enabled gauge\n"
                 + "gateway_market_structure_enabled " + boolMetric(settings.marketStructureEnabled()) + "\n"
+                + (settings.marketStructureEstimateEnabled() ? "gateway_market_structure_estimate_enabled 1\n" : "")
                 + "# HELP gateway_market_structure_drops_total market-structure records dropped at the gateway boundary (invalid, oversize, tombstone).\n"
                 + "# TYPE gateway_market_structure_drops_total counter\n"
                 + "gateway_market_structure_drops_total " + marketStructureDrops.get() + "\n"
@@ -2882,6 +2887,11 @@ public class FeedGatewayService implements ReplayRunner {
             // Avro consumer decodes it; updateCache has no case for it and the event keeps its own latest-record retention for the
             // connect replay. Rendered to the historical JSON text by MarketStructureAvro, then handled exactly as before.
             topicEvents.put(settings.marketStructureTopic(), new TopicBinding("DATABENTO", "market-structure"));
+            if (settings.marketStructureEstimateEnabled()) {
+                // dev only: the pre-market estimate record joins the SAME event and retention (newest asOfMs wins), so the regular record
+                // replaces it at the cash open; the staged recovery compares asOfMs the same way across both topics
+                topicEvents.put(settings.marketStructureEstimateTopic(), new TopicBinding("DATABENTO", "market-structure"));
+            }
         }
         if (settings.marketStructurePatternsEnabled()) {
             // PATTERNS (W0: Avro): the candlestick pattern sets — LIVE consumer only, same reasoning; the event keeps its own
@@ -12897,11 +12907,16 @@ public class FeedGatewayService implements ReplayRunner {
         if (!"market-structure".equals(event)) {
             return;
         }
-        if (record.value() == null) {
+        if (record.value() == null && !isEstimateStructureTopic(record.topic())) {
             marketStructureLatest.set(null);
             marketStructureAsOfMs = -1L;
         }
         marketStructureDrops.incrementAndGet();
+    }
+
+    /** The dev-only estimate structure topic shares the regular retention, so only its records (never its withdrawals) may enter it. */
+    private boolean isEstimateStructureTopic(String topic) {
+        return settings.marketStructureEstimateEnabled() && settings.marketStructureEstimateTopic().equals(topic);
     }
 
     LevelSignalView.Reading levelSignals(String date, String tf) {
@@ -13062,6 +13077,9 @@ public class FeedGatewayService implements ReplayRunner {
         List<String> topics = new ArrayList<>();
         if (settings.marketStructureEnabled()) {
             topics.add(settings.marketStructureTopic());
+            if (settings.marketStructureEstimateEnabled()) {
+                topics.add(settings.marketStructureEstimateTopic());
+            }
         }
         if (settings.marketStructurePatternsEnabled()) {
             topics.add(settings.marketStructurePatternsTopic());
