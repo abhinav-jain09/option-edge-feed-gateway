@@ -1,6 +1,7 @@
 """Finite transport faults, with SSH/SCP/Maven stubbed; no host, broker or large suite is contacted."""
 import hashlib
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -409,6 +410,41 @@ exit %d
         (self.repo / ".jenkins-tmp/es4-tests-123").mkdir(parents=True)
         self.run_transport(1)
         self.assertFalse((self.root / "calls").exists())
+
+
+class StageBackstopTest(unittest.TestCase):
+    """The Jenkins stage timeout and the worker's own bound, read from the files that carry them."""
+
+    JENKINSFILE = Path(__file__).resolve().parents[2] / "Jenkinsfile"
+
+    def worker_bounds(self):
+        # Both literals, as the script assigns them: whichever is larger is what the stage has to outlast.
+        return [int(m) for m in re.findall(r"run_bound_sec=(\d+)", SOURCE.read_text())]
+
+    def stage_backstop(self):
+        text = self.JENKINSFILE.read_text()
+        after = text[text.index("stage('Test') {"):]
+        return int(re.search(r"options \{ timeout\(time: (\d+), unit: 'MINUTES'\) \}", after).group(1)) * 60
+
+    def test_the_stage_backstop_outlasts_the_longest_worker_bound(self):
+        # Build 814 is why this is a test and not a comment: the waived bound went to 90 minutes while the
+        # stage kept the 60 it had been derived from, so Jenkins cancelled the step first. The two bounds
+        # are not interchangeable — the worker's restores the tree, names the signal and scps the evidence
+        # back, and the stage's leaves the evidence on es4 — so the one that fires must be the worker's.
+        self.assertGreater(self.stage_backstop(), max(self.worker_bounds()))
+
+    def test_the_backstop_leaves_room_for_the_setup_and_the_evidence_it_has_to_survive(self):
+        # Strictly greater is not enough: the stage also pays for its own work either side of the driver
+        # — the fixtures, the two tree verifies and the scp-back — so a backstop one minute past the bound
+        # would still abort a run the worker completed. (The contracts install is not in that budget; it is
+        # a stage of its own.) 20 minutes is the MINIMUM slack asserted, not the slack there is: 115 over
+        # 90 leaves 25, so the number may be raised to what is measured without the test moving.
+        self.assertGreaterEqual(self.stage_backstop() - max(self.worker_bounds()), 20 * 60)
+
+    def test_both_bounds_are_still_readable_where_the_backstop_reads_them(self):
+        # A negative control for the two assertions above: if either literal stops being found, the max()
+        # silently narrows or raises, and a vacuous pass would be worse than a failure.
+        self.assertEqual([3000, 5400], sorted(self.worker_bounds()))
 
 
 if __name__ == "__main__":

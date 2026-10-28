@@ -218,6 +218,19 @@ minutes. Nothing else about the unit changes with the waiver; the memory, task, 
 watchdogs are identical in both cases, and a test asserts that the bound is the only property that
 differs.
 
+The Jenkins `Test` stage carries its own timeout, and it is a backstop for a hung `ssh` or `scp`, not a
+second opinion about how long the work may take. It has to outlast the worker's bound, because the two
+fail differently: the worker's bound restores the mutated tree, names the signal and still scps the
+evidence back, while the stage's cancels the step with the evidence still on es4. Build 814 is what
+happens when they drift — the waived bound went to 90 minutes while the stage kept the 60 it had been
+derived from, so Jenkins cancelled the run at 60 and archived no `test.log` at all, and that build could
+only be diagnosed from the next one. The stage is now 115 minutes: the waived 90 plus this stage's
+own work either side of the driver — the fixtures, the two tree verifies and the scp-back. The contracts
+install is not in that budget; it is a stage of its own and runs on its own clock. It is deliberately one number rather than
+a waived and an unwaived one, since a second copy of the worker's two bounds is a third thing to keep in
+step. `test-on-es4-test.py` reads both files and asserts the stage outlasts the longer bound with that
+slack still left, and reads the two bound literals back so the comparison cannot pass vacuously.
+
 A signal at the bound is an ordinary outcome, so the campaign has to survive one cleanly. It handles
 SIGTERM by restoring the mutated file and discarding the compiled classes, and the mutation loop's
 own `finally` restores unconditionally for exactly the same reason — which meant both ran, and the
