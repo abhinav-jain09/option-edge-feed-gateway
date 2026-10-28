@@ -188,3 +188,21 @@ schemas are unchanged. The new whole-volume regime schema and writer cache do no
 add a gateway writer. Changed test compilation is local only; real stress/test and
 all50-mutation execution remain on es4 through the final Jenkins image qualification.
 This preparation does not itself authorize a source writer or claim a production rollout.
+
+## Running inside the cash window
+
+es4 is refused 08:30-16:00 America/New_York by default, in three places: once on the caller before
+anything is transported, and twice on es4 itself — before the workspace is laid down, and again
+immediately before the test unit starts. The reason is not load alone. es4 runs the one auction
+tracker, and a published auction minute can never be re-admitted, so a minute lost to contention is
+lost for that trade date.
+
+`ALLOW_CASH_WINDOW=true` waives it for a single build. It is a Jenkins parameter defaulting to false,
+it is never inferred, and it crosses to es4 as a positional argument so the es4-side gates honour the
+same decision the caller made rather than re-deriving one. Any value other than `true` or `false` is
+exit 64 — not a fallback to either answer, because reading a typo as false passes a build whose caller
+believed the window waived, and reading it as true runs on the live box by accident. An empty value is
+absence, which a blank Jenkins field gives, and takes the safe default.
+
+The suite is bounded to 50 minutes on two pinned cores with a 4 GiB cap, so the waiver's cost is
+bounded too — but it is a cost on the box carrying the live session, and the default stays off.

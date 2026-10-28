@@ -33,6 +33,7 @@ pipeline {
     string(name: 'BUILD_PLATFORM', defaultValue: '', description: 'Override platform. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers.')
     string(name: 'CONTRACTS_BRANCH', defaultValue: 'main', description: 'options-edge-contracts branch to install before building the gateway')
     booleanParam(name: 'PUSH_IMAGE', defaultValue: true, description: 'Push built image to registry')
+    booleanParam(name: 'ALLOW_CASH_WINDOW', defaultValue: false, description: 'Waive the 08:30-16:00 America/New_York es4 exclusion for THIS build. Off by default: es4 carries the live session and runs the one auction tracker, whose published minutes can never be re-admitted. Set it only when an image is needed before the close, knowing a 50-minute two-core suite then runs on es4 alongside the session.')
     booleanParam(name: 'DEPLOY_AND_VERIFY', defaultValue: true, description: 'Dev only: after a successful build+push, trigger service-deploy to roll the dev pod and VERIFY it picked up the new image (fails the build if the running pod does not report the pinned digest). Closes the silent-stale-build gap. No effect on production (manual promote gate).')
     string(name: 'REMOTE_BUILD_HOST', defaultValue: '192.168.100.252', description: 'Deprecated compatibility parameter; all image builds run on the resolved CI agent.')
     string(name: 'REMOTE_BUILD_ROOT', defaultValue: '/home/abhinav/ci/remote-builds', description: 'Deprecated compatibility parameter; no remote build workspace is used.')
@@ -259,7 +260,10 @@ pipeline {
         timeout(time: 10, unit: 'MINUTES') {
           sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
         }
-        sh 'bash scripts/jenkins/test-on-es4.sh'
+        // The parameter does not exist on the job until a build has run THIS Jenkinsfile, so the first
+        // build after it merges sees null and must read as not waived — never as the string "null",
+        // which the driver would refuse outright, and never as waived.
+        sh "ALLOW_CASH_WINDOW=${params.ALLOW_CASH_WINDOW ?: false} bash scripts/jenkins/test-on-es4.sh"
       }
       post {
         always {
