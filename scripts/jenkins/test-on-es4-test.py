@@ -125,6 +125,14 @@ if [ "$*" = -version ]; then echo "Apache Maven fixture"; exit 0; fi
 # failure this assertion exists to make impossible to reintroduce silently.
 [[ "$*" = *-Doptions-edge-contracts.version=0.8.0* ]] || { echo "Missing installed contracts version override: $*"; exit 5; }
 [[ ${CI_CONTRACTS_VERSION:-} = 0.8.0 ]] || { echo "CI_CONTRACTS_VERSION not passed through env -i"; exit 6; }
+# The campaign's maven is NOT this command line. It comes from a committed spec, carries no version,
+# and the only thing that can point it at the installed contracts is .mvn/maven.config in the run
+# root, which real maven reads by walking up from the project directory. A stub cannot parse that
+# file the way maven does, so it asserts the file is there and says the right thing — the condition
+# whose absence failed every gateway build from the moment contracts main passed the pom's pin.
+cfg="$(dirname "$CI_GATEWAY_DIR")/.mvn/maven.config"
+[ -f "$cfg" ] || { echo "No .mvn/maven.config in the run root: the campaign's mvn resolves the pom pin"; exit 7; }
+grep -qxF -- "-Doptions-edge-contracts.version=0.8.0" "$cfg" || { echo "maven.config does not name the installed contracts version: $(cat "$cfg")"; exit 8; }
 mkdir -p "$CI_GATEWAY_DIR/target/surefire-reports"
 printf '<testsuite tests="1" failures="0"/>' > "$CI_GATEWAY_DIR/target/surefire-reports/TEST-fixture.xml"
 echo finite-maven-stub
@@ -236,6 +244,34 @@ exit %d
         self.run_transport(1)
         out = self.repo / ".jenkins-tmp/es4-tests-123"
         self.assertIn("Missing installed contracts version override", (out / "test.log").read_text())
+        self.assertFalse((out / "receipt.json").exists())
+
+    def test_stale_pom_pin_pins_every_maven_through_the_run_root(self):
+        """A maven that carries no version of its own — the footprint campaign's, whose argv comes from a
+        committed spec — can only be pointed at the installed jar by the run root's .mvn/maven.config.
+        The stub refuses the run unless that file is there and names the installed version, so a pass
+        here IS the assertion; the run root is cleaned up afterwards, so checking it after the fact
+        would prove nothing. What a real maven does with the file is measured separately: a parent
+        .mvn/maven.config beats a child pom's own property, where MAVEN_OPTS does not and MAVEN_ARGS
+        needs maven 3.9 against es4's 3.6.3."""
+        self.stale_pom_pin()
+        self.run_transport()
+        import json
+        receipt = json.loads((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").read_text())
+        self.assertEqual("PASS", receipt["status"])
+
+    def test_without_the_run_root_pin_the_campaigns_maven_is_unpinned(self):
+        """The negative control: with the write removed, nothing points a maven that carries no version
+        of its own at the installed jar, which is exactly how the campaign's baseline came to resolve
+        the pom's pin, miss it in the private repository and report BASELINE IS RED."""
+        self.stale_pom_pin()
+        body = self.runner.read_text()
+        needle = """printf -- '-Doptions-edge-contracts.version=%s\\n' "$cv" > .mvn/maven.config"""
+        self.assertIn(needle, body)
+        self.runner.write_text(body.replace(needle, ":"))
+        self.run_transport(1)
+        out = self.repo / ".jenkins-tmp/es4-tests-123"
+        self.assertIn("No .mvn/maven.config in the run root", (out / "test.log").read_text())
         self.assertFalse((out / "receipt.json").exists())
 
     def test_cash_window_refuses_before_any_transport(self):
