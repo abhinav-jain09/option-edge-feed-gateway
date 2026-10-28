@@ -434,9 +434,11 @@ class StageBackstopTest(unittest.TestCase):
         self.assertGreater(self.stage_backstop(), max(self.worker_bounds()))
 
     def test_the_backstop_leaves_room_for_the_setup_and_the_evidence_it_has_to_survive(self):
-        # Strictly greater is not enough: the stage also pays for the contracts install, the fixtures, the
-        # two tree verifies and the scp-back, so a backstop one minute past the bound would still abort a
-        # run the worker completed. 20 minutes is the slack the measured sequence leaves at 115 over 90.
+        # Strictly greater is not enough: the stage also pays for its own work either side of the driver
+        # — the fixtures, the two tree verifies and the scp-back — so a backstop one minute past the bound
+        # would still abort a run the worker completed. (The contracts install is not in that budget; it is
+        # a stage of its own.) 20 minutes is the MINIMUM slack asserted, not the slack there is: 115 over
+        # 90 leaves 25, so the number may be raised to what is measured without the test moving.
         self.assertGreaterEqual(self.stage_backstop() - max(self.worker_bounds()), 20 * 60)
 
     def test_both_bounds_are_still_readable_where_the_backstop_reads_them(self):
