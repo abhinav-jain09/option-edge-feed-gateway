@@ -3550,7 +3550,7 @@ public class FeedGatewayService implements ReplayRunner {
                     }
                     if (binding != null && "es-auction".equals(binding.event())) {
                         // RESTART HYDRATION ONLY. The SAME keyed upsert as the live branch (latest
-                        // correctionRev per tradeDate|HH:mm wins, current + previous trade date
+                        // correctionRev per minute of a trade date wins, current + previous trade date
                         // retention) and NO broadcast — the live consumer owns the wire, and a
                         // second emitter would duplicate every minute on every socket. Without this
                         // branch the record fell through updateCache's default (no generic cache
@@ -11711,7 +11711,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * At-least-once keyed upsert: the latest {@code correctionRev} per {@code tradeDate|HH:mm}
+     * At-least-once keyed upsert: the latest {@code correctionRev} per minute of a trade date
      * wins (an equal rev overwrites, so a restart's re-emission replaces rather than duplicates).
      * Retention is the CURRENT trade date plus the PREVIOUS one: a newer date rolls the view
      * forward and evicts everything older than the date it rolled from; a record older than the
@@ -11921,7 +11921,8 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The prefix range of one trade date; caller holds the view lock. */
     private java.util.NavigableMap<String, String> esAuctionDayLocked(String tradeDate) {
-        // '|' + 1 == '}' — every "tradeDate|HH:mm" key sorts inside [tradeDate|, tradeDate}).
+        // '|' + 1 == '}' — every "tradeDate|NNNN|HH:mm" key sorts inside [tradeDate|, tradeDate}),
+        // whatever follows the date, so this is one trade date however the rest of the key is shaped.
         return esAuctionMinutes.subMap(tradeDate + "|", true, tradeDate + "}", false);
     }
 
