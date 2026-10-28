@@ -224,8 +224,12 @@ own `finally` restores unconditionally for exactly the same reason — which mea
 second moved a backup the first had already consumed. Build 813 ended on that `FileNotFoundError`
 instead of on its exit 130, with the one line that said `interrupted by signal 15` buried under the
 traceback. The handler now records what it restored and the loop skips those paths only, so a missing
-backup anywhere else still raises. `scripts/footprint-mutate-signal-test.py` drives the real script
-to the mutated state, sends the signal, and carries a negative control that reproduces 813's output.
+backup anywhere else still raises. The same handler discards the compiled output, in both of Maven's
+trees rather than only `target/classes`: a mutation may name a test source as readily as a main one,
+and restoring a file puts back its original mtime, so a mutant's bytecode left behind would be reused
+as the baseline's. `scripts/footprint-mutate-signal-test.py` drives the real script to the mutated
+state, sends the signal, and carries two negative controls — one reproducing 813's output, one
+keeping only the main output and finding the mutant test class still there.
 
 The variable is inherited like any other, so the Jenkinsfile sets it on every invocation of the driver
 and the fixture pins it to false in setUp. That pin is not tidiness: Jenkins exports every build

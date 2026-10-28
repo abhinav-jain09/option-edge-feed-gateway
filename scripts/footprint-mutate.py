@@ -128,8 +128,12 @@ def _restore_and_exit(signum, frame):
             _ACTIVE['restored'].add(path)
     root = _ACTIVE['root']
     if root:
+        # BOTH outputs. A mutation may name a test source as readily as a main one, and the message
+        # below says compiled classes are discarded: discarding only target/classes would leave a
+        # mutant's test bytecode for the next run to inherit while still claiming otherwise.
         for d, _, _ in list(os.walk(root)):
-            if os.path.basename(d) == 'classes' and os.path.basename(os.path.dirname(d)) == 'target':
+            if os.path.basename(d) in ('classes', 'test-classes') \
+                    and os.path.basename(os.path.dirname(d)) == 'target':
                 shutil.rmtree(d, ignore_errors=True)
     print(f"\ninterrupted by signal {signum}: tree restored and compiled classes discarded")
     sys.exit(130)
