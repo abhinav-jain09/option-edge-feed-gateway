@@ -104,6 +104,12 @@ for source in args[:-1]:
                     "JENKINS_URL": "unit-fixture", "PERMITTED_SHA": self.sha,
                     "CONTRACTS_PERMITTED_SHA": "c" * 40, "BUILD_NUMBER": "123",
                     "CI_CALLS": str(self.root / "calls"), "CI_FAKE_DATE": "6 0700 EDT",
+                    # Pinned, never inherited. Jenkins exports every build parameter into the
+                    # environment, so under the real pipeline os.environ already carries the waiver
+                    # the build was triggered with — and build 811 proved it: the default-path test
+                    # ran the whole transport on a waiver no test had asked for. Each test that cares
+                    # sets this itself; every other test must see the shipped default.
+                    "ALLOW_CASH_WINDOW": "false",
                     "CI_UNIT_EXEC": str(self.root / "unit-exec"), "CI_UNIT_STOPS": str(self.root / "unit-stops")}
 
     def tearDown(self):

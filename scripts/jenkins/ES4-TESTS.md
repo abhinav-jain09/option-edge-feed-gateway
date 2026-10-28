@@ -206,3 +206,9 @@ absence, which a blank Jenkins field gives, and takes the safe default.
 
 The suite is bounded to 50 minutes on two pinned cores with a 4 GiB cap, so the waiver's cost is
 bounded too — but it is a cost on the box carrying the live session, and the default stays off.
+
+The variable is inherited like any other, so the Jenkinsfile sets it on every invocation of the driver
+and the fixture pins it to false in setUp. That pin is not tidiness: Jenkins exports every build
+parameter into the environment, so under a waived build the fixture's own default-path test inherited
+the waiver and ran the whole transport it was written to refuse. Build 811 failed exactly there, which
+is the test doing its job.
