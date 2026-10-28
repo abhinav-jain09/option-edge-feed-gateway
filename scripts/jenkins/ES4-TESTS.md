@@ -5,7 +5,7 @@ The Package stage uses `-DskipTests`: a source/artifact/build-bound test receipt
 first, so the large tests never run again during native packaging. Application hot paths
 and packaging/image/deployment source guards are unchanged.
 
-This intentionally prevents image builds during 08:30–16:00 America/New_York on weekdays,
+This intentionally prevents image builds during 07:30–16:00 America/New_York on weekdays,
 including cash-hours hotfix builds. There is no skip/override. The 60-minute pre-open margin
 reserves 20 minutes beyond the 40-minute test deadline for cleanup. es4 is the test host named by the
 Performance Rule; no Jenkins controller or agent is installed there. A successful real
@@ -191,7 +191,7 @@ This preparation does not itself authorize a source writer or claim a production
 
 ## Running inside the cash window
 
-es4 is refused 08:30-16:00 America/New_York by default, in three places: once on the caller before
+es4 is refused 07:30-16:00 America/New_York by default, in three places: once on the caller before
 anything is transported, and twice on es4 itself — before the workspace is laid down, and again
 immediately before the test unit starts. The reason is not load alone. es4 runs the one auction
 tracker, and a published auction minute can never be re-admitted, so a minute lost to contention is
@@ -207,16 +207,22 @@ absence, which a blank Jenkins field gives, and takes the safe default.
 The run is bounded on two pinned cores with a 4 GiB cap, so the waiver's cost is bounded too — but it
 is a cost on the box carrying the live session, and the default stays off.
 
-The bound itself differs by case, because the two cases answer different questions. An unwaived run
-keeps 50 minutes: that number exists only to fit inside the 60-minute pre-open margin, so a run
-starting at the last permitted moment still ends before the open. A waived run is already inside the
-session by an explicit decision, so the margin has nothing left to protect, and the bound becomes 90
-minutes — what the work measures at, not what the margin allows. Builds 812 and 813 are the
-measurement: both passed all 1,632 tests in 9-11 minutes and were then killed at the 50-minute cap
-with the 50-case footprint campaign at 48 and 38 cases, which puts the whole sequence near 52
-minutes. Nothing else about the unit changes with the waiver; the memory, task, swap, disk and log
-watchdogs are identical in both cases, and a test asserts that the bound is the only property that
-differs.
+The bound is 90 minutes, the same in both cases, and it comes from the record rather than from a
+margin: build 815 took 12.4 minutes for the 1,632-test suite and 37.6 for the 50-case footprint
+campaign, so 50.0 minutes is what the sequence measures. Three builds have now died at a cap with
+every test passing — #800 at 40 minutes, 812 and 813 at 50 — which is what a cap set to what the
+margin allowed, rather than to what the work needs, produces: not protection, just a failed build
+50 minutes later with no verdict. Nothing about the unit changes with the waiver at all; the bound,
+memory, task, swap, disk and log watchdogs are identical, and a test asserts that the properties are
+byte-for-byte the same waived and unwaived.
+
+What protects the open is the start-time exclusion, and it is the same fact as the bound stated
+twice, so the two move together: 90 minutes of run needs the exclusion to begin 120 minutes before
+the 09:30 open, which is why it is **07:30-16:00** New York and no longer 08:30. The last permitted
+start, 07:29, releases es4 by 08:59, half an hour clear — more margin than the old 08:30 boundary
+left a 50-minute run. A test walks 07:29, 07:30, 08:29, 15:59, 16:00 and 23:59 against the script's
+own `--check-window`, and a second one walks a Saturday and a Sunday 09:00, which look identical on
+the clock and would be refused by a boundary check that lost its weekday test.
 
 The Jenkins `Test` stage carries its own timeout, and it is a backstop for a hung `ssh` or `scp`, not a
 second opinion about how long the work may take. It has to outlast the worker's bound, because the two

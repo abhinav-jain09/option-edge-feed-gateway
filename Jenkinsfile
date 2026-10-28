@@ -33,7 +33,7 @@ pipeline {
     string(name: 'BUILD_PLATFORM', defaultValue: '', description: 'Override platform. Empty = derive from oeProfile(ENVIRONMENT). Kept for back-compat callers.')
     string(name: 'CONTRACTS_BRANCH', defaultValue: 'main', description: 'options-edge-contracts branch to install before building the gateway')
     booleanParam(name: 'PUSH_IMAGE', defaultValue: true, description: 'Push built image to registry')
-    booleanParam(name: 'ALLOW_CASH_WINDOW', defaultValue: false, description: 'Waive the 08:30-16:00 America/New_York es4 exclusion for THIS build. Off by default: es4 carries the live session and runs the one auction tracker, whose published minutes can never be re-admitted. Set it only when an image is needed before the close, knowing a 50-minute two-core suite then runs on es4 alongside the session.')
+    booleanParam(name: 'ALLOW_CASH_WINDOW', defaultValue: false, description: 'Waive the 07:30-16:00 America/New_York es4 exclusion for THIS build. Off by default: es4 carries the live session and runs the one auction tracker, whose published minutes can never be re-admitted. Set it only when an image is needed before the close, knowing a two-core run bounded at 90 minutes then runs on es4 alongside the session.')
     booleanParam(name: 'DEPLOY_AND_VERIFY', defaultValue: true, description: 'Dev only: after a successful build+push, trigger service-deploy to roll the dev pod and VERIFY it picked up the new image (fails the build if the running pod does not report the pinned digest). Closes the silent-stale-build gap. No effect on production (manual promote gate).')
     string(name: 'REMOTE_BUILD_HOST', defaultValue: '192.168.100.252', description: 'Deprecated compatibility parameter; all image builds run on the resolved CI agent.')
     string(name: 'REMOTE_BUILD_ROOT', defaultValue: '/home/abhinav/ci/remote-builds', description: 'Deprecated compatibility parameter; no remote build workspace is used.')
@@ -241,16 +241,15 @@ pipeline {
     }
     stage('Test') {
       // This backstop has to stay ABOVE the worker's own bound in scripts/jenkins/test-on-es4.sh, which is
-      // 50 minutes ordinarily and 90 on an ALLOW_CASH_WINDOW waiver. It is not a second opinion about how
-      // long the work may take, and the two are not interchangeable: the worker's bound restores the mutated
+      // 90 minutes. It is not a second opinion about how long the work may take, and the two are not
+      // interchangeable: the worker's bound restores the mutated
       // tree, names the signal and still scps the evidence back, while this one cancels the step with the
       // evidence still on es4. Build 814 aborted here at 60 minutes against a 90-minute worker and archived
       // no test.log at all, so that run could only be diagnosed from the next one. 115 = the waived 90 plus
       // this stage's own work either side of the driver: the four fixtures, the two tree verifies and the
       // scp-back. The contracts install is NOT in it — that is a stage of its own, with its own clock.
-      // It is deliberately ONE number rather than a waived and an unwaived one: a second copy of the
-      // worker's two bounds is a third thing to keep in step, and 814 is what happens when they drift.
-      // test-on-es4-test.py asserts it stays above the bound it backs up.
+      // test-on-es4-test.py asserts it stays above the bound it backs up, and that the bound is still a
+      // single number: 814 is what happens when two of them drift apart.
       options { timeout(time: 115, unit: 'MINUTES') }
       when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
