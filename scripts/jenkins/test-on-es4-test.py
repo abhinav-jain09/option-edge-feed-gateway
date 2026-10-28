@@ -48,6 +48,9 @@ test "$(git -C "$dir" rev-parse HEAD)" = "$PERMITTED_SHA"
         self.script(self.bin / "systemd-run", '''
 # The kernel probe is not a host operation in this fixture; the final command is exercised.
 case "$*" in *oe-gateway-probe-*) exit 0;; esac
+# The properties are the only place the run bound is observable, and the shift loop below drops
+# them; record the real run's argv before it does.
+printf "%s\n" "$*" >> "$CI_UNIT_ARGV"
 while [[ $1 = --* ]]; do shift; done
 if [ "${CI_FAKE_PARTIAL:-}" = 1 ]; then
     last="${@: -1}"
@@ -110,7 +113,8 @@ for source in args[:-1]:
                     # ran the whole transport on a waiver no test had asked for. Each test that cares
                     # sets this itself; every other test must see the shipped default.
                     "ALLOW_CASH_WINDOW": "false",
-                    "CI_UNIT_EXEC": str(self.root / "unit-exec"), "CI_UNIT_STOPS": str(self.root / "unit-stops")}
+                    "CI_UNIT_EXEC": str(self.root / "unit-exec"), "CI_UNIT_STOPS": str(self.root / "unit-stops"),
+                    "CI_UNIT_ARGV": str(self.root / "unit-argv")}
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -305,6 +309,43 @@ exit %d
         self.env["CI_FAKE_DATE"] = "1 0900 EDT"
         self.run_transport(1)
         self.assertFalse((self.root / "calls").exists())
+
+    def test_an_unwaived_run_is_bounded_to_the_fifty_minutes_the_pre_open_margin_allows(self):
+        # 50 minutes is not a taste: it is what fits inside the 60-minute pre-open margin, so an
+        # out-of-hours run that starts at the last permitted moment still ends before the open.
+        self.run_transport()
+        self.assertIn("--property=RuntimeMaxSec=3000", (self.root / "unit-argv").read_text())
+
+    def test_a_waived_run_is_bounded_to_the_ninety_minutes_the_work_actually_needs(self):
+        # Builds 812 and 813 passed all 1,632 tests and then died at 50 minutes with the campaign
+        # at 48 and 38 of its 50 cases. A waived run is already inside the session, so the margin
+        # has nothing left to protect and the bound can cover the measured ~52 minutes with room.
+        self.env["CI_FAKE_DATE"] = "1 0900 EDT"
+        self.env["ALLOW_CASH_WINDOW"] = "true"
+        self.run_transport()
+        self.assertIn("--property=RuntimeMaxSec=5400", (self.root / "unit-argv").read_text())
+
+    def test_the_bound_is_the_only_unit_property_the_waiver_changes(self):
+        # A longer run must not quietly come with a larger memory, task or swap allowance: the
+        # waiver answers one question, and every other limit on the live box stays as shipped.
+        # Only the properties are compared: the unit name and the private run directory carry a
+        # fresh random component per run, so the raw argv differs for reasons that are not limits.
+        def properties():
+            words = (self.root / "unit-argv").read_text().split()
+            return [w for w in words if w.startswith("--property=")]
+        self.run_transport()
+        plain = properties()
+        self.tearDown(); self.setUp()
+        self.env["CI_FAKE_DATE"] = "1 0900 EDT"
+        self.env["ALLOW_CASH_WINDOW"] = "true"
+        self.run_transport()
+        waived = properties()
+        self.assertNotEqual(plain, waived)
+        self.assertEqual(["--property=RuntimeMaxSec=3000"], [w for w in plain if "RuntimeMaxSec" in w])
+        self.assertEqual(["--property=RuntimeMaxSec=5400"], [w for w in waived if "RuntimeMaxSec" in w])
+        strip = lambda ws: [w for w in ws if "RuntimeMaxSec" not in w]
+        self.assertEqual(strip(plain), strip(waived))
+        self.assertIn("--property=MemoryMax=4G", plain)
 
     def test_an_explicit_waiver_runs_inside_the_cash_window_on_both_sides_of_the_transport(self):
         # The es4 side checks the window twice more, with the waiver carried as a positional, so a run
