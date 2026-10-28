@@ -5,14 +5,14 @@ The Package stage uses `-DskipTests`: a source/artifact/build-bound test receipt
 first, so the large tests never run again during native packaging. Application hot paths
 and packaging/image/deployment source guards are unchanged.
 
-This intentionally prevents image builds during 07:30–16:00 America/New_York on weekdays,
-including cash-hours hotfix builds. There is no skip/override. The 60-minute pre-open margin
-reserves 20 minutes beyond the 40-minute test deadline for cleanup. es4 is the test host named by the
-Performance Rule; no Jenkins controller or agent is installed there. A successful real
-Jenkins sequence, with its measured duration and reports, is required before a production
-image rollout. Forty minutes is an initial fail-closed ceiling, not a duration benchmark.
-The actual duration has not yet been measured on es4; the first reviewed-main build must
-establish it, and failure cannot authorize packaging or deployment.
+This prevents image builds during 07:30–16:00 America/New_York on weekdays, including cash-hours
+hotfix builds, unless the build carries an explicit `ALLOW_CASH_WINDOW=true` waiver — see **Running
+inside the cash window** below for what that waiver does and does not change. The boundary is
+07:30 because the run is bounded at 90 minutes and the market opens at 09:30: the two are one fact
+stated twice. es4 is the test host named by the Performance Rule; no Jenkins controller or agent is
+installed there. A successful real Jenkins sequence, with its reports, is required before a
+production image rollout, and failure cannot authorize packaging or deployment. The duration is no
+longer an estimate: build 815 measured 12.4 minutes for the suite and 37.6 for the campaign.
 
 `test-on-es4.sh` requires Jenkins, full permitted source/contract SHAs and a numeric build
 number. It reruns the main-tip guard/tree check, checks the exact installed contracts JAR
@@ -192,8 +192,11 @@ This preparation does not itself authorize a source writer or claim a production
 ## Running inside the cash window
 
 es4 is refused 07:30-16:00 America/New_York by default, in three places: once on the caller before
-anything is transported, and twice on es4 itself — before the workspace is laid down, and again
-immediately before the test unit starts. The reason is not load alone. es4 runs the one auction
+anything is transported, and twice on es4 itself — at the top of the test script, which is after
+`REMOTE_INIT` has already made the run directory and probed systemd, and again immediately before the
+test unit starts. The three copies are a boundary each, so a test asserts that every one of them
+compares against the same literal, and a second drives the transport past a disabled caller check to
+show the es4 side refusing on its own. The reason is not load alone. es4 runs the one auction
 tracker, and a published auction minute can never be re-admitted, so a minute lost to contention is
 lost for that trade date.
 

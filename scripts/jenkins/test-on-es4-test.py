@@ -352,6 +352,31 @@ exit %d
                 self.assertEqual(1 if refused else 0, result.returncode, result.stderr[-500:])
                 self.assertEqual(refused, "cash-window exclusion is 07:30-16:00" in result.stderr)
 
+    def test_every_copy_of_the_exclusion_compares_against_the_same_boundary(self):
+        # The boundary is written three times: once on the caller and twice inside the es4 heredoc. The
+        # --check-window test above exercises only the caller, so a remote copy left at 08:30 would pass
+        # it. Every weekday-window comparison in the script is extracted here instead, so a copy that
+        # moves alone is a failure wherever it lives.
+        hhmm = re.findall(r'"\$hhmm" -ge (\d{4})', SOURCE.read_text())
+        self.assertEqual(3, len(hhmm), hhmm)
+        self.assertEqual({"0730"}, set(hhmm))
+        ends = re.findall(r'"\$hhmm" -lt (\d{4})', SOURCE.read_text())
+        self.assertEqual(["1600"] * 3, ends)
+
+    def test_the_es4_side_refuses_the_window_with_the_callers_check_removed(self):
+        # The caller refuses first, so nothing else would ever reach the two copies on es4. With the
+        # caller's call deleted the transport runs into them, and a weekday 07:30 without the waiver has
+        # to die there rather than start a unit that would still be running into the pre-open margin.
+        body = self.runner.read_text()
+        self.assertIn("\ncheck_window\n", body)
+        self.runner.write_text(body.replace("\ncheck_window\n", "\n", 1))
+        self.env["CI_FAKE_DATE"] = "1 0730 EDT"
+        self.run_transport(1)
+        # No receipt and no completion marker: the refusal happened before anything ran, not after.
+        out = self.repo / ".jenkins-tmp/es4-tests-123"
+        self.assertFalse((out / "complete.txt").exists())
+        self.assertFalse((out / "receipt.json").exists())
+
     def test_a_weekend_start_is_never_in_the_exclusion_however_the_clock_reads(self):
         # The exclusion is a weekday fact. A Saturday 09:00 looks exactly like the refused weekday
         # case on the clock alone, so a boundary check that dropped the weekday test would still pass
