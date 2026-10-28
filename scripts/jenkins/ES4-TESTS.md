@@ -204,8 +204,28 @@ exit 64 — not a fallback to either answer, because reading a typo as false pas
 believed the window waived, and reading it as true runs on the live box by accident. An empty value is
 absence, which a blank Jenkins field gives, and takes the safe default.
 
-The suite is bounded to 50 minutes on two pinned cores with a 4 GiB cap, so the waiver's cost is
-bounded too — but it is a cost on the box carrying the live session, and the default stays off.
+The run is bounded on two pinned cores with a 4 GiB cap, so the waiver's cost is bounded too — but it
+is a cost on the box carrying the live session, and the default stays off.
+
+The bound itself differs by case, because the two cases answer different questions. An unwaived run
+keeps 50 minutes: that number exists only to fit inside the 60-minute pre-open margin, so a run
+starting at the last permitted moment still ends before the open. A waived run is already inside the
+session by an explicit decision, so the margin has nothing left to protect, and the bound becomes 90
+minutes — what the work measures at, not what the margin allows. Builds 812 and 813 are the
+measurement: both passed all 1,632 tests in 9-11 minutes and were then killed at the 50-minute cap
+with the 50-case footprint campaign at 48 and 38 cases, which puts the whole sequence near 52
+minutes. Nothing else about the unit changes with the waiver; the memory, task, swap, disk and log
+watchdogs are identical in both cases, and a test asserts that the bound is the only property that
+differs.
+
+A signal at the bound is an ordinary outcome, so the campaign has to survive one cleanly. It handles
+SIGTERM by restoring the mutated file and discarding the compiled classes, and the mutation loop's
+own `finally` restores unconditionally for exactly the same reason — which meant both ran, and the
+second moved a backup the first had already consumed. Build 813 ended on that `FileNotFoundError`
+instead of on its exit 130, with the one line that said `interrupted by signal 15` buried under the
+traceback. The handler now records what it restored and the loop skips those paths only, so a missing
+backup anywhere else still raises. `scripts/footprint-mutate-signal-test.py` drives the real script
+to the mutated state, sends the signal, and carries a negative control that reproduces 813's output.
 
 The variable is inherited like any other, so the Jenkinsfile sets it on every invocation of the driver
 and the fixture pins it to false in setUp. That pin is not tidiness: Jenkins exports every build

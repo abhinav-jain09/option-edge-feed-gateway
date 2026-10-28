@@ -113,13 +113,19 @@ def tree_dirty(root):
 # compiled classes built from the mutation. Restoring the source is not enough: `mv` puts back the
 # ORIGINAL mtime, so an incremental build keeps testing the mutant. Handle the signal, restore, and
 # discard the compiled output so the next run cannot inherit a mutant.
-_ACTIVE = {'paths': [], 'root': None}
+_ACTIVE = {'paths': [], 'root': None, 'restored': set()}
 
 def _restore_and_exit(signum, frame):
+    # Each backup this handler consumes is recorded, because the mutation loop's own finally block
+    # restores unconditionally and would then move a .bak this handler has already moved. Build 813
+    # died exactly there: the signal arrived mid-mutation, the tree was restored correctly and the
+    # reason printed, and then FileNotFoundError on the missing backup replaced SystemExit(130) and
+    # buried the one line that said what had happened.
     for path in _ACTIVE['paths']:
         if os.path.exists(path + '.bak'):
             shutil.move(path + '.bak', path)
             os.utime(path, None)
+            _ACTIVE['restored'].add(path)
     root = _ACTIVE['root']
     if root:
         for d, _, _ in list(os.walk(root)):
@@ -339,6 +345,10 @@ def main():
             # UNCONDITIONAL. A timeout, an interrupt or a crash between the write and the restore
             # would otherwise leave the tree mutated and poison every later mutation AND the baseline.
             for path in touched:
+                # Still unconditional for every path the signal handler did not already restore: a
+                # missing backup there is a real failure and must raise, not be skipped quietly.
+                if path in _ACTIVE['restored']:
+                    continue
                 shutil.move(path + '.bak', path)
                 os.utime(path, None)   # mv restores the ORIGINAL mtime; Maven would skip recompiling
             _ACTIVE['paths'] = []

@@ -20,7 +20,7 @@ check_window() {
   local weekday hhmm zone
   read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
   [[ $zone = EST || $zone = EDT ]] || { echo 'New York timezone unavailable' >&2; return 1; }
-  # A test run is bounded to 50 minutes: do not start inside the 60-minute pre-open margin.
+  # An unwaived run is bounded to 50 minutes: do not start inside the 60-minute pre-open margin.
   if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then
     [ "$allow_cash_window" = true ] || {
       echo 'Gateway es4 tests refused: cash-window exclusion is 08:30-16:00 America/New_York.' >&2
@@ -228,10 +228,17 @@ scripts/footprint-reverify.sh
 scripts/footprint-reqstate.sh --check
 printf '%s\n' "$CI_SOURCE_SHA" > ../complete.txt
 RUN
-# Build #800 passed all 1,617 tests but hit the 40-minute cap near the end of
-# its 50-case mutation campaign. Allow 50 minutes, still below the 60-minute
-# pre-open exclusion margin; retain the CPU, memory, disk and log watchdogs.
-# Successful execution is required before any image is packaged or deployed.
+# Two caps, because they answer two different questions. An ordinary out-of-hours run must finish
+# before the open, so it keeps the 50 minutes that sit inside the 60-minute pre-open margin: that
+# margin is the ONLY reason the number is 50, and build #800 showed 40 was too few. Measured on
+# builds 812 and 813 the work does not fit 50 either: the suite takes 9-11 minutes and the 50-case
+# campaign ran 48 of 50 in the 39 minutes left, so ~52 minutes is the honest figure, and both builds
+# died at the cap with every one of the 1,632 tests passing. A WAIVED run is already inside the
+# session by explicit decision, so the pre-open margin has nothing left to protect and the cap can
+# be what the work needs: 90 minutes, with real headroom over the measured 52 rather than another
+# number the campaign will grow past. The CPU, memory, disk and log watchdogs are unchanged in
+# both cases, and successful execution is still required before any image is packaged or deployed.
+if [ "$allow_cash_window" = true ]; then run_bound_sec=5400; else run_bound_sec=3000; fi
 unit="oe-gateway-$(basename "$dir" | tr '.' '-')"
 stop_unit() { systemctl --user stop "$unit" >/dev/null 2>&1 || true; }
 trap stop_unit EXIT
@@ -243,12 +250,16 @@ if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ] && [ "$a
 # The Kafka test container separately has 2 GiB / one CPU limits; planned total is 8 GiB.
 cpu_list=$(cat "$dir/cpus.txt")
 [[ $cpu_list =~ ^[0-9]+,[0-9]+$ ]] || exit 64
-python3 - "$dir" "$unit" "$java_home" "$source_sha" "$cpu_list" "$cv" <<'SUPERVISE'
+python3 - "$dir" "$unit" "$java_home" "$source_sha" "$cpu_list" "$cv" "$run_bound_sec" <<'SUPERVISE'
 import os, pathlib, selectors, subprocess, sys, time
-root, unit, java, source, cpus, contracts_version = sys.argv[1:]
+# The bound is not validated here: it is one of two literals assigned a few lines above, from an
+# allow_cash_window this side already refused unless it was exactly true or false. A check for a
+# third value would be a guard against a state that cannot occur, and reading it as a promise of
+# one would be worse than having none.
+root, unit, java, source, cpus, contracts_version, run_bound_sec = sys.argv[1:]
 command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=" + unit,
     "--property=MemoryMax=4G", "--property=MemorySwapMax=0", "--property=TasksMax=512",
-    "--property=RuntimeMaxSec=3000", "--property=TimeoutStopSec=10",
+    "--property=RuntimeMaxSec=" + run_bound_sec, "--property=TimeoutStopSec=10",
     "--property=KillMode=control-group", "taskset", "--cpu-list", cpus, "env", "-i", "PATH=" + java + "/bin:/usr/bin:/bin",
     "JAVA_HOME=" + java, "JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=" + root + "/tmp",
     "MAVEN_SKIP_RC=true", "MAVEN_OPTS=-Xmx768m -DreuseForks=false -Dmaven.repo.local=" + root + "/cache/repository -Djava.io.tmpdir=" + root + "/tmp",
