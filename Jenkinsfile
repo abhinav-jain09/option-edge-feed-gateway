@@ -240,8 +240,17 @@ pipeline {
       }
     }
     stage('Test') {
-      // The worker is bounded to 50 minutes; leave time for setup and evidence collection.
-      options { timeout(time: 60, unit: 'MINUTES') }
+      // This backstop has to stay ABOVE the worker's own bound in scripts/jenkins/test-on-es4.sh, which is
+      // 50 minutes ordinarily and 90 on an ALLOW_CASH_WINDOW waiver. It is not a second opinion about how
+      // long the work may take, and the two are not interchangeable: the worker's bound restores the mutated
+      // tree, names the signal and still scps the evidence back, while this one cancels the step with the
+      // evidence still on es4. Build 814 aborted here at 60 minutes against a 90-minute worker and archived
+      // no test.log at all, so that run could only be diagnosed from the next one. 115 = the waived 90 plus
+      // the contracts install, the four fixtures, the two tree verifies and the scp-back, with room to spare.
+      // It is deliberately ONE number rather than a waived and an unwaived one: a second copy of the
+      // worker's two bounds is a third thing to keep in step, and 814 is what happens when they drift.
+      // test-on-es4-test.py asserts it stays above the bound it backs up.
+      options { timeout(time: 115, unit: 'MINUTES') }
       when { expression { env.PERMITTED_SHA_GUARD == 'PASSED' } }
       steps {
         // A previous build's Jib run leaves its cache and digest under ci/jib-image/target (gitignored, so
