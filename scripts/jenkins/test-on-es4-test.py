@@ -300,6 +300,42 @@ exit %d
         self.run_transport(1)
         self.assertFalse((self.root / "calls").exists())
 
+    def test_an_explicit_waiver_runs_inside_the_cash_window_on_both_sides_of_the_transport(self):
+        # The es4 side checks the window twice more, with the waiver carried as a positional, so a run
+        # that reaches its receipt proves the waiver crossed: a missing positional is exit 64 there.
+        self.env["CI_FAKE_DATE"] = "1 0900 EDT"
+        self.env["ALLOW_CASH_WINDOW"] = "true"
+        self.run_transport()
+        import json
+        receipt = json.loads((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").read_text())
+        self.assertEqual("PASS", receipt["status"])
+
+    def test_an_unrecognised_waiver_is_refused_rather_than_read_as_either_answer(self):
+        for value in ("TRUE", "True", "1", "yes", "no", "0"):
+            with self.subTest(value=value):
+                self.env["CI_FAKE_DATE"] = "1 0900 EDT"
+                self.env["ALLOW_CASH_WINDOW"] = value
+                result = self.run_transport(64)
+                self.assertIn("ALLOW_CASH_WINDOW must be true or false", result.stderr)
+                self.assertFalse((self.root / "calls").exists())
+
+    def test_an_empty_waiver_is_absence_so_the_window_still_refuses(self):
+        # Empty is not supplied, which is what a blank Jenkins field gives: it takes the safe default
+        # and refuses, rather than being a third state the operator has to reason about.
+        self.env["CI_FAKE_DATE"] = "1 0900 EDT"
+        self.env["ALLOW_CASH_WINDOW"] = ""
+        self.run_transport(1)
+        self.assertFalse((self.root / "calls").exists())
+
+    def test_the_waiver_does_not_relax_the_window_outside_the_cash_session(self):
+        # Nothing about the waiver depends on the clock: it is only ever consulted inside the window,
+        # so the ordinary out-of-hours run must be byte-identical with it set and with it absent.
+        self.env["CI_FAKE_DATE"] = "6 0700 EDT"
+        self.env["ALLOW_CASH_WINDOW"] = "true"
+        self.run_transport()
+        self.assertEqual("PASS", __import__("json").loads(
+            (self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").read_text())["status"])
+
     def cancellation(self, command):
         run = self.remote / "run.123.fixture"
         run.mkdir(parents=True)
