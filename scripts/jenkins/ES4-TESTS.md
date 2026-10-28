@@ -224,8 +224,9 @@ fail differently: the worker's bound restores the mutated tree, names the signal
 evidence back, while the stage's cancels the step with the evidence still on es4. Build 814 is what
 happens when they drift — the waived bound went to 90 minutes while the stage kept the 60 it had been
 derived from, so Jenkins cancelled the run at 60 and archived no `test.log` at all, and that build could
-only be diagnosed from the next one. The stage is now 115 minutes: the waived 90 plus the contracts
-install, the fixtures, the two tree verifies and the scp-back. It is deliberately one number rather than
+only be diagnosed from the next one. The stage is now 115 minutes: the waived 90 plus this stage's
+own work either side of the driver — the fixtures, the two tree verifies and the scp-back. The contracts
+install is not in that budget; it is a stage of its own and runs on its own clock. It is deliberately one number rather than
 a waived and an unwaived one, since a second copy of the worker's two bounds is a third thing to keep in
 step. `test-on-es4-test.py` reads both files and asserts the stage outlasts the longer bound with that
 slack still left, and reads the two bound literals back so the comparison cannot pass vacuously.

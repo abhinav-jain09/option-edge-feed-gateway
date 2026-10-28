@@ -246,7 +246,8 @@ pipeline {
       // tree, names the signal and still scps the evidence back, while this one cancels the step with the
       // evidence still on es4. Build 814 aborted here at 60 minutes against a 90-minute worker and archived
       // no test.log at all, so that run could only be diagnosed from the next one. 115 = the waived 90 plus
-      // the contracts install, the four fixtures, the two tree verifies and the scp-back, with room to spare.
+      // this stage's own work either side of the driver: the four fixtures, the two tree verifies and the
+      // scp-back. The contracts install is NOT in it — that is a stage of its own, with its own clock.
       // It is deliberately ONE number rather than a waived and an unwaived one: a second copy of the
       // worker's two bounds is a third thing to keep in step, and 814 is what happens when they drift.
       // test-on-es4-test.py asserts it stays above the bound it backs up.
