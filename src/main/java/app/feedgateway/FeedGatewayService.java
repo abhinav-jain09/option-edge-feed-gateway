@@ -3550,7 +3550,7 @@ public class FeedGatewayService implements ReplayRunner {
                     }
                     if (binding != null && "es-auction".equals(binding.event())) {
                         // RESTART HYDRATION ONLY. The SAME keyed upsert as the live branch (latest
-                        // correctionRev per tradeDate|HH:mm wins, current + previous trade date
+                        // correctionRev per minute of a trade date wins, current + previous trade date
                         // retention) and NO broadcast — the live consumer owns the wire, and a
                         // second emitter would duplicate every minute on every socket. Without this
                         // branch the record fell through updateCache's default (no generic cache
@@ -11617,10 +11617,17 @@ public class FeedGatewayService implements ReplayRunner {
     // ---- SPX Auction Desk minute view (es-auction) ------------------------------------------
 
     /**
-     * Keyed view of the SPX Auction Desk minute records — {@code tradeDate|HH:mm} -> record JSON
-     * (verbatim). String order IS (tradeDate, minute) order because both components are
-     * fixed-width and {@code '|'} sorts above every digit, so a per-trade-date sub-map is a plain
-     * prefix range and pages come out in minute order for free.
+     * Keyed view of the SPX Auction Desk minute records — {@code tradeDate|NNNN|HH:mm} -> record JSON
+     * (verbatim), where {@code NNNN} is the minute's chronological position inside its trade date
+     * ({@link #esAuctionMinuteIndex}). String order is then (tradeDate, time) order, so a
+     * per-trade-date sub-map is still a plain prefix range and pages still come out in time order.
+     *
+     * <p>The position is in the key because the LABEL alone does not sort chronologically. A trade
+     * date's minutes run from 18:01 — the Globex open the calendar evening before — through the cash
+     * close, and as text "18:01" sorts AFTER "09:31" although it comes fifteen hours earlier, so a
+     * label-ordered view puts the whole evening block last. At 02:00 ET its "latest minute" was the
+     * previous evening's 23:59, four hours stale, and a client taking its backfill cursor from there
+     * skipped every minute between midnight and the cash open.
      */
     private final java.util.TreeMap<String, String> esAuctionMinutes = new java.util.TreeMap<>();
     /** minute key -> the highest correctionRev already BROADCAST for it. Separate from the view on purpose:
@@ -11673,7 +11680,38 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * At-least-once keyed upsert: the latest {@code correctionRev} per {@code tradeDate|HH:mm}
+     * The chronological position of a minute label inside its trade date: 18:01 -> 1, 23:59 -> 359,
+     * 00:00 -> 360, 09:30 -> 930, the 16:00 cash close -> 1320. {@code -1} when the text is not a
+     * minute label, which is not a minute of any session and so has no position in one.
+     */
+    static int esAuctionMinuteIndex(String minute) {
+        if (minute == null || minute.length() != 5 || minute.charAt(2) != ':') return -1;
+        int hh = 0;
+        int mm = 0;
+        for (int i = 0; i < 5; i++) {
+            if (i == 2) continue;
+            char c = minute.charAt(i);
+            if (c < '0' || c > '9') return -1;
+            if (i < 2) hh = hh * 10 + (c - '0');
+            else mm = mm * 10 + (c - '0');
+        }
+        if (hh > 23 || mm > 59) return -1;
+        int ofDay = hh * 60 + mm;
+        return ofDay >= 1080 ? ofDay - 1080 : ofDay + 360;     // 18:00 ET is where a trade date's own minutes begin
+    }
+
+    /** The view key for a minute whose position is already known; {@code NNNN} is what keeps the text order chronological. */
+    private static String esAuctionViewKey(String tradeDate, String minute, int index) {
+        return tradeDate + "|" + (index < 10 ? "000" : index < 100 ? "00" : index < 1000 ? "0" : "") + index + "|" + minute;
+    }
+
+    /** The label out of a view key: the part after the last separator. */
+    private static String esAuctionViewKeyMinute(String viewKey) {
+        return viewKey.substring(viewKey.lastIndexOf('|') + 1);
+    }
+
+    /**
+     * At-least-once keyed upsert: the latest {@code correctionRev} per minute of a trade date
      * wins (an equal rev overwrites, so a restart's re-emission replaces rather than duplicates).
      * Retention is the CURRENT trade date plus the PREVIOUS one: a newer date rolls the view
      * forward and evicts everything older than the date it rolled from; a record older than the
@@ -11723,7 +11761,11 @@ public class FeedGatewayService implements ReplayRunner {
             }
         }
         if (tradeDate == null || tradeDate.isEmpty() || minute == null || minute.isEmpty()) { outcome[0] = EsAuctionUpsert.DROPPED; return false; }
-        String viewKey = tradeDate + "|" + minute;
+        int index = esAuctionMinuteIndex(minute);
+        // A label that is not HH:mm has no place in the day, and admitting one would seat it at an
+        // arbitrary point in an order every client reads as chronological.
+        if (index < 0) { outcome[0] = EsAuctionUpsert.DROPPED; return false; }
+        String viewKey = esAuctionViewKey(tradeDate, minute, index);
         // A §7b CorrectionEnvelope is a SPARSE PATCH, not a minute. /api/auction/minutes promises MINUTES,
         // and a page loading cold cannot reconstruct one from a patch whose base it never receives, so the
         // view stores the MATERIALIZED record: the envelope applied to the minute it corrects (code review
@@ -11871,7 +11913,7 @@ public class FeedGatewayService implements ReplayRunner {
             java.util.NavigableMap<String, String> day = td == null
                     ? java.util.Collections.emptyNavigableMap() : esAuctionDayLocked(td);
             sb.append(",\"minutes\":").append(day.size());
-            String last = day.isEmpty() ? null : day.lastKey().substring(td.length() + 1);
+            String last = day.isEmpty() ? null : esAuctionViewKeyMinute(day.lastKey());
             sb.append(",\"lastMinute\":").append(last == null ? "null" : "\"" + escapeJson(last) + "\"");
             return sb.append('}').toString();
         }
@@ -11879,7 +11921,8 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The prefix range of one trade date; caller holds the view lock. */
     private java.util.NavigableMap<String, String> esAuctionDayLocked(String tradeDate) {
-        // '|' + 1 == '}' — every "tradeDate|HH:mm" key sorts inside [tradeDate|, tradeDate}).
+        // '|' + 1 == '}' — every "tradeDate|NNNN|HH:mm" key sorts inside [tradeDate|, tradeDate}),
+        // whatever follows the date, so this is one trade date however the rest of the key is shaped.
         return esAuctionMinutes.subMap(tradeDate + "|", true, tradeDate + "}", false);
     }
 
@@ -11903,13 +11946,19 @@ public class FeedGatewayService implements ReplayRunner {
             }
             java.util.NavigableMap<String, String> day = esAuctionDayLocked(td);
             if (fromMinuteInclusive != null && !fromMinuteInclusive.isBlank()) {
-                day = day.tailMap(td + "|" + fromMinuteInclusive.trim(), true);
+                String from = fromMinuteInclusive.trim();
+                int index = esAuctionMinuteIndex(from);
+                // A cursor that is not a minute label names no position in the day. Answering from the
+                // first held minute instead would hand back the whole session as though the cursor had
+                // been the start of it, which is the one wrong answer a paging client cannot detect.
+                if (index < 0) return new EsAuctionMinutesPage(td, java.util.List.of(), null);
+                day = day.tailMap(esAuctionViewKey(td, from, index), true);
             }
             java.util.List<String> out = new java.util.ArrayList<>();
             String next = null;
             for (java.util.Map.Entry<String, String> e : day.entrySet()) {
                 if (out.size() >= limit) {
-                    next = e.getKey().substring(td.length() + 1);
+                    next = esAuctionViewKeyMinute(e.getKey());
                     break;
                 }
                 out.add(e.getValue());
