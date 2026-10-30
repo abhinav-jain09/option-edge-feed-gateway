@@ -322,7 +322,138 @@
      ]
     }
    }
+  },
+  {
+   "name": "calibrationSummary",
+   "type": [
+    "null",
+    {
+     "type": "record",
+     "namespace": "com.optionsedge.contracts.indicators.avro",
+     "name": "StudyCalibrationSummary",
+     "doc": "Version 2 (optional): what the running parameter set measured on SPX history; the results are per family and timeframe.",
+     "fields": [
+      {
+       "name": "state",
+       "type": "string",
+       "doc": "CALIBRATED (the running parameterSetHash is the one measured) or NOT_CALIBRATED."
+      },
+      {
+       "name": "parameterSetHash",
+       "type": "string"
+      },
+      {
+       "name": "validationResultId",
+       "type": "string"
+      },
+      {
+       "name": "ledgerSha256",
+       "type": "string",
+       "doc": "SHA-256 of LEDGER-VAL.tsv."
+      },
+      {
+       "name": "datasetSha256",
+       "type": "string",
+       "doc": "The 1m-bar digest of the validation fold (equal to Phase E PLAN-VAL.txt)."
+      },
+      {
+       "name": "developmentFromDay",
+       "type": "int"
+      },
+      {
+       "name": "developmentToDay",
+       "type": "int"
+      },
+      {
+       "name": "validationFromDay",
+       "type": "int"
+      },
+      {
+       "name": "validationToDay",
+       "type": "int"
+      },
+      {
+       "name": "scope",
+       "type": "string",
+       "doc": "Which symbol and timeframes were measured."
+      },
+      {
+       "name": "results",
+       "type": {
+        "type": "array",
+        "items": {
+         "type": "record",
+         "namespace": "com.optionsedge.contracts.indicators.avro",
+         "name": "StudyFamilyResult",
+         "doc": "One measured result: a study family on one timeframe ('ALL' = every timeframe of the symbol) with the fixed statement the chart shows verbatim.",
+         "fields": [
+          {
+           "name": "family",
+           "type": "string",
+           "doc": "Closed vocabulary of INDICATOR-STUDIES-CALIBRATION-REPORT.md section 1 (at most 24 characters)."
+          },
+          {
+           "name": "timeframe",
+           "type": "string",
+           "doc": "1m, 5m, 15m, 30s, 1h, 4h or ALL."
+          },
+          {
+           "name": "measuredEdge",
+           "type": "string",
+           "doc": "NONE, POSITIVE, NOT_TESTABLE or EXACT_CONSTRUCT."
+          },
+          {
+           "name": "cell",
+           "type": [
+            "null",
+            "string"
+           ],
+           "default": null,
+           "doc": "The headline cell of the verdict, null where none exists."
+          },
+          {
+           "name": "n",
+           "type": "long",
+           "doc": "Trials of the headline cell (NOT_TESTABLE: events of the family)."
+          },
+          {
+           "name": "effectBp",
+           "type": [
+            "null",
+            "int"
+           ],
+           "default": null,
+           "doc": "Hit-rate (or efficiency-ratio) difference to the baseline in basis points; null unless measured."
+          },
+          {
+           "name": "pAdjPpm",
+           "type": [
+            "null",
+            "int"
+           ],
+           "default": null,
+           "doc": "Adjusted p in parts per million; null unless measured."
+          },
+          {
+           "name": "members",
+           "type": "string",
+           "doc": "Comma-separated event ids and divergence series (series:kind) the family covers; empty on rows that repeat another timeframe's members."
+          },
+          {
+           "name": "statement",
+           "type": "string",
+           "doc": "The sentence the chart shows verbatim (at most 300 bytes)."
+          }
+         ]
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "default": null,
+   "doc": "Version 2 (optional): null in a version-1 record and where the running parameter set was not measured."
   }
  ],
- "doc": "STUDIES_V1 current state (Appendix J.2); local copy until the contracts repository registers subject StudiesCurrent (id 2009)"
+ "doc": "STUDIES_V1 current state (INDICATOR-STUDIES-REQUIREMENT.md Appendix J.2). Registered subject com.optionsedge.contracts.indicators.avro.StudiesCurrent: version 1 id 2502, version 2 (this file) adds the optional calibrationSummary. The legacy field calibration keeps its name and now carries CALIBRATED (or NOT_CALIBRATED), never UNVALIDATED."
 }

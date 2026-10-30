@@ -315,7 +315,16 @@
   {
    "name": "calibration",
    "type": "string"
+  },
+  {
+   "name": "validationResultId",
+   "type": [
+    "null",
+    "string"
+   ],
+   "default": null,
+   "doc": "Version 2 (optional): the id of the historical validation the running parameterSetHash was measured under (INDICATOR-STUDIES-CALIBRATION-REPORT.md); the per-family results are in StudiesCurrent.calibrationSummary. Null in a version-1 record."
   }
  ],
- "doc": "STUDIES_V1 per-bar record (PHASE-A-INDICATORS-REQUIREMENT.md Appendix J.1); local copy until the contracts repository registers subject StudyBar (id 2008)"
+ "doc": "STUDIES_V1 per-bar record (INDICATOR-STUDIES-REQUIREMENT.md Appendix J.1). Registered subject com.optionsedge.contracts.indicators.avro.StudyBar: version 1 id 2501, version 2 (this file) adds the optional validationResultId. The legacy field calibration keeps its name and now carries CALIBRATED (or NOT_CALIBRATED), never UNVALIDATED."
 }

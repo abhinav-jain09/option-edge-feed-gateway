@@ -949,6 +949,99 @@
            "string"
           ],
           "default": null
+         },
+         {
+          "name": "calibrationState",
+          "type": [
+           "null",
+           "string"
+          ],
+          "default": null,
+          "doc": "CALIBRATED when the running parameter set is the one measured on the registered plan, NOT_CALIBRATED otherwise (a string vocabulary: an enum could never gain a symbol under FULL compatibility)."
+         },
+         {
+          "name": "measuredEdge",
+          "type": [
+           "null",
+           "string"
+          ],
+          "default": null,
+          "doc": "NONE, POSITIVE, NOT_TESTABLE or EXACT_CONSTRUCT; null iff calibrationState is not CALIBRATED. CALIBRATED never means that the pattern has an edge."
+         },
+         {
+          "name": "evidence",
+          "type": [
+           "null",
+           {
+            "type": "record",
+            "name": "Evidence",
+            "namespace": "com.optionsedge.contracts.marketstructure.geometry",
+            "fields": [
+             {
+              "name": "validationResultId",
+              "type": "string"
+             },
+             {
+              "name": "claim",
+              "type": "string",
+              "doc": "the headline cell the numbers belong to, at most 40 characters"
+             },
+             {
+              "name": "n",
+              "type": "long",
+              "doc": "annotations with a measured outcome in the headline cell (NOT_TESTABLE: confirmed annotations of the unit)"
+             },
+             {
+              "name": "effectBp",
+              "type": [
+               "null",
+               "int"
+              ],
+              "default": null,
+              "doc": "hit rate minus baseline in basis points of hit rate; null unless measured"
+             },
+             {
+              "name": "pAdjPpm",
+              "type": [
+               "null",
+               "int"
+              ],
+              "default": null,
+              "doc": "permutation-maximum adjusted p in parts per million; null unless measured"
+             },
+             {
+              "name": "calibrationFromDay",
+              "type": "int"
+             },
+             {
+              "name": "calibrationToDay",
+              "type": "int"
+             },
+             {
+              "name": "validationFromDay",
+              "type": "int"
+             },
+             {
+              "name": "validationToDay",
+              "type": "int"
+             },
+             {
+              "name": "datasetSha256",
+              "type": "string"
+             },
+             {
+              "name": "ledgerSha256",
+              "type": "string"
+             },
+             {
+              "name": "statement",
+              "type": "string",
+              "doc": "the fixed wording the chart shows verbatim, at most 300 bytes"
+             }
+            ]
+           }
+          ],
+          "default": null
          }
         ]
        }

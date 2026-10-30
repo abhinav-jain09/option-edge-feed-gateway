@@ -18,8 +18,11 @@ import org.apache.avro.generic.GenericRecord;
  * value, and the 56 values / 8 states of a COMPLETE bar are filled so JSON sizes are the real ones.
  */
 final class StudiesFixtures {
-    static final Schema BAR = load("StudyBar");
-    static final Schema CURRENT = load("StudiesCurrent");
+    static final Schema BAR = load("studies", "StudyBar");
+    static final Schema CURRENT = load("studies", "StudiesCurrent");
+    /** The registered version 1 (contracts schemas-registry/indicators/v1): what a producer that has not been upgraded writes. */
+    static final Schema BAR_V1 = load("studies-v1", "StudyBar");
+    static final Schema CURRENT_V1 = load("studies-v1", "StudiesCurrent");
     static final long T0 = Instant.parse("2026-10-20T13:30:00Z").toEpochMilli();
 
     /** The real segment id of the dev SPX series (32 hex): the barId is then 71-72 characters, as the producer really emits it (a 4-character fixture segment hid the 64 bound). */
@@ -28,8 +31,8 @@ final class StudiesFixtures {
     private StudiesFixtures() {
     }
 
-    private static Schema load(String name) {
-        try (InputStream in = StudiesFixtures.class.getResourceAsStream("/studies/" + name + ".avsc")) {
+    private static Schema load(String dir, String name) {
+        try (InputStream in = StudiesFixtures.class.getResourceAsStream("/" + dir + "/" + name + ".avsc")) {
             return new Schema.Parser().parse(new String(in.readAllBytes(), StandardCharsets.UTF_8));
         } catch (IOException e) {
             throw new IllegalStateException(e);
@@ -60,7 +63,7 @@ final class StudiesFixtures {
             r.put("states", values(BAR.getField("states").schema().getValueType(), 8, index));
             r.put("events", List.of("RSI_OB_ENTER"));
         }
-        r.put("calibration", "UNVALIDATED");
+        r.put("calibration", "CALIBRATED");
         return r;
     }
 
@@ -90,7 +93,7 @@ final class StudiesFixtures {
         r.put("revision", (long) publishedMinutes);
         r.put("publishedAt", Instant.ofEpochMilli(T0 + publishedMinutes * 60_000L).toString());
         r.put("quality", enumOf(CURRENT, "quality", "READY"));
-        r.put("calibration", "UNVALIDATED");
+        r.put("calibration", "CALIBRATED");
         Schema tfSchema = CURRENT.getField("timeframes").schema().getValueType();
         Map<String, Object> byTf = new HashMap<>();
         for (String tf : List.of("30s", "1m", "5m", "15m", "1h", "4h")) {

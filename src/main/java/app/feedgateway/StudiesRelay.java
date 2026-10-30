@@ -24,7 +24,7 @@ final class StudiesRelay {
     /** Recent finalized bars kept per symbol and timeframe, and carried in the hello. */
     static final int HISTORY_BARS = 8;
     /** The whole studies part of the hello, in UTF-8 bytes of the rendered JSON (producer strings are not assumed ASCII). */
-    static final int HELLO_MAX_BYTES = 512 * 1024;
+    static final int HELLO_MAX_BYTES = 512 * 1024;   // the calibrated release adds the measured summary (about 19 KB SPX, 7 KB ES) to each of the three per-timeframe current entries of a symbol: about 78 KB of the 512 KiB
     static final int BAR_MAX_BYTES = 64 * 1024;
     static final int CURRENT_MAX_BYTES = 256 * 1024;
     /**
@@ -38,22 +38,28 @@ final class StudiesRelay {
     static final int MAX_TIMEFRAMES = 12;
 
     /**
-     * The writer schemas this relay forwards, pinned by their Avro parsing-form fingerprints (contracts 0.30.0 registry files
-     * StudyBar.avsc / StudiesCurrent.avsc; pinned in StudiesRelayTest against the byte-identical test copies). A record written under a
-     * schema of the same name but another shape is refused: the browser contract is exact, and the page rejects an altered field set.
+     * The writer schemas this relay forwards, pinned by their Avro parsing-form fingerprints (contracts registry files StudyBar.avsc / StudiesCurrent.avsc;
+     * pinned in StudiesRelayTest against the byte-identical test copies). Since the INDICATOR-STUDIES calibrated release (contracts 0.50.0) each record has TWO
+     * approved writer schemas: version 2 (ids 2505 and 2506: {@code StudyBar.validationResultId}, {@code StudiesCurrent.calibrationSummary}, optional) and the
+     * registered version 1 (ids 2501 and 2502) that a producer which has not been upgraded still writes. A frame is the rendering of the WRITER schema, so a version-2
+     * record carries the measured evidence and its fixed statements verbatim and a version-1 record carries none; the gateway judges none of the new vocabularies.
+     * A record written under a schema of the same name but another shape is refused: the browser contract is exact, and the page rejects an altered field set.
      */
-    static final long BAR_FINGERPRINT = 2213339975127789770L;
-    static final long CURRENT_FINGERPRINT = -2671074147627402471L;
+    static final long BAR_FINGERPRINT = 28750306123793365L;
+    static final long CURRENT_FINGERPRINT = -4478088565585461864L;
+    static final long BAR_FINGERPRINT_V1 = 2213339975127789770L;
+    static final long CURRENT_FINGERPRINT_V1 = -2671074147627402471L;
     private final java.util.IdentityHashMap<Schema, Boolean> approvedSchemas = new java.util.IdentityHashMap<>();
 
-    private boolean approvedSchema(Schema schema, long expected) {
+    private boolean approvedSchema(Schema schema, long expected, long expectedV1) {
         synchronized (approvedSchemas) {
             Boolean known = approvedSchemas.get(schema);
             if (known == null) {
                 if (approvedSchemas.size() > 32) {
                     approvedSchemas.clear();   // a bounded identity cache: a deserializer hands out one Schema object per writer id
                 }
-                known = org.apache.avro.SchemaNormalization.parsingFingerprint64(schema) == expected;
+                long fingerprint = org.apache.avro.SchemaNormalization.parsingFingerprint64(schema);
+                known = fingerprint == expected || fingerprint == expectedV1;
                 approvedSchemas.put(schema, known);
             }
             return known;
@@ -315,7 +321,7 @@ final class StudiesRelay {
         int t = indexOf(TF_ENUM, str(r, "timeframe"));
         String status = str(r, "status");
         String barId = str(r, "barId");
-        if (!BAR_SCHEMA.equals(schema.getFullName()) || !approvedSchema(schema, BAR_FINGERPRINT) || s != topicSymbol || t < 0 || !"STUDIES_V1".equals(str(r, "methodVersion"))
+        if (!BAR_SCHEMA.equals(schema.getFullName()) || !approvedSchema(schema, BAR_FINGERPRINT, BAR_FINGERPRINT_V1) || s != topicSymbol || t < 0 || !"STUDIES_V1".equals(str(r, "methodVersion"))
                 || !Integer.valueOf(1).equals(r.get("schemaVersion")) || "EMPTY".equals(status) || barId.isEmpty()
                 || !(symbol + "|" + TF[t]).equals(String.valueOf(key)) || !withinBarBounds(r)) {
             drops.incrementAndGet();
@@ -425,7 +431,7 @@ final class StudiesRelay {
     private String applyCurrent(Store target, Object key, GenericRecord r, int topicSymbol) throws JsonProcessingException {
         String symbol = str(r, "symbol");
         int s = indexOf(SYMBOLS, symbol);
-        if (!CURRENT_SCHEMA.equals(r.getSchema().getFullName()) || !approvedSchema(r.getSchema(), CURRENT_FINGERPRINT) || s != topicSymbol || !symbol.equals(String.valueOf(key))
+        if (!CURRENT_SCHEMA.equals(r.getSchema().getFullName()) || !approvedSchema(r.getSchema(), CURRENT_FINGERPRINT, CURRENT_FINGERPRINT_V1) || s != topicSymbol || !symbol.equals(String.valueOf(key))
                 || !"STUDIES_V1".equals(str(r, "methodVersion")) || !Integer.valueOf(1).equals(r.get("schemaVersion"))) {
             drops.incrementAndGet();
             return null;

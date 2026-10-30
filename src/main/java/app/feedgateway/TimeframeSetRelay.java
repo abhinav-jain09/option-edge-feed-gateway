@@ -10,6 +10,14 @@ import org.apache.avro.generic.GenericRecord;
  * timeframe, size); the page is the full validator. Per timeframe the set with the greatest {@code asOfMs} is retained, a smaller one
  * is a counted regression and an equal one replaces. The hello carries the retained sets whole, in the order 1m, 5m, 15m, while they
  * fit the part budget and {@code null} for the rest: a set is never truncated or thinned.
+ * <p>
+ * Version 2 of both records (the calibrated release: StructureToolsSet id 2212 adds {@code calibrationState}, {@code validationState}, {@code measuredEdge} and the {@code evidence} record to every
+ * object; GeometryAnnotationSet id 2223 adds {@code calibrationState}, {@code measuredEdge} and {@code evidence} to every annotation's {@code calibration}, all optional) needs no code here: a frame is
+ * the rendering of the WRITER schema of the record, so a version-2 record carries the measured evidence and its fixed statements verbatim and a version-1 record carries none. The gateway judges none
+ * of the new vocabularies (the boundary check below is unchanged); the page is the validator. The evidence block makes a frame larger (about 0.5 KB per tools object in the producer's real sets, at most
+ * 96 objects, 667 453 bytes for the producer's worst case; about 0.35 KB per geometry annotation, at most 48), still inside {@link #FRAME_MAX_BYTES}; the hello part keeps its 384 KiB bound, so fewer
+ * of the three timeframes of a large tools day fit the hello and the rest arrive as live frames (a later timeframe is {@code null} in the hello, never thinned).
+ * CalibratedMarketStructureProducerRecordsTest pins this with the bytes the real producer published.
  */
 final class TimeframeSetRelay extends TaRelay {
     static final String TOOLS_EVENT = "market-structure-tools";

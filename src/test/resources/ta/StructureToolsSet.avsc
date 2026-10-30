@@ -472,8 +472,116 @@
                   "UNVALIDATED",
                   "VALIDATED"
                 ],
-                "doc": "always UNVALIDATED until B-R13 passes"
+                "doc": "VALIDATED when a stored validation result exists for the running parameter set (the measured result is in calibrationState, measuredEdge and evidence); UNVALIDATED only for a parameter set that was not measured. The enum cannot gain a symbol under FULL compatibility."
               }
+            },
+            {
+              "name": "calibrationState",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null,
+              "doc": "CALIBRATED (the running parameterSetHash is the one measured) or NOT_CALIBRATED; null only in a record written before this version"
+            },
+            {
+              "name": "validationState",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null,
+              "doc": "MEASURED when the validation fold was measured once under the running parameter set, else NOT_MEASURED; null only in a record written before this version"
+            },
+            {
+              "name": "measuredEdge",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null,
+              "doc": "NONE, POSITIVE, NOT_TESTABLE or EXACT_CONSTRUCT; null iff not CALIBRATED"
+            },
+            {
+              "name": "evidence",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "Evidence",
+                  "namespace": "com.optionsedge.contracts.marketstructure.tools",
+                  "doc": "the measured result of the tool on this timeframe, from the pre-registered historical calibration",
+                  "fields": [
+                    {
+                      "name": "validationResultId",
+                      "type": "string"
+                    },
+                    {
+                      "name": "claim",
+                      "type": "string",
+                      "doc": "the headline cell the numbers belong to, at most 40 characters"
+                    },
+                    {
+                      "name": "n",
+                      "type": "long",
+                      "doc": "trials in the headline cell (NOT_TESTABLE: the largest trial count of the unit)"
+                    },
+                    {
+                      "name": "effectBp",
+                      "type": [
+                        "null",
+                        "int"
+                      ],
+                      "default": null,
+                      "doc": "hit rate minus baseline in basis points of hit rate; null unless measured"
+                    },
+                    {
+                      "name": "pAdjPpm",
+                      "type": [
+                        "null",
+                        "int"
+                      ],
+                      "default": null,
+                      "doc": "permutation-maximum adjusted p in parts per million; null unless measured"
+                    },
+                    {
+                      "name": "calibrationFromDay",
+                      "type": "int"
+                    },
+                    {
+                      "name": "calibrationToDay",
+                      "type": "int"
+                    },
+                    {
+                      "name": "validationFromDay",
+                      "type": "int"
+                    },
+                    {
+                      "name": "validationToDay",
+                      "type": "int"
+                    },
+                    {
+                      "name": "datasetSha256",
+                      "type": "string"
+                    },
+                    {
+                      "name": "ledgerSha256",
+                      "type": "string"
+                    },
+                    {
+                      "name": "statement",
+                      "type": "string",
+                      "doc": "the fixed wording the chart shows verbatim, at most 300 bytes"
+                    },
+                    {
+                      "name": "scaleStatement",
+                      "type": "string",
+                      "doc": "the measured time-scale evidence of the timeframe, at most 240 bytes"
+                    }
+                  ]
+                }
+              ],
+              "default": null
             }
           ]
         }
