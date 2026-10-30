@@ -32,7 +32,7 @@ class CalibratedMarketStructureProducerRecordsTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String TOOLS_SUBJECT = "com.optionsedge.contracts.marketstructure.tools.StructureToolsSet";
     private static final String GEOMETRY_SUBJECT = "com.optionsedge.contracts.marketstructure.geometry.GeometryAnnotationSet";
-    private static final List<String> SCOPES = List.of("bc-tools", "bc-geometry", "bc-size", "bc-v1");
+    private static final List<String> SCOPES = List.of("bc-tools", "bc-geometry", "bc-size", "bc-v1", "bc-v1-real-tools", "bc-v1-real-geometry");
 
     /** The mock registry keeps its scopes in static state: drop them so nothing leaks into another test of the JVM. */
     @AfterAll
