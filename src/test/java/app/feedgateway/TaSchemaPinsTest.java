@@ -11,7 +11,7 @@ import java.util.TreeMap;
 import org.junit.jupiter.api.Test;
 
 /**
- * The test schemas (src/test/resources/ta) are byte-identical copies of the contracts registry files (options-edge-contracts 0.36.0 for WaveSet and CycleSet version 2, 0.31.0 otherwise,
+ * The test schemas (src/test/resources/ta) are byte-identical copies of the contracts registry files (options-edge-contracts 0.36.0 for WaveSet and CycleSet version 2, 0.49.0 for StructureToolsSet and GeometryAnnotationSet version 2, 0.31.0 otherwise,
  * schemas-registry/ta, SHA-256 pinned there against the producers' resources). The gateway needs no contracts class for them: it renders
  * from the writer schema the registry returns. If a producer schema changes, the contracts pin, this copy and the fixtures change together.
  */
@@ -25,7 +25,7 @@ class TaSchemaPinsTest {
             "CycleSet", "00fd1f9fb68b9aca1ee0e7622ea5e26184d490d2df5377c84562721e74e9ef7b",
             "DlqRecord", "1dbd98fbae1ccbe1ad9278c43905e7bbb24d2c94cf3acf6aeca8ef2413867a31",
             "FlowBar", "ee5260efdf2f48bcc7bcc4e4f712e2f8f1cf2d086ae404a2f4ae20dbaa83f8f1",
-            "GeometryAnnotationSet", "7df6d75aab13cfa943ef3b7cd10a7fc3da78f7e54c24dcedba4664fec2b023a8",
+            "GeometryAnnotationSet", "4263cc10c517fcf92989fbf773f5e208a2be37fe7dd2f181c4146d73a9baad3c",
             "GeometryUnavailable", "15dd96c7d3e97e62e029b67689ba4a53a471002cb32d19c13751fb5e39c91e46",
             "PatternAnnotationSet", "71f68ef6858c5bce3db89217b162d43541a945de3c77f8048333b1969493be28",
             "PatternUnavailable", "4600ad015dfb74d463ba95a9c09bad424fda27d277829ba8c5b1479d2beb3813",
@@ -42,7 +42,7 @@ class TaSchemaPinsTest {
             "RecoveryPayload", "aec8e8512a33d120d4f64ae1f79c59f1ceb8d34cc38ebc7715f97f0259d295ac",
             "SequenceRecord", "9d2f86434bbc799118c9eb8913a59f1b3f67276006bad2bfd79f20404528a216",
             "SeriesCheckpoint", "9f0606d80e7bcf2847784d31380e9bf986be99e18ca13b9b2a6aa6c7f71309f5",
-            "StructureToolsSet", "d7b13694069d53b46ce7aa91c1f6c484f379f2daf777f55417834f6208cf9a6e",
+            "StructureToolsSet", "1ea12cb68be4e18d420dcd1f9bad0fd35111ec9ca5a7a286e5b47e2dd7119422",
             "TimeframeCheckpoint", "9ad3fc99ac64650fa4dd5b30ffa8ccdb60d49d31030a6e6f73a5466f43fc8a44",
             "TtCheckpointChunk", "5909bd204ed7c79ca6cd33ae132219b040ec41e1e1cf0ddc1864bf604a60df91",
             "TtCheckpointManifest", "e0b7363d4306ba55b9c03d6855b2273204b566b61f3051640f827a30bb1dc8f8",
@@ -68,13 +68,24 @@ class TaSchemaPinsTest {
         }
     }
 
+    /** The registered version 1 of StructureToolsSet and GeometryAnnotationSet (contracts schemas-registry/ta/v1, ids 2211 and 2221): a producer that has not been upgraded still writes them. */
+    @Test
+    void theVersion1MarketStructureSchemasAreTheFrozenRegistryFiles() throws Exception {
+        Map<String, String> v1 = Map.of("GeometryAnnotationSet", "7df6d75aab13cfa943ef3b7cd10a7fc3da78f7e54c24dcedba4664fec2b023a8",
+                "StructureToolsSet", "d7b13694069d53b46ce7aa91c1f6c484f379f2daf777f55417834f6208cf9a6e");
+        for (Map.Entry<String, String> e : v1.entrySet()) {
+            byte[] bytes = Files.readAllBytes(Path.of("src", "test", "resources", "ta-v1", e.getKey() + ".avsc"));
+            assertEquals(e.getValue(), HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)), e.getKey() + " version 1");
+        }
+    }
+
     /** The registered version 1 of WaveSet and CycleSet (contracts schemas-registry/ta/v1): a producer that has not been upgraded still writes it, and the relay renders it from its own writer schema. */
     @Test
     void theVersion1WaveAndCycleSchemasAreTheFrozenRegistryFiles() throws Exception {
         Map<String, String> v1 = Map.of("CycleSet", "48e70d6ff1aac5336ac083a5ff5607e341ac0e4f2a782520d3fe51badcc3b230",
                 "WaveSet", "2d28adcf2ca2683383e6d2959651a03830a16da2b696f653062abb1319ca3644");
         try (var files = Files.list(Path.of("src", "test", "resources", "ta-v1"))) {
-            assertEquals(v1.keySet(), files.map(p -> p.getFileName().toString().replace(".avsc", "")).collect(java.util.stream.Collectors.toCollection(java.util.TreeSet::new)));
+            assertEquals(java.util.Set.of("CycleSet", "WaveSet", "StructureToolsSet", "GeometryAnnotationSet"), files.map(p -> p.getFileName().toString().replace(".avsc", "")).collect(java.util.stream.Collectors.toCollection(java.util.TreeSet::new)));
         }
         for (Map.Entry<String, String> e : v1.entrySet()) {
             byte[] bytes = Files.readAllBytes(Path.of("src", "test", "resources", "ta-v1", e.getKey() + ".avsc"));

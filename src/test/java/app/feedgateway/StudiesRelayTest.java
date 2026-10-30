@@ -41,7 +41,7 @@ class StudiesRelayTest {
         String json = live(bar("SPX", "T5M", 0));
         JsonNode n = JSON.readTree(json);
         assertEquals(List.of("schemaVersion", "methodVersion", "parameterSetHash", "symbol", "tradeDate", "timeframe", "barId", "barStart",
-                "barEnd", "status", "resetCount", "closesSeen", "values", "states", "events", "divergences", "calibration"),
+                "barEnd", "status", "resetCount", "closesSeen", "values", "states", "events", "divergences", "calibration", "validationResultId"),
                 new ArrayList<>(iterator(n.fieldNames())));
         assertEquals("T5M", n.get("timeframe").asText());
         assertEquals("COMPLETE", n.get("status").asText());
@@ -149,7 +149,7 @@ class StudiesRelayTest {
         String frame = StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", current("SPX", 1));
         JsonNode n = JSON.readTree(frame);
         assertEquals(List.of("schemaVersion", "methodVersion", "parameterSetHash", "symbol", "tradeDate", "runId", "revision",
-                "publishedAt", "asOfEventTime", "quality", "restored", "calibration", "timeframes"), iterator(n.fieldNames()));
+                "publishedAt", "asOfEventTime", "quality", "restored", "calibration", "calibrationSummary", "timeframes"), iterator(n.fieldNames()));
         assertEquals(List.of("1m", "5m", "15m"), iterator(n.get("timeframes").fieldNames()));
         assertEquals("READY", n.get("quality").asText());
         assertEquals(56, n.get("timeframes").get("5m").get("values").size());
@@ -364,7 +364,7 @@ class StudiesRelayTest {
         // braces) pushes the rendered fragment over it unless the budget accounts for the framing too
         int target = (StudiesRelay.HELLO_MAX_BYTES - 100) / 24 - 1;
         String probe = live(bar("SPX", "T1M", 0));
-        int pad = target - StudiesRelay.utf8Length(probe) + "UNVALIDATED".length();   // the fixture bar carries calibration UNVALIDATED
+        int pad = target - StudiesRelay.utf8Length(probe) + "CALIBRATED".length();   // the fixture bar carries calibration CALIBRATED
         assertTrue(pad > 0 && target < StudiesRelay.BAR_MAX_BYTES);
         int symbolIndex = 0;
         for (String symbol : List.of("SPX", "ES")) {
@@ -408,7 +408,7 @@ class StudiesRelayTest {
         assertTrue(relay.promote(staged).isEmpty(), "identical to what is live: nothing owed");
         GenericRecord revised = current("SPX", 5);
         revised.put("revision", 6L);   // same run, same instant, higher revision
-        revised.put("calibration", "UNVALIDATED");
+        revised.put("calibration", "CALIBRATED");
         StudiesFixtures.onStaged(relay, staged, StudiesRelay.CURRENT_EVENT, "SPX", revised);
         List<String[]> frames = relay.promote(staged);
         assertEquals(1, frames.size());
@@ -485,7 +485,7 @@ class StudiesRelayTest {
         GenericRecord otherRun = current("SPX", 5);
         otherRun.put("runId", "run-2");
         otherRun.put("revision", 99L);
-        otherRun.put("calibration", "UNVALIDATED");
+        otherRun.put("calibration", "CALIBRATED");
         otherRun.put("restored", true);
         assertNull(StudiesFixtures.onLive(relay, StudiesRelay.CURRENT_EVENT, "SPX", otherRun), "another run does not displace the held state of that instant");
         assertEquals(2L, relay.regressionsForTest());
@@ -644,6 +644,9 @@ class StudiesRelayTest {
         // the SHA-256 test in the contracts repository (StudySubjectsTest), not here
         assertEquals(StudiesRelay.BAR_FINGERPRINT, org.apache.avro.SchemaNormalization.parsingFingerprint64(StudiesFixtures.BAR), "StudyBar.avsc changed: re-pin");
         assertEquals(StudiesRelay.CURRENT_FINGERPRINT, org.apache.avro.SchemaNormalization.parsingFingerprint64(StudiesFixtures.CURRENT), "StudiesCurrent.avsc changed: re-pin");
+        // the registered version 1 (ids 2501 and 2502, resources studies-v1) stays approved: a producer that has not been upgraded still writes it
+        assertEquals(StudiesRelay.BAR_FINGERPRINT_V1, org.apache.avro.SchemaNormalization.parsingFingerprint64(StudiesFixtures.BAR_V1), "StudyBar v1 changed: re-pin");
+        assertEquals(StudiesRelay.CURRENT_FINGERPRINT_V1, org.apache.avro.SchemaNormalization.parsingFingerprint64(StudiesFixtures.CURRENT_V1), "StudiesCurrent v1 changed: re-pin");
         // a record of the same full name with one extra field
         org.apache.avro.Schema base = StudiesFixtures.BAR;
         java.util.List<org.apache.avro.Schema.Field> fields = new java.util.ArrayList<>();
