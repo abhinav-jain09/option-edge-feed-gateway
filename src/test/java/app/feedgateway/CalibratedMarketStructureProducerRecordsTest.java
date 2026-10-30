@@ -201,7 +201,8 @@ class CalibratedMarketStructureProducerRecordsTest {
 
     @Test
     void aVersion1RecordOfAnUpgradedRegistryStillRelaysAndCarriesNoInventedFields() throws Exception {
-        // the version-1 schemas under the ids a not-yet-upgraded producer stamps (2211, 2221): the relay renders the WRITER schema, so the frame has no evidence
+        // the version-1 schemas under the ids a not-yet-upgraded producer stamps (2211, 2221): the relay renders the WRITER schema, so no object and no annotation carries evidence.
+        // The version-1 records are the REAL version-2 records of the producers rewritten as version 1 (DownVersion), so objects and annotations are present and really are walked.
         String scope = "bc-v1";
         SchemaRegistryClient registry = io.confluent.kafka.schemaregistry.testutil.MockSchemaRegistry.getClientForScope(scope);
         registry.register(TOOLS_SUBJECT, new AvroSchema(schema("ta-v1", "StructureToolsSet")), 1, 2211);
@@ -217,21 +218,47 @@ class CalibratedMarketStructureProducerRecordsTest {
         reader.put("specific.avro.reader", "false");
         reader.put(GatewayAvroDeserializer.SPX_PRICE_TOPIC, "underlying.spx.price");
         reader.put(GatewayAvroDeserializer.TOLERANT_TOPICS, "t.bc1");
-        GenericRecord oldTools = TaFixtures.minimal(schema("ta-v1", "StructureToolsSet"));
-        TaFixtures.put(oldTools, "schemaVersion", 1);
-        TaFixtures.put(oldTools, "service", "market-structure");
-        TaFixtures.put(oldTools, "state", "OK");
-        TaFixtures.put(oldTools, "timeframe", "M5");
-        TaFixtures.put(oldTools, "asOfMs", 1_790_000_000_001L);
-        try (KafkaAvroSerializer serializer = new KafkaAvroSerializer(); GatewayAvroDeserializer d = new GatewayAvroDeserializer()) {
+        GatewayAvroDeserializer realTools = deserializer("bc-v1-real-tools", "t.bc1t", TOOLS_SUBJECT, "StructureToolsSet", 111);
+        GatewayAvroDeserializer realGeometry = deserializer("bc-v1-real-geometry", "t.bc1g", GEOMETRY_SUBJECT, "GeometryAnnotationSet", 121);
+        try (KafkaAvroSerializer serializer = new KafkaAvroSerializer(); GatewayAvroDeserializer d = new GatewayAvroDeserializer(); realTools; realGeometry) {
             serializer.configure(config, false);
             d.configure(reader, false);
-            var relay = TimeframeSetRelay.structureTools();
+            // tools
+            JsonNode toolsRecord = records("structure-tools-records.json").get(0);
+            GenericRecord realT = (GenericRecord) realTools.deserialize("t.bc1t", Base64.getDecoder().decode(toolsRecord.get("framedBase64").asText()));
+            GenericRecord oldTools = DownVersion.to(realT, schema("ta-v1", "StructureToolsSet"));
             byte[] bytes = serializer.serialize("t.bc1", oldTools);
             assertEquals(2211, java.nio.ByteBuffer.wrap(bytes, 1, 4).getInt(), "the serializer finds the exact schema, so a version-1 record keeps its version-1 id");
-            JsonNode t = frameData(relay.onLive(TimeframeSetRelay.TOOLS_EVENT, d.deserialize("t.bc1", bytes)));
-            assertEquals(1, relay.acceptedForTest());
-            assertFalse(t.has("evidence"));
+            var toolsRelay = TimeframeSetRelay.structureTools();
+            JsonNode t = frameData(toolsRelay.onLive(TimeframeSetRelay.TOOLS_EVENT, d.deserialize("t.bc1", bytes)));
+            assertEquals(1, toolsRelay.acceptedForTest());
+            assertTrue(t.get("objects").size() > 5, "real objects were relayed");
+            for (JsonNode o : t.get("objects")) {
+                assertTrue(o.has("calibration"), "the one calibration field version 1 has");
+                for (String f : List.of("calibrationState", "validationState", "measuredEdge", "evidence")) {
+                    assertFalse(o.has(f), f);
+                }
+            }
+            // geometry
+            JsonNode geometryRecord = records("geometry-records.json").get(1);
+            GenericRecord realG = (GenericRecord) realGeometry.deserialize("t.bc1g", Base64.getDecoder().decode(geometryRecord.get("framedBase64").asText()));
+            GenericRecord oldGeometry = DownVersion.to(realG, schema("ta-v1", "GeometryAnnotationSet"));
+            byte[] gBytes = serializer.serialize("t.bc1", oldGeometry);
+            assertEquals(2221, java.nio.ByteBuffer.wrap(gBytes, 1, 4).getInt());
+            var geometryRelay = TimeframeSetRelay.geometry();
+            JsonNode g = frameData(geometryRelay.onLive(TimeframeSetRelay.GEOMETRY_EVENT, d.deserialize("t.bc1", gBytes)));
+            assertEquals(1, geometryRelay.acceptedForTest());
+            assertTrue(g.get("annotations").size() >= 2, "real annotations were relayed");
+            for (JsonNode a : g.get("annotations")) {
+                JsonNode c = a.get("calibration");
+                assertEquals(List.of("state", "validationResultId"), fieldNames(c), "the calibration block of version 1");
+            }
         }
+    }
+
+    private static List<String> fieldNames(JsonNode n) {
+        List<String> out = new java.util.ArrayList<>();
+        n.fieldNames().forEachRemaining(out::add);
+        return out;
     }
 }

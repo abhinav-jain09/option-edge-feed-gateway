@@ -24,7 +24,7 @@ final class StudiesRelay {
     /** Recent finalized bars kept per symbol and timeframe, and carried in the hello. */
     static final int HISTORY_BARS = 8;
     /** The whole studies part of the hello, in UTF-8 bytes of the rendered JSON (producer strings are not assumed ASCII). */
-    static final int HELLO_MAX_BYTES = 512 * 1024;   // the calibrated release adds the measured summary (about 19 KB SPX, 7 KB ES) to each of the three per-timeframe current entries of a symbol: about 78 KB of the 512 KiB
+    static final int HELLO_MAX_BYTES = 512 * 1024;   // the calibrated release adds the measured summary (about 29.5 KB SPX, 10 KB ES, measured on the producer's real records) to each of the three per-timeframe current entries of a symbol: about 120 KB of the 512 KiB
     static final int BAR_MAX_BYTES = 64 * 1024;
     static final int CURRENT_MAX_BYTES = 256 * 1024;
     /**

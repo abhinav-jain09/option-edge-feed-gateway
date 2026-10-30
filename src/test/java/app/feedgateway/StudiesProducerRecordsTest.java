@@ -143,7 +143,7 @@ class StudiesProducerRecordsTest {
 
     @Test
     void theHelloBudgetWithTheRealSummariesIsRecomputedNotAssumed() throws Exception {
-        // the summary rides in the header of every per-timeframe entry of the hello: 3 x SPX (about 19 KB) + 3 x ES (about 7 KB) over the pre-calibration entries
+        // the summary rides in the header of every per-timeframe entry of the hello: 3 x SPX (about 29.5 KB) + 3 x ES (about 10 KB) over the pre-calibration entries
         try (GatewayAvroDeserializer d = deserializer("studies-real", "t.sb")) {
             var relay = new StudiesRelay(JSON);
             int summaries = 0;
@@ -163,6 +163,7 @@ class StudiesProducerRecordsTest {
 
     @Test
     void aVersion1RecordOfAnUpgradedRegistryStillRelaysAndCarriesNoInventedFields() throws Exception {
+        // the REAL version-2 records of the producer rewritten as version 1 (DownVersion): what a producer that has not been upgraded writes, under the ids 2501 and 2502
         String scope = "studies-v1";
         SchemaRegistryClient registry = io.confluent.kafka.schemaregistry.testutil.MockSchemaRegistry.getClientForScope(scope);
         registry.register(BAR_SUBJECT, new AvroSchema(schema("studies-v1", "StudyBar")), 1, 2501);
@@ -174,21 +175,31 @@ class StudiesProducerRecordsTest {
         config.put("auto.register.schemas", false);
         config.put("use.latest.version", false);
         config.put("value.subject.name.strategy", "io.confluent.kafka.serializers.subject.RecordNameStrategy");
-        GenericRecord oldBar = StudiesFixtures.bar("SPX", "T5M", 0);
-        GenericRecord v1Bar = new org.apache.avro.generic.GenericData.Record(StudiesFixtures.BAR_V1);
-        for (Schema.Field f : StudiesFixtures.BAR_V1.getFields()) {
-            v1Bar.put(f.name(), oldBar.get(f.name()));
-        }
-        try (KafkaAvroSerializer serializer = new KafkaAvroSerializer(); GatewayAvroDeserializer d = new GatewayAvroDeserializer()) {
+        try (GatewayAvroDeserializer real = deserializer("studies-real", "t.s2"); KafkaAvroSerializer serializer = new KafkaAvroSerializer(); GatewayAvroDeserializer d = new GatewayAvroDeserializer()) {
             serializer.configure(config, false);
             d.configure(readerConfig(scope, "t.s1"), false);
-            byte[] bytes = serializer.serialize("t.s1", v1Bar);
-            assertEquals(2501, java.nio.ByteBuffer.wrap(bytes, 1, 4).getInt(), "a version-1 record keeps its version-1 id");
             var relay = new StudiesRelay(JSON);
-            String frame = relay.onLive(StudiesRelay.BAR_EVENT, "SPX|5m", d.deserialize("t.s1", bytes), false);
-            assertNotNull(frame, "the approved version-1 writer schema still relays");
-            assertFalse(JSON.readTree(frame).has("validationResultId"));
+            for (JsonNode r : records()) {
+                if (!r.get("symbol").asText().equals("SPX") || !r.get("timeframe").asText().equals(r.get("event").asText().equals("indicator-studies") ? "5m" : "ALL")) {
+                    continue;
+                }
+                boolean bar = r.get("event").asText().equals("indicator-studies");
+                GenericRecord v2 = (GenericRecord) real.deserialize("t.s2", Base64.getDecoder().decode(r.get("framedBase64").asText()));
+                GenericRecord v1 = DownVersion.to(v2, bar ? StudiesFixtures.BAR_V1 : StudiesFixtures.CURRENT_V1);
+                byte[] bytes = serializer.serialize("t.s1", v1);
+                assertEquals(bar ? 2501 : 2502, java.nio.ByteBuffer.wrap(bytes, 1, 4).getInt(), "a version-1 record keeps its version-1 id");
+                String frame = relay.onLive(r.get("event").asText(), r.get("key").asText(), d.deserialize("t.s1", bytes), false);
+                assertNotNull(frame, "the approved version-1 writer schema still relays: " + r.get("name").asText());
+                JsonNode n = JSON.readTree(frame);
+                assertFalse(n.has("validationResultId") || n.has("calibrationSummary"), "a version-1 frame carries no evidence field");
+                if (bar) {
+                    assertEquals(v2.get("barId").toString(), n.get("barId").asText());
+                } else {
+                    assertEquals(List.of("1m", "5m", "15m"), fieldNames(n.get("timeframes")), "the projected current state of version 1");
+                }
+            }
             assertEquals(0, relay.dropsForTest());
+            assertEquals(2, relay.acceptedForTest());
         }
     }
 }
