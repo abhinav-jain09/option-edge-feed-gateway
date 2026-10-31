@@ -2700,6 +2700,7 @@ public class FeedGatewayService implements ReplayRunner {
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
         addEsAggressorFlowTopic(topicEvents);
+        addZeroDteIntelligenceTopic(topicEvents);
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2837,8 +2838,6 @@ public class FeedGatewayService implements ReplayRunner {
             // Market commentary: CACHE consumer ONLY (polled REST view, no broadcast), like the early-auction verdict ledger.
             topicEvents.put(settings.marketCommentaryTopic(), new TopicBinding("DATABENTO", "market-commentary"));
         }
-        // Binary SPX direction / unusual-flow state: JSON, standalone, optional during staged rollout.
-        topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -2939,6 +2938,7 @@ public class FeedGatewayService implements ReplayRunner {
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
         addEsAggressorFlowTopic(topicEvents);
+        addZeroDteIntelligenceTopic(topicEvents);
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -2953,6 +2953,16 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.esAggressorFlowEnabled()) {
             topicEvents.put(settings.esAggressorFlowTopic(), new TopicBinding("DATABENTO", "es-aggressor-flow"));
         }
+    }
+
+    /**
+     * Binary SPX direction / unusual-flow state from vix-option-inteligence-service: AVRO since its 2026-10-31 conversion (contracts 0.53.0, record
+     * {@code com.optionsedge.contracts.zerodte.ZeroDteIntelligenceSnapshot}, fixed id 3001), so it is consumed by the Avro consumers only and rendered
+     * through {@link AvroJson}; the browser keeps receiving the {@code zero-dte-intelligence} JSON it always has. Standalone and optional during staged
+     * rollout. The topic is tolerant (see {@link #tolerantTopics()}): a retained or foreign value is dropped, it never stalls the shared Avro consumer.
+     */
+    private void addZeroDteIntelligenceTopic(Map<String, TopicBinding> topicEvents) {
+        topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
     }
 
     /** Binds one chart relay topic; two roles (or a chart topic and another stream) on one topic would silently route records to the wrong relay, so it refuses to start. */
@@ -3093,7 +3103,6 @@ public class FeedGatewayService implements ReplayRunner {
             // this event keeps its own latest-record retention for the connect replay.
             topicEvents.put(settings.esCvdSpxLevelsTopic(), new TopicBinding("DATABENTO", "es-cvd-spx-levels"));
         }
-        topicEvents.put(settings.vixOptionInteligenceTopic(), new TopicBinding("DATABENTO", "zero-dte-intelligence"));
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
 
@@ -13159,6 +13168,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.esAggressorFlowEnabled()) {
             topics.add(settings.esAggressorFlowTopic());
         }
+        topics.add(settings.vixOptionInteligenceTopic());
         return topics;
     }
 
@@ -13725,6 +13735,11 @@ public class FeedGatewayService implements ReplayRunner {
         if ("es-aggressor-flow".equals(event)) {
             // ONE fixed contract (id 2701 = exactly this schema; a later version is its own reviewed change): any other schema is dropped, never relayed
             return value instanceof GenericRecord r && com.optionsedge.contracts.esflow.EsAggressorFlowAvro.schema().equals(r.getSchema())
+                    ? avroJson(value) : null;
+        }
+        if ("zero-dte-intelligence".equals(event)) {
+            // ONE fixed contract (id 3001 = exactly this schema; a later version is its own reviewed change): any other schema is dropped, never relayed
+            return value instanceof GenericRecord r && com.optionsedge.contracts.zerodte.ZeroDteIntelligenceAvro.schema().equals(r.getSchema())
                     ? avroJson(value) : null;
         }
         return "spx-price".equals(event) ? SpxPriceJson.render(mapper, value) : avro ? avroJson(value) : stringJson(value);

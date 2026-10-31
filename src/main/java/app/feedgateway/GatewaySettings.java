@@ -614,8 +614,8 @@ public final class GatewaySettings {
     }
 
     /**
-     * Current binary SPX direction from vix-option-inteligence-service (JSON, key = symbol|sessionDate).
-     * Forwarded as standalone websocket event {@code zero-dte-intelligence}; optional until the new
+     * Current binary SPX direction from vix-option-inteligence-service (Avro, contracts ZeroDteIntelligenceSnapshot id 3001, key = symbol|sessionDate).
+     * Forwarded as standalone websocket event {@code zero-dte-intelligence} (the JSON the browser has always received); optional until the new
      * producer is deployed.
      */
     public String vixOptionInteligenceTopic() {
