@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "snapshotId": "run-7",
+  "symbol": "SPX",
+  "sessionDate": "2026-10-30",
+  "asOfEventTime": "2026-10-30T15:00:00Z",
+  "asOfEventTimeMs": 1788102000000,
+  "producedAt": "2026-10-30T15:00:01Z",
+  "askSideCallPremium": 1250000.5,
+  "askSidePutPremium": 980000.25,
+  "minutesToExpiry": 210.5,
+  "atmIv": 0.1875,
+  "putSkew25": 0.031,
+  "riskReversal25": -0.012,
+  "remainingSessionVol": 0.0114,
+  "constantOneDayVol": 0.0121,
+  "surfaceStatus": "OK",
+  "surfaceActionable": true,
+  "rateSource": "SOFR",
+  "rateEventTime": "2026-10-30T14:59:00Z",
+  "rateAgeMs": 61000,
+  "carryQuality": "GOOD",
+  "riskFreeRateNear": 0.0431,
+  "nextExpiry": "2026-10-31",
+  "riskFreeRateNext": 0.0432,
+  "nextRateEventTime": "2026-10-30T14:59:00Z",
+  "rateMethod": "OBSERVED",
+  "nextRateSource": "SOFR",
+  "nextRateMethod": "OBSERVED",
+  "frameAgeMs": 1000,
+  "marketDirection": "BULLISH",
+  "directionalIntensity": "STRONG",
+  "directionalTriggers": [
+    "FLOW_SKEW",
+    "VIX_CONFIRM"
+  ],
+  "directionExpiresAt": "2026-10-30T15:05:00Z",
+  "marketDirectionHorizon": null,
+  "directionLifetimeMs": 300000,
+  "directionalFlow": "BULLISH",
+  "qualityStatus": "OK",
+  "actionable": true,
+  "evidenceStrengthType": "DETERMINISTIC_OPTION_ACTIVITY",
+  "directionalScore": 0.4213,
+  "optionFlowScore": 0.3,
+  "vixMarketScore": -1.0,
+  "classifiedPremium": 2230001,
+  "uniqueStrikes": 37,
+  "reasonCodes": [
+    "OK"
+  ],
+  "featureVersion": "option-flow-v1",
+  "modelVersion": "deterministic-live-v1",
+  "runId": "run",
+  "epochSeq": 7,
+  "prediction": {
+    "modelVersion": "flow-live-v3",
+    "byHorizon": {
+      "H5": {
+        "state": "EXPANSION",
+        "pExpansion": 0.5,
+        "pContraction": 0.2,
+        "pBalanced": 0.3
+      },
+      "H10": {
+        "state": "EXPANSION",
+        "pExpansion": 0.5,
+        "pContraction": 0.2,
+        "pBalanced": 0.3
+      },
+      "H15": {
+        "state": "EXPANSION",
+        "pExpansion": 0.5,
+        "pContraction": 0.2,
+        "pBalanced": 0.3
+      }
+    }
+  }
+}

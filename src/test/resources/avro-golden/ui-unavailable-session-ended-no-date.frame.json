@@ -1,0 +1,1 @@
+{"schemaVersion":1,"service":"market-structure","asOfMs":1790947860000,"sessionDate":null,"state":"UNAVAILABLE","reason":"fixed_level_mutation:PDH:7740.00->7741.00","quality":{"usable":false,"reason":"fixed_level_mutation:PDH:7740.00->7741.00"},"automationSafe":false,"sessionEnded":true}

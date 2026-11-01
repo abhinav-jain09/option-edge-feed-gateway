@@ -1,0 +1,1 @@
+{"schemaVersion":1,"dlqId":"options.indicators.bars|3|1000","reason":"SCHEDULE_MISMATCH","detail":"rthOpenMs:1","sessionFatal":false,"scheduleId":"2026-10-02.r0000000000","timeframe":"1m","ordinal":7,"topic":"options.indicators.bars","partition":3,"offset":1000,"sourceKey":"SPX|1m","payloadHash":"deadbeef","payloadBytes":812,"payloadPrefixBase64":"eyJ9"}
