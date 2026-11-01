@@ -31,6 +31,14 @@ class MarketStructureRecoverySeekTest {
         return new FeedGatewayService(settings, new ObjectMapper(), new HpsfGatewayViewMapper(), null);
     }
 
+    /** A UiProjection whose frame carries a 101 KiB warning (bigger than the 64 KiB of the pre-W0 bound). */
+    private static org.apache.avro.generic.GenericRecord ui(long asOfMs) {
+        var r = TaFixtures.uiProjection(asOfMs);
+        TaFixtures.put(r, "warning", "x".repeat(101 * 1024));
+        TaFixtures.put(r, "sessionEnded", true);
+        return r;
+    }
+
     @Test
     @SuppressWarnings("unchecked")
     void coldAndRetryStartsOverrideEndForTheQuietStructureSnapshotOnly() {
@@ -89,13 +97,11 @@ class MarketStructureRecoverySeekTest {
         for (boolean retry : List.of(false, true)) {
           for (boolean terminalTombstone : List.of(false, true)) {
             var s = service();
-            String payload = "{\"schemaVersion\":1,\"service\":\"market-structure\",\"state\":\"OK\","
-                + "\"sessionDate\":\"2026-10-13\",\"asOfMs\":1791921600000,\"sessionEnded\":true,"
-                + "\"sessionReferences\":{\"scope\":\"SPX_RTH\",\"rthOpenMs\":1791898200000,"
-                + "\"rthCloseMs\":1791921600000,\"dayHigh\":7814.15,\"dayLow\":7786.11,\"previousClose\":null},"
-                + "\"history\":\"" + "x".repeat(101 * 1024) + "\"}";
-            String older = payload.replace("1791921600000", "1791921500000");
-            String live = payload.replace("1791921600000", "1791921600001");
+            // a record whose frame exceeds the pre-W0 64 KiB bound: the 101 KiB warning rides the frame (the ui bound is 128 KiB)
+            var payloadRecord = ui(1791921600000L);
+            var older = ui(1791921500000L);
+            var live = ui(1791921600001L);
+            String payload = TaFixtures.frame(payloadRecord);
             if (retry) s.retainMarketStructure(1791921600000L, payload);
             String held = s.marketStructureLatestForTest().get();
             s.runOutboundWritesInline();
@@ -131,7 +137,7 @@ class MarketStructureRecoverySeekTest {
                 }
                 if (poll <= capturedEnd + (terminalTombstone ? 0 : 1) && position.get() < poll) {
                     position.set(poll);
-                    String value = switch (poll) { case 1 -> older; case 2 -> null; case 3 -> payload; default -> live; };
+                    Object value = switch (poll) { case 1 -> older; case 2 -> null; case 3 -> payloadRecord; default -> live; };
                     return new ConsumerRecords<>(Map.of(STRUCTURE, List.of(
                         new ConsumerRecord<String, Object>(STRUCTURE.topic(), 0, poll - 1, "SPX", value))));
                 }
@@ -139,20 +145,21 @@ class MarketStructureRecoverySeekTest {
                 return ConsumerRecords.empty();
             });
             s.setRunningForTest(true);
-            s.runLiveConsumerAttemptForTest("state-live", Map.of(STRUCTURE.topic(), BINDINGS.get(STRUCTURE.topic())),
+            s.runLiveConsumerAttemptForTest("avro-live", Map.of(STRUCTURE.topic(), BINDINGS.get(STRUCTURE.topic())),
                 new java.util.concurrent.atomic.AtomicBoolean(), consumer, retry);
             if (terminalTombstone) {
                 assertNull(s.marketStructureLatestForTest().get(), "an authoritative final withdrawal clears the complete hello");
                 verify(socket, never()).sendMessage(any());
-                assertTrue(s.retainMarketStructure(1791921500000L, older), "a withdrawal resets the retention clock");
+                assertTrue(s.retainMarketStructure(1791921500000L, TaFixtures.frame(older)), "a withdrawal resets the retention clock");
                 continue;
             }
-            assertTrue(live.equals(s.marketStructureLatestForTest().get()), "continuous live delivery resumes after recovery");
-            assertTrue(s.cvdHelloJson().contains("\"structure\":" + live), "hello keeps original prices and event time");
+            String liveText = TaFixtures.frame(live);
+            assertTrue(liveText.equals(s.marketStructureLatestForTest().get()), "continuous live delivery resumes after recovery");
+            assertTrue(s.cvdHelloJson().contains("\"structure\":" + liveText), "hello keeps original prices and event time");
             var frames = org.mockito.ArgumentCaptor.forClass(org.springframework.web.socket.TextMessage.class);
             verify(socket, times(2)).sendMessage(frames.capture());
             assertTrue(frames.getAllValues().get(0).getPayload().contains(payload), "only final recovered snapshot fans out");
-            assertTrue(frames.getAllValues().get(1).getPayload().contains(live), "next fresh event fans out normally");
+            assertTrue(frames.getAllValues().get(1).getPayload().contains(liveText), "next fresh event fans out normally");
         }
               }
 }
@@ -186,8 +193,8 @@ class MarketStructureRecoverySeekTest {
         when(socket.isOpen()).thenReturn(true);
         s.addClient(socket);
         clearInvocations(socket);
-        String old = "{\"schemaVersion\":1,\"service\":\"market-structure\",\"state\":\"OK\",\"asOfMs\":100}";
-        String latest = old.replace("100", "200");
+        var old = ui(100L);
+        var latest = ui(200L);
         var polls = new java.util.concurrent.atomic.AtomicInteger();
         when(consumer.poll(any(Duration.class))).thenAnswer(call -> {
             int poll = polls.incrementAndGet();
@@ -205,12 +212,12 @@ class MarketStructureRecoverySeekTest {
             return ConsumerRecords.empty();
         });
         s.setRunningForTest(true);
-        s.runLiveConsumerAttemptForTest("state-live", BINDINGS, new java.util.concurrent.atomic.AtomicBoolean(), consumer, false);
-        assertEquals(latest, s.marketStructureLatestForTest().get());
+        s.runLiveConsumerAttemptForTest("avro-live", BINDINGS, new java.util.concurrent.atomic.AtomicBoolean(), consumer, false);
+        assertEquals(TaFixtures.frame(latest), s.marketStructureLatestForTest().get());
         var frame = org.mockito.ArgumentCaptor.forClass(org.springframework.web.socket.TextMessage.class);
         verify(socket, times(1)).sendMessage(frame.capture());
-        assertTrue(frame.getValue().getPayload().contains(latest));
-        assertTrue(s.cvdHelloJson().contains("\"structure\":" + latest));
+        assertTrue(frame.getValue().getPayload().contains(TaFixtures.frame(latest)));
+        assertTrue(s.cvdHelloJson().contains("\"structure\":" + TaFixtures.frame(latest)));
     }
 
 }

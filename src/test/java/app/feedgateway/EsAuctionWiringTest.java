@@ -307,6 +307,75 @@ class EsAuctionWiringTest {
         assertEquals(4L, s.esAuctionBackfillRequestsForTest());
     }
 
+    /**
+     * A trade date's minutes run from 18:01 — the Globex open the calendar evening before — through the cash
+     * close, and as TEXT "18:01" sorts after "09:31" although it comes fifteen hours earlier. A view ordered
+     * by the label alone therefore put the whole evening block last: at 02:00 ET its "latest minute" was the
+     * previous evening's 23:59, four hours stale, and a client that takes its backfill cursor from there asks
+     * for everything after 23:59 and never reads a single minute between midnight and the cash open.
+     */
+    @Test void aTradeDatesMinutesAreServedInChronologicalOrderAcrossThe1800Boundary() {
+        var s = service();
+        for (String m : List.of("09:31", "16:00", "18:01", "23:59", "00:05")) {
+            s.upsertEsAuctionMinute(key("2026-09-08", m), minute("2026-09-08", m, 0, m));
+        }
+        var page = s.auctionMinutesPage("2026-09-08", "", 10);
+        assertEquals(List.of("18:01", "23:59", "00:05", "09:31", "16:00"), minutesOf(page),
+                "the evening opens the trade date; the cash close ends it");
+        assertTrue(s.esAuctionHelloJson().contains("\"lastMinute\":\"16:00\""));
+        // The cursor is chronological too: from 00:05 is the rest of the day, not the evening behind it.
+        assertEquals(List.of("00:05", "09:31", "16:00"), minutesOf(s.auctionMinutesPage("2026-09-08", "00:05", 10)));
+        assertEquals("23:59", s.auctionMinutesPage("2026-09-08", "", 1).nextCursor(), "the cursor is the first minute NOT returned, in TIME order");
+    }
+
+    /** The overnight on its own: a page of only evening-and-after-midnight minutes, where the label order and
+     *  the time order disagree on every pair. This is the state the page is in at 02:00 ET. */
+    @Test void anOvernightOnlyViewReportsTheLatestMinuteAsTheOneAfterMidnight() {
+        var s = service();
+        for (String m : List.of("18:01", "20:30", "23:59", "00:01", "02:00")) {
+            s.upsertEsAuctionMinute(key("2026-09-08", m), minute("2026-09-08", m, 0, m));
+        }
+        assertTrue(s.esAuctionHelloJson().contains("\"lastMinute\":\"02:00\""), "02:00 is the newest minute held, not 23:59");
+        assertEquals(List.of("18:01", "20:30", "23:59", "00:01", "02:00"), minutesOf(s.auctionMinutesPage("2026-09-08", "", 10)));
+    }
+
+    /** The position of a label inside its trade date: 18:00 opens it, 17:59 closes it, and nothing else is one. */
+    @Test void theMinuteIndexPlacesEighteenHundredFirstAndRejectsWhatIsNotALabel() {
+        assertEquals(0, FeedGatewayService.esAuctionMinuteIndex("18:00"));
+        assertEquals(1, FeedGatewayService.esAuctionMinuteIndex("18:01"));
+        assertEquals(359, FeedGatewayService.esAuctionMinuteIndex("23:59"));
+        assertEquals(360, FeedGatewayService.esAuctionMinuteIndex("00:00"));
+        assertEquals(930, FeedGatewayService.esAuctionMinuteIndex("09:30"));
+        assertEquals(1320, FeedGatewayService.esAuctionMinuteIndex("16:00"));
+        assertEquals(1439, FeedGatewayService.esAuctionMinuteIndex("17:59"), "the last minute before the next session opens");
+        for (String bad : new String[]{null, "", "9:31", "09:311", "ab:cd", "24:00", "09:60", "09-31"}) {
+            assertEquals(-1, FeedGatewayService.esAuctionMinuteIndex(bad), "accepted " + bad);
+        }
+    }
+
+    /** A label that is not a minute is dropped rather than seated at an arbitrary point in the order, and a
+     *  cursor that is not one answers an empty page rather than the whole session. */
+    @Test void aLabelThatIsNotAMinuteIsNeitherStoredNorAcceptedAsACursor() {
+        var s = service();
+        assertTrue(s.upsertEsAuctionMinute(key("2026-09-08", "09:31"), minute("2026-09-08", "09:31", 0, "real")));
+        assertFalse(s.upsertEsAuctionMinute(key("2026-09-08", "9:31"), minute("2026-09-08", "9:31", 0, "short")));
+        assertFalse(s.upsertEsAuctionMinute(key("2026-09-08", "24:00"), minute("2026-09-08", "24:00", 0, "nohour")));
+        assertEquals(1, s.esAuctionMinutesCached());
+        var page = s.auctionMinutesPage("2026-09-08", "99:99", 10);
+        assertTrue(page.minutes().isEmpty(), "a cursor that names no position in the day returns nothing");
+        assertNull(page.nextCursor());
+        assertEquals("2026-09-08", page.tradeDate());
+    }
+
+    private static List<String> minutesOf(FeedGatewayService.EsAuctionMinutesPage page) {
+        List<String> out = new java.util.ArrayList<>();
+        for (String record : page.minutes()) {
+            int at = record.indexOf("\"minute\":\"");
+            out.add(record.substring(at + 10, at + 15));
+        }
+        return out;
+    }
+
     @Test void defaultTradeDateIsTheCurrentOneAndAnUnknownDateAnswersEmpty() {
         var s = service();
         var empty = s.auctionMinutesPage(null, null, 10);

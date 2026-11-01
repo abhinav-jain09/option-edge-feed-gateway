@@ -5,14 +5,14 @@ The Package stage uses `-DskipTests`: a source/artifact/build-bound test receipt
 first, so the large tests never run again during native packaging. Application hot paths
 and packaging/image/deployment source guards are unchanged.
 
-This intentionally prevents image builds during 08:30–16:00 America/New_York on weekdays,
-including cash-hours hotfix builds. There is no skip/override. The 60-minute pre-open margin
-reserves 20 minutes beyond the 40-minute test deadline for cleanup. es4 is the test host named by the
-Performance Rule; no Jenkins controller or agent is installed there. A successful real
-Jenkins sequence, with its measured duration and reports, is required before a production
-image rollout. Forty minutes is an initial fail-closed ceiling, not a duration benchmark.
-The actual duration has not yet been measured on es4; the first reviewed-main build must
-establish it, and failure cannot authorize packaging or deployment.
+This prevents image builds during 07:30–16:00 America/New_York on weekdays, including cash-hours
+hotfix builds, unless the build carries an explicit `ALLOW_CASH_WINDOW=true` waiver — see **Running
+inside the cash window** below for what that waiver does and does not change. The boundary is
+07:30 because the run is bounded at 90 minutes and the market opens at 09:30: the two are one fact
+stated twice. es4 is the test host named by the Performance Rule; no Jenkins controller or agent is
+installed there. A successful real Jenkins sequence, with its reports, is required before a
+production image rollout, and failure cannot authorize packaging or deployment. The duration is no
+longer an estimate: build 815 measured 12.4 minutes for the suite and 37.6 for the campaign.
 
 `test-on-es4.sh` requires Jenkins, full permitted source/contract SHAs and a numeric build
 number. It reruns the main-tip guard/tree check, checks the exact installed contracts JAR
@@ -112,6 +112,28 @@ supplied through MAVEN_OPTS. Transport fixtures require the property; a negative
 control removes it and cannot create a passing receipt. A fresh real Jenkins run
 still must qualify the full suite and campaign under the unchanged limits.
 
+## The contracts version every maven resolves
+
+The transport installs contracts from main's tip, so the version it carries is not the version this
+pom pins, and the pin goes stale on every contracts release. `run-tests.sh` names the installed
+version on the full suite's own `mvn` command line. The footprint campaign's `mvn` cannot be told
+that way: its argv comes from the committed `scripts/footprint-campaign.spec.json` and is part of
+the claim each row of `ES-FOOTPRINT-CAMPAIGN.json` makes, so it carries no per-build version. Until
+build #826 nothing supplied one, and the campaign's BASELINE resolved the pin, missed it in this
+build's private repository, went to the network and reported `BASELINE IS RED` before a single
+mutation ran — with nothing in the console log, because run-tests.sh writes to `test.log`.
+
+So the version is supplied as environment, beside the repository that holds the jar: the transport
+writes `.mvn/maven.config` in the RUN ROOT, which maven finds by walking up from the project
+directory, so the verified checkout is untouched. The two mechanisms that look obvious do not work
+and were measured, not argued: a `-D` in `MAVEN_OPTS` is a JVM system property and LOSES to a pom
+property, and `MAVEN_ARGS` needs maven 3.9 where es4 has 3.6.3.
+
+Validation: the fixture runs the campaign's unqualified `mvn` exactly as the spec does, and the stub
+resolves the version the way maven does — command line, then the nearest `.mvn/maven.config` walking
+up, then the pom — and refuses any version that is not an artifact in the run's own repository. With
+the run-root write removed, three of the eighteen cases go red on the message build #825 died on.
+
 ## Campaign evidence capture
 
 Run 739 passed all 1,403 full-suite tests and ran all 50 mutations (49 KILLED,
@@ -166,3 +188,73 @@ schemas are unchanged. The new whole-volume regime schema and writer cache do no
 add a gateway writer. Changed test compilation is local only; real stress/test and
 all50-mutation execution remain on es4 through the final Jenkins image qualification.
 This preparation does not itself authorize a source writer or claim a production rollout.
+
+## Running inside the cash window
+
+es4 is refused 07:30-16:00 America/New_York by default, in three places: once on the caller before
+anything is transported, and twice on es4 itself — at the top of the test script, which is after
+`REMOTE_INIT` has already made the run directory and probed systemd, and again immediately before the
+test unit starts. The three copies are a boundary each, so a test asserts that every one of them
+compares against the same literal, and a second drives the transport past a disabled caller check to
+show the es4 side refusing on its own. The reason is not load alone. es4 runs the one auction
+tracker, and a published auction minute can never be re-admitted, so a minute lost to contention is
+lost for that trade date.
+
+`ALLOW_CASH_WINDOW=true` waives it for a single build. It is a Jenkins parameter defaulting to false,
+it is never inferred, and it crosses to es4 as a positional argument so the es4-side gates honour the
+same decision the caller made rather than re-deriving one. Any value other than `true` or `false` is
+exit 64 — not a fallback to either answer, because reading a typo as false passes a build whose caller
+believed the window waived, and reading it as true runs on the live box by accident. An empty value is
+absence, which a blank Jenkins field gives, and takes the safe default.
+
+The run is bounded on two pinned cores with a 4 GiB cap, so the waiver's cost is bounded too — but it
+is a cost on the box carrying the live session, and the default stays off.
+
+The bound is 90 minutes, the same in both cases, and it comes from the record rather than from a
+margin: build 815 took 12.4 minutes for the 1,632-test suite and 37.6 for the 50-case footprint
+campaign, so 50.0 minutes is what the sequence measures. Three builds have now died at a cap with
+every test passing — #800 at 40 minutes, 812 and 813 at 50 — which is what a cap set to what the
+margin allowed, rather than to what the work needs, produces: not protection, just a failed build
+50 minutes later with no verdict. Nothing about the unit changes with the waiver at all; the bound,
+memory, task, swap, disk and log watchdogs are identical, and a test asserts that the properties are
+byte-for-byte the same waived and unwaived.
+
+What protects the open is the start-time exclusion, and it is the same fact as the bound stated
+twice, so the two move together: 90 minutes of run needs the exclusion to begin 120 minutes before
+the 09:30 open, which is why it is **07:30-16:00** New York and no longer 08:30. The last permitted
+start, 07:29, releases es4 by 08:59, half an hour clear — more margin than the old 08:30 boundary
+left a 50-minute run. A test walks 07:29, 07:30, 08:29, 15:59, 16:00 and 23:59 against the script's
+own `--check-window`, and a second one walks a Saturday and a Sunday 09:00, which look identical on
+the clock and would be refused by a boundary check that lost its weekday test.
+
+The Jenkins `Test` stage carries its own timeout, and it is a backstop for a hung `ssh` or `scp`, not a
+second opinion about how long the work may take. It has to outlast the worker's bound, because the two
+fail differently: the worker's bound restores the mutated tree, names the signal and still scps the
+evidence back, while the stage's cancels the step with the evidence still on es4. Build 814 is what
+happens when they drift — the waived bound went to 90 minutes while the stage kept the 60 it had been
+derived from, so Jenkins cancelled the run at 60 and archived no `test.log` at all, and that build could
+only be diagnosed from the next one. The stage is now 115 minutes: the waived 90 plus this stage's
+own work either side of the driver — the fixtures, the two tree verifies and the scp-back. The contracts
+install is not in that budget; it is a stage of its own and runs on its own clock. It is deliberately one number rather than
+a waived and an unwaived one, since a second copy of the worker's two bounds is a third thing to keep in
+step. `test-on-es4-test.py` reads both files and asserts the stage outlasts the longer bound with that
+slack still left, and reads the two bound literals back so the comparison cannot pass vacuously.
+
+A signal at the bound is an ordinary outcome, so the campaign has to survive one cleanly. It handles
+SIGTERM by restoring the mutated file and discarding the compiled classes, and the mutation loop's
+own `finally` restores unconditionally for exactly the same reason — which meant both ran, and the
+second moved a backup the first had already consumed. Build 813 ended on that `FileNotFoundError`
+instead of on its exit 130, with the one line that said `interrupted by signal 15` buried under the
+traceback. The handler now records what it restored and the loop skips those paths only, so a missing
+backup anywhere else still raises. The same handler discards the compiled output, in both of Maven's
+trees rather than only `target/classes`: a mutation may name a test source as readily as a main one,
+and restoring a file puts back its original mtime, so a mutant's bytecode left behind would be reused
+as the baseline's. `scripts/footprint-mutate-signal-test.py` drives the real script to the mutated
+state, sends the signal, and carries two negative controls — one reproducing 813's output, one
+keeping only the main output and finding the mutant test class still there.
+
+The variable is inherited like any other, so the Jenkinsfile sets it on every invocation of the driver
+and the fixture pins it to false in setUp. That pin is not tidiness: Jenkins exports every build
+parameter into the environment, so under a waived build the fixture's own default-path test inherited
+the waiver and ran the whole transport it was written to refuse. Build 811 failed exactly there, which
+is the test doing its job.

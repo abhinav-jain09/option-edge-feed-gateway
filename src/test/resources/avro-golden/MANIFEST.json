@@ -1,0 +1,221 @@
+{
+  "fixtures" : [ {
+    "name" : "ui-first-fold",
+    "topic" : "options.spx.market-structure.ui",
+    "schemaFile" : "src/main/resources/avro/UiProjection.avsc",
+    "schemaSha256" : "e77f05135fdbf99b39cfae491c613c956b3605fe6156661d084821423ae448f5",
+    "record" : "com.optionsedge.contracts.marketstructure.ui.UiProjection",
+    "avroFile" : "ui-first-fold.avro",
+    "avroSha256" : "915d179f58f86f0b01b78ce4a0e4244156fc9303f52ebbc13446c00891ec9d2c",
+    "frameFile" : "ui-first-fold.frame.json",
+    "frameSha256" : "85356846d2d7a82e5c49288b42c5bc0f859a66de3fae83b654b4c7f64a6cc6ff",
+    "note" : "the first fold of a session: no break, no sweep, every level ACTIVE"
+  }, {
+    "name" : "ui-lifecycle-break",
+    "topic" : "options.spx.market-structure.ui",
+    "schemaFile" : "src/main/resources/avro/UiProjection.avsc",
+    "schemaSha256" : "e77f05135fdbf99b39cfae491c613c956b3605fe6156661d084821423ae448f5",
+    "record" : "com.optionsedge.contracts.marketstructure.ui.UiProjection",
+    "avroFile" : "ui-lifecycle-break.avro",
+    "avroSha256" : "906c6abfaf527035d3c85975481dad1a24f4f7467e63945376e4269c44071cc3",
+    "frameFile" : "ui-lifecycle-break.frame.json",
+    "frameSha256" : "fa07631860297ed6a55eb59ed5c5375fe77e9bef30c0fd487170d0151179ccf8",
+    "note" : "a level with a lastBreak object (Map.of in the engine: the frame fixes its key order to the schema's)"
+  }, {
+    "name" : "ui-lifecycle-sweep",
+    "topic" : "options.spx.market-structure.ui",
+    "schemaFile" : "src/main/resources/avro/UiProjection.avsc",
+    "schemaSha256" : "e77f05135fdbf99b39cfae491c613c956b3605fe6156661d084821423ae448f5",
+    "record" : "com.optionsedge.contracts.marketstructure.ui.UiProjection",
+    "avroFile" : "ui-lifecycle-sweep.avro",
+    "avroSha256" : "026b61d09a157f90055a64dc2bfd5255bf4f24fec045955185b010397b3530e1",
+    "frameFile" : "ui-lifecycle-sweep.frame.json",
+    "frameSha256" : "d44c652313a29794e774258ee58f7547698a111637773a7f82fd7f5c9763aa49",
+    "note" : "a level with a lastSweep object"
+  }, {
+    "name" : "ui-session-ended",
+    "topic" : "options.spx.market-structure.ui",
+    "schemaFile" : "src/main/resources/avro/UiProjection.avsc",
+    "schemaSha256" : "e77f05135fdbf99b39cfae491c613c956b3605fe6156661d084821423ae448f5",
+    "record" : "com.optionsedge.contracts.marketstructure.ui.UiProjection",
+    "avroFile" : "ui-session-ended.avro",
+    "avroSha256" : "ddbea27554d48b1818c32404d2bc041138f71aa28e38233e818f3ad34d4c66a5",
+    "frameFile" : "ui-session-ended.frame.json",
+    "frameSha256" : "ca8311fb727bc54eef9606a5063b76383fe903a41b430c2ec55c7c5a0259e59f",
+    "note" : "the terminal fold: sessionEnded:true is the last key"
+  }, {
+    "name" : "ui-placeholder-decision-slot",
+    "topic" : "options.spx.market-structure.ui",
+    "schemaFile" : "src/main/resources/avro/UiProjection.avsc",
+    "schemaSha256" : "e77f05135fdbf99b39cfae491c613c956b3605fe6156661d084821423ae448f5",
+    "record" : "com.optionsedge.contracts.marketstructure.ui.UiProjection",
+    "avroFile" : "ui-placeholder-decision-slot.avro",
+    "avroSha256" : "b0158f99a781712d5a1797f39b7803ef01e5356f0964c1d7d278878cd80c1982",
+    "frameFile" : "ui-placeholder-decision-slot.frame.json",
+    "frameSha256" : "27a288445ba0bbcb7699c2dc18493e34f73ca2ecfe7c6eea198ea27044a7d8f2",
+    "note" : "a full record whose decision slot is a PLACEHOLDER: state UNAVAILABLE, lastClose null, reason a lower-case token"
+  }, {
+    "name" : "ui-unavailable",
+    "topic" : "options.spx.market-structure.ui",
+    "schemaFile" : "src/main/resources/avro/UiUnavailable.avsc",
+    "schemaSha256" : "7b4d518b830fc8b2ecb932f4728b733264c2c89d58de1acb1b731b90d79d39ba",
+    "record" : "com.optionsedge.contracts.marketstructure.ui.UiUnavailable",
+    "avroFile" : "ui-unavailable.avro",
+    "avroSha256" : "64c9081a531f56e33f3f625bbdc4694be255f81a30083ddf2433f0c592f1d35a",
+    "frameFile" : "ui-unavailable.frame.json",
+    "frameSha256" : "76909bbf17f572235397daf6065147e025557eca0947f19e227052c9b34ddb6b",
+    "note" : "the short record: no scheduleId, no levels; sessionEnded is absent (omitted, not null)"
+  }, {
+    "name" : "ui-unavailable-session-ended-no-date",
+    "topic" : "options.spx.market-structure.ui",
+    "schemaFile" : "src/main/resources/avro/UiUnavailable.avsc",
+    "schemaSha256" : "7b4d518b830fc8b2ecb932f4728b733264c2c89d58de1acb1b731b90d79d39ba",
+    "record" : "com.optionsedge.contracts.marketstructure.ui.UiUnavailable",
+    "avroFile" : "ui-unavailable-session-ended-no-date.avro",
+    "avroSha256" : "5858f3815c438b98cc61de89a96cb68a5e7490c1d67c1a7b243e2f2b5a0dad26",
+    "frameFile" : "ui-unavailable-session-ended-no-date.frame.json",
+    "frameSha256" : "cd2c607441ba405388c82bf31358f841d5300bf9f85f71852848dd5985eca966",
+    "note" : "the short record with a null sessionDate and sessionEnded:true"
+  }, {
+    "name" : "patterns-set-ok",
+    "topic" : "options.spx.market-structure.patterns",
+    "schemaFile" : "src/main/resources/avro/PatternAnnotationSet.avsc",
+    "schemaSha256" : "71f68ef6858c5bce3db89217b162d43541a945de3c77f8048333b1969493be28",
+    "record" : "com.optionsedge.contracts.marketstructure.patterns.PatternAnnotationSet",
+    "avroFile" : "patterns-set-ok.avro",
+    "avroSha256" : "5018ab75b0a42014fa5de8ac404967cfc3bf286bee431ce198ca03d7d24f5b5f",
+    "frameFile" : "patterns-set-ok.frame.json",
+    "frameSha256" : "6468c4aeaf598a048b2846f376ecaf5e8c03f732b112234d879b9102c7309d65",
+    "note" : "a timeframe's set with annotations, bars, levelsTouched and measures"
+  }, {
+    "name" : "patterns-set-measures-edge",
+    "topic" : "options.spx.market-structure.patterns",
+    "schemaFile" : "src/main/resources/avro/PatternAnnotationSet.avsc",
+    "schemaSha256" : "71f68ef6858c5bce3db89217b162d43541a945de3c77f8048333b1969493be28",
+    "record" : "com.optionsedge.contracts.marketstructure.patterns.PatternAnnotationSet",
+    "avroFile" : "patterns-set-measures-edge.avro",
+    "avroSha256" : "5952b884bf00e8c037d055126a1d185749eb9b12cd1ab6c57987e42237eb9951",
+    "frameFile" : "patterns-set-measures-edge.frame.json",
+    "frameSha256" : "00d9fa2cefc4df6debc3bf3c3c0cf11527d7994a7732b6688c4349fad4e797ea",
+    "note" : "measures as a JSON object in entry order: an explicit null, a negative integer, a scale-4 decimal, a 0/1 integer"
+  }, {
+    "name" : "patterns-set-unavailable",
+    "topic" : "options.spx.market-structure.patterns",
+    "schemaFile" : "src/main/resources/avro/PatternUnavailable.avsc",
+    "schemaSha256" : "4600ad015dfb74d463ba95a9c09bad424fda27d277829ba8c5b1479d2beb3813",
+    "record" : "com.optionsedge.contracts.marketstructure.patterns.PatternUnavailable",
+    "avroFile" : "patterns-set-unavailable.avro",
+    "avroSha256" : "e2d4c66678eccae691d927b56b30ef33bc1391306df8e71e0ecff9b2d94c34a5",
+    "frameFile" : "patterns-set-unavailable.frame.json",
+    "frameSha256" : "a33cd873f7363b4c93dee54368d439193f315f790b66163de9b85cf9b6db5c51",
+    "note" : "a set that cannot be published"
+  }, {
+    "name" : "sequence-session-start",
+    "topic" : "options.spx.market-structure.sequence",
+    "schemaFile" : "src/main/resources/avro/SequenceRecord.avsc",
+    "schemaSha256" : "9d2f86434bbc799118c9eb8913a59f1b3f67276006bad2bfd79f20404528a216",
+    "record" : "com.optionsedge.contracts.marketstructure.sequence.SequenceRecord",
+    "avroFile" : "sequence-session-start.avro",
+    "avroSha256" : "64c81cd9662daa8ccf4e44dc3e66af42168b3bcf9a1f9edace621c31ecee0bc8",
+    "frameFile" : "sequence-session-start.frame.json",
+    "frameSha256" : "8576d2d922f29a9a64c0da89bcf50edbc194c5605eb48aa985f765d0668c209b",
+    "note" : "the first SESSION_START record of the full session"
+  }, {
+    "name" : "sequence-fold-group",
+    "topic" : "options.spx.market-structure.sequence",
+    "schemaFile" : "src/main/resources/avro/SequenceRecord.avsc",
+    "schemaSha256" : "9d2f86434bbc799118c9eb8913a59f1b3f67276006bad2bfd79f20404528a216",
+    "record" : "com.optionsedge.contracts.marketstructure.sequence.SequenceRecord",
+    "avroFile" : "sequence-fold-group.avro",
+    "avroSha256" : "3a38a4e6ced8fb6f6ea861cfd06360126dd072951fef5c0b01546180baaed497",
+    "frameFile" : "sequence-fold-group.frame.json",
+    "frameSha256" : "1e60a920df8080b3ef09760af9a242b4c58cb4405a0a610d5658de584aca5fe8",
+    "note" : "the first FOLD_GROUP record of the full session"
+  }, {
+    "name" : "sequence-session-end",
+    "topic" : "options.spx.market-structure.sequence",
+    "schemaFile" : "src/main/resources/avro/SequenceRecord.avsc",
+    "schemaSha256" : "9d2f86434bbc799118c9eb8913a59f1b3f67276006bad2bfd79f20404528a216",
+    "record" : "com.optionsedge.contracts.marketstructure.sequence.SequenceRecord",
+    "avroFile" : "sequence-session-end.avro",
+    "avroSha256" : "05277e7a0a2939aae626971dc6411d22a6b5832aecb8a5e67a98d6c399091561",
+    "frameFile" : "sequence-session-end.frame.json",
+    "frameSha256" : "1b77ff467450d150eca35956fe5602baad461899cd9c98968ee61de0a1ac10d0",
+    "note" : "the first SESSION_END record of the full session"
+  }, {
+    "name" : "sequence-fatal-uninitialized",
+    "topic" : "options.spx.market-structure.sequence",
+    "schemaFile" : "src/main/resources/avro/SequenceRecord.avsc",
+    "schemaSha256" : "9d2f86434bbc799118c9eb8913a59f1b3f67276006bad2bfd79f20404528a216",
+    "record" : "com.optionsedge.contracts.marketstructure.sequence.SequenceRecord",
+    "avroFile" : "sequence-fatal-uninitialized.avro",
+    "avroSha256" : "7ab88c78889966405b37492e68f22b8b8f239ec378551d27423a0dc2edea5563",
+    "frameFile" : "sequence-fatal-uninitialized.frame.json",
+    "frameSha256" : "ef3bc5b9d8287fa3cab82cd5027daa7131d171dd92582671511a151db3d27e9e",
+    "note" : "SEQ-05: no schedule, no trade date, explicit nulls"
+  }, {
+    "name" : "dlq-full",
+    "topic" : "options.spx.market-structure.dlq",
+    "schemaFile" : "src/main/resources/avro/DlqRecord.avsc",
+    "schemaSha256" : "1dbd98fbae1ccbe1ad9278c43905e7bbb24d2c94cf3acf6aeca8ef2413867a31",
+    "record" : "com.optionsedge.contracts.marketstructure.dlq.DlqRecord",
+    "avroFile" : "dlq-full.avro",
+    "avroSha256" : "6566f22100ac0f9a1a908b16d1256457898ec3bb8db14a8b4e749ab3f7a7c779",
+    "frameFile" : "dlq-full.frame.json",
+    "frameSha256" : "8b39b5490340389a22e4e28a685f02cbe5a8fc55de20e862bd73217fe14baaad",
+    "note" : "every field present"
+  }, {
+    "name" : "dlq-sparse",
+    "topic" : "options.spx.market-structure.dlq",
+    "schemaFile" : "src/main/resources/avro/DlqRecord.avsc",
+    "schemaSha256" : "1dbd98fbae1ccbe1ad9278c43905e7bbb24d2c94cf3acf6aeca8ef2413867a31",
+    "record" : "com.optionsedge.contracts.marketstructure.dlq.DlqRecord",
+    "avroFile" : "dlq-sparse.avro",
+    "avroSha256" : "002bc8f93bbfcbb6bc3a5288062f24a43365d6bd68bf1a81d0edd62bfc3d162f",
+    "frameFile" : "dlq-sparse.frame.json",
+    "frameSha256" : "3de843d5ad4c2049d6e45cd91b6943161decf648ea542ef1643a0035b10f8489",
+    "note" : "DLQ-05: the nullable fields are explicit nulls"
+  } ],
+  "hello" : [ {
+    "name" : "hello-structure-latest",
+    "file" : "hello-structure-latest.hello.json",
+    "sha256" : "c7af4bb46eb76f157cfec6f8af313b05dfd98b8b54285958c7b279263c5bed48",
+    "note" : "the retained ui frame of the last fold, embedded raw (field present, record)"
+  }, {
+    "name" : "hello-structure-none",
+    "file" : "hello-structure-none.hello.json",
+    "sha256" : "33e9b95b6041a262667384ac523b3e4bafc65ef4e1ede02a096e09848c69eb9c",
+    "note" : "no ui record retained yet: the field is present and null"
+  }, {
+    "name" : "hello-patterns-latest-per-timeframe",
+    "file" : "hello-patterns-latest-per-timeframe.hello.json",
+    "sha256" : "d3b458db5b7a0606594485c26d93008107bf6dc3b0667e500d8f242f3edbf0a6",
+    "note" : "the latest set of each timeframe (here the last three sets of the full session, the terminal fold), 1m, 5m, 15m in that order"
+  }, {
+    "name" : "hello-patterns-partial",
+    "file" : "hello-patterns-partial.hello.json",
+    "sha256" : "6df22ef8942275b7501149dc6d8ea95ee928d0838dc0e3abf382049aead6e3de",
+    "note" : "only the 1m set retained: absent timeframes are explicit nulls"
+  }, {
+    "name" : "hello-patterns-unavailable-member",
+    "file" : "hello-patterns-unavailable-member.hello.json",
+    "sha256" : "68f3f572fd3e1f15f07512e94d34623356ed9734bbcc643d81df564467dd6161",
+    "note" : "an UNAVAILABLE set is retained and relayed like any other set, under the key of its own timeframe (this set is 15m)"
+  } ],
+  "tombstones" : [ {
+    "topic" : "options.spx.market-structure.ui",
+    "key" : "2026-10-02.r0000000000",
+    "value" : "null (a Kafka tombstone, never Avro)",
+    "expect" : "clear the retained structure frame and the asOfMs baseline; count a drop; never decode"
+  }, {
+    "topic" : "options.spx.market-structure.patterns",
+    "key" : "2026-10-02.r0000000000|5m",
+    "value" : "null (a Kafka tombstone, never Avro)",
+    "expect" : "withdraw the 5m entry only (key = scheduleId|timeframe, exactly one '|'); the hello member becomes null"
+  }, {
+    "topic" : "options.spx.market-structure.patterns",
+    "key" : "malformed-key",
+    "value" : "null (a Kafka tombstone, never Avro)",
+    "expect" : "no timeframe can be derived: counted, nothing withdrawn"
+  } ]
+}
