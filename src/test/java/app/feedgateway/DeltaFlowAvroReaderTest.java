@@ -144,7 +144,7 @@ class DeltaFlowAvroReaderTest {
         assertFalse(source.contains("stringTopics.put(settings.databentoDeltaFlowByStrikeTopic(), \"delta-flow\");"));
         assertTrue(source.contains("avroTopics.remove(settings.databentoDeltaFlowByStrikeTopic());"));
         assertFalse(source.contains("stringTopics.remove(settings.databentoDeltaFlowByStrikeTopic());"));
-        assertTrue(source.contains("\"gex-strike-lifecycle\", \"delta-flow\"));"), "Avro bootstrap list carries delta-flow");
+        assertTrue(source.contains("\"gex-strike-lifecycle\", \"delta-flow\", \"strike-invasion\"));"), "Avro bootstrap list carries delta-flow (and strike-invasion)");
     }
 
     private static String methodBody(String source, String methodName) {
