@@ -273,7 +273,12 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
         if (issuer == null || issuer.isBlank()) {
             throw new IllegalStateException("WS_AUTH_ISSUER_URI is required when WS_AUTH_ENABLED=true");
         }
-        NimbusJwtDecoder nimbus = NimbusJwtDecoder.withIssuerLocation(issuer).build();
+        // Split-horizon deployments may reach Keycloak directly while tokens retain their
+        // public issuer. This changes key retrieval only; issuer and audience stay mandatory.
+        String jwksUrl = settings.keycloakJwksUrl();
+        NimbusJwtDecoder nimbus = jwksUrl == null || jwksUrl.isBlank()
+                ? NimbusJwtDecoder.withIssuerLocation(issuer).build()
+                : NimbusJwtDecoder.withJwkSetUri(jwksUrl.trim()).build();
         OAuth2TokenValidator<Jwt> withIssuer = JwtValidators.createDefaultWithIssuer(issuer);
         OAuth2TokenValidator<Jwt> audience = new AudienceValidator(settings.wsAuthAudience());
         nimbus.setJwtValidator(new DelegatingOAuth2TokenValidator<>(withIssuer, audience));

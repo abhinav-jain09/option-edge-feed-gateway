@@ -1,0 +1,20 @@
+{
+ "type": "record",
+ "name": "RecoveryCheckpoint",
+ "namespace": "com.optionsedge.contracts.marketstructure.recovery",
+ "fields": [
+  {
+   "name": "methodVersion",
+   "type": "string"
+  },
+  {
+   "name": "sha256",
+   "type": "string"
+  },
+  {
+   "name": "payloadGzip",
+   "type": "bytes"
+  }
+ ],
+ "doc": "The committed replay checkpoint envelope. payloadGzip is the gzip of the Avro binary datum of RecoveryPayload (RecoveryPayload.avsc); sha256 is the SHA-256 of the UNCOMPRESSED datum."
+}

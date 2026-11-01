@@ -1,6 +1,7 @@
 """Finite transport faults, with SSH/SCP/Maven stubbed; no host, broker or large suite is contacted."""
 import hashlib
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -30,8 +31,13 @@ while [ $# -gt 0 ]; do case "$1" in --dir) dir=$2;shift 2;; --allow-ignored) shi
 test "$(git -C "$dir" rev-parse HEAD)" = "$PERMITTED_SHA"
 ''')
         self.script(self.repo / "scripts/jenkins/permitted-sha-guard-version.sh", 'shasum -a 256 "$1" | cut -d" " -f1')
-        for name in ("footprint-reverify.sh", "footprint-reqstate.sh"):
-            self.script(self.repo / "scripts" / name, 'echo footprint-check')
+        # The campaign's maven is the one that broke: scripts/footprint-campaign.spec.json names
+        # `mvn -B test -Dtest=Footprint*,...` and NOTHING else, because that argv is part of the
+        # committed campaign record. The fixture runs it the same way, so the stub below is asked
+        # the real question — what does a maven with no version of its own resolve?
+        self.script(self.repo / "scripts/footprint-reverify.sh",
+                    'echo footprint-check\nmvn -B test -Dtest=Footprint*,CvdSpxLevelsWiringTest -DfailIfNoTests=false')
+        self.script(self.repo / "scripts/footprint-reqstate.sh", 'echo footprint-check')
         self.script(self.jdk / "bin/java", 'echo \'openjdk version "21"\' >&2')
         self.maven(0)
         self.script(self.bin / "date", 'printf "%s\\n" "${CI_FAKE_DATE:-6 0700 EDT}"')
@@ -43,6 +49,9 @@ test "$(git -C "$dir" rev-parse HEAD)" = "$PERMITTED_SHA"
         self.script(self.bin / "systemd-run", '''
 # The kernel probe is not a host operation in this fixture; the final command is exercised.
 case "$*" in *oe-gateway-probe-*) exit 0;; esac
+# The properties are the only place the run bound is observable, and the shift loop below drops
+# them; record the real run's argv before it does.
+printf "%s\n" "$*" >> "$CI_UNIT_ARGV"
 while [[ $1 = --* ]]; do shift; done
 if [ "${CI_FAKE_PARTIAL:-}" = 1 ]; then
     last="${@: -1}"
@@ -99,7 +108,14 @@ for source in args[:-1]:
                     "JENKINS_URL": "unit-fixture", "PERMITTED_SHA": self.sha,
                     "CONTRACTS_PERMITTED_SHA": "c" * 40, "BUILD_NUMBER": "123",
                     "CI_CALLS": str(self.root / "calls"), "CI_FAKE_DATE": "6 0700 EDT",
-                    "CI_UNIT_EXEC": str(self.root / "unit-exec"), "CI_UNIT_STOPS": str(self.root / "unit-stops")}
+                    # Pinned, never inherited. Jenkins exports every build parameter into the
+                    # environment, so under the real pipeline os.environ already carries the waiver
+                    # the build was triggered with — and build 811 proved it: the default-path test
+                    # ran the whole transport on a waiver no test had asked for. Each test that cares
+                    # sets this itself; every other test must see the shipped default.
+                    "ALLOW_CASH_WINDOW": "false",
+                    "CI_UNIT_EXEC": str(self.root / "unit-exec"), "CI_UNIT_STOPS": str(self.root / "unit-stops"),
+                    "CI_UNIT_ARGV": str(self.root / "unit-argv")}
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -123,8 +139,34 @@ if [ "$*" = -version ]; then echo "Apache Maven fixture"; exit 0; fi
 # The remote test MUST be told the contracts version the build installed. Without this the mvn
 # here falls back to the pom's pin, which goes stale the moment contracts main bumps — the exact
 # failure this assertion exists to make impossible to reintroduce silently.
-[[ "$*" = *-Doptions-edge-contracts.version=0.8.0* ]] || { echo "Missing installed contracts version override: $*"; exit 5; }
 [[ ${CI_CONTRACTS_VERSION:-} = 0.8.0 ]] || { echo "CI_CONTRACTS_VERSION not passed through env -i"; exit 6; }
+# TWO invocations with different obligations. The full suite is run by run-tests.sh, which names the
+# installed version itself — that is asserted outright. The campaign's comes from the committed spec
+# and names nothing, so it is resolved the way maven resolves it: a -D on the command line wins,
+# else the nearest .mvn/maven.config walking UP from the project directory, else the pom's own
+# property. Whatever that yields must be an artifact in this run's private repository, or this stub
+# fails with the message real maven gave in build #825.
+if [[ "$*" = *-Dtest=Footprint* ]]; then
+    version=""
+    for arg in "$@"; do case "$arg" in -Doptions-edge-contracts.version=*) version=${arg#*=};; esac; done
+    if [ -z "$version" ]; then
+        dir=$PWD
+        while [ "$dir" != / ]; do
+            if [ -f "$dir/.mvn/maven.config" ]; then
+                version=$(sed -n 's/^-Doptions-edge-contracts[.]version=//p' "$dir/.mvn/maven.config" | tail -1)
+                break
+            fi
+            dir=$(dirname "$dir")
+        done
+    fi
+    [ -n "$version" ] || version=$(tr -d ' \t\n' < pom.xml | sed -e 's|.*<options-edge-contracts[.]version>||' -e 's|<.*||')
+    repository=${MAVEN_OPTS#*-Dmaven.repo.local=}; repository=${repository%% *}
+    [ -f "$repository/com/optionsedge/options-edge-contracts/$version/options-edge-contracts-$version.jar" ] || {
+        echo "[ERROR] Could not resolve dependencies: Could not find artifact com.optionsedge:options-edge-contracts:jar:$version"
+        exit 1; }
+else
+    [[ "$*" = *-Doptions-edge-contracts.version=0.8.0* ]] || { echo "Missing installed contracts version override: $*"; exit 5; }
+fi
 mkdir -p "$CI_GATEWAY_DIR/target/surefire-reports"
 printf '<testsuite tests="1" failures="0"/>' > "$CI_GATEWAY_DIR/target/surefire-reports/TEST-fixture.xml"
 echo finite-maven-stub
@@ -238,10 +280,149 @@ exit %d
         self.assertIn("Missing installed contracts version override", (out / "test.log").read_text())
         self.assertFalse((out / "receipt.json").exists())
 
+    def test_the_campaigns_unqualified_maven_resolves_the_installed_version(self):
+        """The campaign's maven carries no version of its own, so the run root's .mvn/maven.config is the
+        only thing that can point it at the jar this build installed. The pom here pins 0.9.0 and only
+        0.8.0 exists in the private repository, so a run that completes is a run whose campaign maven
+        resolved 0.8.0 — the stub resolves it exactly as maven does and refuses otherwise."""
+        self.stale_pom_pin()
+        self.run_transport()
+        import json
+        receipt = json.loads((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").read_text())
+        self.assertEqual("PASS", receipt["status"])
+        self.assertIn("footprint-check", (self.repo / ".jenkins-tmp/es4-tests-123/test.log").read_text())
+
+    def test_without_the_run_root_pin_the_campaigns_maven_resolves_the_stale_pin(self):
+        """The negative control, and it reproduces build #825 exactly: with the write removed, the
+        campaign's maven falls back to the pom's 0.9.0, which is not in this build's repository."""
+        self.stale_pom_pin()
+        body = self.runner.read_text()
+        needle = """printf -- '-Doptions-edge-contracts.version=%s\\n' "$cv" > .mvn/maven.config"""
+        self.assertIn(needle, body)
+        self.runner.write_text(body.replace(needle, ":"))
+        self.run_transport(1)
+        out = self.repo / ".jenkins-tmp/es4-tests-123"
+        log = (out / "test.log").read_text()
+        self.assertIn("Could not find artifact com.optionsedge:options-edge-contracts:jar:0.9.0", log)
+        self.assertFalse((out / "complete.txt").exists())
+
     def test_cash_window_refuses_before_any_transport(self):
         self.env["CI_FAKE_DATE"] = "1 0900 EDT"
         self.run_transport(1)
         self.assertFalse((self.root / "calls").exists())
+
+    def test_the_run_is_bounded_to_the_ninety_minutes_the_work_measures(self):
+        # 90 is from the record, not from a margin: 12.4 minutes for the suite and 37.6 for the
+        # 50-case campaign in build 815 is 50.0 measured, and #800 at 40 and 812/813 at 50 are the
+        # three builds that died at a cap with every test passing.
+        self.run_transport()
+        self.assertIn("--property=RuntimeMaxSec=5400", (self.root / "unit-argv").read_text())
+
+    def test_the_waiver_changes_no_unit_property_at_all(self):
+        # The waiver says a run may START inside the session. It says nothing about how long the work
+        # takes, so it must not reach the bound, nor the memory, task or swap allowance. Only the
+        # properties are compared: the unit name and the private run directory carry a fresh random
+        # component per run, so the raw argv differs for reasons that are not limits.
+        def properties():
+            words = (self.root / "unit-argv").read_text().split()
+            return [w for w in words if w.startswith("--property=")]
+        self.run_transport()
+        plain = properties()
+        self.tearDown(); self.setUp()
+        self.env["CI_FAKE_DATE"] = "1 0900 EDT"
+        self.env["ALLOW_CASH_WINDOW"] = "true"
+        self.run_transport()
+        waived = properties()
+        self.assertEqual(plain, waived)
+        self.assertEqual(["--property=RuntimeMaxSec=5400"], [w for w in plain if "RuntimeMaxSec" in w])
+        self.assertIn("--property=MemoryMax=4G", plain)
+
+    def test_the_exclusion_starts_a_full_bound_plus_margin_before_the_open(self):
+        # The bound and the boundary are one fact stated twice. 07:29 is the last permitted start, and
+        # a run that takes the whole 90 minutes from there releases es4 at 08:59 — half an hour before
+        # the 09:30 open. 07:30 is already refused, so the margin can never be less than that.
+        # --check-window is the script's own entry point for this and runs no transport, so each case
+        # is a verdict on the clock alone rather than a run that would claim this build's directory.
+        for hhmm, refused in (("0729", False), ("0730", True), ("0829", True), ("1559", True),
+                              ("1600", False), ("2359", False)):
+            with self.subTest(hhmm=hhmm):
+                env = dict(self.env, CI_FAKE_DATE=f"1 {hhmm} EDT")
+                result = subprocess.run(["bash", str(self.runner), "--check-window"], cwd=self.repo,
+                                        env=env, text=True, capture_output=True, timeout=30)
+                self.assertEqual(1 if refused else 0, result.returncode, result.stderr[-500:])
+                self.assertEqual(refused, "cash-window exclusion is 07:30-16:00" in result.stderr)
+
+    def test_every_copy_of_the_exclusion_compares_against_the_same_boundary(self):
+        # The boundary is written three times: once on the caller and twice inside the es4 heredoc. The
+        # --check-window test above exercises only the caller, so a remote copy left at 08:30 would pass
+        # it. Every weekday-window comparison in the script is extracted here instead, so a copy that
+        # moves alone is a failure wherever it lives.
+        hhmm = re.findall(r'"\$hhmm" -ge (\d{4})', SOURCE.read_text())
+        self.assertEqual(3, len(hhmm), hhmm)
+        self.assertEqual({"0730"}, set(hhmm))
+        ends = re.findall(r'"\$hhmm" -lt (\d{4})', SOURCE.read_text())
+        self.assertEqual(["1600"] * 3, ends)
+
+    def test_the_es4_side_refuses_the_window_with_the_callers_check_removed(self):
+        # The caller refuses first, so nothing else would ever reach the two copies on es4. With the
+        # caller's call deleted the transport runs into them, and a weekday 07:30 without the waiver has
+        # to die there rather than start a unit that would still be running into the pre-open margin.
+        body = self.runner.read_text()
+        self.assertIn("\ncheck_window\n", body)
+        self.runner.write_text(body.replace("\ncheck_window\n", "\n", 1))
+        self.env["CI_FAKE_DATE"] = "1 0730 EDT"
+        self.run_transport(1)
+        # No receipt and no completion marker: the refusal happened before anything ran, not after.
+        out = self.repo / ".jenkins-tmp/es4-tests-123"
+        self.assertFalse((out / "complete.txt").exists())
+        self.assertFalse((out / "receipt.json").exists())
+
+    def test_a_weekend_start_is_never_in_the_exclusion_however_the_clock_reads(self):
+        # The exclusion is a weekday fact. A Saturday 09:00 looks exactly like the refused weekday
+        # case on the clock alone, so a boundary check that dropped the weekday test would still pass
+        # every case above and refuse every weekend build.
+        for day in ("6", "7"):
+            with self.subTest(day=day):
+                env = dict(self.env, CI_FAKE_DATE=f"{day} 0900 EDT")
+                result = subprocess.run(["bash", str(self.runner), "--check-window"], cwd=self.repo,
+                                        env=env, text=True, capture_output=True, timeout=30)
+                self.assertEqual(0, result.returncode, result.stderr[-500:])
+
+    def test_an_explicit_waiver_runs_inside_the_cash_window_on_both_sides_of_the_transport(self):
+        # The es4 side checks the window twice more, with the waiver carried as a positional, so a run
+        # that reaches its receipt proves the waiver crossed: a missing positional is exit 64 there.
+        self.env["CI_FAKE_DATE"] = "1 0900 EDT"
+        self.env["ALLOW_CASH_WINDOW"] = "true"
+        self.run_transport()
+        import json
+        receipt = json.loads((self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").read_text())
+        self.assertEqual("PASS", receipt["status"])
+
+    def test_an_unrecognised_waiver_is_refused_rather_than_read_as_either_answer(self):
+        for value in ("TRUE", "True", "1", "yes", "no", "0"):
+            with self.subTest(value=value):
+                self.env["CI_FAKE_DATE"] = "1 0900 EDT"
+                self.env["ALLOW_CASH_WINDOW"] = value
+                result = self.run_transport(64)
+                self.assertIn("ALLOW_CASH_WINDOW must be true or false", result.stderr)
+                self.assertFalse((self.root / "calls").exists())
+
+    def test_an_empty_waiver_is_absence_so_the_window_still_refuses(self):
+        # Empty is not supplied, which is what a blank Jenkins field gives: it takes the safe default
+        # and refuses, rather than being a third state the operator has to reason about.
+        self.env["CI_FAKE_DATE"] = "1 0900 EDT"
+        self.env["ALLOW_CASH_WINDOW"] = ""
+        self.run_transport(1)
+        self.assertFalse((self.root / "calls").exists())
+
+    def test_the_waiver_does_not_relax_the_window_outside_the_cash_session(self):
+        # Nothing about the waiver depends on the clock: it is only ever consulted inside the window,
+        # so the ordinary out-of-hours run must be byte-identical with it set and with it absent.
+        self.env["CI_FAKE_DATE"] = "6 0700 EDT"
+        self.env["ALLOW_CASH_WINDOW"] = "true"
+        self.run_transport()
+        self.assertEqual("PASS", __import__("json").loads(
+            (self.repo / ".jenkins-tmp/es4-tests-123/receipt.json").read_text())["status"])
 
     def cancellation(self, command):
         run = self.remote / "run.123.fixture"
@@ -269,6 +450,42 @@ exit %d
         (self.repo / ".jenkins-tmp/es4-tests-123").mkdir(parents=True)
         self.run_transport(1)
         self.assertFalse((self.root / "calls").exists())
+
+
+class StageBackstopTest(unittest.TestCase):
+    """The Jenkins stage timeout and the worker's own bound, read from the files that carry them."""
+
+    JENKINSFILE = Path(__file__).resolve().parents[2] / "Jenkinsfile"
+
+    def worker_bounds(self):
+        # Every literal the script assigns, so a bound added later is still what the stage must outlast.
+        return [int(m) for m in re.findall(r"run_bound_sec=(\d+)", SOURCE.read_text())]
+
+    def stage_backstop(self):
+        text = self.JENKINSFILE.read_text()
+        after = text[text.index("stage('Test') {"):]
+        return int(re.search(r"options \{ timeout\(time: (\d+), unit: 'MINUTES'\) \}", after).group(1)) * 60
+
+    def test_the_stage_backstop_outlasts_the_longest_worker_bound(self):
+        # Build 814 is why this is a test and not a comment: the waived bound went to 90 minutes while the
+        # stage kept the 60 it had been derived from, so Jenkins cancelled the step first. The two bounds
+        # are not interchangeable — the worker's restores the tree, names the signal and scps the evidence
+        # back, and the stage's leaves the evidence on es4 — so the one that fires must be the worker's.
+        self.assertGreater(self.stage_backstop(), max(self.worker_bounds()))
+
+    def test_the_backstop_leaves_room_for_the_setup_and_the_evidence_it_has_to_survive(self):
+        # Strictly greater is not enough: the stage also pays for its own work either side of the driver
+        # — the fixtures, the two tree verifies and the scp-back — so a backstop one minute past the bound
+        # would still abort a run the worker completed. (The contracts install is not in that budget; it is
+        # a stage of its own.) 20 minutes is the MINIMUM slack asserted, not the slack there is: 115 over
+        # 90 leaves 25, so the number may be raised to what is measured without the test moving.
+        self.assertGreaterEqual(self.stage_backstop() - max(self.worker_bounds()), 20 * 60)
+
+    def test_the_bound_is_still_readable_where_the_backstop_reads_it(self):
+        # A negative control for the two assertions above: if the literal stops being found, the max()
+        # raises or narrows, and a vacuous pass would be worse than a failure. It is one bound, so a
+        # second one appearing is a finding too — that is the shape build 814 came from.
+        self.assertEqual([5400], self.worker_bounds())
 
 
 if __name__ == "__main__":

@@ -30,11 +30,8 @@ class MarketStructurePatternsLoopTest {
         return new FeedGatewayService(settings, new ObjectMapper(), new HpsfGatewayViewMapper(), null);
     }
 
-    private static String set(String tf, long asOfMs) {
-        return "{\"schemaVersion\":1,\"service\":\"market-structure\",\"state\":\"OK\",\"sessionDate\":\"2026-10-16\","
-                + "\"asOfMs\":" + asOfMs + ",\"scheduleId\":\"2026-10-16.r0000000000\",\"timeframe\":\"" + tf + "\","
-                + "\"decisionOrdinal\":7,\"parameterSetHash\":\"" + "a".repeat(64) + "\","
-                + "\"effectiveLimits\":{\"maxPatternBars\":24,\"maxAnnotations\":64},\"annotations\":[]}";
+    private static org.apache.avro.generic.GenericRecord set(String tf, long asOfMs) {
+        return TaFixtures.patternSet(tf, asOfMs);
     }
 
     @Test
@@ -58,9 +55,9 @@ class MarketStructurePatternsLoopTest {
         doAnswer(call -> { position.set(0L); return null; }).when(consumer).seekToEnd(anyCollection());
         when(consumer.assignment()).thenReturn(java.util.Set.of(PATTERNS));
         when(consumer.position(PATTERNS)).thenAnswer(call -> position.get());
-        String valid1m = set("1m", 100L), valid5m = set("5m", 100L);
-        String malformed = set("1m", 200L).replace("\"service\":\"market-structure\"", "\"service\":\"other\"");
-        String older1m = set("1m", 50L);
+        Object valid1m = set("1m", 100L), valid5m = set("5m", 100L);
+        Object malformed = TaFixtures.put(set("1m", 200L), "service", "other");
+        Object older1m = set("1m", 50L);
         var polls = new java.util.concurrent.atomic.AtomicInteger();
         when(consumer.poll(any(Duration.class))).thenAnswer(call -> {
             int poll = polls.incrementAndGet();
@@ -68,7 +65,7 @@ class MarketStructurePatternsLoopTest {
             switch (poll) {
                 case 1: return records(poll, "2026-10-16.r0000000000|1m", valid1m);
                 case 2: return records(poll, "2026-10-16.r0000000000|1m", malformed);
-                case 3: return records(poll, "2026-10-16.r0000000000|1m", "not json at all");
+                case 3: return records(poll, "2026-10-16.r0000000000|1m", GatewayAvroDeserializer.UNDECODABLE);
                 case 4: return records(poll, "2026-10-16.r0000000000|5m", valid5m);
                 case 5: return records(poll, "2026-10-16.r0000000000|1m", older1m);
                 case 6: return records(poll, "bad|extra|5m", null);                       // malformed key: withdraws nothing
@@ -77,16 +74,16 @@ class MarketStructurePatternsLoopTest {
             }
         });
         s.setRunningForTest(true);
-        s.runLiveConsumerAttemptForTest("state-live", Map.of(PATTERNS.topic(), BINDINGS.get(PATTERNS.topic())),
+        s.runLiveConsumerAttemptForTest("avro-live", Map.of(PATTERNS.topic(), BINDINGS.get(PATTERNS.topic())),
             new java.util.concurrent.atomic.AtomicBoolean(), consumer, false);
-        assertEquals(valid1m, s.marketStructurePatternsLatestForTest("1m"), "the valid 1m set is retained; the malformed, unparseable and older ones never displaced it");
+        assertEquals(TaFixtures.frame((org.apache.avro.generic.GenericRecord) valid1m), s.marketStructurePatternsLatestForTest("1m"), "the valid 1m set is retained; the malformed, unparseable and older ones never displaced it");
         assertNull(s.marketStructurePatternsLatestForTest("5m"), "the keyed tombstone withdrew 5m");
         assertEquals(4L, s.marketStructurePatternsDropsForTest(), "two malformed values, the malformed-key tombstone and the keyed tombstone are the four drops");
         assertEquals(1L, s.marketStructurePatternsRegressionsForTest(), "the older 1m set is a regression");
         verify(socket, times(2)).sendMessage(any());                                      // valid1m and valid5m only
     }
 
-    private static ConsumerRecords<String, Object> records(int poll, String key, String value) {
+    private static ConsumerRecords<String, Object> records(int poll, String key, Object value) {
         return new ConsumerRecords<>(Map.of(PATTERNS, List.of(new ConsumerRecord<String, Object>(PATTERNS.topic(), 0, poll - 1, key, value))));
     }
 }

@@ -4,14 +4,34 @@
 # Artifact/image packaging and its existing guards remain in the original Jenkins workspace.
 set -euo pipefail
 
+# es4 carries the live session: it runs the one auction tracker, and a published auction minute can
+# never be re-admitted, so the default is to keep a 90-minute two-core test run off it until the close.
+# ALLOW_CASH_WINDOW=true is an explicit per-build waiver, for the case where an image is needed INSIDE
+# the session; it is never a default and never inferred from anything else. Any other value is a
+# refusal rather than a fallback to either one: reading a typo as false would pass a build whose
+# caller believed the window waived, and reading it as true would run on the live box by accident.
+allow_cash_window=${ALLOW_CASH_WINDOW:-false}
+case $allow_cash_window in
+  true|false) ;;
+  *) echo "ALLOW_CASH_WINDOW must be true or false (got '$allow_cash_window')" >&2; exit 64 ;;
+esac
+
 check_window() {
   local weekday hhmm zone
   read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
   [[ $zone = EST || $zone = EDT ]] || { echo 'New York timezone unavailable' >&2; return 1; }
-  # A test run is bounded to 40 minutes: do not start inside the 60-minute pre-open margin.
-  if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then
-    echo 'Gateway es4 tests refused: cash-window exclusion is 08:30-16:00 America/New_York.' >&2
-    return 1
+  # The run is bounded to 90 minutes everywhere, so the exclusion starts 120 minutes before the 09:30
+  # open: a start at the last permitted moment, 07:29, releases the box by 08:59. The bound and this
+  # boundary are the SAME fact stated twice and have to move together — 2 hours of margin for a 90
+  # minute run. Keeping the bound at what the margin allowed instead is what failed: at 50 minutes it
+  # was under the 50.0 the work measures (12.4 for the suite, 37.6 for the campaign, build 815), so
+  # every ordinary run was a coin flip on how loaded es4 happened to be.
+  if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0730 ] && [ "$hhmm" -lt 1600 ]; then
+    [ "$allow_cash_window" = true ] || {
+      echo 'Gateway es4 tests refused: cash-window exclusion is 07:30-16:00 America/New_York.' >&2
+      return 1
+    }
+    echo 'Gateway es4 tests START INSIDE the cash window on an explicit ALLOW_CASH_WINDOW=true waiver.' >&2
   fi
 }
 if [ "${1:-}" = --check-window ]; then check_window; exit; fi
@@ -145,17 +165,20 @@ trap 'exit 143' TERM HUP
 scp "${ssh_args[@]}" "$local_dir/source.bundle" "$local_dir/maven-cache.tar.gz" \
   "$local_dir/.contracts-sha" "$local_dir/.contracts-version" "$local_dir/.contracts-jar-sha256" \
   "$local_dir/inputs.sha256" "$host:$remote_dir/"
-ssh "${ssh_args[@]}" "$host" "bash -s -- $remote_dir $PERMITTED_SHA $CONTRACTS_PERMITTED_SHA $java_home $BUILD_NUMBER" <<'REMOTE_TEST'
+ssh "${ssh_args[@]}" "$host" "bash -s -- $remote_dir $PERMITTED_SHA $CONTRACTS_PERMITTED_SHA $java_home $BUILD_NUMBER $allow_cash_window" <<'REMOTE_TEST'
 set -euo pipefail
-[ $# -eq 5 ] || exit 64
-dir=$1; source_sha=$2; contracts_sha=$3; java_home=$4; build=$5
+[ $# -eq 6 ] || exit 64
+dir=$1; source_sha=$2; contracts_sha=$3; java_home=$4; build=$5; allow_cash_window=$6
+# The waiver crosses to es4 as a positional, validated here exactly as it was on the caller: an
+# unrecognised value is refused, never read as either answer.
+case $allow_cash_window in true|false) ;; *) exit 64 ;; esac
 [[ $build =~ ^[0-9]+$ ]] || exit 64
 [[ $dir =~ ^/home/abhinav/ci/gateway-tests/run\.[0-9]+\.[A-Za-z0-9]+$ ]] || exit 64
 [[ $source_sha =~ ^[0-9a-f]{40}$ ]] && [[ $contracts_sha =~ ^[0-9a-f]{40}$ ]] || exit 64
 [ "$java_home" = /usr/lib/jvm/java-21-openjdk ] || exit 64
 read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
 [[ $zone = EST || $zone = EDT ]] || exit 1
-if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then exit 1; fi
+if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0730 ] && [ "$hhmm" -lt 1600 ] && [ "$allow_cash_window" != true ]; then exit 1; fi
 cd "$dir"
 sha256sum -c inputs.sha256
 [ "$(cat .contracts-sha)" = "$contracts_sha" ] || exit 1
@@ -173,6 +196,21 @@ cv=$(cat .contracts-version)
 [[ $cv =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 64
 jar="cache/repository/com/optionsedge/options-edge-contracts/$cv/options-edge-contracts-$cv.jar"
 [ "$(sha256sum "$jar" | cut -d' ' -f1)" = "$(cat .contracts-jar-sha256)" ] || exit 1
+# EVERY maven in this run must resolve the contracts jar this build INSTALLED, not the pom's pin.
+# The suite names the version on its own command line, but the footprint campaign's maven comes from a
+# COMMITTED spec whose argv is part of the campaign record and so cannot carry a per-build version. With
+# nothing else to tell it, the campaign's BASELINE resolved the stale pin, found no such jar in this
+# build's private repository, went to the network and reported "BASELINE IS RED — refusing to run a
+# campaign against a failing suite" before a single mutation ran. Every gateway build failed that way
+# from the moment contracts main moved past the pin, and the console log showed none of it, because
+# run-tests.sh writes to test.log.
+#
+# maven.config goes in the RUN ROOT, not in the gateway checkout: maven walks UP from the project
+# directory to find .mvn, so the checkout stays exactly the tree verify-permitted-tree just passed.
+# MAVEN_OPTS cannot carry it (a JVM system property loses to a pom property) and MAVEN_ARGS needs
+# maven 3.9, where es4 has 3.6.3 — both measured, neither assumed.
+mkdir -p .mvn
+printf -- '-Doptions-edge-contracts.version=%s\n' "$cv" > .mvn/maven.config
 "$java_home/bin/java" -version
 cat > run-tests.sh <<'RUN'
 #!/usr/bin/env bash
@@ -195,25 +233,35 @@ scripts/footprint-reverify.sh
 scripts/footprint-reqstate.sh --check
 printf '%s\n' "$CI_SOURCE_SHA" > ../complete.txt
 RUN
-# The complete sequence has an initial 40-minute deadline, not a claim of measured duration.
-# Successful execution is required before any image is packaged or deployed.
+# ONE cap, because the work takes what it takes and the waiver is not a statement about that. The
+# number comes from the record: 12.4 minutes for the 1,632-test suite and 37.6 for the 50-case
+# campaign in build 815, so 50.0 is the measured figure, and build #800 at 40 and builds 812 and 813
+# at 50 are the three that died at a cap with every test passing. 90 leaves real headroom instead of
+# another number the campaign grows past. A cap below what the work needs buys nothing: it does not
+# protect the open, which the start-time exclusion above does, it just converts a slow box into a
+# failed build 50 minutes later with no verdict. The CPU, memory, disk and log watchdogs are
+# unchanged, and successful execution is still required before any image is packaged or deployed.
+run_bound_sec=5400
 unit="oe-gateway-$(basename "$dir" | tr '.' '-')"
 stop_unit() { systemctl --user stop "$unit" >/dev/null 2>&1 || true; }
 trap stop_unit EXIT
 trap 'exit 143' HUP INT TERM
 read -r weekday hhmm zone < <(TZ=America/New_York date '+%u %H%M %Z')
 [[ $zone = EST || $zone = EDT ]] || exit 1
-if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0830 ] && [ "$hhmm" -lt 1600 ]; then exit 1; fi
+if [ "$weekday" -le 5 ] && [ "$hhmm" -ge 0730 ] && [ "$hhmm" -lt 1600 ] && [ "$allow_cash_window" != true ]; then exit 1; fi
 # User-systemd owns every descendant, including TERM-resistant/orphaned processes.
 # The Kafka test container separately has 2 GiB / one CPU limits; planned total is 8 GiB.
 cpu_list=$(cat "$dir/cpus.txt")
 [[ $cpu_list =~ ^[0-9]+,[0-9]+$ ]] || exit 64
-python3 - "$dir" "$unit" "$java_home" "$source_sha" "$cpu_list" "$cv" <<'SUPERVISE'
+python3 - "$dir" "$unit" "$java_home" "$source_sha" "$cpu_list" "$cv" "$run_bound_sec" <<'SUPERVISE'
 import os, pathlib, selectors, subprocess, sys, time
-root, unit, java, source, cpus, contracts_version = sys.argv[1:]
+# The bound is not validated here: it is a single literal assigned a few lines above, with nothing
+# between that assignment and this argv that could change it. A check would be a guard against a
+# state that cannot occur, and reading it as a promise of one would be worse than having none.
+root, unit, java, source, cpus, contracts_version, run_bound_sec = sys.argv[1:]
 command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=" + unit,
     "--property=MemoryMax=4G", "--property=MemorySwapMax=0", "--property=TasksMax=512",
-    "--property=RuntimeMaxSec=2400", "--property=TimeoutStopSec=10",
+    "--property=RuntimeMaxSec=" + run_bound_sec, "--property=TimeoutStopSec=10",
     "--property=KillMode=control-group", "taskset", "--cpu-list", cpus, "env", "-i", "PATH=" + java + "/bin:/usr/bin:/bin",
     "JAVA_HOME=" + java, "JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=" + root + "/tmp",
     "MAVEN_SKIP_RC=true", "MAVEN_OPTS=-Xmx768m -DreuseForks=false -Dmaven.repo.local=" + root + "/cache/repository -Djava.io.tmpdir=" + root + "/tmp",
