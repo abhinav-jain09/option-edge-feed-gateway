@@ -2698,6 +2698,9 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // Greek-move-authenticity CURRENT verdict (AVRO, key = symbol; browsers still get the identical JSON, see
+        // GreekMoveAuthJson): standalone global advisory, OPTIONAL topic, on the SHORT greekMoveAuthTtlMs window.
+        topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // strike-invasion is AVRO (contracts StrikeInvasionSnapshot, per-strike+direction keyed symbol|strike|direction,
         // SPX-only, NO expiry; a null value is a compaction tombstone). It is rendered back to the exact JSON text of
         // the JSON era (StrikeInvasionJson) before the unchanged JSON pipeline, so the browser payload is identical.
@@ -2785,10 +2788,6 @@ public class FeedGatewayService implements ReplayRunner {
         // advisory like its siblings, OPTIONAL topic — but on the SHORT esOpenDirectionStatusTtlMs
         // window (default 5 min), which also bounds its seek-back here to the last few minutes.
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
-        // Greek-move-authenticity CURRENT verdict (JSON, key = symbol): standalone global advisory like the
-        // open-direction siblings, OPTIONAL topic — on the SHORT greekMoveAuthTtlMs window (default 5 min),
-        // which also bounds its seek-back here to the last few minutes.
-        topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
@@ -2937,6 +2936,8 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // Keep cache + live symmetric: the greek-move-authenticity CURRENT verdict is AVRO.
+        topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Keep cache + live symmetric: strike-invasion is AVRO (see runAvroCacheConsumer).
         topicEvents.put(settings.strikeInvasionTopic(), new TopicBinding("DATABENTO", "strike-invasion"));
         // Keep cache + live symmetric: delta-flow-by-strike is AVRO (see runAvroCacheConsumer).
@@ -3057,9 +3058,6 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the ES open-direction live STATUS
         // heartbeat (JSON, standalone/optional — same rule as the forecast/outcome siblings above).
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
-        // Keep the cache + live JSON consumer topic sets symmetric: the greek-move-authenticity CURRENT
-        // verdict (JSON, key = symbol, standalone/optional — same rule as the open-direction siblings above).
-        topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
@@ -13748,6 +13746,9 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if ("delta-flow".equals(event)) {
             return deltaFlowJson(value);
+        }
+        if ("greek-move-auth".equals(event)) {
+            return GreekMoveAuthJson.render(value);
         }
         return avro ? avroJson(value) : stringJson(value);
     }
