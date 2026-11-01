@@ -250,7 +250,7 @@ public final class GatewaySettings {
         return value("KAFKA_UNDERLYING_SPX_PRICE_TOPIC", "underlying.spx.price");
     }
 
-    /** Latest continuous ES futures aggressor-flow snapshot (JSON, keyed by ES.v.0). */
+    /** Latest continuous ES futures aggressor-flow snapshot (Avro EsAggressorFlowSnapshot, id 2701, keyed by ES.v.0). */
     public String esAggressorFlowTopic() {
         return value("KAFKA_ES_AGGRESSOR_FLOW_TOPIC", "futures.aggressor-flow");
     }
@@ -326,6 +326,21 @@ public final class GatewaySettings {
     }
 
     /**
+     * The dev-only pre-market estimate structure record (processing market-structure-service, session profile PREMARKET_ESTIMATE): the
+     * same {@code market-structure.levels} record, built on the ES estimate candles, on a topic of its own so that no reader of the
+     * regular topic ever sees one. It feeds the SAME retention and the SAME {@code market-structure} event as the regular record, so the
+     * record with the newest {@code asOfMs} wins and the regular record takes over from the estimate at the cash open without the page
+     * doing anything. OFF by default, needs the structure stream itself, and is never set on production.
+     */
+    public String marketStructureEstimateTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_ESTIMATE_TOPIC", "options.spx.market-structure.estimate.ui");
+    }
+
+    public boolean marketStructureEstimateEnabled() {
+        return marketStructureEnabled() && boolValue("GATEWAY_MARKET_STRUCTURE_ESTIMATE_ENABLED", false);
+    }
+
+    /**
      * Candlestick pattern annotations for the Context Tape PATTERNS layer (processing
      * CANDLESTICK-PATTERN-REQUIREMENT.md R6.2/R6.4: one {@code PatternAnnotationSet} per timeframe per 1m fold
      * from the market-structure service, keyed {@code <scheduleId>|<tf>}). OFF by default, the last rollout step;
@@ -337,6 +352,120 @@ public final class GatewaySettings {
 
     public boolean marketStructurePatternsEnabled() {
         return boolValue("GATEWAY_MARKET_STRUCTURE_PATTERNS_ENABLED", false);
+    }
+
+    /**
+     * The dev-only pre-market estimate pattern sets (processing market-structure-service
+     * PREMARKET-ESTIMATE-CANDLESTICK-PATTERNS-REQUIREMENT.md P6): the same {@code PatternAnnotationSet} records, built on the ES estimate
+     * candles, on a topic of their own so that no reader of the regular topic ever sees one. They feed the SAME per-timeframe retention
+     * and the SAME {@code market-structure-patterns} event as the regular sets, so the set with the newest {@code asOfMs} wins and the
+     * regular sets take over from the estimate at the cash open without the page doing anything. OFF by default, needs the patterns
+     * stream itself, and is never set on production.
+     */
+    public String marketStructureEstimatePatternsTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_ESTIMATE_PATTERNS_TOPIC", "options.spx.market-structure.estimate.patterns");
+    }
+
+    public boolean marketStructureEstimatePatternsEnabled() {
+        return marketStructurePatternsEnabled() && boolValue("GATEWAY_MARKET_STRUCTURE_ESTIMATE_PATTERNS_ENABLED", false);
+    }
+
+    /**
+     * INDICATOR-STUDIES studies relay (frames {@code indicator-studies} / {@code indicator-studies-current} and the hello's study
+     * fields; options-edge-processing docs/ta-books/catalog/STUDIES-FRAME-CONTRACT.md). OFF by default: absent study fields in the hello are how the
+     * page learns this gateway has no study stream.
+     */
+    public boolean studiesEnabled() {
+        return boolValue("GATEWAY_STUDIES_ENABLED", false);
+    }
+
+    /**
+     * The StudyBar topics: the locally computed SPX one and the es4-mirrored ES one. The names are FIXED, not environment-overridable:
+     * the producer's default names are declared in scripts/kafka/topics.env and the mirror job's allow-list, and the source topic
+     * decides which symbol a record may carry (local = SPX, es. = ES), so an override of one half could only misroute the other.
+     */
+    public java.util.Set<String> studiesBarsTopics() {
+        return new java.util.LinkedHashSet<>(java.util.List.of("options.indicators.studies.bars", "es.options.indicators.studies.bars"));
+    }
+
+    /** The StudiesCurrent topics (one partition, one symbol each, written about every 5 s): local SPX and the mirrored ES one; fixed names. */
+    public java.util.Set<String> studiesCurrentTopics() {
+        return new java.util.LinkedHashSet<>(java.util.List.of("options.indicators.studies.current", "es.options.indicators.studies.current"));
+    }
+
+    /** The longest seek-back accepted: 30 days (the bars topic itself keeps 45).*/
+    private static final long STUDIES_RECOVERY_MAX_HOURS = 720L;
+
+    /** How far back the bars topic is re-read on a cold start to rebuild the hello history (a weekend plus a margin). */
+    public long studiesRecoveryMs() {
+        return Math.min(longValue("GATEWAY_STUDIES_RECOVERY_HOURS", 72L, 1L), STUDIES_RECOVERY_MAX_HOURS) * 3_600_000L;   // clamped: no overflow, no absurd seek-back
+    }
+
+    /**
+     * CHART-STRUCTURE-TOOLS structure tools (frame {@code market-structure-tools}, hello field {@code tools};
+     * options-edge-processing docs/ta-books/catalog/GEOMETRY-FRAME-CONTRACT.md). OFF by default: an absent {@code tools} field is how the page learns this
+     * gateway has no tools stream.
+     */
+    public boolean structureToolsEnabled() {
+        return boolValue("GATEWAY_STRUCTURE_TOOLS_ENABLED", false);
+    }
+
+    public String structureToolsTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_TOOLS_TOPIC", "options.spx.market-structure.tools");
+    }
+
+    /** CLASSICAL-CHART-PATTERNS classical geometry (frame {@code market-structure-geometry}, hello field {@code geometry}); OFF by default. */
+    public boolean geometryEnabled() {
+        return boolValue("GATEWAY_GEOMETRY_ENABLED", false);
+    }
+
+    public String geometryTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_GEOMETRY_TOPIC", "options.spx.market-structure.geometry");
+    }
+
+    /**
+     * TICK-TRADE-TOOLS trade-level tools (twelve {@code trade-tools-*} frames, hello field {@code tradeTools};
+     * options-edge-processing docs/ta-books/catalog/TRADE-TOOLS-FRAME-CONTRACT.md). OFF by default. The producer's topic names are the keys of {@link #tradeToolsTopics()}.
+     */
+    public boolean tradeToolsEnabled() {
+        return boolValue("GATEWAY_TRADE_TOOLS_ENABLED", false);
+    }
+
+    /** The six display topics of es-trade-tools-service by role, in the order {@link TradeToolsRelay#ROLES} names them. */
+    public java.util.List<String> tradeToolsTopics() {
+        return java.util.List.of(
+                value("KAFKA_TT_PF_CHART_TOPIC", "futures.pf.chart"),
+                value("KAFKA_TT_PF_COLUMNS_TOPIC", "futures.pf.columns"),
+                value("KAFKA_TT_PF_EVENTS_TOPIC", "futures.pf.events"),
+                value("KAFKA_TT_VOLUME_NODES_TOPIC", "futures.volume-nodes"),
+                value("KAFKA_TT_FLOW_BARS_TOPIC", "futures.flow.bars"),
+                value("KAFKA_TT_FLOW_EVENTS_TOPIC", "futures.flow.events"));
+    }
+
+    /** ELLIOTT-FIB-CYCLE-TOOLS Elliott counts, Fibonacci, channels and cycles (frames {@code wave-cycle-waves}/{@code wave-cycle-cycles}, hello field {@code waves}); OFF by default. */
+    public boolean waveCycleEnabled() {
+        return boolValue("GATEWAY_WAVE_CYCLE_ENABLED", false);
+    }
+
+    public String waveCycleWavesTopic() {
+        return value("KAFKA_WAVE_CYCLE_WAVES_TOPIC", "options.spx.wave-cycle.waves");
+    }
+
+    public String waveCycleCyclesTopic() {
+        return value("KAFKA_WAVE_CYCLE_CYCLES_TOPIC", "options.spx.wave-cycle.cycles");
+    }
+
+    /**
+     * Phase F break classification, trap or real (frames {@code break-classification-mark}/{@code -outcome}/{@code -status}, hello field {@code breaks};
+     * ta-books-catalog 17_BREAK_CLASSIFICATION_FRAME_CONTRACT.md). OFF by default: an absent {@code breaks} field is how the page knows this gateway has no such stream.
+     */
+    public boolean breakClassificationEnabled() {
+        return boolValue("GATEWAY_BREAK_CLASSIFICATION_ENABLED", false);
+    }
+
+    /** The one topic of break-classifier-service (marks, outcomes and the status, told apart by their writer schema). */
+    public String breakClassificationTopic() {
+        return value("KAFKA_BREAK_CLASSIFICATION_TOPIC", "options.spx.break-classification");
     }
 
     /**
@@ -485,8 +614,8 @@ public final class GatewaySettings {
     }
 
     /**
-     * Current binary SPX direction from vix-option-inteligence-service (JSON, key = symbol|sessionDate).
-     * Forwarded as standalone websocket event {@code zero-dte-intelligence}; optional until the new
+     * Current binary SPX direction from vix-option-inteligence-service (Avro, contracts ZeroDteIntelligenceSnapshot id 3001, key = symbol|sessionDate).
+     * Forwarded as standalone websocket event {@code zero-dte-intelligence} (the JSON the browser has always received); optional until the new
      * producer is deployed.
      */
     public String vixOptionInteligenceTopic() {
@@ -519,7 +648,7 @@ public final class GatewaySettings {
     }
 
     /**
-     * Per-strike delta-flow topic (JSON {@code DeltaFlowStrikeSnapshot}, one record per
+     * Per-strike delta-flow topic (Avro {@code DeltaFlowStrikeSnapshot}, one record per
      * {@code symbol|date|expiry|strike}) from delta-flow-service. Broadcast as event
      * {@code "delta-flow"}. NB: unlike the {@code options.databento.*} topics, the delta-flow
      * topics are UNPREFIXED — the default is the bare name {@code delta-flow-by-strike}.
@@ -603,7 +732,7 @@ public final class GatewaySettings {
     }
 
     /**
-     * Per-strike strike-invasion topic (JSON {@code StrikeInvasionSnapshot}, one record per
+     * Per-strike strike-invasion topic (Avro {@code StrikeInvasionSnapshot}, one record per
      * {@code symbol|strike} — SPX-only, so there is NO expiry). Broadcast as event
      * {@code "strike-invasion"}. Mirrors the strike-intel topic getter.
      */

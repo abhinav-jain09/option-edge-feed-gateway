@@ -278,7 +278,7 @@ class SpotBandForwardingTest {
     @Test
     void theLegacyConnectBootstrapIncludesBands() throws Exception {
         String source = Files.readString(Path.of(SERVICE));
-        assertTrue(source.contains("\"strike-flow\", \"spot-band\", \"delta-flow\", \"strike-intel\""),
+        assertTrue(source.contains("\"strike-flow\", \"spot-band\", \"strike-intel\""),
                 "sendCachedState on connect must list spot-band");
     }
 

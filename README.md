@@ -320,6 +320,8 @@ Environment variables and matching Java system properties are supported.
 | `GATEWAY_KAFKA_RETRY_MAX_MS` | `30000` | Maximum delay between Kafka consumer restart attempts |
 | `GATEWAY_CACHE_TTL_MS` | `900000` | Maximum age for records kept in the gateway replay cache (fast-ticking events) |
 | `GATEWAY_MAXPAIN_TTL_MS` | `43200000` | Separate, longer cache window for the slow daily-OI max-pain stream (12h). `<= 0` treats max-pain as always-stale (it is not cached at all) — it does **not** fall back to the 15-min `GATEWAY_CACHE_TTL_MS`, and it does **not** mean infinite retention |
+| `GATEWAY_BREAK_CLASSIFICATION_ENABLED` | `false` | Phase F break-classification relay (trap / real marks): frames `break-classification-mark`, `-outcome`, `-status` and the hello field `breaks`. OFF: no frame, no hello field. |
+| `KAFKA_BREAK_CLASSIFICATION_TOPIC` | `options.spx.break-classification` | The one Avro topic of break-classifier-service (BreakMark, BreakOutcome and BreakStatus, told apart by their writer schema) |
 
 Example:
 
@@ -329,6 +331,19 @@ KAFKA_BOOTSTRAP_SERVERS=192.168.100.252:9092,192.168.100.252:9094,192.168.100.25
 KAFKA_SCHEMA_REGISTRY_URL=http://192.168.100.252:8082 \
 mvn spring-boot:run
 ```
+
+### Break-classification relay (Phase F)
+
+`BreakClassificationRelay` relays `BreakMark`, `BreakOutcome` and `BreakStatus` records of `KAFKA_BREAK_CLASSIFICATION_TOPIC` (Avro, one partition) as the frames
+`break-classification-mark`, `break-classification-outcome` and `break-classification-status` (the contract: `17_BREAK_CLASSIFICATION_FRAME_CONTRACT.md` of the TA-books catalog).
+The gateway checks the boundary only (writer record type, `schemaVersion` 1, required enums not `UNKNOWN`, mark timeframe M1/M5/M15, 64 lower-case hex ids and hashes, a mark's
+`yyyy-mm-dd` session date, size under the 1 MiB frame guard) and counts every refusal; the page is the full validator.
+
+* Retention (bounded): per timeframe the marks of the greatest `sessionDate` seen, at most 64 keyed by `classificationId` (the 65th evicts the first arrival with its outcome); at most one outcome per mark, only for a retained mark; the latest status.
+* Hello: field `breaks` = `{"1m":{"marks":[...],"outcomes":[...]}|null,"5m":...,"15m":...,"status":{...}|null}`, last in the priority order after the trade tools, held under 256 KiB: the status first, then whole timeframes in the order 1m, 5m, 15m while they fit, `null` for the rest. Flag off: the field is absent.
+* Recovery: cold start, retry and late adoption re-read `end - 600` records, stage privately below the captured end offset and promote once.
+* Metrics (flag on): `gateway_break_classification_{enabled,accepted_total,drops_total,regressions_total}` and `gateway_break_classification_{late,orphan,conflict,evicted}_total` (`regressions_total` stays 0: an ordering refusal is the `late` counter).
+* Measured hello part (real producer records, `BreakHelloBudgetTest`): 23 474 bytes for the three development sets on a light day, 132 998 bytes (50 % of the part) for the type-maximal 64 marks + 64 outcomes of one timeframe.
 
 ## Build Check
 
