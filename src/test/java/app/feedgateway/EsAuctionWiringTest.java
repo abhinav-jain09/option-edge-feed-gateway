@@ -175,6 +175,20 @@ class EsAuctionWiringTest {
         assertTrue(page.minutes().get(0).contains("\"callId\":\"corr\""), "latest correctionRev wins");
     }
 
+    @Test void humpLinesRideTheRecordVerbatimOnTheWireAndInTheBackfill() throws Exception {
+        var s = service();
+        s.runOutboundWritesInline();
+        List<String> sink = new ArrayList<>();
+        s.addClient(socket("s1", sink));
+        sink.clear();
+        String humps = "\"humps\":[{\"session\":\"PRIOR\",\"price\":7555.0,\"strength\":1.0,\"minutes\":120,\"share\":0.3077,\"poc\":true},"
+                + "{\"session\":\"CURRENT\",\"price\":7561.5,\"strength\":0.41,\"minutes\":30,\"share\":0.19,\"poc\":false}]";
+        String payload = minute("2026-09-08", "09:31", 0, "h").replace("\"events\":[]", "\"events\":[]," + humps);
+        s.onEsAuctionRecord(key("2026-09-08", "09:31"), payload);
+        assertEquals(List.of("{\"type\":\"es-auction\",\"data\":" + payload + "}"), sink, "the gateway adds, drops and recomputes nothing");
+        assertTrue(s.auctionMinutesPage(null, null, 10).minutes().get(0).contains(humps), "the backfill serves the same bytes");
+    }
+
     // ---- restart hydration (cache consumer) ----
 
     @Test void cacheConsumerHydratesTheViewWithoutBroadcasting() throws Exception {
