@@ -186,7 +186,7 @@ class EsAuctionWiringTest {
         String payload = minute("2026-09-08", "09:31", 0, "h").replace("\"events\":[]", "\"events\":[]," + humps);
         s.onEsAuctionRecord(key("2026-09-08", "09:31"), payload);
         assertEquals(List.of("{\"type\":\"es-auction\",\"data\":" + payload + "}"), sink, "the gateway adds, drops and recomputes nothing");
-        assertTrue(s.auctionMinutesPage(null, null, 10).minutes().get(0).contains(humps), "the backfill serves the same bytes");
+        assertEquals(payload, s.auctionMinutesPage(null, null, 10).minutes().get(0), "the backfill serves the same bytes");
     }
 
     // ---- restart hydration (cache consumer) ----
