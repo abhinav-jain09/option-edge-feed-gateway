@@ -2711,6 +2711,9 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
         addEsAggressorFlowTopic(topicEvents);
         addZeroDteIntelligenceTopic(topicEvents);
+        // Spot-vol-regime CURRENT (AVRO since its 2026-10-19 cutover; browsers still get the identical JSON, see
+        // SpotVolRegimeJson): the same optional/standalone GLOBAL advisory class as before, only the wire changed.
+        topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         runAssignedCacheConsumer("avro", topicEvents, true, avroCaughtUp);
     }
 
@@ -2788,10 +2791,10 @@ public class FeedGatewayService implements ReplayRunner {
         // advisory like its siblings, OPTIONAL topic — but on the SHORT esOpenDirectionStatusTtlMs
         // window (default 5 min), which also bounds its seek-back here to the last few minutes.
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
-        // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
-        topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
+        // (Spot-vol-regime CURRENT is AVRO since its 2026-10-19 cutover: it is consumed by the Avro cache and live
+        // consumers, not here.)
         // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
-        // JSON class as spot-vol-regime. Both consumers are ASSIGNED both topics (the two maps stay
+        // JSON class as greek-move-auth. Both consumers are ASSIGNED both topics (the two maps stay
         // symmetric), but only the CACHE consumer ingests them (relayVolPremium); the live consumer's
         // vol-premium branch says why.
         topicEvents.put(settings.volPremiumIvrvTopic(),
@@ -2944,6 +2947,8 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
         addEsAggressorFlowTopic(topicEvents);
         addZeroDteIntelligenceTopic(topicEvents);
+        // Spot-vol-regime CURRENT: AVRO (see the cache twin); symmetric topic sets.
+        topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
     }
 
@@ -3058,10 +3063,10 @@ public class FeedGatewayService implements ReplayRunner {
         // Keep the cache + live JSON consumer topic sets symmetric: the ES open-direction live STATUS
         // heartbeat (JSON, standalone/optional — same rule as the forecast/outcome siblings above).
         topicEvents.put(settings.esOpenDirectionStatusTopic(), new TopicBinding("DATABENTO", "es-open-direction-status"));
-        // Spot-vol-regime CURRENT rides the same optional/standalone JSON class as greek-move-auth.
-        topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
+        // (Spot-vol-regime CURRENT is AVRO since its 2026-10-19 cutover: it is consumed by the Avro cache and live
+        // consumers, not here.)
         // Vol-premium IV/RV observations AND early-warning transitions ride the same optional/standalone
-        // JSON class as spot-vol-regime. Both consumers are ASSIGNED both topics (the two maps stay
+        // JSON class as greek-move-auth. Both consumers are ASSIGNED both topics (the two maps stay
         // symmetric), but only the CACHE consumer ingests them (relayVolPremium); the live consumer's
         // vol-premium branch says why.
         topicEvents.put(settings.volPremiumIvrvTopic(),
@@ -13750,6 +13755,9 @@ public class FeedGatewayService implements ReplayRunner {
         if ("greek-move-auth".equals(event)) {
             return GreekMoveAuthJson.render(value);
         }
+        if ("spot-vol-regime".equals(event)) {
+            return SpotVolRegimeJson.render(value);
+        }
         return avro ? avroJson(value) : stringJson(value);
     }
 
@@ -15778,6 +15786,7 @@ public class FeedGatewayService implements ReplayRunner {
         Properties properties = baseConsumerProperties(name);
         properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, GatewayAvroDeserializer.class.getName());
         properties.put(GatewayAvroDeserializer.SPX_PRICE_TOPIC, settings.underlyingSpxPriceTopic());
+        properties.put(GatewayAvroDeserializer.SPOT_VOL_REGIME_TOPIC, settings.spotVolRegimeTopic());
         properties.put("schema.registry.url", settings.schemaRegistryUrl());
         properties.put("specific.avro.reader", "false");
         properties.put(GatewayAvroDeserializer.TOLERANT_TOPICS, String.join(",", tolerantTopics()));
