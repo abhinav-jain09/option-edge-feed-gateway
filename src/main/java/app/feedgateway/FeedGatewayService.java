@@ -2289,6 +2289,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# TYPE gateway_es_auction_backfill_requests_total counter\n"
                 + "gateway_es_auction_backfill_requests_total " + esAuctionBackfillRequests.get() + "\n"
                 + "gateway_es_auction_orphan_envelopes_total " + esAuctionOrphanEnvelopes.get() + "\n"
+                + "# HELP gateway_es_auction_refused_total es-auction values dropped because they were not the EsAuctionMinute Avro record (retained JSON, another schema).\n"
+                + "# TYPE gateway_es_auction_refused_total counter\n"
+                + "gateway_es_auction_refused_total " + esAuctionRefused.get() + "\n"
                 + "# HELP gateway_market_commentary_enabled Whether the market commentary relay is enabled.\n"
                 + "# TYPE gateway_market_commentary_enabled gauge\n"
                 + "gateway_market_commentary_enabled " + boolMetric(settings.marketCommentaryEnabled()) + "\n"
@@ -2715,6 +2718,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
         addEsAggressorFlowTopic(topicEvents);
         addZeroDteIntelligenceTopic(topicEvents);
+        addEsAuctionTopics(topicEvents);
         // Spot-vol-regime CURRENT (AVRO since its 2026-10-19 cutover; browsers still get the identical JSON, see
         // SpotVolRegimeJson): the same optional/standalone GLOBAL advisory class as before, only the wire changed.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
@@ -2829,7 +2833,6 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
         addEsCvdTopics(topicEvents);
         addEsFootprintTopics(topicEvents);
-        addEsAuctionTopics(topicEvents);
         if (settings.earlyAuctionVerdictEnabled()) {
             // Early-auction verdict ledger: CACHE consumer ONLY — the opposite polarity of
             // market-structure (live-only). There is no WebSocket event for it: the /early-auction
@@ -2956,6 +2959,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.databentoDeltaFlowByStrikeTopic(), new TopicBinding("DATABENTO", "delta-flow"));
         addEsAggressorFlowTopic(topicEvents);
         addZeroDteIntelligenceTopic(topicEvents);
+        addEsAuctionTopics(topicEvents);
         // Spot-vol-regime CURRENT: AVRO (see the cache twin); symmetric topic sets.
         topicEvents.put(settings.spotVolRegimeTopic(), new TopicBinding("DATABENTO", "spot-vol-regime"));
         runLiveConsumer("avro-live", topicEvents, true, avroCaughtUp);
@@ -3105,7 +3109,6 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.closeDirectionSignalTopic(), new TopicBinding("DATABENTO", "close-direction"));
         addEsCvdTopics(topicEvents);
         addEsFootprintTopics(topicEvents);
-        addEsAuctionTopics(topicEvents);
         if (settings.esCvdSpxLevelsEnabled()) {
             // U16: SPX-translated CVD structure levels (compacted single-partition heartbeat,
             // >=1 record per ALIGN_HEARTBEAT while the aligner runs) — LIVE consumer only. The
@@ -3139,7 +3142,13 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.esFootprintStrikeTopic(), new TopicBinding("DATABENTO", "es-footprint-strike"));
     }
 
-    /** SPX Auction Desk minute stream: same shared-wiring rule as {@link #addEsCvdTopics}. */
+    /**
+     * SPX Auction Desk minute stream: AVRO since its 2026-11 conversion (contracts record
+     * {@code com.optionsedge.contracts.esamt.EsAuctionMinute}, fixed id 3201), so it is consumed by the Avro consumers only and decoded back
+     * to the exact JSON text the JSON era published ({@link com.optionsedge.contracts.esamt.EsAuctionAvro#toJson}); everything downstream
+     * (keyed minute view, verbatim broadcast, backfill) is unchanged. The topic is tolerant (see {@link #tolerantTopics()}): a retained or foreign
+     * value is counted and dropped, it never stalls the shared Avro consumer.
+     */
     private void addEsAuctionTopics(Map<String, TopicBinding> topicEvents) {
         if (!settings.esAuctionEnabled()) return;
         topicEvents.put(settings.esAuctionTopic(), new TopicBinding("DATABENTO", "es-auction"));
@@ -3490,6 +3499,8 @@ public class FeedGatewayService implements ReplayRunner {
                         json = avroJson(record.value());
                     } else if (binding != null && isStudiesEvent(binding.event())) {
                         json = null;   // the studies relay renders and validates the record itself, below
+                    } else if (binding != null && binding.event().equals("es-auction")) {
+                        json = esAuctionJson(record.value());   // Avro -> the JSON text the JSON era published; null = refused (counted)
                     } else if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
@@ -3941,6 +3952,8 @@ public class FeedGatewayService implements ReplayRunner {
                         json = MarketStructureAvro.patternsFrame(record.value());
                     } else if (binding != null && (isStudiesEvent(binding.event()) || taRelay != null)) {
                         json = null;   // the relay renders and validates the record itself, below
+                    } else if (binding != null && binding.event().equals("es-auction")) {
+                        json = esAuctionJson(record.value());   // Avro -> the JSON text the JSON era published; null = refused (counted)
                     } else if (binding != null && isRawPassThroughEvent(binding.event())) {
                         json = stringJson(record.value());
                     } else {
@@ -11658,6 +11671,8 @@ public class FeedGatewayService implements ReplayRunner {
     /** The trade date the current one rolled forward FROM; retained so late corrections still land. */
     private volatile String esAuctionPrevTradeDate;
     private final AtomicLong esAuctionRecords = new AtomicLong();
+    /** Values on the es-auction topic that were not the EsAuctionMinute Avro record (retained JSON, another schema, null): counted and dropped. */
+    private final AtomicLong esAuctionRefused = new AtomicLong();
     private final AtomicLong esAuctionBackfillRequests = new AtomicLong();
     /** Envelopes that arrived with no minute to correct: counted, never stored (the view holds MINUTES). */
     private final AtomicLong esAuctionOrphanEnvelopes = new AtomicLong();
@@ -13187,6 +13202,9 @@ public class FeedGatewayService implements ReplayRunner {
             topics.add(settings.esAggressorFlowTopic());
         }
         topics.add(settings.vixOptionInteligenceTopic());
+        if (settings.esAuctionEnabled()) {
+            topics.add(settings.esAuctionTopic());
+        }
         return topics;
     }
 
@@ -13711,6 +13729,25 @@ public class FeedGatewayService implements ReplayRunner {
     private static final String INDICATOR_SNAPSHOT_SCHEMA = "com.optionsedge.contracts.indicators.avro.IndicatorSnapshot";
     private static final String INDICATOR_SIGNALS_SCHEMA = "com.optionsedge.contracts.indicators.avro.IndicatorSignals";
 
+    /**
+     * The browser JSON of one es-auction Kafka value: the contracts {@code EsAuctionMinute} record (fixed id 3201, exactly that schema) decoded to the
+     * text the JSON era published. Anything else (retained JSON, another schema, a null value) is counted and dropped, never relayed and never fatal.
+     */
+    String esAuctionJson(Object value) {
+        if (value instanceof GenericRecord r && com.optionsedge.contracts.esamt.EsAuctionAvro.schema().equals(r.getSchema())) {
+            try {
+                return com.optionsedge.contracts.esamt.EsAuctionAvro.toJson(r);
+            } catch (RuntimeException e) {
+                System.err.println("Feed gateway es-auction: record refused, could not be rendered: " + e);
+            }
+        } else if (esAuctionRefused.get() % 1000 == 0) {
+            System.err.println("Feed gateway es-auction: value refused (not the EsAuctionMinute Avro record: "
+                    + (value == null ? "null" : value instanceof GenericRecord g ? g.getSchema().getFullName() : value.getClass().getName()) + ")");
+        }
+        esAuctionRefused.incrementAndGet();
+        return null;
+    }
+
     /** The generic rendering of a non-indicator Avro record; the indicator bindings never come here. */
     private String avroJson(Object value) {
         if (!(value instanceof GenericRecord record)) {
@@ -13754,6 +13791,9 @@ public class FeedGatewayService implements ReplayRunner {
             // ONE fixed contract (id 2701 = exactly this schema; a later version is its own reviewed change): any other schema is dropped, never relayed
             return value instanceof GenericRecord r && com.optionsedge.contracts.esflow.EsAggressorFlowAvro.schema().equals(r.getSchema())
                     ? avroJson(value) : null;
+        }
+        if ("es-auction".equals(event)) {
+            return esAuctionJson(value);
         }
         if ("zero-dte-intelligence".equals(event)) {
             // ONE fixed contract (id 3001 = exactly this schema; a later version is its own reviewed change): any other schema is dropped, never relayed

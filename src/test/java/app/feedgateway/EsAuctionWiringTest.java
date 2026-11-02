@@ -122,13 +122,18 @@ class EsAuctionWiringTest {
         assertTrue(helper >= 0 && helperEnd > helper);
         assertTrue(source.substring(helper, helperEnd).contains("if (!settings.esAuctionEnabled()) return;"),
                 "the helper is the single place the flag gates the subscription");
-        // Live builder must reach the helper (the es-cvd defect class: right branch, wrong loop).
-        int liveBuilder = source.indexOf("private void runJsonStateLiveConsumer()");
-        int liveRun = source.indexOf("runLiveConsumer(\"state-live\"", liveBuilder);
-        assertTrue(source.substring(liveBuilder, liveRun).contains("addEsAuctionTopics("));
-        int cacheBuilder = source.indexOf("private void runJsonStateCacheConsumer()");
-        int cacheRun = source.indexOf("runAssignedCacheConsumer(\"state\"", cacheBuilder);
-        assertTrue(source.substring(cacheBuilder, cacheRun).contains("addEsAuctionTopics("));
+        // The topic is AVRO (contracts EsAuctionMinute, id 3201): it lives on the Avro consumers ONLY, never on a JSON one (the es-cvd defect class: right branch, wrong loop).
+        int liveBuilder = source.indexOf("private void runAvroLiveConsumer()");
+        int liveRun = source.indexOf("runLiveConsumer(\"avro-live\"", liveBuilder);
+        assertTrue(liveBuilder >= 0 && liveRun > liveBuilder && source.substring(liveBuilder, liveRun).contains("addEsAuctionTopics("));
+        int cacheBuilder = source.indexOf("private void runAvroCacheConsumer()");
+        int cacheRun = source.indexOf("runAssignedCacheConsumer(\"avro\"", cacheBuilder);
+        assertTrue(cacheBuilder >= 0 && cacheRun > cacheBuilder && source.substring(cacheBuilder, cacheRun).contains("addEsAuctionTopics("));
+        int jsonLive = source.indexOf("private void runJsonStateLiveConsumer()");
+        assertFalse(source.substring(jsonLive, source.indexOf("runLiveConsumer(\"state-live\"", jsonLive)).contains("addEsAuctionTopics("), "no JSON live consumer may bind the topic");
+        int jsonCache = source.indexOf("private void runJsonStateCacheConsumer()");
+        assertFalse(source.substring(jsonCache, source.indexOf("runAssignedCacheConsumer(\"state\"", jsonCache)).contains("addEsAuctionTopics("), "no JSON cache consumer may bind the topic");
+        assertTrue(source.substring(source.indexOf("private List<String> tolerantTopics()")).contains("settings.esAuctionTopic()"), "a stray value must not stall the shared Avro consumer");
     }
 
     @Test void deliveryIsRawPassThroughStandaloneAndAllowlisted() throws Exception {
