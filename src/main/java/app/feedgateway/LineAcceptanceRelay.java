@@ -250,10 +250,11 @@ final class LineAcceptanceRelay extends TaRelay {
         List<String> cells = new ArrayList<>();
         long skeleton = StudiesRelay.utf8Length(",\"lineAcceptance\":{\"1m\":null,\"5m\":null,\"15m\":null,\"status\":[]}");
         for (Held h : st.status.values()) {
-            if (used + h.bytes() + 1 > cap / 8 || skeleton + used + h.bytes() + 1 > cap) {
+            long add = h.bytes() + (cells.isEmpty() ? 0 : 1);   // a comma only between cells
+            if (used + add > cap / 8 || skeleton + used + add > cap) {
                 break;
             }
-            used += h.bytes() + 1;
+            used += add;
             cells.add(h.json());
         }
         used += StudiesRelay.utf8Length(",\"lineAcceptance\":{\"1m\":null,\"5m\":null,\"15m\":null,\"status\":[]}");   // the empty field, exactly; a part replaces its "null"

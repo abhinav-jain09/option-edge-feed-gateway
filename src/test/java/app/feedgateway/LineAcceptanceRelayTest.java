@@ -226,9 +226,12 @@ class LineAcceptanceRelayTest {
         assertNull(relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "a", 10, 1000)), "identical redelivery");
         assertEquals(1, relay.regressionsForTest());
         assertEquals(1, counter(relay, "duplicate"));
+        assertNull(relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:mean", "ARMED", 10, 1900)), "a monitor at the core's sequence shares the timeframe watermark");
+        assertEquals(2, relay.regressionsForTest());
         assertNotNull(relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:mean", "ARMED", 11, 2000)));
         assertNull(relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:upper", "ARMED", 11, 2100)), "one sequence per timeframe, shared by the monitor stream");
-        assertEquals(2, relay.regressionsForTest());
+        assertNull(relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "late", 10, 2200)), "and the reverse: a core below the monitor's sequence");
+        assertEquals(4, relay.regressionsForTest());
     }
 
     @Test
@@ -302,5 +305,14 @@ class LineAcceptanceRelayTest {
         assertNull(relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "new", 50, 2000)), "a live record below the promoted history is a regression");
         assertEquals(1, relay.regressionsForTest());
         assertNotNull(relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "newer", 101, 2100)));
+    }
+
+    @Test
+    void aStatusCellThatExactlyFitsItsEighthOfTheBudgetIsKept() throws Exception {
+        var relay = new LineAcceptanceRelay();
+        relay.onLive(S, LineAcceptanceFixtures.status("c", 1, "UNVALIDATED"));
+        int bytes = JSON.writeValueAsString(hello(relay, 1 << 20).get("status").get(0)).getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        assertEquals(1, hello(relay, 8L * bytes).get("status").size());
+        assertEquals(0, hello(relay, 8L * bytes - 1).get("status").size());
     }
 }
