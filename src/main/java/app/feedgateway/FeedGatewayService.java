@@ -100,6 +100,8 @@ public class FeedGatewayService implements ReplayRunner {
      */
     static final String BARRIER_CONSUMER_ISOLATION = "read_uncommitted";
     private final Instant startedAt = Instant.now();
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private org.springframework.beans.factory.ObjectProvider<RithmicDepthRelay> rithmicDepthRelay;
     private final GatewaySettings settings;
     // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1..G-R11) — null unless the flag is on ----
     private final FootprintViews footprintViews;
@@ -148,7 +150,7 @@ public class FeedGatewayService implements ReplayRunner {
      */
     static final String EVENT_VOL_PREMIUM_FRAME = "vol-premium-frame";
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "spot-band", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "rithmic-liquidity", "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "spot-band", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "gex-oi-status",
             "strike-sr",
             "gex-magnet",
@@ -1635,6 +1637,10 @@ public class FeedGatewayService implements ReplayRunner {
             } else {
                 send(session, "cvd-hello", cvdHelloJson());
             }
+        }
+        if(rithmicDepthRelay!=null&&settings.rithmicDepthEnabled()) {
+            var relay=rithmicDepthRelay.getIfAvailable();
+            if(relay!=null)relay.replay(json->send(session,"rithmic-liquidity",json));
         }
         // A client may reconnect after the one-shot readiness broadcast (for example after a
         // gateway restart or a transient socket failure). Re-announce the already-committed
@@ -13816,6 +13822,8 @@ public class FeedGatewayService implements ReplayRunner {
         return value == null ? null : value.toString();
     }
 
+    void streamRithmicDepth(String json) {broadcast("rithmic-liquidity",json);}
+
     private void broadcast(String event, String json) {
         // Per-session routing: only explicitly allowlisted global events may fan out to every
         // socket. Any other event reaching here (e.g. a market-data event via a fallback path) is
@@ -14904,6 +14912,7 @@ public class FeedGatewayService implements ReplayRunner {
      * per-user market-data event can never reach another user's socket.
      */
     static final Set<String> GLOBAL_BROADCAST_EVENTS = Set.of(
+            "rithmic-liquidity",
             "status", "reset", "source-switching", "source-ready", "source-stale",
             // Candlestick pattern annotation sets (market-structure service): global, verbatim, flag-gated.
             "market-structure-patterns",

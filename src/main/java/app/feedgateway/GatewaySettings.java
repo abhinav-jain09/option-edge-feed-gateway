@@ -106,6 +106,8 @@ public final class GatewaySettings {
         }
     }
 
+    public boolean rithmicDepthEnabled() {return boolValue("GATEWAY_RITHMIC_DEPTH_ENABLED",false);}
+
     public String bootstrapServers() {
         return value("KAFKA_BOOTSTRAP_SERVERS", DEFAULT_BOOTSTRAP_SERVERS);
     }
