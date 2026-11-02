@@ -2928,6 +2928,11 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.breakClassificationEnabled()) {
             bindChartTopic(topicEvents, settings.breakClassificationTopic(), BreakClassificationRelay.EVENT);
         }
+        if (settings.lineAcceptanceEnabled()) {
+            bindChartTopic(topicEvents, settings.lineAcceptanceTopic(), LineAcceptanceRelay.EVENT);
+            bindChartTopic(topicEvents, settings.lineAcceptanceMonitorTopic(), LineAcceptanceRelay.MONITOR_EVENT);
+            bindChartTopic(topicEvents, settings.lineAcceptanceStatusTopic(), LineAcceptanceRelay.STATUS_EVENT);
+        }
         if (settings.studiesEnabled()) {
             // INDICATOR-STUDIES studies: Avro, LIVE consumer only (the cache consumer has no case for them; the relay keeps its own
             // bounded history and last states and recovers them with a seek-back, see seekStudies).
@@ -13114,6 +13119,9 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.breakClassificationEnabled()) {
             relays.add(new BreakClassificationRelay());
         }
+        if (settings.lineAcceptanceEnabled()) {
+            relays.add(new LineAcceptanceRelay());
+        }
         return List.copyOf(relays);
     }
 
@@ -13169,6 +13177,11 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (settings.breakClassificationEnabled()) {
             topics.add(settings.breakClassificationTopic());
+        }
+        if (settings.lineAcceptanceEnabled()) {
+            topics.add(settings.lineAcceptanceTopic());
+            topics.add(settings.lineAcceptanceMonitorTopic());
+            topics.add(settings.lineAcceptanceStatusTopic());
         }
         if (settings.esAggressorFlowEnabled()) {
             topics.add(settings.esAggressorFlowTopic());
@@ -14903,6 +14916,8 @@ public class FeedGatewayService implements ReplayRunner {
             "trade-tools-flow-bar", "trade-tools-climax",
             // Phase F break classification (break-classifier-service): global, SPX only, flag-gated.
             BreakClassificationRelay.MARK_FRAME, BreakClassificationRelay.OUTCOME_FRAME, BreakClassificationRelay.STATUS_FRAME,
+            // VWAP-ACCEPTANCE-REJECTION line acceptance (line-acceptance-service): global, SPX only, flag-gated.
+            LineAcceptanceRelay.EPISODE_FRAME, LineAcceptanceRelay.COVERAGE_FRAME, LineAcceptanceRelay.MONITOR_FRAME, LineAcceptanceRelay.STATUS_FRAME,
             // Pre-open IBKR GEX window state (rev13 R-STATE): a GLOBAL control/status stream —
             // identical for all users, sessionId-gated client-side. Allowlisted so the
             // standalone broadcast reaches sockets in per-session (auth) mode too

@@ -469,6 +469,29 @@ public final class GatewaySettings {
     }
 
     /**
+     * VWAP-ACCEPTANCE-REJECTION line / zone acceptance and rejection (frames {@code line-acceptance}, {@code -coverage}, {@code -monitor}, {@code -status}, hello field {@code lineAcceptance};
+     * options-edge-processing VWAP-ACCEPTANCE-REJECTION-DESIGN.md 10.1). OFF by default: an absent {@code lineAcceptance} field is how the page knows this gateway has no such stream.
+     */
+    public boolean lineAcceptanceEnabled() {
+        return boolValue("GATEWAY_LINE_ACCEPTANCE_ENABLED", false);
+    }
+
+    /** The episode topic of line-acceptance-service (core, evidence, outcome, integrity, lean and coverage records, told apart by their writer schema). */
+    public String lineAcceptanceTopic() {
+        return value("KAFKA_LINE_ACCEPTANCE_TOPIC", "options.spx.line-acceptance");
+    }
+
+    /** The live per-line monitor status (compacted, never calibrated). */
+    public String lineAcceptanceMonitorTopic() {
+        return value("KAFKA_LINE_ACCEPTANCE_MONITOR_TOPIC", "options.spx.line-acceptance.monitor");
+    }
+
+    /** The calibration status artifact (one immutable record per version, never compacted). */
+    public String lineAcceptanceStatusTopic() {
+        return value("KAFKA_LINE_ACCEPTANCE_STATUS_TOPIC", "options.spx.line-acceptance.status");
+    }
+
+    /**
      * Early-auction verdict evidence ledger (EARLY-AUCTION-VERDICT-STAGE1-GATE1.md:
      * {@code early-auction.verdicts.shadow}, JSON, ONE partition, one immutable record per line —
      * PREDICTION / OUTCOME / MISS / terminals). Feeds the read-only {@code /early-auction} web panel
