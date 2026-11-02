@@ -87,9 +87,7 @@ final class LineAcceptanceRelay extends TaRelay {
         final Map<String, Ep>[] episodes = new Map[TF.length];
         final Held[] coverage = new Held[TF.length];
         final long[] lastSeq = new long[TF.length];
-        final String[] monSession = new String[TF.length];
         final Map<String, Held>[] monitors = new Map[TF.length];
-        final long[] monSeq = new long[TF.length];
         final Map<String, Held> status = new LinkedHashMap<>();
         long version;
 
@@ -98,7 +96,6 @@ final class LineAcceptanceRelay extends TaRelay {
                 episodes[t] = new LinkedHashMap<>();
                 monitors[t] = new LinkedHashMap<>();
                 lastSeq[t] = -1L;
-                monSeq[t] = -1L;
             }
         }
 
@@ -112,7 +109,6 @@ final class LineAcceptanceRelay extends TaRelay {
             }
             System.arraycopy(session, 0, c.session, 0, session.length);
             System.arraycopy(coverage, 0, c.coverage, 0, coverage.length);
-            System.arraycopy(monSession, 0, c.monSession, 0, monSession.length);
             c.status.putAll(status);
             c.version = version;
             return c;   // the publishSeq trackers start empty: history is replayed in log order into a copy that is merged, not compared
@@ -166,6 +162,7 @@ final class LineAcceptanceRelay extends TaRelay {
             if (order > 0) {
                 live.episodes[t].clear();
                 live.coverage[t] = null;
+                live.monitors[t].clear();
                 live.session[t] = s;
             }
             if (order >= 0) {
@@ -197,14 +194,6 @@ final class LineAcceptanceRelay extends TaRelay {
                     live.coverage[t] = sc;
                     frames.add(new String[] {COVERAGE_FRAME, sc.json()});
                 }
-            }
-            String ms = staged.monSession[t];
-            int morder = ms == null ? -1 : live.monSession[t] == null ? 1 : ms.compareTo(live.monSession[t]);
-            if (morder > 0) {
-                live.monitors[t].clear();
-                live.monSession[t] = ms;
-            }
-            if (morder >= 0) {
                 for (Map.Entry<String, Held> e : staged.monitors[t].entrySet()) {
                     Held a = live.monitors[t].get(e.getKey());
                     if ((a == null || e.getValue().asOf() > a.asOf()) && live.monitors[t].size() < MONITORS_PER_TF + (a == null ? 0 : 1)) {
@@ -212,6 +201,7 @@ final class LineAcceptanceRelay extends TaRelay {
                         frames.add(new String[] {MONITOR_FRAME, e.getValue().json()});
                     }
                 }
+                live.lastSeq[t] = Math.max(order > 0 ? -1L : live.lastSeq[t], staged.lastSeq[t]);   // the monotonicity guard survives the recovery
             }
         }
         if (staged != null) {
@@ -258,20 +248,21 @@ final class LineAcceptanceRelay extends TaRelay {
     private static String renderHello(Store st, long cap) {
         long used = 0;
         List<String> cells = new ArrayList<>();
+        long skeleton = StudiesRelay.utf8Length(",\"lineAcceptance\":{\"1m\":null,\"5m\":null,\"15m\":null,\"status\":[]}");
         for (Held h : st.status.values()) {
-            if (used + h.bytes() + 1 > cap / 8) {
+            if (used + h.bytes() + 1 > cap / 8 || skeleton + used + h.bytes() + 1 > cap) {
                 break;
             }
             used += h.bytes() + 1;
             cells.add(h.json());
         }
-        used += 40;   // the field skeleton and the status brackets
+        used += StudiesRelay.utf8Length(",\"lineAcceptance\":{\"1m\":null,\"5m\":null,\"15m\":null,\"status\":[]}");   // the empty field, exactly; a part replaces its "null"
         StringBuilder sb = new StringBuilder(",\"lineAcceptance\":{");
         boolean fits = true;
         for (int t = 0; t < TF.length; t++) {
             sb.append('"').append(TF[t]).append("\":");
-            String d = st.session[t] == null ? st.monSession[t] : st.monSession[t] == null || st.session[t].compareTo(st.monSession[t]) >= 0 ? st.session[t] : st.monSession[t];
-            boolean eps = d != null && d.equals(st.session[t]), mons = d != null && d.equals(st.monSession[t]);
+            String d = st.session[t];
+            boolean eps = d != null, mons = d != null;
             boolean held = d != null && (eps && (!st.episodes[t].isEmpty() || st.coverage[t] != null) || mons && !st.monitors[t].isEmpty());
             String part = null;
             if (fits && held) {
@@ -286,14 +277,14 @@ final class LineAcceptanceRelay extends TaRelay {
                 int lo = 0, hi = keys.size();   // keep the newest `keep` episodes: the largest keep whose rendering fits
                 while (lo < hi) {
                     int mid = (lo + hi + 1) >>> 1;
-                    if (used + StudiesRelay.utf8Length(tfPart(st, t, d, eps, mons, keys, keys.size() - mid)) <= cap) {
+                    if (used + StudiesRelay.utf8Length(tfPart(st, t, d, eps, mons, keys, keys.size() - mid)) - 4 <= cap) {
                         lo = mid;
                     } else {
                         hi = mid - 1;
                     }
                 }
                 String candidate = tfPart(st, t, d, eps, mons, keys, keys.size() - lo);
-                if (used + StudiesRelay.utf8Length(candidate) <= cap) {
+                if (used + StudiesRelay.utf8Length(candidate) - 4 <= cap) {
                     part = candidate;
                 }
             }
@@ -301,7 +292,7 @@ final class LineAcceptanceRelay extends TaRelay {
                 fits &= !held;   // the first retained timeframe that does not fit ends the list: the rest are null
                 sb.append("null,");
             } else {
-                used += StudiesRelay.utf8Length(part) + 1;
+                used += StudiesRelay.utf8Length(part) - 4;
                 sb.append(part).append(',');
             }
         }
@@ -488,15 +479,14 @@ final class LineAcceptanceRelay extends TaRelay {
     }
 
     private static void seen(Store st, int t, long publishSeq, boolean staging) {
-        if (!staging) {
-            st.lastSeq[t] = Math.max(st.lastSeq[t], publishSeq);
-        }
+        st.lastSeq[t] = Math.max(st.lastSeq[t], publishSeq);   // a staged replay records it too: promote() folds it into the live watermark
     }
 
     private void enter(Store st, int t, String date, int order) {
         if (order > 0) {
             st.episodes[t].clear();
             st.coverage[t] = null;
+            st.monitors[t].clear();
             st.lastSeq[t] = -1L;
             st.session[t] = date;
         }
@@ -508,7 +498,7 @@ final class LineAcceptanceRelay extends TaRelay {
             return null;
         }
         String lineId = String.valueOf(r.get("lineId"));
-        int order = st.monSession[t] == null ? 1 : date.compareTo(st.monSession[t]);
+        int order = st.session[t] == null ? 1 : date.compareTo(st.session[t]);
         if (order < 0) {
             late.incrementAndGet();
             return null;
@@ -518,15 +508,10 @@ final class LineAcceptanceRelay extends TaRelay {
             duplicate.incrementAndGet();
             return null;
         }
-        if (order == 0 && !staging && publishSeq <= st.monSeq[t]) {
-            regressed();
+        if (!freshSeq(st, t, publishSeq, order, staging)) {
             return null;
         }
-        if (order > 0) {
-            st.monitors[t].clear();
-            st.monSession[t] = date;
-            st.monSeq[t] = -1L;
-        }
+        enter(st, t, date, order);
         Held old = st.monitors[t].get(lineId);
         if (old != null && held.asOf() < old.asOf()) {
             if (!staging) {
@@ -540,9 +525,7 @@ final class LineAcceptanceRelay extends TaRelay {
         }
         st.monitors[t].remove(lineId);
         st.monitors[t].put(lineId, held);
-        if (!staging) {
-            st.monSeq[t] = Math.max(st.monSeq[t], publishSeq);
-        }
+        seen(st, t, publishSeq, staging);
         st.version++;
         accepted();
         return new String[] {MONITOR_FRAME, held.json()};

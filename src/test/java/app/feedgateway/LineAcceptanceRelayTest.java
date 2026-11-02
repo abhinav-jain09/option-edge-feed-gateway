@@ -130,7 +130,7 @@ class LineAcceptanceRelayTest {
         assertEquals(0, empty.get("status").size(), "the field's presence is the flag: an empty stream still says the gateway has one");
         relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "a", 1, 1000));
         relay.onLive(E, LineAcceptanceFixtures.coverage("M5", D1, 1, 2, 1100));
-        relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:mean", "ARMED", 1, 1200));
+        relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:mean", "ARMED", 3, 1200));
         relay.onLive(S, LineAcceptanceFixtures.status("cell-1", 1, "UNVALIDATED"));
         JsonNode h = hello(relay, 1 << 20);
         assertTrue(h.get("1m").isNull());
@@ -226,8 +226,8 @@ class LineAcceptanceRelayTest {
         assertNull(relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "a", 10, 1000)), "identical redelivery");
         assertEquals(1, relay.regressionsForTest());
         assertEquals(1, counter(relay, "duplicate"));
-        assertNotNull(relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:mean", "ARMED", 3, 2000)));
-        assertNull(relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:upper", "ARMED", 3, 2100)));
+        assertNotNull(relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:mean", "ARMED", 11, 2000)));
+        assertNull(relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:upper", "ARMED", 11, 2100)), "one sequence per timeframe, shared by the monitor stream");
         assertEquals(2, relay.regressionsForTest());
     }
 
@@ -265,7 +265,7 @@ class LineAcceptanceRelayTest {
         relay.onLive(E, LineAcceptanceFixtures.coverage("M5", D1, 1, 100, 5000));
         for (long budget : new long[] {10, 200, 3000, 20000, 60000}) {
             String field = relay.helloField(budget);
-            assertTrue(field.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= Math.max(budget, 120), "budget " + budget + " got " + field.length());
+            assertTrue(field.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= Math.max(budget, 62), "the requested budget whenever the empty field fits: budget " + budget + " got " + field.length());
             JsonNode h = JSON.readTree("{" + field.substring(1) + "}").get("lineAcceptance");
             assertTrue(h.get("5m").isNull() || h.get("5m").get("episodes").size() + h.get("5m").get("omitted").asInt() == 20);
         }
@@ -283,5 +283,24 @@ class LineAcceptanceRelayTest {
         List<String[]> frames = relay.promote();
         assertTrue(frames.isEmpty(), "history below live changes nothing and is not re-sent");
         assertEquals(3, JSON.readTree(hello(relay, 1 << 20).get("5m").get("episodes").get(0).get("evidence").toString()).get("evidenceVersion").asInt());
+    }
+
+    @Test
+    void aMonitorOfAnEarlierSessionThanTheTimeframeHoldsIsLateAndForwardedNowhere() {
+        var relay = new LineAcceptanceRelay();
+        relay.onLive(E, LineAcceptanceFixtures.core("M5", D2, "a", 1, 1000));
+        assertNull(relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:mean", "ARMED", 9, 900)));
+        assertEquals(1, counter(relay, "late"));
+    }
+
+    @Test
+    void theSequenceWatermarkSurvivesARecovery() {
+        var relay = new LineAcceptanceRelay();
+        relay.beginRecovery();
+        relay.onStaged(E, LineAcceptanceFixtures.core("M5", D1, "old", 100, 1000));
+        relay.promote();
+        assertNull(relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "new", 50, 2000)), "a live record below the promoted history is a regression");
+        assertEquals(1, relay.regressionsForTest());
+        assertNotNull(relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "newer", 101, 2100)));
     }
 }
