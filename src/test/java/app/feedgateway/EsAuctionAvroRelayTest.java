@@ -104,7 +104,11 @@ class EsAuctionAvroRelayTest {
             assertNull(s.esAuctionJson(GatewayAvroDeserializer.UNDECODABLE));
             assertNull(s.esAuctionJson(null));
             assertNull(s.esAuctionJson("{\"a\":1}"));
-            assertTrue(s.metrics().contains("gateway_es_auction_refused_total 3"), "refusals are counted on the metric");
+            org.apache.avro.Schema other = org.apache.avro.SchemaBuilder.record("Other").namespace("x").fields().requiredString("tradeDate").endRecord();
+            org.apache.avro.generic.GenericRecord foreign = new org.apache.avro.generic.GenericData.Record(other);
+            foreign.put("tradeDate", "2026-11-02");
+            assertNull(s.esAuctionJson(foreign), "valid Avro of another schema is not relayed");
+            assertTrue(s.metrics().contains("gateway_es_auction_refused_total 4"), "refusals are counted on the metric");
         }
     }
 
