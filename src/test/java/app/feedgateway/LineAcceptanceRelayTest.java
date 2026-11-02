@@ -216,4 +216,72 @@ class LineAcceptanceRelayTest {
         assertEquals(expected, names);
         assertFalse(core.toString().toLowerCase().contains("likely"));
     }
+
+    @Test
+    void anEqualPublishSeqOnAnotherRecordIsARegressionButAnIdenticalRedeliveryIsNot() {
+        var relay = new LineAcceptanceRelay();
+        assertNotNull(relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "a", 10, 1000)));
+        assertNull(relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "b", 10, 1100)), "strictly increasing: an equal one is a violation");
+        assertEquals(1, relay.regressionsForTest());
+        assertNull(relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "a", 10, 1000)), "identical redelivery");
+        assertEquals(1, relay.regressionsForTest());
+        assertEquals(1, counter(relay, "duplicate"));
+        assertNotNull(relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:mean", "ARMED", 3, 2000)));
+        assertNull(relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D1, "vwap:upper", "ARMED", 3, 2100)));
+        assertEquals(2, relay.regressionsForTest());
+    }
+
+    @Test
+    void aRecordWhoseRecordTypeDisagreesWithItsSchemaIsDropped() {
+        var relay = new LineAcceptanceRelay();
+        GenericRecord core = LineAcceptanceFixtures.core("M5", D1, "a", 1, 1000);
+        TaFixtures.put(core, "recordType", "LEAN_EVENT");
+        assertNull(relay.onLive(E, core));
+        GenericRecord mon = LineAcceptanceFixtures.monitor("M5", D1, "l", "ARMED", 1, 1000);
+        TaFixtures.put(mon, "recordType", "EPISODE_CORE");
+        assertNull(relay.onLive(M, mon));
+        assertEquals(2, relay.dropsForTest());
+    }
+
+    @Test
+    void aMonitorOfALaterSessionIsNeverRenderedUnderTheEpisodesOlderDate() throws Exception {
+        var relay = new LineAcceptanceRelay();
+        relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "a", 1, 1000));
+        relay.onLive(M, LineAcceptanceFixtures.monitor("M5", D2, "vwap:mean", "ARMED", 1, 2000));
+        JsonNode t = hello(relay, 1 << 20).get("5m");
+        assertEquals(D2, t.get("sessionDate").asText());
+        assertEquals(0, t.get("episodes").size(), "the older episodes are not shown under the newer date");
+        assertEquals(1, t.get("monitors").size());
+        relay.onLive(M, LineAcceptanceFixtures.monitor("M1", D1, "vwap:mean", "ARMED", 1, 2000));
+        assertEquals(D1, hello(relay, 1 << 20).get("1m").get("sessionDate").asText(), "a monitor-only timeframe is attributed to its own date");
+    }
+
+    @Test
+    void aConstrainedHelloBudgetIsHonouredOnTheRenderedBytes() throws Exception {
+        var relay = new LineAcceptanceRelay();
+        for (int i = 0; i < 20; i++) {
+            relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "e" + i, i + 1, 1000 + i));
+        }
+        relay.onLive(E, LineAcceptanceFixtures.coverage("M5", D1, 1, 100, 5000));
+        for (long budget : new long[] {10, 200, 3000, 20000, 60000}) {
+            String field = relay.helloField(budget);
+            assertTrue(field.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= Math.max(budget, 120), "budget " + budget + " got " + field.length());
+            JsonNode h = JSON.readTree("{" + field.substring(1) + "}").get("lineAcceptance");
+            assertTrue(h.get("5m").isNull() || h.get("5m").get("episodes").size() + h.get("5m").get("omitted").asInt() == 20);
+        }
+        assertTrue(hello(relay, 10).get("5m").isNull(), "nothing fits: null, never an oversize field");
+    }
+
+    @Test
+    void aLiveUpdateDuringARecoveryIsNeitherOverwrittenNorResent() throws Exception {
+        var relay = new LineAcceptanceRelay();
+        relay.onLive(E, LineAcceptanceFixtures.core("M5", D1, "a", 5, 1000));
+        relay.beginRecovery();
+        relay.onStaged(E, LineAcceptanceFixtures.core("M5", D1, "a", 1, 900));
+        relay.onStaged(E, LineAcceptanceFixtures.evidence("M5", D1, "a", 1, 2, 950));
+        assertNotNull(relay.onLive(E, LineAcceptanceFixtures.evidence("M5", D1, "a", 3, 6, 1500)));   // live is newer than anything staged
+        List<String[]> frames = relay.promote();
+        assertTrue(frames.isEmpty(), "history below live changes nothing and is not re-sent");
+        assertEquals(3, JSON.readTree(hello(relay, 1 << 20).get("5m").get("episodes").get(0).get("evidence").toString()).get("evidenceVersion").asInt());
+    }
 }

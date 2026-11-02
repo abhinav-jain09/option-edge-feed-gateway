@@ -45,6 +45,7 @@ final class LineAcceptanceRelay extends TaRelay {
     private static final String[] TF_ENUM = {"M1", "M5", "M15"};
     private static final String UNKNOWN = "UNKNOWN";
     private static final int CORE = 0, EVIDENCE = 1, OUTCOME = 2, INTEGRITY = 3, LEAN = 4, COVERAGE = 5, MONITOR = 6, STATUS = 7;
+    private static final String[] RECORD_TYPES = {"EPISODE_CORE", "EPISODE_EVIDENCE", "EPISODE_OUTCOME", "EPISODE_INTEGRITY", "LEAN_EVENT", "SESSION_COVERAGE", "MONITOR_STATUS", null};
     private static final String[] NAMES = {"LineEpisodeCore", "LineEpisodeEvidence", "LineEpisodeOutcome", "LineEpisodeIntegrity", "LeanEvent", "SessionCoverage", "LineMonitorStatus", "CalibrationStatus"};
 
     /** One retained record: its frame data, its UTF-8 size, its version (part version / lean ordinal / coverage version) and its asOfMs. */
@@ -249,64 +250,77 @@ final class LineAcceptanceRelay extends TaRelay {
         return helloCache;
     }
 
-    /** The status cells first (the page needs them to word every verdict), then whole timeframes while they fit; a timeframe that does not fit loses its OLDEST episodes and says how many. */
+    /**
+     * The status cells first (the page needs them to word every verdict; never more than an eighth of the part), then whole timeframes while they fit. Every byte is measured on the text that is
+     * actually rendered. A timeframe that does not fit loses its OLDEST episodes (and says how many in {@code omitted}); one that cannot fit even with none is {@code null}, and so are the later ones.
+     * A timeframe's session date is the greater of its episode and monitor dates; records of an older date are not rendered under it.
+     */
     private static String renderHello(Store st, long cap) {
         long used = 0;
         List<String> cells = new ArrayList<>();
         for (Held h : st.status.values()) {
             if (used + h.bytes() + 1 > cap / 8) {
-                break;   // the status artifact never takes more than an eighth of the part
+                break;
             }
             used += h.bytes() + 1;
             cells.add(h.json());
         }
+        used += 40;   // the field skeleton and the status brackets
         StringBuilder sb = new StringBuilder(",\"lineAcceptance\":{");
         boolean fits = true;
         for (int t = 0; t < TF.length; t++) {
             sb.append('"').append(TF[t]).append("\":");
-            boolean held = st.session[t] != null && (!st.episodes[t].isEmpty() || st.coverage[t] != null) || !st.monitors[t].isEmpty();
-            if (!(fits && held)) {
+            String d = st.session[t] == null ? st.monSession[t] : st.monSession[t] == null || st.session[t].compareTo(st.monSession[t]) >= 0 ? st.session[t] : st.monSession[t];
+            boolean eps = d != null && d.equals(st.session[t]), mons = d != null && d.equals(st.monSession[t]);
+            boolean held = d != null && (eps && (!st.episodes[t].isEmpty() || st.coverage[t] != null) || mons && !st.monitors[t].isEmpty());
+            String part = null;
+            if (fits && held) {
+                List<String> keys = new ArrayList<>();
+                if (eps) {
+                    for (Map.Entry<String, Ep> e : st.episodes[t].entrySet()) {
+                        if (e.getValue().part[CORE] != null) {
+                            keys.add(e.getKey());
+                        }
+                    }
+                }
+                int lo = 0, hi = keys.size();   // keep the newest `keep` episodes: the largest keep whose rendering fits
+                while (lo < hi) {
+                    int mid = (lo + hi + 1) >>> 1;
+                    if (used + StudiesRelay.utf8Length(tfPart(st, t, d, eps, mons, keys, keys.size() - mid)) <= cap) {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                String candidate = tfPart(st, t, d, eps, mons, keys, keys.size() - lo);
+                if (used + StudiesRelay.utf8Length(candidate) <= cap) {
+                    part = candidate;
+                }
+            }
+            if (part == null) {
                 fits &= !held;   // the first retained timeframe that does not fit ends the list: the rest are null
                 sb.append("null,");
-                continue;
+            } else {
+                used += StudiesRelay.utf8Length(part) + 1;
+                sb.append(part).append(',');
             }
-            long fixed = (st.coverage[t] == null ? 0 : st.coverage[t].bytes() + 1);
-            for (Held m : st.monitors[t].values()) {
-                fixed += m.bytes() + 1;
-            }
-            List<String> eps = new ArrayList<>();
-            List<String> keys = new ArrayList<>(st.episodes[t].keySet());
-            long room = cap - used - fixed - 400, size = 0;
-            int omitted = 0;
-            List<Integer> take = new ArrayList<>();
-            for (int i = keys.size() - 1; i >= 0; i--) {   // newest first: the oldest are the ones that give way
-                Ep ep = st.episodes[t].get(keys.get(i));
-                if (ep.part[CORE] == null) {
-                    continue;   // an episode without its core is not shown
-                }
-                long b = ep.bytes() + 160;
-                if (size + b > room) {
-                    omitted++;
-                    continue;
-                }
-                size += b;
-                take.add(i);
-            }
-            java.util.Collections.reverse(take);
-            for (int i : take) {
-                eps.add(st.episodes[t].get(keys.get(i)).view(TF[t], st.session[t] == null ? "" : st.session[t], keys.get(i)));
-            }
-            used += fixed + size + 400;
-            sb.append("{\"sessionDate\":").append(st.session[t] == null ? "null" : "\"" + st.session[t] + "\"").append(",\"episodes\":[").append(String.join(",", eps)).append("],\"omitted\":").append(omitted)
-                    .append(",\"coverage\":").append(st.coverage[t] == null ? "null" : st.coverage[t].json()).append(",\"monitors\":[");
-            boolean first = true;
-            for (Held m : st.monitors[t].values()) {
-                sb.append(first ? "" : ",").append(m.json());
-                first = false;
-            }
-            sb.append("]},");
         }
         return sb.append("\"status\":[").append(String.join(",", cells)).append("]}").toString();
+    }
+
+    /** One timeframe's object, with the newest episodes after dropping the first {@code drop} of {@code keys}. */
+    private static String tfPart(Store st, int t, String date, boolean eps, boolean mons, List<String> keys, int drop) {
+        StringBuilder sb = new StringBuilder("{\"sessionDate\":\"").append(date).append("\",\"episodes\":[");
+        for (int i = drop; i < keys.size(); i++) {
+            sb.append(i == drop ? "" : ",").append(st.episodes[t].get(keys.get(i)).view(TF[t], date, keys.get(i)));
+        }
+        sb.append("],\"omitted\":").append(drop).append(",\"coverage\":").append(eps && st.coverage[t] != null ? st.coverage[t].json() : "null").append(",\"monitors\":[");
+        boolean first = true;
+        for (Held m : mons ? st.monitors[t].values() : List.<Held>of()) {
+            sb.append(first ? "" : ",").append(m.json());
+            first = false;
+        }
+        return sb.append("]}").toString();
     }
 
     private String[] apply(Store target, String bindingEvent, Object value, boolean staging) {
@@ -323,7 +337,7 @@ final class LineAcceptanceRelay extends TaRelay {
                 }
             }
             boolean topicOk = kind >= 0 && (kind == STATUS ? STATUS_EVENT.equals(bindingEvent) : kind == MONITOR ? MONITOR_EVENT.equals(bindingEvent) : EVENT.equals(bindingEvent));
-            if (!topicOk || !Integer.valueOf(1).equals(r.get("schemaVersion"))) {
+            if (!topicOk || !Integer.valueOf(1).equals(r.get("schemaVersion")) || RECORD_TYPES[kind] != null && !RECORD_TYPES[kind].equals(String.valueOf(r.get("recordType")))) {
                 onDrop();
                 return null;
             }
@@ -362,12 +376,12 @@ final class LineAcceptanceRelay extends TaRelay {
         }
         if (kind == COVERAGE) {
             long cv = ((Number) r.get("coverageVersion")).longValue();
-            if (!freshSeq(st, t, publishSeq, order, staging)) {
-                return null;
-            }
             Held old = order > 0 ? null : st.coverage[t];
             if (old != null && cv <= old.version()) {
                 return same(old, frame, cv);
+            }
+            if (!freshSeq(st, t, publishSeq, order, staging)) {
+                return null;
             }
             enter(st, t, date, order);
             seen(st, t, publishSeq, staging);
@@ -466,7 +480,7 @@ final class LineAcceptanceRelay extends TaRelay {
         if (staging) {
             return true;
         }
-        if (order <= 0 && publishSeq < st.lastSeq[t]) {
+        if (order <= 0 && publishSeq <= st.lastSeq[t]) {
             regressed();
             return false;
         }
@@ -499,7 +513,12 @@ final class LineAcceptanceRelay extends TaRelay {
             late.incrementAndGet();
             return null;
         }
-        if (order == 0 && !staging && publishSeq < st.monSeq[t]) {
+        Held same = order == 0 ? st.monitors[t].get(lineId) : null;
+        if (same != null && same.json().equals(held.json())) {
+            duplicate.incrementAndGet();
+            return null;
+        }
+        if (order == 0 && !staging && publishSeq <= st.monSeq[t]) {
             regressed();
             return null;
         }
