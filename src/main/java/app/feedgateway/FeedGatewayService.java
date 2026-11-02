@@ -2655,7 +2655,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void runAvroCacheConsumer() {
-        Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
+        Map<String, TopicBinding> topicEvents = new UniqueBindings();
         topicEvents.put(settings.ibkrDisplayTopic(), new TopicBinding("IBKR", "snapshot"));
         topicEvents.put(settings.ibkrPaceTopic(), new TopicBinding("IBKR", "pace"));
         topicEvents.put(settings.ibkrPaceRankTopic(), new TopicBinding("IBKR", "pace-rank"));

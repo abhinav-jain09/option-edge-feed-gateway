@@ -115,4 +115,18 @@ class EsAuctionAvroRelayTest {
         assertTrue(source.contains("json = esAuctionJson(record.value());"));
         assertFalse(source.contains("json = stringJson(record.value());   // es-auction"));
     }
+
+    @Test
+    void bothAvroConsumersRefuseAMisroutingBindingOfTheAuctionTopic() throws Exception {
+        String source = Files.readString(Path.of(SRC));
+        for (String sig : List.of("private void runAvroCacheConsumer() {", "private void runAvroLiveConsumer() {")) {
+            int at = source.indexOf(sig);
+            assertTrue(at >= 0, sig);
+            assertTrue(source.startsWith("\n        Map<String, TopicBinding> topicEvents = new UniqueBindings();", at + sig.length()), sig + " must use UniqueBindings");
+        }
+        Map<String, FeedGatewayService.TopicBinding> m = new FeedGatewayService.UniqueBindings();
+        m.put("es.futures.auction", new FeedGatewayService.TopicBinding("DATABENTO", "es-auction"));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> m.put("es.futures.auction", new FeedGatewayService.TopicBinding("DATABENTO", "es-cvd")));
+    }
 }
