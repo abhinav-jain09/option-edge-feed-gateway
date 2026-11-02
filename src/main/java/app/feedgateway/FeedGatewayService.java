@@ -903,6 +903,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicLong droppedByStaleness = new AtomicLong();         // records dropped by selection-barrier / stale gate
     private final AtomicLong droppedByCacheGate = new AtomicLong();         // records dropped because cacheCaughtUpFlag was false
     private final AtomicLong retainedCvdRecordsDropped = new AtomicLong();
+    private final AtomicLong earlyAuctionUndecodableSkipped = new AtomicLong();
     private final AtomicLong droppedByOtherReasons = new AtomicLong();      // caught-up + non-forwardable (source/symbol/expiry mismatch, etc.)
     private final AtomicLong strikeBandsRejected = new AtomicLong();        // spot-vol-regime strikeBand blocks refused by sanitizeStrikeBand
     private final AtomicLong tapeZonesRejected = new AtomicLong();          // tape-zones boards refused by the fail-closed identity contract
@@ -2571,6 +2572,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_cvd_retained_records_dropped_total Malformed retained JSON values skipped explicitly; Avro failures are never skipped.\n"
                 + "# TYPE options_edge_feed_gateway_cvd_retained_records_dropped_total counter\n"
                 + "options_edge_feed_gateway_cvd_retained_records_dropped_total " + retainedCvdRecordsDropped.get() + "\n"
+                + "# HELP options_edge_feed_gateway_early_auction_undecodable_skipped_total Early-auction verdict records skipped because their writer schema is not the pinned canonical one (view-only topic).\n"
+                + "# TYPE options_edge_feed_gateway_early_auction_undecodable_skipped_total counter\n"
+                + "options_edge_feed_gateway_early_auction_undecodable_skipped_total " + earlyAuctionUndecodableSkipped.get() + "\n"
                 + "# HELP options_edge_feed_gateway_forward_stalled_live_records_polled_total Total records observed by the live consumers (poll advance signal).\n"
                 + "# TYPE options_edge_feed_gateway_forward_stalled_live_records_polled_total counter\n"
                 + "options_edge_feed_gateway_forward_stalled_live_records_polled_total " + liveRecordsPolled.get() + "\n"
@@ -15823,6 +15827,21 @@ public class FeedGatewayService implements ReplayRunner {
     ConsumerRecords<String, Object> pollCompatible(org.apache.kafka.clients.consumer.Consumer<String, Object> consumer, Duration timeout) {
         try { return consumer.poll(timeout); }
         catch (org.apache.kafka.common.errors.RecordDeserializationException failure) {
+            // The early-auction verdict ledger is a VIEW-ONLY relay (polled REST page, no authority, no broadcast). A ledger
+            // record written under a schema this build does not know (a producer one revision ahead of the pinned contracts)
+            // must not stall the whole 'state' consumer: it never reaches its catch-up barrier, so every cached state replay
+            // behind that barrier is withheld from the page. Count it, name it in the log, step past it. Every OTHER Avro
+            // decode failure stays fatal (the policy below).
+            if (failure.origin() == org.apache.kafka.common.errors.RecordDeserializationException.DeserializationExceptionOrigin.VALUE
+                    && settings.earlyAuctionVerdictTopic().equals(failure.topicPartition().topic())
+                    && failure.offset() >= 0 && failure.offset() != Long.MAX_VALUE) {
+                consumer.seek(failure.topicPartition(), failure.offset() + 1);
+                long skipped = earlyAuctionUndecodableSkipped.incrementAndGet();
+                if ((skipped & (skipped - 1)) == 0)
+                    System.err.println("Gateway skipped an undecodable early-auction verdict record at " + failure.topicPartition()
+                            + " offset=" + failure.offset() + " total=" + skipped + " cause=" + failure.getMessage());
+                return ConsumerRecords.empty();
+            }
             java.nio.ByteBuffer wire = failure.valueBuffer();
             if (failure.origin() != org.apache.kafka.common.errors.RecordDeserializationException.DeserializationExceptionOrigin.VALUE
                     || !cvdAvroBindings().containsKey(failure.topicPartition().topic())

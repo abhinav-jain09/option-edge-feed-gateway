@@ -34,6 +34,25 @@ class CvdRetainedPollTest {
         }
     }
 
+    @Test void anUndecodableEarlyAuctionLedgerRecordIsCountedAndSkippedButOtherAvroFailuresStayFatal() {
+        var settings=new GatewaySettings();var service=new FeedGatewayService(settings,new ObjectMapper(),new HpsfGatewayViewMapper(),null);
+        var tp=new TopicPartition(settings.earlyAuctionVerdictTopic(),0);
+        try(var consumer=new MockConsumer<String,Object>(OffsetResetStrategy.NONE)) {
+            consumer.assign(List.of(tp));consumer.updateBeginningOffsets(Map.of(tp,0L));consumer.seek(tp,162);
+            consumer.setPollException(failure(tp,162,new byte[]{0,0,0,0x0b,(byte)0xf3,2}));
+            assertTrue(service.pollCompatible(consumer,Duration.ZERO).isEmpty());assertEquals(163,consumer.position(tp));
+            assertTrue(service.metrics().contains("options_edge_feed_gateway_early_auction_undecodable_skipped_total 1\n"));
+            assertTrue(service.metrics().contains("options_edge_feed_gateway_cvd_retained_records_dropped_total 0\n"));
+        }
+        var other=new TopicPartition(settings.esCvdBarsTopic(),0);
+        try(var consumer=new MockConsumer<String,Object>(OffsetResetStrategy.NONE)) {
+            consumer.assign(List.of(other));consumer.updateBeginningOffsets(Map.of(other,0L));consumer.seek(other,5);
+            var error=failure(other,5,new byte[]{0,0,0,0x0b,(byte)0xf3,2});consumer.setPollException(error);
+            assertSame(error,assertThrows(RecordDeserializationException.class,()->service.pollCompatible(consumer,Duration.ZERO)));
+            assertEquals(5,consumer.position(other));
+        }
+    }
+
     @Test void framedAvroErrorsAndUnboundTopicErrorsRemainFatalAtTheSameOffset() {
         var settings=new GatewaySettings();var service=new FeedGatewayService(settings,new ObjectMapper(),new HpsfGatewayViewMapper(),null);
         for(String topic:List.of(settings.esCvdBarsTopic(),"unrelated-topic")) {
