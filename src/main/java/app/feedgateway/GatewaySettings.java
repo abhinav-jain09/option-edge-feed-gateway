@@ -416,6 +416,20 @@ public final class GatewaySettings {
         return value("KAFKA_MARKET_STRUCTURE_TOOLS_TOPIC", "options.spx.market-structure.tools");
     }
 
+    /**
+     * The overnight (Globex estimate, ES-derived) structure tools sets of market-structure-service's estimate profile (GTH-STRUCTURE-OUTPUTS): they join the SAME
+     * {@code market-structure-tools} event and per-timeframe retention as the regular sets (newest {@code asOfMs} wins), so the regular sets take over at the cash open.
+     * No flag of its own: bound whenever the tools stream is on, and a topic that does not exist (production, or before the producer is deployed) is simply absent.
+     */
+    public String structureToolsEstimateTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_ESTIMATE_TOOLS_TOPIC", "options.spx.market-structure.estimate.tools");
+    }
+
+    /** The overnight classical geometry sets of the estimate profile; same rule as {@link #structureToolsEstimateTopic()}. */
+    public String geometryEstimateTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_ESTIMATE_GEOMETRY_TOPIC", "options.spx.market-structure.estimate.geometry");
+    }
+
     /** CLASSICAL-CHART-PATTERNS classical geometry (frame {@code market-structure-geometry}, hello field {@code geometry}); OFF by default. */
     public boolean geometryEnabled() {
         return boolValue("GATEWAY_GEOMETRY_ENABLED", false);
