@@ -2920,9 +2920,12 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (settings.structureToolsEnabled()) {
             bindChartTopic(topicEvents, settings.structureToolsTopic(), TimeframeSetRelay.TOOLS_EVENT);
+            // overnight (estimate) sets: the SAME event and retention, newest asOfMs per timeframe wins (like the estimate ui and patterns topics)
+            bindChartTopic(topicEvents, settings.structureToolsEstimateTopic(), TimeframeSetRelay.TOOLS_EVENT);
         }
         if (settings.geometryEnabled()) {
             bindChartTopic(topicEvents, settings.geometryTopic(), TimeframeSetRelay.GEOMETRY_EVENT);
+            bindChartTopic(topicEvents, settings.geometryEstimateTopic(), TimeframeSetRelay.GEOMETRY_EVENT);
         }
         if (settings.tradeToolsEnabled()) {
             List<String> tradeToolsTopics = settings.tradeToolsTopics();
@@ -13185,9 +13188,11 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (settings.structureToolsEnabled()) {
             topics.add(settings.structureToolsTopic());
+            topics.add(settings.structureToolsEstimateTopic());
         }
         if (settings.geometryEnabled()) {
             topics.add(settings.geometryTopic());
+            topics.add(settings.geometryEstimateTopic());
         }
         if (settings.tradeToolsEnabled()) {
             topics.addAll(settings.tradeToolsTopics());
