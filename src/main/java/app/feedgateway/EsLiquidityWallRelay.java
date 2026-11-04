@@ -304,8 +304,10 @@ final class EsLiquidityWallRelay {
             while (wallRing.size() > settings.esLiquidityWallEventRing()) {
                 wallRing.removeFirst();
             }
-            if (now - bucketEnd > settings.esLiquidityWallEventReplayMs()) {
-                staleEvents.incrementAndGet();   // the session-open catch-up: folded and ringed, never broadcast as if it had just happened
+            if (!fresh(bucketEnd, now, settings.esLiquidityWallEventReplayMs())) {
+                // the session-open catch-up (older than the replay window) or a bucket end ahead of the clock beyond the skew allowance: folded and ringed,
+                // never broadcast as if it had just happened; the same two-sided gate as the dashboard frames
+                staleEvents.incrementAndGet();
                 return;
             }
             sink.accept(WALL_EVENT, EsLiquidityWallJson.withCached(json, false));
@@ -351,7 +353,7 @@ final class EsLiquidityWallRelay {
         }
         long window = settings.esLiquidityWallEventReplayMs();
         for (Cached e : wallRing) {
-            if (now - e.bucketEnd() <= window) {
+            if (fresh(e.bucketEnd(), now, window)) {   // two-sided: neither older than the window nor ahead of the clock beyond the skew allowance
                 send.accept(WALL_EVENT, EsLiquidityWallJson.withCached(e.json(), true));
             }
         }

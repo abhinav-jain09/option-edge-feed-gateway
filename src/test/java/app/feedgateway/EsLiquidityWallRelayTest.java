@@ -201,12 +201,15 @@ class EsLiquidityWallRelayTest {
         relay.accept(EVENTS, "C1", wire.bytes(EsLiquidityWallFixtures.retired(NOW - 1000, "C1", "AGED")), NOW);
         assertEquals(4, sink.frames.size(), "an event outside the replay window is never broadcast as if it had just happened");
         assertEquals(1, relay.staleEventsForTest());
+        relay.accept(EVENTS, "C9", wire.bytes(EsLiquidityWallFixtures.born(NOW + window + 60_000, "C9")), NOW);   // far ahead of the clock: never fresh at any instant this test replays
+        assertEquals(4, sink.frames.size(), "an event ahead of the clock beyond the skew allowance is not forwarded live");
+        assertEquals(2, relay.staleEventsForTest());
         assertEquals(1, relay.history().render(NOW).indexOf("\"clusterId\":\"C0\"") > 0 ? 1 : 0, "but it is folded into the projection");
-        assertTrue(relay.metrics().contains("gateway_es_liquidity_wall_stale_events_total 1\n"));
+        assertTrue(relay.metrics().contains("gateway_es_liquidity_wall_stale_events_total 2\n"));
 
         Sink replay = new Sink();
         relay.replay(replay, NOW);
-        assertEquals(List.of("es-liquidity-wall", "es-liquidity-wall", "es-liquidity-voice"), replay.events(), "C0 is outside the replay window");
+        assertEquals(List.of("es-liquidity-wall", "es-liquidity-wall", "es-liquidity-voice"), replay.events(), "C0 is outside the replay window and C9 is ahead of the clock");
         assertEquals("BORN", replay.json(0).get("kind").asText());
         assertEquals("C1", replay.json(0).get("wall").get("clusterId").asText());
         assertEquals("RETIRED", replay.json(1).get("kind").asText());
