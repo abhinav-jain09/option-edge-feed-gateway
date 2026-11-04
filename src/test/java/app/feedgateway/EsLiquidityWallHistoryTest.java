@@ -47,12 +47,13 @@ class EsLiquidityWallHistoryTest {
                 .set("levels", List.of(EsLiquidityWallFixtures.level("BID", 30440L, 100L, 120L, "EATEN"), EsLiquidityWallFixtures.level("ASK", 30460L, 900L, 880L, "STABLE_WALL")))
                 .set("leanThousandths", -412).build());
         h.foldEvent(EsLiquidityWallFixtures.born(NOW, "C1"));
-        // window B: one DEGRADED bucket whose only level is INSUFFICIENT_DATA, a RETIRED and a FLIP
+        // window B: one DEGRADED bucket whose only level is INSUFFICIENT_DATA, a RETIRED, and a FLIP and a DEFENDED that section 8 does not project
         h.foldDashboard(EsLiquidityWallFixtures.dashboard(NOW + 1000, "DEGRADED")
                 .set("levels", List.of(EsLiquidityWallFixtures.level("BID", 30440L, 50L, 60L, "INSUFFICIENT_DATA"))).set("walls", List.of())
                 .set("spotTick", null).set("leanThousandths", null).set("sideRead", null).set("confirmedSide", null).set("layerBEnabled", false).build());
         h.foldEvent(EsLiquidityWallFixtures.retired(NOW + 1000, "C1", "BREACHED"));
         h.foldEvent(EsLiquidityWallFixtures.flip(NOW + 2000));
+        h.foldEvent(EsLiquidityWallFixtures.event(NOW + 3000, "DEFENDED").set("wall", EsLiquidityWallFixtures.eventWall("C1", "RESISTANCE", 30459L, 30461L, NOW)).build());
         // a frame of an older trade date is late and folds nothing
         h.foldDashboard(EsLiquidityWallFixtures.dashboard(NOW - 3 * 86_400_000L));
 
@@ -63,7 +64,8 @@ class EsLiquidityWallHistoryTest {
         assertEquals("SESSION_OPEN", v.get("coverage").asText());
         assertEquals(4, v.get("framesFolded").intValue());
         assertEquals(1, v.get("framesLate").intValue());
-        assertEquals(3, v.get("eventsFolded").intValue());
+        assertEquals(2, v.get("eventsFolded").intValue(), "BORN and RETIRED only");
+        assertEquals(2, v.get("eventsNotProjected").intValue(), "the FLIP and the DEFENDED stay on the live stream");
         assertEquals(2, v.get("minutes").size());
 
         JsonNode a = v.get("minutes").get(0);
@@ -110,12 +112,10 @@ class EsLiquidityWallHistoryTest {
         assertNull(b.get("confirmedSide"));
         assertEquals("INSUFFICIENT_DATA", b.get("levels").get(0).get("state").asText(), "INSUFFICIENT_DATA only when every bucket showed it");
         assertEquals(0, b.get("walls").size());
-        assertEquals(2, b.get("events").size());
+        assertEquals(1, b.get("events").size(), "the minute lists its BORN and RETIRED events only (section 8)");
         assertEquals("RETIRED", b.get("events").get(0).get("kind").asText());
         assertEquals("BREACHED", b.get("events").get(0).get("retireReason").asText());
-        assertEquals("FLIP", b.get("events").get(1).get("kind").asText());
-        assertEquals("FLIP_TO_DOWNSIDE", b.get("events").get(1).get("direction").asText());
-        assertNull(b.get("events").get(1).get("clusterId"), "a flip has no wall");
+        assertFalse(v.toString().contains("FLIP"), "no flip, defence or break event is projected");
         assertFalse(v.toString().contains("Added"), "the print-matched quantities are not on the dashboard record and are never invented");
     }
 

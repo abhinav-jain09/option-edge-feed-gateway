@@ -24,7 +24,8 @@ import org.apache.avro.generic.GenericRecord;
  * the bucket count, and the minute's state = the highest-precedence state (section 5's order) any of its buckets showed, with INSUFFICIENT_DATA only when
  * every bucket showed it. The minute carries measuredBuckets (LIVE quality) and missingBuckets (the others), quality DEGRADED when any bucket was, else the
  * worst by LIVE &lt; GAP &lt; STALE, the last spot, the lean's last, minimum and maximum (thousandths), the last side read and confirmed side, the walls live at
- * its end (the last frame's) and the events within it. Absent fields are elided and read as "not measured", never as zero.
+ * its end (the last frame's) and the BORN and RETIRED events within it (section 8 lists those two kinds only: a DEFENDED, BROKEN or FLIP event stays on the
+ * live {@code es-liquidity-wall} stream and is not projected). Absent fields are elided and read as "not measured", never as zero.
  * <p>
  * The print-matched quantities (Added, Decrease, Traded, Accounted, Unaccounted, Hidden, pull and refill counts) are not on the dashboard record: they are
  * folded from {@code futures.liquidity-wall.buckets} ({@link #foldBucket}), per level the row of the minute's LAST LIVE bucket (the classification window
@@ -83,7 +84,10 @@ final class EsLiquidityWallHistory {
         }
     }
 
-    record WallEvent(String kind, long bucketEnd, String clusterId, String lane, Long loTick, Long hiTick, String retireReason, String direction) {
+    /** The event kinds the projection lists (section 8). */
+    static final List<String> PROJECTED_EVENT_KINDS = List.of("BORN", "RETIRED");
+
+    record WallEvent(String kind, long bucketEnd, String clusterId, String lane, Long loTick, Long hiTick, String retireReason) {
     }
 
     static final class Minute {
@@ -124,6 +128,7 @@ final class EsLiquidityWallHistory {
     private long framesRefused;
     private long eventsFolded;
     private long eventsLate;
+    private long eventsNotProjected;
     private long bucketsFolded;
     private long bucketsLate;
     private long bucketsNotLive;
@@ -260,9 +265,14 @@ final class EsLiquidityWallHistory {
         }
     }
 
-    /** Folds a validated event record into the minute of its bucket end. */
+    /** Folds a validated BORN or RETIRED event into the minute of its bucket end; any other kind is counted and not projected. */
     synchronized void foldEvent(GenericRecord r) {
         try {
+            String kind = EsLiquidityWallJson.text(r.get("kind"));
+            if (!PROJECTED_EVENT_KINDS.contains(kind)) {
+                eventsNotProjected++;
+                return;
+            }
             long bucketEnd = (Long) r.get("bucketEnd");
             Minute m = minute(bucketEnd, r);
             if (m == null) {
@@ -272,16 +282,9 @@ final class EsLiquidityWallHistory {
             if (m.events.size() >= MAX_EVENTS) {
                 return;
             }
-            String kind = EsLiquidityWallJson.text(r.get("kind"));
-            GenericRecord wall = r.get("wall") instanceof GenericRecord w ? w : null;
-            GenericRecord flip = r.get("flip") instanceof GenericRecord f ? f : null;
-            m.events.add(new WallEvent(kind, bucketEnd,
-                    wall == null ? null : EsLiquidityWallJson.text(wall.get("clusterId")),
-                    wall == null ? null : EsLiquidityWallJson.text(wall.get("lane")),
-                    wall == null ? null : (Long) wall.get("loTick"),
-                    wall == null ? null : (Long) wall.get("hiTick"),
-                    r.get("retireReason") == null ? null : r.get("retireReason").toString(),
-                    flip == null ? null : EsLiquidityWallJson.text(flip.get("direction"))));
+            GenericRecord wall = (GenericRecord) r.get("wall");   // present on every wall event ({@link EsLiquidityWallJson#event} refused it otherwise)
+            m.events.add(new WallEvent(kind, bucketEnd, EsLiquidityWallJson.text(wall.get("clusterId")), EsLiquidityWallJson.text(wall.get("lane")),
+                    (Long) wall.get("loTick"), (Long) wall.get("hiTick"), r.get("retireReason") == null ? null : r.get("retireReason").toString()));
             eventsFolded++;
         } catch (RuntimeException invalid) {
             framesRefused++;
@@ -365,6 +368,7 @@ final class EsLiquidityWallHistory {
             g.writeNumberField("framesRefused", framesRefused);
             g.writeNumberField("eventsFolded", eventsFolded);
             g.writeNumberField("eventsLate", eventsLate);
+            g.writeNumberField("eventsNotProjected", eventsNotProjected);
             g.writeNumberField("bucketsFolded", bucketsFolded);
             g.writeNumberField("bucketsLate", bucketsLate);
             g.writeNumberField("bucketsNotLive", bucketsNotLive);
@@ -450,17 +454,12 @@ final class EsLiquidityWallHistory {
                     g.writeStartObject();
                     g.writeStringField("kind", e.kind());
                     g.writeNumberField("bucketEnd", e.bucketEnd());
-                    if (e.clusterId() != null) {
-                        g.writeStringField("clusterId", e.clusterId());
-                        g.writeStringField("lane", e.lane());
-                        g.writeNumberField("loTick", e.loTick());
-                        g.writeNumberField("hiTick", e.hiTick());
-                    }
+                    g.writeStringField("clusterId", e.clusterId());
+                    g.writeStringField("lane", e.lane());
+                    g.writeNumberField("loTick", e.loTick());
+                    g.writeNumberField("hiTick", e.hiTick());
                     if (e.retireReason() != null) {
                         g.writeStringField("retireReason", e.retireReason());
-                    }
-                    if (e.direction() != null) {
-                        g.writeStringField("direction", e.direction());
                     }
                     g.writeEndObject();
                 }
