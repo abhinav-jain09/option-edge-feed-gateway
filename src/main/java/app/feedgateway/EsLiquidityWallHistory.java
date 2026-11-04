@@ -298,6 +298,10 @@ final class EsLiquidityWallHistory {
             tradeDate = date;
             minutes.clear();
             lastBucketEnd = 0;
+            // every dashboard-derived session identity goes with the minutes: a bucket row or an event may be the new session's first record (the topics are
+            // polled independently), and the body must not report the new trade date with the previous session's contract or depth environment
+            contract = null;
+            depthEnvironment = null;
         } else if (date.isBefore(tradeDate)) {
             return null;
         }

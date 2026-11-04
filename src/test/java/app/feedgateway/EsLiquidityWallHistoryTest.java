@@ -173,4 +173,25 @@ class EsLiquidityWallHistoryTest {
         assertEquals(1, h.minuteCount());
         assertEquals(EsLiquidityWallHistory.tradeDate(NOW).plusDays(1), h.tradeDate());
     }
+
+    /** The new session's first record may be an event or a bucket row: the previous session's contract and depth environment never label the new trade date. */
+    @Test
+    void anEventFirstRolloverCarriesNoPreviousSessionIdentity() throws Exception {
+        EsLiquidityWallHistory h = new EsLiquidityWallHistory();
+        h.foldDashboard(EsLiquidityWallFixtures.dashboard(NOW));
+        com.fasterxml.jackson.databind.JsonNode before = new com.fasterxml.jackson.databind.ObjectMapper().readTree(h.render(NOW + 1));
+        assertEquals("ESZ6", before.get("contract").asText());
+        assertEquals("Rithmic Test", before.get("depthEnvironment").asText());
+        long nextSession = EsLiquidityWallHistory.sessionStartMs(EsLiquidityWallHistory.tradeDate(NOW).plusDays(1)) + 1000;
+        h.foldEvent(EsLiquidityWallFixtures.event(nextSession, "BORN").build());
+        com.fasterxml.jackson.databind.JsonNode after = new com.fasterxml.jackson.databind.ObjectMapper().readTree(h.render(nextSession + 1));
+        assertEquals(EsLiquidityWallHistory.tradeDate(NOW).plusDays(1).toString(), after.get("tradeDate").asText());
+        assertTrue(after.get("contract").isNull(), "no dashboard frame of the new session yet: no contract");
+        assertTrue(after.get("depthEnvironment").isNull(), "no dashboard frame of the new session yet: no depth environment");
+        assertEquals(1, after.get("minutes").size());
+        // the next dashboard frame of the new session labels it again
+        h.foldDashboard(EsLiquidityWallFixtures.dashboard(nextSession + 1000));
+        com.fasterxml.jackson.databind.JsonNode labelled = new com.fasterxml.jackson.databind.ObjectMapper().readTree(h.render(nextSession + 2000));
+        assertEquals("ESZ6", labelled.get("contract").asText());
+    }
 }
