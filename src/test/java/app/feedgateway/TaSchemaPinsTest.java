@@ -27,6 +27,8 @@ class TaSchemaPinsTest {
             "FlowBar", "ee5260efdf2f48bcc7bcc4e4f712e2f8f1cf2d086ae404a2f4ae20dbaa83f8f1",
             "GeometryAnnotationSet", "4263cc10c517fcf92989fbf773f5e208a2be37fe7dd2f181c4146d73a9baad3c",
             "GeometryUnavailable", "15dd96c7d3e97e62e029b67689ba4a53a471002cb32d19c13751fb5e39c91e46",
+            "PatternAlertEvent", "0dc50508517917474977da1149d2fc55a6633b623fc3d7c6adb36eb752d2eab7",
+            "PatternAlertWatermark", "64584e22b900cea01689cdbf83c0ebba13f42c82994042e5e9fd52f986c2ca56",
             "PatternAnnotationSet", "71f68ef6858c5bce3db89217b162d43541a945de3c77f8048333b1969493be28",
             "PatternUnavailable", "4600ad015dfb74d463ba95a9c09bad424fda27d277829ba8c5b1479d2beb3813",
             "PfBreakEvent", "6227ed2f980e92486949f6289ae15152b83abecef9574872ae23aa81dc288d00",

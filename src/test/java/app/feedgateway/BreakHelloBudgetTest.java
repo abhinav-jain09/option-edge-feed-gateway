@@ -17,7 +17,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 
 /**
- * The hello with every relay on and the break-classification part last in the priority order (studies, geometry, tools, waves, trade tools, breaks). Sizes are measured with the records the
+ * The hello with every relay on and the break-classification part last in the priority order (studies, then the alerts part when GATEWAY_PATTERN_ALERTS_ENABLED is on, geometry, tools, waves, trade tools, breaks). Sizes are measured with the records the
  * REAL producer wrote (producer-records.jsonl), the largest mark being 1 927 bytes of frame JSON: a day of real records, a busy day, and the type-maximal 64 marks and 64 outcomes of every timeframe.
  */
 class BreakHelloBudgetTest {
@@ -135,6 +135,29 @@ class BreakHelloBudgetTest {
         }
         assertTrue(bytes(part.toString()) <= PART, "the breaks part is held under its own cap");
         System.out.println("BREAK-HELLO worst case, every part at its cap: hello " + bytes(hello) + " bytes (hard guard " + FeedGatewayService.HELLO_FRAME_HARD_BYTES + "), without breaks " + bytes(plainHello()) + ", breaks field " + bytes(part.toString()) + " bytes, 1m " + (part.get("1m").isNull() ? "null" : "present") + ", 5m " + (part.get("5m").isNull() ? "null" : "present"));
+    }
+
+    @Test
+    void withTheAlertsPartFirstTheBreaksPartIsStillLastAndTheHelloStaysUnderTheGuard() throws Exception {
+        GatewaySettings settings = spy(new GatewaySettings());
+        doReturn(true).when(settings).studiesEnabled();
+        doReturn(true).when(settings).geometryEnabled();
+        doReturn(true).when(settings).structureToolsEnabled();
+        doReturn(true).when(settings).waveCycleEnabled();
+        doReturn(true).when(settings).tradeToolsEnabled();
+        doReturn(true).when(settings).breakClassificationEnabled();
+        doReturn(true).when(settings).patternAlertsEnabled();
+        var s = new FeedGatewayService(settings, JSON, new HpsfGatewayViewMapper(), null);
+        ChartHelloBudgetTest.fillAlerts(s);
+        ChartHelloBudgetTest.fill(s, 8, 11_000, 190_000, 4, 50_000);
+        fillBreaks(breaks(s), BreakClassificationRelay.MARKS_PER_TF);
+        String hello = s.cvdHelloJson();
+        assertTrue(bytes(hello) <= FeedGatewayService.HELLO_FRAME_HARD_BYTES, "the hello is " + bytes(hello) + " bytes");
+        assertTrue(hello.indexOf("\"alerts\":") < hello.indexOf("\"geometry\":") && hello.indexOf("\"tradeTools\":") < hello.indexOf("\"breaks\":"), "alerts first, breaks last");
+        JsonNode node = JSON.readTree(hello);
+        assertTrue(bytes(node.get("alerts").toString()) <= PatternAlertRelay.HELLO_PART_BYTES + 512);
+        assertTrue(bytes(node.get("breaks").toString()) <= PART, "the breaks part keeps its own cap");
+        assertEquals(hello, s.cvdHelloJson(), "deterministic");
     }
 
     private static String plainHello() {

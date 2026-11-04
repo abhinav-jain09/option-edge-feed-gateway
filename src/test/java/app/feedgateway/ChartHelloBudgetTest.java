@@ -18,6 +18,9 @@ import org.junit.jupiter.api.Test;
  * The hello with every relay on: the five relay parts (studies, geometry, tools, waves, trade tools) share what the fixed fields leave of
  * the 1 MiB guard. Worst case = every part at its own cap (512 + 384 + 384 + 384 + 512 KiB = 2 176 KiB of content): the arbitration trims
  * by priority (studies, geometry, tools, waves, trade tools), each part by its own rule, and the hello stays under the guard.
+ * <p>
+ * The server-side pattern break alerts part (flag GATEWAY_PATTERN_ALERTS_ENABLED, off by default and absent from every test above) is the FIRST chart relay part: after the studies and before
+ * the geometry, held under min(budget, 96 KiB). {@link #theAlertsPartIsTheFirstChartPartAtItsOwnCapAndTheOthersTrimAfterItUnderTheGuard} pins that placement with every part at its cap.
  */
 class ChartHelloBudgetTest {
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -110,6 +113,62 @@ class ChartHelloBudgetTest {
         assertTrue(studiesBytes > StudiesRelay.HELLO_MAX_BYTES * 0.7 && studiesBytes <= StudiesRelay.HELLO_MAX_BYTES, "the studies really fill their share: " + studiesBytes + " bytes");
         assertNotEquals(0, bytesOf(node, "studies"));
         assertFalse(node.get("studies").get("5m").isNull(), "the studies' current states are never traded for a newer layer");
+    }
+
+    private static FeedGatewayService serviceWithAlerts() {
+        GatewaySettings settings = spy(new GatewaySettings());
+        doReturn(true).when(settings).studiesEnabled();
+        doReturn(true).when(settings).geometryEnabled();
+        doReturn(true).when(settings).structureToolsEnabled();
+        doReturn(true).when(settings).waveCycleEnabled();
+        doReturn(true).when(settings).tradeToolsEnabled();
+        doReturn(true).when(settings).patternAlertsEnabled();
+        return new FeedGatewayService(settings, JSON, new HpsfGatewayViewMapper(), null);
+    }
+
+    /** Both profiles at the retention bound with records near the record bound, so the alerts part is cut to its own 96 KiB. */
+    static void fillAlerts(FeedGatewayService s) {
+        PatternAlertRelay alerts = (PatternAlertRelay) s.taRelaysForTest().get(0);
+        alerts.beginRecovery();
+        alerts.promote();
+        for (String event : List.of(PatternAlertRelay.REGULAR_EVENT, PatternAlertRelay.ESTIMATE_EVENT)) {
+            for (int i = 1; i <= 256; i++) {
+                GenericRecord e = PatternAlertFixtures.numbered(PatternAlertFixtures.DATE, i, i % 3 == 0 ? "SUPPRESSED_STALE" : "RAISED", 100 + i);
+                PatternAlertFixtures.with(e, "tip", "t".repeat(2_000));
+                alerts.onLive(event, e);
+            }
+        }
+    }
+
+    @Test
+    void theAlertsPartIsTheFirstChartPartAtItsOwnCapAndTheOthersTrimAfterItUnderTheGuard() throws Exception {
+        var s = serviceWithAlerts();
+        assertTrue(s.taRelaysForTest().get(0) instanceof PatternAlertRelay, "the first relay");
+        fillAlerts(s);
+        fill(s, 8, 11_000, 190_000, 4, 50_000);
+        String hello = s.cvdHelloJson();
+        assertTrue(bytes(hello) <= FeedGatewayService.HELLO_FRAME_HARD_BYTES, "the hello is " + bytes(hello) + " bytes");
+        JsonNode node = JSON.readTree(hello);
+        JsonNode alerts = node.get("alerts");
+        long alertBytes = bytes(alerts.toString());
+        assertTrue(alertBytes <= PatternAlertRelay.HELLO_PART_BYTES + 512 && alertBytes > PatternAlertRelay.HELLO_PART_BYTES / 2, "the alerts part is cut at its own 96 KiB, not by the others: " + alertBytes);
+        assertTrue(hello.indexOf("\"esStudyBars\":") < hello.indexOf("\"alerts\":") && hello.indexOf("\"alerts\":") < hello.indexOf("\"geometry\":") && hello.indexOf("\"geometry\":") < hello.indexOf("\"tools\":"),
+                "after the studies, before the geometry, then the existing order");
+        var plain = service(true);
+        fill(plain, 8, 11_000, 190_000, 4, 50_000);
+        JsonNode without = JSON.readTree(plain.cvdHelloJson());
+        for (String field : List.of("studies", "studyBars", "esStudies", "esStudyBars")) {
+            assertEquals(without.get(field), node.get(field), field + " is placed before the alerts part and does not depend on it");
+        }
+        assertTrue(alertBytes + bytesOf(node, "geometry") + bytesOf(node, "tools") + bytesOf(node, "waves") + bytesOf(node, "tradeTools") <= bytes(hello), "sanity: the parts add up inside the hello");
+        for (String field : List.of("geometry", "tools", "waves", "tradeTools")) {
+            boolean ended = false;
+            for (String tf : List.of("1m", "5m", "15m")) {
+                boolean none = node.get(field).get(tf).isNull();
+                assertFalse(ended && !none, field + " " + tf + " follows a null");
+                ended |= none;
+            }
+        }
     }
 
     private String fillAndHello(boolean tradeTools) {
