@@ -58,3 +58,13 @@ AUDIT_NOT_SERIALISED	src/main/java/app/feedgateway/PatternAlertAudit.java	new Se
 AUDIT_UNREADABLE_AS_EMPTY	src/main/java/app/feedgateway/PatternAlertAudit.java	scan.error = "the topic " + topic + " does not exist";	
 AUDIT_DEADLINE_EXTENDED	src/main/java/app/feedgateway/PatternAlertAudit.java	long deadline = clock.getAsLong() + settings.patternAlertsAuditTimeoutMs();	long deadline = clock.getAsLong() + 100 * settings.patternAlertsAuditTimeoutMs();
 AUDIT_OUTSIDE_RETENTION_AS_EMPTY	src/main/java/app/feedgateway/PatternAlertAudit.java	dateEndMs < clock.getAsLong() - settings.patternAlertsRetentionMs() || 	false || 
+AUDIT_SECURITY_NOT_APPLIED	src/main/java/app/feedgateway/PatternAlertAudit.java	settings.applyKafkaSecurity(p);   // TLS/SASL	// TLS/SASL
+AUDIT_RETAINED_BUDGET_IGNORED	src/main/java/app/feedgateway/PatternAlertAudit.java	if (scan.retainedBytes > retainedMax) {	if (false) {
+AUDIT_EVENT_SEQ_UNCHECKED	src/main/java/app/feedgateway/PatternAlertAudit.java	!DATE.matcher(date).matches() || seq <= 0 || tf < 0	!DATE.matcher(date).matches() || tf < 0
+AUDIT_EVENT_SERVICE_UNCHECKED	src/main/java/app/feedgateway/PatternAlertAudit.java	 || !SERVICE.equals(String.valueOf(r.get("service"))) || !DATE.matcher(date).matches() || seq <= 0	 || !DATE.matcher(date).matches() || seq <= 0
+AUDIT_UNKNOWN_DISPOSITION_ACCEPTED	src/main/java/app/feedgateway/PatternAlertAudit.java	 || "UNKNOWN".equals(disposition)	
+AUDIT_OVERSIZE_RETAINED	src/main/java/app/feedgateway/PatternAlertAudit.java	AvroFrameJson.render(r, EVENT_MAX_CHARS, false)	AvroFrameJson.render(r, Integer.MAX_VALUE, false)
+AUDIT_OVERSIZE_NOT_COUNTED	src/main/java/app/feedgateway/PatternAlertAudit.java	scan.oversize++;   // too large to hold	// too large to hold
+AUDIT_WATERMARK_UNVALIDATED	src/main/java/app/feedgateway/PatternAlertAudit.java	 || decision < 0 || previous < -1 || previous >= decision	
+AUDIT_OTHER_DISPOSITIONS_LOST	src/main/java/app/feedgateway/PatternAlertAudit.java	.append(events.size() - known)	.append(0)
+AUDIT_ALL_REJECTED_AS_EMPTY	src/main/java/app/feedgateway/PatternAlertAudit.java	scan.undecodable + scan.invalid + scan.oversize > 0) {\n                scan.error = "no usable record: " + (scan.undecodable + scan.invalid + scan.oversize) + " records of the topic were rejected";\n            }\n            if (scan.error != null) {\n                return unreadable(p, null,	false) {\n                scan.error = "no usable record: " + (scan.undecodable + scan.invalid + scan.oversize) + " records of the topic were rejected";\n            }\n            if (scan.error != null) {\n                return unreadable(p, null,

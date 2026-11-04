@@ -73,7 +73,7 @@ final class PatternAlertAudit {
     record Response(int status, String body) {
     }
 
-    private record Ev(String date, long seq, String disposition, String tf, String json) {
+    record Ev(String date, long seq, String disposition, String tf, String json) {
     }
 
     private record Wm(String date, int tf, int decision, int previous, long asOfMs, boolean evaluated) {
@@ -476,7 +476,7 @@ final class PatternAlertAudit {
         return sb.append('}').toString();
     }
 
-    private static String counts(List<Ev> events) {
+    static String counts(List<Ev> events) {
         Map<String, Integer> n = new TreeMap<>();
         for (String d : DISPOSITIONS) {
             n.put(d, 0);

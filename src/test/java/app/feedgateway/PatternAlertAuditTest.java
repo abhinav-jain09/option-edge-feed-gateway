@@ -438,13 +438,13 @@ class PatternAlertAuditTest {
     }
 
     @Test
-    void anUnknownButWellFormedDispositionIsKeptAndCountedAsOther() {
-        Rig rig = new Rig(TOPIC);
-        rig.watermarks(DATE, 1);
-        rig.put(PatternAlertFixtures.triangleBreak(1, "RAISED"));
-        JsonNode r = json(rig.audit().byDate("regular", DATE, null, null));
-        assertEquals(0, r.get("counts").get("OTHER").asInt());
-        assertEquals(1, r.get("counts").get("RAISED").asInt());
+    void aLaterAdditiveDispositionIsCountedAsOtherNeverLost() throws Exception {
+        List<PatternAlertAudit.Ev> events = List.of(new PatternAlertAudit.Ev(DATE, 1, "RAISED", "1m", "{}"), new PatternAlertAudit.Ev(DATE, 2, "SUPPRESSED_NEW_REASON", "1m", "{}"),
+                new PatternAlertAudit.Ev(DATE, 3, "SUPPRESSED_STALE", "1m", "{}"));
+        JsonNode c = JSON.readTree(PatternAlertAudit.counts(events));
+        assertEquals(1, c.get("RAISED").asInt());
+        assertEquals(1, c.get("SUPPRESSED_STALE").asInt());
+        assertEquals(1, c.get("OTHER").asInt());
     }
 
     @Test
