@@ -171,10 +171,11 @@ public final class GatewaySettings {
     }
 
     /**
-     * Whether the relay reads the dashboard topic from the current trade date's session open (18:00 ET of the previous day) on start, so the
-     * 60-second projection covers the session so far; off = read from the latest record and the projection starts at relay start. The dashboard is one
-     * partition, one key, compacted: a day is at most 86,400 frames. The buckets topic is read from the same instant and is band-size times larger (one
-     * record per bucket x side x level, delete retention 1 day), which is the bound of that read.
+     * Whether the relay reads the two RETAINED topics, {@code futures.liquidity-wall.buckets} (delete, 1 day; one record per bucket x side x level, so
+     * band-size x 86,400 records a day at most) and {@code futures.liquidity-wall.events} (delete under a byte cap), from the current trade date's session
+     * open (18:00 ET of the previous day) on start, so the 60-second projection's sizes, states, bucket counts and walls cover the session so far; off =
+     * both from the latest record. The dashboard topic is compacted under one key and is ALWAYS read from the latest record: its part of the projection
+     * covers the relay's uptime only, whatever this setting says.
      */
     public boolean esLiquidityWallHistoryFromSessionOpen() {
         return boolValue("ES_LIQUIDITY_WALL_HISTORY_FROM_SESSION_OPEN", true);

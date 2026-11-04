@@ -36,15 +36,19 @@ import org.springframework.stereotype.Component;
  * <ul>
  * <li>Dashboard: the latest frame is cached and broadcast while it is within {@link GatewaySettings#esLiquidityWallFreshMs()} of its bucket end; an older
  * frame (a boot read from the session open, a backlog) is folded into the projection and never shown as live, like {@code liquidity-heatmap}.</li>
- * <li>Events: every record is forwarded; the last {@link GatewaySettings#esLiquidityWallEventRing()} are kept and a connecting socket receives those whose
- * bucket end is within {@link GatewaySettings#esLiquidityWallEventReplayMs()} of now, in log order.</li>
+ * <li>Events: read from the session open (the retained audit trail, which reconstructs the projection's walls); a record is forwarded live only while its
+ * bucket end is within {@link GatewaySettings#esLiquidityWallEventReplayMs()} of now (a boot catch-up is folded and ringed, never broadcast as live); the
+ * last {@link GatewaySettings#esLiquidityWallEventRing()} are kept and a connecting socket receives those within the same window, in log order.</li>
  * <li>Voice: forwarded and cached as the last value, each delivery carrying {@code stale} = older than {@link GatewaySettings#esLiquidityWallVoiceFreshMs()}
  * from the bucket end (section 7b: the page speaks only a fresh record that arrived live).</li>
- * <li>Buckets: never forwarded; the LIVE rows feed the projection's classification-window quantities.</li>
+ * <li>Buckets: never forwarded; read from the session open, the retained source of the projection's per-level sizes, states, bucket counts and
+ * classification-window quantities.</li>
  * </ul>
  * Every frame a connect replay sends carries {@code "cached":true} and every live forward {@code "cached":false}, so the page tells the two apart without a
- * timer. The dashboard and buckets reads start at the current trade date's session open (18:00 ET of the previous day, {@code offsetsForTimes}) when
- * {@link GatewaySettings#esLiquidityWallHistoryFromSessionOpen()}, else at the latest record; events and voice start at the latest record. After a consumer
+ * timer. The dashboard topic is COMPACTED under one key, so a read from the session open could only ever recover the surviving latest frame: it is read from
+ * the latest record, always, and the projection reports its dashboard-derived coverage as SINCE_START from the instant the read began. The buckets and events
+ * reads start at the current trade date's session open (18:00 ET of the previous day, {@code offsetsForTimes}) when
+ * {@link GatewaySettings#esLiquidityWallHistoryFromSessionOpen()}, else at the latest record; the voice read starts at the latest record. After a consumer
  * failure the read resumes at the next unread offset of each partition, so no record is folded twice within one gateway life. Disabled
  * ({@code ES_LIQUIDITY_WALL_RELAY_ENABLED=false}, the default): no thread, no consumer, nothing cached, the history endpoint answers 404.
  */
@@ -73,6 +77,7 @@ final class EsLiquidityWallRelay {
     private final AtomicLong drops = new AtomicLong();
     private final AtomicLong undecodable = new AtomicLong();
     private final AtomicLong staleFrames = new AtomicLong();
+    private final AtomicLong staleEvents = new AtomicLong();
     private final AtomicLong consumerFailures = new AtomicLong();
     private final ArrayDeque<Cached> wallRing = new ArrayDeque<>();
     private Cached dashboard;
@@ -154,10 +159,13 @@ final class EsLiquidityWallRelay {
                     Long resume = resumeAt.get(tp);
                     if (resume != null) {
                         c.seek(tp, resume);
-                    } else if (tp.equals(dashboardPartition) || tp.equals(bucketsPartition)) {
-                        seekFromSessionOpen(c, tp, tp.equals(dashboardPartition));
+                    } else if (tp.equals(bucketsPartition) || tp.equals(eventsPartition)) {
+                        seekFromSessionOpen(c, tp, tp.equals(bucketsPartition));
                     } else {
-                        c.seekToEnd(List.of(tp));
+                        c.seekToEnd(List.of(tp));   // the compacted dashboard (its history is one surviving frame) and the voice: latest only
+                        if (tp.equals(dashboardPartition)) {
+                            history.dashboardCoverageFrom(System.currentTimeMillis());
+                        }
                     }
                 }
                 while (running.get()) {
@@ -195,7 +203,8 @@ final class EsLiquidityWallRelay {
         return new TopicPartition(topic, 0);
     }
 
-    private void seekFromSessionOpen(KafkaConsumer<String, byte[]> c, TopicPartition tp, boolean dashboard) {
+    /** The two retained reads (buckets, events): from the session open when the setting says so and the broker finds an offset for it, else from the latest record. */
+    private void seekFromSessionOpen(KafkaConsumer<String, byte[]> c, TopicPartition tp, boolean buckets) {
         long now = System.currentTimeMillis();
         if (settings.esLiquidityWallHistoryFromSessionOpen()) {
             LocalDate tradeDate = EsLiquidityWallHistory.tradeDate(now);
@@ -204,19 +213,19 @@ final class EsLiquidityWallRelay {
             OffsetAndTimestamp at = found == null ? null : found.get(tp);
             if (at != null) {
                 c.seek(tp, at.offset());
-                origin(dashboard, "SESSION_OPEN", from);
+                origin(buckets, "SESSION_OPEN", from);
                 return;
             }
         }
         c.seekToEnd(List.of(tp));
-        origin(dashboard, "LATEST", now);
+        origin(buckets, "LATEST", now);
     }
 
-    private void origin(boolean dashboard, String origin, long from) {
-        if (dashboard) {
-            history.seekOrigin(origin, from);
-        } else {
+    private void origin(boolean buckets, String origin, long from) {
+        if (buckets) {
             history.bucketsSeekOrigin(origin, from);
+        } else {
+            history.eventsSeekOrigin(origin, from);
         }
     }
 
@@ -288,11 +297,16 @@ final class EsLiquidityWallRelay {
                 return;
             }
             GenericRecord r = (GenericRecord) decoded;
+            long bucketEnd = (Long) r.get("bucketEnd");
             history.foldEvent(r);
             lane.accepted.incrementAndGet();
-            wallRing.addLast(new Cached(json, (Long) r.get("bucketEnd")));
+            wallRing.addLast(new Cached(json, bucketEnd));
             while (wallRing.size() > settings.esLiquidityWallEventRing()) {
                 wallRing.removeFirst();
+            }
+            if (now - bucketEnd > settings.esLiquidityWallEventReplayMs()) {
+                staleEvents.incrementAndGet();   // the session-open catch-up: folded and ringed, never broadcast as if it had just happened
+                return;
             }
             sink.accept(WALL_EVENT, EsLiquidityWallJson.withCached(json, false));
         } else if (subject == LiquidityWallSchemas.VOICE) {
@@ -363,6 +377,8 @@ final class EsLiquidityWallRelay {
         }
         sb.append("# HELP ").append(p).append("stale_frames_total Dashboard records folded but not broadcast because their bucket end was outside the freshness bound.\n# TYPE ").append(p)
                 .append("stale_frames_total counter\n").append(p).append("stale_frames_total ").append(staleFrames.get()).append('\n');
+        sb.append("# HELP ").append(p).append("stale_events_total Event records folded and ringed but not broadcast because their bucket end was outside the replay window (the boot catch-up).\n# TYPE ").append(p)
+                .append("stale_events_total counter\n").append(p).append("stale_events_total ").append(staleEvents.get()).append('\n');
         sb.append("# HELP ").append(p).append("drops_total Records refused at the gateway boundary (foreign topic, tombstone, wrong record, key, version, oversize).\n# TYPE ").append(p)
                 .append("drops_total counter\n").append(p).append("drops_total ").append(drops.get()).append('\n');
         sb.append("# HELP ").append(p).append("undecodable_total Framed values the registry could not decode (unknown id, corrupt body).\n# TYPE ").append(p)
@@ -380,6 +396,10 @@ final class EsLiquidityWallRelay {
 
     long staleFramesForTest() {
         return staleFrames.get();
+    }
+
+    long staleEventsForTest() {
+        return staleEvents.get();
     }
 
     long schemaIdRefusedForTest(LiquidityWallSchemas.Subject subject) {
