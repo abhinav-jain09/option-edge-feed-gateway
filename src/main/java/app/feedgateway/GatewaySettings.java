@@ -108,6 +108,79 @@ public final class GatewaySettings {
 
     public boolean rithmicDepthEnabled() {return boolValue("GATEWAY_RITHMIC_DEPTH_ENABLED",false);}
 
+    // ---- ES book liquidity walls (es-liquidity-wall-service; ES Book Liquidity Walls Requirements rev 11 section 8 "Gateway and page") ----
+
+    /**
+     * Master switch of the ES liquidity-wall relay: the three topics below are consumed, the events {@code es-liquidity-heatmap},
+     * {@code es-liquidity-wall} and {@code es-liquidity-voice} are broadcast and {@code /api/es-liquidity-history} answers. OFF by default
+     * (the topics exist on dev only); when off nothing is consumed and the endpoint answers 404.
+     */
+    public boolean esLiquidityWallRelayEnabled() {
+        return boolValue("ES_LIQUIDITY_WALL_RELAY_ENABLED", false);
+    }
+
+    /** futures.liquidity-wall.dashboard ({@code LiquidityWallDashboard}, fixed schema id 3403): the per-bucket frame, compact, latest. */
+    public String esLiquidityWallDashboardTopic() {
+        return value("ES_LIQUIDITY_WALL_DASHBOARD_TOPIC", "futures.liquidity-wall.dashboard");
+    }
+
+    /** futures.liquidity-wall.events ({@code LiquidityWallEvent}, fixed schema id 3404): wall lifecycle changes and flips. */
+    public String esLiquidityWallEventsTopic() {
+        return value("ES_LIQUIDITY_WALL_EVENTS_TOPIC", "futures.liquidity-wall.events");
+    }
+
+    /** futures.liquidity-wall.voice ({@code LiquidityWallVoice}, fixed schema id 3407): the spoken flip, compact, latest. */
+    public String esLiquidityWallVoiceTopic() {
+        return value("ES_LIQUIDITY_WALL_VOICE_TOPIC", "futures.liquidity-wall.voice");
+    }
+
+    /**
+     * futures.liquidity-wall.buckets ({@code LiquidityWallBucket}, fixed schema id 3402, key {@code <side>|<tick>}, delete retention 1 day): one record per
+     * bucket x side x level, the only carrier of the classification-window quantities (Added, Decrease, Traded, Accounted, Unaccounted, Hidden, pull and
+     * refill counts) the 60-second projection folds per level as of the minute's last LIVE bucket (section 8). Never relayed to a socket.
+     */
+    public String esLiquidityWallBucketsTopic() {
+        return value("ES_LIQUIDITY_WALL_BUCKETS_TOPIC", "futures.liquidity-wall.buckets");
+    }
+
+    /** The connect replay of {@code es-liquidity-wall} carries only the ring's events whose bucket end is within this window of now. Default 15 minutes. */
+    public long esLiquidityWallEventReplayMs() {
+        return longValue("ES_LIQUIDITY_WALL_EVENT_REPLAY_MS", 900_000L, 0L);
+    }
+
+    /**
+     * Freshness bound of a dashboard frame, measured from its {@code bucketEnd}: a frame older than this is folded into the session
+     * projection but neither broadcast nor replayed to a connecting socket (the {@link #liquidityHeatmapTtlMs()} rule for the options page:
+     * a minutes-old "latest column" must never render as live liquidity). Default 5 s = a few 1-second buckets plus grace.
+     */
+    public long esLiquidityWallFreshMs() {
+        return longValue("ES_LIQUIDITY_WALL_FRESH_MS", 5_000L, 0L);
+    }
+
+    /**
+     * Section 7b: the voice record's freshness bound from its bucket end, beyond which the gateway still delivers it, marked {@code stale}
+     * (the page speaks only a fresh record that arrived live). Starting value 15,000.
+     */
+    public long esLiquidityWallVoiceFreshMs() {
+        return longValue("ES_LIQUIDITY_WALL_VOICE_FRESH_MS", 15_000L, 0L);
+    }
+
+    /** How many recent event records ({@code es-liquidity-wall}) a connecting socket receives. */
+    public int esLiquidityWallEventRing() {
+        return intValue("ES_LIQUIDITY_WALL_EVENT_RING", 256, 1);
+    }
+
+    /**
+     * Whether the relay reads the two RETAINED topics, {@code futures.liquidity-wall.buckets} (delete, 1 day; one record per bucket x side x level, so
+     * band-size x 86,400 records a day at most) and {@code futures.liquidity-wall.events} (delete under a byte cap), from the current trade date's session
+     * open (18:00 ET of the previous day) on start, so the 60-second projection's sizes, states, bucket counts and walls cover the session so far; off =
+     * both from the latest record. The dashboard topic is compacted under one key and is ALWAYS read from the latest record: its part of the projection
+     * covers the relay's uptime only, whatever this setting says.
+     */
+    public boolean esLiquidityWallHistoryFromSessionOpen() {
+        return boolValue("ES_LIQUIDITY_WALL_HISTORY_FROM_SESSION_OPEN", true);
+    }
+
     public String bootstrapServers() {
         return value("KAFKA_BOOTSTRAP_SERVERS", DEFAULT_BOOTSTRAP_SERVERS);
     }
