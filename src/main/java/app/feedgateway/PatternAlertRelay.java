@@ -56,6 +56,8 @@ final class PatternAlertRelay extends TaRelay {
     private static final String SELF_CHECK = "SUPPRESSED_SELF_CHECK";
     private static final Pattern DATE = Pattern.compile("\\d{4}-\\d{2}-\\d{2}");
     private static final String[] TF_ENUM = {"TF_1M", "TF_5M", "TF_15M"};
+    /** The closed vocabulary of an event's kind: a later additive symbol is not relayed until this relay knows it. */
+    private static final String[] KINDS = {"BREAK", "RETURN", "FAILED"};
     private static final ObjectMapper JSON = new ObjectMapper();
 
     /** One retained event: the compact form always, the full record while it is among the newest {@link #FULL_RAISED_MAX} RAISED. */
@@ -249,7 +251,7 @@ final class PatternAlertRelay extends TaRelay {
             String disposition = String.valueOf(r.get("disposition"));
             String timeframe = String.valueOf(r.get("timeframe"));
             int tfSlot = indexOf(TF_ENUM, timeframe);
-            if (!DATE.matcher(date).matches() || seq <= 0 || UNKNOWN.equals(kind) || UNKNOWN.equals(disposition) || tfSlot < 0) {
+            if (!DATE.matcher(date).matches() || seq <= 0 || indexOf(KINDS, kind) < 0 || UNKNOWN.equals(disposition) || tfSlot < 0) {
                 onDrop();
                 return null;
             }

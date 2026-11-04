@@ -72,6 +72,12 @@ class PatternAlertAuditTest {
         }
 
         @Override
+        public Map<TopicPartition, OffsetAndTimestamp> offsetsForTimes(Map<TopicPartition, Long> search, java.time.Duration timeout) {
+            assertTrue(timeout.toMillis() >= 1 && timeout.toMillis() <= 10_000, "every Kafka call is bounded by what is left of the read's bound (10 s at most here): " + timeout);
+            return offsetsForTimes(search);
+        }
+
+        @Override
         public Map<TopicPartition, OffsetAndTimestamp> offsetsForTimes(Map<TopicPartition, Long> search) {
             Map<TopicPartition, OffsetAndTimestamp> out = new HashMap<>();
             for (Map.Entry<TopicPartition, Long> e : search.entrySet()) {
@@ -273,6 +279,7 @@ class PatternAlertAuditTest {
         PatternAlertAudit.Response gone = missing.audit().byDate("regular", DATE, null, null);
         assertEquals(503, gone.status());
         assertEquals("UNREADABLE", json(gone).get("status").asText());
+        assertEquals("{\"undecodable\":0,\"invalid\":0,\"oversize\":0}", json(gone).get("rejected").toString(), "an unreadable answer states what was rejected too");
         assertTrue(json(gone).get("error").asText().contains("does not exist"));
         // a read that never reaches the end offsets within the bound
         Rig stuck = new Rig(TOPIC);
@@ -414,12 +421,13 @@ class PatternAlertAuditTest {
     @Test
     void aTopicWhereNothingIsUsableIsUnreadableAndAZeroRejectedBlockIsAlwaysThere() {
         Rig bad = new Rig(TOPIC);
-        bad.putRaw(new byte[] {1}, 1L);
+        bad.putRaw(new byte[] {1}, PatternAlertFixtures.barEnd(10));
         bad.put(PatternAlertFixtures.with(PatternAlertFixtures.numbered(DATE, 1, "RAISED", 70), "schemaVersion", 2));
         PatternAlertAudit.Response r = bad.audit().byDate("regular", DATE, null, null);
         assertEquals(503, r.status());
         assertEquals("UNREADABLE", json(r).get("status").asText());
         assertTrue(json(r).get("error").asText().contains("rejected"));
+        assertEquals("{\"undecodable\":1,\"invalid\":1,\"oversize\":0}", json(r).get("rejected").toString());
         assertEquals(503, bad.audit.byDays("regular", "7", null).status());
         JsonNode ok = json(threeEvents().audit().byDays("regular", "7", null));
         assertEquals("{\"undecodable\":0,\"invalid\":0,\"oversize\":0}", ok.get("rejected").toString());

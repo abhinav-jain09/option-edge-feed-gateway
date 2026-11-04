@@ -178,7 +178,7 @@ final class PatternAlertAudit {
                 scan.error = "no usable record: " + (scan.undecodable + scan.invalid + scan.oversize) + " records of the topic were rejected";
             }
             if (scan.error != null) {
-                return unreadable(p, null, scan.error);
+                return unreadable(p, null, scan);
             }
             List<Ev> events = new ArrayList<>();
             List<Wm> wms = new ArrayList<>();
@@ -248,7 +248,7 @@ final class PatternAlertAudit {
                 scan.error = "no usable record: " + (scan.undecodable + scan.invalid + scan.oversize) + " records of the topic were rejected";
             }
             if (scan.error != null) {
-                return unreadable(p, n, scan.error);
+                return unreadable(p, n, scan);
             }
             TreeSet<String> dates = new TreeSet<>(Comparator.reverseOrder());
             scan.events.forEach(e -> dates.add(e.date()));
@@ -299,7 +299,7 @@ final class PatternAlertAudit {
         Scan scan = new Scan();
         long deadline = clock.getAsLong() + settings.patternAlertsAuditTimeoutMs();
         try (Consumer<String, byte[]> consumer = consumers.get()) {
-            List<PartitionInfo> infos = consumer.partitionsFor(topic, Duration.ofSeconds(5));
+            List<PartitionInfo> infos = consumer.partitionsFor(topic, remaining(deadline));
             if (infos == null || infos.isEmpty()) {
                 scan.error = "the topic " + topic + " does not exist";
                 return scan;
@@ -309,14 +309,14 @@ final class PatternAlertAudit {
                 partitions.add(new TopicPartition(topic, info.partition()));
             }
             consumer.assign(partitions);
-            Map<TopicPartition, Long> begin = consumer.beginningOffsets(partitions);
-            Map<TopicPartition, Long> end = consumer.endOffsets(partitions);
-            for (Map.Entry<TopicPartition, OffsetAndTimestamp> e : consumer.offsetsForTimes(zeros(partitions)).entrySet()) {
+            Map<TopicPartition, Long> begin = consumer.beginningOffsets(partitions, remaining(deadline));
+            Map<TopicPartition, Long> end = consumer.endOffsets(partitions, remaining(deadline));
+            for (Map.Entry<TopicPartition, OffsetAndTimestamp> e : consumer.offsetsForTimes(zeros(partitions), remaining(deadline)).entrySet()) {
                 if (e.getValue() != null) {
                     scan.earliestTimestamp = scan.earliestTimestamp == null ? e.getValue().timestamp() : Math.min(scan.earliestTimestamp, e.getValue().timestamp());
                 }
             }
-            Map<TopicPartition, OffsetAndTimestamp> from = startMs < 0 ? Map.of() : consumer.offsetsForTimes(timestamps(partitions, startMs));
+            Map<TopicPartition, OffsetAndTimestamp> from = startMs < 0 ? Map.of() : consumer.offsetsForTimes(timestamps(partitions, startMs), remaining(deadline));
             for (TopicPartition tp : partitions) {
                 OffsetAndTimestamp at = from.get(tp);
                 consumer.seek(tp, startMs < 0 ? begin.get(tp) : at == null ? end.get(tp) : Math.max(begin.get(tp), at.offset()));
@@ -327,7 +327,7 @@ final class PatternAlertAudit {
                     scan.error = "the read did not reach the end offsets within " + settings.patternAlertsAuditTimeoutMs() + " ms";
                     return scan;
                 }
-                for (ConsumerRecord<String, byte[]> record : consumer.poll(Duration.ofMillis(200))) {
+                for (ConsumerRecord<String, byte[]> record : consumer.poll(Duration.ofMillis(Math.min(200L, remaining(deadline).toMillis())))) {
                     if (++seen > RECORD_BOUND) {
                         scan.error = "the topic holds more than " + RECORD_BOUND + " records to read";
                         return scan;
@@ -340,9 +340,18 @@ final class PatternAlertAudit {
                 }
             }
         } catch (RuntimeException e) {
-            scan.error = "the topic could not be read: " + e.getClass().getSimpleName();
+            scan.error = "the topic could not be read within " + settings.patternAlertsAuditTimeoutMs() + " ms: " + e.getClass().getSimpleName();
         }
         return scan;
+    }
+
+    /** What is left of the read's wall-time bound, at least one millisecond: every Kafka call is given this, not the client's own (much longer) default timeouts. */
+    private Duration remaining(long deadline) {
+        long left = deadline - clock.getAsLong();
+        if (left <= 0) {
+            throw new IllegalStateException("the audit read exceeded its " + settings.patternAlertsAuditTimeoutMs() + " ms bound");
+        }
+        return Duration.ofMillis(left);
     }
 
     private static Map<TopicPartition, Long> zeros(List<TopicPartition> partitions) {
@@ -492,9 +501,9 @@ final class PatternAlertAudit {
         return sb.append(",\"OTHER\":").append(events.size() - known).append('}').toString();   // a later additive disposition is counted, never lost
     }
 
-    private Response unreadable(int p, Integer days, String error) {
-        return new Response(503, "{" + (days == null ? "" : "\"days\":" + days + ",") + "\"profile\":" + quote(PatternAlertRelay.PROFILE[p]) + ",\"status\":\"UNREADABLE\",\"error\":" + quote(error)
-                + ",\"events\":[],\"truncated\":false,\"coverage\":{}}");
+    private Response unreadable(int p, Integer days, Scan scan) {
+        return new Response(503, "{" + (days == null ? "" : "\"days\":" + days + ",") + "\"profile\":" + quote(PatternAlertRelay.PROFILE[p]) + ",\"status\":\"UNREADABLE\",\"error\":" + quote(scan.error)
+                + ",\"rejected\":" + rejected(scan) + ",\"events\":[],\"truncated\":false,\"coverage\":{}}");
     }
 
     // ── validation ──────────────────────────────────────────────────────────────────────────────────

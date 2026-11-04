@@ -132,4 +132,15 @@ final class PatternAlertFixtures {
     static GenericRecord with(GenericRecord r, String field, Object value) {
         return TaFixtures.put(r, field, value);
     }
+
+    /** The record rebuilt on a writer schema whose AlertKind has one more symbol (a forward-compatible writer), with that symbol as its kind. */
+    static GenericRecord withUnknownKindSymbol(GenericRecord base, String symbol) {
+        Schema widened = new Schema.Parser().parse(EVENT.toString().replace("\"symbols\":[\"UNKNOWN\",\"BREAK\",\"RETURN\",\"FAILED\"]", "\"symbols\":[\"UNKNOWN\",\"BREAK\",\"RETURN\",\"FAILED\",\"" + symbol + "\"]"));
+        GenericRecord r = new GenericData.Record(widened);
+        for (Schema.Field f : EVENT.getFields()) {
+            r.put(f.name(), base.get(f.name()));
+        }
+        r.put("kind", new GenericData.EnumSymbol(widened.getField("kind").schema(), symbol));
+        return r;
+    }
 }

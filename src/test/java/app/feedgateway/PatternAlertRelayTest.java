@@ -167,6 +167,7 @@ class PatternAlertRelayTest {
         bad.add(PatternAlertFixtures.with(PatternAlertFixtures.triangleBreak(1, "RAISED"), "sessionDate", "03-11-2026"));
         bad.add(PatternAlertFixtures.with(PatternAlertFixtures.triangleBreak(1, "RAISED"), "eventSeq", 0L));
         bad.add(PatternAlertFixtures.with(PatternAlertFixtures.triangleBreak(1, "RAISED"), "kind", "UNKNOWN"));
+        bad.add(PatternAlertFixtures.withUnknownKindSymbol(PatternAlertFixtures.triangleBreak(1, "RAISED"), "SQUEEZE"));   // a symbol of a later writer schema is not relayed until this relay knows it
         bad.add(PatternAlertFixtures.with(PatternAlertFixtures.triangleBreak(1, "RAISED"), "disposition", "UNKNOWN"));
         bad.add(PatternAlertFixtures.with(PatternAlertFixtures.triangleBreak(1, "RAISED"), "timeframe", "UNKNOWN"));
         bad.add(PatternAlertFixtures.with(PatternAlertFixtures.triangleBreak(1, "RAISED"), "tip", "x".repeat(PatternAlertRelay.RECORD_MAX_BYTES)));
