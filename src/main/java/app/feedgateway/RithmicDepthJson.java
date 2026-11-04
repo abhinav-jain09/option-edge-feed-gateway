@@ -10,7 +10,7 @@ final class RithmicDepthJson {
     static String render(String key,Object input,long now){
         try {
             if(!RithmicSchemas.KEY.equals(key)||!(input instanceof GenericRecord r)||!RithmicSchemas.FRAME.equals(r.getSchema()))return null;
-            if(!"Rithmic Test".equals(r.get("environment").toString())||!"CME".equals(r.get("exchange").toString())||!"ESZ6".equals(r.get("contract").toString())
+            if(!List.of("Rithmic Test","Rithmic Paper Trading").contains(r.get("environment").toString())||!"CME".equals(r.get("exchange").toString())||!"ESZ6".equals(r.get("contract").toString())
                 ||(Integer)r.get("schemaVersion")!=1||((Long)r.get("sequence")<1||(Long)r.get("sequence")>9007199254740991L))return null;
             String stream=r.get("streamId").toString();if(stream.isBlank()||stream.length()>128)return null;
             long source=(Long)r.get("receivedAtMs"),emitted=(Long)r.get("emittedAtMs");

@@ -6,6 +6,12 @@ import org.apache.avro.generic.GenericRecord;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 class RithmicDepthJsonTest {
+    @Test void paperTradingDepthIsAdmittedWithoutRelabelling() {
+        var input=frame();input.put("environment","Rithmic Paper Trading");
+        var output=RithmicDepthJson.render(RithmicSchemas.KEY,input,NOW);
+        assertNotNull(output);assertTrue(output.contains("Rithmic Paper Trading"));
+        input.put("environment","unknown");assertNull(RithmicDepthJson.render(RithmicSchemas.KEY,input,NOW));
+    }
     static final long NOW=1800000000000L;
     static GenericRecord frame(){
         var r=new GenericData.Record(RithmicSchemas.FRAME);
