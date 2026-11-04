@@ -24,7 +24,7 @@
       "name": "timeframe",
       "type": {
         "type": "enum",
-        "name": "WatermarkTimeframe",
+        "name": "AlertTimeframe",
         "namespace": "com.optionsedge.contracts.marketstructure.alerts",
         "symbols": [
           "UNKNOWN",
