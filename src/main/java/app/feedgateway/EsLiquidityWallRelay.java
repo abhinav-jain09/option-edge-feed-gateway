@@ -338,7 +338,8 @@ final class EsLiquidityWallRelay {
     }
 
     private String voiceFrame(Cached v, long now, boolean cached) {
-        return EsLiquidityWallJson.withCached(EsLiquidityWallJson.withStale(v.json(), now - v.bucketEnd() > settings.esLiquidityWallVoiceFreshMs()), cached);
+        // two-sided like every other timestamped frame: older than the bound OR ahead of the clock beyond the skew allowance is stale (delivered, marked)
+        return EsLiquidityWallJson.withCached(EsLiquidityWallJson.withStale(v.json(), !fresh(v.bucketEnd(), now, settings.esLiquidityWallVoiceFreshMs())), cached);
     }
 
     /** The connect replay, every frame marked {@code cached}: the fresh dashboard frame, the ring's recent events in log order, the last voice record marked by its age now. */

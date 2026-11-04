@@ -196,13 +196,19 @@ class EsLiquidityWallRelayTest {
         assertFalse(sink.json(0).get("cached").booleanValue());
         relay.accept(VOICE, KEY, wire.bytes(EsLiquidityWallFixtures.voice(NOW)), NOW);
         assertFalse(sink.json(1).get("stale").booleanValue());
+        relay.accept(VOICE, KEY, wire.bytes(EsLiquidityWallFixtures.voice(NOW + EsLiquidityWallRelay.FUTURE_SKEW_MS + 1)), NOW);   // ahead of the clock
+        assertTrue(sink.json(2).get("stale").booleanValue(), "a voice record ahead of the clock beyond the skew allowance is delivered marked stale");
+        Sink aheadReplay = new Sink();
+        relay.replay(aheadReplay, NOW);
+        assertTrue(aheadReplay.json(aheadReplay.events().size() - 1).get("stale").booleanValue(), "and replayed marked stale while it stays ahead");
+        relay.accept(VOICE, KEY, wire.bytes(EsLiquidityWallFixtures.voice(NOW)), NOW);   // back to a current record for the rest of the test
         relay.accept(EVENTS, "C0", wire.bytes(EsLiquidityWallFixtures.born(NOW - window - 1, "C0")), NOW);   // the session-open catch-up: folded, ringed, not live
         relay.accept(EVENTS, "C1", wire.bytes(EsLiquidityWallFixtures.born(NOW - 2000, "C1")), NOW);
         relay.accept(EVENTS, "C1", wire.bytes(EsLiquidityWallFixtures.retired(NOW - 1000, "C1", "AGED")), NOW);
-        assertEquals(4, sink.frames.size(), "an event outside the replay window is never broadcast as if it had just happened");
+        assertEquals(6, sink.frames.size(), "an event outside the replay window is never broadcast as if it had just happened");
         assertEquals(1, relay.staleEventsForTest());
         relay.accept(EVENTS, "C9", wire.bytes(EsLiquidityWallFixtures.born(NOW + window + 60_000, "C9")), NOW);   // far ahead of the clock: never fresh at any instant this test replays
-        assertEquals(4, sink.frames.size(), "an event ahead of the clock beyond the skew allowance is not forwarded live");
+        assertEquals(6, sink.frames.size(), "an event ahead of the clock beyond the skew allowance is not forwarded live");
         assertEquals(2, relay.staleEventsForTest());
         assertEquals(1, relay.history().render(NOW).indexOf("\"clusterId\":\"C0\"") > 0 ? 1 : 0, "but it is folded into the projection");
         assertTrue(relay.metrics().contains("gateway_es_liquidity_wall_stale_events_total 2\n"));
