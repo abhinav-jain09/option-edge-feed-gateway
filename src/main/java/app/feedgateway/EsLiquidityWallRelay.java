@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
 import org.apache.kafka.common.PartitionInfo;
@@ -46,7 +47,9 @@ import org.springframework.stereotype.Component;
  * </ul>
  * Every frame a connect replay sends carries {@code "cached":true} and every live forward {@code "cached":false}, so the page tells the two apart without a
  * timer. The dashboard topic is COMPACTED under one key, so a read from the session open could only ever recover the surviving latest frame: it is read from
- * the latest record, always, and the projection reports its dashboard-derived coverage as SINCE_START from the instant the read began. The buckets and events
+ * its LAST record (the captured end offset minus one, so a restart loads the current frame and the current voice record through the normal accept path,
+ * where the freshness gate and the stale flag decide what a socket sees; an empty partition starts at its end), and the projection reports its
+ * dashboard-derived coverage as SINCE_START from the instant the read began. The buckets and events
  * reads start at the current trade date's session open (18:00 ET of the previous day, {@code offsetsForTimes}) when
  * {@link GatewaySettings#esLiquidityWallHistoryFromSessionOpen()}, else at the latest record; the voice read starts at the latest record. After a consumer
  * failure the read resumes at the next unread offset of each partition, so no record is folded twice within one gateway life. Disabled
@@ -162,7 +165,7 @@ final class EsLiquidityWallRelay {
                     } else if (tp.equals(bucketsPartition) || tp.equals(eventsPartition)) {
                         seekFromSessionOpen(c, tp, tp.equals(bucketsPartition));
                     } else {
-                        c.seekToEnd(List.of(tp));   // the compacted dashboard (its history is one surviving frame) and the voice: latest only
+                        seekToLastRecord(c, tp);   // the compacted dashboard (its history is one surviving frame) and the voice: the current record, then the tail
                         if (tp.equals(dashboardPartition)) {
                             history.dashboardCoverageFrom(System.currentTimeMillis());
                         }
@@ -195,7 +198,7 @@ final class EsLiquidityWallRelay {
     }
 
     /** Section 8: one partition each. A topic with another count is refused loud (retried every 2 s) rather than read in part. */
-    private static TopicPartition partitionZero(KafkaConsumer<String, byte[]> c, String topic) {
+    private static TopicPartition partitionZero(Consumer<String, byte[]> c, String topic) {
         List<PartitionInfo> partitions = c.partitionsFor(topic, Duration.ofSeconds(10));
         if (partitions == null || partitions.size() != 1) {
             throw new IllegalStateException(topic + " must have exactly one partition, found " + (partitions == null ? "none" : partitions.size()));
@@ -204,7 +207,20 @@ final class EsLiquidityWallRelay {
     }
 
     /** The two retained reads (buckets, events): from the session open when the setting says so and the broker finds an offset for it, else from the latest record. */
-    private void seekFromSessionOpen(KafkaConsumer<String, byte[]> c, TopicPartition tp, boolean buckets) {
+    /**
+     * The startup position of a compacted last-value partition (dashboard, voice): its last record, so a restart loads the current value through
+     * {@link #accept} (the dashboard freshness gate and the voice stale flag apply: an old record is cached or marked, never forwarded as live), then the
+     * tail. An empty partition (end == beginning) starts at its end. Returns the offset positioned at.
+     */
+    static long seekToLastRecord(Consumer<String, byte[]> c, TopicPartition tp) {
+        long end = c.endOffsets(List.of(tp), Duration.ofSeconds(10)).get(tp);
+        long beginning = c.beginningOffsets(List.of(tp), Duration.ofSeconds(10)).get(tp);
+        long at = end > beginning ? end - 1 : end;
+        c.seek(tp, at);
+        return at;
+    }
+
+    private void seekFromSessionOpen(Consumer<String, byte[]> c, TopicPartition tp, boolean buckets) {
         long now = System.currentTimeMillis();
         if (settings.esLiquidityWallHistoryFromSessionOpen()) {
             LocalDate tradeDate = EsLiquidityWallHistory.tradeDate(now);

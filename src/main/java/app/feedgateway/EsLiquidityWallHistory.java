@@ -27,8 +27,10 @@ import org.apache.avro.generic.GenericRecord;
  * the state = the highest-precedence state (section 5's order) any row showed, with INSUFFICIENT_DATA only when every row showed it, and the
  * classification-window quantities (Added, Decrease, Traded, Accounted, Unaccounted, Hidden, pull and refill counts) of the minute's LAST LIVE row, each
  * null when that window has it null, never summed across windows ({@code windowBucketEnd} says which bucket they are as of). The minute's bucket count is
- * the number of distinct bucket ends its rows showed, measuredBuckets those of LIVE quality and missingBuckets the others; quality DEGRADED when any
- * bucket was, else the worst by LIVE &lt; GAP &lt; STALE.</li>
+ * the number of distinct bucket ends its rows showed, measuredBuckets those of LIVE quality and missingBuckets the others; the minute's quality is the
+ * worst its buckets showed by the order LIVE &lt; GAP &lt; STALE &lt; RESTART &lt; DEGRADED (document D section 4's five qualities: DEGRADED when any bucket
+ * was, else RESTART when any was, else the worst of the three), a literal outside the five ranking between STALE and RESTART as {@code OTHER}. A RESTART
+ * row folds its sizes and state like a GAP or STALE row (section 5 classifies it INSUFFICIENT_DATA) and its window is never taken.</li>
  * <li>{@code futures.liquidity-wall.events} (id 3404, delete retention under a byte cap): read from the session open; the BORN and RETIRED events are listed
  * in their minute (section 8 lists those two kinds only) and, applied in bucket order, give the walls alive at every minute's end (identity, lane, ticks,
  * birth bucket). A wall whose BORN fell outside the retained bytes is unknown until a dashboard frame lists it.</li>
@@ -54,6 +56,14 @@ final class EsLiquidityWallHistory {
     static final int MAX_BUCKETS_PER_MINUTE = 600;
     /** Section 5's classification order, highest precedence first. */
     static final List<String> STATE_ORDER = List.of("INSUFFICIENT_DATA", "EATEN", "HIDDEN", "REFILLING", "PULLED", "STABLE_WALL", "LOW_LIQUIDITY", "NEUTRAL");
+    /** Document D section 4's bucket qualities from best to worst, with {@code OTHER} for a literal outside them; the minute's quality is its worst bucket's. */
+    static final List<String> QUALITY_ORDER = List.of("LIVE", "GAP", "STALE", "OTHER", "RESTART", "DEGRADED");
+
+    static int qualityRank(String quality) {
+        int i = QUALITY_ORDER.indexOf(quality);
+        return i < 0 ? QUALITY_ORDER.indexOf("OTHER") : i;
+    }
+
     /** The event kinds the projection lists (section 8). */
     static final List<String> PROJECTED_EVENT_KINDS = List.of("BORN", "RETIRED");
     static final String SINCE_START = "SINCE_START";
@@ -135,15 +145,13 @@ final class EsLiquidityWallHistory {
             return n;
         }
 
+        /** The worst quality of the minute's buckets by {@link #QUALITY_ORDER}; null while it has none. */
         String quality() {
             int rank = -1;
             for (String q : bucketQualities.values()) {
-                if ("DEGRADED".equals(q)) {
-                    return "DEGRADED";
-                }
-                rank = Math.max(rank, "LIVE".equals(q) ? 0 : "GAP".equals(q) ? 1 : "STALE".equals(q) ? 2 : 3);
+                rank = Math.max(rank, qualityRank(q));
             }
-            return rank == 0 ? "LIVE" : rank == 1 ? "GAP" : rank == 2 ? "STALE" : rank < 0 ? null : "OTHER";
+            return rank < 0 ? null : QUALITY_ORDER.get(rank);
         }
 
         long firstBucketEnd() {

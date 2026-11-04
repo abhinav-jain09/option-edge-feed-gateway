@@ -19,6 +19,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.MockConsumer;
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -254,6 +258,54 @@ class EsLiquidityWallRelayTest {
         assertEquals(ring + 1, sink.frames.size(), "nothing refused was forwarded");
         assertTrue(relay.metrics().contains("gateway_es_liquidity_wall_drops_total 3\n"));
         assertTrue(relay.metrics().contains("gateway_es_liquidity_wall_events_accepted_total " + (ring + 1) + "\n"));
+    }
+
+    @Test
+    void theStartupPositionOfALastValuePartitionIsItsLastRecordWhichLoadsThroughTheNormalPath() throws Exception {
+        TopicPartition tp = new TopicPartition(VOICE, 0);
+        Sink sink = new Sink();
+        EsLiquidityWallRelay relay = wire.relay(sink);
+        try (var c = new MockConsumer<String, byte[]>(OffsetResetStrategy.NONE)) {
+            c.assign(List.of(tp));
+            c.updateBeginningOffsets(Map.of(tp, 3L));   // offsets 0-2 compacted away; 3, 4 and 5 remain
+            c.updateEndOffsets(Map.of(tp, 6L));
+            assertEquals(5L, EsLiquidityWallRelay.seekToLastRecord(c, tp), "the captured end offset minus one");
+            assertEquals(5L, c.position(tp));
+            for (long offset = 3; offset <= 5; offset++) {
+                c.addRecord(new ConsumerRecord<>(VOICE, 0, offset, KEY, wire.bytes(EsLiquidityWallFixtures.voice(NOW - 100_000L + offset))));
+            }
+            var records = c.poll(java.time.Duration.ofMillis(10));
+            assertEquals(1, records.count(), "only the last record is read, then the tail");
+            for (var r : records) {
+                relay.accept(r.topic(), r.key(), r.value(), NOW);
+            }
+        }
+        assertEquals(List.of("es-liquidity-voice"), sink.events());
+        assertTrue(sink.json(0).get("stale").booleanValue(), "an old current value is delivered marked stale, never as a fresh flip");
+        assertEquals("ESZ6|" + (NOW - 100_000L + 5), sink.json(0).get("voiceId").asText(), "the LAST record");
+        Sink replay = new Sink();
+        relay.replay(replay, NOW);
+        assertEquals(List.of("es-liquidity-voice"), replay.events(), "a connect after the restart gets the current voice record");
+        assertTrue(replay.json(0).get("cached").booleanValue());
+    }
+
+    @Test
+    void anEmptyLastValuePartitionStartsAtItsEndAndLoadsNothing() {
+        TopicPartition tp = new TopicPartition(DASHBOARD, 0);
+        Sink sink = new Sink();
+        EsLiquidityWallRelay relay = wire.relay(sink);
+        try (var c = new MockConsumer<String, byte[]>(OffsetResetStrategy.NONE)) {
+            c.assign(List.of(tp));
+            c.updateBeginningOffsets(Map.of(tp, 7L));   // everything before 7 is gone and nothing has been written since
+            c.updateEndOffsets(Map.of(tp, 7L));
+            assertEquals(7L, EsLiquidityWallRelay.seekToLastRecord(c, tp), "end == beginning: the end itself, never end - 1");
+            assertEquals(7L, c.position(tp));
+            assertEquals(0, c.poll(java.time.Duration.ofMillis(10)).count());
+        }
+        assertTrue(sink.frames.isEmpty());
+        Sink replay = new Sink();
+        relay.replay(replay, NOW);
+        assertTrue(replay.frames.isEmpty(), "nothing cached, nothing replayed");
     }
 
     @Test

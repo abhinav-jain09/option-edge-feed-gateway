@@ -263,6 +263,35 @@ class EsLiquidityWallHistoryTest {
     }
 
     @Test
+    void aRestartBucketRanksAboveStaleAndBelowDegradedAndItsRowFoldsSizesButNoWindow() throws Exception {
+        EsLiquidityWallHistory h = new EsLiquidityWallHistory();
+        h.foldBucket(row(NOW - 3000, "LIVE", "BID", 30440L, 150L, "NEUTRAL"));
+        h.foldBucket(row(NOW - 2000, "STALE", "BID", 30440L, 140L, "INSUFFICIENT_DATA"));
+        h.foldBucket(EsLiquidityWallFixtures.bucket(NOW - 1000, "RESTART", "BID", 30440L, 500L, "INSUFFICIENT_DATA").set("added", 999L).build());
+        JsonNode a = JSON.readTree(h.render(NOW)).get("minutes").get(0);
+        assertEquals("RESTART", a.get("quality").asText(), "RESTART outranks STALE");
+        assertEquals(3, a.get("buckets").intValue());
+        assertEquals(1, a.get("measuredBuckets").intValue());
+        assertEquals(2, a.get("missingBuckets").intValue());
+        JsonNode bid = a.get("levels").get(0);
+        assertEquals(3, bid.get("buckets").intValue(), "the RESTART row is a row of the level");
+        assertEquals(500L, bid.get("maxSize").longValue(), "its sizes fold");
+        assertEquals(500L, bid.get("lastSize").longValue());
+        assertEquals("NEUTRAL", bid.get("state").asText(), "its INSUFFICIENT_DATA does not outrank a measured state");
+        assertEquals(NOW - 3000, bid.get("windowBucketEnd").longValue(), "its window is never taken");
+        assertEquals(40L, bid.get("added").longValue());
+        // DEGRADED outranks RESTART; a literal outside the five ranks between STALE and RESTART
+        h.foldBucket(row(NOW, "DEGRADED", "ASK", 30460L, 1L, "INSUFFICIENT_DATA"));
+        assertEquals("DEGRADED", JSON.readTree(h.render(NOW)).get("minutes").get(0).get("quality").asText());
+        EsLiquidityWallHistory other = new EsLiquidityWallHistory();
+        other.foldBucket(row(NOW - 1000, "STALE", "BID", 30440L, 1L, "INSUFFICIENT_DATA"));
+        other.foldBucket(row(NOW, "SOMETHING_NEW", "BID", 30440L, 1L, "INSUFFICIENT_DATA"));
+        assertEquals("OTHER", JSON.readTree(other.render(NOW)).get("minutes").get(0).get("quality").asText());
+        other.foldBucket(row(NOW - 2000, "RESTART", "BID", 30440L, 1L, "INSUFFICIENT_DATA"));
+        assertEquals("RESTART", JSON.readTree(other.render(NOW)).get("minutes").get(0).get("quality").asText());
+    }
+
+    @Test
     void aNewerTradeDateClearsTheProjectionAndItsIdentity() {
         EsLiquidityWallHistory h = new EsLiquidityWallHistory();
         h.foldBucket(row(NOW, "LIVE", "BID", 30440L, 150L, "NEUTRAL"));
