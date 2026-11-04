@@ -21,7 +21,7 @@ PROFILE_STATE_SHARED	src/main/java/app/feedgateway/PatternAlertRelay.java	ESTIMA
 SELF_CHECK_FORWARDED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (SELF_CHECK.equals(disposition)) {	if (false) {
 WATERMARK_NOT_IGNORED	src/main/java/app/feedgateway/PatternAlertRelay.java	watermarksIgnored.incrementAndGet();	
 FULL_CAP_NOT_APPLIED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (h.full != null && ++fulls > FULL_RAISED_MAX) {	if (false) {
-RETENTION_NOT_BOUNDED	src/main/java/app/feedgateway/PatternAlertRelay.java	while (prof.events.size() > retained) {	while (false) {
+RETENTION_NOT_BOUNDED	src/main/java/app/feedgateway/PatternAlertRelay.java	while (prof.events.size() > retained) {	while (prof.events.size() > retained + 1_000_000) {
 EVICTION_UNREPORTED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (gone.raised && gone.seq > prof.evictedRaisedSeq) {	if (false) {
 REPLY_BUDGET_IGNORED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (used + size > room) {	if (false) {
 DISPLAY_WINDOW_IGNORED	src/main/java/app/feedgateway/PatternAlertRelay.java	 || now > h.availableMs + windowMs) {	) {
@@ -33,7 +33,7 @@ SNAPSHOT_BROADCAST_NOT_PER_SOCKET	src/main/java/app/feedgateway/PatternAlertRela
 SNAPSHOT_NO_RESUME_CREDIT	src/main/java/app/feedgateway/PatternAlertRelay.java	s.initialCredit[p]++;	
 SNAPSHOT_RACE_UNHANDLED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (!s.ready[p] && ready[p]) {	if (false) {
 HELLO_SNAPSHOT_NOT_BOUND	src/main/java/app/feedgateway/PatternAlertRelay.java	sockets.put(socketId, s);	
-HELLO_FORGOTTEN_ON_CLOSE	src/main/java/app/feedgateway/FeedGatewayService.java	patternAlerts.forget(id);	
+HELLO_FORGOTTEN_ON_CLOSE	src/main/java/app/feedgateway/FeedGatewayService.java	patternAlerts.forget(socketId);	
 RESET_NOT_MARKED	src/main/java/app/feedgateway/PatternAlertRelay.java	\"reset\":" + reset	\"reset\":" + false
 REPLY_NOT_SENT	src/main/java/app/feedgateway/FeedGatewayService.java	send(session, reply[0], reply[1]);   // an alert event name	// an alert event name
 ALERT_FRAMES_NOT_ALLOWLISTED	src/main/java/app/feedgateway/FeedGatewayService.java	            PatternAlertRelay.REGULAR_EVENT, PatternAlertRelay.ESTIMATE_EVENT,\n	            // none\n

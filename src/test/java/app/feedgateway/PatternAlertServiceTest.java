@@ -23,6 +23,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.avro.generic.GenericRecord;
 import org.junit.jupiter.api.AfterEach;
+import org.mockito.Mockito;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.TextMessage;
@@ -473,6 +474,24 @@ class PatternAlertServiceTest {
         assertEquals(1, r.socketsForTest());
         s.removeClient(w.socket);
         assertEquals(0, r.socketsForTest());
+    }
+
+    @Test
+    void everyWayASocketLeavesForgetsItsAlertState() throws Exception {
+        FeedGatewayService s = service(false);
+        PatternAlertRelay r = relay(s);
+        ready(r);
+        Wire closed = new Wire("by-close-sockets");
+        s.addClient(closed.socket);
+        assertEquals(1, r.socketsForTest());
+        s.closeSockets(List.of("by-close-sockets"));
+        assertEquals(0, r.socketsForTest(), "closeSockets (expiry and revocation sweeps)");
+        Wire expired = new Wire("by-expiry");
+        Mockito.when(expired.socket.getAttributes()).thenReturn(new java.util.HashMap<>(java.util.Map.of(WsJwtHandshakeInterceptor.AUTH_EXPIRES_AT_ATTR, 1_000L)));
+        s.addClient(expired.socket);
+        assertEquals(1, r.socketsForTest());
+        s.closeExpiredAuthSessions(2_000L);
+        assertEquals(0, r.socketsForTest(), "token expiry");
     }
 
     // ── the display reply's bounds ────────────────────────────────────────────────────────────────

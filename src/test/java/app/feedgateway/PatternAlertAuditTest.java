@@ -318,6 +318,7 @@ class PatternAlertAuditTest {
         while (true) {
             JsonNode page = json(audit.byDate("regular", DATE, "3", after));
             pages++;
+            assertTrue(pages <= 10, "paging by the continuation terminates");
             page.get("events").forEach(e -> seen.add(e.get("eventSeq").asLong()));
             assertTrue(page.get("events").size() <= 3);
             assertEquals(2, page.get("coverage").get("1m").get("folds").asInt(), "the coverage rides every page");
