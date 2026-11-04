@@ -124,6 +124,7 @@ final class PatternAlertRelay extends TaRelay {
         final int[] initialCredit = new int[2];
         final boolean[] initialDone = new boolean[2];
         int overflowUsed;
+        final List<String[]> owed = new ArrayList<>();   // snapshots a hello bound too late owes this socket
     }
 
     private static final ThreadLocal<HelloSnapshot> HELLO = new ThreadLocal<>();
@@ -443,13 +444,13 @@ final class PatternAlertRelay extends TaRelay {
 
     /**
      * Binds the hello this thread just composed to {@code socketId}: its resume allowance and the date and high-water it will resume against. A profile that was not ready in that
-     * hello but is by now (the promotion ran between the composition and this call) owes the socket its snapshot, returned here.
+     * hello but is by now (the promotion ran between the composition and this call) owes the socket its snapshot, collected by {@link #takeOwed} once the hello is sent.
      */
-    synchronized List<String[]> bindHello(String socketId) {
+    synchronized void bindHello(String socketId) {
         HelloSnapshot h = HELLO.get();
         HELLO.remove();
         if (h == null) {
-            return List.of();
+            return;
         }
         Sock s = new Sock();
         for (int p = 0; p < PROFILE.length; p++) {
@@ -459,13 +460,22 @@ final class PatternAlertRelay extends TaRelay {
             s.initialCredit[p] = h.ready()[p] ? 1 : 0;
         }
         sockets.put(socketId, s);
-        List<String[]> owed = new ArrayList<>(2);
         for (int p = 0; p < PROFILE.length; p++) {
             if (!s.ready[p] && ready[p]) {
-                owed.add(snapshotFor(s, p));
+                s.owed.add(snapshotFor(s, p));
             }
         }
-        return owed;
+    }
+
+    /** The snapshots {@link #bindHello} found owed to {@code socketId}, once. */
+    synchronized List<String[]> takeOwed(String socketId) {
+        Sock s = sockets.get(socketId);
+        if (s == null || s.owed.isEmpty()) {
+            return List.of();
+        }
+        List<String[]> out = new ArrayList<>(s.owed);
+        s.owed.clear();
+        return out;
     }
 
     synchronized void forget(String socketId) {

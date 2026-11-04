@@ -455,10 +455,12 @@ class PatternAlertServiceTest {
         r.beginRecovery();
         r.onStaged(PatternAlertRelay.REGULAR_EVENT, PatternAlertFixtures.triangleBreak(1, "RAISED"));
         r.promote();                    // the promotion lands before the socket is bound
-        List<String[]> owed = r.bindHello("racer");
+        r.bindHello("racer");
+        List<String[]> owed = r.takeOwed("racer");
         assertEquals(2, owed.size(), "a snapshot for each profile the hello showed as not ready");
         assertEquals("market-structure-alerts", owed.get(0)[0]);
         assertEquals("snapshot", readTree(owed.get(0)[1]).get("type").asText());
+        assertTrue(r.takeOwed("racer").isEmpty(), "owed once");
     }
 
     @Test

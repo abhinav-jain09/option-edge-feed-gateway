@@ -1342,7 +1342,11 @@ public class FeedGatewayService implements ReplayRunner {
                 broadcast("es-footprint-strike-control", frame.body());
                 footprintCounter("broadcast_total{event=\"es-footprint-strike-control\"}").incrementAndGet();
             }
-            case HELLO -> sendHello((WebSocketSession) frame.target(), () -> cvdHelloJson(frame.body()));
+            case HELLO -> {
+                WebSocketSession target = (WebSocketSession) frame.target();
+                send(target, "cvd-hello", helloBound(target, () -> cvdHelloJson(frame.body())));
+                sendOwedAlertSnapshots(target);
+            }
         }
     }
 
@@ -1642,7 +1646,8 @@ public class FeedGatewayService implements ReplayRunner {
                 // never hold a hello older than a control it already received. Delivered before this returns.
                 footprintStrikeView.hello(session);
             } else {
-                sendHello(session, this::cvdHelloJson);
+                send(session, "cvd-hello", helloBound(session, this::cvdHelloJson));
+                sendOwedAlertSnapshots(session);
             }
         }
         if(rithmicDepthRelay!=null&&settings.rithmicDepthEnabled()) {
@@ -1784,21 +1789,25 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /**
-     * Composes and sends one socket's hello. With the alert relay on, the composition and the binding run on this thread, one after the other: the date and high-water the
-     * hello showed are what that socket's resume message is validated against, and a profile that became ready between the composition and the binding owes the socket its
-     * snapshot, sent right after the hello.
+     * Composes one socket's hello. With the alert relay on, the composition and the binding run on this thread, one after the other: the date and high-water the hello showed are
+     * what that socket's resume message is validated against. A profile that became ready between the composition and the binding owes the socket its snapshot, which the caller
+     * sends right after the hello with {@link #sendOwedAlertSnapshots}.
      */
-    private void sendHello(WebSocketSession target, java.util.function.Supplier<String> compose) {
+    private String helloBound(WebSocketSession target, java.util.function.Supplier<String> compose) {
         if (patternAlerts == null) {
-            send(target, "cvd-hello", compose.get());
-            return;
+            return compose.get();
         }
         PatternAlertRelay.clearHelloSnapshot();
         String hello = compose.get();
-        List<String[]> owed = patternAlerts.bindHello(target.getId());
-        send(target, "cvd-hello", hello);
-        for (String[] snapshot : owed) {
-            send(target, snapshot[0], snapshot[1]);
+        patternAlerts.bindHello(target.getId());
+        return hello;
+    }
+
+    private void sendOwedAlertSnapshots(WebSocketSession target) {
+        if (patternAlerts != null) {
+            for (String[] snapshot : patternAlerts.takeOwed(target.getId())) {
+                send(target, snapshot[0], snapshot[1]);
+            }
         }
     }
 
