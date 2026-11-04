@@ -485,6 +485,62 @@ public final class GatewaySettings {
     }
 
     /**
+     * Server-side pattern break alerts (options-edge-processing market-structure-service/docs/PATTERN-ALERTS-SERVER-SIDE-DESIGN.md section 6; binding events
+     * {@code market-structure-alerts} and {@code market-structure-alerts-estimate}, hello field {@code alerts}, resume message {@code alerts-resume}, REST
+     * {@code GET /api/pattern-alerts}). OFF by default: an absent {@code alerts} field is how the page learns this gateway has no alert relay.
+     */
+    public boolean patternAlertsEnabled() {
+        return boolValue("GATEWAY_PATTERN_ALERTS_ENABLED", false);
+    }
+
+    /** The alert topic of the regular profile (one partition, durable: the audit trail). */
+    public String patternAlertsTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_PATTERN_ALERTS_TOPIC", "options.spx.market-structure.pattern-alerts");
+    }
+
+    /** The alert topic of the estimate (Globex) profile. */
+    public String patternAlertsEstimateTopic() {
+        return value("KAFKA_MARKET_STRUCTURE_ESTIMATE_PATTERN_ALERTS_TOPIC", "options.spx.market-structure.estimate.pattern-alerts");
+    }
+
+    /**
+     * The catch-up window {@code W}: an event is displayed to a late page while {@code availableMs + W} has not passed. It must equal the producer's window; the
+     * producer-stamped {@code speakUntilMs} is the authority for speech, this value only bounds what a resume may display.
+     */
+    public long patternAlertsWindowMs() {
+        return longValue("GATEWAY_PATTERN_ALERTS_WINDOW_MS", 1_800_000L, 1_000L);
+    }
+
+    /** Events retained per profile and session (the newest are kept). */
+    public int patternAlertsRetained() {
+        return (int) Math.min(4_096L, longValue("GATEWAY_PATTERN_ALERTS_RETAINED", 256L, 8L));
+    }
+
+    /** The topic retention the audit read reports (the deploy repo declares 7 days; the gateway only states it). */
+    public long patternAlertsRetentionMs() {
+        return longValue("GATEWAY_PATTERN_ALERTS_RETENTION_MS", 604_800_000L, 3_600_000L);
+    }
+
+    /** The wall-time bound of one audit read. */
+    public long patternAlertsAuditTimeoutMs() {
+        return longValue("GATEWAY_PATTERN_ALERTS_AUDIT_TIMEOUT_MS", 10_000L, 100L);
+    }
+
+    /** The smallest per-socket queue under which the alert relay can honour its reply budget (see {@link PatternAlertRelay#MIN_WS_QUEUED_BYTES}); below it the relay refuses to enable. */
+    public String patternAlertsRefusal() {
+        if (!patternAlertsEnabled()) {
+            return null;
+        }
+        return wsMaxQueuedBytes() < PatternAlertRelay.MIN_WS_QUEUED_BYTES
+                ? "GATEWAY_WS_MAX_QUEUED_BYTES=" + wsMaxQueuedBytes() + " is below the " + PatternAlertRelay.MIN_WS_QUEUED_BYTES + " bytes the alert relay needs for its display reply" : null;
+    }
+
+    /** Whether the alert relay, its bindings and its REST read are active: the flag is on and nothing refuses it. */
+    public boolean patternAlertsActive() {
+        return patternAlertsEnabled() && patternAlertsRefusal() == null;
+    }
+
+    /**
      * VWAP-ACCEPTANCE-REJECTION line / zone acceptance and rejection (frames {@code line-acceptance}, {@code -coverage}, {@code -monitor}, {@code -status}, hello field {@code lineAcceptance};
      * options-edge-processing VWAP-ACCEPTANCE-REJECTION-DESIGN.md 10.1). OFF by default: an absent {@code lineAcceptance} field is how the page knows this gateway has no such stream.
      */

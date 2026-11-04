@@ -809,6 +809,9 @@ public class FeedGatewayService implements ReplayRunner {
     private final StudiesRelay studies;
     /** The enabled technical-analysis chart relays (structure tools, geometry, trade tools, waves and cycles), in hello priority order. */
     private final List<TaRelay> taRelays;
+    /** The server-side pattern break alert relay and its audit read; both null unless GATEWAY_PATTERN_ALERTS_ENABLED is on and nothing refuses it. */
+    private final PatternAlertRelay patternAlerts;
+    private final PatternAlertAudit patternAlertAudit;
     static final java.util.List<String> MARKET_STRUCTURE_PATTERN_TIMEFRAMES = java.util.List.of("1m", "5m", "15m");
     /** U16 retention baseline: the provenance of the retained record; guarded by the retain lock. */
     private CvdSpxLevelsProvenance cvdSpxLevelsProvenance;
@@ -980,6 +983,8 @@ public class FeedGatewayService implements ReplayRunner {
         this.mapper = mapper;
         this.studies = new StudiesRelay(mapper);
         this.taRelays = taRelays(settings);
+        this.patternAlerts = taRelays.isEmpty() || !(taRelays.get(0) instanceof PatternAlertRelay relay) ? null : relay;
+        this.patternAlertAudit = patternAlerts == null ? null : new PatternAlertAudit(settings);
         this.hpsfViewMapper = hpsfViewMapper;
         this.routingEngine = routingEngine;
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
@@ -1011,6 +1016,8 @@ public class FeedGatewayService implements ReplayRunner {
         this.mapper = mapper;
         this.studies = new StudiesRelay(mapper);
         this.taRelays = taRelays(settings);
+        this.patternAlerts = taRelays.isEmpty() || !(taRelays.get(0) instanceof PatternAlertRelay relay) ? null : relay;
+        this.patternAlertAudit = patternAlerts == null ? null : new PatternAlertAudit(settings);
         this.hpsfViewMapper = hpsfViewMapper;
         this.routingEngine = routingEngine;
         this.activeSelection = new AtomicReference<>(ActiveSelection.fromSettings(settings));
@@ -1335,7 +1342,11 @@ public class FeedGatewayService implements ReplayRunner {
                 broadcast("es-footprint-strike-control", frame.body());
                 footprintCounter("broadcast_total{event=\"es-footprint-strike-control\"}").incrementAndGet();
             }
-            case HELLO -> send((WebSocketSession) frame.target(), "cvd-hello", cvdHelloJson(frame.body()));
+            case HELLO -> {
+                WebSocketSession target = (WebSocketSession) frame.target();
+                send(target, "cvd-hello", helloBound(target, () -> cvdHelloJson(frame.body())));
+                sendOwedAlertSnapshots(target);
+            }
         }
     }
 
@@ -1635,7 +1646,8 @@ public class FeedGatewayService implements ReplayRunner {
                 // never hold a hello older than a control it already received. Delivered before this returns.
                 footprintStrikeView.hello(session);
             } else {
-                send(session, "cvd-hello", cvdHelloJson());
+                send(session, "cvd-hello", helloBound(session, this::cvdHelloJson));
+                sendOwedAlertSnapshots(session);
             }
         }
         if(rithmicDepthRelay!=null&&settings.rithmicDepthEnabled()) {
@@ -1776,9 +1788,40 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /**
+     * Composes one socket's hello. With the alert relay on, the composition and the binding run on this thread, one after the other: the date and high-water the hello showed are
+     * what that socket's resume message is validated against. A profile that became ready between the composition and the binding owes the socket its snapshot, which the caller
+     * sends right after the hello with {@link #sendOwedAlertSnapshots}.
+     */
+    private String helloBound(WebSocketSession target, java.util.function.Supplier<String> compose) {
+        if (patternAlerts == null) {
+            return compose.get();
+        }
+        PatternAlertRelay.clearHelloSnapshot();
+        String hello = compose.get();
+        patternAlerts.bindHello(target.getId());
+        return hello;
+    }
+
+    private void sendOwedAlertSnapshots(WebSocketSession target) {
+        if (patternAlerts != null) {
+            for (String[] snapshot : patternAlerts.takeOwed(target.getId())) {
+                send(target, snapshot[0], snapshot[1]);
+            }
+        }
+    }
+
+    /** A socket is gone by any path: its alert resume state goes with it. */
+    private void forgetAlertSocket(String socketId) {
+        if (patternAlerts != null && socketId != null) {
+            patternAlerts.forget(socketId);
+        }
+    }
+
     public void removeClient(WebSocketSession session) {
         esAuctionHelloPending.remove(session);   // a socket that closed while waiting for its hello must not be held
         String id = session.getId();
+        forgetAlertSocket(id);
         volPremiumDeliveries.remove(id);   // a delivery (and a paced replay) for a socket that is gone must not hold it
         OutboundChannel channel = outbound.remove(id);
         spotBandSwitchDelivered.remove(id);
@@ -1821,6 +1864,7 @@ public class FeedGatewayService implements ReplayRunner {
             volPremiumDeliveries.remove(socketId);
             OutboundChannel channel = outbound.remove(socketId);
             WebSocketSession stored = clientsById.remove(socketId);
+            forgetAlertSocket(socketId);
             if (stored != null) {
                 clients.remove(stored);
             }
@@ -1844,6 +1888,7 @@ public class FeedGatewayService implements ReplayRunner {
             volPremiumDeliveries.remove(socketId);
             OutboundChannel channel = outbound.remove(socketId);
             WebSocketSession stored = clientsById.remove(socketId);
+            forgetAlertSocket(socketId);
             if (stored != null) {
                 clients.remove(stored);
             }
@@ -1882,6 +1927,7 @@ public class FeedGatewayService implements ReplayRunner {
         outbound.remove(channel.socketId(), channel);
         volPremiumDeliveries.remove(channel.socketId());
         WebSocketSession stored = clientsById.remove(channel.socketId());
+        forgetAlertSocket(channel.socketId());
         if (stored != null) {
             clients.remove(stored);
         }
@@ -2024,6 +2070,7 @@ public class FeedGatewayService implements ReplayRunner {
             }
             clients.remove(session);
             clientsById.remove(session.getId());
+            forgetAlertSocket(session.getId());
             OutboundChannel channel = outbound.remove(session.getId());
             if (channel != null) {
                 channel.shutdown();
@@ -2926,6 +2973,11 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.geometryEnabled()) {
             bindChartTopic(topicEvents, settings.geometryTopic(), TimeframeSetRelay.GEOMETRY_EVENT);
             bindChartTopic(topicEvents, settings.geometryEstimateTopic(), TimeframeSetRelay.GEOMETRY_EVENT);
+        }
+        if (settings.patternAlertsActive()) {
+            // two profiles, two binding events: the relay names the profile of a record by the event it arrived on
+            bindChartTopic(topicEvents, settings.patternAlertsTopic(), PatternAlertRelay.REGULAR_EVENT);
+            bindChartTopic(topicEvents, settings.patternAlertsEstimateTopic(), PatternAlertRelay.ESTIMATE_EVENT);
         }
         if (settings.tradeToolsEnabled()) {
             List<String> tradeToolsTopics = settings.tradeToolsTopics();
@@ -13127,7 +13179,12 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The enabled relays in hello priority order: after the studies, the geometry, the tools, the waves, the trade tools, then the break classification. */
     private static List<TaRelay> taRelays(GatewaySettings settings) {
-        List<TaRelay> relays = new ArrayList<>(5);
+        List<TaRelay> relays = new ArrayList<>(6);
+        if (settings.patternAlertsActive()) {
+            relays.add(new PatternAlertRelay(settings));   // FIRST: the part is small and decisive; the geometry and tools parts keep their own caps and trim after it
+        } else if (settings.patternAlertsRefusal() != null) {
+            System.err.println("Feed gateway: the pattern alert relay is NOT enabled: " + settings.patternAlertsRefusal());
+        }
         if (settings.geometryEnabled()) {
             relays.add(TimeframeSetRelay.geometry());
         }
@@ -13156,6 +13213,11 @@ public class FeedGatewayService implements ReplayRunner {
 
     List<TaRelay> taRelaysForTest() {
         return taRelays;
+    }
+
+    /** The audit read of the pattern alerts, or null when the relay is off (the REST route then answers 404). */
+    PatternAlertAudit patternAlertAudit() {
+        return patternAlertAudit;
     }
 
     private TaRelay taRelayFor(String event) {
@@ -13194,6 +13256,10 @@ public class FeedGatewayService implements ReplayRunner {
             topics.add(settings.geometryTopic());
             topics.add(settings.geometryEstimateTopic());
         }
+        if (settings.patternAlertsActive()) {
+            topics.add(settings.patternAlertsTopic());
+            topics.add(settings.patternAlertsEstimateTopic());
+        }
         if (settings.tradeToolsEnabled()) {
             topics.addAll(settings.tradeToolsTopics());
         }
@@ -13223,6 +13289,13 @@ public class FeedGatewayService implements ReplayRunner {
         StringBuilder metrics = new StringBuilder();
         for (TaRelay relay : taRelays) {
             metrics.append(relay.metrics());
+        }
+        if (patternAlertAudit != null) {
+            metrics.append(patternAlertAudit.metrics());
+        }
+        if (settings.patternAlertsRefusal() != null) {
+            metrics.append("# HELP gateway_pattern_alerts_refused 1 when the flag is on but the relay refused to enable (the per-socket queue is too small for its display reply).\n"
+                    + "# TYPE gateway_pattern_alerts_refused gauge\ngateway_pattern_alerts_refused 1\n");
         }
         return metrics.toString();
     }
@@ -13339,6 +13412,15 @@ public class FeedGatewayService implements ReplayRunner {
             for (String[] frame : relay.promote()) {
                 broadcast(frame[0], frame[1]);
                 forwardedEvents.incrementAndGet();
+            }
+            if (relay == patternAlerts) {
+                // each connected socket whose hello showed a profile as not ready is sent that profile's snapshot, one socket at a time
+                patternAlerts.afterPromote((socketId, frame) -> {
+                    WebSocketSession socket = clientsById.get(socketId);
+                    if (socket != null) {
+                        send(socket, frame[0], frame[1]);
+                    }
+                });
             }
         }
     }
@@ -14965,6 +15047,8 @@ public class FeedGatewayService implements ReplayRunner {
             StudiesRelay.BAR_EVENT, StudiesRelay.CURRENT_EVENT,
             // CHART-STRUCTURE-TOOLS .. ELLIOTT-FIB-CYCLE-TOOLS chart frames (market-structure-service, es-trade-tools-service, wave-cycle-service): global, SPX/ES only, flag-gated.
             TimeframeSetRelay.TOOLS_EVENT, TimeframeSetRelay.GEOMETRY_EVENT, WaveCycleRelay.WAVES_EVENT, WaveCycleRelay.CYCLES_EVENT,
+            // Server-side pattern break alerts (market-structure-service via the alert topic): global, SPX only, flag-gated; every alert frame is delivered (never coalesced).
+            PatternAlertRelay.REGULAR_EVENT, PatternAlertRelay.ESTIMATE_EVENT,
             "trade-tools-pf-chart", "trade-tools-pf-column", "trade-tools-pf-break", "trade-tools-pf-line", "trade-tools-pf-count",
             "trade-tools-pf-macross", "trade-tools-pf-voldiv", "trade-tools-pf-mfdiv", "trade-tools-pf-volcheck", "trade-tools-volume-nodes",
             "trade-tools-flow-bar", "trade-tools-climax",
@@ -15137,10 +15221,26 @@ public class FeedGatewayService implements ReplayRunner {
         broadcast(event, json);
     }
 
+    /** The inbound message type of the alert page (see {@link PatternAlertRelay#resume}). */
+    static final String ALERTS_RESUME = "alerts-resume";
+
     /** History travels on the authenticated socket; only registered clients can read the view. */
     void handleFootprintBasicMessage(WebSocketSession session, String payload) {
-        if (session == null || clientsById.get(session.getId()) != session || !session.isOpen()
-                || payload == null || payload.length() > FootprintBasicHistory.MAX_REQUEST_BYTES
+        if (session == null || clientsById.get(session.getId()) != session || !session.isOpen() || payload == null) return;
+        if (patternAlerts != null && payload.contains(ALERTS_RESUME)) {
+            // the small dispatcher: the alert resume message is answered by the alert relay (ALWAYS one reply, an oversize one with a size error and unparsed),
+            // everything else follows the footprint path below
+            JsonNode head = null;
+            if (payload.length() <= PatternAlertRelay.REQUEST_MAX_BYTES) {
+                try { head = mapper.readTree(payload); } catch (Exception invalid) { head = null; }
+            }
+            if (head == null ? payload.length() > PatternAlertRelay.REQUEST_MAX_BYTES : ALERTS_RESUME.equals(head.path("type").asText())) {
+                String[] reply = patternAlerts.resume(session.getId(), payload);
+                send(session, reply[0], reply[1]);   // an alert event name is not coalescable: every reply is delivered
+                return;
+            }
+        }
+        if (payload.length() > FootprintBasicHistory.MAX_REQUEST_BYTES
                 || payload.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > FootprintBasicHistory.MAX_REQUEST_BYTES) return;
         JsonNode request;
         try { request = mapper.readTree(payload); } catch (Exception invalid) { return; }

@@ -1,0 +1,73 @@
+# One mutant per line, fields separated by a TAB: NAME, FILE (relative to the repository root), OLD (must occur exactly once), NEW (may be empty).
+# A newline inside OLD or NEW is written as the two characters \n.  Lines starting with # are comments.
+DISPLAY_IGNORES_RAISED	src/main/java/app/feedgateway/PatternAlertRelay.java	boolean display = h.raised;	boolean display = true;
+SPEAK_IGNORES_EXPIRY	src/main/java/app/feedgateway/PatternAlertRelay.java	boolean speak = display && now <= h.speakUntilMs;	boolean speak = display;
+REPLY_SPEAK_IGNORES_EXPIRY	src/main/java/app/feedgateway/PatternAlertRelay.java	fullWith(h, true, now <= h.speakUntilMs)	fullWith(h, true, true)
+CURSOR_GE	src/main/java/app/feedgateway/PatternAlertRelay.java	!h.raised || h.seq <= above	!h.raised || h.seq < above
+REGRESSION_ACCEPTED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (seq <= prof.high) {	if (seq < prof.high) {
+ALERT_EVENT_COALESCED	src/main/java/app/feedgateway/FeedGatewayService.java	"rithmic-liquidity", "snapshot", "pace", "pace-rank",	"market-structure-alerts", "market-structure-alerts-estimate", "rithmic-liquidity", "snapshot", "pace", "pace-rank",
+RESUME_CURSOR_UNCHECKED	src/main/java/app/feedgateway/PatternAlertRelay.java	!c.canConvertToLong() || c.asLong() < 0	!c.canConvertToLong()
+CURSOR_ABOVE_HIGH_IS_NOT_RESET	src/main/java/app/feedgateway/PatternAlertRelay.java	boolean reset = cursor > high;	boolean reset = false;
+RESUME_RATE_UNCHECKED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (s.initialCredit[p] <= 0) {	if (false) {
+OVERFLOW_RATE_UNCHECKED	src/main/java/app/feedgateway/PatternAlertRelay.java	 || s.overflowUsed >= OVERFLOW_RETRIES_MAX	
+OVERFLOW_WITHOUT_INITIAL	src/main/java/app/feedgateway/PatternAlertRelay.java	if (!s.initialDone[p] || s.overflowUsed	if (s.overflowUsed
+OVERFLOW_NO_FRESH_SNAPSHOT	src/main/java/app/feedgateway/PatternAlertRelay.java	s.high[p] = prof.high;   // a retry	// a retry
+RESUME_SESSION_UNCHECKED	src/main/java/app/feedgateway/PatternAlertRelay.java	!DATE.matcher(date).matches() || !date.equals(s.date[p]) || !date.equals(prof.sessionDate)	!DATE.matcher(date).matches()
+RESUME_NOT_READY_ACCEPTED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (!s.ready[p]) {\n                return error(p, "not-ready");	if (false) {\n                return error(p, "not-ready");
+HELLO_BUDGET_UNBOUNDED	src/main/java/app/feedgateway/PatternAlertRelay.java	long cap = Math.min(budget, HELLO_PART_BYTES);	long cap = budget;
+HELLO_TRIM_DROPS_FULL_FIRST	src/main/java/app/feedgateway/PatternAlertRelay.java	int drop = isFull.indexOf(Boolean.FALSE);	int drop = isFull.indexOf(Boolean.TRUE);
+NOT_READY_HELLO_SHOWS_EVENTS	src/main/java/app/feedgateway/PatternAlertRelay.java	        if (!ready[p]) {\n            // the staged recovery	        if (false) {\n            // the staged recovery
+PROFILE_STATE_SHARED	src/main/java/app/feedgateway/PatternAlertRelay.java	ESTIMATE_EVENT.equals(bindingEvent) ? 1 : -1;	ESTIMATE_EVENT.equals(bindingEvent) ? 0 : -1;
+SELF_CHECK_FORWARDED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (SELF_CHECK.equals(disposition)) {	if (false) {
+WATERMARK_NOT_IGNORED	src/main/java/app/feedgateway/PatternAlertRelay.java	watermarksIgnored.incrementAndGet();	
+FULL_CAP_NOT_APPLIED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (h.full != null && ++fulls > FULL_RAISED_MAX) {	if (false) {
+RETENTION_NOT_BOUNDED	src/main/java/app/feedgateway/PatternAlertRelay.java	while (prof.events.size() > retained) {	while (prof.events.size() > retained + 1_000_000) {
+EVICTION_UNREPORTED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (gone.raised && gone.seq > prof.evictedRaisedSeq) {	if (false) {
+REPLY_BUDGET_IGNORED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (used + size > room) {	if (false) {
+DISPLAY_WINDOW_IGNORED	src/main/java/app/feedgateway/PatternAlertRelay.java	 || now > h.availableMs + windowMs) {	) {
+REPLY_HIGH_BOUND_IGNORED	src/main/java/app/feedgateway/PatternAlertRelay.java	 || h.seq > high	
+SESSION_NOT_REPLACED	src/main/java/app/feedgateway/PatternAlertRelay.java	prof.clear(date);   // a new session date	// a new session date
+OLDER_SESSION_ACCEPTED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (prof.sessionDate != null && date.compareTo(prof.sessionDate) < 0) {	if (false) {
+HISTORY_NOT_MERGED	src/main/java/app/feedgateway/PatternAlertRelay.java	liveProf.events.add(h);	
+SNAPSHOT_BROADCAST_NOT_PER_SOCKET	src/main/java/app/feedgateway/PatternAlertRelay.java	if (!e.getValue().ready[p] && ready[p]) {	if (ready[p]) {
+SNAPSHOT_NO_RESUME_CREDIT	src/main/java/app/feedgateway/PatternAlertRelay.java	s.initialCredit[p]++;	
+SNAPSHOT_RACE_UNHANDLED	src/main/java/app/feedgateway/PatternAlertRelay.java	if (!s.ready[p] && ready[p]) {	if (false) {
+HELLO_SNAPSHOT_NOT_BOUND	src/main/java/app/feedgateway/PatternAlertRelay.java	sockets.put(socketId, s);	
+HELLO_FORGOTTEN_ON_CLOSE	src/main/java/app/feedgateway/FeedGatewayService.java	patternAlerts.forget(socketId);	
+RESET_NOT_MARKED	src/main/java/app/feedgateway/PatternAlertRelay.java	\"reset\":" + reset	\"reset\":" + false
+REPLY_NOT_SENT	src/main/java/app/feedgateway/FeedGatewayService.java	send(session, reply[0], reply[1]);   // an alert event name	// an alert event name
+ALERT_FRAMES_NOT_ALLOWLISTED	src/main/java/app/feedgateway/FeedGatewayService.java	            PatternAlertRelay.REGULAR_EVENT, PatternAlertRelay.ESTIMATE_EVENT,\n	            // none\n
+ALERTS_NOT_FIRST	src/main/java/app/feedgateway/FeedGatewayService.java	return List.copyOf(relays);	if (settings.patternAlertsActive()) { relays.add(relays.remove(0)); } return List.copyOf(relays);
+TOPICS_NOT_TOLERANT	src/main/java/app/feedgateway/FeedGatewayService.java	topics.add(settings.patternAlertsTopic());	
+ESTIMATE_BOUND_AS_REGULAR	src/main/java/app/feedgateway/FeedGatewayService.java	settings.patternAlertsEstimateTopic(), PatternAlertRelay.ESTIMATE_EVENT)	settings.patternAlertsEstimateTopic(), PatternAlertRelay.REGULAR_EVENT)
+WS_FLOOR_NOT_ENFORCED	src/main/java/app/feedgateway/GatewaySettings.java	return wsMaxQueuedBytes() < PatternAlertRelay.MIN_WS_QUEUED_BYTES	return false
+AUDIT_EMPTY_WITHOUT_COVERAGE	src/main/java/app/feedgateway/PatternAlertAudit.java	String status = !events.isEmpty() || !wms.isEmpty() ? "OK" :	String status = !events.isEmpty() ? "OK" :
+AUDIT_AFTER_IGNORED	src/main/java/app/feedgateway/PatternAlertAudit.java	if (e.seq() > afterSeq) {	if (true) {
+AUDIT_LIMIT_UNCAPPED	src/main/java/app/feedgateway/PatternAlertAudit.java	return n >= 1 && n <= max ? n : null;	return n >= 1 ? n : null;
+AUDIT_TRUNCATION_UNREPORTED	src/main/java/app/feedgateway/PatternAlertAudit.java	boolean truncated = after1.size() > lim;	boolean truncated = false;
+AUDIT_NEXT_AFTER_WRONG	src/main/java/app/feedgateway/PatternAlertAudit.java	page.get(page.size() - 1).seq()	page.get(0).seq()
+AUDIT_HOLE_MISSED	src/main/java/app/feedgateway/PatternAlertAudit.java	if (w.previous() > last) {	if (false) {
+AUDIT_DUPLICATE_WATERMARK_COUNTED	src/main/java/app/feedgateway/PatternAlertAudit.java	if (w.tf() != t || w.decision() <= last) {	if (w.tf() != t) {
+AUDIT_UNEVALUATED_COUNTED_AS_EVALUATED	src/main/java/app/feedgateway/PatternAlertAudit.java	if (w.evaluated()) {	if (true) {
+AUDIT_OTHER_DATE_INCLUDED	src/main/java/app/feedgateway/PatternAlertAudit.java	if (e.date().equals(date)) {	if (true) {
+AUDIT_DAYS_UNBOUNDED	src/main/java/app/feedgateway/PatternAlertAudit.java	if (n < 1 || n > DAYS_MAX) {	if (n < 1) {
+AUDIT_DAYS_NOT_NEWEST_FIRST	src/main/java/app/feedgateway/PatternAlertAudit.java	.thenComparingLong(Ev::seq).reversed());	.thenComparingLong(Ev::seq));
+AUDIT_STATUS_TEXT_CHANGED	src/main/java/app/feedgateway/PatternAlertAudit.java	case "SUPPRESSED_STALE" -> "Not alerted: service was catching up";	case "SUPPRESSED_STALE" -> "Not alerted";
+AUDIT_READ_UNCOMMITTED	src/main/java/app/feedgateway/PatternAlertAudit.java	"read_committed"	"read_uncommitted"
+AUDIT_NOT_SERIALISED	src/main/java/app/feedgateway/PatternAlertAudit.java	new Semaphore(1)	new Semaphore(100)
+AUDIT_UNREADABLE_AS_EMPTY	src/main/java/app/feedgateway/PatternAlertAudit.java	scan.error = "the topic " + topic + " does not exist";	
+AUDIT_DEADLINE_EXTENDED	src/main/java/app/feedgateway/PatternAlertAudit.java	long deadline = clock.getAsLong() + settings.patternAlertsAuditTimeoutMs();	long deadline = clock.getAsLong() + 100 * settings.patternAlertsAuditTimeoutMs();
+AUDIT_OUTSIDE_RETENTION_AS_EMPTY	src/main/java/app/feedgateway/PatternAlertAudit.java	dateEndMs < clock.getAsLong() - settings.patternAlertsRetentionMs() || 	false || 
+AUDIT_SECURITY_NOT_APPLIED	src/main/java/app/feedgateway/PatternAlertAudit.java	settings.applyKafkaSecurity(p);   // TLS/SASL	// TLS/SASL
+AUDIT_RETAINED_BUDGET_IGNORED	src/main/java/app/feedgateway/PatternAlertAudit.java	if (scan.retainedBytes > retainedMax) {	if (false) {
+AUDIT_EVENT_SEQ_UNCHECKED	src/main/java/app/feedgateway/PatternAlertAudit.java	!DATE.matcher(date).matches() || seq <= 0 || tf < 0	!DATE.matcher(date).matches() || tf < 0
+AUDIT_EVENT_SERVICE_UNCHECKED	src/main/java/app/feedgateway/PatternAlertAudit.java	 || !SERVICE.equals(String.valueOf(r.get("service"))) || !DATE.matcher(date).matches() || seq <= 0	 || !DATE.matcher(date).matches() || seq <= 0
+AUDIT_UNKNOWN_DISPOSITION_ACCEPTED	src/main/java/app/feedgateway/PatternAlertAudit.java	 || "UNKNOWN".equals(disposition)	
+AUDIT_OVERSIZE_RETAINED	src/main/java/app/feedgateway/PatternAlertAudit.java	AvroFrameJson.render(r, EVENT_MAX_CHARS, false)	AvroFrameJson.render(r, Integer.MAX_VALUE, false)
+AUDIT_OVERSIZE_NOT_COUNTED	src/main/java/app/feedgateway/PatternAlertAudit.java	scan.oversize++;   // too large to hold	// too large to hold
+AUDIT_WATERMARK_UNVALIDATED	src/main/java/app/feedgateway/PatternAlertAudit.java	 || decision < 0 || previous < -1 || previous >= decision	
+AUDIT_OTHER_DISPOSITIONS_LOST	src/main/java/app/feedgateway/PatternAlertAudit.java	.append(events.size() - known)	.append(0)
+AUDIT_ALL_REJECTED_AS_EMPTY	src/main/java/app/feedgateway/PatternAlertAudit.java	scan.undecodable + scan.invalid + scan.oversize > 0) {\n                scan.error = "no usable record: " + (scan.undecodable + scan.invalid + scan.oversize) + " records of the topic were rejected";\n            }\n            if (scan.error != null) {\n                return unreadable(p, null,	false) {\n                scan.error = "no usable record: " + (scan.undecodable + scan.invalid + scan.oversize) + " records of the topic were rejected";\n            }\n            if (scan.error != null) {\n                return unreadable(p, null,
+AUDIT_OFFSETS_CALL_UNBOUNDED	src/main/java/app/feedgateway/PatternAlertAudit.java	consumer.offsetsForTimes(zeros(partitions), remaining(deadline))	consumer.offsetsForTimes(zeros(partitions), Duration.ofHours(1))
+AUDIT_UNREADABLE_WITHOUT_REJECTED	src/main/java/app/feedgateway/PatternAlertAudit.java	+ ",\"rejected\":" + rejected(scan) + ",\"events\":[],\"truncated\":false,\"coverage\":{}}");	+ ",\"rejected\":{}" + ",\"events\":[],\"truncated\":false,\"coverage\":{}}");
+RELAY_KIND_VOCABULARY_OPEN	src/main/java/app/feedgateway/PatternAlertRelay.java	indexOf(KINDS, kind) < 0	UNKNOWN.equals(kind)
