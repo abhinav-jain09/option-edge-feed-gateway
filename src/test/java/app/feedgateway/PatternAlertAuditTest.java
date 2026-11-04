@@ -119,8 +119,11 @@ class PatternAlertAuditTest {
         }
 
         Rig put(GenericRecord r) {
-            long ts = (Long) r.get("asOfMs");
-            records.add(new Object[] {serializer.serialize(topic, r), ts});
+            return putAt(r, (Long) r.get("asOfMs"));
+        }
+
+        Rig putAt(GenericRecord r, long timestamp) {
+            records.add(new Object[] {serializer.serialize(topic, r), timestamp});
             return this;
         }
 
@@ -269,6 +272,17 @@ class PatternAlertAuditTest {
         assertEquals("EMPTY", json(audit.byDate("regular", "2026-11-04", null, null)).get("status").asText(), "a recent date without records is quiet, not lost");
         JsonNode beforeData = json(audit.byDate("regular", "2026-11-01", null, null));
         assertEquals("OUTSIDE_RETENTION", beforeData.get("status").asText(), "older than the earliest surviving record on the topic");
+    }
+
+    @Test
+    void aDateOlderThanTheRetentionIsOutsideItEvenWhenOlderRecordsHaveNotBeenDeletedYet() {
+        Rig rig = new Rig(TOPIC);
+        long oct19 = java.time.ZonedDateTime.of(2026, 10, 19, 12, 0, 0, 0, java.time.ZoneId.of("America/New_York")).toInstant().toEpochMilli();
+        rig.putAt(PatternAlertFixtures.numbered("2026-10-19", 1, "RAISED", 40), oct19);   // the broker has not deleted it yet: the earliest record is older than the date asked for
+        rig.clock.set(PatternAlertFixtures.OPEN_MS + 86_400_000L);                          // 2026-11-04: a week back is 2026-10-28
+        PatternAlertAudit audit = rig.audit();
+        assertEquals("OUTSIDE_RETENTION", json(audit.byDate("regular", "2026-10-20", null, null)).get("status").asText(), "older than the retention, nothing recorded: lost, not quiet");
+        assertEquals("EMPTY", json(audit.byDate("regular", "2026-11-02", null, null)).get("status").asText(), "inside the retention and quiet");
     }
 
     @Test
