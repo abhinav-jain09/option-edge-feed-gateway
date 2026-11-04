@@ -19,7 +19,26 @@ class EsLiquidityWallHistoryControllerTest {
     @Test
     void aDisabledRelayAnswersNotFound() {
         EsLiquidityWallHistoryController c = new EsLiquidityWallHistoryController(() -> false, new EsLiquidityWallHistory(), OPEN);
-        assertEquals(404, c.serve(null, null, NOW).getStatusCode().value());
+        ResponseEntity<String> off = c.serve(null, null, NOW);
+        assertEquals(404, off.getStatusCode().value());
+        assertEquals("no-store", off.getHeaders().getCacheControl(), "a negative answer is never cached: the page must recover when the relay comes up");
+    }
+
+    @Test
+    void everyResponsePathIsNoStore() {
+        EsLiquidityWallHistory history = new EsLiquidityWallHistory();
+        history.foldDashboard(EsLiquidityWallFixtures.dashboard(NOW));
+        EsLiquidityWallHistoryController c = new EsLiquidityWallHistoryController(() -> true, history, OPEN);
+        ResponseEntity<String> other = c.serve(history.tradeDate().minusDays(1).toString(), null, NOW + 100);
+        assertEquals(404, other.getStatusCode().value());
+        assertEquals("no-store", other.getHeaders().getCacheControl());
+        ResponseEntity<String> last = null;
+        for (int i = 0; i < 121; i++) {
+            last = c.serve(null, null, NOW + 200);
+        }
+        assertEquals(429, last.getStatusCode().value());
+        assertEquals("no-store", last.getHeaders().getCacheControl());
+        assertTrue(last.getHeaders().containsKey("Retry-After"));
     }
 
     @Test

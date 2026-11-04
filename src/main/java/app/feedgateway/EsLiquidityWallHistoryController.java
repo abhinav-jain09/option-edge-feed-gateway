@@ -49,22 +49,27 @@ public class EsLiquidityWallHistoryController {
     }
 
     ResponseEntity<String> serve(String tradeDate, String authorization, long now) {
+        // every response path is no-store: a cached 404/401/403/429 would keep the page unavailable after the relay, the token or the budget recovers
         if (!enabled.getAsBoolean()) {
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+            return noStore(ResponseEntity.status(HttpStatus.NOT_FOUND)).build();
         }
         LiquidityHistoryAuth.Result authResult = auth.authenticate(authorization);
         if (authResult.status() != 200) {
-            return ResponseEntity.status(authResult.status()).build();
+            return noStore(ResponseEntity.status(authResult.status())).build();
         }
         long retryAfterSeconds = tryAcquire(authResult.principal(), now);
         if (retryAfterSeconds > 0) {
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header(HttpHeaders.RETRY_AFTER, Long.toString(retryAfterSeconds)).build();
+            return noStore(ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)).header(HttpHeaders.RETRY_AFTER, Long.toString(retryAfterSeconds)).build();
         }
         if (tradeDate != null && !tradeDate.isBlank() && (history.tradeDate() == null || !tradeDate.trim().equals(history.tradeDate().toString()))) {
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).contentType(MediaType.APPLICATION_JSON)
+            return noStore(ResponseEntity.status(HttpStatus.NOT_FOUND)).contentType(MediaType.APPLICATION_JSON)
                     .body("{\"error\":\"only the current trade date is held\",\"tradeDate\":" + (history.tradeDate() == null ? "null" : "\"" + history.tradeDate() + "\"") + "}");
         }
-        return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON).header(HttpHeaders.CACHE_CONTROL, "no-store").body(history.render(now));
+        return noStore(ResponseEntity.ok()).contentType(MediaType.APPLICATION_JSON).body(history.render(now));
+    }
+
+    private static ResponseEntity.BodyBuilder noStore(ResponseEntity.BodyBuilder b) {
+        return b.header(HttpHeaders.CACHE_CONTROL, "no-store");
     }
 
     /** 0 when allowed, else the Retry-After seconds: the per-principal minute budget of the other authenticated reads. */
