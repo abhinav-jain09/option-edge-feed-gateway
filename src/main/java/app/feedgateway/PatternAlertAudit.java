@@ -43,7 +43,11 @@ final class PatternAlertAudit {
     static final int DAYS_LIMIT_MAX = 500;
     static final int DAYS_MAX = 7;
     /** A read that sees more records than this is refused (a week of the topic is about ten thousand). */
-    static final int RECORD_BOUND = 500_000;
+    static final int RECORD_BOUND = 100_000;
+    /** A rendered event above this is rejected and counted, never retained (the relay refuses above 4 KiB; the audit is more lenient so it can show what the relay dropped). */
+    static final int EVENT_MAX_CHARS = 16_384;
+    /** The rendered events one read may retain; beyond it the read is refused as unreadable rather than risking the heap of the gateway. */
+    static final long RETAINED_MAX_BYTES = 32L * 1024 * 1024;
 
     private static final String EVENT_SCHEMA = "com.optionsedge.contracts.marketstructure.alerts.PatternAlertEvent";
     private static final String WATERMARK_SCHEMA = "com.optionsedge.contracts.marketstructure.alerts.PatternAlertWatermark";
@@ -51,6 +55,8 @@ final class PatternAlertAudit {
     private static final ZoneId EASTERN = ZoneId.of("America/New_York");
     private static final String[] TF_ENUM = {"TF_1M", "TF_5M", "TF_15M"};
     private static final String[] DISPOSITIONS = {"RAISED", "SUPPRESSED_SELF_CHECK", "SUPPRESSED_REPLAY", "SUPPRESSED_STALE"};
+    private static final String[] KINDS = {"BREAK", "RETURN", "FAILED"};
+    private static final String SERVICE = "market-structure";
     private static final ObjectMapper JSON = new ObjectMapper();
 
     /** The closed table of the page's wording for a disposition. */
@@ -76,7 +82,10 @@ final class PatternAlertAudit {
     private static final class Scan {
         final List<Ev> events = new ArrayList<>();
         final List<Wm> watermarks = new ArrayList<>();
-        long undecodable;
+        long undecodable;   // not an Avro record of the registry, or of another subject
+        long invalid;       // an alert record that contradicts the design's record shape (version, service, date, sequence, vocabulary)
+        long oversize;      // an event whose rendered form exceeds EVENT_MAX_CHARS
+        long retainedBytes;
         Long earliestTimestamp;
         String error;   // non-null: the read failed, nothing in it is to be trusted
     }
@@ -86,6 +95,7 @@ final class PatternAlertAudit {
     private final BiFunction<String, byte[], Object> decoder;
     private final LongSupplier clock;
     private final Semaphore one = new Semaphore(1);
+    private long retainedMax = RETAINED_MAX_BYTES;
     private final AtomicLong requests = new AtomicLong();
     private final AtomicLong busy = new AtomicLong();
 
@@ -101,6 +111,12 @@ final class PatternAlertAudit {
         this.clock = clock;
     }
 
+    /** Test seam: a smaller byte budget for the events one read may hold. */
+    PatternAlertAudit withRetainedMax(long bytes) {
+        this.retainedMax = bytes;
+        return this;
+    }
+
     static Properties consumerProperties(GatewaySettings settings) {
         Properties p = new Properties();
         p.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, settings.bootstrapServers());
@@ -110,6 +126,7 @@ final class PatternAlertAudit {
         p.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
         p.put(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, "false");   // a reader never creates a topic
         p.put(ConsumerConfig.CLIENT_ID_CONFIG, settings.groupIdBase() + "-pattern-alert-audit");
+        settings.applyKafkaSecurity(p);   // TLS/SASL when configured, exactly as for the gateway's other consumers
         return p;
     }
 
@@ -157,6 +174,9 @@ final class PatternAlertAudit {
             long startMs = LocalDate.parse(date).atStartOfDay(EASTERN).toInstant().toEpochMilli() - 86_400_000L;
             long endMs = LocalDate.parse(date).plusDays(1).atStartOfDay(EASTERN).toInstant().toEpochMilli();
             Scan scan = scan(topic(p), startMs);
+            if (scan.error == null && scan.events.isEmpty() && scan.watermarks.isEmpty() && scan.undecodable + scan.invalid + scan.oversize > 0) {
+                scan.error = "no usable record: " + (scan.undecodable + scan.invalid + scan.oversize) + " records of the topic were rejected";
+            }
             if (scan.error != null) {
                 return unreadable(p, null, scan.error);
             }
@@ -183,7 +203,7 @@ final class PatternAlertAudit {
             boolean truncated = after1.size() > lim;
             List<Ev> page = truncated ? after1.subList(0, lim) : after1;
             StringBuilder sb = new StringBuilder("{\"date\":").append(quote(date)).append(",\"profile\":").append(quote(PatternAlertRelay.PROFILE[p]))
-                    .append(',').append(retention(p, scan)).append(",\"status\":\"").append(status).append("\",\"events\":[");
+                    .append(',').append(retention(p, scan)).append(",\"status\":\"").append(status).append("\",\"rejected\":").append(rejected(scan)).append(",\"events\":[");
             for (int i = 0; i < page.size(); i++) {
                 sb.append(i == 0 ? "" : ",").append(eventJson(page.get(i), false));
             }
@@ -224,6 +244,9 @@ final class PatternAlertAudit {
         try {
             requests.incrementAndGet();
             Scan scan = scan(topic(p), -1L);   // the topic holds a week: read it whole, the newest N session dates are chosen from what is there
+            if (scan.error == null && scan.events.isEmpty() && scan.watermarks.isEmpty() && scan.undecodable + scan.invalid + scan.oversize > 0) {
+                scan.error = "no usable record: " + (scan.undecodable + scan.invalid + scan.oversize) + " records of the topic were rejected";
+            }
             if (scan.error != null) {
                 return unreadable(p, n, scan.error);
             }
@@ -241,7 +264,7 @@ final class PatternAlertAudit {
             boolean truncated = events.size() > lim;
             List<Ev> page = truncated ? events.subList(0, lim) : events;
             StringBuilder sb = new StringBuilder("{\"days\":").append(n).append(",\"profile\":").append(quote(PatternAlertRelay.PROFILE[p]))
-                    .append(',').append(retention(p, scan)).append(",\"status\":\"").append(chosen.isEmpty() ? "EMPTY" : "OK").append("\",\"events\":[");
+                    .append(',').append(retention(p, scan)).append(",\"status\":\"").append(chosen.isEmpty() ? "EMPTY" : "OK").append("\",\"rejected\":").append(rejected(scan)).append(",\"events\":[");
             for (int i = 0; i < page.size(); i++) {
                 sb.append(i == 0 ? "" : ",").append(eventJson(page.get(i), true));
             }
@@ -288,10 +311,8 @@ final class PatternAlertAudit {
             consumer.assign(partitions);
             Map<TopicPartition, Long> begin = consumer.beginningOffsets(partitions);
             Map<TopicPartition, Long> end = consumer.endOffsets(partitions);
-            Map<TopicPartition, Long> first = new HashMap<>();
             for (Map.Entry<TopicPartition, OffsetAndTimestamp> e : consumer.offsetsForTimes(zeros(partitions)).entrySet()) {
                 if (e.getValue() != null) {
-                    first.put(e.getKey(), e.getValue().timestamp());
                     scan.earliestTimestamp = scan.earliestTimestamp == null ? e.getValue().timestamp() : Math.min(scan.earliestTimestamp, e.getValue().timestamp());
                 }
             }
@@ -312,6 +333,10 @@ final class PatternAlertAudit {
                         return scan;
                     }
                     classify(scan, record);
+                    if (scan.retainedBytes > retainedMax) {
+                        scan.error = "the events of the topic exceed the " + retainedMax + " bytes one read may hold";
+                        return scan;
+                    }
                 }
             }
         } catch (RuntimeException e) {
@@ -353,33 +378,58 @@ final class PatternAlertAudit {
             }
             String schema = r.getSchema().getFullName();
             if (EVENT_SCHEMA.equals(schema)) {
-                String json = AvroFrameJson.render(r, Integer.MAX_VALUE, false);
-                int tf = PatternAlertRelay.indexOf(TF_ENUM, String.valueOf(r.get("timeframe")));
-                if (json == null || tf < 0) {
-                    scan.undecodable++;
-                    return;
-                }
-                scan.events.add(new Ev(String.valueOf(r.get("sessionDate")), (Long) r.get("eventSeq"), String.valueOf(r.get("disposition")), TaRelay.TF[tf], json));
+                event(scan, r);
             } else if (WATERMARK_SCHEMA.equals(schema)) {
-                int tf = PatternAlertRelay.indexOf(TF_ENUM, String.valueOf(r.get("timeframe")));
-                if (tf < 0) {
-                    scan.undecodable++;
-                    return;
-                }
-                scan.watermarks.add(new Wm(String.valueOf(r.get("sessionDate")), tf, (Integer) r.get("decisionOrdinal"), (Integer) r.get("previousDecisionOrdinal"),
-                        (Long) r.get("asOfMs"), (Boolean) r.get("evaluated")));
+                watermark(scan, r);
             } else {
                 scan.undecodable++;
             }
         } catch (RuntimeException e) {
-            scan.undecodable++;
+            scan.invalid++;   // a missing or mistyped field: the record contradicts the design's shape
         }
+    }
+
+    private static void event(Scan scan, GenericRecord r) {
+        String date = String.valueOf(r.get("sessionDate"));
+        long seq = (Long) r.get("eventSeq");
+        String disposition = String.valueOf(r.get("disposition"));
+        int tf = PatternAlertRelay.indexOf(TF_ENUM, String.valueOf(r.get("timeframe")));
+        if (!Integer.valueOf(1).equals(r.get("schemaVersion")) || !SERVICE.equals(String.valueOf(r.get("service"))) || !DATE.matcher(date).matches() || seq <= 0 || tf < 0
+                || PatternAlertRelay.indexOf(KINDS, String.valueOf(r.get("kind"))) < 0 || "UNKNOWN".equals(disposition)) {
+            scan.invalid++;
+            return;
+        }
+        String json = AvroFrameJson.render(r, EVENT_MAX_CHARS, false);
+        if (json == null) {
+            scan.oversize++;   // too large to hold (or not renderable): counted, never retained
+            return;
+        }
+        scan.retainedBytes += StudiesRelay.utf8Length(json);
+        scan.events.add(new Ev(date, seq, disposition, TaRelay.TF[tf], json));
+    }
+
+    private static void watermark(Scan scan, GenericRecord r) {
+        String date = String.valueOf(r.get("sessionDate"));
+        int tf = PatternAlertRelay.indexOf(TF_ENUM, String.valueOf(r.get("timeframe")));
+        int decision = (Integer) r.get("decisionOrdinal");
+        int previous = (Integer) r.get("previousDecisionOrdinal");
+        if (!Integer.valueOf(1).equals(r.get("schemaVersion")) || !SERVICE.equals(String.valueOf(r.get("service"))) || !DATE.matcher(date).matches() || tf < 0
+                || decision < 0 || previous < -1 || previous >= decision) {
+            scan.invalid++;
+            return;
+        }
+        scan.watermarks.add(new Wm(date, tf, decision, previous, (Long) r.get("asOfMs"), (Boolean) r.get("evaluated")));
     }
 
     // ── rendering ───────────────────────────────────────────────────────────────────────────────────
 
     private static String eventJson(Ev e, boolean withStatus) {
         return e.json().substring(0, e.json().length() - 1) + ",\"tf\":\"" + e.tf() + "\"" + (withStatus ? ",\"statusText\":" + quote(statusText(e.disposition())) : "") + "}";
+    }
+
+    /** What the read refused, so a response is never an apparently trustworthy answer over records it silently skipped. */
+    private static String rejected(Scan scan) {
+        return "{\"undecodable\":" + scan.undecodable + ",\"invalid\":" + scan.invalid + ",\"oversize\":" + scan.oversize + "}";
     }
 
     private String retention(int p, Scan scan) {
@@ -433,11 +483,13 @@ final class PatternAlertAudit {
         }
         events.forEach(e -> n.merge(e.disposition(), 1, Integer::sum));
         StringBuilder sb = new StringBuilder("{");
+        int known = 0;
         int i = 0;
         for (String d : DISPOSITIONS) {
             sb.append(i++ == 0 ? "" : ",").append('"').append(d).append("\":").append(n.get(d));
+            known += n.get(d);
         }
-        return sb.append('}').toString();
+        return sb.append(",\"OTHER\":").append(events.size() - known).append('}').toString();   // a later additive disposition is counted, never lost
     }
 
     private Response unreadable(int p, Integer days, String error) {

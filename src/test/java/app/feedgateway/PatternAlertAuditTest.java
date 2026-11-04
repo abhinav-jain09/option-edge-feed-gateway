@@ -388,6 +388,66 @@ class PatternAlertAuditTest {
     }
 
     @Test
+    void aRecordThatContradictsTheDesignsShapeIsRejectedAndCountedNeverPresentedAsAuditTruth() {
+        Rig rig = threeEvents();
+        rig.put(PatternAlertFixtures.with(PatternAlertFixtures.numbered(DATE, 10, "RAISED", 70), "schemaVersion", 2));
+        rig.put(PatternAlertFixtures.with(PatternAlertFixtures.numbered(DATE, 11, "RAISED", 71), "service", "somebody-else"));
+        rig.put(PatternAlertFixtures.with(PatternAlertFixtures.numbered(DATE, 12, "RAISED", 72), "sessionDate", "03/11/2026"));
+        rig.put(PatternAlertFixtures.with(PatternAlertFixtures.numbered(DATE, 0, "RAISED", 73), "eventSeq", 0L));
+        rig.put(PatternAlertFixtures.with(PatternAlertFixtures.numbered(DATE, 14, "RAISED", 74), "disposition", "UNKNOWN"));
+        rig.put(PatternAlertFixtures.with(PatternAlertFixtures.numbered(DATE, 15, "RAISED", 75), "timeframe", "UNKNOWN"));
+        rig.put(PatternAlertFixtures.with(PatternAlertFixtures.numbered(DATE, 16, "RAISED", 76), "tip", "x".repeat(PatternAlertAudit.EVENT_MAX_CHARS)));   // oversize
+        rig.put(PatternAlertFixtures.watermark(DATE, "TF_1M", 40, 40, true, 0));   // previous >= decision
+        rig.put(PatternAlertFixtures.with(PatternAlertFixtures.watermark(DATE, "TF_1M", 41, 40, true, 0), "service", "somebody-else"));
+        rig.putRaw(new byte[] {9, 9}, 1L);
+        JsonNode r = json(rig.audit().byDate("regular", DATE, null, null));
+        assertEquals("OK", r.get("status").asText());
+        assertEquals(3, r.get("events").size(), "only the three well-formed events");
+        assertEquals(8, r.get("rejected").get("invalid").asInt(), "six malformed events (version, service, date, sequence, disposition, timeframe) and two malformed watermarks: " + r.get("rejected"));
+        assertEquals(1, r.get("rejected").get("oversize").asInt());
+        assertEquals(1, r.get("rejected").get("undecodable").asInt());
+        assertEquals(3, r.get("coverage").get("1m").get("folds").asInt(), "the two malformed watermarks are not coverage");
+        assertEquals(0, r.get("coverage").get("1m").get("holes").size());
+        assertEquals(0, r.get("counts").get("OTHER").asInt());
+    }
+
+    @Test
+    void aTopicWhereNothingIsUsableIsUnreadableAndAZeroRejectedBlockIsAlwaysThere() {
+        Rig bad = new Rig(TOPIC);
+        bad.putRaw(new byte[] {1}, 1L);
+        bad.put(PatternAlertFixtures.with(PatternAlertFixtures.numbered(DATE, 1, "RAISED", 70), "schemaVersion", 2));
+        PatternAlertAudit.Response r = bad.audit().byDate("regular", DATE, null, null);
+        assertEquals(503, r.status());
+        assertEquals("UNREADABLE", json(r).get("status").asText());
+        assertTrue(json(r).get("error").asText().contains("rejected"));
+        assertEquals(503, bad.audit.byDays("regular", "7", null).status());
+        JsonNode ok = json(threeEvents().audit().byDays("regular", "7", null));
+        assertEquals("{\"undecodable\":0,\"invalid\":0,\"oversize\":0}", ok.get("rejected").toString());
+    }
+
+    @Test
+    void aReadThatWouldHoldMoreThanItsByteBudgetIsRefusedAsUnreadable() {
+        Rig rig = new Rig(TOPIC);
+        for (int i = 1; i <= 20; i++) {
+            rig.put(PatternAlertFixtures.numbered(DATE, i, "RAISED", 100 + i));
+        }
+        PatternAlertAudit.Response r = rig.audit().withRetainedMax(5_000).byDate("regular", DATE, null, null);
+        assertEquals(503, r.status());
+        assertTrue(json(r).get("error").asText().contains("5000 bytes"), r.body());
+        assertEquals(200, rig.audit().byDate("regular", DATE, null, null).status(), "and the default budget holds a real day many times over");
+    }
+
+    @Test
+    void anUnknownButWellFormedDispositionIsKeptAndCountedAsOther() {
+        Rig rig = new Rig(TOPIC);
+        rig.watermarks(DATE, 1);
+        rig.put(PatternAlertFixtures.triangleBreak(1, "RAISED"));
+        JsonNode r = json(rig.audit().byDate("regular", DATE, null, null));
+        assertEquals(0, r.get("counts").get("OTHER").asInt());
+        assertEquals(1, r.get("counts").get("RAISED").asInt());
+    }
+
+    @Test
     void theStatusTextTableIsClosedForEveryDisposition() {
         assertEquals("Raised", PatternAlertAudit.statusText("RAISED"));
         assertEquals("Not alerted: service was catching up", PatternAlertAudit.statusText("SUPPRESSED_STALE"));
@@ -428,5 +488,8 @@ class PatternAlertAuditTest {
         assertEquals("false", p.get("enable.auto.commit"));
         assertEquals("org.apache.kafka.common.serialization.ByteArrayDeserializer", p.get("value.deserializer"));
         assertNotNull(p.get("bootstrap.servers"));
+        GatewaySettings secure = spy(new GatewaySettings());
+        doReturn("SASL_SSL").when(secure).kafkaSecurityProtocol();
+        assertEquals("SASL_SSL", PatternAlertAudit.consumerProperties(secure).get("security.protocol"), "TLS/SASL as for every other consumer of the gateway");
     }
 }

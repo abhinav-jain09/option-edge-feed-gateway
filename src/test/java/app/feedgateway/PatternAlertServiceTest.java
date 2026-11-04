@@ -409,7 +409,7 @@ class PatternAlertServiceTest {
         assertEquals(0, p.get("events").size());
         int mark = early.sent.size();
         s.handleFootprintBasicMessage(early.socket, resume("initial", "regular", PatternAlertFixtures.DATE, 0));
-        assertEquals("resume-error", reply(early, mark).get("type").asText(), "not ready: no resume");
+        assertEquals("not-ready", reply(early, mark).get("error").asText(), "not ready: no resume");
         // the recovery reads history and the relay becomes ready; the promotion's per-socket step runs in finishTaRecovery (see PatternAlertLoopTest)
         now.set(PatternAlertFixtures.barEnd(160) + 5_000L);
         r.beginRecovery();
