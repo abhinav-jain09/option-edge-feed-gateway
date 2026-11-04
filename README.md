@@ -371,3 +371,16 @@ Status checks:
 curl http://127.0.0.1:8091/health
 curl http://127.0.0.1:8080/api/config
 ```
+
+### Rithmic browser depth cadence
+
+The read-only `RithmicDepthRelay` consumes the complete `options.rithmic.es-depth-spx`
+Kafka stream. Authenticated WebSocket fanout sends the latest complete depth snapshot
+at most once per 250 ms during steady state; the consumer's 100 ms poll also flushes
+an otherwise quiet pending snapshot. Intermediate browser snapshots are replaced,
+not merged, and source timestamps, quantities, prices and provenance are unchanged.
+Kafka retention and the collector's full-rate stream are unaffected. First books,
+stream changes, unavailable-to-ready and ready-to-unavailable transitions bypass the
+cadence. Existing 10-second source and 30-second basis freshness limits still apply;
+reconnect replay uses the freshest validated cache. This display cadence does not
+apply to trades or orders. Home and Order retain one-second heatmap samples.

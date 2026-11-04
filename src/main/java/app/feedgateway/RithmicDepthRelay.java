@@ -20,8 +20,10 @@ final class RithmicDepthRelay {
     private final GatewaySettings settings;
     private final ObjectProvider<FeedGatewayService> gateway;
     private final AtomicBoolean running=new AtomicBoolean();
-    private record Cached(String json,long source,long emitted,long basisTime,boolean mapped) {}
-    private Cached latest;
+    static final long DISPLAY_INTERVAL_MS=250;
+    private record Cached(String json,long source,long emitted,long basisTime,boolean mapped,String stream,long sequence) {}
+    private Cached latest, published;
+    private long publishedAt;
     private volatile KafkaConsumer<String,Object> consumer;
     private Thread thread;
     RithmicDepthRelay(GatewaySettings settings,ObjectProvider<FeedGatewayService> gateway){this.settings=settings;this.gateway=gateway;}
@@ -45,8 +47,10 @@ final class RithmicDepthRelay {
                     partitions.add(new TopicPartition(partition.topic(),partition.partition()));
                 if(partitions.isEmpty()||partitions.size()>16)throw new IllegalStateException("Depth topic partition bounds");
                 c.assign(partitions);c.seekToEnd(partitions);
-                while(running.get())for(var record:c.poll(Duration.ofMillis(250))){
-                    accept(record.key(),record.value(),System.currentTimeMillis());
+                while(running.get()){
+                    for(var record:c.poll(Duration.ofMillis(100)))
+                        accept(record.key(),record.value(),System.currentTimeMillis());
+                    flush(System.currentTimeMillis());
                 }
             }catch(WakeupException stopped){if(running.get())clear();}
             catch(RuntimeException unavailable){clear();}
@@ -58,16 +62,27 @@ final class RithmicDepthRelay {
         String json=RithmicDepthJson.render(key,value,now);
         if(json!=null){
             var r=(GenericRecord)value;boolean mapped=Boolean.TRUE.equals(r.get("mappingReady"));
-            latest=new Cached(json,(Long)r.get("receivedAtMs"),(Long)r.get("emittedAtMs"),mapped?(Long)r.get("basisEventTimeMs"):0,mapped);
-            gateway.getObject().streamRithmicDepth(json);
+            String stream=r.get("streamId").toString();long sequence=(Long)r.get("sequence");
+            if(latest!=null&&latest.stream().equals(stream)&&sequence<=latest.sequence())return;
+            latest=new Cached(json,(Long)r.get("receivedAtMs"),(Long)r.get("emittedAtMs"),mapped?(Long)r.get("basisEventTimeMs"):0,mapped,stream,sequence);
+            // Snapshot cadence bounds browser ingress; status/recovery and stream changes stay immediate.
+            if(published==null||published.mapped()!=mapped||!published.stream().equals(stream))publish(now);
+            else flush(now);
         }
     }
-    synchronized void replay(java.util.function.Consumer<String> send){
-        var value=latest;if(value==null)return;long now=System.currentTimeMillis();
-        if(value.emitted()<now-10000||value.emitted()>now+5000)return;
-        if(value.mapped()&&(value.source()<now-10000||value.source()>now+5000||value.basisTime()<now-30000||value.basisTime()>now+5000))return;
-        send.accept(value.json());
+    synchronized void flush(long now){
+        if(latest!=null&&latest!=published&&(now-publishedAt>=DISPLAY_INTERVAL_MS||now<publishedAt)&&fresh(latest,now))publish(now);
     }
-    private synchronized void clear(){latest=null;}
+    private void publish(long now){
+        gateway.getObject().streamRithmicDepth(latest.json());published=latest;publishedAt=now;
+    }
+    private static boolean fresh(Cached value,long now){
+        return value.emitted()>=now-10000&&value.emitted()<=now+5000
+            &&(!value.mapped()||(value.source()>=now-10000&&value.source()<=now+5000&&value.basisTime()>=now-30000&&value.basisTime()<=now+5000));
+    }
+    synchronized void replay(java.util.function.Consumer<String> send){
+        var value=latest;if(value!=null&&fresh(value,System.currentTimeMillis()))send.accept(value.json());
+    }
+    private synchronized void clear(){latest=null;published=null;publishedAt=0;}
     @PreDestroy void stop(){running.set(false);var c=consumer;if(c!=null)c.wakeup();if(thread!=null)try{thread.join(5000);}catch(InterruptedException e){Thread.currentThread().interrupt();}}
 }
