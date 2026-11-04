@@ -40,6 +40,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FeedGatewayServiceTest {
@@ -2082,6 +2083,79 @@ class FeedGatewayServiceTest {
         expected.fieldNames().forEachRemaining(extra::remove);
         assertEquals(java.util.Set.of("marketDataSource", "sessionDate", "source"), extra, "only the provenance stamp was added");
         assertTrue(golden.contains("\"revision\":5") && golden.contains("\"runId\":\"run-A\""), golden);
+    }
+
+    /** The version-1 (id 2001) form of a current IndicatorSnapshot record: the same values under the frozen schema, which has no sessionSegment. */
+    private static org.apache.avro.generic.GenericRecord snapshotWrittenAsVersionOne(org.apache.avro.generic.GenericRecord current) throws Exception {
+        org.apache.avro.Schema v1 = com.optionsedge.contracts.indicators.avro.IndicatorSchemas.SUBJECTS.stream()
+                .filter(s -> "IndicatorSnapshot".equals(s.simpleName())).findFirst().orElseThrow().priorSchema();
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        org.apache.avro.io.BinaryEncoder encoder = org.apache.avro.io.EncoderFactory.get().binaryEncoder(bytes, null);
+        new org.apache.avro.generic.GenericDatumWriter<org.apache.avro.generic.GenericRecord>(current.getSchema()).write(current, encoder);
+        encoder.flush();
+        org.apache.avro.generic.GenericRecord old = new org.apache.avro.generic.GenericDatumReader<org.apache.avro.generic.GenericRecord>(current.getSchema(), v1)
+                .read(null, org.apache.avro.io.DecoderFactory.get().binaryDecoder(bytes.toByteArray(), null));
+        assertNull(old.getSchema().getField("sessionSegment"), "the fixture really is a version-1 record");
+        return old;
+    }
+
+    private static org.apache.avro.generic.GenericRecord currentSnapshotWithNullSessionSegment() {
+        return IndicatorSnapshotFixture.keepingSequence(() -> IndicatorSnapshotFixture.generic(IndicatorSnapshotFixture.record(sessionSegmentNullSnapshot())));
+    }
+
+    private static String sessionSegmentNullSnapshot() {
+        return "{\"symbol\":\"SPX\",\"runId\":\"run-version-one\",\"revision\":7,\"publishedAt\":\""
+                + java.time.Instant.ofEpochMilli(System.currentTimeMillis()) + "\",\"currentPrice\":6420.50,\"sessionSegment\":null}";
+    }
+
+    @Test
+    void aVersionOneIndicatorSnapshotIsRenderedAsTheCurrentOneWithAnAbsentSessionSegment() throws Exception {
+        // 2026-11-04: the ES snapshot topic is still written under version 1 (id 2001, no sessionSegment); the strict contract
+        // mapper threw on it, which crash-looped the Avro cache consumer and kept avroCaughtUp false. Version 1's definition is
+        // "absence reads as null", so the same values must render exactly as the current record with a null sessionSegment.
+        org.apache.avro.generic.GenericRecord current = currentSnapshotWithNullSessionSegment();
+        String golden = IndicatorSnapshotFixture.contractJson(current);
+        Method indicatorJson = FeedGatewayService.class.getDeclaredMethod("indicatorJson", Object.class, String.class);
+        indicatorJson.setAccessible(true);
+        assertEquals(golden, indicatorJson.invoke(service(), snapshotWrittenAsVersionOne(current), "indicators"),
+                "a version-1 record re-emits exactly the current record's contract JSON");
+    }
+
+    @Test
+    void aCurrentIndicatorSnapshotPassesThroughTheVersionResolutionUntouched() throws Exception {
+        org.apache.avro.generic.GenericRecord current = currentSnapshotWithNullSessionSegment();
+        Method resolve = FeedGatewayService.class.getDeclaredMethod("snapshotAtCurrentVersion", org.apache.avro.generic.GenericRecord.class);
+        resolve.setAccessible(true);
+        assertSame(current, resolve.invoke(null, current), "no copy, no re-encode for a current-version record");
+    }
+
+    @Test
+    void aVersionOneSnapshotDoesNotStopTheCacheConsumerFromCatchingUpAndBeingReplayed() throws Exception {
+        // The production loop that crashed: a version-1 record in the middle of the topic must be cached like any other, and the
+        // consumer must reach its caught-up flag (the flag every Avro-sourced cached replay is gated on).
+        FeedGatewayService service = service();
+        String topic = new GatewaySettings().indicatorsSnapshotTopic();
+        org.apache.avro.generic.GenericRecord current = currentSnapshotWithNullSessionSegment();
+        VpBroker broker = new VpBroker().topic(topic, List.of(new VolPremiumFixtures.Row("SPX", snapshotWrittenAsVersionOne(current))));
+        broker.onPoll = n -> {
+            if (n >= 2) {
+                service.setRunningForTest(false);
+            }
+        };
+        service.setRunningForTest(true);
+        java.util.concurrent.atomic.AtomicBoolean caughtUp = new java.util.concurrent.atomic.AtomicBoolean(false);
+        service.runCacheConsumerAttemptForTest("avro", Map.of(topic, new FeedGatewayService.TopicBinding("DATABENTO", "indicators")), caughtUp, broker.consumer());
+        assertTrue(caughtUp.get(), "the consumer finished its catch-up instead of throwing on the version-1 record");
+        List<String> sink = new ArrayList<>();
+        Method replay = FeedGatewayService.class.getDeclaredMethod("replayIndicatorsCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, recordingSession(sink));
+        assertEquals(1, sink.size(), "the version-1 snapshot was cached and is replayed; got: " + sink);
+        Method enrich = FeedGatewayService.class.getDeclaredMethod("enrichJson", String.class, FeedGatewayService.TopicBinding.class);
+        enrich.setAccessible(true);
+        assertEquals("{\"type\":\"indicators\",\"data\":" + enrich.invoke(service, IndicatorSnapshotFixture.contractJson(current),
+                        new FeedGatewayService.TopicBinding("DATABENTO", "indicators")) + "}", sink.get(0),
+                "the replayed envelope is exactly what the current-version record would have produced");
     }
 
     @Test

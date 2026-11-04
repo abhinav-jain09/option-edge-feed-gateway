@@ -135,6 +135,20 @@ final class IndicatorSnapshotFixture {
 
     private static int n;
 
+    /**
+     * Builds with the value sequence put back afterwards. The values {@link #build} generates grow with how many records were
+     * built before, and some tests are sensitive to that; a test that builds records of its own must not shift what the tests
+     * after it see.
+     */
+    static <T> T keepingSequence(java.util.function.Supplier<T> build) {
+        int saved = n;
+        try {
+            return build.get();
+        } finally {
+            n = saved;
+        }
+    }
+
     /** A deterministic, fully populated instance of a contract record. */
     private static Object build(Class<?> record) {
         RecordComponent[] comps = record.getRecordComponents();

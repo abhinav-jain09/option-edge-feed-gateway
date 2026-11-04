@@ -13883,11 +13883,40 @@ public class FeedGatewayService implements ReplayRunner {
             Object contract = signals
                     ? com.optionsedge.contracts.indicators.avro.AvroRecordMapper.fromAvro(record,
                             com.optionsedge.contracts.indicators.SignalContracts.IndicatorSignals.class)
-                    : com.optionsedge.contracts.indicators.avro.AvroRecordMapper.fromAvro(record,
+                    : com.optionsedge.contracts.indicators.avro.AvroRecordMapper.fromAvro(snapshotAtCurrentVersion(record),
                             com.optionsedge.contracts.indicators.IndicatorSnapshot.class);
             return com.optionsedge.contracts.indicators.IndicatorJson.writer().writeValueAsString(contract);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException(event + ": could not render the " + schema + " record as JSON", e);
+        }
+    }
+
+    private static final org.apache.avro.Schema INDICATOR_SNAPSHOT_CURRENT =
+            com.optionsedge.contracts.indicators.avro.IndicatorSnapshot.getClassSchema();
+
+    /**
+     * IndicatorSnapshot is a two-version subject (version 1 = id 2001, version 2 = id 2507, whose added GTH fields are
+     * nullable with a null default). A consumer that seeks back through a topic meets BOTH: the ES topic is still written
+     * under version 1. The generic record carries its writer's schema, and the contract mapper refuses a field its class
+     * needs but the record lacks, so one version-1 record crashed the Avro cache consumer on every restart and kept
+     * {@code avroCaughtUp} false (2026-11-04: no cached gamma replay). Avro's own writer-to-reader resolution is the
+     * contract's definition of version 1 ("absence reads as null"), so a record under any other schema is resolved onto
+     * the current one here; a current record passes through untouched.
+     */
+    private static GenericRecord snapshotAtCurrentVersion(GenericRecord record) {
+        org.apache.avro.Schema writer = record.getSchema();
+        if (writer.equals(INDICATOR_SNAPSHOT_CURRENT)) {
+            return record;
+        }
+        try {
+            java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+            org.apache.avro.io.BinaryEncoder encoder = org.apache.avro.io.EncoderFactory.get().binaryEncoder(bytes, null);
+            new org.apache.avro.generic.GenericDatumWriter<GenericRecord>(writer).write(record, encoder);
+            encoder.flush();
+            return new org.apache.avro.generic.GenericDatumReader<GenericRecord>(writer, INDICATOR_SNAPSHOT_CURRENT)
+                    .read(null, org.apache.avro.io.DecoderFactory.get().binaryDecoder(bytes.toByteArray(), null));
+        } catch (IOException e) {
+            throw new IllegalStateException("indicators: a " + writer.getFullName() + " record could not be resolved onto the current schema", e);
         }
     }
 
