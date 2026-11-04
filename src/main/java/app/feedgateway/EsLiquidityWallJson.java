@@ -7,10 +7,11 @@ import org.apache.avro.generic.GenericRecord;
 /**
  * The browser view of the three ES liquidity-wall records the gateway relays (ES Book Liquidity Walls Requirements rev 11 section 8 "Gateway and page";
  * es-liquidity-wall-service): {@code LiquidityWallDashboard} (event {@code es-liquidity-heatmap}), {@code LiquidityWallEvent} ({@code es-liquidity-wall}) and
- * {@code LiquidityWallVoice} ({@code es-liquidity-voice}). The view is the record's own fields in schema order ({@link AvroFrameJson}: int and long as JSON
+ * {@code LiquidityWallVoice} ({@code es-liquidity-voice}), and the boundary of the {@code LiquidityWallBucket} record the projection folds. The view is the record's own fields in schema order ({@link AvroFrameJson}: int and long as JSON
  * integers, a null union as {@code null}, no float, no enum), so {@code depthEnvironment}, {@code bucketEnd}, {@code quality}, {@code closePath} and
  * {@code configFingerprint} reach the page exactly as written and a later FULL-compatible field needs no code change here. Nothing is added or repaired; the
- * only gateway-owned field is the voice record's {@code stale} flag, appended at delivery by {@link #withStale}.
+ * only gateway-owned fields are appended at delivery: {@code cached} on every frame ({@link #withCached}: a connect replay, or a live forward) and the voice
+ * record's {@code stale} ({@link #withStale}). The schema ID of the frame is checked by the relay BEFORE decoding ({@link EsLiquidityWallRelay#accept}).
  * <p>
  * Boundary checks, each a counted drop in the relay: the WRITER schema is the subject's record (a record of another family under the same topic is refused by
  * name, not by key), {@code schemaVersion} 1, the key is the one section 8 states ({@code CME|<contract>} for the dashboard and the voice,
@@ -67,9 +68,34 @@ final class EsLiquidityWallJson {
         return render(r);
     }
 
+    /**
+     * A bucket record ({@code LiquidityWallBucket}, key {@code <side>|<tick>}) when it passes the boundary, else null. Never rendered for a socket: it feeds
+     * the projection's classification-window quantities only.
+     */
+    static GenericRecord bucket(String key, Object value) {
+        GenericRecord r = record(LiquidityWallSchemas.BUCKET, value);
+        if (r == null || key == null || !key.equals(text(r.get("side")) + "|" + text(r.get("tick")))) {
+            return null;
+        }
+        return r;
+    }
+
     /** The voice view with the gateway's {@code stale} flag (section 7b: delivered marked stale beyond the freshness bound). */
     static String withStale(String voiceJson, boolean stale) {
-        return voiceJson.substring(0, voiceJson.length() - 1) + ",\"stale\":" + stale + "}";
+        return flagged(voiceJson, "stale", stale);
+    }
+
+    /**
+     * A delivered frame with the gateway's {@code cached} flag: {@code true} on every record a connect replay sends, {@code false} on a live forward, so the page
+     * can tell a replayed record from one that arrived live (it never speaks a replayed voice record) without a timer.
+     */
+    static String withCached(String json, boolean cached) {
+        return flagged(json, "cached", cached);
+    }
+
+    /** {@code json} (an object) with one more boolean member appended last. */
+    static String flagged(String json, String name, boolean value) {
+        return json.substring(0, json.length() - 1) + ",\"" + name + "\":" + value + "}";
     }
 
     /** The section 8 dashboard key of a record: {@code CME|<contract>}. */

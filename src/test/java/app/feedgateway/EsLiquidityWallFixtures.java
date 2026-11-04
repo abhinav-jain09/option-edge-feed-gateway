@@ -6,7 +6,7 @@ import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.GenericRecordBuilder;
 
-/** The three relayed records of the liquidity-wall family, built from the REAL schemas of the contracts jar (0.66.0, ids 3403/3404/3407). */
+/** The three relayed records and the bucket row of the liquidity-wall family, built from the REAL schemas of the contracts jar (0.66.0, ids 3403/3404/3407/3402). */
 final class EsLiquidityWallFixtures {
     static final long NOW = 1_800_000_000_000L;
     static final String ENV = "Rithmic Test";
@@ -96,6 +96,16 @@ final class EsLiquidityWallFixtures {
                 .set("riseRatioThousandths", 2310).set("spotTickB0", 30451L).set("spotTickB1", 30449L).set("aboveB0", 2400L).set("belowB0", 900L).set("aboveB1", 800L)
                 .set("belowB1", 2600L).set("leanB0Thousandths", -455).set("leanB1Thousandths", 529).build();
         return event(bucketEnd, "FLIP").set("flip", flip).build();
+    }
+
+    /** One bucket x side x level row (schema id 3402, key side|tick); the window quantities nullable, as section 5 has them null across a gap. */
+    static GenericRecordBuilder bucket(long bucketEnd, String quality, String side, long tick, long lastSize, String state) {
+        return new GenericRecordBuilder(LiquidityWallSchemas.BUCKET.schema())
+                .set("schemaVersion", 1).set("depthEnvironment", ENV).set("contract", CONTRACT).set("bucketEnd", bucketEnd).set("configFingerprint", FINGERPRINT)
+                .set("side", side).set("tick", tick).set("quality", quality).set("closePath", "WATERMARK").set("openSize", lastSize + 10).set("lastSize", lastSize)
+                .set("maxSize", lastSize + 10).set("minSize", lastSize).set("sizeDeltaSum", -10L).set("smoothedSize", lastSize).set("smoothingCount", 5)
+                .set("added", 40L).set("decrease", 50L).set("traded", 45L).set("accounted", 45L).set("unaccounted", 5L).set("hidden", 0L).set("pullCount", 1).set("refillCount", 2)
+                .set("state", state).set("lastAdmittedFrameReceivedAtMs", bucketEnd - 80L).set("lastAdmittedStreamId", "stream-1").set("closingFramePresent", true);
     }
 
     static GenericRecord voice(long bucketEnd) {

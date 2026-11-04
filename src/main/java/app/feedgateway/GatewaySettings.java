@@ -135,6 +135,20 @@ public final class GatewaySettings {
     }
 
     /**
+     * futures.liquidity-wall.buckets ({@code LiquidityWallBucket}, fixed schema id 3402, key {@code <side>|<tick>}, delete retention 1 day): one record per
+     * bucket x side x level, the only carrier of the classification-window quantities (Added, Decrease, Traded, Accounted, Unaccounted, Hidden, pull and
+     * refill counts) the 60-second projection folds per level as of the minute's last LIVE bucket (section 8). Never relayed to a socket.
+     */
+    public String esLiquidityWallBucketsTopic() {
+        return value("ES_LIQUIDITY_WALL_BUCKETS_TOPIC", "futures.liquidity-wall.buckets");
+    }
+
+    /** The connect replay of {@code es-liquidity-wall} carries only the ring's events whose bucket end is within this window of now. Default 15 minutes. */
+    public long esLiquidityWallEventReplayMs() {
+        return longValue("ES_LIQUIDITY_WALL_EVENT_REPLAY_MS", 900_000L, 0L);
+    }
+
+    /**
      * Freshness bound of a dashboard frame, measured from its {@code bucketEnd}: a frame older than this is folded into the session
      * projection but neither broadcast nor replayed to a connecting socket (the {@link #liquidityHeatmapTtlMs()} rule for the options page:
      * a minutes-old "latest column" must never render as live liquidity). Default 5 s = a few 1-second buckets plus grace.
@@ -158,8 +172,9 @@ public final class GatewaySettings {
 
     /**
      * Whether the relay reads the dashboard topic from the current trade date's session open (18:00 ET of the previous day) on start, so the
-     * 60-second projection covers the session so far; off = read from the latest record and the projection starts at relay start. One
-     * partition, one key, compacted: a day is at most 86,400 frames, which is the bound of that read.
+     * 60-second projection covers the session so far; off = read from the latest record and the projection starts at relay start. The dashboard is one
+     * partition, one key, compacted: a day is at most 86,400 frames. The buckets topic is read from the same instant and is band-size times larger (one
+     * record per bucket x side x level, delete retention 1 day), which is the bound of that read.
      */
     public boolean esLiquidityWallHistoryFromSessionOpen() {
         return boolValue("ES_LIQUIDITY_WALL_HISTORY_FROM_SESSION_OPEN", true);

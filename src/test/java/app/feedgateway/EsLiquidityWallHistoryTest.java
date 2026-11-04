@@ -120,6 +120,50 @@ class EsLiquidityWallHistoryTest {
     }
 
     @Test
+    void theWindowQuantitiesAreTheMinutesLastLiveBucketRowAndAbsentWithoutOne() throws Exception {
+        EsLiquidityWallHistory h = new EsLiquidityWallHistory();
+        h.foldDashboard(EsLiquidityWallFixtures.dashboard(NOW - 1000));
+        // two bucket rows of the BID level in minute A: the earlier LIVE, the later GAP (its window is null by section 5): the minute carries the earlier
+        h.foldBucket(EsLiquidityWallFixtures.bucket(NOW - 1000, "LIVE", "BID", 30440L, 150L, "NEUTRAL").set("hidden", null).set("refillCount", null).build());
+        h.foldBucket(EsLiquidityWallFixtures.bucket(NOW, "GAP", "BID", 30440L, 120L, "INSUFFICIENT_DATA").set("added", 999L).build());
+        // a LIVE row of a level the dashboard never listed: window quantities only, sizes and state not measured
+        h.foldBucket(EsLiquidityWallFixtures.bucket(NOW - 1000, "LIVE", "ASK", 30470L, 70L, "LOW_LIQUIDITY").build());
+        // a LIVE row in minute B for a level whose later LIVE row must win
+        h.foldBucket(EsLiquidityWallFixtures.bucket(NOW + 2000, "LIVE", "BID", 30440L, 90L, "EATEN").set("added", 7L).build());
+        h.foldBucket(EsLiquidityWallFixtures.bucket(NOW + 1000, "LIVE", "BID", 30440L, 95L, "EATEN").set("added", 3L).build());
+
+        JsonNode v = JSON.readTree(h.render(NOW + 5000));
+        assertEquals(4, v.get("bucketsFolded").intValue());
+        assertEquals(1, v.get("bucketsNotLive").intValue());
+        JsonNode a = v.get("minutes").get(0);
+        JsonNode bid = a.get("levels").get(0);
+        assertEquals(30440L, bid.get("tick").longValue());
+        assertEquals(NOW - 1000, bid.get("windowBucketEnd").longValue(), "the window ending at the minute's last LIVE bucket, not the later GAP one");
+        assertEquals(40L, bid.get("added").longValue());
+        assertEquals(50L, bid.get("decrease").longValue());
+        assertEquals(45L, bid.get("traded").longValue());
+        assertEquals(45L, bid.get("accounted").longValue());
+        assertEquals(5L, bid.get("unaccounted").longValue());
+        assertEquals(1, bid.get("pullCount").intValue());
+        assertNull(bid.get("hidden"), "null in the window: elided, never zero");
+        assertNull(bid.get("refillCount"));
+        assertEquals(150L, bid.get("maxSize").longValue(), "the sizes stay the dashboard's");
+        JsonNode ask = a.get("levels").get(1);
+        assertEquals(30460L, ask.get("tick").longValue());
+        assertNull(ask.get("windowBucketEnd"), "a level with no LIVE bucket row carries no window quantities");
+        assertNull(ask.get("added"));
+        JsonNode askOnlyBuckets = a.get("levels").get(2);
+        assertEquals(30470L, askOnlyBuckets.get("tick").longValue());
+        assertEquals(0, askOnlyBuckets.get("buckets").intValue());
+        assertNull(askOnlyBuckets.get("maxSize"), "sizes come from the dashboard only: not measured here");
+        assertNull(askOnlyBuckets.get("state"));
+        assertEquals(40L, askOnlyBuckets.get("added").longValue());
+        JsonNode b = v.get("minutes").get(1).get("levels").get(0);
+        assertEquals(NOW + 2000, b.get("windowBucketEnd").longValue(), "the later LIVE row wins regardless of arrival order");
+        assertEquals(7L, b.get("added").longValue());
+    }
+
+    @Test
     void aNewerTradeDateClearsTheProjection() {
         EsLiquidityWallHistory h = new EsLiquidityWallHistory();
         h.foldDashboard(EsLiquidityWallFixtures.dashboard(NOW));

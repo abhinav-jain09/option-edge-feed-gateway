@@ -26,8 +26,10 @@ import org.apache.avro.generic.GenericRecord;
  * worst by LIVE &lt; GAP &lt; STALE, the last spot, the lean's last, minimum and maximum (thousandths), the last side read and confirmed side, the walls live at
  * its end (the last frame's) and the events within it. Absent fields are elided and read as "not measured", never as zero.
  * <p>
- * The print-matched quantities (Added, Decrease, Accounted, Unaccounted, Hidden) are NOT on the dashboard record (they are on
- * {@code futures.liquidity-wall.buckets}, which the gateway does not read), so the projection does not carry them: an elided field, by the document's rule.
+ * The print-matched quantities (Added, Decrease, Traded, Accounted, Unaccounted, Hidden, pull and refill counts) are not on the dashboard record: they are
+ * folded from {@code futures.liquidity-wall.buckets} ({@link #foldBucket}), per level the row of the minute's LAST LIVE bucket (the classification window
+ * ending there), each null when that window has it null, never summed across windows; a minute with no LIVE bucket row for a level carries none, and the
+ * level entry says which bucket end the values are as of ({@code windowBucketEnd}).
  * <p>
  * Trade date: the ES session rolls at 18:00 ET, so a bucket end at or after 18:00 ET belongs to the next calendar date (no holiday arithmetic: a projection is
  * keyed by the date it is served under). A record of an older trade date is counted late and dropped; a newer one clears the projection. Bounded:
@@ -70,6 +72,10 @@ final class EsLiquidityWallHistory {
         int buckets;
         String state;
         boolean everOutsideInsufficient;
+        /** The bucket end of the LIVE bucket row the window quantities below are as of; 0 while none. */
+        long windowBucketEnd;
+        Long added, decrease, traded, accounted, unaccounted, hidden;
+        Integer pullCount, refillCount;
 
         Level(String side, long tick) {
             this.side = side;
@@ -118,14 +124,75 @@ final class EsLiquidityWallHistory {
     private long framesRefused;
     private long eventsFolded;
     private long eventsLate;
+    private long bucketsFolded;
+    private long bucketsLate;
+    private long bucketsNotLive;
     private String seekOrigin = "NONE";
     private long coverageFromMs;
+    private String bucketsSeekOrigin = "NONE";
+    private long bucketsCoverageFromMs;
     private final TreeMap<Long, Minute> minutes = new TreeMap<>();
 
     /** Where the relay's dashboard read started: {@code SESSION_OPEN} with that instant, or {@code LATEST} with the start time. */
     synchronized void seekOrigin(String origin, long fromMs) {
         seekOrigin = origin;
         coverageFromMs = fromMs;
+    }
+
+    /** Where the relay's buckets read started, as {@link #seekOrigin}. */
+    synchronized void bucketsSeekOrigin(String origin, long fromMs) {
+        bucketsSeekOrigin = origin;
+        bucketsCoverageFromMs = fromMs;
+    }
+
+    /**
+     * Folds a validated bucket row ({@link EsLiquidityWallJson#bucket} accepted it): a LIVE bucket's classification-window quantities become the level's when
+     * that bucket is the latest LIVE one of the minute seen so far; any other quality is counted and folds nothing (the window ending at a non-LIVE bucket
+     * has them null by section 5, and the minute's values are those of its last LIVE bucket).
+     */
+    synchronized void foldBucket(GenericRecord r) {
+        try {
+            long bucketEnd = (Long) r.get("bucketEnd");
+            if (!"LIVE".equals(EsLiquidityWallJson.text(r.get("quality")))) {
+                bucketsNotLive++;
+                return;
+            }
+            Minute m = minute(bucketEnd, r);
+            if (m == null) {
+                bucketsLate++;
+                return;
+            }
+            Level level = level(m, EsLiquidityWallJson.text(r.get("side")), (Long) r.get("tick"));
+            if (level == null) {
+                return;   // the minute's level bound
+            }
+            bucketsFolded++;   // every LIVE row admitted to a minute, a superseded one included
+            if (bucketEnd < level.windowBucketEnd) {
+                return;   // an earlier LIVE bucket arriving after a later one: the minute's values stay those of its last LIVE bucket
+            }
+            level.windowBucketEnd = bucketEnd;
+            level.added = (Long) r.get("added");
+            level.decrease = (Long) r.get("decrease");
+            level.traded = (Long) r.get("traded");
+            level.accounted = (Long) r.get("accounted");
+            level.unaccounted = (Long) r.get("unaccounted");
+            level.hidden = (Long) r.get("hidden");
+            level.pullCount = (Integer) r.get("pullCount");
+            level.refillCount = (Integer) r.get("refillCount");
+        } catch (RuntimeException invalid) {
+            framesRefused++;
+        }
+    }
+
+    /** The minute's level entry, created when absent while the bound allows; null when the minute is full. */
+    private static Level level(Minute m, String side, long tick) {
+        String key = side + "|" + tick;
+        Level level = m.levels.get(key);
+        if (level == null && m.levels.size() < MAX_LEVELS) {
+            level = new Level(side, tick);
+            m.levels.put(key, level);
+        }
+        return level;
     }
 
     /** Folds a validated dashboard record ({@link EsLiquidityWallJson#dashboard} accepted it). */
@@ -173,16 +240,9 @@ final class EsLiquidityWallHistory {
             }
             for (Object o : (List<?>) r.get("levels")) {
                 GenericRecord lr = (GenericRecord) o;
-                String side = EsLiquidityWallJson.text(lr.get("side"));
-                long tick = (Long) lr.get("tick");
-                String key = side + "|" + tick;
-                Level level = m.levels.get(key);
+                Level level = level(m, EsLiquidityWallJson.text(lr.get("side")), (Long) lr.get("tick"));
                 if (level == null) {
-                    if (m.levels.size() >= MAX_LEVELS) {
-                        continue;
-                    }
-                    level = new Level(side, tick);
-                    m.levels.put(key, level);
+                    continue;
                 }
                 long lastSize = (Long) lr.get("lastSize");
                 level.buckets++;
@@ -295,6 +355,8 @@ final class EsLiquidityWallHistory {
             g.writeNumberField("servedAtMs", nowMs);
             g.writeStringField("coverage", seekOrigin);
             g.writeNumberField("coverageFromMs", coverageFromMs);
+            g.writeStringField("bucketsCoverage", bucketsSeekOrigin);
+            g.writeNumberField("bucketsCoverageFromMs", bucketsCoverageFromMs);
             if (lastBucketEnd > 0) {
                 g.writeNumberField("lastBucketEnd", lastBucketEnd);
             }
@@ -303,6 +365,9 @@ final class EsLiquidityWallHistory {
             g.writeNumberField("framesRefused", framesRefused);
             g.writeNumberField("eventsFolded", eventsFolded);
             g.writeNumberField("eventsLate", eventsLate);
+            g.writeNumberField("bucketsFolded", bucketsFolded);
+            g.writeNumberField("bucketsLate", bucketsLate);
+            g.writeNumberField("bucketsNotLive", bucketsNotLive);
             g.writeArrayFieldStart("minutes");
             for (Minute m : minutes.values()) {
                 g.writeStartObject();
@@ -342,11 +407,24 @@ final class EsLiquidityWallHistory {
                     g.writeStartObject();
                     g.writeStringField("side", level.side);
                     g.writeNumberField("tick", level.tick);
-                    g.writeNumberField("maxSize", level.maxSize);
-                    g.writeNumberField("lastSize", level.lastSize);
-                    g.writeNumberField("maxSmoothedSize", level.maxSmoothedSize);
-                    g.writeStringField("state", level.state);
                     g.writeNumberField("buckets", level.buckets);
+                    if (level.buckets > 0) {   // the dashboard-derived sizes and state: absent when only bucket rows were seen
+                        g.writeNumberField("maxSize", level.maxSize);
+                        g.writeNumberField("lastSize", level.lastSize);
+                        g.writeNumberField("maxSmoothedSize", level.maxSmoothedSize);
+                        g.writeStringField("state", level.state);
+                    }
+                    if (level.windowBucketEnd > 0) {   // the classification window ending at the minute's last LIVE bucket; a null quantity is elided
+                        g.writeNumberField("windowBucketEnd", level.windowBucketEnd);
+                        number(g, "added", level.added);
+                        number(g, "decrease", level.decrease);
+                        number(g, "traded", level.traded);
+                        number(g, "accounted", level.accounted);
+                        number(g, "unaccounted", level.unaccounted);
+                        number(g, "hidden", level.hidden);
+                        number(g, "pullCount", level.pullCount);
+                        number(g, "refillCount", level.refillCount);
+                    }
                     g.writeEndObject();
                 }
                 g.writeEndArray();
@@ -395,5 +473,13 @@ final class EsLiquidityWallHistory {
             throw new UncheckedIOException(e);
         }
         return out.toString();
+    }
+
+    private static void number(JsonGenerator g, String name, Number value) throws IOException {
+        if (value instanceof Long l) {
+            g.writeNumberField(name, l);
+        } else if (value instanceof Integer i) {
+            g.writeNumberField(name, i);
+        }
     }
 }
