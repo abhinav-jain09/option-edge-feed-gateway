@@ -108,6 +108,63 @@ public final class GatewaySettings {
 
     public boolean rithmicDepthEnabled() {return boolValue("GATEWAY_RITHMIC_DEPTH_ENABLED",false);}
 
+    // ---- ES book liquidity walls (es-liquidity-wall-service; ES Book Liquidity Walls Requirements rev 11 section 8 "Gateway and page") ----
+
+    /**
+     * Master switch of the ES liquidity-wall relay: the three topics below are consumed, the events {@code es-liquidity-heatmap},
+     * {@code es-liquidity-wall} and {@code es-liquidity-voice} are broadcast and {@code /api/es-liquidity-history} answers. OFF by default
+     * (the topics exist on dev only); when off nothing is consumed and the endpoint answers 404.
+     */
+    public boolean esLiquidityWallRelayEnabled() {
+        return boolValue("ES_LIQUIDITY_WALL_RELAY_ENABLED", false);
+    }
+
+    /** futures.liquidity-wall.dashboard ({@code LiquidityWallDashboard}, fixed schema id 3403): the per-bucket frame, compact, latest. */
+    public String esLiquidityWallDashboardTopic() {
+        return value("ES_LIQUIDITY_WALL_DASHBOARD_TOPIC", "futures.liquidity-wall.dashboard");
+    }
+
+    /** futures.liquidity-wall.events ({@code LiquidityWallEvent}, fixed schema id 3404): wall lifecycle changes and flips. */
+    public String esLiquidityWallEventsTopic() {
+        return value("ES_LIQUIDITY_WALL_EVENTS_TOPIC", "futures.liquidity-wall.events");
+    }
+
+    /** futures.liquidity-wall.voice ({@code LiquidityWallVoice}, fixed schema id 3407): the spoken flip, compact, latest. */
+    public String esLiquidityWallVoiceTopic() {
+        return value("ES_LIQUIDITY_WALL_VOICE_TOPIC", "futures.liquidity-wall.voice");
+    }
+
+    /**
+     * Freshness bound of a dashboard frame, measured from its {@code bucketEnd}: a frame older than this is folded into the session
+     * projection but neither broadcast nor replayed to a connecting socket (the {@link #liquidityHeatmapTtlMs()} rule for the options page:
+     * a minutes-old "latest column" must never render as live liquidity). Default 5 s = a few 1-second buckets plus grace.
+     */
+    public long esLiquidityWallFreshMs() {
+        return longValue("ES_LIQUIDITY_WALL_FRESH_MS", 5_000L, 0L);
+    }
+
+    /**
+     * Section 7b: the voice record's freshness bound from its bucket end, beyond which the gateway still delivers it, marked {@code stale}
+     * (the page speaks only a fresh record that arrived live). Starting value 15,000.
+     */
+    public long esLiquidityWallVoiceFreshMs() {
+        return longValue("ES_LIQUIDITY_WALL_VOICE_FRESH_MS", 15_000L, 0L);
+    }
+
+    /** How many recent event records ({@code es-liquidity-wall}) a connecting socket receives. */
+    public int esLiquidityWallEventRing() {
+        return intValue("ES_LIQUIDITY_WALL_EVENT_RING", 256, 1);
+    }
+
+    /**
+     * Whether the relay reads the dashboard topic from the current trade date's session open (18:00 ET of the previous day) on start, so the
+     * 60-second projection covers the session so far; off = read from the latest record and the projection starts at relay start. One
+     * partition, one key, compacted: a day is at most 86,400 frames, which is the bound of that read.
+     */
+    public boolean esLiquidityWallHistoryFromSessionOpen() {
+        return boolValue("ES_LIQUIDITY_WALL_HISTORY_FROM_SESSION_OPEN", true);
+    }
+
     public String bootstrapServers() {
         return value("KAFKA_BOOTSTRAP_SERVERS", DEFAULT_BOOTSTRAP_SERVERS);
     }

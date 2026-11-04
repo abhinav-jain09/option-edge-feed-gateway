@@ -102,6 +102,9 @@ public class FeedGatewayService implements ReplayRunner {
     private final Instant startedAt = Instant.now();
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private org.springframework.beans.factory.ObjectProvider<RithmicDepthRelay> rithmicDepthRelay;
+    /** ES liquidity-wall relay (es-liquidity-wall-service), wired like the depth relay: connect replay + global broadcast, nothing in the ui-batch cache. */
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private org.springframework.beans.factory.ObjectProvider<EsLiquidityWallRelay> esLiquidityWallRelay;
     private final GatewaySettings settings;
     // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1..G-R11) — null unless the flag is on ----
     private final FootprintViews footprintViews;
@@ -150,7 +153,7 @@ public class FeedGatewayService implements ReplayRunner {
      */
     static final String EVENT_VOL_PREMIUM_FRAME = "vol-premium-frame";
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "rithmic-liquidity", "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "spot-band", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "rithmic-liquidity", EsLiquidityWallRelay.HEATMAP_EVENT, "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "spot-band", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "gex-oi-status",
             "strike-sr",
             "gex-magnet",
@@ -1654,6 +1657,10 @@ public class FeedGatewayService implements ReplayRunner {
             var relay=rithmicDepthRelay.getIfAvailable();
             if(relay!=null)relay.replay(json->send(session,"rithmic-liquidity",json));
         }
+        if(esLiquidityWallRelay!=null&&settings.esLiquidityWallRelayEnabled()) {
+            var relay=esLiquidityWallRelay.getIfAvailable();
+            if(relay!=null)relay.replay((event,json)->send(session,event,json));
+        }
         // A client may reconnect after the one-shot readiness broadcast (for example after a
         // gateway restart or a transient socket failure). Re-announce the already-committed
         // readiness to this socket so its UI cannot remain stuck in source-switching forever.
@@ -2322,6 +2329,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + marketStructurePatternsCounterMetrics()
                 + studiesMetrics()
                 + taMetrics()
+                + esLiquidityWallMetrics()
                 + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
                 + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
                 + "gateway_cvd_spx_levels_enabled " + boolMetric(settings.esCvdSpxLevelsEnabled()) + "\n"
@@ -13285,6 +13293,11 @@ public class FeedGatewayService implements ReplayRunner {
         return topics;
     }
 
+    private String esLiquidityWallMetrics() {
+        var relay = esLiquidityWallRelay == null ? null : esLiquidityWallRelay.getIfAvailable();
+        return relay == null ? "" : relay.metrics();
+    }
+
     private String taMetrics() {
         StringBuilder metrics = new StringBuilder();
         for (TaRelay relay : taRelays) {
@@ -13950,6 +13963,9 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     void streamRithmicDepth(String json) {broadcast("rithmic-liquidity",json);}
+
+    /** The ES liquidity-wall relay's fan-out: {@code es-liquidity-heatmap}, {@code es-liquidity-wall} and {@code es-liquidity-voice} are global events. */
+    void streamEsLiquidityWall(String event, String json) {broadcast(event, json);}
 
     private void broadcast(String event, String json) {
         // Per-session routing: only explicitly allowlisted global events may fan out to every
@@ -15040,6 +15056,8 @@ public class FeedGatewayService implements ReplayRunner {
      */
     static final Set<String> GLOBAL_BROADCAST_EVENTS = Set.of(
             "rithmic-liquidity",
+            // ES liquidity walls (es-liquidity-wall-service): ONE contract, no per-user data; the voice and the events are never coalesced.
+            EsLiquidityWallRelay.HEATMAP_EVENT, EsLiquidityWallRelay.WALL_EVENT, EsLiquidityWallRelay.VOICE_EVENT,
             "status", "reset", "source-switching", "source-ready", "source-stale",
             // Candlestick pattern annotation sets (market-structure service): global, verbatim, flag-gated.
             "market-structure-patterns",
@@ -15330,6 +15348,10 @@ public class FeedGatewayService implements ReplayRunner {
                 // r3 finding 3: the frozen key is literally `<event>|symbol` —
                 // additive fields must never split the coalescing identity.
                 return event + "|" + symbol;
+            }
+            if (EsLiquidityWallRelay.HEATMAP_EVENT.equals(event)) {
+                // One dashboard frame per contract (section 8: key CME|<contract>); the newest replaces a queued one behind a slow socket.
+                return event + "|" + root.path("contract").asText("");
             }
             if ("tapeZones".equals(event)) {
                 // ONE board per session (§6.2). The wrapper's own fields (offset/serverTime/ageMs)
