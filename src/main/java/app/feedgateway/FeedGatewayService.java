@@ -102,6 +102,8 @@ public class FeedGatewayService implements ReplayRunner {
     private final Instant startedAt = Instant.now();
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private org.springframework.beans.factory.ObjectProvider<RithmicDepthRelay> rithmicDepthRelay;
+    @org.springframework.beans.factory.annotation.Autowired
+    private org.springframework.beans.factory.ObjectProvider<RithmicDepthHistory> rithmicDepthHistory;
     /** ES liquidity-wall relay (es-liquidity-wall-service), wired like the depth relay: connect replay + global broadcast, nothing in the ui-batch cache. */
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private org.springframework.beans.factory.ObjectProvider<EsLiquidityWallRelay> esLiquidityWallRelay;
@@ -15291,6 +15293,13 @@ public class FeedGatewayService implements ReplayRunner {
                 || payload.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > FootprintBasicHistory.MAX_REQUEST_BYTES) return;
         JsonNode request;
         try { request = mapper.readTree(payload); } catch (Exception invalid) { return; }
+        if(request!=null&&RithmicDepthHistory.REQUEST.equals(request.path("type").asText())){
+            var history=rithmicDepthHistory==null?null:rithmicDepthHistory.getIfAvailable();
+            if(history==null||!settings.rithmicDepthEnabled()){send(session,RithmicDepthHistory.RESPONSE,mapper.createObjectNode().put("requestId",request.path("requestId").asText()).put("error","unavailable").toString());return;}
+            if(!footprintBackfillPermits.tryAcquire()){send(session,RithmicDepthHistory.RESPONSE,mapper.createObjectNode().put("requestId",request.path("requestId").asText()).put("error","busy").toString());return;}
+            try{send(session,RithmicDepthHistory.RESPONSE,history.page(session.getId(),request,System.currentTimeMillis(),(int)Math.min(524288,settings.wsMaxQueuedBytes()/4)));}
+            finally{footprintBackfillPermits.release();}return;
+        }
         if (request == null || !FootprintBasicHistory.REQUEST.equals(request.path("type").asText())) return;
         if (footprintViews == null) {
             send(session, FootprintBasicHistory.RESPONSE, "{\"error\":\"unavailable\"}");
