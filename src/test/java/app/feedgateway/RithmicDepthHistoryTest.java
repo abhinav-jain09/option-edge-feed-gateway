@@ -43,4 +43,23 @@ class RithmicDepthHistoryTest {
   var h=new RithmicDepthHistory(new GatewaySettings());for(int i=0;i<=7202;i++)h.accept(RithmicSchemas.KEY,frame(NOW+i*1000,i+1),NOW+i*1000);
   long now=NOW+7202000;var value=JSON.readTree(h.page("s",request(NOW,now,NOW-1),now,524288));assertTrue(value.path("availableFromMs").asLong()>=now-RithmicDepthHistory.WINDOW);
  }
+ @Test void registeredSocketDispatchUsesBoundedWriterAndSharedPermits()throws Exception{
+  var settings=org.mockito.Mockito.spy(new GatewaySettings());org.mockito.Mockito.doReturn(true).when(settings).rithmicDepthEnabled();org.mockito.Mockito.doReturn(4096L).when(settings).wsMaxQueuedBytes();
+  var service=new FeedGatewayService(settings,JSON,new HpsfGatewayViewMapper(),null);service.runOutboundWritesInline();
+  var history=new RithmicDepthHistory(settings);long now=System.currentTimeMillis();history.accept(RithmicSchemas.KEY,frame(now-1000,1),now);
+  @SuppressWarnings("unchecked") var provider=(org.springframework.beans.factory.ObjectProvider<RithmicDepthHistory>)org.mockito.Mockito.mock(org.springframework.beans.factory.ObjectProvider.class);
+  org.mockito.Mockito.when(provider.getIfAvailable()).thenReturn(history);
+  org.springframework.test.util.ReflectionTestUtils.setField(service,"rithmicDepthHistory",provider);
+  var socket=org.mockito.Mockito.mock(org.springframework.web.socket.WebSocketSession.class);org.mockito.Mockito.when(socket.getId()).thenReturn("history-test");org.mockito.Mockito.when(socket.isOpen()).thenReturn(true);
+  var req=request(now-2000,now,now-2001);req.put("type",RithmicDepthHistory.REQUEST);
+  service.handleFootprintBasicMessage(socket,req.toString());org.mockito.Mockito.verify(socket,org.mockito.Mockito.never()).sendMessage(org.mockito.ArgumentMatchers.any());
+  service.addClient(socket);org.mockito.Mockito.clearInvocations(socket);service.handleFootprintBasicMessage(socket,req.toString());
+  var sent=org.mockito.ArgumentCaptor.forClass(org.springframework.web.socket.TextMessage.class);org.mockito.Mockito.verify(socket).sendMessage(sent.capture());
+  var envelope=JSON.readTree(sent.getValue().getPayload());assertEquals(RithmicDepthHistory.RESPONSE,envelope.path("type").asText());assertEquals("one",envelope.path("data").path("requestId").asText());
+  assertTrue(envelope.path("data").toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=1024);assertEquals(4,service.footprintBackfillPermits().availablePermits());
+  org.mockito.Mockito.clearInvocations(socket);assertTrue(service.footprintBackfillPermits().tryAcquire(4));service.handleFootprintBasicMessage(socket,req.toString());org.mockito.Mockito.verify(socket).sendMessage(sent.capture());
+  assertEquals("busy",JSON.readTree(sent.getValue().getPayload()).path("data").path("error").asText());service.footprintBackfillPermits().release(4);
+  org.mockito.Mockito.clearInvocations(socket);service.handleFootprintBasicMessage(socket,"x".repeat(1025));org.mockito.Mockito.verify(socket,org.mockito.Mockito.never()).sendMessage(org.mockito.ArgumentMatchers.any());service.removeClient(socket);
+ }
+
 }

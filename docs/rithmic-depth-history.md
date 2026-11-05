@@ -43,13 +43,20 @@ Focused tests cover old-source timestamps, pagination, price filtering, rate and
 - `option-edge-feed-gateway/src/main/java/app/feedgateway/FeedGatewayService.java:15277` — `void handleFootprintBasicMessage`.
 - `option-edge-feed-gateway/src/main/java/app/feedgateway/FeedGatewayService.java:15327` — `private void send(WebSocketSession`.
 - `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:95` — `function historyCells`.
-- `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:152` — `function requestHistory`.
-- `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:162` — `function acceptHistory`.
-- `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:186` — `function syncZones`.
-- `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:240` — `ctx.drawImage`.
+- `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:153` — `function requestHistory`.
+- `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:163` — `function acceptHistory`.
+- `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:187` — `function syncZones`.
+- `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:241` — `ctx.drawImage`.
 - `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:19` — `function frame`.
-- `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:245` — `const end=latest`.
+- `options-edge/src/app/web/assets/context-tape-rithmic-liquidity.js:246` — `const end=latest`.
 - `options-edge/src/app/web/assets/context-tape-order-tab.js:111` — `function edgeRecenter`.
-- `options-edge/src/app/web/assets/context-tape-order-tab.js:1318` — `function followView`.
-- `options-edge/src/app/web/assets/context-tape-order-tab.js:1674` — `data-liquidity-zone-fill`.
+- `options-edge/src/app/web/assets/context-tape-order-tab.js:1320` — `function followView`.
+- `options-edge/src/app/web/assets/context-tape-order-tab.js:1676` — `data-liquidity-zone-fill`.
 - `options-edge/src/app/web/assets/context-tape.js:3816` — `sendHistory:function`.
+
+## Premerge validation, 2026-11-05
+
+- Web: `OE_RENDER_CHROME=1 CHROME_BIN=<installed chrome-headless-shell> node --test test/js/rithmic-liquidity*.test.js test/js/order-edge-recenter.test.js test/js/local-broker-page.test.js`: 65 passed, zero failures/skips. Includes native canvas alpha checks and 900/1500px chart follow/gesture cases. Native rendering fixtures use synthetic test data, not runtime proof.
+- Gateway: `mvn -Dtest=RithmicDepthHistoryTest,RithmicDepthJsonTest,RithmicDepthRelayTest,FootprintBasicHistoryTest test`: 22 passed plus the mandatory context smoke test. Dispatcher coverage checks unregistered sockets, response envelope, shared permits, small socket budget and oversized input, including Rithmic enabled with footprint history disabled.
+- Maximum-depth benchmark: 8,192 levels per snapshot; 500 snapshots ingested in roughly 2.1 seconds. Cold 32-column price-filtered page about 81ms; four concurrent requests at 512KiB/64KiB/4KiB/1KiB budgets took about 17–21ms each. All replies obeyed their byte limits; too-wide requests returned an error. These are local CPU measurements, excluding Kafka/network and deployment warmup; the test budget was 250ms per page.
+- Native Edge synthetic fixture: about 0.18ms per small forced repaint. This does not establish maximum-depth GPU cost. Live dev screenshot, history warmup and responsive interaction proof remain rollout checks.

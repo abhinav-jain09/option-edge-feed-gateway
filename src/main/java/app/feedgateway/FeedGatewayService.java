@@ -1010,7 +1010,7 @@ public class FeedGatewayService implements ReplayRunner {
             this.footprintViews = null;
             this.footprintStrikeView = null;
             this.footprintGate = null;
-            this.footprintBackfillPermits = null;
+            this.footprintBackfillPermits = settings.rithmicDepthEnabled() ? new java.util.concurrent.Semaphore(settings.esFootprintBackfillConcurrency(), true) : null;
         }
     }
 
