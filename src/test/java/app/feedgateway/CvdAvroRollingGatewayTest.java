@@ -212,6 +212,44 @@ class CvdAvroRollingGatewayTest {
         } finally {MockSchemaRegistry.dropScope(scope);}
     }
 
+    /** EAV ledger rev 20 (contracts 0.69.0): the gateway's strict ledger reader must accept the writer schema that carries
+     *  {@code segment} (per-tracker) and {@code overnightDisposition} (terminals) — on 0.67.0 it refused every such record and the
+     *  Early Auction page went blind from the first overnight trace (found by the 2026-11-05 Codex dev-site test). */
+    @Test void eavCacheDecoderReadsRev20OvernightRecordsAndTerminals() throws Exception {
+        var settings=new GatewaySettings();var mapper=new ObjectMapper();
+        var service=new FeedGatewayService(settings,mapper,new HpsfGatewayViewMapper(),null);
+        var method=FeedGatewayService.class.getDeclaredMethod("stringObjectConsumerProperties",String.class);method.setAccessible(true);
+        var properties=(Properties)method.invoke(service,"state");
+        String topic=settings.earlyAuctionVerdictTopic(),scope="eav-gateway-rev20";
+        var schema=com.optionsedge.contracts.cvd.CvdRelatedSchemas.EARLY_AUCTION_LEDGER;
+        properties.put("schema.registry.url","mock://"+scope);properties.put("auto.register.schemas",false);
+        var config=new HashMap<String,Object>();properties.forEach((key,value)->config.put((String)key,value));
+        var configured=(Class<?>)properties.get(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG);
+        var registry=MockSchemaRegistry.getClientForScope(scope);registry.register(topic+"-value",schema);
+        try(var reader=configured.asSubclass(org.apache.kafka.common.serialization.Deserializer.class).getDeclaredConstructor().newInstance();
+            var writer=new com.optionsedge.contracts.avro.CanonicalAvroSerializer(registry);
+            var input=getClass().getResourceAsStream("/cvd/eav-engine-emissions.json")) {
+            reader.configure(config,false);writer.configure(config,false);
+            long offset=0;int seen=0;
+            for(var model:mapper.readTree(input).path("models")) {
+                String kind=model.path("kind").asText();
+                com.fasterxml.jackson.databind.node.ObjectNode rev20=((com.fasterxml.jackson.databind.node.ObjectNode)model.deepCopy());
+                if(kind.equals("SCORE_TRACE")||kind.equals("PREDICTION")) rev20.put("segment","OVERNIGHT");
+                else if(kind.equals("SESSION_CLOSE")||kind.equals("SESSION_ABORTED")) rev20.put("overnightDisposition","COMPLETED");
+                else continue;
+                String expected=rev20.toString();
+                byte[] avro=writer.serialize(topic,CanonicalJsonAvro.record(schema,rev20));
+                String decoded=(String)reader.deserialize(topic,avro);
+                assertEquals(expected,decoded,"a rev 20 record must decode to exactly its model");
+                assertEquals(model.path("tradeDate").asText(),service.validateEarlyAuctionVerdict(decoded));
+                service.onEarlyAuctionVerdictRecord(decoded,offset++);seen++;
+            }
+            assertTrue(seen>=2,"the fixture carries per-tracker and terminal kinds to extend");
+            assertTrue(service.earlyAuctionVerdictPage(null,-1,100).events().stream().anyMatch(e->e.json().contains("\"segment\":\"OVERNIGHT\"")));
+            assertTrue(service.earlyAuctionVerdictPage(null,-1,100).events().stream().anyMatch(e->e.json().contains("\"overnightDisposition\":\"COMPLETED\"")));
+        } finally {MockSchemaRegistry.dropScope(scope);}
+    }
+
     private static List<String> fieldNames(JsonNode node) {
         var names=new ArrayList<String>();node.fieldNames().forEachRemaining(names::add);return names;
     }
