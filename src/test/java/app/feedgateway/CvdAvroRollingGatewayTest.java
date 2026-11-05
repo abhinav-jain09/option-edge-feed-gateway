@@ -212,6 +212,75 @@ class CvdAvroRollingGatewayTest {
         } finally {MockSchemaRegistry.dropScope(scope);}
     }
 
+    /** EAV ledger rev 20 (contracts 0.69.0): the gateway's strict ledger reader must accept the writer schema that carries
+     *  {@code segment} (per-tracker) and {@code overnightDisposition} (terminals) — on 0.67.0 it refused every such record and the
+     *  Early Auction page went blind from the first overnight trace (found by the 2026-11-05 Codex dev-site test). */
+    @Test void eavCacheDecoderReadsRev20OvernightRecordsAndTerminals() throws Exception {
+        var settings=new GatewaySettings();var mapper=new ObjectMapper();
+        var service=new FeedGatewayService(settings,mapper,new HpsfGatewayViewMapper(),null);
+        var method=FeedGatewayService.class.getDeclaredMethod("stringObjectConsumerProperties",String.class);method.setAccessible(true);
+        var properties=(Properties)method.invoke(service,"state");
+        String topic=settings.earlyAuctionVerdictTopic(),scope="eav-gateway-rev20";
+        var schema=com.optionsedge.contracts.cvd.CvdRelatedSchemas.EARLY_AUCTION_LEDGER;
+        properties.put("schema.registry.url","mock://"+scope);properties.put("auto.register.schemas",false);
+        var config=new HashMap<String,Object>();properties.forEach((key,value)->config.put((String)key,value));
+        var configured=(Class<?>)properties.get(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG);
+        var registry=MockSchemaRegistry.getClientForScope(scope);registry.register(topic+"-value",schema);
+        try(var reader=configured.asSubclass(org.apache.kafka.common.serialization.Deserializer.class).getDeclaredConstructor().newInstance();
+            var writer=new com.optionsedge.contracts.avro.CanonicalAvroSerializer(registry);
+            var input=getClass().getResourceAsStream("/cvd/eav-engine-emissions.json")) {
+            reader.configure(config,false);writer.configure(config,false);
+            long offset=0;int seen=0;
+            for(var model:mapper.readTree(input).path("models")) {
+                String kind=model.path("kind").asText();
+                com.fasterxml.jackson.databind.node.ObjectNode rev20=((com.fasterxml.jackson.databind.node.ObjectNode)model.deepCopy());
+                if(kind.equals("SCORE_TRACE")||kind.equals("PREDICTION")) rev20.put("segment","OVERNIGHT");
+                else if(kind.equals("SESSION_CLOSE")||kind.equals("SESSION_ABORTED")) rev20.put("overnightDisposition","COMPLETED");
+                else continue;
+                String expected=rev20.toString();
+                byte[] avro=writer.serialize(topic,CanonicalJsonAvro.record(schema,rev20));
+                String decoded=(String)reader.deserialize(topic,avro);
+                assertEquals(expected,decoded,"a rev 20 record must decode to exactly its model");
+                assertEquals(model.path("tradeDate").asText(),service.validateEarlyAuctionVerdict(decoded));
+                service.onEarlyAuctionVerdictRecord(decoded,offset++);seen++;
+            }
+            assertTrue(seen>=2,"the fixture must carry at least one per-tracker (SCORE_TRACE/PREDICTION) and one terminal (SESSION_CLOSE/SESSION_ABORTED) model to extend");
+            assertTrue(service.earlyAuctionVerdictPage(null,-1,100).events().stream().anyMatch(e->e.json().contains("\"segment\":\"OVERNIGHT\"")));
+            assertTrue(service.earlyAuctionVerdictPage(null,-1,100).events().stream().anyMatch(e->e.json().contains("\"overnightDisposition\":\"COMPLETED\"")));
+        } finally {MockSchemaRegistry.dropScope(scope);}
+    }
+
+    /** NEGATIVE CONTROL for the rev 20 roll: the reader is strict — exactly ONE writer schema per topic — so a record written with
+     *  the PREVIOUS ledger schema (v2, rev 19, still retained on a topic) is refused with a SerializationException, which the relay
+     *  counts and skips (never fatal). This is the stated consequence of bumping the pin; it pins the behavior explicitly. */
+    @Test void eavCacheDecoderRefusesALedgerRecordWrittenWithThePreviousSchema() throws Exception {
+        var settings=new GatewaySettings();var mapper=new ObjectMapper();
+        var service=new FeedGatewayService(settings,mapper,new HpsfGatewayViewMapper(),null);
+        var method=FeedGatewayService.class.getDeclaredMethod("stringObjectConsumerProperties",String.class);method.setAccessible(true);
+        var properties=(Properties)method.invoke(service,"state");
+        String topic=settings.earlyAuctionVerdictTopic(),scope="eav-gateway-v2-writer";
+        var current=com.optionsedge.contracts.cvd.CvdRelatedSchemas.EARLY_AUCTION_LEDGER;
+        org.apache.avro.Schema previous;
+        try(var in=getClass().getResourceAsStream("/cvd/eav-ledger-v2.avsc")){previous=new org.apache.avro.Schema.Parser().parse(in);}
+        assertTrue(previous.getField("segment")==null&&current.getField("segment")!=null,"v2 lacks the rev 20 fields, the pinned schema has them");
+        properties.put("schema.registry.url","mock://"+scope);properties.put("auto.register.schemas",false);
+        var config=new HashMap<String,Object>();properties.forEach((key,value)->config.put((String)key,value));
+        var configured=(Class<?>)properties.get(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG);
+        var registry=MockSchemaRegistry.getClientForScope(scope);registry.register(topic+"-value",current);
+        int previousId=registry.register(topic+"-value",previous);
+        try(var reader=configured.asSubclass(org.apache.kafka.common.serialization.Deserializer.class).getDeclaredConstructor().newInstance();
+            var input=getClass().getResourceAsStream("/cvd/eav-engine-emissions.json")) {
+            reader.configure(config,false);
+            var model=mapper.readTree(input).path("models").get(0);
+            var record=CanonicalJsonAvro.record(previous,model);
+            var out=new java.io.ByteArrayOutputStream();out.write(0);out.write(java.nio.ByteBuffer.allocate(4).putInt(previousId).array());
+            var encoder=org.apache.avro.io.EncoderFactory.get().binaryEncoder(out,null);
+            new org.apache.avro.generic.GenericDatumWriter<org.apache.avro.generic.GenericRecord>(previous).write(record,encoder);encoder.flush();
+            assertThrows(org.apache.kafka.common.errors.SerializationException.class,()->reader.deserialize(topic,out.toByteArray()),
+                    "a v2-written record is refused by the v3 reader");
+        } finally {MockSchemaRegistry.dropScope(scope);}
+    }
+
     private static List<String> fieldNames(JsonNode node) {
         var names=new ArrayList<String>();node.fieldNames().forEachRemaining(names::add);return names;
     }
