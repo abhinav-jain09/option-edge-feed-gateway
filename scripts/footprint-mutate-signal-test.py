@@ -37,7 +37,7 @@ class SignalRestoreTest(unittest.TestCase):
             'mkdir -p "$PWD/target/classes" "$PWD/target/test-classes"\n'
             'echo mutant > "$PWD/target/classes/Fixture.class"\n'
             'echo mutant > "$PWD/target/test-classes/FixtureTest.class"\n'
-            'if [ -f "$PWD/started" ]; then echo blocking; sleep 60; fi\n'
+            'if [ -f "$PWD/started" ]; then touch "$PWD/mutation-ready"; echo blocking; exec sleep 60; fi\n'
             'touch "$PWD/started"\n'
             "echo 'Tests run: 1, Failures: 0, Errors: 0'\necho 'BUILD SUCCESS'\n")
         self.runner.chmod(0o755)
@@ -66,7 +66,9 @@ class SignalRestoreTest(unittest.TestCase):
                                  cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            if self.target.read_text() == MUTANT:
+            # The edited source precedes runner startup. Wait for the runner to
+            # finish both output writes before cancelling the blocking phase.
+            if self.target.read_text() == MUTANT and (self.root / "mutation-ready").exists():
                 break
             if child.poll() is not None:
                 self.fail("the run ended before it mutated anything: " + child.communicate()[0][-2000:])
