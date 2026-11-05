@@ -1,0 +1,9 @@
+# Ordered liquidity v2 gateway foundations — not enabled
+
+Coordinated design: options-edge PR1543, `docs/rithmic/bookmap-order-liquidity-design.md`, source SHA256 `5b099afd8cb1849bc727936a289b060de0031ada22dd6786fb92e71bd3b29141`. Every nonblank design line remains tracked by its `LDV2-Lnnnn` reconciliation; no clause is waived here.
+
+This branch adds a strict fixed-ID3303 Confluent source decoder using candidate contracts0.71.0 (contracts PR159), validates the source Avro-datum hash before admission, and bounds string/array/union/enum encodings before GenericDatumReader allocates them. Independent Python fixture bytes verify decoding and hash tamper rejection. No schema registration or topic provisioning occurs here.
+
+The shared128MiB bounded compressed journal preserves collector K, same-K heartbeat watermark metadata and exact source datum bytes. It rejects discontinuous K and regressing watermarks, pages at most256 items/4MiB, evicts oldest compressed blocks, and refuses resume across evicted input. A retained earliest timestamp alone does not certify a seed horizon or completeness; source checkpoint and coverage qualification are still required.
+
+Local validation: `mvn -q -Dtest=DepthUnitCodecTest,DepthUnitJournalTest,DepthDatumBoundsTest test` passes12 tests. The build's configured context smoke test also executes. The dependency is a locally installed candidate, not yet a released runtime artifact. There is no Kafka listener, canonical-book integration, checkpoint encoder/cache, authenticated WSS lane/ACK integration, seed service or application config enablement in this foundation yet. Those components, bounded allocation/throughput tests, the16-client2-hour soak, Jenkins deployment and real-dev A1–A14 acceptance remain unfinished. No deployed readiness or visual-parity claim is made.
