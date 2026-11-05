@@ -37,7 +37,7 @@ class SignalRestoreTest(unittest.TestCase):
             'mkdir -p "$PWD/target/classes" "$PWD/target/test-classes"\n'
             'echo mutant > "$PWD/target/classes/Fixture.class"\n'
             'echo mutant > "$PWD/target/test-classes/FixtureTest.class"\n'
-            'if [ -f "$PWD/started" ]; then touch "$PWD/mutation-ready"; echo blocking; sleep 60; fi\n'
+            'if [ -f "$PWD/started" ]; then touch "$PWD/mutation-ready"; echo blocking; exec sleep 60; fi\n'
             'touch "$PWD/started"\n'
             "echo 'Tests run: 1, Failures: 0, Errors: 0'\necho 'BUILD SUCCESS'\n")
         self.runner.chmod(0o755)
