@@ -1670,6 +1670,11 @@ public class FeedGatewayService implements ReplayRunner {
         if (readySelectionKeyMatchesActive(selection)) {
             send(session, "source-ready", activeSelectionJson(selection, "source-ready"));
         }
+        if(settings.esAuctionEnabled()||footprintViews!=null) {
+            var capability=mapper.createObjectNode().put("schemaVersion",1).put("maxRecords",OrderChartHistory.MAX_PAGE_RECORDS);
+            var resources=capability.putArray("resources");if(settings.esAuctionEnabled())resources.add("auction");if(footprintViews!=null)resources.add("footprint");
+            send(session,OrderChartHistory.HELLO,capability.toString());
+        }
         if (settings.esAuctionEnabled()) {
             // Auction-desk hello: what this gateway holds for the current trade date, so the page can
             // bound its /api/auction/minutes backfill and buffer live WS minutes past it. It must NOT
@@ -15299,6 +15304,22 @@ public class FeedGatewayService implements ReplayRunner {
             if(!footprintBackfillPermits.tryAcquire()){send(session,RithmicDepthHistory.RESPONSE,mapper.createObjectNode().put("requestId",request.path("requestId").asText()).put("error","busy").toString());return;}
             try{send(session,RithmicDepthHistory.RESPONSE,history.page(session.getId(),request,System.currentTimeMillis(),(int)Math.min(524288,settings.wsMaxQueuedBytes()/4)));}
             finally{footprintBackfillPermits.release();}return;
+        }
+        if(request!=null&&OrderChartHistory.REQUEST.equals(request.path("type").asText())) {
+            if(!footprintBackfillPermits.tryAcquire()){send(session,OrderChartHistory.RESPONSE,mapper.createObjectNode().put("schemaVersion",1).put("requestId",request.path("requestId").asText()).put("error","busy").toString());return;}
+            try {
+                int capacity=(int)Math.min(524288L,settings.wsMaxQueuedBytes()/4);
+                String response;
+                if("auction".equals(request.path("resource").asText())) {
+                    synchronized(esAuctionIncarnationLock) {
+                        response=!settings.esAuctionEnabled()||!esAuctionHandoffFrozen.get()
+                            ?mapper.createObjectNode().put("schemaVersion",1).put("requestId",request.path("requestId").asText()).put("error","loading").toString()
+                            :OrderChartHistory.reply(mapper,footprintViews,this::auctionMinutesPage,request,capacity,(int)Math.min(Integer.MAX_VALUE,settings.esFootprintMaxRecordBytes()));
+                    }
+                } else response=OrderChartHistory.reply(mapper,footprintViews,this::auctionMinutesPage,request,capacity,(int)Math.min(Integer.MAX_VALUE,settings.esFootprintMaxRecordBytes()));
+                send(session,OrderChartHistory.RESPONSE,response);
+            } finally {footprintBackfillPermits.release();}
+            return;
         }
         if (request == null || !FootprintBasicHistory.REQUEST.equals(request.path("type").asText())) return;
         if (footprintViews == null) {
