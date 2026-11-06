@@ -122,7 +122,7 @@ class StudiesWiringTest {
     @Test
     void theStudiesAreAppendedLastWithWhatTheRestOfTheHelloLeavesUnderTheFrameGuard() throws Exception {
         String src = java.nio.file.Files.readString(java.nio.file.Path.of("src/main/java/app/feedgateway/FeedGatewayService.java"));
-        int hello = src.indexOf("String cvdHelloJson(String footprintStrikeField)");
+        int hello = src.indexOf("String cvdHelloJson(String footprintStrikeField, String lineHealthOwnerTag)");
         int footprint = src.indexOf("sb.append(\",\\\"footprintStrike\\\":\")", hello);
         int studies = src.indexOf("sb.append(studies.helloFields(budget))", hello);
         assertTrue(hello > 0 && footprint > hello && studies > footprint, "appended after every other field");
