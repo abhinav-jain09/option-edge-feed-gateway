@@ -135,6 +135,7 @@ public class FeedGatewayService implements ReplayRunner {
     // P0 (slow-client isolation): per-socket bounded async outbound queues. The Kafka thread enqueues here
     // and returns; dedicated writers do the network I/O, so one slow client never stalls polling.
     private final Map<String, OutboundChannel> outbound = new ConcurrentHashMap<>();
+    private final Map<String,WebSocketSession> nativeHistorySubscribers=new ConcurrentHashMap<>();
     private volatile ExecutorService outboundWriters;
     private volatile java.util.concurrent.Executor outboundWriterOverride; // test seam (caller-runs)
     private volatile java.util.concurrent.Executor outboundCloserOverride; // test seam (a failing teardown hand-over)
@@ -1647,6 +1648,15 @@ public class FeedGatewayService implements ReplayRunner {
         clients.add(session);
         clientsById.put(session.getId(), session);
         send(session, "status", statusJson());
+        if(nativeHistoryAuthorized(session,channel)&&RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem())){
+            boolean subscribed; synchronized(nativeHistorySubscribers){subscribed=nativeHistorySubscribers.size()<1024;if(subscribed)nativeHistorySubscribers.put(session.getId(),session);}
+            if(subscribed&&!nativeHistoryAuthorized(session,channel)){nativeHistorySubscribers.remove(session.getId(),session);subscribed=false;}
+            if(subscribed){
+                String identity=mapper.createObjectNode().put("subject",(String)session.getAttributes().get(TicketHandshakeInterceptor.ATTR_USER_ID)).toString();
+                channel.enqueueAuthorizedText(envelopeJson("session-identity",identity),null,()->nativeHistoryAuthorized(session,channel));
+                sendNativeHistoryHello(session,channel);
+            }
+        }
         if (sendsCvdHello()) {
             // R46 hello: the per-timeframe high-water marks of the bar view, so the page can bound
             // its REST backfill to exactly what this gateway holds and buffer WS bars past it.
@@ -1841,6 +1851,9 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** A socket is gone by any path: its alert resume state goes with it. */
     private void forgetAlertSocket(String socketId) {
+        if(socketId!=null)nativeHistorySubscribers.remove(socketId);
+        var history=rithmicDepthHistory==null?null:rithmicDepthHistory.getIfAvailable();
+        if(history!=null&&socketId!=null)history.forget(socketId);
         if (patternAlerts != null && socketId != null) {
             patternAlerts.forget(socketId);
         }
@@ -1849,9 +1862,9 @@ public class FeedGatewayService implements ReplayRunner {
     public void removeClient(WebSocketSession session) {
         esAuctionHelloPending.remove(session);   // a socket that closed while waiting for its hello must not be held
         String id = session.getId();
-        forgetAlertSocket(id);
         volPremiumDeliveries.remove(id);   // a delivery (and a paced replay) for a socket that is gone must not hold it
         OutboundChannel channel = outbound.remove(id);
+        forgetAlertSocket(id);
         spotBandSwitchDelivered.remove(id);
         WebSocketSession stored = clientsById.remove(id);
         if (stored != null) {
@@ -15366,6 +15379,68 @@ public class FeedGatewayService implements ReplayRunner {
     /** The inbound message type of the alert page (see {@link PatternAlertRelay#resume}). */
     static final String ALERTS_RESUME = "alerts-resume";
 
+    private void sendNativeHistoryHello(WebSocketSession session,OutboundChannel channel){
+        var history=rithmicDepthHistory==null?null:rithmicDepthHistory.getIfAvailable();
+        if(history!=null)channel.enqueueAuthorizedText(envelopeJson("rithmic-history-hello",history.nativeHello()),"rithmic-history-hello",()->nativeHistoryAuthorized(session,channel));
+    }
+
+    /** Called after releasing the source-cache lock; no engine/channel work occurs inside that lock. */
+    void rithmicHistoryChanged(Long affected){
+        if(nativeHistorySubscribers.isEmpty()||!RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem()))return;
+        var history=rithmicDepthHistory==null?null:rithmicDepthHistory.getIfAvailable();if(history==null)return;
+        String hello=history.nativeHello();var invalidation=affected==null?null:history.invalidation(affected);
+        for(var session:nativeHistorySubscribers.values()){
+            var channel=outbound.get(session.getId());if(channel==null||!nativeHistoryAuthorized(session,channel)){nativeHistorySubscribers.remove(session.getId(),session);history.forget(session.getId());continue;}
+            if(invalidation!=null)channel.enqueueHistoryInvalidation(invalidation,()->nativeHistoryAuthorized(session,channel));
+            channel.enqueueAuthorizedText(envelopeJson("rithmic-history-hello",hello),"rithmic-history-hello",()->nativeHistoryAuthorized(session,channel));
+        }
+    }
+
+    private boolean nativeHistoryAuthorized(WebSocketSession session,OutboundChannel channel) {
+        if(!settings.authEnabled()||!settings.rithmicDepthEnabled()||routingEngine==null||session==null||channel==null
+                ||!session.isOpen()||clientsById.get(session.getId())!=session||outbound.get(session.getId())!=channel)return false;
+        Object subject=session.getAttributes().get(TicketHandshakeInterceptor.ATTR_USER_ID);
+        Object expiry=session.getAttributes().get(WsJwtHandshakeInterceptor.AUTH_EXPIRES_AT_ATTR);
+        long now=System.currentTimeMillis();
+        if(!(subject instanceof String user)||user.isBlank()||user.length()>256||!(expiry instanceof Long until)||until<=now)return false;
+        String appId=appSessionIdOf(session);if(appId==null)return false;
+        // The existing approval reaper tears down revoked authoritative approvals. Role-mode is also
+        // checked on every admission/write against the current engine, never the stale token snapshot.
+        String role=settings.approvalUrl().isBlank()?settings.approvalRole():"";
+        if(settings.approvalUrl().isBlank()&&role.isBlank())return false;
+        return routingEngine.canReadNativeHistory(appId,session.getId(),user,now,role);
+    }
+
+    private void nativeHistoryError(WebSocketSession session,OutboundChannel channel,String requestId,String error) {
+        var control=mapper.createObjectNode().put("requestId",requestId).put("format",RithmicNativeHistoryRequest.FORMAT).put("error",error);
+        if(RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem()))control.putObject("namespace").put("environment",settings.rithmicSystem()).put("exchange","CME").put("contract","ESZ6");
+        String json=control.toString();
+        channel.enqueueAuthorizedText(envelopeJson(RithmicDepthHistory.RESPONSE,json),null,()->nativeHistoryAuthorized(session,channel));
+    }
+
+    private void handleNativeRithmicHistory(WebSocketSession session,JsonNode request) {
+        OutboundChannel channel=outbound.get(session.getId());
+        if(!settings.authEnabled()||!settings.rithmicDepthEnabled()||routingEngine==null||settings.approvalUrl().isBlank()&&settings.approvalRole().isBlank()||!RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem())){
+            String id=request.path("requestId").isTextual()?request.path("requestId").asText():"";if(id.length()>64)id="";
+            send(session,RithmicDepthHistory.RESPONSE,mapper.createObjectNode().put("requestId",id).put("format",RithmicNativeHistoryRequest.FORMAT).put("error","unavailable").toString());return;
+        }
+        if(!nativeHistoryAuthorized(session,channel)){if(channel!=null)channel.revokeAuthorization();return;}
+        var parsed=RithmicNativeHistoryRequest.parse(request,settings.rithmicSystem(),System.currentTimeMillis());
+        if(!parsed.accepted()){nativeHistoryError(session,channel,parsed.requestId(),parsed.error());return;}
+        if(nativeHistorySubscribers.get(session.getId())!=session){nativeHistoryError(session,channel,parsed.requestId(),"busy");return;}
+        var history=rithmicDepthHistory==null?null:rithmicDepthHistory.getIfAvailable();
+        if(history==null){nativeHistoryError(session,channel,parsed.requestId(),"unavailable");return;}
+        if(footprintBackfillPermits==null||!footprintBackfillPermits.tryAcquire()){nativeHistoryError(session,channel,parsed.requestId(),"busy");return;}
+        try {
+            var reply=history.nativePage(session.getId(),parsed.request(),System.currentTimeMillis(),(int)Math.min(524288L,settings.wsMaxQueuedBytes()/4));
+            if(reply.error()!=null){nativeHistoryError(session,channel,parsed.requestId(),reply.error());return;}
+            var admission=channel.tryEnqueueHistoryBinary(reply.binary(),()->nativeHistoryAuthorized(session,channel));
+            if(admission==OutboundChannel.HistoryAdmission.BUSY||admission==OutboundChannel.HistoryAdmission.CAPACITY)
+                nativeHistoryError(session,channel,parsed.requestId(),admission==OutboundChannel.HistoryAdmission.BUSY?"busy":"capacity");
+        } catch(RuntimeException invalid){nativeHistoryError(session,channel,parsed.requestId(),"unavailable");}
+        finally {if(!nativeHistoryAuthorized(session,channel))history.forget(session.getId());footprintBackfillPermits.release();}
+    }
+
     /** History travels on the authenticated socket; only registered clients can read the view. */
     void handleFootprintBasicMessage(WebSocketSession session, String payload) {
         if (session == null || clientsById.get(session.getId()) != session || !session.isOpen() || payload == null) return;
@@ -15400,6 +15475,7 @@ public class FeedGatewayService implements ReplayRunner {
         JsonNode request;
         try { request = mapper.readTree(payload); } catch (Exception invalid) { return; }
         if(request!=null&&RithmicDepthHistory.REQUEST.equals(request.path("type").asText())){
+            if(request.has("format")){handleNativeRithmicHistory(session,request);return;}
             var history=rithmicDepthHistory==null?null:rithmicDepthHistory.getIfAvailable();
             if(history==null||!settings.rithmicDepthEnabled()){send(session,RithmicDepthHistory.RESPONSE,mapper.createObjectNode().put("requestId",request.path("requestId").asText()).put("error","unavailable").toString());return;}
             if(!footprintBackfillPermits.tryAcquire()){send(session,RithmicDepthHistory.RESPONSE,mapper.createObjectNode().put("requestId",request.path("requestId").asText()).put("error","busy").toString());return;}

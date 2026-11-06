@@ -1,6 +1,9 @@
 package app.feedgateway;
 
 import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.BinaryMessage;
+import org.springframework.web.socket.WebSocketMessage;
+import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.WebSocketSession;
 
 import java.io.IOException;
@@ -14,6 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * Per-socket bounded, coalescing, asynchronous outbound channel (P0 — slow-client isolation).
@@ -102,10 +106,13 @@ final class OutboundChannel {
         void droppedOnClose(int messages);
     }
 
-    private enum CloseReason { OVERFLOW, WRITE_ERROR }
+    private enum CloseReason { OVERFLOW, WRITE_ERROR, AUTH_REVOKED }
 
-    private record Pending(String envelope, int bytes) {
+    private record Pending(WebSocketMessage<?> message,int bytes,BooleanSupplier authorized,RithmicHistoryInvalidation invalidation) {
     }
+    private record Insert(boolean overflow,boolean startDrain) {}
+    enum HistoryAdmission { ENQUEUED, BUSY, CAPACITY, CLOSED }
+    static final int HISTORY_CONTROL_RESERVE=4096;
 
     // The teardown's lifecycle (strike re-review round 5). NONE while the channel is open. PENDING once it is closed
     // and no closer holds its teardown. HANDED from the moment one thread claims it for a hand-over — PENDING ->
@@ -136,6 +143,7 @@ final class OutboundChannel {
     private long peakDepth;
     private volatile long sendStartedAtMs; // 0 = no send in flight; else the wall-clock the write began
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private volatile CloseStatus authorizationClose;
     private final AtomicInteger teardownState = new AtomicInteger(TEARDOWN_NONE);
     private final AtomicBoolean tornDown = new AtomicBoolean(false);
     /**
@@ -183,7 +191,7 @@ final class OutboundChannel {
         }
     }
 
-    /** Bytes currently queued (the same char-count bound {@link #enqueue} charges against maxBytes). */
+    /** Exact UTF-8 text plus binary bytes currently queued. */
     long queuedBytes() {
         synchronized (lock) {
             return queuedBytes;
@@ -208,42 +216,104 @@ final class OutboundChannel {
         if (closed.get() || envelope == null) {
             return false;
         }
-        int bytes = envelope.length(); // chars ≈ bytes for the ASCII JSON envelopes; a bound, not exact
-        boolean overflow;
-        boolean startDrain = false;
+        return enqueueText(envelope,coalesceKey,null);
+    }
+
+    void revokeAuthorization(){close(CloseReason.AUTH_REVOKED);}
+
+    boolean enqueueAuthorizedText(String envelope,String coalesceKey,BooleanSupplier authorized){
+        if(closed.get()||envelope==null)return false;
+        if(!authorized(authorized)){close(CloseReason.AUTH_REVOKED);return false;}
+        return enqueueText(envelope,coalesceKey,authorized);
+    }
+
+    private boolean enqueueText(String envelope,String coalesceKey,BooleanSupplier authorized){
+        envelope=utf8Safe(envelope);TextMessage message=new TextMessage(envelope);int wireBytes=utf8Length(envelope);
+        Insert inserted;
         synchronized (lock) {
             if (closed.get()) {
                 return false;
             }
-            // Coalescable messages share a key (latest-wins, position preserved); non-coalescable messages
-            // get a unique key so every one is delivered (replay records, control/lifecycle events).
-            String key = (coalesceKey != null) ? ("c " + coalesceKey) : ("u " + (seq++));
-            Pending prev = queue.put(key, new Pending(envelope, bytes));
-            if (prev != null) {
-                queuedBytes -= prev.bytes();
-                metrics.coalesced();
-            }
-            queuedBytes += bytes;
-            metrics.enqueued(bytes);
-            if (queue.size() > peakDepth) {
-                peakDepth = queue.size();
-            }
-            overflow = queue.size() > maxMessages || queuedBytes > maxBytes;
-            if (!overflow && !draining) {
-                draining = true;
-                startDrain = true;
-            }
+            inserted=insertLocked(new Pending(message,wireBytes,authorized,null),coalesceKey);
         }
-        if (overflow) {
+        return finishInsert(inserted);
+    }
+
+    /** Preserve Java's former malformed-surrogate replacement without copying valid shared text. */
+    static String utf8Safe(String text){
+        StringBuilder out=null;for(int i=0;i<text.length();i++){char c=text.charAt(i);
+            if(Character.isHighSurrogate(c)&&i+1<text.length()&&Character.isLowSurrogate(text.charAt(i+1))){if(out!=null){out.append(c);out.append(text.charAt(i+1));}i++;continue;}
+            if(Character.isSurrogate(c)){if(out==null){out=new StringBuilder(text.length());out.append(text,0,i);}out.append('?');}
+            else if(out!=null)out.append(c);
+        }return out==null?text:out.toString();
+    }
+
+    /** Exact StandardCharsets.UTF_8 length without allocating/decoding per-recipient byte copies. */
+    static int utf8Length(String text){
+        long count=0;for(int i=0;i<text.length();i++){char c=text.charAt(i);
+            if(c<128)count++;else if(c<2048)count+=2;
+            else if(Character.isHighSurrogate(c)&&i+1<text.length()&&Character.isLowSurrogate(text.charAt(i+1))){count+=4;i++;}
+            else count+=Character.isSurrogate(c)?1:3;
+            if(count>Integer.MAX_VALUE)return Integer.MAX_VALUE;
+        }return (int)count;
+    }
+
+    private Insert insertLocked(Pending pending,String coalesceKey){
+        String key=coalesceKey!=null?"c "+coalesceKey:"u "+seq++;
+        Pending previous=queue.put(key,pending);if(previous!=null){queuedBytes-=previous.bytes();metrics.coalesced();}
+        queuedBytes+=pending.bytes();metrics.enqueued(pending.bytes());peakDepth=Math.max(peakDepth,queue.size());
+        boolean overflow=queue.size()>maxMessages||queuedBytes>maxBytes,start=!overflow&&!draining;
+        if(start)draining=true;return new Insert(overflow,start);
+    }
+
+    private boolean finishInsert(Insert inserted){
+        if (inserted.overflow()) {
             // The client cannot keep up even after coalescing — disconnect it deterministically. The close
             // itself happens on the closers executor: this thread is an enqueuer, and must not wait on it.
             close(CloseReason.OVERFLOW);
             return false;
         }
-        if (startDrain) {
-            writers.execute(this::drain);
+        if (inserted.startDrain()) {
+            try{writers.execute(this::drain);}catch(RuntimeException|Error rejected){close(CloseReason.WRITE_ERROR);return false;}
         }
         return true;
+    }
+
+    private static boolean authorized(BooleanSupplier check){
+        try{return check!=null&&check.getAsBoolean();}catch(RuntimeException|Error unavailable){return false;}
+    }
+
+    /** Reserve one small control plus4KiB before making the channel-owned binary copy. */
+    HistoryAdmission tryEnqueueHistoryBinary(byte[] payload,BooleanSupplier authorized){
+        if(closed.get())return HistoryAdmission.CLOSED;
+        if(payload==null||payload.length==0||payload.length>Math.min(524288L,maxBytes/4))return HistoryAdmission.CAPACITY;
+        if(!authorized(authorized)){close(CloseReason.AUTH_REVOKED);return HistoryAdmission.CLOSED;}
+        Insert inserted=null;boolean saturated=false;
+        synchronized(lock){
+            if(closed.get())return HistoryAdmission.CLOSED;
+            if(queue.size()+1>maxMessages||queuedBytes+HISTORY_CONTROL_RESERVE>maxBytes)saturated=true;
+            else if(queue.size()+2>maxMessages||queuedBytes+payload.length+HISTORY_CONTROL_RESERVE>maxBytes)return HistoryAdmission.BUSY;
+            else{
+                BinaryMessage message=new BinaryMessage(payload.clone());
+                inserted=insertLocked(new Pending(message,payload.length,authorized,null),null);
+            }
+        }
+        if(saturated){close(CloseReason.OVERFLOW);return HistoryAdmission.CLOSED;}
+        return finishInsert(inserted)?HistoryAdmission.ENQUEUED:HistoryAdmission.CLOSED;
+    }
+
+    boolean enqueueHistoryInvalidation(RithmicHistoryInvalidation value,BooleanSupplier authorized){
+        if(closed.get()||value==null)return false;
+        if(!authorized(authorized)){close(CloseReason.AUTH_REVOKED);return false;}
+        Insert inserted;
+        synchronized(lock){
+            if(closed.get())return false;
+            Pending previous=queue.get("c "+value.key());
+            if(previous!=null&&previous.invalidation()!=null)value=previous.invalidation().merge(value);
+            String envelope=utf8Safe(value.envelope());TextMessage message=new TextMessage(envelope);
+            inserted=insertLocked(new Pending(message,utf8Length(envelope),authorized,value),value.key());
+        }
+        return finishInsert(inserted);
     }
 
     /** Drains the queue to the socket. Runs on a writer-pool thread; only ONE drain runs per socket. */
@@ -270,9 +340,10 @@ final class OutboundChannel {
             }
             sendStartedAtMs = System.currentTimeMillis(); // arm the watchdog deadline
             try {
+                if(next.authorized()!=null&&!authorized(next.authorized())){close(CloseReason.AUTH_REVOKED);return;}
                 // Blocking write — but NEVER on the Kafka thread, so a slow socket cannot stall polling.
                 // If it exceeds the write deadline the watchdog force-closes the session, unblocking us.
-                session.sendMessage(new TextMessage(next.envelope()));
+                session.sendMessage(next.message());
                 metrics.sent(next.bytes());
             } catch (IOException | RuntimeException e) {
                 close(CloseReason.WRITE_ERROR);
@@ -312,6 +383,7 @@ final class OutboundChannel {
         if (!closed.compareAndSet(false, true)) {
             return false;
         }
+        if(reason==CloseReason.AUTH_REVOKED)authorizationClose=new CloseStatus(4001,"authorization unavailable");
         int dropped;
         synchronized (lock) {
             dropped = queue.size();
@@ -320,7 +392,7 @@ final class OutboundChannel {
         }
         if (reason == CloseReason.OVERFLOW) {
             metrics.disconnectedSlow();
-        } else {
+        } else if(reason==CloseReason.WRITE_ERROR) {
             metrics.writeError();
         }
         if (dropped > 0) {
@@ -432,7 +504,7 @@ final class OutboundChannel {
     private void closeSessionQuietly() {
         try {
             if (session.isOpen()) {
-                session.close();
+                if(authorizationClose==null)session.close();else session.close(authorizationClose);
             }
         } catch (IOException | RuntimeException ignored) {
             // already marked closed and detached from routing

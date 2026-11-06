@@ -6,6 +6,25 @@ import org.apache.avro.generic.GenericRecord;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 class RithmicDepthJsonTest {
+    @Test void typedValidationDistinguishesFullBookFromRenderableUnavailableStatus(){
+        var valid=RithmicDepthJson.validate(RithmicSchemas.KEY,frame(),NOW);assertTrue(valid.fullBook());assertTrue(valid.renderable());assertNull(valid.gapReason());
+        var status=frame();status.put("mappingReady",false);status.put("basisCents",null);status.put("bids",List.of());status.put("asks",List.of());
+        var checked=RithmicDepthJson.validate(RithmicSchemas.KEY,status,NOW);assertFalse(checked.fullBook());assertTrue(checked.renderable());assertEquals(RithmicDepthJson.GapReason.NOT_READY,checked.gapReason());assertNotNull(RithmicDepthJson.render(checked));
+    }
+    @Test void typedRefusalReasonsAreBoundedAndCannotBePromotedIntoBooks(){
+        var empty=frame();empty.put("bids",List.of());assertEquals(RithmicDepthJson.GapReason.EMPTY_BOOK,RithmicDepthJson.validate(RithmicSchemas.KEY,empty,NOW).gapReason());
+        var disconnected=frame();disconnected.put("connected",false);assertEquals(RithmicDepthJson.GapReason.NOT_READY,RithmicDepthJson.validate(RithmicSchemas.KEY,disconnected,NOW).gapReason());
+        var wrong=frame();((GenericRecord)((List<?>)wrong.get("bids")).getFirst()).put("spxPriceCents",1L);var invalid=RithmicDepthJson.validate(RithmicSchemas.KEY,wrong,NOW);assertFalse(invalid.fullBook());assertFalse(invalid.renderable());assertEquals(RithmicDepthJson.GapReason.INVALID_RECORD,invalid.gapReason());
+    }
+    @Test void canonicalSizeIsCountedWithoutSerializationAndMatchesEscapedUtf8Output(){
+        for(String reason:List.of("OK","escaped \" \\ \n \u0001 € 🟢","x".repeat(1024))){var r=frame();r.put("reason",reason);var checked=RithmicDepthJson.validate(RithmicSchemas.KEY,r,NOW);assertTrue(checked.fullBook());assertEquals(RithmicDepthJson.render(checked).getBytes(java.nio.charset.StandardCharsets.UTF_8).length,checked.jsonBytes());}
+        var tooLong=frame();tooLong.put("reason","x".repeat(1025));assertFalse(RithmicDepthJson.validate(RithmicSchemas.KEY,tooLong,NOW).renderable());
+    }
+    @Test void maxWidthFullBookIsAnExplicitOversizeGapRatherThanClippedDepth(){
+        var r=frame();var bids=new java.util.ArrayList<GenericRecord>();var asks=new java.util.ArrayList<GenericRecord>();
+        for(int i=0;i<4096;i++){var b=level(30360-i);b.put("quantity",9007199254740991L);bids.add(b);var a=level(30361+i);a.put("quantity",9007199254740991L);asks.add(a);}r.put("bids",bids);r.put("asks",asks);
+        var checked=RithmicDepthJson.validate(RithmicSchemas.KEY,r,NOW);assertEquals(RithmicDepthJson.GapReason.OVERSIZE_COLUMN,checked.gapReason());assertFalse(checked.fullBook());assertNull(RithmicDepthJson.render(checked));
+    }
     @Test void paperTradingDepthIsAdmittedWithoutRelabelling() {
         var input=frame();input.put("environment","Rithmic Paper Trading");
         var output=RithmicDepthJson.render(RithmicSchemas.KEY,input,NOW);

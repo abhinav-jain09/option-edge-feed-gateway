@@ -59,6 +59,7 @@ final class RithmicDepthRelay {
         }
     }
     synchronized void accept(String key,Object value,long now){
+        if(RithmicDepthJson.knownForeign(value,settings.rithmicSystem()))return;
         String json=RithmicDepthJson.render(key,value,now);
         if(json!=null){
             var r=(GenericRecord)value;boolean mapped=Boolean.TRUE.equals(r.get("mappingReady"));

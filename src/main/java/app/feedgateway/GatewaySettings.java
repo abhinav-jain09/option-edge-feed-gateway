@@ -107,6 +107,7 @@ public final class GatewaySettings {
     }
 
     public boolean rithmicDepthEnabled() {return boolValue("GATEWAY_RITHMIC_DEPTH_ENABLED",false);}
+    public String rithmicSystem() {return value("GATEWAY_RITHMIC_SYSTEM","");}
 
     // ---- Line health (level-absorption-service line-health loop; docs line-health requirement LH-O-6) ----
 
