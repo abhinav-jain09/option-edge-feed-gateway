@@ -396,7 +396,8 @@ final class LineHealthRelay {
             return;
         }
         long epoch = status.get("statusEpoch").asLong();
-        if (epochSeen != null && epochSeen != epoch) {
+        // the bootstrap scan reads every epoch the compacted topic still holds: only a change seen on the live tail is a continuity reset
+        if (live && epochSeen != null && epochSeen != epoch) {
             epochChanged = true;
         }
         epochSeen = epoch;
@@ -404,6 +405,10 @@ final class LineHealthRelay {
 
     private Long epochSeen;
     private volatile boolean epochChanged;
+
+    boolean epochChangedForTest() {
+        return epochChanged;
+    }
 
     private synchronized boolean hasHeldWithoutBound() {
         for (HeldStatus h : held) {
@@ -582,7 +587,7 @@ final class LineHealthRelay {
                 return null;
             }
             // the semantic fields each subject needs: none is synthesized from another (a made-up count would defeat the page's gap detection)
-            if (subject == LineHealthSchemas.STATUS && (!(r.get("stateSequence") instanceof Long) || !(r.get("systemRecordCount") instanceof Long))) {
+            if (subject == LineHealthSchemas.STATUS && (!(r.get("stateSequence") instanceof Long) || !(r.get("systemRecordCount") instanceof Long) || !(r.get("statusEpoch") instanceof Long))) {
                 return null;
             }
             if (subject == LineHealthSchemas.STATE && r.get("ownerTag") == null && !(r.get("systemSequence") instanceof Long)) {
