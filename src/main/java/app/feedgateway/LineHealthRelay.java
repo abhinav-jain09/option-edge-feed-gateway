@@ -405,6 +405,10 @@ final class LineHealthRelay {
     private Long epochSeen;
     private volatile boolean epochChanged;
 
+    boolean epochChangedForTest() {
+        return epochChanged;
+    }
+
     private synchronized boolean hasHeldWithoutBound() {
         for (HeldStatus h : held) {
             if (h.waitsForStateOffset < 0) {
@@ -582,7 +586,7 @@ final class LineHealthRelay {
                 return null;
             }
             // the semantic fields each subject needs: none is synthesized from another (a made-up count would defeat the page's gap detection)
-            if (subject == LineHealthSchemas.STATUS && (!(r.get("stateSequence") instanceof Long) || !(r.get("systemRecordCount") instanceof Long))) {
+            if (subject == LineHealthSchemas.STATUS && (!(r.get("stateSequence") instanceof Long) || !(r.get("systemRecordCount") instanceof Long) || !(r.get("statusEpoch") instanceof Long))) {
                 return null;
             }
             if (subject == LineHealthSchemas.STATE && r.get("ownerTag") == null && !(r.get("systemSequence") instanceof Long)) {

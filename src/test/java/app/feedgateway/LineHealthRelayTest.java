@@ -101,7 +101,7 @@ class LineHealthRelayTest {
 
     private static GenericRecord status(long stateSequence, long systemRecordCount) {
         return new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", stateSequence)
-                .set("systemRecordCount", systemRecordCount).build();
+                .set("systemRecordCount", systemRecordCount).set("statusEpoch", 1L).build();
     }
 
     private static GenericRecord voice(String eventId) {
@@ -363,7 +363,7 @@ class LineHealthRelayTest {
         Sink sink = new Sink();
         LineHealthRelay relay = relay(sink);
         relay.accept(STATE, "A", bytes(state("A", 0, "TOUCHING", 6, null).set("systemSequence", null).build()));        // a system line without its sequence
-        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 5L).build()));   // no systemRecordCount
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 5L).set("statusEpoch", 1L).build()));   // no systemRecordCount
         assertEquals(2, relay.dropsForTest());
         assertTrue(sink.frames.isEmpty());
     }
@@ -450,5 +450,17 @@ class LineHealthRelayTest {
         for (String part : relay.checkpointParts()) {
             assertTrue(part.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= SETTINGS.lineHealthHelloMaxBytes() + 400, "a part is within the bound in bytes, not characters");
         }
+    }
+
+    @Test
+    void aStatusWithoutAnEpochIsRefusedAndAChangedEpochRequestsARebuildOfTheFold() {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink);
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 5L).set("systemRecordCount", 2L).build()));
+        assertEquals(1, relay.dropsForTest(), "no statusEpoch, no status");
+        relay.accept(STATUS, "SPX", bytes(status(6, 2)));
+        assertFalse(relay.epochChangedForTest());
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 1L).set("systemRecordCount", 0L).set("statusEpoch", 2L).build()));
+        assertTrue(relay.epochChangedForTest(), "a new epoch is a continuity reset: the consumer loop rebuilds from the topics");
     }
 }
