@@ -228,7 +228,7 @@ final class OutboundChannel {
     }
 
     private boolean enqueueText(String envelope,String coalesceKey,BooleanSupplier authorized){
-        TextMessage message=new TextMessage(envelope);int wireBytes=utf8Length(envelope);
+        envelope=utf8Safe(envelope);TextMessage message=new TextMessage(envelope);int wireBytes=utf8Length(envelope);
         Insert inserted;
         synchronized (lock) {
             if (closed.get()) {
@@ -237,6 +237,15 @@ final class OutboundChannel {
             inserted=insertLocked(new Pending(message,wireBytes,authorized,null),coalesceKey);
         }
         return finishInsert(inserted);
+    }
+
+    /** Preserve Java's former malformed-surrogate replacement without copying valid shared text. */
+    static String utf8Safe(String text){
+        StringBuilder out=null;for(int i=0;i<text.length();i++){char c=text.charAt(i);
+            if(Character.isHighSurrogate(c)&&i+1<text.length()&&Character.isLowSurrogate(text.charAt(i+1))){if(out!=null){out.append(c);out.append(text.charAt(i+1));}i++;continue;}
+            if(Character.isSurrogate(c)){if(out==null){out=new StringBuilder(text.length());out.append(text,0,i);}out.append('?');}
+            else if(out!=null)out.append(c);
+        }return out==null?text:out.toString();
     }
 
     /** Exact StandardCharsets.UTF_8 length without allocating/decoding per-recipient byte copies. */
@@ -301,7 +310,7 @@ final class OutboundChannel {
             if(closed.get())return false;
             Pending previous=queue.get("c "+value.key());
             if(previous!=null&&previous.invalidation()!=null)value=previous.invalidation().merge(value);
-            String envelope=value.envelope();TextMessage message=new TextMessage(envelope);
+            String envelope=utf8Safe(value.envelope());TextMessage message=new TextMessage(envelope);
             inserted=insertLocked(new Pending(message,utf8Length(envelope),authorized,value),value.key());
         }
         return finishInsert(inserted);

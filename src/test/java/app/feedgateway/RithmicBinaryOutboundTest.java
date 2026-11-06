@@ -77,4 +77,9 @@ class RithmicBinaryOutboundTest {
     @Test void allocationFreeUtf8LengthMatchesJavaForAsciiBmpSupplementaryAndMalformedSurrogates(){
         for(String value:java.util.List.of("ascii","é€","🎯","a\uD800b","x\uDC00y","\uD800\uD800\uDC00"))assertEquals(value.getBytes(java.nio.charset.StandardCharsets.UTF_8).length,OutboundChannel.utf8Length(value));
     }
+
+    @Test void malformedSurrogatesAreNormalizedBeforeTheWriterAndValidTextKeepsSharedIdentity()throws Exception{
+        String good="shared🎯é";assertSame(good,OutboundChannel.utf8Safe(good));assertEquals("a?b",OutboundChannel.utf8Safe("a\uD800b"));assertEquals("x?y",OutboundChannel.utf8Safe("x\uDC00y"));assertEquals("?🎯?",OutboundChannel.utf8Safe("\uD800🎯\uDC00"));
+        var h=new Fixture(8,16384);h.channel.enqueue("a\uD800b",null);h.drain();assertEquals("a?b",((org.springframework.web.socket.TextMessage)h.sent.get(0)).getPayload());assertEquals(3,h.sentBytes);
+    }
 }

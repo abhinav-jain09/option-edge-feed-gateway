@@ -15371,10 +15371,11 @@ public class FeedGatewayService implements ReplayRunner {
     /** Called after releasing the source-cache lock; no engine/channel work occurs inside that lock. */
     void rithmicHistoryChanged(Long affected){
         var history=rithmicDepthHistory==null?null:rithmicDepthHistory.getIfAvailable();if(history==null)return;
+        String hello=history.nativeHello();var invalidation=affected==null?null:history.invalidation(affected);
         for(var session:nativeHistorySubscribers.values()){
             var channel=outbound.get(session.getId());if(channel==null||!nativeHistoryAuthorized(session,channel)){nativeHistorySubscribers.remove(session.getId(),session);history.forget(session.getId());continue;}
-            if(affected!=null)channel.enqueueHistoryInvalidation(history.invalidation(affected),()->nativeHistoryAuthorized(session,channel));
-            sendNativeHistoryHello(session,channel);
+            if(invalidation!=null)channel.enqueueHistoryInvalidation(invalidation,()->nativeHistoryAuthorized(session,channel));
+            channel.enqueueAuthorizedText(envelopeJson("rithmic-history-hello",hello),"rithmic-history-hello",()->nativeHistoryAuthorized(session,channel));
         }
     }
 
@@ -15402,7 +15403,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void handleNativeRithmicHistory(WebSocketSession session,JsonNode request) {
         OutboundChannel channel=outbound.get(session.getId());
-        if(!settings.authEnabled()||!settings.rithmicDepthEnabled()||!RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem())){
+        if(!settings.authEnabled()||!settings.rithmicDepthEnabled()||routingEngine==null||settings.approvalUrl().isBlank()&&settings.approvalRole().isBlank()||!RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem())){
             String id=request.path("requestId").isTextual()?request.path("requestId").asText():"";if(id.length()>64)id="";
             send(session,RithmicDepthHistory.RESPONSE,mapper.createObjectNode().put("requestId",id).put("format",RithmicNativeHistoryRequest.FORMAT).put("error","unavailable").toString());return;
         }

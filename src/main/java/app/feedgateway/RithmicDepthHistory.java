@@ -49,6 +49,7 @@ final class RithmicDepthHistory {
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private org.springframework.beans.factory.ObjectProvider<FeedGatewayService> gateway;
     private long mutationAffected=Long.MAX_VALUE;
+    private boolean mutationBumped;
     private void notifySubscribers(Long affected){
         var service=gateway==null?null:gateway.getIfAvailable();
         if(service!=null)service.rithmicHistoryChanged(affected);
@@ -89,7 +90,7 @@ final class RithmicDepthHistory {
     }
     void accept(String key,Object value,long now){
         Long affected=null;boolean first;
-        synchronized(this){boolean empty=columns.isEmpty();long before=lateRevision;String incarnation=cacheIncarnation;mutationAffected=Long.MAX_VALUE;acceptLocked(key,value,now);first=empty&&!columns.isEmpty();if(before!=lateRevision||!incarnation.equals(cacheIncarnation))affected=mutationAffected==Long.MAX_VALUE?Math.max(0,now-WINDOW):mutationAffected;}
+        synchronized(this){boolean empty=columns.isEmpty();long before=lateRevision;String incarnation=cacheIncarnation;mutationAffected=Long.MAX_VALUE;mutationBumped=false;acceptLocked(key,value,now);first=empty&&!columns.isEmpty();if(before!=lateRevision||!incarnation.equals(cacheIncarnation))affected=mutationAffected==Long.MAX_VALUE?Math.max(0,now-WINDOW):mutationAffected;}
         if(affected!=null||first&&ready)notifySubscribers(affected);
     }
     private void acceptLocked(String key,Object value,long now){
@@ -142,11 +143,12 @@ final class RithmicDepthHistory {
     }
     void markScanSkip(long now){
         long affected;
-        synchronized(this){affected=columns.isEmpty()?Math.max(0,now-WINDOW):Math.min(now,columns.lastKey());pendingScanFrom=affected;if(!columns.isEmpty())rememberGap(affected,columns.lastKey()+1,RithmicDepthJson.GapReason.SCAN_SKIP);limitedUntil.put("SCAN_LIMIT",now+WINDOW);limited=true;bumpRevision(affected);}
+        synchronized(this){mutationBumped=false;affected=columns.isEmpty()?Math.max(0,now-WINDOW):Math.min(now,columns.lastKey());pendingScanFrom=affected;if(!columns.isEmpty())rememberGap(affected,columns.lastKey()+1,RithmicDepthJson.GapReason.SCAN_SKIP);limitedUntil.put("SCAN_LIMIT",now+WINDOW);limited=true;bumpRevision(affected);}
         notifySubscribers(affected);
     }
     private void bumpRevision(long affected){
         mutationAffected=Math.min(mutationAffected,Math.max(0,affected));
+        if(mutationBumped)return;mutationBumped=true;
         if(lateRevision==RithmicNativeHistoryRequest.MAX_SAFE){cacheIncarnation=UUID.randomUUID().toString();lateRevision=0;}else lateRevision++;
     }
     private void put(RithmicNativeHistoryColumn next){
@@ -210,7 +212,7 @@ final class RithmicDepthHistory {
             result.put("afterMs",cursor);result.put("done",items.isEmpty()||cursor>=items.getLast().getKey());return JSON.writeValueAsString(result);
         }catch(Exception invalid){return "{\"error\":\"invalid_request\"}";}
     }
-    static byte[] compress(String value)throws IOException{var out=new ByteArrayOutputStream();try(var gzip=new GZIPOutputStream(out)){gzip.write(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));}return out.toByteArray();}
+    static byte[] compress(String value)throws IOException{var out=new ByteArrayOutputStream();try(var gzip=new GZIPOutputStream(out){{def.setLevel(java.util.zip.Deflater.BEST_SPEED);}}){gzip.write(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));}return out.toByteArray();}
     static byte[] expand(byte[] value)throws IOException{try(var gzip=new GZIPInputStream(new ByteArrayInputStream(value))){byte[] result=gzip.readNBytes(524289);if(result.length>524288)throw new IOException("History column bound");return result;}}
     @PreDestroy void stop(){running.set(false);var c=consumer;if(c!=null)c.wakeup();if(thread!=null)try{thread.join(5000);}catch(InterruptedException e){Thread.currentThread().interrupt();}}
 }

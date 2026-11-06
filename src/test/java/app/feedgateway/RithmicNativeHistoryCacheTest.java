@@ -28,7 +28,7 @@ class RithmicNativeHistoryCacheTest {
     @Test void syntheticStreamBoundaryNeverOverwritesAnExistingRealBook()throws Exception{
         var h=history();h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW-1,1),NOW);var next=RithmicDepthHistoryTest.frame(NOW,2);next.put("streamId","replacement");h.accept(RithmicSchemas.KEY,next,NOW);
         var result=header(h,"s",request(NOW-1000,NOW,NOW-1001),NOW);assertEquals(2,result.path("columns").size());assertEquals("BOOK",result.path("columns").get(0).path("kind").asText());assertEquals("BOOK",result.path("columns").get(1).path("kind").asText());assertEquals(NOW-1,result.path("columns").get(1).path("breakBeforeMs").asLong());
-        var legacy=JSON.readTree(h.page("legacy",RithmicDepthHistoryTest.request(NOW-1000,NOW,NOW-1001),NOW,524288));assertEquals(2,legacy.path("frames").size());assertFalse(legacy.path("frames").get(0).has("gapAtMs"));
+        var legacy=JSON.readTree(h.page("legacy",RithmicDepthHistoryTest.request(NOW-1000,NOW,NOW-1001),NOW,524288));assertEquals(2,legacy.path("frames").size());assertFalse(legacy.path("frames").get(0).has("gapAtMs"));assertEquals(1L,ReflectionTestUtils.getField(h,"lateRevision"),"one retroactive stream boundary is one source mutation");
     }
     @Test void unknownScopeBecomesABoundedGapAndCannotAcquireBookProvenance()throws Exception{
         var h=history();var raw=RithmicDepthHistoryTest.frame(NOW,1);raw.put("environment","unrecognised input scope");h.accept(RithmicSchemas.KEY,raw,NOW);var result=header(h,"s",request(NOW-1000,NOW,NOW-1001),NOW);assertEquals("SOURCE_GAP",result.path("columns").get(0).path("kind").asText());assertFalse(result.toString().contains("unrecognised"));
@@ -48,7 +48,7 @@ class RithmicNativeHistoryCacheTest {
     }
 
     @Test void scanSkipRemainsVisibleUntilItsSupportedHorizonExpires()throws Exception{
-        var h=history();h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW-1000,1),NOW);h.markScanSkip(NOW);var value=header(h,"scan",request(NOW-2000,NOW,NOW-2001),NOW);assertTrue(value.path("limited").asBoolean());assertTrue(value.path("sourceGapIntervals").toString().contains("SCAN_SKIP"));assertTrue(value.path("lateRevision").asLong()>0);
+        var h=history();h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW-1000,1),NOW);h.markScanSkip(NOW);assertEquals(1L,ReflectionTestUtils.getField(h,"lateRevision"));var value=header(h,"scan",request(NOW-2000,NOW,NOW-2001),NOW);assertTrue(value.path("limited").asBoolean());assertTrue(value.path("sourceGapIntervals").toString().contains("SCAN_SKIP"));assertTrue(value.path("lateRevision").asLong()>0);
         h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW+1,2),NOW+1);long later=NOW+RithmicDepthHistory.WINDOW+2;h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(later,2),later);var expired=header(h,"expired",request(later-1000,later,later-1001),later);assertFalse(expired.path("limited").asBoolean());assertEquals(0,expired.path("sourceGapIntervals").size());
     }
 
@@ -71,5 +71,12 @@ class RithmicNativeHistoryCacheTest {
         for(int i=0;i<2049;i++){last=NOW+i*1000L;var raw=RithmicDepthHistoryTest.frame(last,i+1);if(i%2==0)raw.put("mappingReady",false);else raw.put("bids",List.of());h.accept(RithmicSchemas.KEY,raw,last);}
         assertEquals(true,ReflectionTestUtils.getField(h,"metadataUnavailable"));h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(last+1000,3000),last+1000);assertEquals("unavailable",h.nativePage("held",request(last-1000,last,last-1001),last+1000,524288).error());
         long later=last+RithmicDepthHistory.WINDOW+2;h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(later,4000),later);assertEquals(false,ReflectionTestUtils.getField(h,"metadataUnavailable"));var invalid=RithmicDepthHistoryTest.frame(later+1,4001);invalid.put("mappingReady",false);h.accept(RithmicSchemas.KEY,invalid,later+1);assertTrue(h.nativePage("recovered",request(later-1000,later+1,later-1001),later+1,524288).accepted());@SuppressWarnings("unchecked")var gaps=(java.util.Map<Long,?>)ReflectionTestUtils.getField(h,"sourceGaps");assertEquals(1,gaps.size());
+    }
+
+    @Test void retroactiveStreamChangeIsOneRevisionDespiteSyntheticAndBookChanges()throws Exception{
+        var h=history();h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW-2000,1),NOW);h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW,2),NOW);var late=RithmicDepthHistoryTest.frame(NOW-1000,1);late.put("streamId","late-stream");h.accept(RithmicSchemas.KEY,late,NOW);assertEquals(1L,ReflectionTestUtils.getField(h,"lateRevision"));
+    }
+    @Test void helloPrunesExpiredLostMetadataBeforeReportingUnavailable()throws Exception{
+        var h=history();ReflectionTestUtils.setField(h,"metadataUnavailable",true);ReflectionTestUtils.setField(h,"metadataLostThrough",System.currentTimeMillis()-RithmicDepthHistory.WINDOW-1);assertTrue(JSON.readTree(h.nativeHello()).path("ready").asBoolean());assertEquals(false,ReflectionTestUtils.getField(h,"metadataUnavailable"));
     }
 }
