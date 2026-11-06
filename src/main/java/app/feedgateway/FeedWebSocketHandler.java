@@ -36,7 +36,7 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
         // LH-O-6: the owner tag of the authenticated subject, computed once; a socket without a subject gets none and so receives no user-line record
-        Object subject = session.getAttributes().get("sub");
+        Object subject = session.getAttributes() == null ? null : session.getAttributes().get("sub");
         if (subject instanceof String text && !text.isBlank()) {
             session.getAttributes().put(FeedGatewayService.LINE_HEALTH_OWNER_TAG_ATTR, LineHealthOwnerTag.of(text));
         }

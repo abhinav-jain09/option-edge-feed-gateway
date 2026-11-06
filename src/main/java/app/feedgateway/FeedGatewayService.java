@@ -17081,7 +17081,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The owner tag of a socket, or null when it has none (it then receives no user-line record). */
     static String lineHealthOwnerTag(WebSocketSession session) {
-        if (session == null) return null;
+        if (session == null || session.getAttributes() == null) return null;
         Object tag = session.getAttributes().get(LINE_HEALTH_OWNER_TAG_ATTR);
         return tag instanceof String text && !text.isBlank() ? text : null;
     }
