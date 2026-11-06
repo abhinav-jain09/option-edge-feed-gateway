@@ -30,4 +30,8 @@ class RithmicNativeHistoryRouteTest {
  @Test void atomicAuthorityRequiresExactSubjectMembershipAndCurrentRole(){
   var e=new SessionRoutingEngine(new ConcurrencyLimits(5,5,100),new SubscriptionManager());e.registerAppSession("a","u",new Selection(MarketDataSource.DATABENTO,"SPX","20261106",StrikeWindow.ALL),Set.of("approved"));e.attachSocket("a","s");long now=System.currentTimeMillis();assertTrue(e.canReadNativeHistory("a","s","u",now,"approved"));assertFalse(e.canReadNativeHistory("a","s","wrong",now,"approved"));assertFalse(e.canReadNativeHistory("a","x","u",now,"approved"));assertFalse(e.canReadNativeHistory("a","s","u",now,"missing"));e.teardownAppSession("a");assertFalse(e.canReadNativeHistory("a","s","u",now,"approved"));
  }
+
+ @Test void featureOffReturnsUnavailableWithoutRevokingTheLiveSocket()throws Exception{
+  var settings=spy(new GatewaySettings());doReturn(false).when(settings).authEnabled();doReturn(false).when(settings).rithmicDepthEnabled();var json=new ObjectMapper();var service=new FeedGatewayService(settings,json,new HpsfGatewayViewMapper(),null);service.runOutboundWritesInline();var socket=mock(WebSocketSession.class);when(socket.getId()).thenReturn("off");when(socket.isOpen()).thenReturn(true);service.addClient(socket);clearInvocations(socket);service.handleFootprintBasicMessage(socket,"{\"type\":\"rithmic-depth-history\",\"format\":\"rithmic-native-fullbook-gzip-v1\",\"requestId\":\"off\"}");var sent=org.mockito.ArgumentCaptor.forClass(TextMessage.class);verify(socket).sendMessage(sent.capture());assertEquals("unavailable",json.readTree(sent.getValue().getPayload()).path("data").path("error").asText());verify(socket,never()).close(any());verify(socket,never()).close();service.removeClient(socket);
+ }
 }

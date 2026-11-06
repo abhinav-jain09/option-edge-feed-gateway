@@ -1855,9 +1855,9 @@ public class FeedGatewayService implements ReplayRunner {
     public void removeClient(WebSocketSession session) {
         esAuctionHelloPending.remove(session);   // a socket that closed while waiting for its hello must not be held
         String id = session.getId();
-        forgetAlertSocket(id);
         volPremiumDeliveries.remove(id);   // a delivery (and a paced replay) for a socket that is gone must not hold it
         OutboundChannel channel = outbound.remove(id);
+        forgetAlertSocket(id);
         spotBandSwitchDelivered.remove(id);
         WebSocketSession stored = clientsById.remove(id);
         if (stored != null) {
@@ -15402,10 +15402,14 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void handleNativeRithmicHistory(WebSocketSession session,JsonNode request) {
         OutboundChannel channel=outbound.get(session.getId());
+        if(!settings.authEnabled()||!settings.rithmicDepthEnabled()||!RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem())){
+            String id=request.path("requestId").isTextual()?request.path("requestId").asText():"";if(id.length()>64)id="";
+            send(session,RithmicDepthHistory.RESPONSE,mapper.createObjectNode().put("requestId",id).put("format",RithmicNativeHistoryRequest.FORMAT).put("error","unavailable").toString());return;
+        }
         if(!nativeHistoryAuthorized(session,channel)){if(channel!=null)channel.revokeAuthorization();return;}
-        if(nativeHistorySubscribers.get(session.getId())!=session){nativeHistoryError(session,channel,"","busy");return;}
         var parsed=RithmicNativeHistoryRequest.parse(request,settings.rithmicSystem(),System.currentTimeMillis());
         if(!parsed.accepted()){nativeHistoryError(session,channel,parsed.requestId(),parsed.error());return;}
+        if(nativeHistorySubscribers.get(session.getId())!=session){nativeHistoryError(session,channel,parsed.requestId(),"busy");return;}
         var history=rithmicDepthHistory==null?null:rithmicDepthHistory.getIfAvailable();
         if(history==null){nativeHistoryError(session,channel,parsed.requestId(),"unavailable");return;}
         if(footprintBackfillPermits==null||!footprintBackfillPermits.tryAcquire()){nativeHistoryError(session,channel,parsed.requestId(),"busy");return;}

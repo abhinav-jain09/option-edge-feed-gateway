@@ -73,4 +73,8 @@ class RithmicBinaryOutboundTest {
         var f=new Fixture(8,32768);f.binary(payload());f.channel.enqueue("text",null);f.channel.shutdown();f.drain();assertEquals(0,f.sent.size());assertEquals(0,f.channel.queuedBytes());assertEquals(OutboundChannel.HistoryAdmission.CLOSED,f.binary(payload()));
         var ws=mock(WebSocketSession.class);when(ws.getId()).thenReturn("rejected");when(ws.isOpen()).thenReturn(true);var metrics=mock(OutboundChannel.Metrics.class);var channel=new OutboundChannel(ws,r->{throw new java.util.concurrent.RejectedExecutionException();},Runnable::run,8,32768,metrics,c->{});assertEquals(OutboundChannel.HistoryAdmission.CLOSED,channel.tryEnqueueHistoryBinary(payload(),()->true));assertEquals(0,channel.queuedBytes());verify(metrics).writeError();verify(ws).close();
     }
+
+    @Test void allocationFreeUtf8LengthMatchesJavaForAsciiBmpSupplementaryAndMalformedSurrogates(){
+        for(String value:java.util.List.of("ascii","é€","🎯","a\uD800b","x\uDC00y","\uD800\uD800\uDC00"))assertEquals(value.getBytes(java.nio.charset.StandardCharsets.UTF_8).length,OutboundChannel.utf8Length(value));
+    }
 }

@@ -59,6 +59,17 @@ class RithmicNativeHistoryCacheTest {
         var h=history();ReflectionTestUtils.setField(h,"metadataUnavailable",true);ReflectionTestUtils.setField(h,"metadataLostThrough",NOW);var req=request(NOW-1000,NOW,NOW-1001);assertEquals("unavailable",h.nativePage("early",req,NOW,524288).error());long later=NOW+RithmicDepthHistory.WINDOW;assertTrue(h.nativePage("aged",request(later-1000,later,later-1001),later,524288).accepted());
     }
     @Test void continuousUnreadyOutageCoalescesRatherThanExhaustingGapMetadata()throws Exception{
-        var h=history();for(int i=0;i<2200;i++){var raw=RithmicDepthHistoryTest.frame(NOW+i*1000L,i+1);raw.put("mappingReady",false);h.accept(RithmicSchemas.KEY,raw,NOW+i*1000L);}assertEquals(false,ReflectionTestUtils.getField(h,"metadataUnavailable"));@SuppressWarnings("unchecked") var gaps=(java.util.Map<Long,?>)ReflectionTestUtils.getField(h,"sourceGaps");assertEquals(1,gaps.size());
+        var h=history();for(int i=0;i<2200;i++){var raw=RithmicDepthHistoryTest.frame(NOW+i*1000L,i+1);raw.put("mappingReady",false);h.accept(RithmicSchemas.KEY,raw,NOW+i*1000L);}assertEquals(false,ReflectionTestUtils.getField(h,"metadataUnavailable"));@SuppressWarnings("unchecked") var gaps=(java.util.Map<Long,?>)ReflectionTestUtils.getField(h,"sourceGaps");assertEquals(1,gaps.size());assertEquals(0L,ReflectionTestUtils.getField(h,"lateRevision"));
+    }
+
+    @Test void outOfOrderPostScanEventCannotConsumeThePendingSkippedSpan()throws Exception{
+        var h=history();h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW-5000,1),NOW);h.markScanSkip(NOW);h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW-9000,2),NOW);assertNotNull(ReflectionTestUtils.getField(h,"pendingScanFrom"));long before=(long)ReflectionTestUtils.getField(h,"lateRevision");h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW+1,3),NOW+1);assertNull(ReflectionTestUtils.getField(h,"pendingScanFrom"));assertEquals(before,ReflectionTestUtils.getField(h,"lateRevision"));var result=header(h,"scan-order",request(NOW-10000,NOW+1,NOW-10001),NOW+1);assertTrue(result.path("sourceGapIntervals").toString().contains("SCAN_SKIP"));assertEquals(NOW+2,result.path("sourceGapIntervals").get(0).path("endMs").asLong());
+    }
+
+    @Test void actualGapOverflowCannotRecoverEarlyAndCanRecordAgainAfterExpiry()throws Exception{
+        var h=history();long last=NOW;
+        for(int i=0;i<2049;i++){last=NOW+i*1000L;var raw=RithmicDepthHistoryTest.frame(last,i+1);if(i%2==0)raw.put("mappingReady",false);else raw.put("bids",List.of());h.accept(RithmicSchemas.KEY,raw,last);}
+        assertEquals(true,ReflectionTestUtils.getField(h,"metadataUnavailable"));h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(last+1000,3000),last+1000);assertEquals("unavailable",h.nativePage("held",request(last-1000,last,last-1001),last+1000,524288).error());
+        long later=last+RithmicDepthHistory.WINDOW+2;h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(later,4000),later);assertEquals(false,ReflectionTestUtils.getField(h,"metadataUnavailable"));var invalid=RithmicDepthHistoryTest.frame(later+1,4001);invalid.put("mappingReady",false);h.accept(RithmicSchemas.KEY,invalid,later+1);assertTrue(h.nativePage("recovered",request(later-1000,later+1,later-1001),later+1,524288).accepted());@SuppressWarnings("unchecked")var gaps=(java.util.Map<Long,?>)ReflectionTestUtils.getField(h,"sourceGaps");assertEquals(1,gaps.size());
     }
 }

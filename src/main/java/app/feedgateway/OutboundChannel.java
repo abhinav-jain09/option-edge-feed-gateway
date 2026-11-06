@@ -228,15 +228,25 @@ final class OutboundChannel {
     }
 
     private boolean enqueueText(String envelope,String coalesceKey,BooleanSupplier authorized){
-        TextMessage message=new TextMessage(envelope.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        TextMessage message=new TextMessage(envelope);int wireBytes=utf8Length(envelope);
         Insert inserted;
         synchronized (lock) {
             if (closed.get()) {
                 return false;
             }
-            inserted=insertLocked(new Pending(message,message.getPayloadLength(),authorized,null),coalesceKey);
+            inserted=insertLocked(new Pending(message,wireBytes,authorized,null),coalesceKey);
         }
         return finishInsert(inserted);
+    }
+
+    /** Exact StandardCharsets.UTF_8 length without allocating/decoding per-recipient byte copies. */
+    static int utf8Length(String text){
+        long count=0;for(int i=0;i<text.length();i++){char c=text.charAt(i);
+            if(c<128)count++;else if(c<2048)count+=2;
+            else if(Character.isHighSurrogate(c)&&i+1<text.length()&&Character.isLowSurrogate(text.charAt(i+1))){count+=4;i++;}
+            else count+=Character.isSurrogate(c)?1:3;
+            if(count>Integer.MAX_VALUE)return Integer.MAX_VALUE;
+        }return (int)count;
     }
 
     private Insert insertLocked(Pending pending,String coalesceKey){
@@ -291,8 +301,8 @@ final class OutboundChannel {
             if(closed.get())return false;
             Pending previous=queue.get("c "+value.key());
             if(previous!=null&&previous.invalidation()!=null)value=previous.invalidation().merge(value);
-            TextMessage message=new TextMessage(value.envelope().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            inserted=insertLocked(new Pending(message,message.getPayloadLength(),authorized,value),value.key());
+            String envelope=value.envelope();TextMessage message=new TextMessage(envelope);
+            inserted=insertLocked(new Pending(message,utf8Length(envelope),authorized,value),value.key());
         }
         return finishInsert(inserted);
     }

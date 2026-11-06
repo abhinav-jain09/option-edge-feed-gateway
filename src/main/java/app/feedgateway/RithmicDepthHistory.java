@@ -54,6 +54,7 @@ final class RithmicDepthHistory {
         if(service!=null)service.rithmicHistoryChanged(affected);
     }
     synchronized String nativeHello(){
+        prune(System.currentTimeMillis());
         try {
             var root=JSON.createObjectNode();root.put("format",RithmicNativeHistoryRequest.FORMAT);
             root.putObject("namespace").put("environment",settings.rithmicSystem()).put("exchange","CME").put("contract","ESZ6");
@@ -96,6 +97,7 @@ final class RithmicDepthHistory {
             if(!RithmicSchemas.KEY.equals(key)||!(value instanceof GenericRecord r)||!RithmicSchemas.FRAME.equals(r.getSchema()))return;
             if(RithmicDepthJson.knownForeign(r,settings.rithmicSystem()))return;
             long emitted=(Long)r.get("emittedAtMs");if(emitted<now-WINDOW||emitted>now+5000)return;
+            Long previousMaximum=columns.isEmpty()?null:columns.lastKey();
             var checked=RithmicDepthJson.validate(key,r,emitted);
             RithmicNativeHistoryRequest.Scope scope=null;
             String environment=String.valueOf(r.get("environment")),exchange=String.valueOf(r.get("exchange")),contract=String.valueOf(r.get("contract"));
@@ -119,7 +121,8 @@ final class RithmicDepthHistory {
             var column=RithmicNativeHistoryColumn.capture(checked,emitted,scope,boundary);
             if(column.gapReason()==RithmicDepthJson.GapReason.OVERSIZE_COLUMN&&checked.fullBook()){lastOversizeIdentity=identity;lastOversizeAt=now;}else{lastOversizeIdentity="";lastOversizeAt=-1;}
             put(column);
-            if(pendingScanFrom!=null){rememberGap(Math.min(pendingScanFrom,emitted),emitted+1,RithmicDepthJson.GapReason.SCAN_SKIP);pendingScanFrom=null;}
+            if(boundary!=null&&previousMaximum!=null&&boundary<=previousMaximum)bumpRevision(boundary-10000);
+            if(pendingScanFrom!=null&&emitted>=pendingScanFrom){rememberGap(Math.min(pendingScanFrom,emitted),emitted+1,RithmicDepthJson.GapReason.SCAN_SKIP);pendingScanFrom=null;}
             if(!column.book()){
                 var previous=columns.lowerEntry(emitted);long start=emitted;
                 if(previous!=null&&!previous.getValue().book()&&previous.getValue().gapReason()==column.gapReason())start=previous.getKey();
@@ -162,8 +165,6 @@ final class RithmicDepthHistory {
             }else merged.add(gap);
         }
         if(merged.size()>2048){metadataUnavailable=true;metadataLostThrough=Math.max(metadataLostThrough,end);return;}
-        boolean changed=!new ArrayList<>(sourceGaps.values()).equals(merged);
-        if(changed&&reason!=RithmicDepthJson.GapReason.RETENTION_EVICTED&&!columns.isEmpty()&&start<columns.lastKey())bumpRevision(start-10000);
         sourceGaps.clear();for(var gap:merged)sourceGaps.put(gap.startMs(),gap);
     }
     private void prune(long now){
