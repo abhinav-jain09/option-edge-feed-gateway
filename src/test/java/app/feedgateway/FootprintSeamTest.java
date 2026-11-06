@@ -180,7 +180,7 @@ class FootprintSeamTest {
                     case "toString" -> "RecordingSession-" + id;
                     case "hashCode" -> System.identityHashCode(proxy);
                     case "equals" -> proxy == args[0];
-                    default -> { Class<?> rt = method.getReturnType(); yield rt == boolean.class ? Boolean.FALSE : rt == int.class ? 0 : rt == long.class ? 0L : null; }
+                    default -> { Class<?> rt = method.getReturnType(); Object zero = null; if (rt == boolean.class) zero = Boolean.FALSE; else if (rt == int.class) zero = 0; else if (rt == long.class) zero = 0L; else if (rt == java.util.Map.class) zero = java.util.Map.of(); yield zero; }
                 });
     }
 
