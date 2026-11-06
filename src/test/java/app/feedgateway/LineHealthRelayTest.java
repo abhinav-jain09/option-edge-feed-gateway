@@ -215,4 +215,74 @@ class LineHealthRelayTest {
         relay.start();
         assertFalse(relay.consuming());
     }
+
+    @Test
+    void anInconsistentUserRecordIsRefusedToo_noFlagOrKindOrNestedSnapshotGetsPastTheFilter() throws Exception {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink);
+        relay.accept(STATE, "U1", bytes(state("U1", 1, "TOUCHING", 6, null).set("isUser", true).build()));            // says user, carries no tag
+        relay.accept(STATE, "U2", bytes(state("U2", 1, "TOUCHING", 6, null).set("kind", "USER_LINE").build()));      // a USER_ kind, no tag
+        GenericRecord userBody = state("A", 1, "GIVING_WAY", 3, null).set("isUser", true).build();
+        relay.accept(EVENTS, "e1", bytes(new GenericRecordBuilder(LineHealthSchemas.EVENT.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("eventId", "e1")
+                .set("snapshot", new GenericRecordBuilder(LineHealthSchemas.EVENT.schema().getField("snapshot").schema().getTypes().get(1)).set("lineId", "U9").set("isUser", true).build()).build()));
+        assertEquals(List.of(), sink.events(), "nothing reaches a socket");
+        assertEquals(3, relay.userRecordsRefusedForTest());
+        assertEquals(0, JSON.readTree(relay.helloField()).get("states").size());
+    }
+
+    @Test
+    void theBoundaryRequiresTheSemanticFieldsAndSynthesizesNone() {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink);
+        relay.accept(STATE, "A", bytes(state("A", 0, "TOUCHING", 6, null).set("systemSequence", null).build()));        // a system line without its sequence
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 5L).build()));   // no systemRecordCount
+        assertEquals(2, relay.dropsForTest());
+        assertTrue(sink.frames.isEmpty());
+    }
+
+    @Test
+    void aWorstCaseFullyPopulatedStateStaysSmallEnoughForSeveralHundredLinesInTheHello() throws Exception {
+        GenericRecordBuilder b = new GenericRecordBuilder(LineHealthSchemas.STATE.schema());
+        for (org.apache.avro.Schema.Field f : LineHealthSchemas.STATE.schema().getFields()) {
+            org.apache.avro.Schema inner = f.schema().getType() == org.apache.avro.Schema.Type.UNION ? f.schema().getTypes().get(1) : f.schema();
+            switch (inner.getType()) {
+                case STRING -> b.set(f.name(), "ABCDEFGHIJKLMNOPQRSTUVWX");
+                case INT -> b.set(f.name(), 1234567);
+                case LONG -> b.set(f.name(), 1_800_000_000_000L);
+                case BOOLEAN -> b.set(f.name(), true);
+                case ARRAY -> b.set(f.name(), List.of("ABCDEFGHIJKLMNOPQRSTUVWX", "ABCDEFGHIJKLMNOPQRSTUVWX", "ABCDEFGHIJKLMNOPQRSTUVWX"));
+                default -> { }
+            }
+        }
+        b.set("schemaVersion", 1).set("ownerTag", null).set("isUser", false).set("kind", "STRUCTURE").set("state", "TOUCHING").set("lineId", "L-0123456789").set("chartKey", "L|0123456789");
+        int one = LineHealthRelay.render(LineHealthSchemas.STATE, "L-0123456789", b.build()).toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        assertTrue(one < 2600, "a fully populated state is " + one + " bytes");
+        // 400 worst-case lines do not fit one hello of 400,000 bytes: the checkpoint follows in parts that together carry every line, and the hello says so
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink);
+        for (int k = 0; k < 400; k++) {
+            relay.accept(STATE, "L-" + k, bytes(withIdentity(b, "L-" + k, k + 1)));
+        }
+        relay.accept(STATUS, "SPX", bytes(status(5, 400)));
+        relay.captureBound(400);
+        relay.release(400);
+        JsonNode hello = JSON.readTree(relay.helloField());
+        assertTrue(hello.get("states").isNull());
+        List<String> parts = relay.checkpointParts();
+        assertEquals(hello.get("parts").asInt(), parts.size());
+        assertTrue(parts.size() >= 3);
+        int lines = 0;
+        for (String part : parts) {
+            assertTrue(part.getBytes(java.nio.charset.StandardCharsets.UTF_8).length < 400_100, "each part is within the hello bound");
+            JsonNode node = JSON.readTree(part);
+            assertEquals(hello.get("version").asLong(), node.get("version").asLong());
+            lines += node.get("states").size();
+        }
+        assertEquals(400, lines, "no line is dropped to make the hello fit");
+        assertEquals(400, hello.get("watermark").asLong());
+    }
+
+    private static GenericRecord withIdentity(GenericRecordBuilder b, String id, long sequence) {
+        return b.set("lineId", id).set("chartKey", "L|" + id).set("systemSequence", sequence).build();
+    }
 }

@@ -119,6 +119,14 @@ public final class GatewaySettings {
         return boolValue("LINE_HEALTH_RELAY_ENABLED", false);
     }
 
+    /**
+     * The most bytes of line states the hello field carries inline (default 400,000, a transport size, not a product limit): a checkpoint that is larger follows the hello in
+     * parts, so the hello stays inside the whole-hello guard and no line is dropped.
+     */
+    public long lineHealthHelloMaxBytes() {
+        return longValue("LINE_HEALTH_HELLO_MAX_BYTES", 400_000L, 1_000L);
+    }
+
     /** futures.line-health.state ({@code LineHealthState}, fixed schema id 3701): the latest state of each line, compacted. */
     public String lineHealthStateTopic() {
         return value("LINE_HEALTH_STATE_TOPIC", "futures.line-health.state");

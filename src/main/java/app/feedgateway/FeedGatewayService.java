@@ -1668,6 +1668,10 @@ public class FeedGatewayService implements ReplayRunner {
             var relay=esLiquidityWallRelay.getIfAvailable();
             if(relay!=null)relay.replay((event,json)->send(session,event,json));
         }
+        if(lineHealthRelay!=null&&settings.lineHealthRelayEnabled()) {
+            var relay=lineHealthRelay.getIfAvailable();
+            if(relay!=null)relay.checkpointParts().forEach(part->send(session,LineHealthRelay.CHECKPOINT_EVENT,part));   // the states of a checkpoint too large for the hello follow it in parts
+        }
         // A client may reconnect after the one-shot readiness broadcast (for example after a
         // gateway restart or a transient socket failure). Re-announce the already-committed
         // readiness to this socket so its UI cannot remain stuck in source-switching forever.
@@ -15161,7 +15165,7 @@ public class FeedGatewayService implements ReplayRunner {
             // ES liquidity walls (es-liquidity-wall-service): ONE contract, no per-user data; the voice and the events are never coalesced.
             EsLiquidityWallRelay.HEATMAP_EVENT, EsLiquidityWallRelay.WALL_EVENT, EsLiquidityWallRelay.VOICE_EVENT,
             // Line health (requirement LH-O-6): system-line records for every socket; user-line records are refused by the relay until the owner filter (M5).
-            LineHealthRelay.STATE_EVENT, LineHealthRelay.EVENT_EVENT, LineHealthRelay.VOICE_EVENT, LineHealthRelay.STATUS_EVENT, LineHealthRelay.RESUME,
+            LineHealthRelay.STATE_EVENT, LineHealthRelay.EVENT_EVENT, LineHealthRelay.VOICE_EVENT, LineHealthRelay.STATUS_EVENT, LineHealthRelay.RESUME, LineHealthRelay.CHECKPOINT_EVENT,
             "status", "reset", "source-switching", "source-ready", "source-stale",
             // Candlestick pattern annotation sets (market-structure service): global, verbatim, flag-gated.
             "market-structure-patterns",
@@ -15349,12 +15353,13 @@ public class FeedGatewayService implements ReplayRunner {
     /** History travels on the authenticated socket; only registered clients can read the view. */
     void handleFootprintBasicMessage(WebSocketSession session, String payload) {
         if (session == null || clientsById.get(session.getId()) != session || !session.isOpen() || payload == null) return;
-        if (settings.lineHealthRelayEnabled() && lineHealthRelay != null && payload.length() <= 4096 && payload.contains(LineHealthRelay.RESUME)) {
+        if (settings.lineHealthRelayEnabled() && lineHealthRelay != null && payload.contains(LineHealthRelay.RESUME)) {
             // the page's request for a fresh checkpoint (a gap in the records it holds): answered with the same checkpoint the hello carries
             var relay = lineHealthRelay.getIfAvailable();
             try {
                 if (relay != null && LineHealthRelay.RESUME.equals(mapper.readTree(payload).path("type").asText())) {
                     send(session, LineHealthRelay.RESUME, relay.resumeReply());
+                    relay.checkpointParts().forEach(part -> send(session, LineHealthRelay.CHECKPOINT_EVENT, part));
                     return;
                 }
             } catch (Exception invalid) {

@@ -44,6 +44,10 @@ import org.springframework.stereotype.Component;
  * checkpoint back until its state consumer has reached E; the state records and the status record of one second are written in one transaction, so the
  * states of that second lie below E and a page never sees a status ahead of the states it counts. The watermark is {@code max(systemRecordCount, the
  * largest systemSequence in the folded map)}. No broker offset is ever put in a frame.</li>
+ * <li><b>A checkpoint may hold newer states than its status.</b> The state records of every fetched batch are folded before the status records of that batch, so when
+ * several seconds are fetched together the checkpoint of status N can include the states of N+1; that is the "state record between two status records" case of
+ * the design, and it is correct because the watermark is the larger of the status count and the largest system sequence in the map, and the page continues
+ * from the watermark (a state at or below it is a duplicate).</li>
  * <li><b>No replay of events or voice.</b> Events and voice are forwarded as they arrive (the tail starts at the end): a warning that a disconnected page
  * missed is not replayed (requirement LH-W-5); the hello's current state of every line is the recovery.</li>
  * <li><b>Records of a user line</b> (a non-null {@code ownerTag}) are refused and counted until the owner filter of milestone M5 exists: delivering them
@@ -60,6 +64,8 @@ final class LineHealthRelay {
     static final String STATUS_EVENT = "line-health-status";
     /** The inbound message type of the page asking for a fresh checkpoint (a gap, a reset). */
     static final String RESUME = "line-health-resume";
+    /** The checkpoint of a socket that does not fit the hello is sent right after it, in parts, under this frame name. */
+    static final String CHECKPOINT_EVENT = "line-health-checkpoint";
     static final String REMOVED = "REMOVED";
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -181,6 +187,9 @@ final class LineHealthRelay {
                     for (var r : records.records(voice)) {
                         accept(r.topic(), r.key(), r.value());
                     }
+                    if (epochChanged) {
+                        throw new IllegalStateException("status epoch changed: the fold is rebuilt from the topics");
+                    }
                     if (hasHeldWithoutBound()) {
                         captureBound(c.endOffsets(List.of(state), Duration.ofSeconds(10)).get(state));
                     }
@@ -253,6 +262,8 @@ final class LineHealthRelay {
         releasedWatermark = -1;
         helloMemo = null;
         live = false;
+        epochSeen = null;
+        epochChanged = false;
     }
 
     private LineHealthSchemas.Subject subjectOf(String topic) {
@@ -300,7 +311,7 @@ final class LineHealthRelay {
             drops.incrementAndGet();
             return;
         }
-        if (subject != LineHealthSchemas.STATUS && node.hasNonNull("ownerTag")) {
+        if (subject != LineHealthSchemas.STATUS && isUserOwned(node)) {
             userRecordsRefused.incrementAndGet();   // a user line: no owner filter yet (milestone M5), so it reaches no socket
             return;
         }
@@ -317,11 +328,27 @@ final class LineHealthRelay {
                 sink.accept(STATE_EVENT, withCached(node, false));
             }
         } else if (subject == LineHealthSchemas.STATUS) {
-            held.addLast(new HeldStatus(withCached(node, false), node.path("systemRecordCount").asLong(node.path("stateSequence").asLong(-1))));
+            noteEpoch(node);
+            held.addLast(new HeldStatus(withCached(node, false), node.path("systemRecordCount").asLong()));
         } else if (live) {
             sink.accept(subject == LineHealthSchemas.EVENT ? EVENT_EVENT : VOICE_EVENT, withCached(node, false));
         }
     }
+
+    /** The status epoch (when the status carries one): a change is a continuity reset of the sequences, so the fold is discarded and rebuilt from the topics. */
+    private void noteEpoch(JsonNode status) {
+        if (!status.hasNonNull("statusEpoch")) {
+            return;
+        }
+        long epoch = status.get("statusEpoch").asLong();
+        if (epochSeen != null && epochSeen != epoch) {
+            epochChanged = true;
+        }
+        epochSeen = epoch;
+    }
+
+    private Long epochSeen;
+    private volatile boolean epochChanged;
 
     private synchronized boolean hasHeldWithoutBound() {
         for (HeldStatus h : held) {
@@ -353,34 +380,87 @@ final class LineHealthRelay {
             releasedStates = new LinkedHashMap<>(states);
             releasedCount = h.count;
             releasedWatermark = watermark;
+            releaseSerial++;
             helloMemo = null;
             if (live) {
                 sink.accept(STATUS_EVENT, h.json);
+                recordAge(h.json);
             }
         }
     }
 
+    private long releaseSerial;
+    private List<String> partsMemo = List.of();
+
+    /** Builds, once per release, the inline field and the parts of the checkpoint, so that a hello and the parts that follow it come from the same release (they share {@code version}). */
+    private void buildCheckpoint() {
+        if (helloMemo != null) {
+            return;
+        }
+        long max = settings.lineHealthHelloMaxBytes();
+        String status = withoutCached(releasedStatus);
+        List<String> parts = new java.util.ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        int inCurrent = 0;
+        long total = 0;
+        for (String st : releasedStates.values()) {
+            int bytes = st.getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 1;
+            if (inCurrent > 0 && current.length() + bytes > max) {
+                parts.add(current.toString());
+                current = new StringBuilder();
+                inCurrent = 0;
+            }
+            current.append(inCurrent == 0 ? "" : ",").append(st);
+            inCurrent++;
+            total += bytes;
+        }
+        parts.add(current.toString());
+        if (total + status.length() <= max) {
+            helloMemo = "{\"status\":" + status + ",\"states\":[" + parts.get(0) + "],\"watermark\":" + releasedWatermark + ",\"version\":" + releaseSerial + "}";
+            partsMemo = List.of();
+        } else {
+            helloMemo = "{\"status\":" + status + ",\"states\":null,\"parts\":" + parts.size() + ",\"watermark\":" + releasedWatermark + ",\"version\":" + releaseSerial + "}";
+            List<String> framed = new java.util.ArrayList<>();
+            for (int k = 0; k < parts.size(); k++) {
+                framed.add("{\"part\":" + k + ",\"parts\":" + parts.size() + ",\"version\":" + releaseSerial + ",\"watermark\":" + releasedWatermark + ",\"states\":[" + parts.get(k) + "]}");
+            }
+            partsMemo = framed;
+        }
+    }
+
     /**
-     * The checkpoint {@code {status, states, watermark}} as the hello field value (the members of the cached pair are never rewritten), or {@code null}
-     * before the first status has been released. Records of a user line are never in it (they are refused at the boundary until milestone M5).
+     * The checkpoint {@code {status, states, watermark, version}} as the hello field value (the members of the cached pair are never rewritten). When the states do not fit
+     * {@link GatewaySettings#lineHealthHelloMaxBytes()} the field carries {@code states:null} and {@code parts:K}, and the states follow the hello in {@code K} frames
+     * {@link #CHECKPOINT_EVENT} that share its {@code version}: no line is ever dropped to make a hello fit. Records of a user line are never in it.
      */
     synchronized String helloField() {
         if (releasedStatus == null) {
             return "{\"status\":null,\"states\":[],\"watermark\":null}";
         }
-        if (helloMemo == null) {
-            StringBuilder sb = new StringBuilder("{\"status\":").append(withoutCached(releasedStatus)).append(",\"states\":[");
-            boolean first = true;
-            for (String s : releasedStates.values()) {
-                if (!first) {
-                    sb.append(',');
-                }
-                sb.append(s);
-                first = false;
-            }
-            helloMemo = sb.append("],\"watermark\":").append(releasedWatermark).append('}').toString();
-        }
+        buildCheckpoint();
         return helloMemo;
+    }
+
+    /** The checkpoint parts that follow a hello whose field is {@code states:null}; empty when the hello carried the states inline. */
+    synchronized List<String> checkpointParts() {
+        if (releasedStatus == null) {
+            return List.of();
+        }
+        buildCheckpoint();
+        return partsMemo;
+    }
+
+    private final AtomicLong[] statusAgeBuckets = {new AtomicLong(), new AtomicLong(), new AtomicLong(), new AtomicLong()};
+
+    /** LH-N-2 telemetry: the age of a status record (gateway clock minus its second's end) at the moment it is forwarded, counted in buckets under 1 s, 2 s, 3 s and 3 s or more. */
+    private void recordAge(String statusJson) {
+        try {
+            long asOf = JSON.readTree(statusJson).path("asOfMs").asLong();
+            long age = System.currentTimeMillis() - asOf;
+            statusAgeBuckets[age < 1000 ? 0 : age < 2000 ? 1 : age < 3000 ? 2 : 3].incrementAndGet();
+        } catch (Exception ignored) {
+            // telemetry only
+        }
     }
 
     /** The answer to {@link #RESUME}: the same checkpoint under its field name. */
@@ -394,6 +474,20 @@ final class LineHealthRelay {
 
     synchronized long releasedCountForTest() {
         return releasedCount;
+    }
+
+    /**
+     * Fail closed: a record is user-owned when it carries an owner tag, says it is a user line ({@code isUser}), or has a kind of the USER_ family, at the top level or in the
+     * snapshot of an event. Any of the three keeps it from every socket (a record that says "user" without a tag is inconsistent and is refused as well).
+     */
+    static boolean isUserOwned(JsonNode node) {
+        if (node == null || !node.isObject()) {
+            return false;
+        }
+        if (node.hasNonNull("ownerTag") || node.path("isUser").asBoolean(false) || node.path("kind").asText("").startsWith("USER_")) {
+            return true;
+        }
+        return isUserOwned(node.get("snapshot"));
     }
 
     /** The node for a record that passes the boundary, with null members omitted, else null. */
@@ -410,8 +504,12 @@ final class LineHealthRelay {
             if (key == null || !key.equals(expectedKey) || key.isBlank()) {
                 return null;
             }
-            if (subject == LineHealthSchemas.STATUS && (r.get("stateSequence") == null)) {
+            // the semantic fields each subject needs: none is synthesized from another (a made-up count would defeat the page's gap detection)
+            if (subject == LineHealthSchemas.STATUS && (!(r.get("stateSequence") instanceof Long) || !(r.get("systemRecordCount") instanceof Long))) {
                 return null;
+            }
+            if (subject == LineHealthSchemas.STATE && r.get("ownerTag") == null && !(r.get("systemSequence") instanceof Long)) {
+                return null;   // a system line always carries its sequence, a removal record included
             }
             if (subject == LineHealthSchemas.VOICE && (r.get("text") == null || r.get("text").toString().isBlank())) {
                 return null;
@@ -475,6 +573,11 @@ final class LineHealthRelay {
             sb.append("# TYPE ").append(p).append(names[i]).append("_accepted_total counter\n").append(p).append(names[i]).append("_accepted_total ").append(lanes[i].accepted.get()).append('\n');
             sb.append("# TYPE ").append(p).append(names[i]).append("_schema_id_refused_total counter\n").append(p).append(names[i]).append("_schema_id_refused_total ")
                     .append(lanes[i].schemaIdRefused.get()).append('\n');
+        }
+        String[] ages = {"lt_1s", "lt_2s", "lt_3s", "ge_3s"};
+        for (int i = 0; i < ages.length; i++) {
+            sb.append("# TYPE ").append(p).append("status_forward_age_").append(ages[i]).append("_total counter\n").append(p).append("status_forward_age_").append(ages[i]).append("_total ")
+                    .append(statusAgeBuckets[i].get()).append('\n');
         }
         sb.append("# TYPE ").append(p).append("drops_total counter\n").append(p).append("drops_total ").append(drops.get()).append('\n');
         sb.append("# TYPE ").append(p).append("undecodable_total counter\n").append(p).append("undecodable_total ").append(undecodable.get()).append('\n');
