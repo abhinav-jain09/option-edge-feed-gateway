@@ -2768,6 +2768,9 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // Shared last-known VIX (AVRO since its 2026-11-06 cutover; browsers still get the identical JSON, see VixPriceJson): the IBKR-labelled
+        // vix-price event, forwarded for either source.
+        topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
         // Greek-move-authenticity CURRENT verdict (AVRO, key = symbol; browsers still get the identical JSON, see
         // GreekMoveAuthJson): standalone global advisory, OPTIONAL topic, on the SHORT greekMoveAuthTtlMs window.
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
@@ -2790,7 +2793,6 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void runJsonStateCacheConsumer() {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
-        topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
         topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
         topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
@@ -3022,6 +3024,9 @@ public class FeedGatewayService implements ReplayRunner {
         // Canonical SPX spot (AVRO since its 2026-10-18 cutover; browsers still get the identical JSON, see SpxPriceJson) — dedicated event, NOT index-price: its payload source names the cascade
         // tier (never "DATABENTO"), so the index-price provenance gate would drop every record.
         topicEvents.put(settings.underlyingSpxPriceTopic(), new TopicBinding("DATABENTO", "spx-price"));
+        // Shared last-known VIX (AVRO since its 2026-11-06 cutover; browsers still get the identical JSON, see VixPriceJson): the IBKR-labelled
+        // vix-price event, forwarded for either source.
+        topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
         // Keep cache + live symmetric: the greek-move-authenticity CURRENT verdict is AVRO.
         topicEvents.put(settings.greekMoveAuthCurrentTopic(), new TopicBinding("DATABENTO", "greek-move-auth"));
         // Keep cache + live symmetric: strike-invasion is AVRO (see runAvroCacheConsumer).
@@ -3087,7 +3092,6 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void runJsonStateLiveConsumer() {
         Map<String, TopicBinding> topicEvents = new LinkedHashMap<>();
-        topicEvents.put(settings.ibkrVixPriceTopic(), new TopicBinding("IBKR", "vix-price"));
         topicEvents.put(settings.databentoEsTradesTopic(), new TopicBinding("DATABENTO", "index-price"));
         topicEvents.put(settings.ibkrVolumeSandwichTopic(), new TopicBinding("IBKR", "volume-sandwich"));
         topicEvents.put(settings.databentoVolumeSandwichTopic(), new TopicBinding("DATABENTO", "volume-sandwich"));
@@ -13940,6 +13944,9 @@ public class FeedGatewayService implements ReplayRunner {
         if ("spx-price".equals(event)) {
             return SpxPriceJson.render(mapper, value);
         }
+        if ("vix-price".equals(event)) {
+            return VixPriceJson.render(mapper, value);
+        }
         if ("strike-invasion".equals(event)) {
             return strikeInvasionJson(value);
         }
@@ -14496,8 +14503,8 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.ibkrPaceTopic(), "pace");
                 avroTopics.put(settings.ibkrPaceRankTopic(), "pace-rank");
                 avroTopics.put(settings.ibkrDirectionalPressureTopic(), "directional-pressure");
+                avroTopics.put(settings.ibkrVixPriceTopic(), "vix-price");
                 stringTopics.put(settings.ibkrUnusualWhalesGexTopic(), "gex-by-strike");
-                stringTopics.put(settings.ibkrVixPriceTopic(), "vix-price");
             }
             if (params.hasRun()) {
                 // Run-scoped replay reads options.replay.<runId>.* topics. The strike-liquidity
@@ -16019,6 +16026,7 @@ public class FeedGatewayService implements ReplayRunner {
         Properties properties = baseConsumerProperties(name);
         properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, GatewayAvroDeserializer.class.getName());
         properties.put(GatewayAvroDeserializer.SPX_PRICE_TOPIC, settings.underlyingSpxPriceTopic());
+        properties.put(GatewayAvroDeserializer.VIX_PRICE_TOPIC, settings.ibkrVixPriceTopic());
         properties.put(GatewayAvroDeserializer.SPOT_VOL_REGIME_TOPIC, settings.spotVolRegimeTopic());
         properties.put("schema.registry.url", settings.schemaRegistryUrl());
         properties.put("specific.avro.reader", "false");
