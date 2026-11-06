@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 SOURCE = Path(__file__).with_name("es4-test-workspace.py")
 spec = importlib.util.spec_from_file_location("workspace_recovery", SOURCE)
@@ -111,6 +113,66 @@ class RecoveryTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             m.recover(self.root, NOW, [])
         self.root.chmod(0o700)
+        self.assertTrue(all(p.is_dir() for p in old))
+
+    def test_restricted_same_user_cwd_uses_bounded_readonly_link_inspection(self):
+        proc = self.root / "13176"
+        proc.mkdir()
+        with patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"/\0", b"")) as call:
+            self.assertEqual(["/"], m.process_directories(self.root))
+            call.assert_called_once_with(["/usr/bin/sudo", "-n", "/usr/bin/readlink", "-z", "--", str(proc / "cwd")], capture_output=True, timeout=5)
+
+    def test_restricted_inspection_refusal_and_malformed_result_fail_closed(self):
+        proc = self.root / "13176"
+        proc.mkdir()
+        for code, value in [(1, b""), (0, b"relative\0"), (0, b"/\0extra\0"), (0, b"/")]:
+            with patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], code, value, b"")):
+                with self.assertRaises(RuntimeError):
+                    m.process_directories(self.root)
+
+    def test_missing_inspection_binary_and_timeout_are_not_exited_processes(self):
+        proc = self.root / "13176"
+        proc.mkdir()
+        for failure in [FileNotFoundError("sudo missing"), PermissionError("sudo not executable"), subprocess.TimeoutExpired("readlink", 5)]:
+            with patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", side_effect=failure):
+                with self.assertRaises(RuntimeError):
+                    m.process_directories(self.root)
+
+    def test_exited_restricted_pid_is_skipped_only_after_failed_inspection(self):
+        proc = self.root / "13176"
+        proc.mkdir()
+        def exited(*args, **kwargs):
+            proc.rmdir()
+            return subprocess.CompletedProcess([], 1, b"", b"")
+        with patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", side_effect=exited):
+            self.assertEqual([], m.process_directories(self.root))
+
+    def test_identity_confirmation_errors_and_pid_replacement_fail_closed(self):
+        proc = self.root / "13176"
+        proc.mkdir()
+        before = proc.stat()
+        changed_uid = SimpleNamespace(st_uid=before.st_uid + 1, st_ino=before.st_ino, st_dev=before.st_dev)
+        changed_pid = SimpleNamespace(st_uid=before.st_uid, st_ino=before.st_ino + 1, st_dev=before.st_dev)
+        for result in [PermissionError("unreadable"), OSError("inspection error"), changed_uid, changed_pid]:
+            with patch.object(Path, "stat", autospec=True, side_effect=[before, result]), patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"/\0", b"")):
+                with self.assertRaises(RuntimeError):
+                    m.process_cwd(proc)
+
+    def test_missing_cwd_on_existing_pid_is_not_mistaken_for_exit(self):
+        proc = self.root / "13176"
+        proc.mkdir()
+        with patch.object(m.os, "readlink", side_effect=FileNotFoundError):
+            with self.assertRaises(RuntimeError):
+                m.process_directories(self.root)
+
+    def test_restricted_active_workspace_still_blocks_recovery(self):
+        old = self.four()
+        proc = self.root / "13176"
+        proc.mkdir()
+        with patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, os.fsencode(str(old[0])) + b"\0", b"")):
+            active = m.process_directories(self.root)
+            with self.assertRaises(RuntimeError):
+                m.recover(self.root, NOW, active)
         self.assertTrue(all(p.is_dir() for p in old))
 
     def test_cli_refuses_every_root_other_than_fixed_es4_root(self):

@@ -22,17 +22,60 @@ def private_directory(path):
     return info
 
 
-def process_directories():
+def process_cwd(proc):
+    def metadata():
+        try:
+            return proc.stat()
+        except FileNotFoundError:
+            raise  # only this error proves the PID is gone
+        except OSError as error:
+            raise RuntimeError("Cannot confirm process identity") from error
+    before = metadata()
+    if before.st_uid != os.getuid():
+        raise RuntimeError("Process owner changed before inspection")
+    try:
+        value = os.readlink(proc / "cwd")
+    except PermissionError:
+        # Container processes may have our uid but disallow unprivileged ptrace.
+        # Read only this already-filtered numeric process link; never ignore it.
+        try:
+            result = subprocess.run(
+                ["/usr/bin/sudo", "-n", "/usr/bin/readlink", "-z", "--", str(proc / "cwd")],
+                capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError("Restricted process inspection could not run") from error
+        after = metadata()
+        if (after.st_uid, after.st_ino, after.st_dev) != (before.st_uid, before.st_ino, before.st_dev):
+            raise RuntimeError("Process identity changed during inspection")
+        if result.returncode != 0:
+            raise RuntimeError("Cannot inspect restricted user process")
+        raw = result.stdout
+        if not raw.startswith(b"/") or not raw.endswith(b"\0") or raw.count(b"\0") != 1:
+            raise RuntimeError("Invalid restricted process directory")
+        return os.fsdecode(raw[:-1])
+    after = metadata()
+    if (after.st_uid, after.st_ino, after.st_dev) != (before.st_uid, before.st_ino, before.st_dev):
+        raise RuntimeError("Process identity changed during inspection")
+    return value
+
+
+def process_directories(proc_root=Path("/proc")):
     result = []
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
+    for proc in proc_root.iterdir():
+        if not re.fullmatch(r"[0-9]+", proc.name):
             continue
         try:
             if proc.stat().st_uid != os.getuid():
                 continue
-            result.append(os.readlink(proc / "cwd"))
+            result.append(process_cwd(proc))
         except FileNotFoundError:
-            continue  # process exited before inspection
+            try:
+                proc.stat()
+            except FileNotFoundError:
+                continue  # confirmed process exit, not an inspection failure
+            except OSError as error:
+                raise RuntimeError("Cannot confirm exited user process") from error
+            raise RuntimeError("User process directory is unreadable while PID remains")
         except PermissionError as error:
             raise RuntimeError("Cannot exclude an active user process") from error
     return result
