@@ -41,4 +41,17 @@ class RithmicNativeHistoryRouteTest {
    var json=new ObjectMapper();var service=new FeedGatewayService(settings,json,new HpsfGatewayViewMapper(),engine);service.runOutboundWritesInline();var socket=mock(WebSocketSession.class);when(socket.getId()).thenReturn("missing");when(socket.isOpen()).thenReturn(true);when(socket.getAttributes()).thenReturn(new HashMap<>());service.addClient(socket);clearInvocations(socket);service.handleFootprintBasicMessage(socket,"{\"type\":\"rithmic-depth-history\",\"format\":\"rithmic-native-fullbook-gzip-v1\",\"requestId\":\"missing\"}");var sent=org.mockito.ArgumentCaptor.forClass(TextMessage.class);verify(socket).sendMessage(sent.capture());assertEquals("unavailable",json.readTree(sent.getValue().getPayload()).path("data").path("error").asText());verify(socket,never()).close(any());verify(socket,never()).close();service.removeClient(socket);
   }
  }
+ @Test void unsupportedLegacyOnlyCacheNotificationsCannotRestartTheConsumer(){
+  var settings=spy(new GatewaySettings());doReturn("").when(settings).rithmicSystem();
+  var service=new FeedGatewayService(settings,new ObjectMapper(),new HpsfGatewayViewMapper(),null);
+  var history=new RithmicDepthHistory(settings);
+  @SuppressWarnings("unchecked") ObjectProvider<RithmicDepthHistory> provider=mock(ObjectProvider.class);when(provider.getIfAvailable()).thenReturn(history);ReflectionTestUtils.setField(service,"rithmicDepthHistory",provider);
+  @SuppressWarnings("unchecked") ObjectProvider<FeedGatewayService> gateway=mock(ObjectProvider.class);when(gateway.getIfAvailable()).thenReturn(service);ReflectionTestUtils.setField(history,"gateway",gateway);
+  long now=System.currentTimeMillis();assertDoesNotThrow(()->{
+   history.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(now,1),now);
+   history.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(now-1000,2),now);
+   history.markScanSkip(now);
+  });verifyNoInteractions(provider);
+ }
+
 }

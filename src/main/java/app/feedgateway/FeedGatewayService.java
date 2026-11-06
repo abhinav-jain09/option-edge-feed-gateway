@@ -15370,6 +15370,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** Called after releasing the source-cache lock; no engine/channel work occurs inside that lock. */
     void rithmicHistoryChanged(Long affected){
+        if(nativeHistorySubscribers.isEmpty()||!RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem()))return;
         var history=rithmicDepthHistory==null?null:rithmicDepthHistory.getIfAvailable();if(history==null)return;
         String hello=history.nativeHello();var invalidation=affected==null?null:history.invalidation(affected);
         for(var session:nativeHistorySubscribers.values()){
