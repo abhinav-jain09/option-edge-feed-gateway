@@ -5325,11 +5325,11 @@ public class FeedGatewayService implements ReplayRunner {
         if (topicEvents.containsKey(settings.esFootprintBarsTopic()) && !ownsFootprintBars) refuseOrderFootprintBinding();
         List<TopicPartition> footprintPartitions = partitions.stream()
                 .filter(p -> p.topic().equals(settings.esFootprintBarsTopic())).toList();
-        if (ownsFootprintBars && supportsOrderFootprintHistory()) orderChartFootprintReplay.begin(strikeReplay, footprintPartitions);
+        if (ownsFootprintBars && supportsOrderFootprintHistory() && !footprintPartitions.isEmpty()) orderChartFootprintReplay.begin(strikeReplay, footprintPartitions);
         Map<TopicPartition, Long> cutoffs = seekToCacheWindow(consumer, partitions, topicEvents);
         Map<TopicPartition, Long> endOffsets = boundedEndOffsets(consumer, partitions, endOffsetsBudgetMs);
         openFootprintStrikeReplay(strikeReplay, endOffsets, cutoffs);
-        if (ownsFootprintBars && supportsOrderFootprintHistory()) {
+        if (ownsFootprintBars && supportsOrderFootprintHistory() && !footprintPartitions.isEmpty()) {
             Map<TopicPartition, Long> footprintEnds = new HashMap<>();
             for (TopicPartition partition : footprintPartitions) {
                 Long end = endOffsets.get(partition);

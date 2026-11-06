@@ -42,6 +42,11 @@ class OrderChartReplayGateTest {
         var attempt=new FeedGatewayService.StrikeReplay();
         service.cacheHydrationSeek(consumer,List.of(partition),Map.of(partition.topic(),new FeedGatewayService.TopicBinding("DATABENTO","es-footprint-bar")),attempt,1000);
         assertFalse(actual.read(()->true,()->false));service.footprintStrikeReplayProgress(consumer,attempt);assertFalse(actual.read(()->true,()->false));service.footprintStrikeReplayProgress(consumer,attempt);assertTrue(actual.read(()->true,()->false));
+        var unrelated=new TopicPartition("unrelated-cache",0);
+        org.mockito.Mockito.doAnswer(invocation->{assertTrue(actual.read(()->true,()->false));return Map.of();}).when(consumer).offsetsForTimes(org.mockito.ArgumentMatchers.anyMap());
+        org.mockito.Mockito.when(consumer.endOffsets(org.mockito.ArgumentMatchers.anyCollection(),org.mockito.ArgumentMatchers.any(java.time.Duration.class))).thenReturn(Map.of(unrelated,0L));
+        service.cacheHydrationSeek(consumer,List.of(unrelated),Map.of(partition.topic(),new FeedGatewayService.TopicBinding("DATABENTO","es-footprint-bar")),attempt,1000);
+        assertTrue(actual.read(()->true,()->false));
     }
     @Test void aSameOwnerReopenCannotPublishPositionsFromAnOlderRevision() {
         Object owner=new Object();gate.begin(owner,List.of(p));gate.capture(owner,Map.of(p,5L));
