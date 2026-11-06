@@ -107,6 +107,9 @@ public class FeedGatewayService implements ReplayRunner {
     /** ES liquidity-wall relay (es-liquidity-wall-service), wired like the depth relay: connect replay + global broadcast, nothing in the ui-batch cache. */
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private org.springframework.beans.factory.ObjectProvider<EsLiquidityWallRelay> esLiquidityWallRelay;
+    /** Liquidity-validator label relay (liquidity-validator-service): connect replay + global broadcast, display only. */
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private org.springframework.beans.factory.ObjectProvider<LiquidityValidatorRelay> liquidityValidatorRelay;
     /** Line-health relay (level-absorption-service line-health loop, requirement LH-O-6): global frames, the hello field {@code lineHealth} and the resume message. */
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private org.springframework.beans.factory.ObjectProvider<LineHealthRelay> lineHealthRelay;
@@ -1668,6 +1671,10 @@ public class FeedGatewayService implements ReplayRunner {
             var relay=esLiquidityWallRelay.getIfAvailable();
             if(relay!=null)relay.replay((event,json)->send(session,event,json));
         }
+        if(liquidityValidatorRelay!=null&&settings.liquidityValidatorRelayEnabled()) {
+            var relay=liquidityValidatorRelay.getIfAvailable();
+            if(relay!=null)relay.replay((event,json)->send(session,event,json));
+        }
         if(lineHealthRelay!=null&&settings.lineHealthRelayEnabled()) {
             var relay=lineHealthRelay.getIfAvailable();
             if(relay!=null)relay.checkpointParts(lineHealthOwnerTag(session)).forEach(part->send(session,LineHealthRelay.CHECKPOINT_EVENT,part));   // the states of a checkpoint too large for the hello follow it in parts
@@ -2344,6 +2351,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + studiesMetrics()
                 + taMetrics()
                 + esLiquidityWallMetrics()
+                + liquidityValidatorMetrics()
                 + lineHealthMetrics()
                 + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
                 + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
@@ -13358,6 +13366,11 @@ public class FeedGatewayService implements ReplayRunner {
         return relay == null ? "" : relay.metrics();
     }
 
+    private String liquidityValidatorMetrics() {
+        var relay = liquidityValidatorRelay == null ? null : liquidityValidatorRelay.getIfAvailable();
+        return relay == null ? "" : relay.metrics();
+    }
+
     private String esLiquidityWallMetrics() {
         var relay = esLiquidityWallRelay == null ? null : esLiquidityWallRelay.getIfAvailable();
         return relay == null ? "" : relay.metrics();
@@ -14069,6 +14082,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The ES liquidity-wall relay's fan-out: {@code es-liquidity-heatmap}, {@code es-liquidity-wall} and {@code es-liquidity-voice} are global events. */
     void streamEsLiquidityWall(String event, String json) {broadcast(event, json);}
+    void streamLiquidityValidator(String event, String json) {broadcast(event, json);}
 
     /** The line-health relay's fan-out: the four {@code line-health-*} frames are global and never coalesced (every record counts for the page's gap detection). */
     void streamLineHealth(String event, String json) {broadcast(event, json);}
@@ -15164,6 +15178,8 @@ public class FeedGatewayService implements ReplayRunner {
             "rithmic-liquidity",
             // ES liquidity walls (es-liquidity-wall-service): ONE contract, no per-user data; the voice and the events are never coalesced.
             EsLiquidityWallRelay.HEATMAP_EVENT, EsLiquidityWallRelay.WALL_EVENT, EsLiquidityWallRelay.VOICE_EVENT,
+            // Liquidity-validator labels (liquidity-validator-service): one research verdict per geometry release, no per-user data.
+            LiquidityValidatorRelay.EVENT,
             // Line health (requirement LH-O-6): system-line records for every socket; user-line records are refused by the relay until the owner filter (M5).
             LineHealthRelay.STATE_EVENT, LineHealthRelay.EVENT_EVENT, LineHealthRelay.VOICE_EVENT, LineHealthRelay.STATUS_EVENT, LineHealthRelay.RESUME, LineHealthRelay.CHECKPOINT_EVENT,
             "status", "reset", "source-switching", "source-ready", "source-stale",
