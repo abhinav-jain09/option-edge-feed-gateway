@@ -107,6 +107,9 @@ public class FeedGatewayService implements ReplayRunner {
     /** ES liquidity-wall relay (es-liquidity-wall-service), wired like the depth relay: connect replay + global broadcast, nothing in the ui-batch cache. */
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private org.springframework.beans.factory.ObjectProvider<EsLiquidityWallRelay> esLiquidityWallRelay;
+    /** Line-health relay (level-absorption-service line-health loop, requirement LH-O-6): global frames, the hello field {@code lineHealth} and the resume message. */
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private org.springframework.beans.factory.ObjectProvider<LineHealthRelay> lineHealthRelay;
     private final GatewaySettings settings;
     // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1..G-R11) — null unless the flag is on ----
     private final FootprintViews footprintViews;
@@ -1665,6 +1668,10 @@ public class FeedGatewayService implements ReplayRunner {
             var relay=esLiquidityWallRelay.getIfAvailable();
             if(relay!=null)relay.replay((event,json)->send(session,event,json));
         }
+        if(lineHealthRelay!=null&&settings.lineHealthRelayEnabled()) {
+            var relay=lineHealthRelay.getIfAvailable();
+            if(relay!=null)relay.checkpointParts().forEach(part->send(session,LineHealthRelay.CHECKPOINT_EVENT,part));   // the states of a checkpoint too large for the hello follow it in parts
+        }
         // A client may reconnect after the one-shot readiness broadcast (for example after a
         // gateway restart or a transient socket failure). Re-announce the already-committed
         // readiness to this socket so its UI cannot remain stuck in source-switching forever.
@@ -2337,6 +2344,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + studiesMetrics()
                 + taMetrics()
                 + esLiquidityWallMetrics()
+                + lineHealthMetrics()
                 + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
                 + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
                 + "gateway_cvd_spx_levels_enabled " + boolMetric(settings.esCvdSpxLevelsEnabled()) + "\n"
@@ -13345,6 +13353,11 @@ public class FeedGatewayService implements ReplayRunner {
         return topics;
     }
 
+    private String lineHealthMetrics() {
+        var relay = lineHealthRelay == null ? null : lineHealthRelay.getIfAvailable();
+        return relay == null ? "" : relay.metrics();
+    }
+
     private String esLiquidityWallMetrics() {
         var relay = esLiquidityWallRelay == null ? null : esLiquidityWallRelay.getIfAvailable();
         return relay == null ? "" : relay.metrics();
@@ -13707,6 +13720,7 @@ public class FeedGatewayService implements ReplayRunner {
         // STRUCTURE joins the hello too. Kept as its own line so the recorded footprint campaign's
         // G-R6.2 mutation (which drops the footprint term from the line below) still applies verbatim.
         if (settings.marketStructureEnabled()) return true;
+        if (settings.lineHealthRelayEnabled()) return true;              // the line-health checkpoint rides the hello
         if (settings.marketStructurePatternsEnabled()) return true;      // PATTERNS joins the hello too
         if (settings.studiesEnabled()) return true;                      // so do the INDICATOR-STUDIES studies
         if (!taRelays.isEmpty()) return true;                            // and the structure tools, geometry, trade tools, waves and break classification
@@ -13752,6 +13766,11 @@ public class FeedGatewayService implements ReplayRunner {
                 sb.append('"').append(tf).append("\":").append(e == null ? "null" : e.json());
             }
             sb.append('}');
+        }
+        if (settings.lineHealthRelayEnabled()) {
+            // LINE HEALTH (LH-O-6): the checkpoint {status, states, watermark}; the FIELD's presence = flag on. Appended before the studies so their hello budget accounts for it.
+            var lineHealth = lineHealthRelay == null ? null : lineHealthRelay.getIfAvailable();
+            sb.append(",\"lineHealth\":").append(lineHealth == null ? "null" : lineHealth.helloField());
         }
         if (footprintViews != null) {
             // G-R6: ONE atomic snapshot of the footprint coordinator rides the SAME hello; the field's
@@ -14050,6 +14069,9 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The ES liquidity-wall relay's fan-out: {@code es-liquidity-heatmap}, {@code es-liquidity-wall} and {@code es-liquidity-voice} are global events. */
     void streamEsLiquidityWall(String event, String json) {broadcast(event, json);}
+
+    /** The line-health relay's fan-out: the four {@code line-health-*} frames are global and never coalesced (every record counts for the page's gap detection). */
+    void streamLineHealth(String event, String json) {broadcast(event, json);}
 
     private void broadcast(String event, String json) {
         // Per-session routing: only explicitly allowlisted global events may fan out to every
@@ -15142,6 +15164,8 @@ public class FeedGatewayService implements ReplayRunner {
             "rithmic-liquidity",
             // ES liquidity walls (es-liquidity-wall-service): ONE contract, no per-user data; the voice and the events are never coalesced.
             EsLiquidityWallRelay.HEATMAP_EVENT, EsLiquidityWallRelay.WALL_EVENT, EsLiquidityWallRelay.VOICE_EVENT,
+            // Line health (requirement LH-O-6): system-line records for every socket; user-line records are refused by the relay until the owner filter (M5).
+            LineHealthRelay.STATE_EVENT, LineHealthRelay.EVENT_EVENT, LineHealthRelay.VOICE_EVENT, LineHealthRelay.STATUS_EVENT, LineHealthRelay.RESUME, LineHealthRelay.CHECKPOINT_EVENT,
             "status", "reset", "source-switching", "source-ready", "source-stale",
             // Candlestick pattern annotation sets (market-structure service): global, verbatim, flag-gated.
             "market-structure-patterns",
@@ -15329,6 +15353,19 @@ public class FeedGatewayService implements ReplayRunner {
     /** History travels on the authenticated socket; only registered clients can read the view. */
     void handleFootprintBasicMessage(WebSocketSession session, String payload) {
         if (session == null || clientsById.get(session.getId()) != session || !session.isOpen() || payload == null) return;
+        if (settings.lineHealthRelayEnabled() && lineHealthRelay != null && payload.contains(LineHealthRelay.RESUME)) {
+            // the page's request for a fresh checkpoint (a gap in the records it holds): answered with the same checkpoint the hello carries
+            var relay = lineHealthRelay.getIfAvailable();
+            try {
+                if (relay != null && LineHealthRelay.RESUME.equals(mapper.readTree(payload).path("type").asText())) {
+                    send(session, LineHealthRelay.RESUME, relay.resumeReply());
+                    relay.checkpointParts().forEach(part -> send(session, LineHealthRelay.CHECKPOINT_EVENT, part));
+                    return;
+                }
+            } catch (Exception invalid) {
+                // not a resume message: falls through to the other dispatchers
+            }
+        }
         if (patternAlerts != null && payload.contains(ALERTS_RESUME)) {
             // the small dispatcher: the alert resume message is answered by the alert relay (ALWAYS one reply, an oversize one with a size error and unparsed),
             // everything else follows the footprint path below
