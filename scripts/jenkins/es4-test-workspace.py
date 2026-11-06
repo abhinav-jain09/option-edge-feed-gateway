@@ -60,7 +60,7 @@ def process_cwd(proc):
 
 
 def confirmed_zombie(proc, before):
-    """A Linux Z task has exited and has no cwd or open descriptors to use."""
+    """Skip only a Z leader with exactly one thread; live peer threads must block."""
     def identity():
         with (proc / "stat").open("rb") as stream:
             raw = stream.read(4097)
@@ -71,9 +71,9 @@ def confirmed_zombie(proc, before):
         if end < 0 or raw.split(b" ", 1)[0] != os.fsencode(proc.name):
             raise RuntimeError("Invalid process state")
         fields = raw[end + 1:].split()
-        if len(fields) < 20 or not fields[19].isdigit():
+        if len(fields) < 20 or not fields[19].isdigit() or not fields[17].isdigit():
             raise RuntimeError("Incomplete process state")
-        return fields[0], fields[19]
+        return fields[0], fields[19], fields[17]
     first = identity()
     after = proc.stat()
     if (before.st_uid, before.st_ino, before.st_dev) != (after.st_uid, after.st_ino, after.st_dev) or after.st_uid != os.getuid():
@@ -81,7 +81,7 @@ def confirmed_zombie(proc, before):
     second = identity()
     if first != second:
         raise RuntimeError("Process terminal state changed during inspection")
-    return first[0] == b"Z"
+    return first[0] == b"Z" and first[2] == b"1"
 
 
 def process_directories(proc_root=Path("/proc")):
