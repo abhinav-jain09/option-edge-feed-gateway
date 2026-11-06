@@ -50,8 +50,9 @@ import org.springframework.stereotype.Component;
  * from the watermark (a state at or below it is a duplicate).</li>
  * <li><b>No replay of events or voice.</b> Events and voice are forwarded as they arrive (the tail starts at the end): a warning that a disconnected page
  * missed is not replayed (requirement LH-W-5); the hello's current state of every line is the recovery.</li>
- * <li><b>Records of a user line</b> (a non-null {@code ownerTag}) are refused and counted until the owner filter of milestone M5 exists: delivering them
- * to every socket would leak one user's lines to another, and the requirement allows no fallback.</li>
+ * <li><b>Records of a user line</b> (a non-null {@code ownerTag}) go only to the sockets whose authenticated subject maps to that tag (requirement LH-O-6, LH-N-6; the
+ * owner filter of milestone M5, no fallback): live frames through the targeted sink, the hello and the resume answer built per socket with the other owners' states
+ * removed before serialization. A record that says it is a user line but carries no tag is inconsistent and reaches no socket (counted as refused).</li>
  * <li>No freshness gate: every record is forwarded in order; the page judges staleness from the status heartbeat (LH-D-7).</li>
  * </ul>
  * Disabled ({@code LINE_HEALTH_RELAY_ENABLED=false}, the default): no thread, no consumer, nothing cached.
@@ -89,6 +90,8 @@ final class LineHealthRelay {
 
     private final GatewaySettings settings;
     private final BiConsumer<String, String> sink;
+    /** The targeted form of the sink: {@code (ownerTag, event, json)} reaches only the sockets of that owner. */
+    private final TargetedSink targetedSink;
     private final AtomicBoolean running = new AtomicBoolean();
     private final Lane stateLane = new Lane(), eventsLane = new Lane(), voiceLane = new Lane(), statusLane = new Lane();
     private final AtomicLong drops = new AtomicLong();
@@ -98,13 +101,16 @@ final class LineHealthRelay {
     /** The folded latest state per line key, in arrival order; a REMOVED record deletes its key. */
     private final Map<String, String> states = new LinkedHashMap<>();
     private final Map<String, Long> stateSequences = new HashMap<>();
+    /** The owner tag of each folded user-line state (a system line has no entry). */
+    private final Map<String, String> stateOwners = new HashMap<>();
+    private Map<String, String> releasedOwners = Map.of();
     private final ArrayDeque<HeldStatus> held = new ArrayDeque<>();
     /** The released checkpoint: the status frame, a copy of the folded states, the sequence of the status. */
     private String releasedStatus;
     private Map<String, String> releasedStates = Map.of();
     private long releasedCount = -1;
     private long releasedWatermark = -1;
-    private String helloMemo;
+    private final Map<String, Checkpoint> checkpointMemo = new HashMap<>();
     private volatile Deserializer<Object> decoder;
     private volatile KafkaConsumer<String, byte[]> consumer;
     private Thread thread;
@@ -112,13 +118,28 @@ final class LineHealthRelay {
 
     @org.springframework.beans.factory.annotation.Autowired
     LineHealthRelay(GatewaySettings settings, ObjectProvider<FeedGatewayService> gateway) {
-        this(settings, (event, json) -> gateway.getObject().streamLineHealth(event, json), null);
+        this(settings, (event, json) -> gateway.getObject().streamLineHealth(event, json),
+                (ownerTag, event, json) -> gateway.getObject().streamLineHealthTo(ownerTag, event, json), null);
     }
+
+    /** Delivers a frame to the sockets of one owner only. */
+    @FunctionalInterface
+    interface TargetedSink {
+        void accept(String ownerTag, String event, String json);
+    }
+
+    /** A hello field and the parts that follow it, built for one owner (or for none). */
+    private record Checkpoint(String field, List<String> parts) { }
 
     /** Test seam: the frames go to {@code sink} instead of the sockets, the bytes are decoded by {@code decoder}. */
     LineHealthRelay(GatewaySettings settings, BiConsumer<String, String> sink, Deserializer<Object> decoder) {
+        this(settings, sink, (ownerTag, event, json) -> { }, decoder);
+    }
+
+    LineHealthRelay(GatewaySettings settings, BiConsumer<String, String> sink, TargetedSink targetedSink, Deserializer<Object> decoder) {
         this.settings = settings;
         this.sink = sink;
+        this.targetedSink = targetedSink;
         this.decoder = decoder;
     }
 
@@ -268,12 +289,14 @@ final class LineHealthRelay {
     private synchronized void resetFold() {
         states.clear();
         stateSequences.clear();
+        stateOwners.clear();
+        releasedOwners = Map.of();
         held.clear();
         releasedStatus = null;
         releasedStates = Map.of();
         releasedCount = -1;
         releasedWatermark = -1;
-        helloMemo = null;
+        checkpointMemo.clear();
         live = false;
         epochSeen = null;
         epochChanged = false;
@@ -324,27 +347,46 @@ final class LineHealthRelay {
             drops.incrementAndGet();
             return;
         }
+        String owner = null;
         if (subject != LineHealthSchemas.STATUS && isUserOwned(node)) {
-            userRecordsRefused.incrementAndGet();   // a user line: no owner filter yet (milestone M5), so it reaches no socket
-            return;
+            owner = node.hasNonNull("ownerTag") ? node.get("ownerTag").asText() : null;
+            if (owner == null || owner.isBlank()) {
+                userRecordsRefused.incrementAndGet();   // says it is a user line but names no owner: fail closed, it reaches no socket
+                return;
+            }
         }
         lane.accepted.incrementAndGet();
         if (subject == LineHealthSchemas.STATE) {
             if (REMOVED.equals(node.path("state").asText())) {
                 states.remove(key);
                 stateSequences.remove(key);
+                stateOwners.remove(key);
             } else {
                 states.put(key, node.toString());
                 stateSequences.put(key, node.path("systemSequence").asLong(-1));
+                if (owner != null) {
+                    stateOwners.put(key, owner);
+                } else {
+                    stateOwners.remove(key);
+                }
             }
             if (live) {
-                sink.accept(STATE_EVENT, withCached(node, false));
+                emit(owner, STATE_EVENT, withCached(node, false));
             }
         } else if (subject == LineHealthSchemas.STATUS) {
             noteEpoch(node);
             held.addLast(new HeldStatus(withCached(node, false), node.path("systemRecordCount").asLong()));
         } else if (live) {
-            sink.accept(subject == LineHealthSchemas.EVENT ? EVENT_EVENT : VOICE_EVENT, withCached(node, false));
+            emit(owner, subject == LineHealthSchemas.EVENT ? EVENT_EVENT : VOICE_EVENT, withCached(node, false));
+        }
+    }
+
+    /** A system record goes to every socket; a user record only to the sockets of its owner. */
+    private void emit(String owner, String event, String json) {
+        if (owner == null) {
+            sink.accept(event, json);
+        } else {
+            targetedSink.accept(owner, event, json);
         }
     }
 
@@ -391,10 +433,11 @@ final class LineHealthRelay {
             }
             releasedStatus = h.json;
             releasedStates = new LinkedHashMap<>(states);
+            releasedOwners = new HashMap<>(stateOwners);
             releasedCount = h.count;
             releasedWatermark = watermark;
             releaseSerial++;
-            helloMemo = null;
+            checkpointMemo.clear();
             if (live) {
                 sink.accept(STATUS_EVENT, h.json);
                 recordAge(h.json);
@@ -405,12 +448,17 @@ final class LineHealthRelay {
     /** The bytes of the hello field around the status and the states: its member names, the watermark and the version. */
     static final long ENVELOPE_BYTES = 128;
     private long releaseSerial;
-    private List<String> partsMemo = List.of();
 
-    /** Builds, once per release, the inline field and the parts of the checkpoint, so that a hello and the parts that follow it come from the same release (they share {@code version}). */
-    private void buildCheckpoint() {
-        if (helloMemo != null) {
-            return;
+    /**
+     * Builds, once per release and owner, the inline field and the parts of the checkpoint, so that a hello and the parts that follow it come from the same release (they
+     * share {@code version}). {@code ownerTag} null means a socket without a subject: it receives system lines only. The states of every other owner are removed before
+     * anything is serialized.
+     */
+    private Checkpoint checkpointFor(String ownerTag) {
+        String memoKey = ownerTag == null ? "" : "#" + ownerTag;
+        Checkpoint memo = checkpointMemo.get(memoKey);
+        if (memo != null) {
+            return memo;
         }
         long max = settings.lineHealthHelloMaxBytes();
         String status = withoutCached(releasedStatus);
@@ -418,7 +466,12 @@ final class LineHealthRelay {
         StringBuilder current = new StringBuilder();
         long currentBytes = 0, total = 0;
         int inCurrent = 0;
-        for (String st : releasedStates.values()) {
+        for (Map.Entry<String, String> entry : releasedStates.entrySet()) {
+            String owner = releasedOwners.get(entry.getKey());
+            if (owner != null && !owner.equals(ownerTag)) {
+                continue;   // another user's line
+            }
+            String st = entry.getValue();
             int bytes = st.getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 1;   // the state and its separator, in UTF-8 bytes
             if (inCurrent > 0 && currentBytes + bytes > max) {
                 parts.add(current.toString());
@@ -433,39 +486,38 @@ final class LineHealthRelay {
         }
         parts.add(current.toString());
         long statusBytes = status.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        Checkpoint built;
         if (total + statusBytes + ENVELOPE_BYTES <= max) {
-            helloMemo = "{\"status\":" + status + ",\"states\":[" + parts.get(0) + "],\"watermark\":" + releasedWatermark + ",\"version\":" + releaseSerial + "}";
-            partsMemo = List.of();
+            built = new Checkpoint("{\"status\":" + status + ",\"states\":[" + parts.get(0) + "],\"watermark\":" + releasedWatermark + ",\"version\":" + releaseSerial + "}", List.of());
         } else {
-            helloMemo = "{\"status\":" + status + ",\"states\":null,\"parts\":" + parts.size() + ",\"watermark\":" + releasedWatermark + ",\"version\":" + releaseSerial + "}";
             List<String> framed = new java.util.ArrayList<>();
             for (int k = 0; k < parts.size(); k++) {
                 framed.add("{\"part\":" + k + ",\"parts\":" + parts.size() + ",\"version\":" + releaseSerial + ",\"watermark\":" + releasedWatermark + ",\"states\":[" + parts.get(k) + "]}");
             }
-            partsMemo = framed;
+            built = new Checkpoint("{\"status\":" + status + ",\"states\":null,\"parts\":" + parts.size() + ",\"watermark\":" + releasedWatermark + ",\"version\":" + releaseSerial + "}", framed);
         }
+        checkpointMemo.put(memoKey, built);
+        return built;
     }
 
     /**
-     * The checkpoint {@code {status, states, watermark, version}} as the hello field value (the members of the cached pair are never rewritten). When the states do not fit
-     * {@link GatewaySettings#lineHealthHelloMaxBytes()} the field carries {@code states:null} and {@code parts:K}, and the states follow the hello in {@code K} frames
-     * {@link #CHECKPOINT_EVENT} that share its {@code version}: no line is ever dropped to make a hello fit. Records of a user line are never in it.
+     * The checkpoint {@code {status, states, watermark, version}} as the hello field value for the socket of {@code ownerTag} (null: a socket without a subject, system lines
+     * only). When the states do not fit {@link GatewaySettings#lineHealthHelloMaxBytes()} the field carries {@code states:null} and {@code parts:K}, and the states follow the
+     * hello in {@code K} frames {@link #CHECKPOINT_EVENT} that share its {@code version}: no line is ever dropped to make a hello fit. Another owner's lines are never in it.
      */
-    synchronized String helloField() {
+    synchronized String helloField(String ownerTag) {
         if (releasedStatus == null) {
             return "{\"status\":null,\"states\":[],\"watermark\":null}";
         }
-        buildCheckpoint();
-        return helloMemo;
+        return checkpointFor(ownerTag).field();
     }
 
-    /** The checkpoint parts that follow a hello whose field is {@code states:null}; empty when the hello carried the states inline. */
-    synchronized List<String> checkpointParts() {
+    /** The checkpoint parts that follow a hello whose field is {@code states:null}, for the same owner; empty when the hello carried the states inline. */
+    synchronized List<String> checkpointParts(String ownerTag) {
         if (releasedStatus == null) {
             return List.of();
         }
-        buildCheckpoint();
-        return partsMemo;
+        return checkpointFor(ownerTag).parts();
     }
 
     private final AtomicLong[] statusAgeBuckets = {new AtomicLong(), new AtomicLong(), new AtomicLong(), new AtomicLong()};
@@ -481,9 +533,16 @@ final class LineHealthRelay {
         }
     }
 
+    /** Test conveniences: the checkpoint of a socket without a subject (system lines only). Production code always passes the socket's own tag. */
+    synchronized String helloField() { return helloField(null); }
+
+    synchronized List<String> checkpointParts() { return checkpointParts(null); }
+
+    String resumeReply() { return resumeReply(null); }
+
     /** The answer to {@link #RESUME}: the same checkpoint under its field name. */
-    String resumeReply() {
-        return "{\"lineHealth\":" + helloField() + "}";
+    String resumeReply(String ownerTag) {
+        return "{\"lineHealth\":" + helloField(ownerTag) + "}";
     }
 
     synchronized long releasedWatermarkForTest() {

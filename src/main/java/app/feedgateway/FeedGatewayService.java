@@ -1354,7 +1354,7 @@ public class FeedGatewayService implements ReplayRunner {
             }
             case HELLO -> {
                 WebSocketSession target = (WebSocketSession) frame.target();
-                send(target, "cvd-hello", helloBound(target, () -> cvdHelloJson(frame.body())));
+                send(target, "cvd-hello", helloBound(target, () -> cvdHelloJson(frame.body(), lineHealthOwnerTag(target))));
                 sendOwedAlertSnapshots(target);
             }
         }
@@ -1656,7 +1656,7 @@ public class FeedGatewayService implements ReplayRunner {
                 // never hold a hello older than a control it already received. Delivered before this returns.
                 footprintStrikeView.hello(session);
             } else {
-                send(session, "cvd-hello", helloBound(session, this::cvdHelloJson));
+                send(session, "cvd-hello", helloBound(session, () -> cvdHelloJson(footprintStrikeView == null ? null : footprintStrikeView.helloField(), lineHealthOwnerTag(session))));
                 sendOwedAlertSnapshots(session);
             }
         }
@@ -1670,7 +1670,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if(lineHealthRelay!=null&&settings.lineHealthRelayEnabled()) {
             var relay=lineHealthRelay.getIfAvailable();
-            if(relay!=null)relay.checkpointParts().forEach(part->send(session,LineHealthRelay.CHECKPOINT_EVENT,part));   // the states of a checkpoint too large for the hello follow it in parts
+            if(relay!=null)relay.checkpointParts(lineHealthOwnerTag(session)).forEach(part->send(session,LineHealthRelay.CHECKPOINT_EVENT,part));   // the states of a checkpoint too large for the hello follow it in parts
         }
         // A client may reconnect after the one-shot readiness broadcast (for example after a
         // gateway restart or a transient socket failure). Re-announce the already-committed
@@ -13732,7 +13732,7 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** The hello with the strike authority field its caller captured — for a socket, in sequence with the control frames. */
-    String cvdHelloJson(String footprintStrikeField) {
+    String cvdHelloJson(String footprintStrikeField, String lineHealthOwnerTag) {
         StringBuilder sb = new StringBuilder("{\"sessionDate\":");
         String sd = cvdBarsSessionDate;
         sb.append(sd == null ? "null" : "\"" + sd + "\"").append(",\"hwm\":{");
@@ -13770,7 +13770,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.lineHealthRelayEnabled()) {
             // LINE HEALTH (LH-O-6): the checkpoint {status, states, watermark}; the FIELD's presence = flag on. Appended before the studies so their hello budget accounts for it.
             var lineHealth = lineHealthRelay == null ? null : lineHealthRelay.getIfAvailable();
-            sb.append(",\"lineHealth\":").append(lineHealth == null ? "null" : lineHealth.helloField());
+            sb.append(",\"lineHealth\":").append(lineHealth == null ? "null" : lineHealth.helloField(lineHealthOwnerTag));
         }
         if (footprintViews != null) {
             // G-R6: ONE atomic snapshot of the footprint coordinator rides the SAME hello; the field's
@@ -15358,8 +15358,8 @@ public class FeedGatewayService implements ReplayRunner {
             var relay = lineHealthRelay.getIfAvailable();
             try {
                 if (relay != null && LineHealthRelay.RESUME.equals(mapper.readTree(payload).path("type").asText())) {
-                    send(session, LineHealthRelay.RESUME, relay.resumeReply());
-                    relay.checkpointParts().forEach(part -> send(session, LineHealthRelay.CHECKPOINT_EVENT, part));
+                    send(session, LineHealthRelay.RESUME, relay.resumeReply(lineHealthOwnerTag(session)));
+                    relay.checkpointParts(lineHealthOwnerTag(session)).forEach(part -> send(session, LineHealthRelay.CHECKPOINT_EVENT, part));
                     return;
                 }
             } catch (Exception invalid) {
@@ -17069,5 +17069,30 @@ public class FeedGatewayService implements ReplayRunner {
     void swapActiveSelectionForTest(String source, String symbol, String expiry, long epoch) {
         long now = System.currentTimeMillis();
         activeSelection.set(new ActiveSelection(source, symbol, expiry, epoch, now));
+    }
+
+    /** The hello without a socket: the line-health field carries system lines only (the tag of a socket is passed by the two-argument form). */
+    String cvdHelloJson(String footprintStrikeField) {
+        return cvdHelloJson(footprintStrikeField, null);
+    }
+
+    /** Session attribute holding the owner tag of the socket's authenticated subject (set once by the handler); absent when the socket has no subject. */
+    static final String LINE_HEALTH_OWNER_TAG_ATTR = "lineHealth.ownerTag";
+
+    /** The owner tag of a socket, or null when it has none (it then receives no user-line record). */
+    static String lineHealthOwnerTag(WebSocketSession session) {
+        if (session == null) return null;
+        Object tag = session.getAttributes().get(LINE_HEALTH_OWNER_TAG_ATTR);
+        return tag instanceof String text && !text.isBlank() ? text : null;
+    }
+
+    /** LH-O-6: a user-line frame reaches only the sockets whose owner tag equals {@code ownerTag}. */
+    void streamLineHealthTo(String ownerTag, String event, String json) {
+        if (ownerTag == null || ownerTag.isBlank()) return;
+        for (WebSocketSession client : clients) {
+            if (ownerTag.equals(lineHealthOwnerTag(client))) {
+                send(client, event, json);
+            }
+        }
     }
 }

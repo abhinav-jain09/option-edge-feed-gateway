@@ -199,18 +199,142 @@ class LineHealthRelayTest {
         assertEquals(3, hello.get("watermark").asLong(), "the removal's sequence still counts");
     }
 
+    private static final String TAG_A = LineHealthOwnerTag.of("alice-subject"), TAG_B = LineHealthOwnerTag.of("bob-subject");
+
+    private static final class Targeted implements LineHealthRelay.TargetedSink {
+        final List<String[]> frames = new ArrayList<>();
+
+        @Override
+        public void accept(String ownerTag, String event, String json) {
+            frames.add(new String[] {ownerTag, event, json});
+        }
+    }
+
+    private LineHealthRelay relay(Sink sink, Targeted targeted) {
+        Deserializer<Object> counting = (topic, data) -> deserializer.deserialize(topic, data);
+        LineHealthRelay relay = new LineHealthRelay(SETTINGS, sink, targeted, counting);
+        relay.goLiveForTest();
+        return relay;
+    }
+
+    private static GenericRecord userVoice(String eventId, String ownerTag) {
+        return new GenericRecordBuilder(LineHealthSchemas.VOICE.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("eventId", eventId).set("lineId", "ui")
+                .set("text", "Support 7612 giving way").set("repeat", false).set("ownerTag", ownerTag).build();
+    }
+
     @Test
-    void aUserLineRecordReachesNoSocketAndNoHelloUntilTheOwnerFilterExists() throws Exception {
+    void ownerTagMatchesTheWebTierVectors() {
+        // the same vectors are asserted by the web tier's LevelAbsorptionManualLinePublisher.ownerTag test: SHA-256 of the UTF-8 subject, first 16 bytes, lowercase hex
+        assertEquals("2bd806c97f0e00af1a1fc3328fa763a9", LineHealthOwnerTag.of("alice"));
+        assertEquals(32, LineHealthOwnerTag.of("anything").length());
+        assertEquals("2bd806c97f0e00af1a1fc3328fa763a9", LineHealthOwnerTag.of("alice"));
+    }
+
+    @Test
+    void liveUserRecordsGoOnlyThroughTheTargetedSinkOfTheirOwner() throws Exception {
         Sink sink = new Sink();
-        LineHealthRelay relay = relay(sink);
-        relay.accept(STATE, "ui-9f-20261106-d1", bytes(state("ui-9f-20261106-d1", 0, "TOUCHING", 6, "9f").build()));
-        relay.accept(EVENTS, "x", bytes(event("x", "9f")));
+        Targeted targeted = new Targeted();
+        LineHealthRelay relay = relay(sink, targeted);
+        relay.accept(STATE, "ui-a", bytes(state("ui-a", 0, "TOUCHED", 6, TAG_A).build()));
+        relay.accept(EVENTS, "ev-a", bytes(event("ev-a", TAG_A)));
+        relay.accept(VOICE, "vo-a", bytes(userVoice("vo-a", TAG_A)));
+        relay.accept(STATE, "ui-b", bytes(state("ui-b", 0, "TOUCHED", 6, TAG_B).build()));
+        assertEquals(List.of(), sink.events(), "no global frame carries a user line");
+        assertEquals(4, targeted.frames.size());
+        assertEquals(TAG_A, targeted.frames.get(0)[0]);
+        assertEquals("line-health-state", targeted.frames.get(0)[1]);
+        assertEquals("line-health-event", targeted.frames.get(1)[1]);
+        assertEquals("line-health-voice", targeted.frames.get(2)[1]);
+        assertEquals(TAG_B, targeted.frames.get(3)[0]);
+        assertEquals(0, relay.userRecordsRefusedForTest());
+    }
+
+    @Test
+    void aSystemRecordStillGoesToTheGlobalSink() {
+        Sink sink = new Sink();
+        Targeted targeted = new Targeted();
+        LineHealthRelay relay = relay(sink, targeted);
+        relay.accept(STATE, "A", bytes(state("A", 1, "TOUCHED", 6, null).build()));
+        assertEquals(List.of("line-health-state"), sink.events());
+        assertEquals(0, targeted.frames.size());
+    }
+
+    @Test
+    void helloAndResumeCarryOnlyTheCallersOwnLines_noOtherUsersLineInAnyPart() throws Exception {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink, new Targeted());
+        relay.accept(STATE, "A", bytes(state("A", 1, "TOUCHED", 6, null).build()));
+        relay.accept(STATE, "ui-a", bytes(state("ui-a", 0, "TOUCHED", 6, TAG_A).build()));
+        relay.accept(STATE, "ui-b", bytes(state("ui-b", 0, "TOUCHED", 6, TAG_B).build()));
+        relay.accept(STATUS, "SPX", bytes(status(1, 1)));
+        relay.captureBound(3);
+        relay.release(3);
+        assertEquals(List.of("A", "ui-a"), lineIds(relay.helloField(TAG_A)));
+        assertEquals(List.of("A", "ui-b"), lineIds(relay.helloField(TAG_B)));
+        assertEquals(List.of("A"), lineIds(relay.helloField(null)), "a socket without a subject gets system lines only");
+        assertFalse(relay.resumeReply(TAG_A).contains("ui-b"));
+        assertFalse(relay.resumeReply(TAG_B).contains("ui-a"));
+        assertFalse(relay.resumeReply(null).contains("ui-"));
+        assertTrue(relay.checkpointParts(TAG_A).isEmpty());
+    }
+
+    @Test
+    void thePartsOfALargeCheckpointAreFilteredToo() throws Exception {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink, new Targeted());
+        String wide = "\u20ac".repeat(40);
+        for (int i = 0; i < 2500; i++) {
+            relay.accept(STATE, "ui-a" + i, bytes(state("ui-a" + i, 0, "TOUCHED", 6, TAG_A).set("patternId", wide).build()));
+            relay.accept(STATE, "ui-b" + i, bytes(state("ui-b" + i, 0, "TOUCHED", 6, TAG_B).set("patternId", wide).build()));
+        }
         relay.accept(STATUS, "SPX", bytes(status(1, 0)));
-        relay.captureBound(0);
-        relay.release(0);
-        assertEquals(List.of("line-health-status"), sink.events());
-        assertEquals(2, relay.userRecordsRefusedForTest());
-        assertEquals(0, JSON.readTree(relay.helloField()).get("states").size());
+        relay.captureBound(5000);
+        relay.release(5000);
+        assertTrue(JSON.readTree(relay.helloField(TAG_A)).get("states").isNull(), "the checkpoint was split");
+        StringBuilder all = new StringBuilder(relay.helloField(TAG_A));
+        int found = 0;
+        for (String part : relay.checkpointParts(TAG_A)) {
+            all.append(part);
+            for (JsonNode st : JSON.readTree(part).get("states")) {
+                assertTrue(st.get("lineId").asText().startsWith("ui-a"));
+                found++;
+            }
+        }
+        assertEquals(2500, found);
+        assertFalse(all.toString().contains("ui-b"));
+    }
+
+    @Test
+    void aRemovedUserLineNeverReappearsInALaterHello() throws Exception {
+        Sink sink = new Sink();
+        Targeted targeted = new Targeted();
+        LineHealthRelay relay = relay(sink, targeted);
+        relay.accept(STATE, "ui-a", bytes(state("ui-a", 0, "TOUCHED", 6, TAG_A).build()));
+        relay.accept(STATE, "ui-a", bytes(state("ui-a", 0, "REMOVED", null, TAG_A).build()));
+        relay.accept(STATUS, "SPX", bytes(status(1, 0)));
+        relay.captureBound(2);
+        relay.release(2);
+        assertEquals(List.of(), lineIds(relay.helloField(TAG_A)));
+        assertEquals(2, targeted.frames.size(), "the removal itself is delivered live, to its owner");
+    }
+
+    @Test
+    void aUserRecordWithoutATagIsStillRefusedAndTheEventSnapshotIsNotTrustedForTheOwner() {
+        Sink sink = new Sink();
+        Targeted targeted = new Targeted();
+        LineHealthRelay relay = relay(sink, targeted);
+        relay.accept(STATE, "U1", bytes(state("U1", 1, "TOUCHED", 6, null).set("isUser", true).build()));
+        assertEquals(List.of(), sink.events());
+        assertEquals(0, targeted.frames.size());
+        assertEquals(1, relay.userRecordsRefusedForTest());
+    }
+
+    private static List<String> lineIds(String helloField) throws Exception {
+        List<String> ids = new ArrayList<>();
+        for (JsonNode st : JSON.readTree(helloField).get("states")) {
+            ids.add(st.get("lineId").asText());
+        }
+        return ids;
     }
 
     @Test
