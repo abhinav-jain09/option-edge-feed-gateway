@@ -184,7 +184,7 @@ public final class GatewaySettings {
         return boolValue("ES_LIQUIDITY_WALL_RELAY_ENABLED", false);
     }
 
-    /** futures.liquidity-wall.dashboard ({@code LiquidityWallDashboard}, fixed schema id 3403): the per-bucket frame, compact, latest. */
+    /** futures.liquidity-wall.dashboard ({@code LiquidityWallDashboard}, fixed schema id 3408, version 2; 3403 is the archival version 1 the relay still accepts): the per-bucket frame, compact, latest. */
     public String esLiquidityWallDashboardTopic() {
         return value("ES_LIQUIDITY_WALL_DASHBOARD_TOPIC", "futures.liquidity-wall.dashboard");
     }

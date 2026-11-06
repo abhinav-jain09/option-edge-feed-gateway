@@ -34,7 +34,7 @@ import org.apache.avro.generic.GenericRecord;
  * <li>{@code futures.liquidity-wall.events} (id 3404, delete retention under a byte cap): read from the session open; the BORN and RETIRED events are listed
  * in their minute (section 8 lists those two kinds only) and, applied in bucket order, give the walls alive at every minute's end (identity, lane, ticks,
  * birth bucket). A wall whose BORN fell outside the retained bytes is unknown until a dashboard frame lists it.</li>
- * <li>{@code futures.liquidity-wall.dashboard} (id 3403): COMPACTED under the single key {@code CME|<contract>}, so after compaction or a gateway restart it
+ * <li>{@code futures.liquidity-wall.dashboard} (id 3408, or the archival version 1 id 3403): COMPACTED under the single key {@code CME|<contract>}, so after compaction or a gateway restart it
  * holds only the surviving latest frame and can never reconstruct a session; the relay reads it from the latest record and this projection's
  * dashboard-derived part covers ONLY the relay's uptime ({@code dashboardCoverage} = SINCE_START with the start instant). It contributes the fields no
  * retained source carries: the lean (last, minimum, maximum in thousandths), side read, confirmed side, spot and layer-B flag of a minute, and the score

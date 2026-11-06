@@ -6,7 +6,7 @@ import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.GenericRecordBuilder;
 
-/** The three relayed records and the bucket row of the liquidity-wall family, built from the REAL schemas of the contracts jar (0.66.0, ids 3403/3404/3407/3402). */
+/** The three relayed records and the bucket row of the liquidity-wall family, built from the REAL schemas of the contracts jar (0.84.0, ids 3408 (dashboard version 2; 3403 is version 1) /3404/3407/3402). */
 final class EsLiquidityWallFixtures {
     static final long NOW = 1_800_000_000_000L;
     static final String ENV = "Rithmic Test";
@@ -52,8 +52,21 @@ final class EsLiquidityWallFixtures {
         return b.build();
     }
 
+    /** The three version-2 wall fields of the design's fixture: an ask wall of 340 contracts under attack. */
+    static final List<Long> SIZE_TAPE = java.util.Arrays.asList(null, 430L, 429L, 433L, 438L, 340L, 340L);
+
+    /** A wall of the version 2 dashboard (id 3408): the version 1 fields plus sizeNow, sizeTape and wordState. */
     static GenericRecord dashboardWall(String id, String lane, long lo, long hi, long birth) {
-        return wall(element(LiquidityWallSchemas.DASHBOARD.schema(), "walls"), id, lane, lo, hi, birth);
+        GenericRecord w = wall(element(LiquidityWallSchemas.DASHBOARD.schema(), "walls"), id, lane, lo, hi, birth);
+        w.put("sizeNow", 340L);
+        w.put("sizeTape", SIZE_TAPE);
+        w.put("wordState", "UNDER_ATTACK");
+        return w;
+    }
+
+    /** A wall of the archival version 1 dashboard (id 3403): none of the three version-2 fields exists in its schema. */
+    static GenericRecord dashboardWallV1(String id, String lane, long lo, long hi, long birth) {
+        return wall(element(LiquidityWallSchemas.DASHBOARD.priorSchema(), "walls"), id, lane, lo, hi, birth);
     }
 
     static GenericRecord eventWall(String id, String lane, long lo, long hi, long birth) {
@@ -61,12 +74,25 @@ final class EsLiquidityWallFixtures {
     }
 
     static GenericRecordBuilder dashboard(long bucketEnd, String quality) {
-        return new GenericRecordBuilder(LiquidityWallSchemas.DASHBOARD.schema())
-                .set("schemaVersion", 1).set("depthEnvironment", ENV).set("contract", CONTRACT).set("bucketEnd", bucketEnd).set("configFingerprint", FINGERPRINT)
+        return dashboardOf(LiquidityWallSchemas.DASHBOARD.schema(), 2, bucketEnd, quality, List.of(dashboardWall("C1", "RESISTANCE", 30459L, 30461L, bucketEnd - 12_000L)));
+    }
+
+    /** The archival version 1 dashboard (writer schema of id 3403, {@code schemaVersion} 1). */
+    static GenericRecordBuilder dashboardV1(long bucketEnd, String quality) {
+        return dashboardOf(LiquidityWallSchemas.DASHBOARD.priorSchema(), 1, bucketEnd, quality, List.of(dashboardWallV1("C1", "RESISTANCE", 30459L, 30461L, bucketEnd - 12_000L)));
+    }
+
+    static GenericRecord dashboardV1(long bucketEnd) {
+        return dashboardV1(bucketEnd, "LIVE").build();
+    }
+
+    private static GenericRecordBuilder dashboardOf(Schema schema, int version, long bucketEnd, String quality, List<GenericRecord> walls) {
+        return new GenericRecordBuilder(schema)
+                .set("schemaVersion", version).set("depthEnvironment", ENV).set("contract", CONTRACT).set("bucketEnd", bucketEnd).set("configFingerprint", FINGERPRINT)
                 .set("quality", quality).set("closePath", "WATERMARK").set("layerBEnabled", true).set("spotTick", 30449L).set("spotAgeMs", 120L)
                 .set("levels", List.of(level("BID", 30440L, 150L, 140L, "NEUTRAL"), level("ASK", 30460L, 900L, 880L, "STABLE_WALL")))
                 .set("clusters", List.of(cluster("C1", "ASK", 30459L, 30461L)))
-                .set("walls", List.of(dashboardWall("C1", "RESISTANCE", 30459L, 30461L, bucketEnd - 12_000L)))
+                .set("walls", walls)
                 .set("leanThousandths", -412).set("above", 2400L).set("below", 1000L).set("sideRead", "UP_HEAVY").set("confirmedSide", "UP_HEAVY")
                 .set("lastAdmittedFrameReceivedAtMs", bucketEnd - 80L).set("lastAdmittedStreamId", "stream-1").set("closingFramePresent", true);
     }

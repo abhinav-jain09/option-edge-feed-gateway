@@ -30,8 +30,8 @@ import org.springframework.stereotype.Component;
  * assigned, no consumer group, nothing committed), fanned out through the existing authenticated sockets as the global events {@link #HEATMAP_EVENT},
  * {@link #WALL_EVENT} and {@link #VOICE_EVENT}, and folded into the 60-second session projection of {@link EsLiquidityWallHistory}.
  * <p>
- * The boundary, in order, per record: the value's Confluent frame must carry the topic's FIXED schema id (3403 dashboard, 3404 events, 3407 voice, 3402
- * buckets; {@link LiquidityWallSchemas#assertFramedAs}) BEFORE any decoding, a mismatch being refused and counted per topic; then the bytes are decoded by the
+ * The boundary, in order, per record: the value's Confluent frame must carry the topic's FIXED schema id (3408 dashboard or its archival version 1 id 3403, 3404 events, 3407 voice, 3402
+ * buckets; {@link LiquidityWallSchemas#assertFramedAs}, and {@link LiquidityWallSchemas#assertFramedAsAnyVersion} for the dashboard) BEFORE any decoding, a mismatch being refused and counted per topic; then the bytes are decoded by the
  * registry through {@link GatewayAvroDeserializer} (tolerant: an unknown id or a corrupt body is {@link GatewayAvroDeserializer#UNDECODABLE}, counted; a
  * registry outage fails the poll and the record is re-read after the retry); then {@link EsLiquidityWallJson}'s record checks.
  * <ul>
@@ -279,7 +279,11 @@ final class EsLiquidityWallRelay {
         }
         Lane lane = lane(subject);
         try {
-            LiquidityWallSchemas.assertFramedAs(value, subject);
+            if (subject == LiquidityWallSchemas.DASHBOARD) {
+                LiquidityWallSchemas.assertFramedAsAnyVersion(value, subject);   // 3403 (version 1) or 3408 (version 2)
+            } else {
+                LiquidityWallSchemas.assertFramedAs(value, subject);
+            }
         } catch (IllegalStateException wrongId) {
             lane.schemaIdRefused.incrementAndGet();
             return;
