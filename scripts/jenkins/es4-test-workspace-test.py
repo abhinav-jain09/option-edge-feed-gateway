@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SOURCE = Path(__file__).with_name("es4-test-workspace.py")
 spec = importlib.util.spec_from_file_location("workspace_recovery", SOURCE)
@@ -111,6 +112,31 @@ class RecoveryTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             m.recover(self.root, NOW, [])
         self.root.chmod(0o700)
+        self.assertTrue(all(p.is_dir() for p in old))
+
+    def test_restricted_same_user_cwd_uses_bounded_readonly_link_inspection(self):
+        proc = self.root / "13176"
+        proc.mkdir()
+        with patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"/\0", b"")) as call:
+            self.assertEqual(["/"], m.process_directories(self.root))
+            call.assert_called_once_with(["sudo", "-n", "/usr/bin/readlink", "-z", "--", str(proc / "cwd")], capture_output=True, timeout=5)
+
+    def test_restricted_inspection_refusal_and_malformed_result_fail_closed(self):
+        proc = self.root / "13176"
+        proc.mkdir()
+        for code, value in [(1, b""), (0, b"relative\0"), (0, b"/\0extra\0"), (0, b"/")]:
+            with patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], code, value, b"")):
+                with self.assertRaises(RuntimeError):
+                    m.process_directories(self.root)
+
+    def test_restricted_active_workspace_still_blocks_recovery(self):
+        old = self.four()
+        proc = self.root / "13176"
+        proc.mkdir()
+        with patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, os.fsencode(str(old[0])) + b"\0", b"")):
+            active = m.process_directories(self.root)
+            with self.assertRaises(RuntimeError):
+                m.recover(self.root, NOW, active)
         self.assertTrue(all(p.is_dir() for p in old))
 
     def test_cli_refuses_every_root_other_than_fixed_es4_root(self):

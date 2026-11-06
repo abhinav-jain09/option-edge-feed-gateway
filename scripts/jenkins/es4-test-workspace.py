@@ -22,15 +22,34 @@ def private_directory(path):
     return info
 
 
-def process_directories():
+def process_cwd(proc):
+    try:
+        return os.readlink(proc / "cwd")
+    except PermissionError:
+        # Container processes may have our uid but disallow unprivileged ptrace.
+        # Read only this already-filtered numeric process link; never ignore it.
+        result = subprocess.run(
+            ["sudo", "-n", "/usr/bin/readlink", "-z", "--", str(proc / "cwd")],
+            capture_output=True, timeout=5)
+        if result.returncode != 0:
+            if not proc.exists():
+                raise FileNotFoundError(str(proc))
+            raise RuntimeError("Cannot inspect restricted user process")
+        raw = result.stdout
+        if not raw.startswith(b"/") or not raw.endswith(b"\0") or raw.count(b"\0") != 1:
+            raise RuntimeError("Invalid restricted process directory")
+        return os.fsdecode(raw[:-1])
+
+
+def process_directories(proc_root=Path("/proc")):
     result = []
-    for proc in Path("/proc").iterdir():
+    for proc in proc_root.iterdir():
         if not proc.name.isdigit():
             continue
         try:
             if proc.stat().st_uid != os.getuid():
                 continue
-            result.append(os.readlink(proc / "cwd"))
+            result.append(process_cwd(proc))
         except FileNotFoundError:
             continue  # process exited before inspection
         except PermissionError as error:
