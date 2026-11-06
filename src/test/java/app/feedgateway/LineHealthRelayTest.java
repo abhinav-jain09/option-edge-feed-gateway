@@ -27,7 +27,8 @@ import org.junit.jupiter.api.Test;
 
 /**
  * The line-health relay at its boundary, fed the raw bytes a consumer hands it. THE RECORDS ARE TEST FIXTURES built from the real schemas of the contracts jar
- * (ids 3701, 3702, 3703, 3705) and an in-memory registry; none of them has ever been on a Kafka topic.
+ * (the current ids 3708, 3709, 3703, 3710, schemaVersion 2 for the three two-version subjects; the archival version-1 schemas under 3701, 3702, 3705 are built from
+ * priorSchema(), schemaVersion 1) and an in-memory registry; none of them has ever been on a Kafka topic.
  */
 class LineHealthRelayTest {
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -94,13 +95,13 @@ class LineHealthRelayTest {
     }
 
     private static GenericRecordBuilder state(String lineId, long sequence, String state, Integer gauge, String ownerTag) {
-        return new GenericRecordBuilder(LineHealthSchemas.STATE.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("lineId", lineId).set("chartKey", "L|" + lineId)
+        return new GenericRecordBuilder(LineHealthSchemas.STATE.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("lineId", lineId).set("chartKey", "L|" + lineId)
                 .set("stateRevision", 1L).set("systemSequence", ownerTag == null ? sequence : null).set("role", "SUPPORT").set("state", state).set("gauge", gauge)
                 .set("lineCents", 761200L).set("ownerTag", ownerTag);
     }
 
     private static GenericRecord status(long stateSequence, long systemRecordCount) {
-        return new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", stateSequence)
+        return new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("stateSequence", stateSequence)
                 .set("systemRecordCount", systemRecordCount).set("statusEpoch", 1L).build();
     }
 
@@ -111,7 +112,7 @@ class LineHealthRelayTest {
 
     private static GenericRecord event(String eventId, String ownerTag) {
         GenericRecord body = state("A", 1, "GIVING_WAY", 3, null).build();
-        return new GenericRecordBuilder(LineHealthSchemas.EVENT.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("eventId", eventId).set("lineId", "A")
+        return new GenericRecordBuilder(LineHealthSchemas.EVENT.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("eventId", eventId).set("lineId", "A")
                 .set("ownerTag", ownerTag).set("eventType", "GIVING_WAY").set("warnVoice", true).build();
     }
 
@@ -428,6 +429,28 @@ class LineHealthRelayTest {
     }
 
     @Test
+    void theFrameIdAndTheRecordsOwnSchemaVersionMustAgree() {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink);
+        // a version-2 frame (3708 / 3709 / 3710) whose record says schemaVersion 1, and a version-1 frame (3701 / 3702 / 3705) whose record says schemaVersion 2: both refused
+        relay.accept(STATE, "A", bytes(state("A", 1, "TOUCHING", 7, null).set("schemaVersion", 1).build()));
+        relay.accept(STATE, "A", versionOneBytes(LineHealthSchemas.STATE, new GenericRecordBuilder(LineHealthSchemas.STATE.priorSchema()).set("schemaVersion", 2).set("asOfMs", NOW)
+                .set("lineId", "A").set("systemSequence", 1L).build()));
+        relay.accept(EVENTS, "e1", bytes(new GenericRecordBuilder(LineHealthSchemas.EVENT.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("eventId", "e1").set("lineId", "A").build()));
+        relay.accept(EVENTS, "e2", versionOneBytes(LineHealthSchemas.EVENT, new GenericRecordBuilder(LineHealthSchemas.EVENT.priorSchema()).set("schemaVersion", 2).set("asOfMs", NOW)
+                .set("eventId", "e2").set("lineId", "A").build()));
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 5L)
+                .set("systemRecordCount", 0L).set("statusEpoch", 1L).build()));
+        relay.accept(STATUS, "SPX", versionOneBytes(LineHealthSchemas.STATUS, new GenericRecordBuilder(LineHealthSchemas.STATUS.priorSchema()).set("schemaVersion", 2).set("asOfMs", NOW)
+                .set("stateSequence", 5L).set("systemRecordCount", 0L).set("statusEpoch", 1L).build()));
+        assertEquals(6, relay.dropsForTest(), "all six mismatched pairs are dropped");
+        assertTrue(sink.frames.isEmpty());
+        // the matching pairs pass
+        relay.accept(STATE, "A", bytes(state("A", 1, "TOUCHING", 7, null).build()));
+        assertEquals(List.of("line-health-state"), sink.events());
+    }
+
+    @Test
     void aDisabledRelayConsumesNothing() {
         LineHealthRelay relay = new LineHealthRelay(SETTINGS, new Sink(), null);
         relay.start();
@@ -441,7 +464,7 @@ class LineHealthRelayTest {
         relay.accept(STATE, "U1", bytes(state("U1", 1, "TOUCHING", 6, null).set("isUser", true).build()));            // says user, carries no tag
         relay.accept(STATE, "U2", bytes(state("U2", 1, "TOUCHING", 6, null).set("kind", "USER_LINE").build()));      // a USER_ kind, no tag
         GenericRecord userBody = state("A", 1, "GIVING_WAY", 3, null).set("isUser", true).build();
-        relay.accept(EVENTS, "e1", bytes(new GenericRecordBuilder(LineHealthSchemas.EVENT.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("eventId", "e1")
+        relay.accept(EVENTS, "e1", bytes(new GenericRecordBuilder(LineHealthSchemas.EVENT.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("eventId", "e1")
                 .set("snapshot", new GenericRecordBuilder(LineHealthSchemas.EVENT.schema().getField("snapshot").schema().getTypes().get(1)).set("lineId", "U9").set("isUser", true).build()).build()));
         assertEquals(List.of(), sink.events(), "nothing reaches a socket");
         assertEquals(3, relay.userRecordsRefusedForTest());
@@ -453,7 +476,7 @@ class LineHealthRelayTest {
         Sink sink = new Sink();
         LineHealthRelay relay = relay(sink);
         relay.accept(STATE, "A", bytes(state("A", 0, "TOUCHING", 6, null).set("systemSequence", null).build()));        // a system line without its sequence
-        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 5L).set("statusEpoch", 1L).build()));   // no systemRecordCount
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("stateSequence", 5L).set("statusEpoch", 1L).build()));   // no systemRecordCount
         assertEquals(2, relay.dropsForTest());
         assertTrue(sink.frames.isEmpty());
     }
@@ -472,7 +495,7 @@ class LineHealthRelayTest {
                 default -> { }
             }
         }
-        b.set("schemaVersion", 1).set("ownerTag", null).set("isUser", false).set("kind", "STRUCTURE").set("state", "TOUCHING").set("lineId", "L-0123456789").set("chartKey", "L|0123456789");
+        b.set("schemaVersion", 2).set("ownerTag", null).set("isUser", false).set("kind", "STRUCTURE").set("state", "TOUCHING").set("lineId", "L-0123456789").set("chartKey", "L|0123456789");
         int one = LineHealthRelay.render(LineHealthSchemas.STATE, "L-0123456789", b.build()).toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
         assertTrue(one < 2800, "a fully populated state is " + one + " bytes (2,611 with the seven fields of version 2; it was under 2,500 before them)");
         // 400 worst-case lines do not fit one hello of 400,000 bytes: the checkpoint follows in parts that together carry every line, and the hello says so
@@ -546,11 +569,11 @@ class LineHealthRelayTest {
     void aStatusWithoutAnEpochIsRefusedAndAChangedEpochRequestsARebuildOfTheFold() {
         Sink sink = new Sink();
         LineHealthRelay relay = relay(sink);
-        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 5L).set("systemRecordCount", 2L).build()));
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("stateSequence", 5L).set("systemRecordCount", 2L).build()));
         assertEquals(1, relay.dropsForTest(), "no statusEpoch, no status");
         relay.accept(STATUS, "SPX", bytes(status(6, 2)));
         assertFalse(relay.epochChangedForTest());
-        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 1L).set("systemRecordCount", 0L).set("statusEpoch", 2L).build()));
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("stateSequence", 1L).set("systemRecordCount", 0L).set("statusEpoch", 2L).build()));
         assertTrue(relay.epochChangedForTest(), "a new epoch is a continuity reset: the consumer loop rebuilds from the topics");
     }
 
@@ -558,8 +581,8 @@ class LineHealthRelayTest {
     void epochsReadByTheBootstrapScanAreNotAResetOnlyAChangeOnTheLiveTailIs() {
         Sink sink = new Sink();
         LineHealthRelay relay = new LineHealthRelay(SETTINGS, sink, (topic, data) -> deserializer.deserialize(topic, data));   // not live: the bootstrap scan
-        GenericRecord epoch1 = new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 9L).set("systemRecordCount", 3L).set("statusEpoch", 1L).build();
-        GenericRecord epoch2 = new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 1L).set("systemRecordCount", 0L).set("statusEpoch", 2L).build();
+        GenericRecord epoch1 = new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("stateSequence", 9L).set("systemRecordCount", 3L).set("statusEpoch", 1L).build();
+        GenericRecord epoch2 = new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("stateSequence", 1L).set("systemRecordCount", 0L).set("statusEpoch", 2L).build();
         relay.accept(STATUS, "SPX", bytes(epoch1));
         relay.accept(STATUS, "SPX", bytes(epoch2));
         assertFalse(relay.epochChangedForTest(), "history of two epochs in the scan is not a reset");

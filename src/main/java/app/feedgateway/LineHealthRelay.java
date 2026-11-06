@@ -330,8 +330,9 @@ final class LineHealthRelay {
             return;
         }
         Lane lane = lane(subject);
+        final int frameId;
         try {
-            LineHealthSchemas.assertFramedAsAnyVersion(value, subject);   // contracts 0.82.0: the state, event and status subjects have two versions (ids 3708, 3709, 3710 and the archival 3701, 3702, 3705); a record of the older version is still relayed
+            frameId = LineHealthSchemas.assertFramedAsAnyVersion(value, subject);   // contracts 0.82.0: the state, event and status subjects have two versions (ids 3708, 3709, 3710 and the archival 3701, 3702, 3705); a record of the older version is still relayed
         } catch (IllegalStateException wrongId) {
             lane.schemaIdRefused.incrementAndGet();
             return;
@@ -342,7 +343,7 @@ final class LineHealthRelay {
             undecodable.incrementAndGet();
             return;
         }
-        ObjectNode node = render(subject, key, decoded);
+        ObjectNode node = render(subject, key, decoded, frameId);
         if (node == null) {
             drops.incrementAndGet();
             return;
@@ -573,24 +574,33 @@ final class LineHealthRelay {
     }
 
     /**
-     * The record's own version number: the state, event and status subjects are written as version 2 (schemaVersion 2: drawOnChart, hostTimeframe and the move score on the state
-     * and the event body, moveScoreReportDigest on the status) and a record of the earlier build is version 1; the voice subject has one version. A record without the added fields is
-     * relayed as it is (the page draws nothing for a state without drawOnChart).
+     * The id and the record's own version number must agree: the state, event and status subjects are written as version 2 (schemaVersion 2, ids 3708, 3709, 3710: drawOnChart,
+     * hostTimeframe and the move score on the state and the event body, moveScoreReportDigest on the status) and a record of the earlier build is version 1 (schemaVersion 1, ids
+     * 3701, 3702, 3705); the voice subject has one version (id 3703, schemaVersion 1). A mismatched pair is refused. A record without the added fields is relayed as it is (the page
+     * draws nothing for a state without drawOnChart).
      */
-    static boolean schemaVersionAccepted(LineHealthSchemas.Subject subject, Object schemaVersion) {
-        if (Integer.valueOf(1).equals(schemaVersion)) {
-            return true;
+    static boolean schemaVersionAccepted(LineHealthSchemas.Subject subject, int frameId, Object schemaVersion) {
+        if (subject.priorId() == 0) {
+            return frameId == subject.id() && Integer.valueOf(1).equals(schemaVersion);
         }
-        return Integer.valueOf(2).equals(schemaVersion) && subject.priorId() != 0;
+        if (frameId == subject.id()) {
+            return Integer.valueOf(2).equals(schemaVersion);
+        }
+        return frameId == subject.priorId() && Integer.valueOf(1).equals(schemaVersion);
     }
 
     /** The node for a record that passes the boundary, with null members omitted, else null. */
     static ObjectNode render(LineHealthSchemas.Subject subject, String key, Object value) {
+        return render(subject, key, value, subject.id());   // the current id of the subject
+    }
+
+    /** As above for a record read under the schema id {@code frameId}, which must agree with the record's own schemaVersion. */
+    static ObjectNode render(LineHealthSchemas.Subject subject, String key, Object value, int frameId) {
         if (!(value instanceof GenericRecord r) || !subject.name().equals(r.getSchema().getFullName())) {
             return null;
         }
         try {
-            if (!schemaVersionAccepted(subject, r.get("schemaVersion")) || !(r.get("asOfMs") instanceof Long asOf) || asOf <= 0) {
+            if (!schemaVersionAccepted(subject, frameId, r.get("schemaVersion")) || !(r.get("asOfMs") instanceof Long asOf) || asOf <= 0) {
                 return null;
             }
             String idField = subject == LineHealthSchemas.STATE ? "lineId" : subject == LineHealthSchemas.STATUS ? null : "eventId";
