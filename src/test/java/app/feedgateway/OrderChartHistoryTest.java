@@ -47,4 +47,31 @@ class OrderChartHistoryTest {
   req.put("after",reply.path("nextCursor").asText());var second=mapper.readTree(OrderChartHistory.reply(mapper,null,source,req,5000,262144));assertEquals("09:32",second.path("records").get(0).path("minute").asText());
   req.put("after","25:99");assertEquals("bad_cursor",mapper.readTree(OrderChartHistory.reply(mapper,null,source,req,5000,262144)).path("error").asText());
  }
+ @Test void footprintShrinksByWireBytesAndRejectsAnOversizedIndividualRecord() throws Exception {
+  var v=view();for(int i=0;i<20;i++){var row=(com.fasterxml.jackson.databind.node.ObjectNode)mapper.readTree(bar(i));row.put("padding","x".repeat(1200));v.admitBar(row.toString());}
+  var first=mapper.readTree(OrderChartHistory.reply(mapper,v,null,request(),5000,262144));assertFalse(first.has("error"));assertTrue(first.path("records").size()>0&&first.path("records").size()<16);assertTrue(first.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=5000);
+  var limited=mapper.readTree(OrderChartHistory.reply(mapper,v,null,request(),5000,500));assertEquals("record_budget",limited.path("error").asText());assertFalse(limited.has("nextCursor"));assertFalse(limited.has("done"));
+ }
+ @Test void unavailableRepliesDoNotEchoUnboundedIdentityAndPreserveValidHeader() throws Exception {
+  var req=(com.fasterxml.jackson.databind.node.ObjectNode)request();var reply=mapper.readTree(OrderChartHistory.refusal(mapper,req,"loading"));assertEquals("generation-7",reply.path("requestId").asText());assertEquals("footprint",reply.path("resource").asText());assertEquals("2026-09-11",reply.path("sessionDate").asText());
+  req.put("requestId","x".repeat(65));reply=mapper.readTree(OrderChartHistory.refusal(mapper,req,"busy"));assertEquals("bad_request",reply.path("error").asText());assertFalse(reply.has("requestId"));
+ }
+ @Test void disabledFeaturesAnswerUnavailableThroughTheRegisteredSocket() throws Exception {
+  var service=new FeedGatewayService(new GatewaySettings(),mapper,new HpsfGatewayViewMapper(),null);service.runOutboundWritesInline();var socket=mock(WebSocketSession.class);when(socket.getId()).thenReturn("disabled-history");when(socket.isOpen()).thenReturn(true);service.addClient(socket);clearInvocations(socket);
+  try{service.handleFootprintBasicMessage(socket,request().toString());var sent=ArgumentCaptor.forClass(TextMessage.class);verify(socket).sendMessage(sent.capture());assertEquals("unavailable",mapper.readTree(sent.getValue().getPayload()).path("data").path("error").asText());}finally{service.removeClient(socket);}
+ }
+ @Test void misboundFootprintTopicIsUnavailableInsteadOfPermanentlyLoading() throws Exception {
+  var service=FootprintWiringTest.on();service.runOutboundWritesInline();@SuppressWarnings("unchecked") var consumer=(org.apache.kafka.clients.consumer.KafkaConsumer<String,Object>)mock(org.apache.kafka.clients.consumer.KafkaConsumer.class);var partition=new org.apache.kafka.common.TopicPartition("futures.footprint.bars",0);
+  when(consumer.endOffsets(anyCollection(),any(java.time.Duration.class))).thenReturn(java.util.Map.of(partition,0L));
+  service.cacheHydrationSeek(consumer,List.of(partition),java.util.Map.of(partition.topic(),new FeedGatewayService.TopicBinding("OTHER","es-footprint-bar")),new FeedGatewayService.StrikeReplay(),1000);assertFalse(service.supportsOrderFootprintHistory());
+  var socket=mock(WebSocketSession.class);when(socket.getId()).thenReturn("misbound-history");when(socket.isOpen()).thenReturn(true);service.addClient(socket);clearInvocations(socket);
+  try{service.handleFootprintBasicMessage(socket,request().toString());var sent=ArgumentCaptor.forClass(TextMessage.class);verify(socket).sendMessage(sent.capture());assertEquals("unavailable",mapper.readTree(sent.getValue().getPayload()).path("data").path("error").asText());}finally{service.removeClient(socket);}
+ }
+ @Test void auctionHandlerDistinguishesLoadingHeldSessionAndMissingSession() throws Exception {
+  String old=System.getProperty("GATEWAY_ES_AUCTION_ENABLED");System.setProperty("GATEWAY_ES_AUCTION_ENABLED","true");var service=FootprintWiringTest.on();service.runOutboundWritesInline();var socket=mock(WebSocketSession.class);when(socket.getId()).thenReturn("auction-history");when(socket.isOpen()).thenReturn(true);service.addClient(socket);clearInvocations(socket);
+  try{var req=(com.fasterxml.jackson.databind.node.ObjectNode)request();req.put("resource","auction");req.put("after","");var sent=ArgumentCaptor.forClass(TextMessage.class);service.handleFootprintBasicMessage(socket,req.toString());verify(socket).sendMessage(sent.capture());assertEquals("loading",mapper.readTree(sent.getValue().getPayload()).path("data").path("error").asText());
+   var frozen=FeedGatewayService.class.getDeclaredField("esAuctionHandoffFrozen");frozen.setAccessible(true);((java.util.concurrent.atomic.AtomicBoolean)frozen.get(service)).set(true);var date=FeedGatewayService.class.getDeclaredField("esAuctionTradeDate");date.setAccessible(true);date.set(service,"2026-09-11");clearInvocations(socket);service.handleFootprintBasicMessage(socket,req.toString());verify(socket).sendMessage(sent.capture());assertFalse(mapper.readTree(sent.getValue().getPayload()).path("data").has("error"));
+   clearInvocations(socket);req.put("sessionDate","2026-09-10");service.handleFootprintBasicMessage(socket,req.toString());verify(socket).sendMessage(sent.capture());assertEquals("session_unavailable",mapper.readTree(sent.getValue().getPayload()).path("data").path("error").asText());
+  }finally{service.removeClient(socket);if(old==null)System.clearProperty("GATEWAY_ES_AUCTION_ENABLED");else System.setProperty("GATEWAY_ES_AUCTION_ENABLED",old);}
+ }
 }

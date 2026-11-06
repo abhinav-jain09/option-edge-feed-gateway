@@ -770,6 +770,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean avroCaughtUp = new AtomicBoolean(false);
     private final OrderChartReplayGate orderChartFootprintReplay = new OrderChartReplayGate();
+    private volatile boolean orderChartFootprintBindingSupported = true;
     private final AtomicBoolean stateCaughtUp = new AtomicBoolean(false);
     /** Sockets that connected before the auction view finished hydrating; each gets its hello when it does. */
     private final Set<WebSocketSession> esAuctionHelloPending = new CopyOnWriteArraySet<>();
@@ -1671,10 +1672,8 @@ public class FeedGatewayService implements ReplayRunner {
         if (readySelectionKeyMatchesActive(selection)) {
             send(session, "source-ready", activeSelectionJson(selection, "source-ready"));
         }
-        if(settings.esAuctionEnabled()||footprintViews!=null) {
-            var capability=mapper.createObjectNode().put("schemaVersion",1).put("maxRecords",OrderChartHistory.MAX_PAGE_RECORDS);
-            var resources=capability.putArray("resources");if(settings.esAuctionEnabled())resources.add("auction");if(footprintViews!=null)resources.add("footprint");
-            send(session,OrderChartHistory.HELLO,capability.toString());
+        if(settings.esAuctionEnabled()||supportsOrderFootprintHistory()) {
+            send(session,OrderChartHistory.HELLO,orderChartHistoryCapabilities());
         }
         if (settings.esAuctionEnabled()) {
             // Auction-desk hello: what this gateway holds for the current trade date, so the page can
@@ -3407,12 +3406,34 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    private String orderChartHistoryCapabilities() {
+        var capability=mapper.createObjectNode().put("schemaVersion",1).put("maxRecords",OrderChartHistory.MAX_PAGE_RECORDS);
+        var resources=capability.putArray("resources");
+        if(settings.esAuctionEnabled())resources.add("auction");
+        if(supportsOrderFootprintHistory())resources.add("footprint");
+        return capability.toString();
+    }
+    private void refuseOrderFootprintBinding() {
+        if(orderChartFootprintBindingSupported) {
+            orderChartFootprintBindingSupported=false;
+            orderChartFootprintReplay.invalidate();
+            broadcast(OrderChartHistory.HELLO,orderChartHistoryCapabilities());
+        }
+    }
+
+    boolean supportsOrderFootprintHistory() { return footprintViews != null && orderChartFootprintBindingSupported; }
+    private boolean ownsOrderFootprintHistory(Map<String, TopicBinding> bindings) {
+        return new TopicBinding("DATABENTO","es-footprint-bar").equals(bindings.get(settings.esFootprintBarsTopic()));
+    }
+
     private void runAssignedCacheConsumer(String name, Map<String, TopicBinding> topicEvents, boolean avro, AtomicBoolean caughtUpFlag) {
         runRetryingConsumer(
                 name,
                 retry -> runAssignedCacheConsumerOnce(name, topicEvents, avro, caughtUpFlag),
-                () -> markCacheRecovering(caughtUpFlag,
-                        topicEvents.values().stream().map(TopicBinding::event).distinct().toList())
+                () -> {
+                    if (ownsOrderFootprintHistory(topicEvents)) orderChartFootprintReplay.invalidate();
+                    markCacheRecovering(caughtUpFlag, topicEvents.values().stream().map(TopicBinding::event).distinct().toList());
+                }
         );
     }
 
@@ -4786,7 +4807,6 @@ public class FeedGatewayService implements ReplayRunner {
      * until {@link #markCacheCaughtUp} serves them again.
      */
     private void markCacheRecovering(AtomicBoolean caughtUpFlag, Collection<String> events) {
-        if (events.contains("es-footprint-bar")) orderChartFootprintReplay.invalidate();
         if (carriesVolPremium(events)) {
             holdVolPremium();
         }
@@ -5298,14 +5318,15 @@ public class FeedGatewayService implements ReplayRunner {
     Map<TopicPartition, Long> cacheHydrationSeek(KafkaConsumer<?, ?> consumer, List<TopicPartition> partitions,
                                                  Map<String, TopicBinding> topicEvents, StrikeReplay strikeReplay,
                                                  long endOffsetsBudgetMs) {
-        boolean ownsFootprintBars = topicEvents.containsKey(settings.esFootprintBarsTopic());
+        boolean ownsFootprintBars = ownsOrderFootprintHistory(topicEvents);
+        if (topicEvents.containsKey(settings.esFootprintBarsTopic()) && !ownsFootprintBars) refuseOrderFootprintBinding();
         List<TopicPartition> footprintPartitions = partitions.stream()
                 .filter(p -> p.topic().equals(settings.esFootprintBarsTopic())).toList();
-        if (ownsFootprintBars) orderChartFootprintReplay.begin(strikeReplay, footprintPartitions);
+        if (ownsFootprintBars && supportsOrderFootprintHistory()) orderChartFootprintReplay.begin(strikeReplay, footprintPartitions);
         Map<TopicPartition, Long> cutoffs = seekToCacheWindow(consumer, partitions, topicEvents);
         Map<TopicPartition, Long> endOffsets = boundedEndOffsets(consumer, partitions, endOffsetsBudgetMs);
         openFootprintStrikeReplay(strikeReplay, endOffsets, cutoffs);
-        if (ownsFootprintBars) {
+        if (ownsFootprintBars && supportsOrderFootprintHistory()) {
             Map<TopicPartition, Long> footprintEnds = new HashMap<>();
             for (TopicPartition partition : footprintPartitions) {
                 Long end = endOffsets.get(partition);
@@ -15309,8 +15330,8 @@ public class FeedGatewayService implements ReplayRunner {
                 return;
             }
         }
-        if (payload.length() > FootprintBasicHistory.MAX_REQUEST_BYTES
-                || payload.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > FootprintBasicHistory.MAX_REQUEST_BYTES) return;
+        if (payload.length() > OrderChartHistory.MAX_REQUEST_BYTES
+                || payload.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > OrderChartHistory.MAX_REQUEST_BYTES) return;
         JsonNode request;
         try { request = mapper.readTree(payload); } catch (Exception invalid) { return; }
         if(request!=null&&RithmicDepthHistory.REQUEST.equals(request.path("type").asText())){
@@ -15321,25 +15342,24 @@ public class FeedGatewayService implements ReplayRunner {
             finally{footprintBackfillPermits.release();}return;
         }
         if(request!=null&&OrderChartHistory.REQUEST.equals(request.path("type").asText())) {
-            if (footprintBackfillPermits == null) {
-                send(session,OrderChartHistory.RESPONSE,mapper.createObjectNode().put("schemaVersion",1).put("requestId",request.path("requestId").asText()).put("error","unavailable").toString());
-                return;
+            String resource=request.path("resource").asText();
+            if(footprintBackfillPermits==null||"footprint".equals(resource)&&!supportsOrderFootprintHistory()||"auction".equals(resource)&&!settings.esAuctionEnabled()) {
+                send(session,OrderChartHistory.RESPONSE,OrderChartHistory.refusal(mapper,request,"unavailable"));return;
             }
-            if(!footprintBackfillPermits.tryAcquire()){send(session,OrderChartHistory.RESPONSE,mapper.createObjectNode().put("schemaVersion",1).put("requestId",request.path("requestId").asText()).put("error","busy").toString());return;}
+            if(!footprintBackfillPermits.tryAcquire()){send(session,OrderChartHistory.RESPONSE,OrderChartHistory.refusal(mapper,request,"busy"));return;}
             try {
                 int capacity=(int)Math.min(524288L,settings.wsMaxQueuedBytes()/4);
                 String response;
-                if("auction".equals(request.path("resource").asText())) {
+                if("auction".equals(resource)) {
                     synchronized(esAuctionIncarnationLock) {
-                        response=!settings.esAuctionEnabled()||!esAuctionHandoffFrozen.get()
-                            ?mapper.createObjectNode().put("schemaVersion",1).put("requestId",request.path("requestId").asText()).put("error","loading").toString()
-                            :OrderChartHistory.reply(mapper,footprintViews,this::auctionMinutesPage,request,capacity,(int)Math.min(Integer.MAX_VALUE,settings.esFootprintMaxRecordBytes()));
+                        if(!esAuctionHandoffFrozen.get())response=OrderChartHistory.refusal(mapper,request,"loading");
+                        else if(!java.util.Objects.equals(request.path("sessionDate").asText(),esAuctionTradeDate)&&!java.util.Objects.equals(request.path("sessionDate").asText(),esAuctionPrevTradeDate))response=OrderChartHistory.refusal(mapper,request,"session_unavailable");
+                        else response=OrderChartHistory.reply(mapper,footprintViews,this::auctionMinutesPage,request,capacity,(int)Math.min(Integer.MAX_VALUE,settings.esFootprintMaxRecordBytes()));
                     }
-                } else if ("footprint".equals(request.path("resource").asText())) {
-                    final JsonNode historyRequest = request;
-                    response = orderChartFootprintReplay.read(
-                        () -> OrderChartHistory.reply(mapper,footprintViews,this::auctionMinutesPage,historyRequest,capacity,(int)Math.min(Integer.MAX_VALUE,settings.esFootprintMaxRecordBytes())),
-                        () -> mapper.createObjectNode().put("schemaVersion",1).put("requestId",historyRequest.path("requestId").asText()).put("error","loading").toString());
+                } else if("footprint".equals(resource)) {
+                    OrderChartHistory.FootprintSource admitted=(tf,to,after,limit,date)->orderChartFootprintReplay.read(
+                        ()->footprintViews.barsPage(tf,to,after,limit,date),()->null);
+                    response=OrderChartHistory.replyFrom(mapper,admitted,this::auctionMinutesPage,request,capacity,(int)Math.min(Integer.MAX_VALUE,settings.esFootprintMaxRecordBytes()));
                 } else response=OrderChartHistory.reply(mapper,footprintViews,this::auctionMinutesPage,request,capacity,(int)Math.min(Integer.MAX_VALUE,settings.esFootprintMaxRecordBytes()));
                 send(session,OrderChartHistory.RESPONSE,response);
             } finally {footprintBackfillPermits.release();}

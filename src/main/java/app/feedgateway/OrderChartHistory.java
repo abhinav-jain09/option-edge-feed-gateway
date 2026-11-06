@@ -12,9 +12,13 @@ final class OrderChartHistory {
     static final String REQUEST="order-chart-history", RESPONSE="order-chart-history", HELLO="order-chart-history-hello";
     static final int MAX_REQUEST_BYTES=1024, MAX_PAGE_RECORDS=16;
     private static final ZoneId ET=ZoneId.of("America/New_York");
+    interface FootprintSource { FootprintViews.BarsPage read(String tf,long to,long after,int limit,String date); }
     interface AuctionSource { FeedGatewayService.EsAuctionMinutesPage read(String date,String after,int limit); }
     private OrderChartHistory() { }
     static String reply(ObjectMapper mapper,FootprintViews footprint,AuctionSource auction,JsonNode request,int capacity,int recordBudget) {
+        return replyFrom(mapper,footprint==null?null:footprint::barsPage,auction,request,capacity,recordBudget);
+    }
+    static String replyFrom(ObjectMapper mapper,FootprintSource footprint,AuctionSource auction,JsonNode request,int capacity,int recordBudget) {
         ObjectNode out=mapper.createObjectNode();out.put("schemaVersion",1);
         if(request==null||!request.isObject())return out.put("error","bad_request").toString();
         String id=request.path("requestId").asText("");
@@ -40,21 +44,31 @@ final class OrderChartHistory {
             long start=parsed.minusDays(1).atTime(18,0).atZone(ET).toInstant().toEpochMilli(),end=parsed.atTime(16,0).atZone(ET).toInstant().toEpochMilli();
             if(!List.of("1m","5m","15m").contains(tf)||!after.isIntegralNumber()||!after.canConvertToLong()||!to.isIntegralNumber()||!to.canConvertToLong()
                     ||after.longValue()<start-1||after.longValue()>=end||to.longValue()<start-1||to.longValue()>=end||after.longValue()>to.longValue())return out.put("error","bad_cursor").toString();
-            var page=footprint.barsPage(tf,to.longValue(),after.longValue(),limit,date);
+            var page=footprint.read(tf,to.longValue(),after.longValue(),limit,date);
+            if(page==null)return out.put("error","loading").toString();
             if(page.sessionMismatch())return out.put("error","session_mismatch").toString();
             records=page.records();out.put("timeframe",tf);out.put("toMs",to.longValue());
             if(page.nextCursor()==null)out.putNull("nextCursor");else out.put("nextCursor",page.nextCursor());
         } else return out.put("error","bad_resource").toString();
         try {
             var rows=out.putArray("records");int bytes=1024;
-            for(String record:records){bytes+=record.getBytes(StandardCharsets.UTF_8).length;if(bytes>capacity)return smaller(mapper,footprint,auction,request,capacity,recordBudget,limit,out);JsonNode row=mapper.readTree(record);if(!row.isObject())return error(out,"invalid_history");rows.add(row);}
+            for(String record:records){int recordBytes=record.getBytes(StandardCharsets.UTF_8).length;if(recordBytes>recordBudget)return error(out,"record_budget");bytes+=recordBytes;if(bytes>capacity)return smaller(mapper,footprint,auction,request,capacity,recordBudget,limit,out);JsonNode row=mapper.readTree(record);if(!row.isObject())return error(out,"invalid_history");rows.add(row);}
             out.put("done",out.path("nextCursor").isNull());String response=out.toString();
             return response.getBytes(StandardCharsets.UTF_8).length<=capacity?response:smaller(mapper,footprint,auction,request,capacity,recordBudget,limit,out);
         }catch(Exception invalid){return error(out,"invalid_history");}
     }
-    private static String smaller(ObjectMapper mapper,FootprintViews footprint,AuctionSource auction,JsonNode request,int capacity,int budget,int limit,ObjectNode out) {
+    private static String smaller(ObjectMapper mapper,FootprintSource footprint,AuctionSource auction,JsonNode request,int capacity,int budget,int limit,ObjectNode out) {
         if(limit<=1)return error(out,"record_budget");
-        ObjectNode reduced=request.deepCopy();reduced.put("limit",Math.max(1,limit/2));return reply(mapper,footprint,auction,reduced,capacity,budget);
+        ObjectNode reduced=request.deepCopy();reduced.put("limit",Math.max(1,limit/2));return replyFrom(mapper,footprint,auction,reduced,capacity,budget);
+    }
+    static String refusal(ObjectMapper mapper,JsonNode request,String code) {
+        ObjectNode out=mapper.createObjectNode().put("schemaVersion",1);
+        if(request==null||!request.path("requestId").isTextual()||request.path("requestId").asText().isEmpty()||request.path("requestId").asText().length()>64)return out.put("error","bad_request").toString();
+        out.put("requestId",request.path("requestId").asText());
+        String resource=request.path("resource").asText(""),date=request.path("sessionDate").asText("");
+        if(List.of("auction","footprint").contains(resource))out.put("resource",resource);
+        if(FootprintViews.parseCanonicalDate(date)!=null)out.put("sessionDate",date);
+        return out.put("error",code).toString();
     }
     private static String error(ObjectNode out,String error){out.remove(List.of("records","nextCursor","done"));return out.put("error",error).toString();}
 }

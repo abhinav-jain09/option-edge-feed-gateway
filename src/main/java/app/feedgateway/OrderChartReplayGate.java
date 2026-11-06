@@ -12,32 +12,42 @@ final class OrderChartReplayGate {
     private Object owner;
     private final Map<TopicPartition, Long> barriers = new HashMap<>();
     private boolean ready;
+    private long revision;
 
     synchronized void begin(Object attempt, Collection<TopicPartition> partitions) {
         if (owner != attempt) { owner = attempt; barriers.clear(); }
-        ready = false;
+        ready = false; revision++;
         for (TopicPartition partition : partitions) barriers.put(partition, Long.MAX_VALUE);
     }
 
     synchronized void capture(Object attempt, Map<TopicPartition, Long> ends) {
         if (owner != attempt) return;
+        revision++;
         ends.forEach((partition, end) -> {
             if (barriers.containsKey(partition) && end >= 0) barriers.put(partition, end);
         });
     }
 
-    synchronized void advance(Object attempt, ToLongFunction<TopicPartition> appliedPosition) {
-        if (owner != attempt || barriers.isEmpty()) return;
-        ready = false;
-        for (var entry : barriers.entrySet()) {
+    void advance(Object attempt, ToLongFunction<TopicPartition> appliedPosition) {
+        final Map<TopicPartition,Long> expected;
+        final long version;
+        synchronized (this) {
+            if (owner != attempt || barriers.isEmpty() || ready) return;
+            ready = false;
+            expected = Map.copyOf(barriers);
+            version = revision;
+        }
+        for (var entry : expected.entrySet()) {
             if (entry.getValue() == Long.MAX_VALUE) return;
             try { if (appliedPosition.applyAsLong(entry.getKey()) < entry.getValue()) return; }
             catch (RuntimeException unassigned) { return; }
         }
-        ready = true;
+        synchronized (this) {
+            if (owner == attempt && revision == version && barriers.equals(expected)) ready = true;
+        }
     }
 
-    synchronized void invalidate() { owner = null; ready = false; barriers.clear(); }
+    synchronized void invalidate() { owner = null; ready = false; barriers.clear(); revision++; }
 
     synchronized <T> T read(Supplier<T> snapshot, Supplier<T> loading) {
         return ready ? snapshot.get() : loading.get();
