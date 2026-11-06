@@ -133,6 +133,15 @@ final class LineHealthRelay {
         thread.start();
     }
 
+    /** Test seam: the relay is running (a bootstrap scan loops while it is). */
+    void runningForTest() {
+        running.set(true);
+    }
+
+    Map<TopicPartition, Long> bootstrapEndsForTest() {
+        return bootstrapEnd;
+    }
+
     boolean consuming() {
         return running.get();
     }
@@ -218,7 +227,7 @@ final class LineHealthRelay {
     private final Map<TopicPartition, Long> bootstrapEnd = new HashMap<>();
 
     /** The bounded scan of the two compacted topics, beginning to the end offsets captured now; the live tails start only after it. */
-    private void bootstrap(Consumer<String, byte[]> c, TopicPartition state, TopicPartition status) {
+    void bootstrap(Consumer<String, byte[]> c, TopicPartition state, TopicPartition status) {
         List<TopicPartition> both = List.of(state, status);
         c.assign(both);
         c.seekToBeginning(both);
@@ -232,10 +241,14 @@ final class LineHealthRelay {
             }
             var records = c.poll(Duration.ofMillis(250));
             for (var r : records.records(state)) {
-                accept(r.topic(), r.key(), r.value());
+                if (r.offset() < ends.get(state)) {   // a record at or beyond the captured end belongs to the live tail, which starts exactly at that end
+                    accept(r.topic(), r.key(), r.value());
+                }
             }
             for (var r : records.records(status)) {
-                accept(r.topic(), r.key(), r.value());
+                if (r.offset() < ends.get(status)) {
+                    accept(r.topic(), r.key(), r.value());
+                }
             }
         }
         // the whole scan is one checkpoint: the last status read, with the states folded up to the state end captured with it
@@ -389,6 +402,8 @@ final class LineHealthRelay {
         }
     }
 
+    /** The bytes of the hello field around the status and the states: its member names, the watermark and the version. */
+    static final long ENVELOPE_BYTES = 128;
     private long releaseSerial;
     private List<String> partsMemo = List.of();
 
@@ -401,21 +416,24 @@ final class LineHealthRelay {
         String status = withoutCached(releasedStatus);
         List<String> parts = new java.util.ArrayList<>();
         StringBuilder current = new StringBuilder();
+        long currentBytes = 0, total = 0;
         int inCurrent = 0;
-        long total = 0;
         for (String st : releasedStates.values()) {
-            int bytes = st.getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 1;
-            if (inCurrent > 0 && current.length() + bytes > max) {
+            int bytes = st.getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 1;   // the state and its separator, in UTF-8 bytes
+            if (inCurrent > 0 && currentBytes + bytes > max) {
                 parts.add(current.toString());
                 current = new StringBuilder();
+                currentBytes = 0;
                 inCurrent = 0;
             }
             current.append(inCurrent == 0 ? "" : ",").append(st);
+            currentBytes += bytes;
             inCurrent++;
             total += bytes;
         }
         parts.add(current.toString());
-        if (total + status.length() <= max) {
+        long statusBytes = status.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        if (total + statusBytes + ENVELOPE_BYTES <= max) {
             helloMemo = "{\"status\":" + status + ",\"states\":[" + parts.get(0) + "],\"watermark\":" + releasedWatermark + ",\"version\":" + releaseSerial + "}";
             partsMemo = List.of();
         } else {

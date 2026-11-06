@@ -17,6 +17,10 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.GenericRecordBuilder;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.MockConsumer;
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -284,5 +288,43 @@ class LineHealthRelayTest {
 
     private static GenericRecord withIdentity(GenericRecordBuilder b, String id, long sequence) {
         return b.set("lineId", id).set("chartKey", "L|" + id).set("systemSequence", sequence).build();
+    }
+
+    @Test
+    void theBootstrapScanFoldsOnlyWhatLiesBelowTheCapturedEndsAndTheLiveTailStartsExactlyThere() throws Exception {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink);
+        relay.runningForTest();
+        MockConsumer<String, byte[]> consumer = new MockConsumer<>(OffsetResetStrategy.EARLIEST);
+        TopicPartition state = new TopicPartition(STATE, 0), status = new TopicPartition(STATUS, 0);
+        consumer.assign(List.of(state, status));
+        consumer.updateBeginningOffsets(Map.of(state, 0L, status, 0L));
+        consumer.updateEndOffsets(Map.of(state, 2L, status, 1L));
+        consumer.addRecord(new ConsumerRecord<>(STATE, 0, 0L, "A", bytes(state("A", 1, "TOUCHING", 7, null).build())));
+        consumer.addRecord(new ConsumerRecord<>(STATE, 0, 1L, "B", bytes(state("B", 2, "TOUCHING", 4, null).build())));
+        consumer.addRecord(new ConsumerRecord<>(STATE, 0, 2L, "C", bytes(state("C", 3, "TOUCHING", 1, null).build())));   // at the captured end: the live tail's
+        consumer.addRecord(new ConsumerRecord<>(STATUS, 0, 0L, "SPX", bytes(status(5, 2))));
+        consumer.addRecord(new ConsumerRecord<>(STATUS, 0, 1L, "SPX", bytes(status(6, 3))));                                 // beyond the captured end
+        relay.bootstrap(consumer, state, status);
+        JsonNode hello = JSON.readTree(relay.helloField());
+        assertEquals(2, hello.get("states").size(), "line C lies at the captured end and is not folded by the scan");
+        assertEquals(5, hello.get("status").get("stateSequence").asLong(), "the status beyond the captured end is not folded either");
+        assertEquals(2L, relay.bootstrapEndsForTest().get(state));
+    }
+
+    @Test
+    void aUnicodeStateIsMeasuredInUtf8BytesWhenTheCheckpointIsSplit() throws Exception {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink);
+        String wide = "\u20ac".repeat(40);   // 3 bytes per character
+        for (int k = 0; k < 6000; k++) {
+            relay.accept(STATE, "L-" + k, bytes(state("L-" + k, k + 1, "TOUCHING", 7, null).set("patternId", wide).build()));
+        }
+        relay.accept(STATUS, "SPX", bytes(status(5, 6000)));
+        relay.captureBound(6000);
+        relay.release(6000);
+        for (String part : relay.checkpointParts()) {
+            assertTrue(part.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= SETTINGS.lineHealthHelloMaxBytes() + 400, "a part is within the bound in bytes, not characters");
+        }
     }
 }
