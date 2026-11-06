@@ -1672,7 +1672,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (readySelectionKeyMatchesActive(selection)) {
             send(session, "source-ready", activeSelectionJson(selection, "source-ready"));
         }
-        if(settings.esAuctionEnabled()||supportsOrderFootprintHistory()) {
+        if(supportsOrderAuctionHistory()||supportsOrderFootprintHistory()) {
             send(session,OrderChartHistory.HELLO,orderChartHistoryCapabilities());
         }
         if (settings.esAuctionEnabled()) {
@@ -3406,10 +3406,13 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    boolean supportsOrderAuctionHistory() {
+        return settings.esAuctionEnabled() && footprintBackfillPermits != null;
+    }
     private String orderChartHistoryCapabilities() {
         var capability=mapper.createObjectNode().put("schemaVersion",1).put("maxRecords",OrderChartHistory.MAX_PAGE_RECORDS);
         var resources=capability.putArray("resources");
-        if(settings.esAuctionEnabled())resources.add("auction");
+        if(supportsOrderAuctionHistory())resources.add("auction");
         if(supportsOrderFootprintHistory())resources.add("footprint");
         return capability.toString();
     }

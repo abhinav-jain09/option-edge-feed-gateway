@@ -25,9 +25,11 @@ final class OrderChartHistory {
         if(!request.path("requestId").isTextual()||id.isEmpty()||id.length()>64)return out.put("error","bad_request").toString();
         out.put("requestId",id);
         String resource=request.path("resource").asText(""),date=request.path("sessionDate").asText("");
-        out.put("resource",resource);out.put("sessionDate",date);
+        if(List.of("auction","footprint").contains(resource))out.put("resource",resource);
+        if(FootprintViews.parseCanonicalDate(date)!=null)out.put("sessionDate",date);
         var parsed=FootprintViews.parseCanonicalDate(date);
-        if((!request.path("schemaVersion").isIntegralNumber()||!request.path("schemaVersion").canConvertToInt()||request.path("schemaVersion").intValue()!=1)||parsed==null||capacity<4096||recordBudget<1)return out.put("error","bad_request").toString();
+        if((!request.path("schemaVersion").isIntegralNumber()||!request.path("schemaVersion").canConvertToInt()||request.path("schemaVersion").intValue()!=1)||parsed==null)return out.put("error","bad_request").toString();
+        if(capacity<4096||recordBudget<1)return out.put("error","unavailable").toString();
         JsonNode asked=request.path("limit");if(!asked.isMissingNode()&&(!asked.isIntegralNumber()||!asked.canConvertToInt()||asked.intValue()<1||asked.intValue()>MAX_PAGE_RECORDS))return out.put("error","bad_request").toString();
         int limit=asked.isMissingNode()?MAX_PAGE_RECORDS:asked.intValue();
         List<String> records;

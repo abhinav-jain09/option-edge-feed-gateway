@@ -56,6 +56,19 @@ class OrderChartHistoryTest {
   var req=(com.fasterxml.jackson.databind.node.ObjectNode)request();var reply=mapper.readTree(OrderChartHistory.refusal(mapper,req,"loading"));assertEquals("generation-7",reply.path("requestId").asText());assertEquals("footprint",reply.path("resource").asText());assertEquals("2026-09-11",reply.path("sessionDate").asText());
   req.put("requestId","x".repeat(65));reply=mapper.readTree(OrderChartHistory.refusal(mapper,req,"busy"));assertEquals("bad_request",reply.path("error").asText());assertFalse(reply.has("requestId"));
  }
+ @Test void auctionWithoutBackfillPoolDoesNotAdvertiseAnUnusableCapability() throws Exception {
+  String old=System.getProperty("GATEWAY_ES_AUCTION_ENABLED");System.setProperty("GATEWAY_ES_AUCTION_ENABLED","true");
+  var service=new FeedGatewayService(new GatewaySettings(),mapper,new HpsfGatewayViewMapper(),null);
+  try{assertNull(service.footprintBackfillPermits());assertFalse(service.supportsOrderAuctionHistory());
+   var method=FeedGatewayService.class.getDeclaredMethod("orderChartHistoryCapabilities");method.setAccessible(true);
+   assertFalse(mapper.readTree((String)method.invoke(service)).path("resources").toString().contains("auction"));
+  }finally{if(old==null)System.clearProperty("GATEWAY_ES_AUCTION_ENABLED");else System.setProperty("GATEWAY_ES_AUCTION_ENABLED",old);}
+ }
+ @Test void errorsOnlyEchoValidatedIdentityAndCapacityIsServerUnavailability() throws Exception {
+  var req=(com.fasterxml.jackson.databind.node.ObjectNode)request();req.put("resource","x".repeat(500));req.put("sessionDate","invalid");
+  var out=mapper.readTree(OrderChartHistory.reply(mapper,view(),null,req,524288,262144));assertFalse(out.has("resource"));assertFalse(out.has("sessionDate"));
+  out=mapper.readTree(OrderChartHistory.reply(mapper,view(),null,request(),4095,262144));assertEquals("unavailable",out.path("error").asText());assertFalse(out.has("done"));
+ }
  @Test void disabledFeaturesAnswerUnavailableThroughTheRegisteredSocket() throws Exception {
   var service=new FeedGatewayService(new GatewaySettings(),mapper,new HpsfGatewayViewMapper(),null);service.runOutboundWritesInline();var socket=mock(WebSocketSession.class);when(socket.getId()).thenReturn("disabled-history");when(socket.isOpen()).thenReturn(true);service.addClient(socket);clearInvocations(socket);
   try{service.handleFootprintBasicMessage(socket,request().toString());var sent=ArgumentCaptor.forClass(TextMessage.class);verify(socket).sendMessage(sent.capture());assertEquals("unavailable",mapper.readTree(sent.getValue().getPayload()).path("data").path("error").asText());}finally{service.removeClient(socket);}
