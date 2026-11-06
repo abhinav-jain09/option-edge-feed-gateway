@@ -28,9 +28,13 @@ def process_cwd(proc):
     except PermissionError:
         # Container processes may have our uid but disallow unprivileged ptrace.
         # Read only this already-filtered numeric process link; never ignore it.
-        result = subprocess.run(
-            ["sudo", "-n", "/usr/bin/readlink", "-z", "--", str(proc / "cwd")],
-            capture_output=True, timeout=5)
+        try:
+            result = subprocess.run(
+                ["/usr/bin/sudo", "-n", "/usr/bin/readlink", "-z", "--", str(proc / "cwd")],
+                capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            # Missing sudo/readlink is an inspection failure, not an exited PID.
+            raise RuntimeError("Restricted process inspection could not run") from error
         if result.returncode != 0:
             if not proc.exists():
                 raise FileNotFoundError(str(proc))
@@ -44,7 +48,7 @@ def process_cwd(proc):
 def process_directories(proc_root=Path("/proc")):
     result = []
     for proc in proc_root.iterdir():
-        if not proc.name.isdigit():
+        if not re.fullmatch(r"[0-9]+", proc.name):
             continue
         try:
             if proc.stat().st_uid != os.getuid():
