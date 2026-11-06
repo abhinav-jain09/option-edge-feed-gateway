@@ -273,6 +273,17 @@ class RecoveryTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 m.process_directories(self.root)
 
+    def test_zombie_identity_replacement_after_second_state_read_is_refused(self):
+        proc = self.proc_state()
+        before = proc.stat()
+        for key in ["st_uid", "st_ino", "st_dev"]:
+            values = {"st_uid": before.st_uid, "st_ino": before.st_ino, "st_dev": before.st_dev}
+            values[key] += 1
+            changed = SimpleNamespace(**values)
+            with patch.object(Path, "stat", autospec=True, side_effect=[before, changed]):
+                with self.assertRaises(RuntimeError):
+                    m.confirmed_zombie(proc, before)
+
     def test_cli_refuses_every_root_other_than_fixed_es4_root(self):
         old = self.four()
         result = subprocess.run([sys.executable, str(SOURCE), str(self.root)], capture_output=True)

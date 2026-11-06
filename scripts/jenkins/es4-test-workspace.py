@@ -79,6 +79,9 @@ def confirmed_zombie(proc, before):
     if (before.st_uid, before.st_ino, before.st_dev) != (after.st_uid, after.st_ino, after.st_dev) or after.st_uid != os.getuid():
         raise RuntimeError("Process changed while checking terminal state")
     second = identity()
+    final = proc.stat()
+    if (before.st_uid, before.st_ino, before.st_dev) != (final.st_uid, final.st_ino, final.st_dev) or final.st_uid != os.getuid():
+        raise RuntimeError("Process changed after terminal state read")
     if first != second:
         raise RuntimeError("Process terminal state changed during inspection")
     return first[0] == b"Z" and first[2] == b"1"
