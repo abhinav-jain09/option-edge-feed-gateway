@@ -61,6 +61,8 @@ fi
 exec "$@"
 ''')
         self.write(self.repo / "scripts/jenkins/es4-test-receipt.py", SOURCE.with_name("es4-test-receipt.py").read_text())
+        for helper in ("es4-test-workspace.py", "es4-test-workspace-test.py"):
+            self.write(self.repo / "scripts/jenkins" / helper, SOURCE.with_name(helper).read_text())
         self.script(self.bin / "sha256sum", 'exec shasum -a 256 "$@"')
         self.write(self.bin / "setsid", "#!/usr/bin/env python3\nimport os,sys\nos.setsid()\nos.execvp(sys.argv[1],sys.argv[1:])\n", True)
         self.script(self.bin / "timeout", 'shift;exec "$@"')
@@ -70,6 +72,12 @@ args=sys.argv[1:]
 while args and args[0]=='-o':args=args[2:]
 assert args.pop(0)=='abhinav@192.168.100.4'
 with open(os.environ['CI_CALLS'],'a') as f:f.write('ssh\\n')
+if args[:2]==['python3','-']:
+ assert args==['python3','-',os.environ['CI_REMOTE_ROOT']],args
+ source=sys.stdin.read()
+ assert source==__import__('pathlib').Path(os.environ['CI_RECOVERY_SOURCE']).read_text()
+ with open(os.environ['CI_CALLS'],'a') as f:f.write('workspace-recovery-transport\\n')
+ sys.exit(0) # no host filesystem operation in this transport fixture
 os.execvp('bash',['bash','-c',' '.join(args)])
 ''', True)
         self.write(self.bin / "scp", '''#!/usr/bin/env python3
@@ -107,7 +115,8 @@ for source in args[:-1]:
         self.env = {**os.environ, "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
                     "JENKINS_URL": "unit-fixture", "PERMITTED_SHA": self.sha,
                     "CONTRACTS_PERMITTED_SHA": "c" * 40, "BUILD_NUMBER": "123",
-                    "CI_CALLS": str(self.root / "calls"), "CI_FAKE_DATE": "6 0700 EDT",
+                    "CI_CALLS": str(self.root / "calls"), "CI_REMOTE_ROOT": str(self.remote),
+                    "CI_RECOVERY_SOURCE": str(SOURCE.with_name("es4-test-workspace.py")), "CI_FAKE_DATE": "6 0700 EDT",
                     # Pinned, never inherited. Jenkins exports every build parameter into the
                     # environment, so under the real pipeline os.environ already carries the waiver
                     # the build was triggered with — and build 811 proved it: the default-path test

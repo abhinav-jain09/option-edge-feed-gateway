@@ -87,6 +87,24 @@ class RecoveryTest(unittest.TestCase):
             m.recover(self.root, NOW, [])
         self.assertTrue(all(p.is_dir() for p in old))
 
+    def test_full_quarantine_and_insufficient_plan_preserve_all_evidence(self):
+        q = self.root / m.QUARANTINE
+        q.mkdir(mode=0o700)
+        for i in range(10, 13):
+            self.run_dir(i, parent=q)
+        old = [self.run_dir(i) for i in range(1, 4)]
+        with self.assertRaises(RuntimeError):
+            m.recover(self.root, NOW, [])
+        self.assertTrue(all(p.is_dir() for p in old))
+        self.assertEqual(3, len(list(q.iterdir())))
+
+    def test_plan_that_cannot_clear_count_moves_nothing(self):
+        old = [self.run_dir(i) for i in range(7)]
+        with self.assertRaises(RuntimeError):
+            m.recover(self.root, NOW, [])
+        self.assertTrue(all(p.is_dir() for p in old))
+        self.assertFalse((self.root / m.QUARANTINE).exists())
+
     def test_writable_root_is_rejected_without_any_move(self):
         old = self.four()
         self.root.chmod(0o777)
