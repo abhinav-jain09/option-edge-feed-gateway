@@ -258,3 +258,11 @@ and the fixture pins it to false in setUp. That pin is not tidiness: Jenkins exp
 parameter into the environment, so under a waived build the fixture's own default-path test inherited
 the waiver and ran the whole transport it was written to refuse. Build 811 failed exactly there, which
 is the test doing its job.
+
+## Bounded stale scratch recovery
+
+The existing Test step runs scripts/jenkins/es4-test-workspace.py through the existing ES4 SSH transport before allocation. It accepts only /home/abhinav/ci/gateway-tests, validates ownership/non-writability and excludes active gateway CI units or same-user process working directories. Only when the existing four-top-level-directory gate would block, up to three run.<build>.<8-character-suffix> directories older than 24h may be atomically moved into owned preserved-orphans under that same root. No evidence is deleted or overwritten. Recent run 846 remains untouched. The top-level count gate, 40GiB free-space floor, 20GiB total retained-byte budget and all unit CPU/memory/time limits remain unchanged; quarantine bytes still count. An exhausted three-directory quarantine fails closed. No collector, Kubernetes service or production path changes.
+
+Ten isolated tests cover preserved bytes, recent folders, active processes/units, symlink quarantine, duplicate target, capacity, writable roots and fixed-root CLI refusal. The ordinary Jenkins build still has to pass all Linux tests and mutation/reconciliation gates; this recovery does not approve a failed image.
+
+The recovery runs before toolchain and disk preflight. A later preflight failure can leave evidence in preserved-orphans; it remains intact and counts against the retained-byte limit. The Jenkins job is serial; no other process may allocate or rename these test roots concurrently.
