@@ -500,6 +500,17 @@ public final class SessionRoutingEngine {
         });
     }
 
+    /** Current attached socket authority, read atomically with session expiry and role state. */
+    public boolean canReadNativeHistory(String appSessionId,String socketId,String subject,long now,String requiredRole) {
+        return callRead(() -> {
+            AppSession app=appSessions.get(appSessionId);
+            return app!=null && app.userId().equals(subject) && app.socketIds().contains(socketId)
+                    && !app.isIdleExpired(now) && !app.isMaxExpired(now)
+                    && (requiredRole==null || requiredRole.isBlank() || app.entitlements().contains(requiredRole))
+                    && EntitlementPolicy.canReceive(app.selection().source(),app.entitlements());
+        });
+    }
+
     public Optional<AppSession> appSession(String appSessionId) {
         return callRead(() -> Optional.ofNullable(appSessions.get(appSessionId)));
     }

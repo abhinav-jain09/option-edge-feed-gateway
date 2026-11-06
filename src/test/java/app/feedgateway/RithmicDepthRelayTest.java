@@ -11,6 +11,11 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class RithmicDepthRelayTest {
+    @Test void configuredSystemRejectsForeignFramesBeforeSequenceAndCadence()throws Exception{
+        var settings=mock(GatewaySettings.class);when(settings.rithmicSystem()).thenReturn("Rithmic Paper Trading");var scoped=new RithmicDepthRelay(settings,provider);
+        scoped.accept(RithmicSchemas.KEY,frame(100,NOW),NOW);verifyNoInteractions(gateway);var paper=frame(1,NOW+1);paper.put("environment","Rithmic Paper Trading");scoped.accept(RithmicSchemas.KEY,paper,NOW+1);
+        var capture=ArgumentCaptor.forClass(String.class);verify(gateway).streamRithmicDepth(capture.capture());assertEquals("Rithmic Paper Trading",new ObjectMapper().readTree(capture.getValue()).path("environment").asText());
+    }
     static final long NOW=RithmicDepthJsonTest.NOW;
     final FeedGatewayService gateway=mock(FeedGatewayService.class);
     @SuppressWarnings("unchecked")

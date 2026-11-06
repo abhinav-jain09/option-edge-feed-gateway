@@ -6,6 +6,11 @@ import org.apache.avro.generic.GenericRecord;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 class RithmicDepthHistoryTest {
+ @Test void configuredSystemFiltersForeignFramesBeforeTheyCanSuppressTheSameBucket()throws Exception{
+  var settings=org.mockito.Mockito.spy(new GatewaySettings());org.mockito.Mockito.doReturn("Rithmic Paper Trading").when(settings).rithmicSystem();var h=new RithmicDepthHistory(settings);
+  h.accept(RithmicSchemas.KEY,frame(NOW,1),NOW);var paper=frame(NOW+1,2);paper.put("environment","Rithmic Paper Trading");h.accept(RithmicSchemas.KEY,paper,NOW+1);
+  var frames=JSON.readTree(h.page("s",request(NOW-1000,NOW+2,NOW-1001),NOW+2,524288)).path("frames");assertEquals(1,frames.size());assertEquals("Rithmic Paper Trading",frames.get(0).path("environment").asText());assertEquals(NOW+1,frames.get(0).path("emittedAtMs").asLong());
+ }
  static final long NOW=1800000000000L;
  static final ObjectMapper JSON=new ObjectMapper();
  static GenericRecord frame(long t,int seq){var r=RithmicDepthJsonTest.frame();r.put("receivedAtMs",t);r.put("emittedAtMs",t);r.put("basisEventTimeMs",t);r.put("basisMeasuredAtMs",t);r.put("sequence",(long)seq);return r;}
