@@ -147,6 +147,32 @@ public final class GatewaySettings {
         return value("LINE_HEALTH_STATUS_TOPIC", "futures.line-health.status");
     }
 
+    // ---- liquidity-validator label relay (design/geometry-trade-rules/VALIDATOR-LABEL-ON-ORDER-PAGE-REQUIREMENT.md) ----
+
+    /** Master switch of the liquidity-validator label relay: futures.liquidity-validator.evaluations is tailed and the global event {@code liquidity-validator} is broadcast. OFF by default (dev only topic). */
+    public boolean liquidityValidatorRelayEnabled() {
+        return boolValue("LIQUIDITY_VALIDATOR_RELAY_ENABLED", false);
+    }
+
+    /** futures.liquidity-validator.evaluations (fixed schema id 3604): one research record per geometry release. */
+    public String liquidityValidatorTopic() {
+        return value("LIQUIDITY_VALIDATOR_TOPIC", "futures.liquidity-validator.evaluations");
+    }
+
+    /** A record whose wall evaluation time is within this of now is a live event; older ones (the session-open catch-up) are ringed and replayed marked cached. */
+    public long liquidityValidatorReplayMs() {
+        return longValue("LIQUIDITY_VALIDATOR_REPLAY_MS", 900_000L, 0L);
+    }
+
+    /** A live record within this of its evaluation time carries {@code speak:true}. */
+    public long liquidityValidatorVoiceFreshMs() {
+        return longValue("LIQUIDITY_VALIDATOR_VOICE_FRESH_MS", 60_000L, 0L);
+    }
+
+    public int liquidityValidatorRing() {
+        return intValue("LIQUIDITY_VALIDATOR_RING", 256, 1);
+    }
+
     // ---- ES book liquidity walls (es-liquidity-wall-service; ES Book Liquidity Walls Requirements rev 11 section 8 "Gateway and page") ----
 
     /**
