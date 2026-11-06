@@ -463,4 +463,20 @@ class LineHealthRelayTest {
         relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 1L).set("systemRecordCount", 0L).set("statusEpoch", 2L).build()));
         assertTrue(relay.epochChangedForTest(), "a new epoch is a continuity reset: the consumer loop rebuilds from the topics");
     }
+
+    @Test
+    void epochsReadByTheBootstrapScanAreNotAResetOnlyAChangeOnTheLiveTailIs() {
+        Sink sink = new Sink();
+        LineHealthRelay relay = new LineHealthRelay(SETTINGS, sink, (topic, data) -> deserializer.deserialize(topic, data));   // not live: the bootstrap scan
+        GenericRecord epoch1 = new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 9L).set("systemRecordCount", 3L).set("statusEpoch", 1L).build();
+        GenericRecord epoch2 = new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 1).set("asOfMs", NOW).set("stateSequence", 1L).set("systemRecordCount", 0L).set("statusEpoch", 2L).build();
+        relay.accept(STATUS, "SPX", bytes(epoch1));
+        relay.accept(STATUS, "SPX", bytes(epoch2));
+        assertFalse(relay.epochChangedForTest(), "history of two epochs in the scan is not a reset");
+        relay.goLiveForTest();
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder((org.apache.avro.generic.GenericData.Record) epoch2).set("stateSequence", 2L).build()));
+        assertFalse(relay.epochChangedForTest());
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder((org.apache.avro.generic.GenericData.Record) epoch2).set("stateSequence", 1L).set("statusEpoch", 3L).build()));
+        assertTrue(relay.epochChangedForTest());
+    }
 }

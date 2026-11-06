@@ -396,7 +396,8 @@ final class LineHealthRelay {
             return;
         }
         long epoch = status.get("statusEpoch").asLong();
-        if (epochSeen != null && epochSeen != epoch) {
+        // the bootstrap scan reads every epoch the compacted topic still holds: only a change seen on the live tail is a continuity reset
+        if (live && epochSeen != null && epochSeen != epoch) {
             epochChanged = true;
         }
         epochSeen = epoch;
