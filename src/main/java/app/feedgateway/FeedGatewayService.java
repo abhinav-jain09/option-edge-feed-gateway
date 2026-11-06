@@ -3420,7 +3420,9 @@ public class FeedGatewayService implements ReplayRunner {
         if(orderChartFootprintBindingSupported) {
             orderChartFootprintBindingSupported=false;
             orderChartFootprintReplay.invalidate();
-            broadcast(OrderChartHistory.HELLO,orderChartHistoryCapabilities());
+            // This is connection capability metadata; authenticated routing drops non-global broadcasts.
+            String capabilities=orderChartHistoryCapabilities();
+            for(WebSocketSession client:clients)send(client,OrderChartHistory.HELLO,capabilities);
         }
     }
 
