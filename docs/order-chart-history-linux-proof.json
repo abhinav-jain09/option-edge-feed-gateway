@@ -24,5 +24,15 @@
   },
   "failure": "Committed campaign source hash drift in FeedGatewayService.java after successful reproducibility check; no image packaged or runtime deployment",
   "sourceChangedByFollowup": false,
-  "remaining": "Actual scoped reviews and a complete passing existing Jenkins build before runtime; no client/native acceptance claim"
+  "remaining": "Actual scoped reviews and a complete passing existing Jenkins build before runtime; no client/native acceptance claim",
+  "testLog": {
+    "url": "http://localhost:8085/job/option-edge-feed-gateway/836/artifact/.jenkins-tmp/es4-tests-836/test.log",
+    "bytes": 3143030,
+    "sha256": "f8a3748d29844b5542e12ca0ced9f94da847ae665513de01606d7a581fc38c1a"
+  },
+  "console": {
+    "url": "http://localhost:8085/job/option-edge-feed-gateway/836/consoleText",
+    "bytes": 387654,
+    "sha256": "9c42cbbe13e83da2f8e5acffb5ff23398cd45205bec26146d7cb700156d7b4cc"
+  }
 }
