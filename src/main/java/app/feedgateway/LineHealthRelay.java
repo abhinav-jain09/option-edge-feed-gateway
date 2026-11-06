@@ -33,8 +33,8 @@ import org.springframework.stereotype.Component;
  * existing authenticated sockets as the global frames {@link #STATE_EVENT}, {@link #EVENT_EVENT}, {@link #VOICE_EVENT} and {@link #STATUS_EVENT}, and
  * folded into the checkpoint that the hello field {@code lineHealth} carries: {@code {status, states, watermark}}.
  * <p>
- * Boundary per record, in order: the Confluent frame must carry the topic's FIXED schema id (3701 state, 3702 events, 3703 voice, 3705 status;
- * {@link LineHealthSchemas#assertFramedAs}) before any decoding; the bytes are decoded by the registry through {@link GatewayAvroDeserializer} (tolerant:
+ * Boundary per record, in order: the Confluent frame must carry the topic's FIXED schema id (state 3708 or the archival 3701, events 3709 or 3702, voice 3703, status
+ * 3710 or 3705; {@link LineHealthSchemas#assertFramedAsAnyVersion}) before any decoding; the bytes are decoded by the registry through {@link GatewayAvroDeserializer} (tolerant:
  * an unknown id or a corrupt body is counted); then the record checks of {@link #render}. Every rendered record omits its null fields (an absent member is
  * a null), so a hello of several hundred lines stays small.
  * <ul>
@@ -331,7 +331,7 @@ final class LineHealthRelay {
         }
         Lane lane = lane(subject);
         try {
-            LineHealthSchemas.assertFramedAs(value, subject);
+            LineHealthSchemas.assertFramedAsAnyVersion(value, subject);   // contracts 0.82.0: the state, event and status subjects have two versions (ids 3708, 3709, 3710 and the archival 3701, 3702, 3705); a record of the older version is still relayed
         } catch (IllegalStateException wrongId) {
             lane.schemaIdRefused.incrementAndGet();
             return;
@@ -572,13 +572,25 @@ final class LineHealthRelay {
         return isUserOwned(node.get("snapshot"));
     }
 
+    /**
+     * The record's own version number: the state, event and status subjects are written as version 2 (schemaVersion 2: drawOnChart, hostTimeframe and the move score on the state
+     * and the event body, moveScoreReportDigest on the status) and a record of the earlier build is version 1; the voice subject has one version. A record without the added fields is
+     * relayed as it is (the page draws nothing for a state without drawOnChart).
+     */
+    static boolean schemaVersionAccepted(LineHealthSchemas.Subject subject, Object schemaVersion) {
+        if (Integer.valueOf(1).equals(schemaVersion)) {
+            return true;
+        }
+        return Integer.valueOf(2).equals(schemaVersion) && subject.priorId() != 0;
+    }
+
     /** The node for a record that passes the boundary, with null members omitted, else null. */
     static ObjectNode render(LineHealthSchemas.Subject subject, String key, Object value) {
         if (!(value instanceof GenericRecord r) || !subject.name().equals(r.getSchema().getFullName())) {
             return null;
         }
         try {
-            if (!Integer.valueOf(1).equals(r.get("schemaVersion")) || !(r.get("asOfMs") instanceof Long asOf) || asOf <= 0) {
+            if (!schemaVersionAccepted(subject, r.get("schemaVersion")) || !(r.get("asOfMs") instanceof Long asOf) || asOf <= 0) {
                 return null;
             }
             String idField = subject == LineHealthSchemas.STATE ? "lineId" : subject == LineHealthSchemas.STATUS ? null : "eventId";

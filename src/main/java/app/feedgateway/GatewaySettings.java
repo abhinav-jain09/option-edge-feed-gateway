@@ -127,12 +127,12 @@ public final class GatewaySettings {
         return longValue("LINE_HEALTH_HELLO_MAX_BYTES", 400_000L, 1_000L);
     }
 
-    /** futures.line-health.state ({@code LineHealthState}, fixed schema id 3701): the latest state of each line, compacted. */
+    /** futures.line-health.state ({@code LineHealthState}, fixed schema id 3708, version 2; 3701 is the archival version 1): the latest state of each line, compacted. */
     public String lineHealthStateTopic() {
         return value("LINE_HEALTH_STATE_TOPIC", "futures.line-health.state");
     }
 
-    /** futures.line-health.events ({@code LineHealthEvent}, fixed schema id 3702): every state change. */
+    /** futures.line-health.events ({@code LineHealthEvent}, fixed schema id 3709, version 2; 3702 is the archival version 1): every state change. */
     public String lineHealthEventsTopic() {
         return value("LINE_HEALTH_EVENTS_TOPIC", "futures.line-health.events");
     }
@@ -142,7 +142,7 @@ public final class GatewaySettings {
         return value("LINE_HEALTH_VOICE_TOPIC", "futures.line-health.voice");
     }
 
-    /** futures.line-health.status ({@code LineHealthStatus}, fixed schema id 3705): the one-second heartbeat, compacted. */
+    /** futures.line-health.status ({@code LineHealthStatus}, fixed schema id 3710, version 2; 3705 is the archival version 1): the one-second heartbeat, compacted. */
     public String lineHealthStatusTopic() {
         return value("LINE_HEALTH_STATUS_TOPIC", "futures.line-health.status");
     }

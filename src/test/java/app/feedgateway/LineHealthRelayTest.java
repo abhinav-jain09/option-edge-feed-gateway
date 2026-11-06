@@ -120,7 +120,7 @@ class LineHealthRelayTest {
         Sink sink = new Sink();
         LineHealthRelay relay = relay(sink);
         byte[] state = bytes(state("A", 1, "TOUCHING", 7, null).build());
-        assertEquals(3701, LineHealthSchemas.assertFramedAs(state, LineHealthSchemas.STATE));
+        assertEquals(3708, LineHealthSchemas.assertFramedAs(state, LineHealthSchemas.STATE), "the state subject is written as version 2");
         relay.accept(STATE, "A", state);
         relay.accept(EVENTS, "A|GIVING_WAY|" + NOW, bytes(event("A|GIVING_WAY|" + NOW, null)));
         relay.accept(VOICE, "E1", bytes(voice("E1")));
@@ -337,6 +337,96 @@ class LineHealthRelayTest {
         return ids;
     }
 
+    /** A record of the earlier build: the version-1 schema of the subject, serialized under the archival id 3701, 3702 or 3705. */
+    private byte[] versionOneBytes(LineHealthSchemas.Subject subject, GenericRecord record) {
+        return serializer.serialize("any-topic", record);
+    }
+
+    @Test
+    void aVersionTwoStateCarriesTheScopeAndTheMoveScoreToTheSocketsAndTheHello() throws Exception {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink);
+        GenericRecord v2 = state("A", 1, "BREAKING", null, null).set("schemaVersion", 2).set("drawOnChart", true).set("hostTimeframe", "5m").set("phase", "PHASE_2")
+                .set("moveScore", 7).set("movePushMilli", 600).set("movePaceMilli", 640).set("moveHoldMilli", 900).set("moveScoreShadow", 6).build();
+        byte[] bytes = bytes(v2);
+        assertEquals(3708, LineHealthSchemas.frameId(bytes));
+        relay.accept(STATE, "A", bytes);
+        assertEquals(List.of("line-health-state"), sink.events());
+        relay.accept(STATUS, "SPX", bytes(status(5, 1)));
+        relay.captureBound(1);
+        relay.release(1);
+        JsonNode frame = sink.json(0);
+        assertTrue(frame.get("drawOnChart").asBoolean());
+        assertEquals("5m", frame.get("hostTimeframe").asText());
+        assertEquals(7, frame.get("moveScore").asInt());
+        assertEquals(600, frame.get("movePushMilli").asInt());
+        assertEquals(640, frame.get("movePaceMilli").asInt());
+        assertEquals(900, frame.get("moveHoldMilli").asInt());
+        assertEquals(6, frame.get("moveScoreShadow").asInt());
+        assertEquals(2, frame.get("schemaVersion").asInt());
+        JsonNode hello = JSON.readTree(relay.helloField());
+        assertEquals(7, hello.get("states").get(0).get("moveScore").asInt(), "the hello fold carries the added fields too");
+    }
+
+    @Test
+    void aVersionOneRecordOfTheEarlierBuildIsStillRelayedAndCarriesNoAddedField() throws Exception {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink);
+        // the version-1 schema under the archival id 3701 (as the compacted state topic still holds it until the new build republishes every line)
+        org.apache.avro.Schema v1 = LineHealthSchemas.STATE.priorSchema();
+        GenericRecord old = new GenericRecordBuilder(v1).set("schemaVersion", 1).set("asOfMs", NOW).set("lineId", "A").set("chartKey", "L|A").set("stateRevision", 1L).set("systemSequence", 1L)
+                .set("role", "SUPPORT").set("state", "TOUCHED").set("gauge", 5).set("lineCents", 761200L).build();
+        byte[] bytes = versionOneBytes(LineHealthSchemas.STATE, old);
+        assertEquals(3701, LineHealthSchemas.frameId(bytes));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> LineHealthSchemas.assertFramedAs(bytes, LineHealthSchemas.STATE), "the strict check of a producer refuses the archival id");
+        relay.accept(STATE, "A", bytes);
+        assertEquals(List.of("line-health-state"), sink.events(), "the reader's check accepts both versions");
+        JsonNode frame = sink.json(0);
+        assertEquals(5, frame.get("gauge").asInt());
+        assertEquals(1, frame.get("schemaVersion").asInt());
+        assertFalse(frame.has("drawOnChart"), "a record without the field draws nothing: the page decides on its absence");
+        assertFalse(frame.has("moveScore"));
+        assertEquals(0, relay.schemaIdRefusedForTest(LineHealthSchemas.STATE));
+    }
+
+    @Test
+    void theEventAndTheStatusSubjectsAreAcceptedInBothVersionsAndAForeignIdIsStillRefused() throws Exception {
+        Sink sink = new Sink();
+        LineHealthRelay relay = relay(sink);
+        // a version 2 event whose nested body has the added fields is relayed live
+        GenericRecord body = new GenericRecordBuilder(LineHealthSchemas.EVENT.schema().getField("snapshot").schema().getTypes().get(1)).set("lineId", "A").set("drawOnChart", true).set("moveScore", 3).build();
+        relay.accept(EVENTS, "e2", bytes(new GenericRecordBuilder(LineHealthSchemas.EVENT.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("eventId", "e2").set("lineId", "A")
+                .set("eventType", "CROSSED").set("snapshot", body).build()));
+        // an event of the earlier build (version 1 schema under 3702) too
+        relay.accept(EVENTS, "e1", versionOneBytes(LineHealthSchemas.EVENT, new GenericRecordBuilder(LineHealthSchemas.EVENT.priorSchema()).set("schemaVersion", 1).set("asOfMs", NOW)
+                .set("eventId", "e1").set("lineId", "A").set("eventType", "TOUCH_BEGAN").build()));
+        assertEquals(List.of("line-health-event", "line-health-event"), sink.events());
+        assertEquals(3, sink.json(0).get("snapshot").get("moveScore").asInt());
+        assertFalse(sink.json(1).has("snapshot"));
+        // statuses are held until the state consumer has reached their bound, then folded: version 2 with the report digest, then a version 1 of the earlier build
+        relay.accept(STATUS, "SPX", bytes(new GenericRecordBuilder(LineHealthSchemas.STATUS.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("stateSequence", 5L)
+                .set("systemRecordCount", 0L).set("statusEpoch", 1L).set("moveScoreReportDigest", "c".repeat(64)).build()));
+        relay.captureBound(0);
+        relay.release(0);
+        assertEquals("c".repeat(64), JSON.readTree(relay.helloField()).get("status").get("moveScoreReportDigest").asText());
+        relay.accept(STATUS, "SPX", versionOneBytes(LineHealthSchemas.STATUS, new GenericRecordBuilder(LineHealthSchemas.STATUS.priorSchema()).set("schemaVersion", 1).set("asOfMs", NOW)
+                .set("stateSequence", 6L).set("systemRecordCount", 0L).set("statusEpoch", 1L).build()));
+        relay.captureBound(0);
+        relay.release(0);
+        JsonNode status = JSON.readTree(relay.helloField()).get("status");
+        assertEquals(6, status.get("stateSequence").asLong());
+        assertFalse(status.has("moveScoreReportDigest"));
+        assertEquals(0, relay.dropsForTest());
+        // a voice record is version 1 only: schemaVersion 2 on it is refused; an id of another subject on the state topic is refused before decoding
+        int before = sink.frames.size();
+        relay.accept(VOICE, "E1", bytes(new GenericRecordBuilder(LineHealthSchemas.VOICE.schema()).set("schemaVersion", 2).set("asOfMs", NOW).set("eventId", "E1").set("lineId", "A")
+                .set("text", "x").set("repeat", false).build()));
+        assertEquals(before, sink.frames.size(), "nothing relayed");
+        assertEquals(1, relay.dropsForTest());
+        relay.accept(STATE, "A", bytes(voice("E1")));
+        assertEquals(1, relay.schemaIdRefusedForTest(LineHealthSchemas.STATE));
+    }
+
     @Test
     void aDisabledRelayConsumesNothing() {
         LineHealthRelay relay = new LineHealthRelay(SETTINGS, new Sink(), null);
@@ -384,7 +474,7 @@ class LineHealthRelayTest {
         }
         b.set("schemaVersion", 1).set("ownerTag", null).set("isUser", false).set("kind", "STRUCTURE").set("state", "TOUCHING").set("lineId", "L-0123456789").set("chartKey", "L|0123456789");
         int one = LineHealthRelay.render(LineHealthSchemas.STATE, "L-0123456789", b.build()).toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
-        assertTrue(one < 2600, "a fully populated state is " + one + " bytes");
+        assertTrue(one < 2800, "a fully populated state is " + one + " bytes (2,611 with the seven fields of version 2; it was under 2,500 before them)");
         // 400 worst-case lines do not fit one hello of 400,000 bytes: the checkpoint follows in parts that together carry every line, and the hello says so
         Sink sink = new Sink();
         LineHealthRelay relay = relay(sink);
