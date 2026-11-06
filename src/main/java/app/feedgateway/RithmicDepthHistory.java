@@ -37,6 +37,10 @@ final class RithmicDepthHistory {
     private String lastIdentity="",lastStream="",cacheIncarnation=UUID.randomUUID().toString();
     private Long sourceAvailableFromMs;
     private boolean metadataUnavailable;
+    private long metadataLostThrough=-1;
+    private Long pendingScanFrom;
+    private String lastOversizeIdentity="";
+    private long lastOversizeAt=-1;
     private volatile boolean limited;
     private volatile boolean ready;
     private volatile String sourceState="LOADING";
@@ -100,6 +104,8 @@ final class RithmicDepthHistory {
             String stream=known?rawStream:"UNKNOWN",identityPrefix=(known?scope.environment()+"|CME|ESZ6|"+stream:"UNKNOWN")+"|"+(emitted/1000)+"|"+Boolean.TRUE.equals(r.get("mappingReady"))+"|"+Boolean.TRUE.equals(r.get("connected"))+"|"+Boolean.TRUE.equals(r.get("bookReady"))+"|";
             String identity=identityPrefix+checked.fullBook()+"|"+checked.gapReason();
             if(identity.equals(lastIdentity)&&!columns.containsKey(emitted))return;
+            // Compressed-oversize recovery is retried at most four times per source second.
+            if(identity.equals(lastOversizeIdentity)&&now>=lastOversizeAt&&now-lastOversizeAt<250)return;
             Long boundary=null;
             if(checked.fullBook()&&!lastStream.isEmpty()&&!stream.equals(lastStream)){
                 long first=Math.min(emitted,(Long)r.get("receivedAtMs"));
@@ -110,8 +116,15 @@ final class RithmicDepthHistory {
                     rememberGap(boundary,boundary+1,RithmicDepthJson.GapReason.STREAM_CHANGE);
                 }
             }
-            var column=RithmicNativeHistoryColumn.capture(checked,emitted,scope,boundary);put(column);
-            if(!column.book())rememberGap(emitted,emitted+1,column.gapReason());
+            var column=RithmicNativeHistoryColumn.capture(checked,emitted,scope,boundary);
+            if(column.gapReason()==RithmicDepthJson.GapReason.OVERSIZE_COLUMN&&checked.fullBook()){lastOversizeIdentity=identity;lastOversizeAt=now;}else{lastOversizeIdentity="";lastOversizeAt=-1;}
+            put(column);
+            if(pendingScanFrom!=null){rememberGap(Math.min(pendingScanFrom,emitted),emitted+1,RithmicDepthJson.GapReason.SCAN_SKIP);pendingScanFrom=null;}
+            if(!column.book()){
+                var previous=columns.lowerEntry(emitted);long start=emitted;
+                if(previous!=null&&!previous.getValue().book()&&previous.getValue().gapReason()==column.gapReason())start=previous.getKey();
+                rememberGap(start,emitted+1,column.gapReason());
+            }
             if(checked.fullBook())lastStream=stream;
             lastIdentity=identityPrefix+column.book()+"|"+column.gapReason();
             if(sourceAvailableFromMs==null)sourceAvailableFromMs=emitted;else sourceAvailableFromMs=Math.min(sourceAvailableFromMs,emitted);
@@ -126,7 +139,7 @@ final class RithmicDepthHistory {
     }
     void markScanSkip(long now){
         long affected;
-        synchronized(this){affected=columns.isEmpty()?Math.max(0,now-WINDOW):Math.min(now,columns.lastKey());rememberGap(affected,now+1,RithmicDepthJson.GapReason.SCAN_SKIP);limitedUntil.put("SCAN_LIMIT",now+WINDOW);limited=true;bumpRevision(affected);}
+        synchronized(this){affected=columns.isEmpty()?Math.max(0,now-WINDOW):Math.min(now,columns.lastKey());pendingScanFrom=affected;if(!columns.isEmpty())rememberGap(affected,columns.lastKey()+1,RithmicDepthJson.GapReason.SCAN_SKIP);limitedUntil.put("SCAN_LIMIT",now+WINDOW);limited=true;bumpRevision(affected);}
         notifySubscribers(affected);
     }
     private void bumpRevision(long affected){
@@ -148,13 +161,13 @@ final class RithmicDepthHistory {
                 merged.set(merged.size()-1,new RithmicNativeHistoryPacket.Gap(previous.startMs(),Math.max(previous.endMs(),gap.endMs()),cause));
             }else merged.add(gap);
         }
-        if(merged.size()>2048){metadataUnavailable=true;return;}
+        if(merged.size()>2048){metadataUnavailable=true;metadataLostThrough=Math.max(metadataLostThrough,end);return;}
         boolean changed=!new ArrayList<>(sourceGaps.values()).equals(merged);
-        if(changed&&!columns.isEmpty()&&start<columns.lastKey())bumpRevision(start-10000);
+        if(changed&&reason!=RithmicDepthJson.GapReason.RETENTION_EVICTED&&!columns.isEmpty()&&start<columns.lastKey())bumpRevision(start-10000);
         sourceGaps.clear();for(var gap:merged)sourceGaps.put(gap.startMs(),gap);
     }
     private void prune(long now){
-        long floor=Math.max(0,now-WINDOW);while(!columns.isEmpty()&&columns.firstKey()<floor)bytes-=columns.pollFirstEntry().getValue().retainedBytes();if(sourceAvailableFromMs!=null)sourceAvailableFromMs=Math.max(sourceAvailableFromMs,floor);
+        long floor=Math.max(0,now-WINDOW);if(metadataUnavailable&&metadataLostThrough>=0&&metadataLostThrough<=floor){metadataUnavailable=false;metadataLostThrough=-1;}while(!columns.isEmpty()&&columns.firstKey()<floor)bytes-=columns.pollFirstEntry().getValue().retainedBytes();if(sourceAvailableFromMs!=null)sourceAvailableFromMs=Math.max(sourceAvailableFromMs,floor);
         sourceGaps.entrySet().removeIf(e->e.getValue().endMs()<=floor);
         if(!sourceGaps.isEmpty()&&sourceGaps.firstKey()<floor){var gap=sourceGaps.pollFirstEntry().getValue();sourceGaps.put(floor,new RithmicNativeHistoryPacket.Gap(floor,gap.endMs(),gap.gapReason()));}
         limitedUntil.entrySet().removeIf(e->e.getValue()<now);limited=!limitedUntil.isEmpty();
@@ -163,7 +176,7 @@ final class RithmicDepthHistory {
         RithmicNativeHistoryPacket.Snapshot snapshot;
         synchronized(this){
             if(!RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem())||!request.namespace().environment().equals(settings.rithmicSystem()))return new RithmicNativeHistoryPacket.Reply(null,"unsupported_namespace");
-            if(metadataUnavailable)return new RithmicNativeHistoryPacket.Reply(null,"unavailable");
+            prune(now);if(metadataUnavailable)return new RithmicNativeHistoryPacket.Reply(null,"unavailable");
             Long previous=nativeRequests.get(socket);if(previous!=null&&now>=previous&&now-previous<50)return new RithmicNativeHistoryPacket.Reply(null,"busy");
             if(previous==null&&nativeRequests.size()>=1024)return new RithmicNativeHistoryPacket.Reply(null,"busy");nativeRequests.put(socket,now);prune(now);
             var items=columns.tailMap(Math.max(request.fromMs(),request.afterMs()+1),true).values().stream().takeWhile(c->c.emittedAtMs()<=request.toMs()).limit(33).toList();

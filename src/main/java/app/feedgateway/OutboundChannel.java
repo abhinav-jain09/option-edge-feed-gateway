@@ -219,6 +219,8 @@ final class OutboundChannel {
         return enqueueText(envelope,coalesceKey,null);
     }
 
+    void revokeAuthorization(){close(CloseReason.AUTH_REVOKED);}
+
     boolean enqueueAuthorizedText(String envelope,String coalesceKey,BooleanSupplier authorized){
         if(closed.get()||envelope==null)return false;
         if(!authorized(authorized)){close(CloseReason.AUTH_REVOKED);return false;}

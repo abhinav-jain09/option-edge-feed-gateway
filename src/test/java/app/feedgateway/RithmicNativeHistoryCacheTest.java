@@ -49,6 +49,16 @@ class RithmicNativeHistoryCacheTest {
 
     @Test void scanSkipRemainsVisibleUntilItsSupportedHorizonExpires()throws Exception{
         var h=history();h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW-1000,1),NOW);h.markScanSkip(NOW);var value=header(h,"scan",request(NOW-2000,NOW,NOW-2001),NOW);assertTrue(value.path("limited").asBoolean());assertTrue(value.path("sourceGapIntervals").toString().contains("SCAN_SKIP"));assertTrue(value.path("lateRevision").asLong()>0);
-        long later=NOW+RithmicDepthHistory.WINDOW+1;h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(later,2),later);var expired=header(h,"expired",request(later-1000,later,later-1001),later);assertFalse(expired.path("limited").asBoolean());assertEquals(0,expired.path("sourceGapIntervals").size());
+        h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW+1,2),NOW+1);long later=NOW+RithmicDepthHistory.WINDOW+2;h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(later,2),later);var expired=header(h,"expired",request(later-1000,later,later-1001),later);assertFalse(expired.path("limited").asBoolean());assertEquals(0,expired.path("sourceGapIntervals").size());
+    }
+
+    @Test void forwardRetentionEvictionDoesNotPretendToBeALateSourceMutation()throws Exception{
+        var h=history();@SuppressWarnings("unchecked") var columns=(java.util.TreeMap<Long,RithmicNativeHistoryColumn>)ReflectionTestUtils.getField(h,"columns");long bytes=0;for(int i=8192;i>0;i--){var c=RithmicNativeHistoryColumn.gap(NOW-i,RithmicNativeHistoryPacketTest.TEST,RithmicDepthJson.GapReason.NOT_READY,null);columns.put(NOW-i,c);bytes+=c.retainedBytes();}ReflectionTestUtils.setField(h,"bytes",bytes);h.accept(RithmicSchemas.KEY,RithmicDepthHistoryTest.frame(NOW,1),NOW);assertEquals(0L,ReflectionTestUtils.getField(h,"lateRevision"));assertEquals(8192,columns.size());
+    }
+    @Test void metadataLossRecoversOnlyAfterEveryUnrecordedGapHasExpired()throws Exception{
+        var h=history();ReflectionTestUtils.setField(h,"metadataUnavailable",true);ReflectionTestUtils.setField(h,"metadataLostThrough",NOW);var req=request(NOW-1000,NOW,NOW-1001);assertEquals("unavailable",h.nativePage("early",req,NOW,524288).error());long later=NOW+RithmicDepthHistory.WINDOW;assertTrue(h.nativePage("aged",request(later-1000,later,later-1001),later,524288).accepted());
+    }
+    @Test void continuousUnreadyOutageCoalescesRatherThanExhaustingGapMetadata()throws Exception{
+        var h=history();for(int i=0;i<2200;i++){var raw=RithmicDepthHistoryTest.frame(NOW+i*1000L,i+1);raw.put("mappingReady",false);h.accept(RithmicSchemas.KEY,raw,NOW+i*1000L);}assertEquals(false,ReflectionTestUtils.getField(h,"metadataUnavailable"));@SuppressWarnings("unchecked") var gaps=(java.util.Map<Long,?>)ReflectionTestUtils.getField(h,"sourceGaps");assertEquals(1,gaps.size());
     }
 }

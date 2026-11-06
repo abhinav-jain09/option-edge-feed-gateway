@@ -1647,6 +1647,7 @@ public class FeedGatewayService implements ReplayRunner {
         send(session, "status", statusJson());
         if(nativeHistoryAuthorized(session,channel)&&RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem())){
             boolean subscribed; synchronized(nativeHistorySubscribers){subscribed=nativeHistorySubscribers.size()<1024;if(subscribed)nativeHistorySubscribers.put(session.getId(),session);}
+            if(subscribed&&!nativeHistoryAuthorized(session,channel)){nativeHistorySubscribers.remove(session.getId(),session);subscribed=false;}
             if(subscribed){
                 String identity=mapper.createObjectNode().put("subject",(String)session.getAttributes().get(TicketHandshakeInterceptor.ATTR_USER_ID)).toString();
                 channel.enqueueAuthorizedText(envelopeJson("session-identity",identity),null,()->nativeHistoryAuthorized(session,channel));
@@ -15371,7 +15372,7 @@ public class FeedGatewayService implements ReplayRunner {
     void rithmicHistoryChanged(Long affected){
         var history=rithmicDepthHistory==null?null:rithmicDepthHistory.getIfAvailable();if(history==null)return;
         for(var session:nativeHistorySubscribers.values()){
-            var channel=outbound.get(session.getId());if(channel==null||!nativeHistoryAuthorized(session,channel))continue;
+            var channel=outbound.get(session.getId());if(channel==null||!nativeHistoryAuthorized(session,channel)){nativeHistorySubscribers.remove(session.getId(),session);history.forget(session.getId());continue;}
             if(affected!=null)channel.enqueueHistoryInvalidation(history.invalidation(affected),()->nativeHistoryAuthorized(session,channel));
             sendNativeHistoryHello(session,channel);
         }
@@ -15401,7 +15402,7 @@ public class FeedGatewayService implements ReplayRunner {
 
     private void handleNativeRithmicHistory(WebSocketSession session,JsonNode request) {
         OutboundChannel channel=outbound.get(session.getId());
-        if(!nativeHistoryAuthorized(session,channel))return;
+        if(!nativeHistoryAuthorized(session,channel)){if(channel!=null)channel.revokeAuthorization();return;}
         if(nativeHistorySubscribers.get(session.getId())!=session){nativeHistoryError(session,channel,"","busy");return;}
         var parsed=RithmicNativeHistoryRequest.parse(request,settings.rithmicSystem(),System.currentTimeMillis());
         if(!parsed.accepted()){nativeHistoryError(session,channel,parsed.requestId(),parsed.error());return;}
@@ -15414,7 +15415,8 @@ public class FeedGatewayService implements ReplayRunner {
             var admission=channel.tryEnqueueHistoryBinary(reply.binary(),()->nativeHistoryAuthorized(session,channel));
             if(admission==OutboundChannel.HistoryAdmission.BUSY||admission==OutboundChannel.HistoryAdmission.CAPACITY)
                 nativeHistoryError(session,channel,parsed.requestId(),admission==OutboundChannel.HistoryAdmission.BUSY?"busy":"capacity");
-        } finally {footprintBackfillPermits.release();}
+        } catch(RuntimeException invalid){nativeHistoryError(session,channel,parsed.requestId(),"unavailable");}
+        finally {if(!nativeHistoryAuthorized(session,channel))history.forget(session.getId());footprintBackfillPermits.release();}
     }
 
     /** History travels on the authenticated socket; only registered clients can read the view. */
