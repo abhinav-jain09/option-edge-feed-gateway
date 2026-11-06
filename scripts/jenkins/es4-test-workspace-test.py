@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 SOURCE = Path(__file__).with_name("es4-test-workspace.py")
 spec = importlib.util.spec_from_file_location("workspace_recovery", SOURCE)
@@ -145,6 +146,24 @@ class RecoveryTest(unittest.TestCase):
             return subprocess.CompletedProcess([], 1, b"", b"")
         with patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", side_effect=exited):
             self.assertEqual([], m.process_directories(self.root))
+
+    def test_identity_confirmation_errors_and_pid_replacement_fail_closed(self):
+        proc = self.root / "13176"
+        proc.mkdir()
+        before = proc.stat()
+        changed_uid = SimpleNamespace(st_uid=before.st_uid + 1, st_ino=before.st_ino, st_dev=before.st_dev)
+        changed_pid = SimpleNamespace(st_uid=before.st_uid, st_ino=before.st_ino + 1, st_dev=before.st_dev)
+        for result in [PermissionError("unreadable"), OSError("inspection error"), changed_uid, changed_pid]:
+            with patch.object(Path, "stat", autospec=True, side_effect=[before, result]), patch.object(m.os, "readlink", side_effect=PermissionError), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"/\0", b"")):
+                with self.assertRaises(RuntimeError):
+                    m.process_cwd(proc)
+
+    def test_missing_cwd_on_existing_pid_is_not_mistaken_for_exit(self):
+        proc = self.root / "13176"
+        proc.mkdir()
+        with patch.object(m.os, "readlink", side_effect=FileNotFoundError):
+            with self.assertRaises(RuntimeError):
+                m.process_directories(self.root)
 
     def test_restricted_active_workspace_still_blocks_recovery(self):
         old = self.four()
