@@ -116,7 +116,7 @@ class EsLiquidityWallRelayTest {
         Sink sink = new Sink();
         EsLiquidityWallRelay relay = wire.relay(sink);
         byte[] dashboard = wire.bytes(EsLiquidityWallFixtures.dashboard(NOW));
-        assertEquals(3403, LiquidityWallSchemas.assertFramedAs(dashboard, LiquidityWallSchemas.DASHBOARD));
+        assertEquals(3408, LiquidityWallSchemas.assertFramedAs(dashboard, LiquidityWallSchemas.DASHBOARD));
         relay.accept(DASHBOARD, KEY, dashboard, NOW + 500);
         relay.accept(EVENTS, "C1", wire.bytes(EsLiquidityWallFixtures.born(NOW, "C1")), NOW + 500);
         relay.accept(EVENTS, KEY + "|FLIP", wire.bytes(EsLiquidityWallFixtures.flip(NOW)), NOW + 500);
@@ -143,12 +143,70 @@ class EsLiquidityWallRelayTest {
     }
 
     @Test
+    void bothDashboardIdsAreAcceptedAndTheVersionTwoJsonCarriesTheThreeWallFields() throws Exception {
+        Sink sink = new Sink();
+        EsLiquidityWallRelay relay = wire.relay(sink);
+        byte[] v2 = wire.bytes(EsLiquidityWallFixtures.dashboard(NOW));
+        byte[] v1 = wire.bytes(EsLiquidityWallFixtures.dashboardV1(NOW + 1000));
+        assertEquals(3408, LiquidityWallSchemas.assertFramedAsAnyVersion(v2, LiquidityWallSchemas.DASHBOARD));
+        assertEquals(3403, LiquidityWallSchemas.assertFramedAsAnyVersion(v1, LiquidityWallSchemas.DASHBOARD));
+        relay.accept(DASHBOARD, KEY, v1, NOW + 500);   // the compacted topic still holds a version 1 record until the service writes its next
+        relay.accept(DASHBOARD, KEY, v2, NOW + 500);
+        assertEquals(List.of("es-liquidity-heatmap", "es-liquidity-heatmap"), sink.events());
+        assertEquals(0, relay.dropsForTest());
+        assertEquals(0, relay.schemaIdRefusedForTest(LiquidityWallSchemas.DASHBOARD));
+        assertEquals(2, relay.history().framesFolded(), "the projection folds both versions (it reads by field name)");
+
+        JsonNode wall1 = sink.json(0).get("walls").get(0);
+        assertEquals(1, sink.json(0).get("schemaVersion").intValue());
+        assertEquals("C1", wall1.get("clusterId").asText());
+        assertFalse(wall1.has("sizeNow") || wall1.has("sizeTape") || wall1.has("wordState"), "a version 1 record has no such fields");
+
+        JsonNode wall2 = sink.json(1).get("walls").get(0);
+        assertEquals(2, sink.json(1).get("schemaVersion").intValue());
+        assertEquals(340L, wall2.get("sizeNow").longValue());
+        assertEquals("UNDER_ATTACK", wall2.get("wordState").asText());
+        JsonNode tape = wall2.get("sizeTape");
+        assertEquals(7, tape.size());
+        assertTrue(tape.get(0).isNull(), "a null entry stays JSON null");
+        assertEquals(List.of(430L, 429L, 433L, 438L, 340L, 340L), List.of(tape.get(1).longValue(), tape.get(2).longValue(), tape.get(3).longValue(), tape.get(4).longValue(), tape.get(5).longValue(), tape.get(6).longValue()));
+        assertEquals("C1", wall2.get("clusterId").asText());
+
+        // a version 2 record whose three fields are null (a restart, a not LIVE bucket) arrives as nulls
+        GenericRecord blank = EsLiquidityWallFixtures.dashboard(NOW + 2000);
+        GenericRecord bw = (GenericRecord) ((List<?>) blank.get("walls")).get(0);
+        bw.put("sizeNow", null);
+        bw.put("sizeTape", null);
+        bw.put("wordState", null);
+        relay.accept(DASHBOARD, KEY, wire.bytes(blank), NOW + 2500);
+        JsonNode nulls = sink.json(2).get("walls").get(0);
+        assertTrue(nulls.get("sizeNow").isNull() && nulls.get("sizeTape").isNull() && nulls.get("wordState").isNull());
+    }
+
+    @Test
+    void aThirdDashboardIdAndAThirdSchemaVersionAreRefusedAndCounted() throws Exception {
+        Sink sink = new Sink();
+        EsLiquidityWallRelay relay = wire.relay(sink);
+        byte[] third = wire.bytes(EsLiquidityWallFixtures.born(NOW, "C1"));   // 3404: another subject's id on the dashboard topic
+        relay.accept(DASHBOARD, KEY, third, NOW);
+        assertEquals(1, relay.schemaIdRefusedForTest(LiquidityWallSchemas.DASHBOARD));
+        assertEquals(0, wire.decodes.get(), "refused before the registry is asked");
+        relay.accept(DASHBOARD, KEY, wire.bytes(EsLiquidityWallFixtures.dashboard(NOW, "LIVE").set("schemaVersion", 3).build()), NOW);
+        relay.accept(DASHBOARD, KEY, wire.bytes(EsLiquidityWallFixtures.dashboardV1(NOW, "LIVE").set("schemaVersion", 3).build()), NOW);
+        assertEquals(2, relay.dropsForTest(), "right ids, but schemaVersion 3 is refused as a record");
+        assertTrue(sink.frames.isEmpty());
+        // the event and the voice stay version 1 only
+        relay.accept(EVENTS, "C1", wire.bytes(EsLiquidityWallFixtures.event(NOW, "BORN").set("schemaVersion", 2).build()), NOW);
+        assertEquals(3, relay.dropsForTest());
+    }
+
+    @Test
     void aFrameUnderAnotherTopicsIdOrNoFrameAtAllIsRefusedBeforeAnyDecodeAndCountedPerTopic() throws Exception {
         Sink sink = new Sink();
         EsLiquidityWallRelay relay = wire.relay(sink);
         byte[] voiceBytes = wire.bytes(EsLiquidityWallFixtures.voice(NOW));   // id 3407
-        relay.accept(DASHBOARD, KEY, voiceBytes, NOW);                        // the dashboard topic requires 3403
-        relay.accept(EVENTS, KEY + "|FLIP", wire.bytes(EsLiquidityWallFixtures.dashboard(NOW)), NOW);   // 3403 on a 3404 topic
+        relay.accept(DASHBOARD, KEY, voiceBytes, NOW);                        // the dashboard topic requires 3408 or 3403
+        relay.accept(EVENTS, KEY + "|FLIP", wire.bytes(EsLiquidityWallFixtures.dashboard(NOW)), NOW);   // 3408 on a 3404 topic
         relay.accept(BUCKETS, "BID|30440", wire.bytes(EsLiquidityWallFixtures.born(NOW, "C1")), NOW);   // 3404 on a 3402 topic
         relay.accept(VOICE, KEY, "{\"text\":\"retained json\"}".getBytes(StandardCharsets.UTF_8), NOW);   // not a Confluent frame
         relay.accept(VOICE, KEY, new byte[] {0, 0, 0}, NOW);                                               // shorter than the header
@@ -248,7 +306,7 @@ class EsLiquidityWallRelayTest {
         assertEquals(ring, replay.frames.size());
         assertEquals("C1", replay.json(0).get("wall").get("clusterId").asText(), "the oldest left the ring");
         relay.accept(EVENTS, "C1", null, NOW);                                                                      // a tombstone
-        relay.accept(DASHBOARD, KEY, wire.bytes(EsLiquidityWallFixtures.dashboard(NOW, "LIVE").set("schemaVersion", 2).build()), NOW);   // right id, refused record
+        relay.accept(DASHBOARD, KEY, wire.bytes(EsLiquidityWallFixtures.dashboard(NOW, "LIVE").set("schemaVersion", 3).build()), NOW);   // right id, refused record (version 3)
         relay.accept("some.other.topic", KEY, wire.bytes(EsLiquidityWallFixtures.dashboard(NOW)), NOW);
         byte[] unknownId = wire.bytes(EsLiquidityWallFixtures.voice(NOW));
         unknownId[4] = (byte) 0x99;   // 3407 -> a foreign id: refused by the id check, not by the registry

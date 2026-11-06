@@ -2,6 +2,7 @@ package app.feedgateway;
 
 import com.optionsedge.contracts.liquiditywall.LiquidityWallSchemas;
 import java.util.List;
+import java.util.Set;
 import org.apache.avro.generic.GenericRecord;
 
 /**
@@ -14,7 +15,7 @@ import org.apache.avro.generic.GenericRecord;
  * record's {@code stale} ({@link #withStale}). The schema ID of the frame is checked by the relay BEFORE decoding ({@link EsLiquidityWallRelay#accept}).
  * <p>
  * Boundary checks, each a counted drop in the relay: the WRITER schema is the subject's record (a record of another family under the same topic is refused by
- * name, not by key), {@code schemaVersion} 1, the key is the one section 8 states ({@code CME|<contract>} for the dashboard and the voice,
+ * name, not by key), {@code schemaVersion} 1 (the dashboard: 1 or 2, ids 3403 and 3408), the key is the one section 8 states ({@code CME|<contract>} for the dashboard and the voice,
  * {@code CME|<contract>|FLIP} for a flip event, the wall's {@code clusterId} for a wall event), a positive {@code bucketEnd}, a non-blank
  * {@code depthEnvironment} and {@code contract}, a dashboard of at most {@link #MAX_LEVELS} levels, a voice record with a non-blank {@code text} and
  * {@code voiceId}, and a rendering of at most {@link TaRelay#FRAME_MAX_BYTES} bytes.
@@ -23,13 +24,17 @@ final class EsLiquidityWallJson {
     /** A band of a few hundred ticks per side; a dashboard listing more levels than this is refused. */
     static final int MAX_LEVELS = 4096;
     static final String FLIP = "FLIP";
+    /** The dashboard has two versions (ids 3403 and 3408, contracts 0.84.0): a version 1 record is still on the compacted topic until the wall service writes its next one. */
+    static final Set<Integer> DASHBOARD_VERSIONS = Set.of(1, 2);
+    /** The event, voice and bucket records have one version. */
+    static final Set<Integer> ONLY_VERSION_1 = Set.of(1);
 
     private EsLiquidityWallJson() {
     }
 
     /** The dashboard view, or null when the record is refused. */
     static String dashboard(String key, Object value) {
-        GenericRecord r = record(LiquidityWallSchemas.DASHBOARD, value);
+        GenericRecord r = record(LiquidityWallSchemas.DASHBOARD, value, DASHBOARD_VERSIONS);
         if (r == null || !dashboardKey(r).equals(key)) {
             return null;
         }
@@ -42,7 +47,7 @@ final class EsLiquidityWallJson {
 
     /** The event view, or null when the record is refused. */
     static String event(String key, Object value) {
-        GenericRecord r = record(LiquidityWallSchemas.EVENT, value);
+        GenericRecord r = record(LiquidityWallSchemas.EVENT, value, ONLY_VERSION_1);
         if (r == null) {
             return null;
         }
@@ -61,7 +66,7 @@ final class EsLiquidityWallJson {
 
     /** The voice view WITHOUT the stale flag (the relay appends it at delivery), or null when the record is refused. */
     static String voice(String key, Object value) {
-        GenericRecord r = record(LiquidityWallSchemas.VOICE, value);
+        GenericRecord r = record(LiquidityWallSchemas.VOICE, value, ONLY_VERSION_1);
         if (r == null || !dashboardKey(r).equals(key) || text(r.get("text")).isBlank() || text(r.get("voiceId")).isBlank()) {
             return null;
         }
@@ -73,7 +78,7 @@ final class EsLiquidityWallJson {
      * the projection's classification-window quantities only.
      */
     static GenericRecord bucket(String key, Object value) {
-        GenericRecord r = record(LiquidityWallSchemas.BUCKET, value);
+        GenericRecord r = record(LiquidityWallSchemas.BUCKET, value, ONLY_VERSION_1);
         if (r == null || key == null || !key.equals(text(r.get("side")) + "|" + text(r.get("tick")))) {
             return null;
         }
@@ -103,13 +108,13 @@ final class EsLiquidityWallJson {
         return "CME|" + text(r.get("contract"));
     }
 
-    /** The record when it is the subject's, schema version 1, with a positive bucket end and a non-blank environment and contract; else null. */
-    private static GenericRecord record(LiquidityWallSchemas.Subject subject, Object value) {
+    /** The record when it is the subject's, with a {@code schemaVersion} in {@code versions}, with a positive bucket end and a non-blank environment and contract; else null. */
+    private static GenericRecord record(LiquidityWallSchemas.Subject subject, Object value, Set<Integer> versions) {
         if (!(value instanceof GenericRecord r) || !subject.name().equals(r.getSchema().getFullName())) {
             return null;
         }
         try {
-            if (!Integer.valueOf(1).equals(r.get("schemaVersion")) || !(r.get("bucketEnd") instanceof Long bucketEnd) || bucketEnd <= 0
+            if (!(r.get("schemaVersion") instanceof Integer version) || !versions.contains(version) || !(r.get("bucketEnd") instanceof Long bucketEnd) || bucketEnd <= 0
                     || text(r.get("depthEnvironment")).isBlank() || text(r.get("contract")).isBlank() || r.get("configFingerprint") == null) {
                 return null;
             }

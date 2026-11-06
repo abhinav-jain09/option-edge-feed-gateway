@@ -94,7 +94,7 @@ class EsLiquidityWallJsonTest {
         assertNull(EsLiquidityWallJson.dashboard("CME|ESH7", dashboard), "the key must be CME|<contract>");
         assertNull(EsLiquidityWallJson.event(KEY, dashboard), "a dashboard record on the events topic is refused by its writer schema name");
         assertNull(EsLiquidityWallJson.voice(KEY, dashboard));
-        assertNull(EsLiquidityWallJson.dashboard(KEY, EsLiquidityWallFixtures.dashboard(NOW, "LIVE").set("schemaVersion", 2).build()));
+        assertNull(EsLiquidityWallJson.dashboard(KEY, EsLiquidityWallFixtures.dashboard(NOW, "LIVE").set("schemaVersion", 3).build()));
         assertNull(EsLiquidityWallJson.dashboard(KEY, EsLiquidityWallFixtures.dashboard(0L, "LIVE").build()), "a bucket end of 0 is refused");
         assertNull(EsLiquidityWallJson.dashboard(KEY, EsLiquidityWallFixtures.dashboard(NOW, "LIVE").set("depthEnvironment", " ").build()));
         assertNull(EsLiquidityWallJson.dashboard(KEY, null), "a tombstone");
