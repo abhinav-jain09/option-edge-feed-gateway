@@ -32,4 +32,15 @@ class OrderChartReplayGateTest {
         Object owner=new Object();gate.begin(owner,List.of());gate.advance(owner,t->0);assertFalse(ready());
         gate.begin(owner,List.of(p));gate.capture(owner,Map.of(p,0L));gate.advance(owner,t->0);assertTrue(ready());
     }
+    @Test void actualCacheSeekAndPostApplyProgressControlTheHistoryGate() throws Exception {
+        var service=FootprintWiringTest.on();var field=FeedGatewayService.class.getDeclaredField("orderChartFootprintReplay");field.setAccessible(true);var actual=(OrderChartReplayGate)field.get(service);
+        @SuppressWarnings("unchecked") var consumer=(org.apache.kafka.clients.consumer.KafkaConsumer<String,Object>)org.mockito.Mockito.mock(org.apache.kafka.clients.consumer.KafkaConsumer.class);
+        var partition=new TopicPartition("futures.footprint.bars",0);
+        org.mockito.Mockito.when(consumer.offsetsForTimes(org.mockito.ArgumentMatchers.anyMap())).thenAnswer(invocation->{assertFalse(actual.read(()->true,()->false));return Map.of(partition,new org.apache.kafka.clients.consumer.OffsetAndTimestamp(0,0));});
+        org.mockito.Mockito.when(consumer.endOffsets(org.mockito.ArgumentMatchers.anyCollection(),org.mockito.ArgumentMatchers.any(java.time.Duration.class))).thenReturn(Map.of(partition,5L));
+        org.mockito.Mockito.when(consumer.position(partition)).thenReturn(4L,5L);
+        var attempt=new FeedGatewayService.StrikeReplay();
+        service.cacheHydrationSeek(consumer,List.of(partition),Map.of(partition.topic(),new FeedGatewayService.TopicBinding("DATABENTO","es-footprint-bar")),attempt,1000);
+        assertFalse(actual.read(()->true,()->false));service.footprintStrikeReplayProgress(consumer,attempt);assertFalse(actual.read(()->true,()->false));service.footprintStrikeReplayProgress(consumer,attempt);assertTrue(actual.read(()->true,()->false));
+    }
 }

@@ -27,10 +27,13 @@ class OrderChartHistoryTest {
  }
  @Test void registeredSocketsUseExistingBoundedWriterAndBusyLimit() throws Exception {
   var service=FootprintWiringTest.on();service.runOutboundWritesInline();service.footprintViews().admitBar(bar(0));
-  var field=FeedGatewayService.class.getDeclaredField("orderChartFootprintReplay");field.setAccessible(true);var gate=(OrderChartReplayGate)field.get(service);Object owner=new Object();var partition=new org.apache.kafka.common.TopicPartition("fixture-bars",0);gate.begin(owner,List.of(partition));gate.capture(owner,java.util.Map.of(partition,0L));gate.advance(owner,p->0L);
+
   WebSocketSession socket=mock(WebSocketSession.class);when(socket.getId()).thenReturn("order-history");when(socket.isOpen()).thenReturn(true);
   service.handleFootprintBasicMessage(socket,request().toString());verify(socket,never()).sendMessage(any());service.addClient(socket);clearInvocations(socket);
   service.handleFootprintBasicMessage(socket,request().toString());var sent=ArgumentCaptor.forClass(TextMessage.class);verify(socket).sendMessage(sent.capture());
+  assertEquals("loading",mapper.readTree(sent.getValue().getPayload()).path("data").path("error").asText());clearInvocations(socket);
+  var field=FeedGatewayService.class.getDeclaredField("orderChartFootprintReplay");field.setAccessible(true);var gate=(OrderChartReplayGate)field.get(service);Object owner=new Object();var partition=new org.apache.kafka.common.TopicPartition("fixture-bars",0);gate.begin(owner,List.of(partition));gate.capture(owner,java.util.Map.of(partition,0L));gate.advance(owner,p->0L);
+  service.handleFootprintBasicMessage(socket,request().toString());verify(socket).sendMessage(sent.capture());
   var envelope=mapper.readTree(sent.getValue().getPayload());assertEquals(OrderChartHistory.RESPONSE,envelope.path("type").asText());assertEquals(1,envelope.path("data").path("records").size());
   clearInvocations(socket);assertTrue(service.footprintBackfillPermits().tryAcquire(4));try{service.handleFootprintBasicMessage(socket,request().toString());verify(socket).sendMessage(sent.capture());assertEquals("busy",mapper.readTree(sent.getValue().getPayload()).path("data").path("error").asText());}finally{service.footprintBackfillPermits().release(4);service.removeClient(socket);}
  }
