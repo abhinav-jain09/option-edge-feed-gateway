@@ -82,6 +82,9 @@ cp .contracts-sha .contracts-version .contracts-jar-sha256 "$local_dir/"
   shasum -a 256 source.bundle maven-cache.tar.gz .contracts-sha .contracts-version .contracts-jar-sha256 > inputs.sha256
 )
 # This root contains only this transport's private test workspaces. Refuse growth after failed cleanup.
+# Preserve old inactive scratch directories without deleting evidence or relaxing either budget.
+python3 scripts/jenkins/es4-test-workspace-test.py
+ssh "${ssh_args[@]}" "$host" python3 - "$remote_root" < scripts/jenkins/es4-test-workspace.py
 remote_dir=$(ssh "${ssh_args[@]}" "$host" "bash -s -- $remote_root $BUILD_NUMBER" <<'REMOTE_INIT'
 set -euo pipefail
 root=$1; build=$2
