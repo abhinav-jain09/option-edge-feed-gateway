@@ -1,0 +1,28 @@
+{
+  "jenkinsBuild": "http://localhost:8085/job/option-edge-feed-gateway/836/",
+  "result": "FAILURE",
+  "productSource": "9d630fac441642b91c0867ed6706fd4ff9c38f74",
+  "contractsSource": "a2a140489af71c47f20b41f9d6d2a650fa2f63a4",
+  "archivedArtifact": ".jenkins-tmp/es4-tests-836/footprint-reverify.json",
+  "recordSha256": "1d7b193ac49bca648018e4d52ba9a61e010d34ddb1d2b185485367dbca6aeb65",
+  "mutations": 50,
+  "statuses": {
+    "KILLED": 49,
+    "SURVIVED": 1
+  },
+  "claimsAndOutcomesMatchPrevious": true,
+  "linuxFullSuite": {
+    "tests": 1834,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "additionalContextSmoke": {
+    "tests": 1,
+    "failures": 0,
+    "errors": 0
+  },
+  "failure": "Committed campaign source hash drift in FeedGatewayService.java after successful reproducibility check; no image packaged or runtime deployment",
+  "sourceChangedByFollowup": false,
+  "remaining": "Actual scoped reviews and a complete passing existing Jenkins build before runtime; no client/native acceptance claim"
+}
