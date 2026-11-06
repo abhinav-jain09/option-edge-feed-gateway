@@ -108,6 +108,37 @@ public final class GatewaySettings {
 
     public boolean rithmicDepthEnabled() {return boolValue("GATEWAY_RITHMIC_DEPTH_ENABLED",false);}
 
+    // ---- Line health (level-absorption-service line-health loop; docs line-health requirement LH-O-6) ----
+
+    /**
+     * Master switch of the line-health relay: the four topics below are consumed, the frames {@code line-health-state}, {@code line-health-event},
+     * {@code line-health-voice} and {@code line-health-status} are broadcast, the hello gains the field {@code lineHealth} and the message
+     * {@code line-health-resume} is answered. OFF by default; when off nothing is consumed, nothing is cached and the hello has no such field.
+     */
+    public boolean lineHealthRelayEnabled() {
+        return boolValue("LINE_HEALTH_RELAY_ENABLED", false);
+    }
+
+    /** futures.line-health.state ({@code LineHealthState}, fixed schema id 3701): the latest state of each line, compacted. */
+    public String lineHealthStateTopic() {
+        return value("LINE_HEALTH_STATE_TOPIC", "futures.line-health.state");
+    }
+
+    /** futures.line-health.events ({@code LineHealthEvent}, fixed schema id 3702): every state change. */
+    public String lineHealthEventsTopic() {
+        return value("LINE_HEALTH_EVENTS_TOPIC", "futures.line-health.events");
+    }
+
+    /** futures.line-health.voice ({@code LineHealthVoice}, fixed schema id 3703): the spoken text of an event. */
+    public String lineHealthVoiceTopic() {
+        return value("LINE_HEALTH_VOICE_TOPIC", "futures.line-health.voice");
+    }
+
+    /** futures.line-health.status ({@code LineHealthStatus}, fixed schema id 3705): the one-second heartbeat, compacted. */
+    public String lineHealthStatusTopic() {
+        return value("LINE_HEALTH_STATUS_TOPIC", "futures.line-health.status");
+    }
+
     // ---- ES book liquidity walls (es-liquidity-wall-service; ES Book Liquidity Walls Requirements rev 11 section 8 "Gateway and page") ----
 
     /**
