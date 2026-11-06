@@ -13732,11 +13732,6 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** The hello with the strike authority field its caller captured — for a socket, in sequence with the control frames. */
-    String cvdHelloJson(String footprintStrikeField) {
-        return cvdHelloJson(footprintStrikeField, null);
-    }
-
-    /** {@code lineHealthOwnerTag}: the tag of the socket this hello is for (null: no subject, so the line-health field carries system lines only). */
     String cvdHelloJson(String footprintStrikeField, String lineHealthOwnerTag) {
         StringBuilder sb = new StringBuilder("{\"sessionDate\":");
         String sd = cvdBarsSessionDate;
@@ -14077,26 +14072,6 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The line-health relay's fan-out: the four {@code line-health-*} frames are global and never coalesced (every record counts for the page's gap detection). */
     void streamLineHealth(String event, String json) {broadcast(event, json);}
-
-    /** Session attribute holding the owner tag of the socket's authenticated subject (set once by the handler); absent when the socket has no subject. */
-    static final String LINE_HEALTH_OWNER_TAG_ATTR = "lineHealth.ownerTag";
-
-    /** The owner tag of a socket, or null when it has none (it then receives no user-line record). */
-    static String lineHealthOwnerTag(WebSocketSession session) {
-        if (session == null) return null;
-        Object tag = session.getAttributes().get(LINE_HEALTH_OWNER_TAG_ATTR);
-        return tag instanceof String text && !text.isBlank() ? text : null;
-    }
-
-    /** LH-O-6: a user-line frame reaches only the sockets whose owner tag equals {@code ownerTag}. */
-    void streamLineHealthTo(String ownerTag, String event, String json) {
-        if (ownerTag == null || ownerTag.isBlank()) return;
-        for (WebSocketSession client : clients) {
-            if (ownerTag.equals(lineHealthOwnerTag(client))) {
-                send(client, event, json);
-            }
-        }
-    }
 
     private void broadcast(String event, String json) {
         // Per-session routing: only explicitly allowlisted global events may fan out to every
@@ -17094,5 +17069,30 @@ public class FeedGatewayService implements ReplayRunner {
     void swapActiveSelectionForTest(String source, String symbol, String expiry, long epoch) {
         long now = System.currentTimeMillis();
         activeSelection.set(new ActiveSelection(source, symbol, expiry, epoch, now));
+    }
+
+    /** The hello without a socket: the line-health field carries system lines only (the tag of a socket is passed by the two-argument form). */
+    String cvdHelloJson(String footprintStrikeField) {
+        return cvdHelloJson(footprintStrikeField, null);
+    }
+
+    /** Session attribute holding the owner tag of the socket's authenticated subject (set once by the handler); absent when the socket has no subject. */
+    static final String LINE_HEALTH_OWNER_TAG_ATTR = "lineHealth.ownerTag";
+
+    /** The owner tag of a socket, or null when it has none (it then receives no user-line record). */
+    static String lineHealthOwnerTag(WebSocketSession session) {
+        if (session == null) return null;
+        Object tag = session.getAttributes().get(LINE_HEALTH_OWNER_TAG_ATTR);
+        return tag instanceof String text && !text.isBlank() ? text : null;
+    }
+
+    /** LH-O-6: a user-line frame reaches only the sockets whose owner tag equals {@code ownerTag}. */
+    void streamLineHealthTo(String ownerTag, String event, String json) {
+        if (ownerTag == null || ownerTag.isBlank()) return;
+        for (WebSocketSession client : clients) {
+            if (ownerTag.equals(lineHealthOwnerTag(client))) {
+                send(client, event, json);
+            }
+        }
     }
 }
