@@ -175,6 +175,43 @@ class RecoveryTest(unittest.TestCase):
                 m.recover(self.root, NOW, active)
         self.assertTrue(all(p.is_dir() for p in old))
 
+    def proc_state(self, state="Z", start="19446"):
+        proc = self.root / "80884"
+        proc.mkdir()
+        (proc / "stat").write_text("80884 (java (old)) " + state + " " + "0 " * 18 + start + " 0\n")
+        return proc
+
+    def test_confirmed_zombie_with_missing_cwd_cannot_block_recovery(self):
+        old = self.four()
+        self.proc_state()
+        with patch.object(m.os, "readlink", side_effect=FileNotFoundError):
+            self.assertEqual([], m.process_directories(self.root))
+        self.assertEqual(3, len(m.recover(self.root, NOW, [])))
+        self.assertFalse(old[0].exists())
+        self.assertEqual(bytes(range(256)), (self.root / m.QUARANTINE / old[0].name / "evidence.bin").read_bytes())
+
+    def test_running_process_with_missing_cwd_is_never_ignored(self):
+        self.proc_state("R")
+        with patch.object(m.os, "readlink", side_effect=FileNotFoundError):
+            with self.assertRaises(RuntimeError):
+                m.process_directories(self.root)
+
+    def test_unreadable_malformed_and_changed_zombie_state_fail_closed(self):
+        proc = self.proc_state()
+        for raw in [b"bad", b"80884 (java) Z", b"80884 (java) Z " + b"1 " * 3000]:
+            (proc / "stat").write_bytes(raw)
+            with patch.object(m.os, "readlink", side_effect=FileNotFoundError):
+                with self.assertRaises(RuntimeError):
+                    m.process_directories(self.root)
+        with patch.object(Path, "open", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                m.confirmed_zombie(proc, proc.stat())
+        good = b"80884 (java) Z " + b"0 " * 18
+        from io import BytesIO
+        with patch.object(Path, "open", side_effect=[BytesIO(good + b"123"), BytesIO(good + b"124")]):
+            with self.assertRaises(RuntimeError):
+                m.confirmed_zombie(proc, proc.stat())
+
     def test_cli_refuses_every_root_other_than_fixed_es4_root(self):
         old = self.four()
         result = subprocess.run([sys.executable, str(SOURCE), str(self.root)], capture_output=True)

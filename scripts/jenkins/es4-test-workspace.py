@@ -59,6 +59,31 @@ def process_cwd(proc):
     return value
 
 
+def confirmed_zombie(proc, before):
+    """A Linux Z task has exited and has no cwd or open descriptors to use."""
+    def identity():
+        with (proc / "stat").open("rb") as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise RuntimeError("Oversized process state")
+        # comm may contain spaces or parentheses; numeric fields follow its final ')'.
+        end = raw.rfind(b")")
+        if end < 0 or raw.split(b" ", 1)[0] != os.fsencode(proc.name):
+            raise RuntimeError("Invalid process state")
+        fields = raw[end + 1:].split()
+        if len(fields) < 20 or not fields[19].isdigit():
+            raise RuntimeError("Incomplete process state")
+        return fields[0], fields[19]
+    first = identity()
+    after = proc.stat()
+    if (before.st_uid, before.st_ino, before.st_dev) != (after.st_uid, after.st_ino, after.st_dev) or after.st_uid != os.getuid():
+        raise RuntimeError("Process changed while checking terminal state")
+    second = identity()
+    if first != second:
+        raise RuntimeError("Process terminal state changed during inspection")
+    return first[0] == b"Z"
+
+
 def process_directories(proc_root=Path("/proc")):
     result = []
     for proc in proc_root.iterdir():
@@ -70,11 +95,24 @@ def process_directories(proc_root=Path("/proc")):
             result.append(process_cwd(proc))
         except FileNotFoundError:
             try:
-                proc.stat()
+                before = proc.stat()
             except FileNotFoundError:
                 continue  # confirmed process exit, not an inspection failure
             except OSError as error:
                 raise RuntimeError("Cannot confirm exited user process") from error
+            try:
+                if confirmed_zombie(proc, before):
+                    continue
+            except FileNotFoundError:
+                try:
+                    proc.stat()
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise RuntimeError("Cannot confirm process disappearance") from error
+                raise RuntimeError("Process state missing while PID remains")
+            except OSError as error:
+                raise RuntimeError("Cannot inspect terminal process state") from error
             raise RuntimeError("User process directory is unreadable while PID remains")
         except PermissionError as error:
             raise RuntimeError("Cannot exclude an active user process") from error
