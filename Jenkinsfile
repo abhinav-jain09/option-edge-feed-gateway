@@ -209,15 +209,24 @@ pipeline {
               sh 'PERMITTED_SHA="${CONTRACTS_PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir .deps/options-edge-contracts --allow-ignored target'
             }
             sh 'mvn -B -f .deps/options-edge-contracts/pom.xml install'
-            // Run source tests as before, then consume exactly the retained release used by web.
-            sh 'python3 scripts/jenkins/gateway-contracts-artifact-test.py'
-            sh 'python3 scripts/jenkins/gateway-contracts-artifact.py prepare'
-            // A preceding image build can leave this ignored cache before the Test stage's cleanup.
+            // Keep source tests, then qualify the same immutable release consumed by web.
+            // Remove prior-image output before this stage's first primary-source check.
             sh 'rm -rf ci/jib-image/target'
             timeout(time: 10, unit: 'MINUTES') {
               sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
             }
+            sh 'python3 scripts/jenkins/gateway-contracts-artifact-test.py'
+            timeout(time: 10, unit: 'MINUTES') {
+              sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+            }
+            sh 'python3 scripts/jenkins/gateway-contracts-artifact.py prepare'
+            timeout(time: 10, unit: 'MINUTES') {
+              sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+            }
             sh 'mvn -B -Dmaven.repo.local="$WORKSPACE/.m2/repository" org.apache.maven.plugins:maven-install-plugin:3.1.3:install-file -Dfile=.jenkins-tmp/contracts-release/current.jar -DpomFile=.jenkins-tmp/contracts-release/current.pom -DlocalRepositoryPath="$WORKSPACE/.m2/repository" -DgeneratePom=false'
+            timeout(time: 10, unit: 'MINUTES') {
+              sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+            }
             sh 'python3 scripts/jenkins/gateway-contracts-artifact.py verify-installed'
             archiveArtifacts artifacts: '.jenkins-tmp/contracts-release/provenance.json', fingerprint: true
 

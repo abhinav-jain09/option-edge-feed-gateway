@@ -119,12 +119,12 @@ class ArtifactTests(unittest.TestCase):
 
     def test_prior_image_cache_is_removed_before_the_qualified_install_guard(self):
         source=(M.ROOT/'Jenkinsfile').read_text()
-        prepare=source.index("sh 'python3 scripts/jenkins/gateway-contracts-artifact.py prepare'")
-        install=source.index("sh 'mvn -B -Dmaven.repo.local=",prepare)
-        between=source[prepare:install]
+        source_install=source.index("sh 'mvn -B -f .deps/options-edge-contracts/pom.xml install'")
+        first_test=source.index("sh 'python3 scripts/jenkins/gateway-contracts-artifact-test.py'",source_install)
+        between=source[source_install:first_test]
         cleanup=between.index("sh 'rm -rf ci/jib-image/target'")
         verify=between.index('verify-permitted-tree.sh')
-        self.assertLess(cleanup,verify,'the prior-image output must be gone at the new primary-source check')
+        self.assertLess(cleanup,verify,'prior image output must be gone at the first new primary-source check')
         self.assertNotIn('--allow-ignored ci/jib-image/target',between,'do not admit prior image output as source')
 
     def test_property_pin_is_resolved_and_mismatch_rejected(self):
