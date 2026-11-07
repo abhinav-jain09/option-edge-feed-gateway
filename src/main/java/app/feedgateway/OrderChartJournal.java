@@ -22,7 +22,7 @@ final class OrderChartJournal implements AutoCloseable {
     OrderChartJournal(){this(GLOBAL_BYTES);}
     OrderChartJournal(long globalLimit){if(globalLimit<1)throw new IllegalArgumentException("journal capacity");this.globalLimit=globalLimit;}
     synchronized Scope attach(){return attach(0);}
-    synchronized Scope attach(long baseline){if(baseline<0||baseline==Long.MAX_VALUE)throw new IllegalArgumentException("journal baseline");if(closed||scopes.size()>=MAX_SCOPES)return null;var scope=new Scope();scope.revision=baseline;scopes.add(scope);return scope;}
+    synchronized Scope attach(long baseline){if(baseline<0||baseline>OrderChartWireCodec.MAX_REVISION)throw new IllegalArgumentException("journal baseline");if(closed||scopes.size()>=MAX_SCOPES)return null;var scope=new Scope();scope.revision=baseline;scopes.add(scope);return scope;}
     synchronized long reservedBytes(){return bytes;}
     synchronized long reservedPinBytes(){return pinBytes;}
     synchronized int retainedScopes(){return scopes.size();}
@@ -37,7 +37,7 @@ final class OrderChartJournal implements AutoCloseable {
         boolean append(long nextRevision,byte[] payload){
             Objects.requireNonNull(payload);
             synchronized(OrderChartJournal.this){
-                if(closed||!active||nextRevision<=0||revision==Long.MAX_VALUE||nextRevision!=revision+1)return false;
+                if(closed||!active||nextRevision<=0||revision>=OrderChartWireCodec.MAX_REVISION||nextRevision!=revision+1)return false;
                 long charge=(long)payload.length+ENTRY_OVERHEAD;
                 if(payload.length==0||charge>SCOPE_BYTES||charge>globalLimit)return false;
                 long freed=0;int freedCount=0;var evict=new ArrayList<Entry>();
@@ -57,7 +57,7 @@ final class OrderChartJournal implements AutoCloseable {
         /** An oversized source change advances authority but deliberately invalidates earlier cursors. */
         boolean nonreplayable(long nextRevision){
             synchronized(OrderChartJournal.this){
-                if(closed||!active||nextRevision<=0||revision==Long.MAX_VALUE||nextRevision!=revision+1)return false;
+                if(closed||!active||nextRevision<=0||revision>=OrderChartWireCodec.MAX_REVISION||nextRevision!=revision+1)return false;
                 for(Entry entry:replay){entry.retired=true;if(entry.pins==0)release(entry);}
                 replay.clear();revision=nextRevision;return true;
             }

@@ -51,7 +51,7 @@ final class OutboundIdleDispatcher implements AutoCloseable {
     }
 
     void signalIdle() {
-        synchronized (lock) { if (closed) return; for (Registration entry : owners.values()) entry.ready = true; }
+        synchronized (lock) { if (closed || owners.isEmpty()) return; for (Registration entry : owners.values()) entry.ready = true; }
         retry();
     }
 
@@ -59,7 +59,9 @@ final class OutboundIdleDispatcher implements AutoCloseable {
     void retry() {
         Work work;
         synchronized (lock) {
-            if (closed || scheduled != null || owners.values().stream().noneMatch(entry -> entry.ready)) return;
+            if (closed || scheduled != null || owners.isEmpty()) return;
+            boolean ready=false;for(Registration entry:owners.values())if(entry.ready){ready=true;break;}
+            if(!ready)return;
             work = new Work(); scheduled = work;
         }
         try { executor.execute(work); }

@@ -70,4 +70,10 @@ class OrderChartJournalTest {
         byte[] copy=new byte[1];pin.copyTo(copy,0);assertEquals(7,copy[0]);scope.close();assertFalse(scope.nonreplayable(902));pin.close();assertEquals(0,journal.reservedBytes());
     }
 
+    @Test void journalAndWireUseTheSameSafeRevisionCeiling(){
+        var journal=new OrderChartJournal();long max=OrderChartWireCodec.MAX_REVISION;
+        assertThrows(IllegalArgumentException.class,()->journal.attach(max+1));var scope=journal.attach(max-1);assertTrue(scope.append(max,new byte[1]));assertFalse(scope.append(max+1,new byte[1]));assertFalse(scope.nonreplayable(max+1));
+        var seeded=journal.attach(max);assertTrue(seeded.pinAfter(max).isEmpty());assertFalse(seeded.append(max+1,new byte[1]));journal.close();assertEquals(0,journal.reservedBytes());
+    }
+
 }

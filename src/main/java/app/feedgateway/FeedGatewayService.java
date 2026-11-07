@@ -138,6 +138,7 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String,WebSocketSession> nativeHistorySubscribers=new ConcurrentHashMap<>();
     private volatile ExecutorService outboundWriters;
     private volatile ExecutorService chartPublicationExecutor;
+    private volatile ExecutorService compatibilityPublicationExecutor;
     private volatile java.util.concurrent.Executor outboundIdleOverride;
     private static final Object VOL_PREMIUM_IDLE_OWNER=new Object();
     private volatile java.util.concurrent.Executor outboundWriterOverride; // test seam (caller-runs)
@@ -1623,6 +1624,7 @@ public class FeedGatewayService implements ReplayRunner {
         outbound.clear();
         shutdownExecutorGracefully(outboundWriters);
         shutdownExecutorGracefully(chartPublicationExecutor);
+        shutdownExecutorGracefully(compatibilityPublicationExecutor);
         sellerActivityStore.close();
         volPremiumStore.close();
     }
@@ -1647,7 +1649,7 @@ public class FeedGatewayService implements ReplayRunner {
     public void addClient(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
-        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(), outboundCloserExecutor(), outboundIdleExecutor(),
+        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(), outboundCloserExecutor(), outboundIdleExecutor(), outboundCompatibilityExecutor(),
                 settings.wsMaxQueuedMessages(), settings.wsMaxQueuedBytes(), outboundMetrics, this::onSlowDisconnect);
         outbound.put(session.getId(), channel);
         clients.add(session);
@@ -2067,6 +2069,21 @@ public class FeedGatewayService implements ReplayRunner {
                         new java.util.concurrent.ArrayBlockingQueue<>(256),task->{var thread=new Thread(task,"options-edge-chart-publication");thread.setDaemon(true);return thread;},
                         new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
                 chartPublicationExecutor=executor;
+            }
+        }
+        return executor;
+    }
+
+    private java.util.concurrent.Executor outboundCompatibilityExecutor() {
+        var override=outboundIdleOverride;if(override!=null)return override;
+        ExecutorService executor=compatibilityPublicationExecutor;
+        if(executor==null)synchronized(this){
+            executor=compatibilityPublicationExecutor;
+            if(executor==null){
+                executor=new java.util.concurrent.ThreadPoolExecutor(2,2,0L,TimeUnit.MILLISECONDS,
+                        new java.util.concurrent.ArrayBlockingQueue<>(256),task->{var thread=new Thread(task,"options-edge-compatibility-publication");thread.setDaemon(true);return thread;},
+                        new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+                compatibilityPublicationExecutor=executor;
             }
         }
         return executor;

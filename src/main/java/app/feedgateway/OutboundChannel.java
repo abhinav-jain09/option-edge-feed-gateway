@@ -163,9 +163,10 @@ final class OutboundChannel {
      * New owners fail independently; legacy compatibility hooks retry only on a later idle event.
      */
     private final OutboundIdleDispatcher idleDispatcher;
+    private final OutboundIdleDispatcher compatibilityDispatcher;
     private final Map<Object, IdleCompat> idleCompat = new LinkedHashMap<>();
     private final Object legacyIdleOwner = new Object();
-    private static final class IdleCompat { OutboundIdleDispatcher.Registration registration; }
+    private static final class IdleCompat { OutboundIdleDispatcher.Registration registration,compatibility; }
 
     OutboundChannel(WebSocketSession session, Executor writers, int maxMessages, long maxBytes,
                     Metrics metrics, Consumer<OutboundChannel> onClose) {
@@ -180,6 +181,11 @@ final class OutboundChannel {
 
     OutboundChannel(WebSocketSession session, Executor writers, Executor closers, Executor idlers, int maxMessages, long maxBytes,
                     Metrics metrics, Consumer<OutboundChannel> onClose) {
+        this(session,writers,closers,idlers,idlers,maxMessages,maxBytes,metrics,onClose);
+    }
+
+    OutboundChannel(WebSocketSession session, Executor writers, Executor closers, Executor idlers, Executor compatibilityIdlers,
+                    int maxMessages, long maxBytes, Metrics metrics, Consumer<OutboundChannel> onClose) {
         this.socketId = session.getId();
         this.session = session;
         this.writers = writers;
@@ -189,6 +195,7 @@ final class OutboundChannel {
         this.metrics = metrics;
         this.onClose = onClose;
         this.idleDispatcher = new OutboundIdleDispatcher(idlers);
+        this.compatibilityDispatcher = new OutboundIdleDispatcher(compatibilityIdlers);
     }
 
     String socketId() {
@@ -231,18 +238,26 @@ final class OutboundChannel {
     boolean onIdle(Object owner,Runnable hook) {
         synchronized(lock){
             if(closed.get())return false;
-            if(hook==null){IdleCompat old=idleCompat.remove(owner);if(old!=null)old.registration.close();return true;}
+            if(hook==null){IdleCompat old=idleCompat.remove(owner);if(old!=null){old.registration.close();old.compatibility.close();}return true;}
             IdleCompat entry=new IdleCompat();
-            entry.registration=idleDispatcher.register(owner,()->{if(!closed.get())try{hook.run();}catch(RuntimeException|Error ignored){/* Legacy hooks survive for the next idle event; no immediate retry. */}},()->{synchronized(lock){idleCompat.remove(owner,entry);}});
-            if(entry.registration==null)return false;
+            Runnable failed=()->{synchronized(lock){if(idleCompat.remove(owner,entry)){if(entry.registration!=null)entry.registration.close();if(entry.compatibility!=null)entry.compatibility.close();}}};
+            entry.compatibility=compatibilityDispatcher.register(owner,()->{
+                synchronized(lock){if(closed.get()||idleCompat.get(owner)!=entry)return;}
+                try{hook.run();}catch(RuntimeException ignored){/* Retry only on a later idle; fatal Errors remove this owner. */}
+            },failed);
+            if(entry.compatibility==null)return false;
+            // Only the constant-time wake runs on the chart pool. The potentially blocking pump is isolated.
+            entry.registration=idleDispatcher.register(owner,entry.compatibility::wake,failed);
+            if(entry.registration==null){entry.compatibility.close();return false;}
             idleCompat.put(owner,entry);return true;
         }
     }
+
     OutboundIdleDispatcher.Registration registerIdleOwner(Object owner,Runnable hook,Runnable failed) {
         if(closed.get())return null;
         return idleDispatcher.register(owner,()->{if(!closed.get())hook.run();},failed);
     }
-    void retryIdleDispatch(){idleDispatcher.retry();}
+    void retryIdleDispatch(){idleDispatcher.retry();compatibilityDispatcher.retry();}
 
     /**
      * Enqueue an envelope for asynchronous delivery. Never blocks on network I/O. {@code coalesceKey != null}
@@ -567,6 +582,7 @@ final class OutboundChannel {
     /** Logical teardown releases queued ownership; the active writer keeps its own lease. */
     private int discardPending() {
         idleDispatcher.close();
+        compatibilityDispatcher.close();
         int dropped;
         var charts=new java.util.ArrayList<Pending>(ChartOutboundBudget.OWNER_FRAMES);
         synchronized (lock) {

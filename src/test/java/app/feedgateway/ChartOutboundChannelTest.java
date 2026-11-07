@@ -130,4 +130,24 @@ class ChartOutboundChannelTest {
         assertTrue(c.enqueue("other stream",null));writes.all();verify(socket,times(1)).sendMessage(any());
     }
 
+    @Test void concurrentAdmissionAndNormalCloseNeverLeakChartOwnership()throws Exception{
+        for(int round=0;round<25;round++){
+            var writes=new OutboundIdleDispatcherTest.Manual();var budget=new ChartOutboundBudget(()->{});var owner=budget.attach();var c=channel(session(),writes,new Metrics(),100,1<<20);var ready=new CountDownLatch(1);var workers=Executors.newFixedThreadPool(2);
+            try{var producer=workers.submit(()->{try{ready.await();}catch(InterruptedException e){throw new AssertionError(e);}for(int n=0;n<20;n++)c.tryEnqueueChartBinary(new byte[64],()->true,owner);});var closer=workers.submit(()->{ready.countDown();c.shutdown();owner.close();});producer.get(5,TimeUnit.SECONDS);closer.get(5,TimeUnit.SECONDS);writes.all();assertEquals(0,budget.reservedBytes());assertEquals(0,budget.retainedOwners());}
+            finally{workers.shutdownNow();}
+        }
+    }
+
+    @Test void compatibilityReplacementFencesAnAlreadyScheduledOldPoolTask(){
+        var writes=new OutboundIdleDispatcherTest.Manual();var chart=new OutboundIdleDispatcherTest.Manual();var compat=new OutboundIdleDispatcherTest.Manual();var c=new OutboundChannel(session(),writes,task->{},chart,compat,100,1<<20,new Metrics(),ignored->{});var old=new AtomicInteger();var replacement=new AtomicInteger();Object key=new Object();
+        assertTrue(c.onIdle(key,old::incrementAndGet));c.enqueue("first",null);writes.all();chart.all();assertFalse(compat.tasks.isEmpty());
+        assertTrue(c.onIdle(key,replacement::incrementAndGet));compat.all();assertEquals(0,old.get());assertEquals(0,replacement.get());
+        c.enqueue("second",null);writes.all();chart.all();compat.all();assertEquals(0,old.get());assertEquals(1,replacement.get());
+    }
+    @Test void compatibilityAndChartShareOneFourOwnerAdmissionLimit(){
+        var tasks=new OutboundIdleDispatcherTest.Manual();var c=new OutboundChannel(session(),tasks,task->{},tasks,tasks,100,1<<20,new Metrics(),ignored->{});var count=new AtomicInteger();
+        for(int n=0;n<4;n++)assertNotNull(c.registerIdleOwner(new Object(),count::incrementAndGet,()->fail("chart")));
+        assertFalse(c.onIdle(new Object(),()->fail("fifth owner")));c.enqueue("quote",null);tasks.all();assertEquals(4,count.get());c.shutdown();
+    }
+
 }
