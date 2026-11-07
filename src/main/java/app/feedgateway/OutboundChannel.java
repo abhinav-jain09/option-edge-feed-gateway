@@ -108,7 +108,17 @@ final class OutboundChannel {
 
     private enum CloseReason { OVERFLOW, WRITE_ERROR, AUTH_REVOKED }
 
-    private record Pending(WebSocketMessage<?> message,int bytes,BooleanSupplier authorized,RithmicHistoryInvalidation invalidation) {
+    private static final class ChartCopy {
+        final ChartOutboundBudget.Lease lease;
+        final ChartOutboundBudget.Owner owner;
+        final AtomicBoolean released = new AtomicBoolean();
+        boolean counted;
+        ChartCopy(ChartOutboundBudget.Lease lease,ChartOutboundBudget.Owner owner) { this.lease = lease; this.owner=owner; }
+    }
+    private record Pending(WebSocketMessage<?> message,int bytes,BooleanSupplier authorized,RithmicHistoryInvalidation invalidation,ChartCopy chart) {
+        Pending(WebSocketMessage<?> message,int bytes,BooleanSupplier authorized,RithmicHistoryInvalidation invalidation) {
+            this(message,bytes,authorized,invalidation,null);
+        }
     }
     private record Insert(boolean overflow,boolean startDrain) {}
     enum HistoryAdmission { ENQUEUED, BUSY, CAPACITY, CLOSED }
@@ -138,6 +148,8 @@ final class OutboundChannel {
     private final Object lock = new Object();
     private final LinkedHashMap<String, Pending> queue = new LinkedHashMap<>();
     private long queuedBytes;
+    private long chartOwnedBytes;
+    private int chartOwnedFrames;
     private long seq;
     private boolean draining;
     private long peakDepth;
@@ -147,11 +159,14 @@ final class OutboundChannel {
     private final AtomicInteger teardownState = new AtomicInteger(TEARDOWN_NONE);
     private final AtomicBoolean tornDown = new AtomicBoolean(false);
     /**
-     * Run each time the writer drains this queue EMPTY — the one moment a producer that paces itself
-     * against this socket's bounds knows there is room again. Set only while such a producer is active
-     * (the vol-premium session replay); null otherwise, which costs one volatile read per idle.
+     * Independent bounded producers are scheduled outside the writer and channel lock after drain.
+     * New owners fail independently; legacy compatibility hooks retry only on a later idle event.
      */
-    private volatile Runnable onIdle;
+    private final OutboundIdleDispatcher idleDispatcher;
+    private final OutboundIdleDispatcher compatibilityDispatcher;
+    private final Map<Object, IdleCompat> idleCompat = new LinkedHashMap<>();
+    private final Object legacyIdleOwner = new Object();
+    private static final class IdleCompat { OutboundIdleDispatcher.Registration registration,compatibility; }
 
     OutboundChannel(WebSocketSession session, Executor writers, int maxMessages, long maxBytes,
                     Metrics metrics, Consumer<OutboundChannel> onClose) {
@@ -161,6 +176,16 @@ final class OutboundChannel {
     /** {@code closers} runs each teardown (session close, then {@code onClose}); it must not be the caller's thread in production. */
     OutboundChannel(WebSocketSession session, Executor writers, Executor closers, int maxMessages, long maxBytes,
                     Metrics metrics, Consumer<OutboundChannel> onClose) {
+        this(session,writers,closers,writers,maxMessages,maxBytes,metrics,onClose);
+    }
+
+    OutboundChannel(WebSocketSession session, Executor writers, Executor closers, Executor idlers, int maxMessages, long maxBytes,
+                    Metrics metrics, Consumer<OutboundChannel> onClose) {
+        this(session,writers,closers,idlers,idlers,maxMessages,maxBytes,metrics,onClose);
+    }
+
+    OutboundChannel(WebSocketSession session, Executor writers, Executor closers, Executor idlers, Executor compatibilityIdlers,
+                    int maxMessages, long maxBytes, Metrics metrics, Consumer<OutboundChannel> onClose) {
         this.socketId = session.getId();
         this.session = session;
         this.writers = writers;
@@ -169,6 +194,8 @@ final class OutboundChannel {
         this.maxBytes = Math.max(1L, maxBytes);
         this.metrics = metrics;
         this.onClose = onClose;
+        this.idleDispatcher = new OutboundIdleDispatcher(idlers);
+        this.compatibilityDispatcher = new OutboundIdleDispatcher(compatibilityIdlers);
     }
 
     String socketId() {
@@ -200,12 +227,37 @@ final class OutboundChannel {
 
     /**
      * Install (or clear, with null) the hook run each time the writer drains the queue empty. It runs on
-     * the writer thread, OUTSIDE this channel's lock, so it may enqueue again — a producer that paces a
+     * the publication executor, OUTSIDE this channel's lock, so it may enqueue again — a producer that paces a
      * large replay against this socket's bounds refills here instead of flooding the queue at once.
      */
     void onIdle(Runnable hook) {
-        this.onIdle = hook;
+        onIdle(legacyIdleOwner,hook);
     }
+
+    /** Compatibility owners cannot clear another producer's hook. New producers retain their registration handle. */
+    boolean onIdle(Object owner,Runnable hook) {
+        synchronized(lock){
+            if(closed.get())return false;
+            if(hook==null){IdleCompat old=idleCompat.remove(owner);if(old!=null){old.registration.close();old.compatibility.close();}return true;}
+            IdleCompat entry=new IdleCompat();
+            Runnable failed=()->{synchronized(lock){if(idleCompat.remove(owner,entry)){if(entry.registration!=null)entry.registration.close();if(entry.compatibility!=null)entry.compatibility.close();}}};
+            entry.compatibility=compatibilityDispatcher.register(owner,()->{
+                synchronized(lock){if(closed.get()||idleCompat.get(owner)!=entry)return;}
+                try{hook.run();}catch(RuntimeException ignored){/* Retry only on a later idle; fatal Errors remove this owner. */}
+            },failed);
+            if(entry.compatibility==null)return false;
+            // Only the constant-time wake runs on the chart pool. The potentially blocking pump is isolated.
+            entry.registration=idleDispatcher.register(owner,entry.compatibility::wake,failed);
+            if(entry.registration==null){entry.compatibility.close();return false;}
+            idleCompat.put(owner,entry);return true;
+        }
+    }
+
+    OutboundIdleDispatcher.Registration registerIdleOwner(Object owner,Runnable hook,Runnable failed) {
+        if(closed.get())return null;
+        return idleDispatcher.register(owner,()->{if(!closed.get())hook.run();},failed);
+    }
+    void retryIdleDispatch(){idleDispatcher.retry();compatibilityDispatcher.retry();}
 
     /**
      * Enqueue an envelope for asynchronous delivery. Never blocks on network I/O. {@code coalesceKey != null}
@@ -302,6 +354,47 @@ final class OutboundChannel {
         return finishInsert(inserted)?HistoryAdmission.ENQUEUED:HistoryAdmission.CLOSED;
     }
 
+    /** Atomic nonclosing chart admission. Other streams keep their existing overflow policy. */
+    HistoryAdmission tryEnqueueChartBinary(byte[] payload, BooleanSupplier authorized, ChartOutboundBudget.Owner owner) {
+        if(closed.get())return HistoryAdmission.CLOSED;
+        if(payload==null||payload.length==0||payload.length>Math.min(65_536L,maxBytes/4)||owner==null)return HistoryAdmission.CAPACITY;
+        if(!owner.active())return HistoryAdmission.BUSY;
+        if(!authorized(authorized)){close(CloseReason.AUTH_REVOKED);return HistoryAdmission.CLOSED;}
+        synchronized(lock){if(closed.get())return HistoryAdmission.CLOSED;if(!chartRoom(payload.length))return HistoryAdmission.BUSY;}
+        ChartOutboundBudget.Lease lease=owner.tryAcquire(payload.length);
+        if(lease==null)return HistoryAdmission.BUSY;
+        ChartCopy copy=null;Pending pending=null;boolean retained=false;
+        try {
+            copy=new ChartCopy(lease,owner);
+            pending=new Pending(new BinaryMessage(payload.clone()),payload.length,authorized,null,copy);
+            Insert inserted;
+            synchronized(lock){
+                if(closed.get())return HistoryAdmission.CLOSED;
+                if(!chartRoom(payload.length))return HistoryAdmission.BUSY;
+                chartOwnedBytes+=payload.length;chartOwnedFrames++;copy.counted=true;
+                inserted=insertLocked(pending,null);retained=true;
+            }
+            return finishInsert(inserted)?HistoryAdmission.ENQUEUED:HistoryAdmission.CLOSED;
+        } catch(RuntimeException|Error failed) {
+            if(pending!=null)synchronized(lock){retained=queue.containsValue(pending);}
+            close(CloseReason.WRITE_ERROR);
+            return HistoryAdmission.CLOSED;
+        } finally {
+            if(!retained){if(copy==null)lease.close();else releaseChart(copy,payload.length);}
+        }
+    }
+
+    /** Caller holds lock; includes any chart copy already handed to the blocking writer. */
+    private boolean chartRoom(int bytes) {
+        return chartOwnedFrames<ChartOutboundBudget.OWNER_FRAMES && chartOwnedBytes+bytes<=Math.min(ChartOutboundBudget.OWNER_BYTES,maxBytes/4)
+                && queue.size()+2<=maxMessages && queuedBytes+bytes+HISTORY_CONTROL_RESERVE<=maxBytes;
+    }
+    private void releaseChart(ChartCopy copy,int bytes) {
+        if(copy==null||!copy.released.compareAndSet(false,true))return;
+        synchronized(lock){if(copy.counted){chartOwnedBytes-=bytes;chartOwnedFrames--;copy.counted=false;}}
+        copy.lease.close();
+    }
+
     boolean enqueueHistoryInvalidation(RithmicHistoryInvalidation value,BooleanSupplier authorized){
         if(closed.get()||value==null)return false;
         if(!authorized(authorized)){close(CloseReason.AUTH_REVOKED);return false;}
@@ -334,12 +427,11 @@ final class OutboundChannel {
                 it.remove();
                 queuedBytes -= next.bytes();
             }
-            if (!session.isOpen()) {
-                close(CloseReason.WRITE_ERROR);
-                return;
-            }
             sendStartedAtMs = System.currentTimeMillis(); // arm the watchdog deadline
             try {
+                if(closed.get())return;
+                if(!session.isOpen()){close(CloseReason.WRITE_ERROR);return;}
+                if(next.chart()!=null&&!next.chart().owner.active())continue;
                 if(next.authorized()!=null&&!authorized(next.authorized())){close(CloseReason.AUTH_REVOKED);return;}
                 // Blocking write — but NEVER on the Kafka thread, so a slow socket cannot stall polling.
                 // If it exceeds the write deadline the watchdog force-closes the session, unblocking us.
@@ -350,19 +442,13 @@ final class OutboundChannel {
                 return;
             } finally {
                 sendStartedAtMs = 0;
+                releaseChart(next.chart(),next.bytes());
             }
         }
         // Idle, and outside the lock: the hook may enqueue (re-arming a drain) without deadlocking on it.
         // A closed channel never calls it — nothing it enqueued could be delivered. A hook that throws is
         // the hook's fault and must not unwind a writer-pool thread, which serves every other socket.
-        Runnable hook = onIdle;
-        if (hook != null && !closed.get()) {
-            try {
-                hook.run();
-            } catch (RuntimeException hookFailed) {
-                // the producer's own state decides what to do next; the socket stays healthy
-            }
-        }
+        if(!closed.get())idleDispatcher.signalIdle();
     }
 
     /**
@@ -384,12 +470,7 @@ final class OutboundChannel {
             return false;
         }
         if(reason==CloseReason.AUTH_REVOKED)authorizationClose=new CloseStatus(4001,"authorization unavailable");
-        int dropped;
-        synchronized (lock) {
-            dropped = queue.size();
-            queue.clear();
-            queuedBytes = 0;
-        }
+        int dropped=discardPending();
         if (reason == CloseReason.OVERFLOW) {
             metrics.disconnectedSlow();
         } else if(reason==CloseReason.WRITE_ERROR) {
@@ -495,10 +576,24 @@ final class OutboundChannel {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
+        discardPending();
+    }
+
+    /** Logical teardown releases queued ownership; the active writer keeps its own lease. */
+    private int discardPending() {
+        idleDispatcher.close();
+        compatibilityDispatcher.close();
+        int dropped;
+        var charts=new java.util.ArrayList<Pending>(ChartOutboundBudget.OWNER_FRAMES);
         synchronized (lock) {
+            dropped = queue.size();
+            idleCompat.clear();
+            for(Pending pending:queue.values())if(pending.chart()!=null)charts.add(pending);
             queue.clear();
             queuedBytes = 0;
         }
+        for(Pending pending:charts)releaseChart(pending.chart(),pending.bytes());
+        return dropped;
     }
 
     private void closeSessionQuietly() {
