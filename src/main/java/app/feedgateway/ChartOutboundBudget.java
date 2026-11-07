@@ -40,6 +40,7 @@ final class ChartOutboundBudget implements AutoCloseable {
         private boolean active=true;
         private int bytes, frames;
         private Owner() { }
+        boolean active(){synchronized(lock){return !closed&&active;}}
         Lease tryAcquire(int wireBytes) {
             synchronized (lock) {
                 if (closed || !active || wireBytes < 1 || wireBytes > ownerLimit || frames >= frameLimit

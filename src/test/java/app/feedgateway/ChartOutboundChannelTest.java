@@ -111,4 +111,23 @@ class ChartOutboundChannelTest {
         assertNull(c.registerIdleOwner(new Object(),()->{},()->{}));
     }
 
+    @Test void chartQuarterBudgetLeavesHeadroomForANormalMarketBurst(){
+        var writes=new OutboundIdleDispatcherTest.Manual();var c=channel(session(),writes,new Metrics(),100,256*1024);var budget=new ChartOutboundBudget(()->{});var owner=budget.attach();
+        assertEquals(OutboundChannel.HistoryAdmission.ENQUEUED,c.tryEnqueueChartBinary(new byte[65536],()->true,owner));
+        assertEquals(OutboundChannel.HistoryAdmission.BUSY,c.tryEnqueueChartBinary(new byte[1],()->true,owner));
+        assertTrue(c.enqueue("q".repeat(128*1024),null));assertFalse(c.isClosed());writes.all();assertEquals(0,budget.reservedBytes());
+    }
+    @Test void compatibilityHookSurvivesATransientFaultUntilTheNextIdle(){
+        var writes=new OutboundIdleDispatcherTest.Manual();var idles=new OutboundIdleDispatcherTest.Manual();var c=new OutboundChannel(session(),writes,task->{},idles,100,1<<20,new Metrics(),ignored->{});var count=new AtomicInteger();
+        c.onIdle(()->{if(count.incrementAndGet()==1)throw new IllegalStateException("transient");});
+        c.enqueue("first",null);writes.all();idles.all();assertEquals(1,count.get());assertTrue(idles.tasks.isEmpty());
+        c.enqueue("second",null);writes.all();idles.all();assertEquals(2,count.get());assertFalse(c.isClosed());
+    }
+    @Test void unsubscribeDiscardsQueuedChartCopiesWithoutRevokingSocketAuthorization()throws Exception{
+        var writes=new OutboundIdleDispatcherTest.Manual();var socket=session();var c=channel(socket,writes,new Metrics(),100,1<<20);var budget=new ChartOutboundBudget(()->{});var owner=budget.attach();
+        for(int n=0;n<2;n++)assertEquals(OutboundChannel.HistoryAdmission.ENQUEUED,c.tryEnqueueChartBinary(new byte[32],()->true,owner));owner.close();
+        assertEquals(OutboundChannel.HistoryAdmission.BUSY,c.tryEnqueueChartBinary(new byte[32],()->false,owner));writes.all();assertFalse(c.isClosed());assertEquals(0,budget.reservedBytes());assertEquals(0,budget.retainedOwners());verify(socket,never()).sendMessage(any());
+        assertTrue(c.enqueue("other stream",null));writes.all();verify(socket,times(1)).sendMessage(any());
+    }
+
 }

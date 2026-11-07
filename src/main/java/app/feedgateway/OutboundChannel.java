@@ -110,9 +110,10 @@ final class OutboundChannel {
 
     private static final class ChartCopy {
         final ChartOutboundBudget.Lease lease;
+        final ChartOutboundBudget.Owner owner;
         final AtomicBoolean released = new AtomicBoolean();
         boolean counted;
-        ChartCopy(ChartOutboundBudget.Lease lease) { this.lease = lease; }
+        ChartCopy(ChartOutboundBudget.Lease lease,ChartOutboundBudget.Owner owner) { this.lease = lease; this.owner=owner; }
     }
     private record Pending(WebSocketMessage<?> message,int bytes,BooleanSupplier authorized,RithmicHistoryInvalidation invalidation,ChartCopy chart) {
         Pending(WebSocketMessage<?> message,int bytes,BooleanSupplier authorized,RithmicHistoryInvalidation invalidation) {
@@ -158,9 +159,8 @@ final class OutboundChannel {
     private final AtomicInteger teardownState = new AtomicInteger(TEARDOWN_NONE);
     private final AtomicBoolean tornDown = new AtomicBoolean(false);
     /**
-     * Run each time the writer drains this queue EMPTY — the one moment a producer that paces itself
-     * against this socket's bounds knows there is room again. Set only while such a producer is active
-     * (the vol-premium session replay); null otherwise, which costs one volatile read per idle.
+     * Independent bounded producers are scheduled outside the writer and channel lock after drain.
+     * New owners fail independently; legacy compatibility hooks retry only on a later idle event.
      */
     private final OutboundIdleDispatcher idleDispatcher;
     private final Map<Object, IdleCompat> idleCompat = new LinkedHashMap<>();
@@ -220,7 +220,7 @@ final class OutboundChannel {
 
     /**
      * Install (or clear, with null) the hook run each time the writer drains the queue empty. It runs on
-     * the writer thread, OUTSIDE this channel's lock, so it may enqueue again — a producer that paces a
+     * the publication executor, OUTSIDE this channel's lock, so it may enqueue again — a producer that paces a
      * large replay against this socket's bounds refills here instead of flooding the queue at once.
      */
     void onIdle(Runnable hook) {
@@ -233,7 +233,7 @@ final class OutboundChannel {
             if(closed.get())return false;
             if(hook==null){IdleCompat old=idleCompat.remove(owner);if(old!=null)old.registration.close();return true;}
             IdleCompat entry=new IdleCompat();
-            entry.registration=idleDispatcher.register(owner,()->{if(!closed.get())hook.run();},()->{synchronized(lock){idleCompat.remove(owner,entry);}});
+            entry.registration=idleDispatcher.register(owner,()->{if(!closed.get())try{hook.run();}catch(RuntimeException|Error ignored){/* Legacy hooks survive for the next idle event; no immediate retry. */}},()->{synchronized(lock){idleCompat.remove(owner,entry);}});
             if(entry.registration==null)return false;
             idleCompat.put(owner,entry);return true;
         }
@@ -343,13 +343,14 @@ final class OutboundChannel {
     HistoryAdmission tryEnqueueChartBinary(byte[] payload, BooleanSupplier authorized, ChartOutboundBudget.Owner owner) {
         if(closed.get())return HistoryAdmission.CLOSED;
         if(payload==null||payload.length==0||payload.length>Math.min(65_536L,maxBytes/4)||owner==null)return HistoryAdmission.CAPACITY;
+        if(!owner.active())return HistoryAdmission.BUSY;
         if(!authorized(authorized)){close(CloseReason.AUTH_REVOKED);return HistoryAdmission.CLOSED;}
         synchronized(lock){if(closed.get())return HistoryAdmission.CLOSED;if(!chartRoom(payload.length))return HistoryAdmission.BUSY;}
         ChartOutboundBudget.Lease lease=owner.tryAcquire(payload.length);
         if(lease==null)return HistoryAdmission.BUSY;
         ChartCopy copy=null;Pending pending=null;boolean retained=false;
         try {
-            copy=new ChartCopy(lease);
+            copy=new ChartCopy(lease,owner);
             pending=new Pending(new BinaryMessage(payload.clone()),payload.length,authorized,null,copy);
             Insert inserted;
             synchronized(lock){
@@ -370,7 +371,7 @@ final class OutboundChannel {
 
     /** Caller holds lock; includes any chart copy already handed to the blocking writer. */
     private boolean chartRoom(int bytes) {
-        return chartOwnedFrames<ChartOutboundBudget.OWNER_FRAMES && chartOwnedBytes+bytes<=ChartOutboundBudget.OWNER_BYTES
+        return chartOwnedFrames<ChartOutboundBudget.OWNER_FRAMES && chartOwnedBytes+bytes<=Math.min(ChartOutboundBudget.OWNER_BYTES,maxBytes/4)
                 && queue.size()+2<=maxMessages && queuedBytes+bytes+HISTORY_CONTROL_RESERVE<=maxBytes;
     }
     private void releaseChart(ChartCopy copy,int bytes) {
@@ -415,6 +416,7 @@ final class OutboundChannel {
             try {
                 if(closed.get())return;
                 if(!session.isOpen()){close(CloseReason.WRITE_ERROR);return;}
+                if(next.chart()!=null&&!next.chart().owner.active())continue;
                 if(next.authorized()!=null&&!authorized(next.authorized())){close(CloseReason.AUTH_REVOKED);return;}
                 // Blocking write — but NEVER on the Kafka thread, so a slow socket cannot stall polling.
                 // If it exceeds the write deadline the watchdog force-closes the session, unblocking us.
@@ -566,16 +568,15 @@ final class OutboundChannel {
     private int discardPending() {
         idleDispatcher.close();
         int dropped;
-        Pending chartFirst=null,chartSecond=null;
+        var charts=new java.util.ArrayList<Pending>(ChartOutboundBudget.OWNER_FRAMES);
         synchronized (lock) {
             dropped = queue.size();
             idleCompat.clear();
-            for(Pending pending:queue.values())if(pending.chart()!=null){if(chartFirst==null)chartFirst=pending;else chartSecond=pending;}
+            for(Pending pending:queue.values())if(pending.chart()!=null)charts.add(pending);
             queue.clear();
             queuedBytes = 0;
         }
-        if(chartFirst!=null)releaseChart(chartFirst.chart(),chartFirst.bytes());
-        if(chartSecond!=null)releaseChart(chartSecond.chart(),chartSecond.bytes());
+        for(Pending pending:charts)releaseChart(pending.chart(),pending.bytes());
         return dropped;
     }
 

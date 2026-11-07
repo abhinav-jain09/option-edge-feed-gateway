@@ -21,14 +21,15 @@ final class OrderChartJournal implements AutoCloseable {
 
     OrderChartJournal(){this(GLOBAL_BYTES);}
     OrderChartJournal(long globalLimit){if(globalLimit<1)throw new IllegalArgumentException("journal capacity");this.globalLimit=globalLimit;}
-    synchronized Scope attach(){if(closed||scopes.size()>=MAX_SCOPES)return null;var scope=new Scope();scopes.add(scope);return scope;}
+    synchronized Scope attach(){return attach(0);}
+    synchronized Scope attach(long baseline){if(baseline<0||baseline==Long.MAX_VALUE)throw new IllegalArgumentException("journal baseline");if(closed||scopes.size()>=MAX_SCOPES)return null;var scope=new Scope();scope.revision=baseline;scopes.add(scope);return scope;}
     synchronized long reservedBytes(){return bytes;}
     synchronized long reservedPinBytes(){return pinBytes;}
     synchronized int retainedScopes(){return scopes.size();}
 
     final class Scope implements AutoCloseable {
-        private final ArrayDeque<Entry> replay=new ArrayDeque<>();
-        private final Set<Entry> owned=new HashSet<>();
+        private final ArrayDeque<Entry> replay=new ArrayDeque<>(SCOPE_ENTRIES);
+        private final Set<Entry> owned=new HashSet<>(256);
         private long reserved, revision;
         private boolean active=true;
         private Scope(){}
@@ -47,8 +48,10 @@ final class OrderChartJournal implements AutoCloseable {
                 if(reserved-freed+charge>SCOPE_BYTES||owned.size()-freedCount+1>SCOPE_ENTRIES||bytes-freed+charge>globalLimit)return false;
                 // Allocate before mutating the admitted cursor or eviction set.
                 Entry fresh=new Entry(nextRevision,payload.clone(),charge);
+                // Grow the node-based ownership structure before evicting any admitted history.
+                owned.add(fresh);
                 for(Entry entry:evict){replay.removeFirst();entry.retired=true;if(entry.pins==0)release(entry);}
-                replay.addLast(fresh);owned.add(fresh);reserved+=charge;bytes+=charge;revision=nextRevision;return true;
+                replay.addLast(fresh);reserved+=charge;bytes+=charge;revision=nextRevision;return true;
             }
         }
         /** An oversized source change advances authority but deliberately invalidates earlier cursors. */

@@ -64,4 +64,10 @@ class OrderChartJournalTest {
         journal.close();pin.close();next.forEach(OrderChartJournal.Pin::close);assertEquals(0,journal.reservedBytes());assertEquals(0,journal.reservedPinBytes());
     }
 
+    @Test void seededScopeRejectsEarlierCursorsAndKeepsPinValidAfterBadCopyArguments(){
+        var journal=new OrderChartJournal();var scope=journal.attach(900);assertNull(scope.pinAfter(899));assertTrue(scope.pinAfter(900).isEmpty());assertTrue(scope.append(901,new byte[]{7}));
+        var pin=scope.pinAfter(900).getFirst();assertThrows(IndexOutOfBoundsException.class,()->pin.copyTo(new byte[0],0));assertEquals(1,pin.size());assertEquals(64,journal.reservedPinBytes());
+        byte[] copy=new byte[1];pin.copyTo(copy,0);assertEquals(7,copy[0]);scope.close();assertFalse(scope.nonreplayable(902));pin.close();assertEquals(0,journal.reservedBytes());
+    }
+
 }
