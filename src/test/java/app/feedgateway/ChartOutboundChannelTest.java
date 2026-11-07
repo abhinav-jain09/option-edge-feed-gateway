@@ -102,4 +102,13 @@ class ChartOutboundChannelTest {
         c.enqueue("second",null);writes.all();c.revokeAuthorization();idles.all();assertEquals(1,vp.get());
         assertNull(c.registerIdleOwner(new Object(),()->fail("closed"),()->{}));
     }
+    @Test void normalShutdownReleasesQueuedCopiesAndCancelsIdleOwners(){
+        var writes=new OutboundIdleDispatcherTest.Manual();var idles=new OutboundIdleDispatcherTest.Manual();
+        var budget=new ChartOutboundBudget(()->{});var owner=budget.attach();var c=new OutboundChannel(session(),writes,task->{},idles,100,1<<20,new Metrics(),ignored->{});
+        var calls=new AtomicInteger();var registration=c.registerIdleOwner(new Object(),calls::incrementAndGet,()->fail("normal shutdown"));registration.wake();
+        for(int n=0;n<2;n++)assertEquals(OutboundChannel.HistoryAdmission.ENQUEUED,c.tryEnqueueChartBinary(new byte[1024],()->true,owner));
+        owner.close();assertEquals(1,budget.retainedOwners());c.shutdown();c.shutdown();assertEquals(0,budget.reservedBytes());assertEquals(0,budget.retainedOwners());writes.all();idles.all();assertEquals(0,calls.get());
+        assertNull(c.registerIdleOwner(new Object(),()->{},()->{}));
+    }
+
 }

@@ -453,18 +453,7 @@ final class OutboundChannel {
             return false;
         }
         if(reason==CloseReason.AUTH_REVOKED)authorizationClose=new CloseStatus(4001,"authorization unavailable");
-        idleDispatcher.close();
-        int dropped;
-        Pending chartFirst=null,chartSecond=null;
-        synchronized (lock) {
-            dropped = queue.size();
-            idleCompat.clear();
-            for(Pending pending:queue.values())if(pending.chart()!=null){if(chartFirst==null)chartFirst=pending;else chartSecond=pending;}
-            queue.clear();
-            queuedBytes = 0;
-        }
-        if(chartFirst!=null)releaseChart(chartFirst.chart(),chartFirst.bytes());
-        if(chartSecond!=null)releaseChart(chartSecond.chart(),chartSecond.bytes());
+        int dropped=discardPending();
         if (reason == CloseReason.OVERFLOW) {
             metrics.disconnectedSlow();
         } else if(reason==CloseReason.WRITE_ERROR) {
@@ -570,10 +559,24 @@ final class OutboundChannel {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
+        discardPending();
+    }
+
+    /** Logical teardown releases queued ownership; the active writer keeps its own lease. */
+    private int discardPending() {
+        idleDispatcher.close();
+        int dropped;
+        Pending chartFirst=null,chartSecond=null;
         synchronized (lock) {
+            dropped = queue.size();
+            idleCompat.clear();
+            for(Pending pending:queue.values())if(pending.chart()!=null){if(chartFirst==null)chartFirst=pending;else chartSecond=pending;}
             queue.clear();
             queuedBytes = 0;
         }
+        if(chartFirst!=null)releaseChart(chartFirst.chart(),chartFirst.bytes());
+        if(chartSecond!=null)releaseChart(chartSecond.chart(),chartSecond.bytes());
+        return dropped;
     }
 
     private void closeSessionQuietly() {
