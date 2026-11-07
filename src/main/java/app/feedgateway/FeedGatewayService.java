@@ -137,6 +137,9 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, OutboundChannel> outbound = new ConcurrentHashMap<>();
     private final Map<String,WebSocketSession> nativeHistorySubscribers=new ConcurrentHashMap<>();
     private volatile ExecutorService outboundWriters;
+    private volatile ExecutorService chartPublicationExecutor;
+    private volatile java.util.concurrent.Executor outboundIdleOverride;
+    private static final Object VOL_PREMIUM_IDLE_OWNER=new Object();
     private volatile java.util.concurrent.Executor outboundWriterOverride; // test seam (caller-runs)
     private volatile java.util.concurrent.Executor outboundCloserOverride; // test seam (a failing teardown hand-over)
     private final AtomicLong wsEnqueued = new AtomicLong();
@@ -1591,6 +1594,7 @@ public class FeedGatewayService implements ReplayRunner {
             }
             try {
                 channel.retryPendingTeardown();
+                channel.retryIdleDispatch();
             } catch (RuntimeException ignored) {
                 // never thrown (a failed hand-over stays pending); guarded like the deadline so the sweep goes on
             }
@@ -1618,6 +1622,7 @@ public class FeedGatewayService implements ReplayRunner {
         }
         outbound.clear();
         shutdownExecutorGracefully(outboundWriters);
+        shutdownExecutorGracefully(chartPublicationExecutor);
         sellerActivityStore.close();
         volPremiumStore.close();
     }
@@ -1642,7 +1647,7 @@ public class FeedGatewayService implements ReplayRunner {
     public void addClient(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
-        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(), outboundCloserExecutor(),
+        OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(), outboundCloserExecutor(), outboundIdleExecutor(),
                 settings.wsMaxQueuedMessages(), settings.wsMaxQueuedBytes(), outboundMetrics, this::onSlowDisconnect);
         outbound.put(session.getId(), channel);
         clients.add(session);
@@ -2049,6 +2054,22 @@ public class FeedGatewayService implements ReplayRunner {
     /** Visible for tests: run outbound writes inline (caller-runs) so delivery is synchronous + deterministic. */
     void runOutboundWritesInline() {
         outboundWriterOverride = Runnable::run;
+        outboundIdleOverride = Runnable::run;
+    }
+
+    private java.util.concurrent.Executor outboundIdleExecutor() {
+        var override=outboundIdleOverride;if(override!=null)return override;
+        ExecutorService executor=chartPublicationExecutor;
+        if(executor==null)synchronized(this){
+            executor=chartPublicationExecutor;
+            if(executor==null){
+                executor=new java.util.concurrent.ThreadPoolExecutor(2,2,0L,TimeUnit.MILLISECONDS,
+                        new java.util.concurrent.ArrayBlockingQueue<>(256),task->{var thread=new Thread(task,"options-edge-chart-publication");thread.setDaemon(true);return thread;},
+                        new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+                chartPublicationExecutor=executor;
+            }
+        }
+        return executor;
     }
 
     private java.util.concurrent.Executor outboundWriterExecutor() {
@@ -9226,7 +9247,7 @@ public class FeedGatewayService implements ReplayRunner {
                 VolPremiumDelivery d = e.getValue();
                 OutboundChannel channel = outbound.get(e.getKey());
                 if (channel != null) {
-                    channel.onIdle(null);
+                    channel.onIdle(VOL_PREMIUM_IDLE_OWNER,null);
                 }
                 if (d.cursor == null) {
                     continue;   // nothing handed over yet: its walk starts from the top when served
@@ -9284,7 +9305,7 @@ public class FeedGatewayService implements ReplayRunner {
         if (channel != null) {
             // Installed BEFORE the budget check below, so a writer that drains the queue between that
             // check and this pump's return still finds the hook and calls back.
-            channel.onIdle(() -> pumpVolPremium(socketId));
+            if(!channel.onIdle(VOL_PREMIUM_IDLE_OWNER,() -> pumpVolPremium(socketId)))return;
         }
         while (volPremiumDeliveries.get(socketId) == delivery) {
             if (channel != null) {
@@ -9315,7 +9336,7 @@ public class FeedGatewayService implements ReplayRunner {
             if (next == null) {
                 delivery.parked = true;
                 if (channel != null) {
-                    channel.onIdle(null);   // parked: nothing is owed until the next admission
+                    channel.onIdle(VOL_PREMIUM_IDLE_OWNER,null);   // parked: nothing is owed until the next admission
                 }
                 return;
             }
