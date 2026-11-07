@@ -175,6 +175,115 @@ class RecoveryTest(unittest.TestCase):
                 m.recover(self.root, NOW, active)
         self.assertTrue(all(p.is_dir() for p in old))
 
+    def proc_state(self, state="Z", start="19446", threads="1"):
+        proc = self.root / "80884"
+        proc.mkdir()
+        fields = [state] + ["0"] * 18 + [start]
+        fields[17] = threads
+        (proc / "stat").write_text("80884 (java (old)) " + " ".join(fields) + " 0\n")
+        return proc
+
+    def test_confirmed_zombie_with_missing_cwd_cannot_block_recovery(self):
+        old = self.four()
+        self.proc_state()
+        with patch.object(m.os, "readlink", side_effect=FileNotFoundError):
+            self.assertEqual([], m.process_directories(self.root))
+        self.assertEqual(3, len(m.recover(self.root, NOW, [])))
+        self.assertFalse(old[0].exists())
+        self.assertEqual(bytes(range(256)), (self.root / m.QUARANTINE / old[0].name / "evidence.bin").read_bytes())
+
+    def test_zombie_leader_with_live_peer_threads_refuses_every_move(self):
+        old = self.four()
+        self.proc_state(threads="2")
+        with patch.object(m.os, "readlink", side_effect=FileNotFoundError):
+            with self.assertRaises(RuntimeError):
+                m.process_directories(self.root)
+        self.assertTrue(all(p.is_dir() for p in old))
+        self.assertFalse((self.root / m.QUARANTINE).exists())
+
+    def test_running_process_with_missing_cwd_is_never_ignored(self):
+        self.proc_state("R")
+        with patch.object(m.os, "readlink", side_effect=FileNotFoundError):
+            with self.assertRaises(RuntimeError):
+                m.process_directories(self.root)
+
+    def test_unreadable_malformed_and_changed_zombie_state_fail_closed(self):
+        proc = self.proc_state()
+        for raw in [b"bad", b"999 (java) Z " + b"0 " * 18 + b"19446", b"80884 (java) Z " + b"0 " * 18 + b"bad", b"80884 (java) Z", b"80884 (java) Z " + b"1 " * 3000]:
+            (proc / "stat").write_bytes(raw)
+            with patch.object(m.os, "readlink", side_effect=FileNotFoundError):
+                with self.assertRaises(RuntimeError):
+                    m.process_directories(self.root)
+        with patch.object(Path, "open", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                m.confirmed_zombie(proc, proc.stat())
+        good = b"80884 (java) Z " + b"0 " * 18
+        from io import BytesIO
+        with patch.object(Path, "open", side_effect=[BytesIO(good + b"123"), BytesIO(good + b"124")]):
+            with self.assertRaises(RuntimeError):
+                m.confirmed_zombie(proc, proc.stat())
+
+    def test_zombie_state_and_uid_changes_are_refused(self):
+        proc = self.proc_state()
+        before = proc.stat()
+        from io import BytesIO
+        def raw(state):
+            fields = [state] + ["0"] * 18 + ["19446"]
+            fields[17] = "1"
+            return ("80884 (java) " + " ".join(fields)).encode()
+        with patch.object(Path, "open", side_effect=[BytesIO(raw("Z")), BytesIO(raw("R"))]):
+            with self.assertRaises(RuntimeError):
+                m.confirmed_zombie(proc, before)
+        changed = SimpleNamespace(st_uid=before.st_uid + 1, st_ino=before.st_ino, st_dev=before.st_dev)
+        with patch.object(Path, "stat", autospec=True, return_value=changed):
+            with self.assertRaises(RuntimeError):
+                m.confirmed_zombie(proc, before)
+
+    def test_second_state_read_disappearance_requires_actual_pid_exit(self):
+        proc = self.proc_state()
+        original = Path.open
+        count = 0
+        def missing(path, *args, **kwargs):
+            nonlocal count
+            if path == proc / "stat":
+                count += 1
+                if count == 2:
+                    raise FileNotFoundError(str(path))
+            return original(path, *args, **kwargs)
+        with patch.object(m.os, "readlink", side_effect=FileNotFoundError), patch.object(Path, "open", new=missing):
+            with self.assertRaises(RuntimeError):
+                m.process_directories(self.root)
+        count = 0
+        def exited(path, *args, **kwargs):
+            nonlocal count
+            if path == proc / "stat":
+                count += 1
+                if count == 2:
+                    (proc / "stat").unlink()
+                    proc.rmdir()
+                    raise FileNotFoundError(str(path))
+            return original(path, *args, **kwargs)
+        with patch.object(m.os, "readlink", side_effect=FileNotFoundError), patch.object(Path, "open", new=exited):
+            self.assertEqual([], m.process_directories(self.root))
+
+    def test_pid_exit_confirmation_permission_error_is_not_ignored(self):
+        proc = self.proc_state()
+        info = proc.stat()
+        with patch.object(m.os, "readlink", side_effect=FileNotFoundError), patch.object(Path, "stat", autospec=True, side_effect=[info, info, PermissionError("cannot confirm")]):
+            with self.assertRaises(RuntimeError):
+                m.process_directories(self.root)
+
+    def test_zombie_identity_replacement_after_second_state_read_is_refused(self):
+        proc = self.proc_state()
+        before = proc.stat()
+        for key in ["st_uid", "st_ino", "st_dev"]:
+            values = {"st_uid": before.st_uid, "st_ino": before.st_ino, "st_dev": before.st_dev}
+            values[key] += 1
+            changed = SimpleNamespace(**values)
+            with patch.object(Path, "stat", autospec=True, side_effect=[before, changed]):
+                with self.assertRaises(RuntimeError):
+                    m.confirmed_zombie(proc, before)
+
     def test_cli_refuses_every_root_other_than_fixed_es4_root(self):
         old = self.four()
         result = subprocess.run([sys.executable, str(SOURCE), str(self.root)], capture_output=True)
