@@ -277,13 +277,15 @@ pipeline {
         sh 'python3 scripts/jenkins/es4-test-receipt-test.py'
         sh 'python3 scripts/footprint-reverify-capture-test.py'
         sh 'python3 scripts/footprint-mutate-signal-test.py'
-        timeout(time: 10, unit: 'MINUTES') {
-          sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+        withEnv(["ALLOW_CASH_WINDOW=${params.ALLOW_CASH_WINDOW ?: false}"]) {
+          timeout(time: 10, unit: 'MINUTES') {
+            sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
+          }
+          // The parameter does not exist on the job until a build has run THIS Jenkinsfile, so the first
+          // build after it merges sees null and must read as not waived — never as the string "null",
+          // which the driver would refuse outright, and never as waived.
+          sh 'bash scripts/jenkins/test-on-es4.sh'
         }
-        // The parameter does not exist on the job until a build has run THIS Jenkinsfile, so the first
-        // build after it merges sees null and must read as not waived — never as the string "null",
-        // which the driver would refuse outright, and never as waived.
-        sh "ALLOW_CASH_WINDOW=${params.ALLOW_CASH_WINDOW ?: false} bash scripts/jenkins/test-on-es4.sh"
       }
       post {
         always {
