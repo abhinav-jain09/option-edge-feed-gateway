@@ -212,6 +212,8 @@ pipeline {
             // Run source tests as before, then consume exactly the retained release used by web.
             sh 'python3 scripts/jenkins/gateway-contracts-artifact-test.py'
             sh 'python3 scripts/jenkins/gateway-contracts-artifact.py prepare'
+            // A preceding image build can leave this ignored cache before the Test stage's cleanup.
+            sh 'rm -rf ci/jib-image/target'
             timeout(time: 10, unit: 'MINUTES') {
               sh 'PERMITTED_SHA="${PERMITTED_SHA:-}" bash scripts/jenkins/verify-permitted-tree.sh --dir . --allow-ignored target --allow-ignored dev/raw-feed-replicator/target --allow-ignored .m2 --allow-ignored .deps --allow-ignored .jenkins-tmp --allow-ignored .contracts-sha --allow-ignored .contracts-version --allow-ignored .contracts-jar-sha256 --allow-ignored .jar-sha256 --allow-ignored scripts/__pycache__ --allow-ignored scripts/jenkins/__pycache__'
             }
