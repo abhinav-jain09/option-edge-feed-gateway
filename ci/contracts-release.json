@@ -2,12 +2,12 @@
   "schemaVersion": 1,
   "groupId": "com.optionsedge",
   "artifactId": "options-edge-contracts",
-  "version": "0.85.0",
-  "sourceSha": "89effc72f3c010aa1948f6384f15371696f60c11",
+  "version": "0.92.0",
+  "sourceSha": "de19ae0bf8c5d1f6c6640356f88dc48c11cf44a8",
   "jenkinsJob": "options-edge-contracts",
-  "jenkinsBuild": 127,
-  "artifactPath": "target/options-edge-contracts-0.85.0.jar",
-  "bytes": 2311374,
-  "jarSha256": "7dde369c83db34e1a613019229c79db9d7bb3f507e23ae41119b139e52c70403",
-  "pomSha256": "da5b40fd55b6b76325ffedd02e040b7f1ad235c6c7beb6086a432731b052d6f0"
+  "jenkinsBuild": 130,
+  "artifactPath": "target/options-edge-contracts-0.92.0.jar",
+  "bytes": 2352169,
+  "jarSha256": "d46e34709aa9dab6290b9377fd424deee414cf0733dde3ca6c360daf66cb0fc3",
+  "pomSha256": "7af625c340e8d6f04a24cc370d1b4fc86a42c7a7505dd0286de34a9cf5d6407a"
 }
