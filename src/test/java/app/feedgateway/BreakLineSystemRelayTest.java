@@ -127,6 +127,18 @@ class BreakLineSystemRelayTest {
     }
 
     @Test
+    void theRecordSchemaVersionMustMatchTheFrameIdVersion() throws Exception {
+        BreakLineRelay r = relay();
+        byte[] v2WithVersion1 = serializer.serialize("t", new GenericRecordBuilder(stateV2).set("schemaVersion", 1).set("messageType", "BREAK_LINE_STATE").set("lineId", "bl-a-9")
+                .set("ownerTag", ALICE).set("lineStatus", "ACTIVE").set("eventSequence", 1L).set("lineOrigin", "USER").build());
+        r.accept(STATE, "bl-a-9", v2WithVersion1);
+        byte[] v1WithVersion2 = serializer.serialize("t", BreakLineRelayTest.state("bl-a-8", ALICE, "ACTIVE", 1, "TESTING", null).set("schemaVersion", 2).build());
+        r.accept(STATE, "bl-a-8", v1WithVersion2);
+        assertEquals(0, r.foldedLinesForTest());
+        assertEquals(2, r.dropsForTest());
+    }
+
+    @Test
     void aMismatchOfOriginAndOwnerReachesNobody() throws Exception {
         BreakLineRelay r = relay();
         r.accept(STATE, "sy-x", v2State("sy-x", ALICE, "SYSTEM"));

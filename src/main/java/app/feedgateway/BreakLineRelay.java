@@ -324,7 +324,7 @@ final class BreakLineRelay {
             undecodable.incrementAndGet();
             return;
         }
-        ObjectNode node = render(kind, key, decoded);
+        ObjectNode node = render(kind, key, decoded, frameId(value) == expectedIdV2(kind) ? 2 : 1);
         if (node == null) {
             drops.incrementAndGet();
             return;
@@ -471,11 +471,16 @@ final class BreakLineRelay {
 
     /** The node for a record that passes the boundary, with null members omitted, else null. */
     static ObjectNode render(Kind kind, String key, Object value) {
+        return render(kind, key, value, 1);
+    }
+
+    /** {@code version} is the version of the frame's schema id (1 for 3902-3904, 2 for 3906-3908); the record's own {@code schemaVersion} must equal it. */
+    static ObjectNode render(Kind kind, String key, Object value, int version) {
         if (!(value instanceof GenericRecord r) || !expectedName(kind).equals(r.getSchema().getFullName())) {
             return null;
         }
         try {
-            if (!Integer.valueOf(1).equals(r.get("schemaVersion")) && !Integer.valueOf(2).equals(r.get("schemaVersion"))) {
+            if (!Integer.valueOf(version).equals(r.get("schemaVersion"))) {
                 return null;
             }
             String expectedKey = kind == Kind.STATUS ? STATUS_KEY : String.valueOf(r.get(kind == Kind.STATE ? "lineId" : "eventId"));
