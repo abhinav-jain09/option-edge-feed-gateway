@@ -84,7 +84,7 @@ final class BreakLineRelay {
     }
 
     /** A hello field and the parts that follow it, built for one owner (or for none). */
-    private record Checkpoint(String field, List<String> parts, String single) { }
+    private record Checkpoint(String field, List<String> parts) { }
 
     private final GatewaySettings settings;
     private final BiConsumer<String, String> sink;
@@ -390,14 +390,13 @@ final class BreakLineRelay {
         long statusBytes = status.getBytes(StandardCharsets.UTF_8).length;
         Checkpoint built;
         if (total + statusBytes + ENVELOPE_BYTES <= max) {
-            built = new Checkpoint("{\"status\":" + status + ",\"states\":[" + parts.get(0) + "],\"version\":" + version + "}", List.of(),
-                    "{\"part\":0,\"parts\":1,\"version\":" + version + ",\"states\":[" + parts.get(0) + "]}");
+            built = new Checkpoint("{\"status\":" + status + ",\"states\":[" + parts.get(0) + "],\"version\":" + version + "}", List.of());
         } else {
             List<String> framed = new ArrayList<>();
             for (int k = 0; k < parts.size(); k++) {
                 framed.add("{\"part\":" + k + ",\"parts\":" + parts.size() + ",\"version\":" + version + ",\"states\":[" + parts.get(k) + "]}");
             }
-            built = new Checkpoint("{\"status\":" + status + ",\"states\":null,\"parts\":" + parts.size() + ",\"version\":" + version + "}", framed, null);
+            built = new Checkpoint("{\"status\":" + status + ",\"states\":null,\"parts\":" + parts.size() + ",\"version\":" + version + "}", framed);
         }
         checkpointMemo.put(memoKey, built);
         return built;
@@ -412,17 +411,8 @@ final class BreakLineRelay {
         if (!live) {
             return NOT_READY_FIELD;   // the scan is not finished: never a partial checkpoint (the page shows nothing; the completed one follows as a resume reply)
         }
-        Checkpoint cp = checkpointFor(ownerTag);
-        String key = ownerTag == null ? "" : ownerTag;
-        if (cp.parts().isEmpty()) {
-            partialServed.remove(key);
-        } else {
-            partialServed.add(key);   // this hello said "the states follow in parts": the parts call must deliver them even if the checkpoint has shrunk to fit inline meanwhile
-        }
-        return cp.field();
+        return checkpointFor(ownerTag).field();
     }
-
-    private final java.util.Set<String> partialServed = new java.util.HashSet<>();
 
     /** The hello field while the bootstrap scan is running: no lines, and the page is told it is not ready. */
     static final String NOT_READY_FIELD = "{\"ready\":false,\"status\":null,\"states\":[],\"version\":0}";
@@ -432,16 +422,13 @@ final class BreakLineRelay {
         if (!live) {
             return List.of();
         }
-        Checkpoint cp = checkpointFor(ownerTag);
-        if (cp.parts().isEmpty() && partialServed.remove(ownerTag == null ? "" : ownerTag)) {
-            return List.of(cp.single());   // the hello promised parts but the checkpoint now fits inline: deliver it as one complete part
-        }
-        return cp.parts();
+        return checkpointFor(ownerTag).parts();
     }
 
     /**
-     * ONE consistent snapshot for a resume answer: the field and its parts come from the same checkpoint object under one lock, so they share a version. (A hello is built elsewhere; its parts frames
-     * carry their own version, total and states, and the page assembles a set of parts of one version on its own.)
+     * ONE consistent snapshot for a resume answer: the field and its parts come from the same checkpoint object under one lock, so they share a version. (A hello is built elsewhere; the parts frames
+     * that follow it carry their own version, total and states, and the page assembles a set of parts of one version on its own. A page whose hello promised parts that never arrive asks for a
+     * resume after a few seconds, so a state change between the hello and the parts call, or a lost frame, costs one round trip and no line.)
      */
     synchronized Snapshot snapshot(String ownerTag) {
         if (!live) {

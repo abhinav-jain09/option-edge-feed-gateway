@@ -101,6 +101,17 @@ class BreakLineRelayTest {
         return relay;
     }
 
+    /** Test helpers for the owner filter test: a live relay whose frames go nowhere, and one state fed for an owner. */
+    BreakLineRelay liveRelayForTest() {
+        BreakLineRelay relay = new BreakLineRelay(SETTINGS, new Sinks(), new Sinks(), deserializer);
+        relay.goLive();
+        return relay;
+    }
+
+    void feed(BreakLineRelay relay, String lineId, String owner) {
+        relay.accept(STATE, lineId, bytes(state(lineId, owner, "ACTIVE", 1, "TESTING", null).build()));
+    }
+
     private byte[] bytes(GenericRecord record) {
         return serializer.serialize("any-topic", record);
     }
@@ -326,7 +337,7 @@ class BreakLineRelayTest {
     }
 
     @Test
-    void aHelloThatPromisedPartsStillGetsTheStatesWhenTheCheckpointShrinksBeforeThePartsCall() throws Exception {
+    void aResumeSnapshotIsOneConsistentCheckpointEvenWhenAHelloThatPromisedPartsIsOvertakenByAStateChange() throws Exception {
         Sinks sinks = new Sinks();
         System.setProperty("BREAK_LINE_HELLO_MAX_BYTES", "1500");
         try {
@@ -339,11 +350,11 @@ class BreakLineRelayTest {
             for (int i = 0; i < 11; i++) {
                 relay.accept(STATE, "bl-a" + i, bytes(state("bl-a" + i, ALICE, "REMOVED", 2, null, null).build()));
             }
-            List<String> parts = relay.checkpointParts(ALICE);
-            assertEquals(1, parts.size(), "the one line left arrives as one complete part");
-            JsonNode part = JSON.readTree(parts.get(0));
-            assertEquals(1, part.get("parts").asInt());
-            assertEquals(1, part.get("states").size());
+            assertTrue(relay.checkpointParts(ALICE).isEmpty(), "the checkpoint now fits inline: no parts (the page asks for a resume when its promised parts do not arrive)");
+            BreakLineRelay.Snapshot sn = relay.snapshot(ALICE);
+            JsonNode field = JSON.readTree(sn.field());
+            assertEquals(1, field.get("states").size(), "the resume field carries the one line left inline");
+            assertTrue(sn.parts().isEmpty());
         } finally {
             System.clearProperty("BREAK_LINE_HELLO_MAX_BYTES");
         }

@@ -105,4 +105,40 @@ class BreakLineOwnerFilterTest {
         assertFalse(service.cvdHelloJson(null, ALICE).contains("breakLine"));
         assertEquals(service.cvdHelloJson(null), service.cvdHelloJson(null, ALICE));
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void aResumeMessageIsAnsweredWithTheCallersOwnCheckpointOnlyAndTheReadyCallbackReachesEveryOpenSocket() throws Exception {
+        System.setProperty("BREAK_LINE_RELAY_ENABLED", "true");
+        try {
+            BreakLineRelayTest fixtures = new BreakLineRelayTest();
+            FeedGatewayService service = gateway();
+            BreakLineRelay relay = fixtures.liveRelayForTest();
+            fixtures.feed(relay, "bl-alice-1", ALICE);
+            fixtures.feed(relay, "bl-bob-1", BOB);
+            ObjectProvider<BreakLineRelay> provider = mock(ObjectProvider.class);
+            when(provider.getIfAvailable()).thenReturn(relay);
+            java.lang.reflect.Field f = FeedGatewayService.class.getDeclaredField("breakLineRelay");
+            f.setAccessible(true);
+            f.set(service, provider);
+            FeedWebSocketHandler handler = handler(service);
+            WebSocketSession alice = socket("a", "alice"), bob = socket("b", "bob"), nobody = socket("n", null);
+            for (WebSocketSession s : List.of(alice, bob, nobody)) {
+                handler.afterConnectionEstablished(s);
+            }
+            received.forEach(List::clear);
+            service.handleFootprintBasicMessage(alice, "{\"type\":\"break-line-resume\"}");
+            assertEquals(1, received.get(0).size());
+            assertTrue(received.get(0).get(0).contains("bl-alice-1"));
+            assertFalse(received.get(0).get(0).contains("bl-bob-1"));
+            assertEquals(0, received.get(1).size());
+            received.forEach(List::clear);
+            service.breakLineReady();
+            assertTrue(received.get(0).get(0).contains("bl-alice-1") && !received.get(0).get(0).contains("bl-bob-1"));
+            assertTrue(received.get(1).get(0).contains("bl-bob-1") && !received.get(1).get(0).contains("bl-alice-1"));
+            assertFalse(received.get(2).get(0).contains("bl-"), "a socket with no subject gets an empty checkpoint");
+        } finally {
+            System.clearProperty("BREAK_LINE_RELAY_ENABLED");
+        }
+    }
 }

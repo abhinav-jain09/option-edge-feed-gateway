@@ -2,6 +2,7 @@
   "type": "record",
   "name": "BreakLineCommand",
   "namespace": "com.optionsedge.contracts.breakline",
+  "doc": "A user command on a break score line (BS13-L). Topic futures.break-line.lines, compacted, key lineId for both operations. Written by the web tier only, under the fixed id 3901.",
   "fields": [
     {
       "name": "schemaVersion",
@@ -14,12 +15,18 @@
       "default": "BREAK_LINE_COMMAND"
     },
     {
-      "name": "operation",
-      "type": "string"
+      "name": "lineId",
+      "type": "string",
+      "doc": "bl-<ownerTag>-<encoded drawing id>; the record key"
     },
     {
-      "name": "lineId",
-      "type": "string"
+      "name": "operation",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "UPSERT or DELETE"
     },
     {
       "name": "ownerTag",
@@ -51,7 +58,8 @@
         "null",
         "string"
       ],
-      "default": null
+      "default": null,
+      "doc": "SPX or ES"
     },
     {
       "name": "priceUnits",
@@ -59,7 +67,8 @@
         "null",
         "long"
       ],
-      "default": null
+      "default": null,
+      "doc": "SPX cents or ES ticks"
     },
     {
       "name": "commandEpochMillis",
@@ -67,7 +76,8 @@
         "null",
         "long"
       ],
-      "default": null
+      "default": null,
+      "doc": "server clock, the order time"
     },
     {
       "name": "createdAtEpochMillis",
@@ -83,7 +93,8 @@
         "null",
         "string"
       ],
-      "default": null
+      "default": null,
+      "doc": "ABOVE or BELOW"
     }
   ]
 }

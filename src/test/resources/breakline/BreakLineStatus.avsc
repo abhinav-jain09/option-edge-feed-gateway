@@ -2,6 +2,7 @@
   "type": "record",
   "name": "BreakLineStatus",
   "namespace": "com.optionsedge.contracts.breakline",
+  "doc": "The status of the break line service, once a second. Topic futures.break-line.status, compacted, key break-line, fixed id 3904.",
   "fields": [
     {
       "name": "schemaVersion",
@@ -83,7 +84,8 @@
         "null",
         "long"
       ],
-      "default": null
+      "default": null,
+      "doc": "wall"
     },
     {
       "name": "dataAsOfEpochMillis",
@@ -151,75 +153,111 @@
     },
     {
       "name": "inputs",
-      "type": {
-        "type": "array",
-        "items": {
-          "type": "record",
-          "name": "BreakLineInputStatus",
-          "namespace": "com.optionsedge.contracts.breakline",
-          "fields": [
-            {
-              "name": "name",
-              "type": "string"
-            },
-            {
-              "name": "admitted",
-              "type": "long"
-            },
-            {
-              "name": "refused",
-              "type": {
-                "type": "array",
-                "items": {
-                  "type": "record",
-                  "name": "BreakLineCount",
-                  "namespace": "com.optionsedge.contracts.breakline",
-                  "fields": [
-                    {
-                      "name": "reason",
-                      "type": "string"
-                    },
-                    {
-                      "name": "count",
-                      "type": "long"
-                    }
-                  ]
-                }
+      "type": [
+        "null",
+        {
+          "type": "array",
+          "items": {
+            "type": "record",
+            "name": "BreakLineInputStatus",
+            "namespace": "com.optionsedge.contracts.breakline",
+            "doc": "Admission counters of one input.",
+            "fields": [
+              {
+                "name": "name",
+                "type": [
+                  "null",
+                  "string"
+                ],
+                "default": null
               },
-              "default": []
-            },
-            {
-              "name": "duplicates",
-              "type": "long"
-            },
-            {
-              "name": "late",
-              "type": "long"
-            },
-            {
-              "name": "oldestUnreadAgeMs",
-              "type": [
-                "null",
-                "long"
-              ],
-              "default": null
-            },
-            {
-              "name": "idle",
-              "type": "boolean"
-            },
-            {
-              "name": "lastKeyEpochMillis",
-              "type": [
-                "null",
-                "long"
-              ],
-              "default": null
-            }
-          ]
+              {
+                "name": "admitted",
+                "type": [
+                  "null",
+                  "long"
+                ],
+                "default": null
+              },
+              {
+                "name": "refused",
+                "type": [
+                  "null",
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "record",
+                      "name": "BreakLineCount",
+                      "namespace": "com.optionsedge.contracts.breakline",
+                      "doc": "A reason and its count.",
+                      "fields": [
+                        {
+                          "name": "reason",
+                          "type": [
+                            "null",
+                            "string"
+                          ],
+                          "default": null
+                        },
+                        {
+                          "name": "count",
+                          "type": [
+                            "null",
+                            "long"
+                          ],
+                          "default": null
+                        }
+                      ]
+                    }
+                  }
+                ],
+                "default": null
+              },
+              {
+                "name": "duplicates",
+                "type": [
+                  "null",
+                  "long"
+                ],
+                "default": null
+              },
+              {
+                "name": "late",
+                "type": [
+                  "null",
+                  "long"
+                ],
+                "default": null
+              },
+              {
+                "name": "oldestUnreadAgeMs",
+                "type": [
+                  "null",
+                  "long"
+                ],
+                "default": null
+              },
+              {
+                "name": "idle",
+                "type": [
+                  "null",
+                  "boolean"
+                ],
+                "default": null
+              },
+              {
+                "name": "lastKeyEpochMillis",
+                "type": [
+                  "null",
+                  "long"
+                ],
+                "default": null
+              }
+            ]
+          }
         }
-      },
-      "default": []
+      ],
+      "default": null
     },
     {
       "name": "lagP50Ms",
@@ -255,25 +293,37 @@
     },
     {
       "name": "scoresByStatus",
-      "type": {
-        "type": "array",
-        "items": {
-          "type": "record",
-          "name": "BreakLineKv",
-          "namespace": "com.optionsedge.contracts.breakline",
-          "fields": [
-            {
-              "name": "name",
-              "type": "string"
-            },
-            {
-              "name": "value",
-              "type": "long"
-            }
-          ]
+      "type": [
+        "null",
+        {
+          "type": "array",
+          "items": {
+            "type": "record",
+            "name": "BreakLineKv",
+            "namespace": "com.optionsedge.contracts.breakline",
+            "doc": "A named integer (an input sum of a measure).",
+            "fields": [
+              {
+                "name": "name",
+                "type": [
+                  "null",
+                  "string"
+                ],
+                "default": null
+              },
+              {
+                "name": "value",
+                "type": [
+                  "null",
+                  "long"
+                ],
+                "default": null
+              }
+            ]
+          }
         }
-      },
-      "default": []
+      ],
+      "default": null
     },
     {
       "name": "undecodable",
