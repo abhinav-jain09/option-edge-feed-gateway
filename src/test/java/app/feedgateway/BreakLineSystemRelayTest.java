@@ -46,16 +46,21 @@ class BreakLineSystemRelayTest {
 
     private final KafkaAvroSerializer serializer = new KafkaAvroSerializer();
     private final GatewayAvroDeserializer deserializer = new GatewayAvroDeserializer();
-    private final Schema stateV2;
+    private final Schema stateV2, eventV2, statusV2;
     private final List<String[]> targeted = new ArrayList<>();
 
     BreakLineSystemRelayTest() throws Exception {
         stateV2 = v2(BreakLineRelayTest.STATE_SCHEMA, "lineOrigin", "sourceKind", "chartKey");
+        eventV2 = v2(BreakLineRelayTest.EVENT_SCHEMA, "lineOrigin", "sourceKind");
+        statusV2 = v2(BreakLineRelayTest.STATUS_SCHEMA, "systemEmptyReason");
         String scope = "break-line-system-" + System.nanoTime();
         SchemaRegistryClient registry = MockSchemaRegistry.getClientForScope(scope);
         registry.register("com.optionsedge.contracts.breakline.BreakLineState", new AvroSchema(BreakLineRelayTest.STATE_SCHEMA), 1, 3902);
         registry.register("com.optionsedge.contracts.breakline.BreakLineState", new AvroSchema(stateV2), 2, 3906);
         registry.register("com.optionsedge.contracts.breakline.BreakLineStatus", new AvroSchema(BreakLineRelayTest.STATUS_SCHEMA), 1, 3904);
+        registry.register("com.optionsedge.contracts.breakline.BreakLineEvent", new AvroSchema(BreakLineRelayTest.EVENT_SCHEMA), 1, 3903);
+        registry.register("com.optionsedge.contracts.breakline.BreakLineEvent", new AvroSchema(eventV2), 2, 3907);
+        registry.register("com.optionsedge.contracts.breakline.BreakLineStatus", new AvroSchema(statusV2), 2, 3908);
         Map<String, Object> w = new HashMap<>();
         w.put("schema.registry.url", "mock://" + scope);
         w.put("auto.register.schemas", false);
@@ -100,6 +105,25 @@ class BreakLineSystemRelayTest {
         assertTrue(alice.contains("sy-gm-725000") && alice.contains("bl-a-1"));
         assertTrue(bob.contains("sy-gm-725000") && !bob.contains("bl-a-1"));
         assertFalse(nobody.contains("sy-gm-725000"), "a signed-out socket gets no system line");
+    }
+
+    @Test
+    void versionTwoEventsAndStatusAreAcceptedAndASystemEventFansOutToAllSignedIn() throws Exception {
+        List<String[]> global = new ArrayList<>();
+        BreakLineRelay r = new BreakLineRelay(SETTINGS, (e, j) -> global.add(new String[] {e, j}), (o, e, j) -> targeted.add(new String[] {o, e, j}), deserializer);
+        r.goLive();
+        GenericRecordBuilder ev = new GenericRecordBuilder(eventV2).set("schemaVersion", 2).set("messageType", "BREAK_LINE_EVENT").set("eventId", "sy-gm-725000|1")
+                .set("scope", "SYSTEM_LINE_CREATED").set("lineId", "sy-gm-725000").set("ownerTag", "SYSTEM").set("eventSequence", 1L).set("eventEpochMillis", NOW)
+                .set("lineOrigin", "SYSTEM").set("sourceKind", "GAMMA_HOLD");
+        r.accept(EVENTS, "sy-gm-725000|1", serializer.serialize("t", ev.build()));
+        assertEquals("SYSTEM", targeted.get(0)[0]);
+        assertEquals("break-line-event", targeted.get(0)[1]);
+        GenericRecordBuilder st = new GenericRecordBuilder(statusV2).set("schemaVersion", 2).set("messageType", "BREAK_LINE_STATUS").set("statusEpochMillis", NOW)
+                .set("dataAsOfEpochMillis", NOW - 5).set("dataLagMs", 5L).set("mode", "SHADOW").set("calibrationState", "CORPUS_ONLY_PROVISIONAL").set("calibrationFlag", false)
+                .set("activeLines", 1).set("activeOwners", 1).set("systemEmptyReason", "NO_SPOT");
+        r.accept(STATUS, "break-line", serializer.serialize("t", st.build()));
+        assertEquals("break-line-status", global.get(0)[0]);
+        assertTrue(global.get(0)[1].contains("NO_SPOT"));
     }
 
     @Test
