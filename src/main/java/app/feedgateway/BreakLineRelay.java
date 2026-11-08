@@ -84,11 +84,13 @@ final class BreakLineRelay {
     }
 
     /** A hello field and the parts that follow it, built for one owner (or for none). */
-    private record Checkpoint(String field, List<String> parts) { }
+    private record Checkpoint(String field, List<String> parts, String single) { }
 
     private final GatewaySettings settings;
     private final BiConsumer<String, String> sink;
     private final TargetedSink targetedSink;
+    /** Called (outside the lock) when a bootstrap scan has finished and the checkpoint became complete: sockets that connected meanwhile are sent their own completed checkpoint. */
+    private final Runnable onReady;
     private final AtomicBoolean running = new AtomicBoolean();
     private final Lane stateLane = new Lane(), eventsLane = new Lane(), statusLane = new Lane();
     private final AtomicLong drops = new AtomicLong();
@@ -111,11 +113,16 @@ final class BreakLineRelay {
     @org.springframework.beans.factory.annotation.Autowired
     BreakLineRelay(GatewaySettings settings, ObjectProvider<FeedGatewayService> gateway) {
         this(settings, (event, json) -> gateway.getObject().streamBreakLine(event, json),
-                (ownerTag, event, json) -> gateway.getObject().streamBreakLineTo(ownerTag, event, json), null);
+                (ownerTag, event, json) -> gateway.getObject().streamBreakLineTo(ownerTag, event, json), null, () -> gateway.getObject().breakLineReady());
     }
 
     /** Test seam: the frames go to the sinks instead of the sockets, the bytes are decoded by {@code decoder}. */
     BreakLineRelay(GatewaySettings settings, BiConsumer<String, String> sink, TargetedSink targetedSink, Deserializer<Object> decoder) {
+        this(settings, sink, targetedSink, decoder, () -> { });
+    }
+
+    BreakLineRelay(GatewaySettings settings, BiConsumer<String, String> sink, TargetedSink targetedSink, Deserializer<Object> decoder, Runnable onReady) {
+        this.onReady = onReady;
         this.settings = settings;
         this.sink = sink;
         this.targetedSink = targetedSink;
@@ -166,6 +173,7 @@ final class BreakLineRelay {
                 TopicPartition state = partitionZero(c, stateTopic), events = partitionZero(c, eventsTopic), status = partitionZero(c, statusTopic);
                 resetFold();
                 bootstrap(c, state, status);
+                onReady.run();   // the fold is complete: every socket that connected during the scan gets its own checkpoint
                 c.assign(List.of(state, status, events));
                 c.seekToEnd(List.of(events));
                 c.seek(state, bootstrapEnd.get(state));
@@ -382,13 +390,14 @@ final class BreakLineRelay {
         long statusBytes = status.getBytes(StandardCharsets.UTF_8).length;
         Checkpoint built;
         if (total + statusBytes + ENVELOPE_BYTES <= max) {
-            built = new Checkpoint("{\"status\":" + status + ",\"states\":[" + parts.get(0) + "],\"version\":" + version + "}", List.of());
+            built = new Checkpoint("{\"status\":" + status + ",\"states\":[" + parts.get(0) + "],\"version\":" + version + "}", List.of(),
+                    "{\"part\":0,\"parts\":1,\"version\":" + version + ",\"states\":[" + parts.get(0) + "]}");
         } else {
             List<String> framed = new ArrayList<>();
             for (int k = 0; k < parts.size(); k++) {
                 framed.add("{\"part\":" + k + ",\"parts\":" + parts.size() + ",\"version\":" + version + ",\"states\":[" + parts.get(k) + "]}");
             }
-            built = new Checkpoint("{\"status\":" + status + ",\"states\":null,\"parts\":" + parts.size() + ",\"version\":" + version + "}", framed);
+            built = new Checkpoint("{\"status\":" + status + ",\"states\":null,\"parts\":" + parts.size() + ",\"version\":" + version + "}", framed, null);
         }
         checkpointMemo.put(memoKey, built);
         return built;
@@ -400,17 +409,58 @@ final class BreakLineRelay {
      * {@link #CHECKPOINT_EVENT} that share its {@code version}: no line is ever dropped to make a hello fit. Another owner's lines are never in it.
      */
     synchronized String helloField(String ownerTag) {
-        return checkpointFor(ownerTag).field();
+        if (!live) {
+            return NOT_READY_FIELD;   // the scan is not finished: never a partial checkpoint (the page shows nothing; the completed one follows as a resume reply)
+        }
+        Checkpoint cp = checkpointFor(ownerTag);
+        String key = ownerTag == null ? "" : ownerTag;
+        if (cp.parts().isEmpty()) {
+            partialServed.remove(key);
+        } else {
+            partialServed.add(key);   // this hello said "the states follow in parts": the parts call must deliver them even if the checkpoint has shrunk to fit inline meanwhile
+        }
+        return cp.field();
     }
+
+    private final java.util.Set<String> partialServed = new java.util.HashSet<>();
+
+    /** The hello field while the bootstrap scan is running: no lines, and the page is told it is not ready. */
+    static final String NOT_READY_FIELD = "{\"ready\":false,\"status\":null,\"states\":[],\"version\":0}";
 
     /** The checkpoint parts that follow a hello whose field is {@code states:null}, for the same owner; empty when the hello carried the states inline. */
     synchronized List<String> checkpointParts(String ownerTag) {
-        return checkpointFor(ownerTag).parts();
+        if (!live) {
+            return List.of();
+        }
+        Checkpoint cp = checkpointFor(ownerTag);
+        if (cp.parts().isEmpty() && partialServed.remove(ownerTag == null ? "" : ownerTag)) {
+            return List.of(cp.single());   // the hello promised parts but the checkpoint now fits inline: deliver it as one complete part
+        }
+        return cp.parts();
     }
+
+    /**
+     * ONE consistent snapshot for a resume answer: the field and its parts come from the same checkpoint object under one lock, so they share a version. (A hello is built elsewhere; its parts frames
+     * carry their own version, total and states, and the page assembles a set of parts of one version on its own.)
+     */
+    synchronized Snapshot snapshot(String ownerTag) {
+        if (!live) {
+            return new Snapshot(NOT_READY_FIELD, List.of());
+        }
+        Checkpoint cp = checkpointFor(ownerTag);
+        return new Snapshot(cp.field(), cp.parts());
+    }
+
+    /** A checkpoint's hello field and the parts that follow it. */
+    record Snapshot(String field, List<String> parts) { }
 
     /** The answer to {@link #RESUME}: the same checkpoint under its field name. */
     String resumeReply(String ownerTag) {
         return "{\"breakLine\":" + helloField(ownerTag) + "}";
+    }
+
+    String resumeReply(Snapshot snapshot) {
+        return "{\"breakLine\":" + snapshot.field() + "}";
     }
 
     /** The node for a record that passes the boundary, with null members omitted, else null. */

@@ -91,6 +91,15 @@ class BreakLineOwnerFilterTest {
     }
 
     @Test
+    void theResumeAnswerAndTheCheckpointPartsAreNeverInTheGlobalAllowlist() {
+        assertFalse(FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains(BreakLineRelay.RESUME));
+        assertFalse(FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains(BreakLineRelay.CHECKPOINT_EVENT));
+        assertFalse(FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains(BreakLineRelay.STATE_EVENT));
+        assertFalse(FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains(BreakLineRelay.EVENT_EVENT));
+        assertTrue(FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains(BreakLineRelay.STATUS_EVENT));
+    }
+
+    @Test
     void theHelloHasNoBreakLineFieldWhileTheFlagIsOff() {
         FeedGatewayService service = gateway();
         assertFalse(service.cvdHelloJson(null, ALICE).contains("breakLine"));

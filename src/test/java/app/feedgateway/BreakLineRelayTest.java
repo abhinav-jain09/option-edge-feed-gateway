@@ -111,6 +111,13 @@ class BreakLineRelayTest {
                 .set("scoreStatus", score == null ? "PENDING" : "SCORED").set("asOfEpochMillis", NOW).set("eventSequence", sequence).set("explanation", "Line broke up through 7,252.00 at 10:41:07.");
     }
 
+    static GenericRecord with(GenericRecord r, String field, Object value) {
+        GenericData.Record copy = new GenericData.Record(r.getSchema());
+        r.getSchema().getFields().forEach(f -> copy.put(f.name(), r.get(f.name())));
+        copy.put(field, value);
+        return copy;
+    }
+
     static GenericRecord status(boolean flag) {
         return new GenericRecordBuilder(STATUS_SCHEMA).set("schemaVersion", 1).set("messageType", "BREAK_LINE_STATUS").set("statusEpochMillis", NOW).set("dataAsOfEpochMillis", NOW - 800)
                 .set("dataLagMs", 800L).set("mode", "SHADOW").set("calibrationState", "CORPUS_ONLY_PROVISIONAL").set("calibrationFlag", flag).set("activeLines", 2).set("activeOwners", 2).build();
@@ -276,5 +283,69 @@ class BreakLineRelayTest {
         relay.start();
         assertFalse(relay.consuming());
         assertFalse(SETTINGS.breakLineRelayEnabled());
+    }
+
+    @Test
+    void eventsAndStatusAreCheckedForTheirOwnFixedIdVersionAndIdentityKey() {
+        Sinks sinks = new Sinks();
+        BreakLineRelay relay = relay(sinks);
+        // events: a state frame on the events topic is refused by id; a wrong key and a wrong schemaVersion are dropped
+        relay.accept(EVENTS, "bl-a|5", bytes(state("bl-a", ALICE, "ACTIVE", 1, "TESTING", null).build()));
+        assertEquals(1, relay.schemaIdRefusedForTest(BreakLineRelay.Kind.EVENT));
+        relay.accept(EVENTS, "WRONG", bytes(event("bl-a|5", "bl-a", ALICE, "TRANSITION")));
+        relay.accept(EVENTS, "bl-a|5", bytes(with(event("bl-a|5", "bl-a", ALICE, "TRANSITION"), "schemaVersion", 2)));
+        // status: an event frame on the status topic is refused by id; wrong key and wrong version are dropped; a status with no epoch time is dropped
+        relay.accept(STATUS, "break-line", bytes(event("bl-a|5", "bl-a", ALICE, "TRANSITION")));
+        assertEquals(1, relay.schemaIdRefusedForTest(BreakLineRelay.Kind.STATUS));
+        relay.accept(STATUS, "WRONG", bytes(status(false)));
+        relay.accept(STATUS, "break-line", bytes(with(status(false), "schemaVersion", 2)));
+        relay.accept(STATUS, "break-line", bytes(with(status(false), "statusEpochMillis", null)));
+        assertEquals(5, relay.dropsForTest());
+        assertTrue(sinks.global.isEmpty() && sinks.targeted.isEmpty());
+        // and the positive case of each: the right id, version and key
+        relay.accept(EVENTS, "bl-a|5", bytes(event("bl-a|5", "bl-a", ALICE, "TRANSITION")));
+        relay.accept(STATUS, "break-line", bytes(status(false)));
+        assertEquals(1, sinks.global.size());
+        assertEquals(1, sinks.targeted.size());
+    }
+
+    @Test
+    void aHelloDuringTheBootstrapScanIsNotReadyAndTheCompletedCheckpointFollowsAsOneSnapshot() throws Exception {
+        Sinks sinks = new Sinks();
+        int[] ready = {0};
+        BreakLineRelay relay = new BreakLineRelay(SETTINGS, sinks, sinks, deserializer, () -> ready[0]++);
+        relay.accept(STATE, "bl-a1", bytes(state("bl-a1", ALICE, "ACTIVE", 1, "TESTING", null).build()));
+        assertEquals(BreakLineRelay.NOT_READY_FIELD, relay.helloField(ALICE), "a partial fold is never served");
+        assertTrue(relay.checkpointParts(ALICE).isEmpty());
+        assertTrue(sinks.targeted.isEmpty(), "nothing is forwarded live before the scan is complete");
+        assertEquals(BreakLineRelay.NOT_READY_FIELD, relay.snapshot(ALICE).field());
+        relay.goLive();
+        BreakLineRelay.Snapshot sn = relay.snapshot(ALICE);
+        assertEquals(1, JSON.readTree(sn.field()).get("states").size());
+        assertEquals("{\"breakLine\":" + sn.field() + "}", relay.resumeReply(sn));
+    }
+
+    @Test
+    void aHelloThatPromisedPartsStillGetsTheStatesWhenTheCheckpointShrinksBeforeThePartsCall() throws Exception {
+        Sinks sinks = new Sinks();
+        System.setProperty("BREAK_LINE_HELLO_MAX_BYTES", "1500");
+        try {
+            BreakLineRelay relay = new BreakLineRelay(new GatewaySettings(), sinks, sinks, deserializer);
+            relay.goLive();
+            for (int i = 0; i < 12; i++) {
+                relay.accept(STATE, "bl-a" + i, bytes(state("bl-a" + i, ALICE, "ACTIVE", 1, "TESTING", null).build()));
+            }
+            assertTrue(JSON.readTree(relay.helloField(ALICE)).get("states").isNull(), "the hello promised parts");
+            for (int i = 0; i < 11; i++) {
+                relay.accept(STATE, "bl-a" + i, bytes(state("bl-a" + i, ALICE, "REMOVED", 2, null, null).build()));
+            }
+            List<String> parts = relay.checkpointParts(ALICE);
+            assertEquals(1, parts.size(), "the one line left arrives as one complete part");
+            JsonNode part = JSON.readTree(parts.get(0));
+            assertEquals(1, part.get("parts").asInt());
+            assertEquals(1, part.get("states").size());
+        } finally {
+            System.clearProperty("BREAK_LINE_HELLO_MAX_BYTES");
+        }
     }
 }
