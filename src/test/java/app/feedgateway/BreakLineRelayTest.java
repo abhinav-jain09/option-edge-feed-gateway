@@ -199,10 +199,10 @@ class BreakLineRelayTest {
     }
 
     @Test
-    void aSchemaVersionOtherThanOneIsRefused() {
+    void aSchemaVersionOtherThanOneOrTwoIsRefused() {
         Sinks sinks = new Sinks();
         BreakLineRelay relay = relay(sinks);
-        relay.accept(STATE, "bl-a", bytes(state("bl-a", ALICE, "ACTIVE", 1, "TESTING", null).set("schemaVersion", 2).build()));
+        relay.accept(STATE, "bl-a", bytes(state("bl-a", ALICE, "ACTIVE", 1, "TESTING", null).set("schemaVersion", 3).build()));
         assertEquals(1, relay.dropsForTest());
         assertTrue(sinks.targeted.isEmpty());
     }
@@ -304,12 +304,12 @@ class BreakLineRelayTest {
         relay.accept(EVENTS, "bl-a|5", bytes(state("bl-a", ALICE, "ACTIVE", 1, "TESTING", null).build()));
         assertEquals(1, relay.schemaIdRefusedForTest(BreakLineRelay.Kind.EVENT));
         relay.accept(EVENTS, "WRONG", bytes(event("bl-a|5", "bl-a", ALICE, "TRANSITION")));
-        relay.accept(EVENTS, "bl-a|5", bytes(with(event("bl-a|5", "bl-a", ALICE, "TRANSITION"), "schemaVersion", 2)));
+        relay.accept(EVENTS, "bl-a|5", bytes(with(event("bl-a|5", "bl-a", ALICE, "TRANSITION"), "schemaVersion", 3)));
         // status: an event frame on the status topic is refused by id; wrong key and wrong version are dropped; a status with no epoch time is dropped
         relay.accept(STATUS, "break-line", bytes(event("bl-a|5", "bl-a", ALICE, "TRANSITION")));
         assertEquals(1, relay.schemaIdRefusedForTest(BreakLineRelay.Kind.STATUS));
         relay.accept(STATUS, "WRONG", bytes(status(false)));
-        relay.accept(STATUS, "break-line", bytes(with(status(false), "schemaVersion", 2)));
+        relay.accept(STATUS, "break-line", bytes(with(status(false), "schemaVersion", 3)));
         relay.accept(STATUS, "break-line", bytes(with(status(false), "statusEpochMillis", null)));
         assertEquals(5, relay.dropsForTest());
         assertTrue(sinks.global.isEmpty() && sinks.targeted.isEmpty());

@@ -17274,6 +17274,12 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** BS13-W-008: a break-line frame (a state or an event of a user's line) reaches only the sockets whose owner tag equals {@code ownerTag}. */
     void streamBreakLineTo(String ownerTag, String event, String json) {
+        if (BreakLineRelay.SYSTEM_OWNER.equals(ownerTag)) {   // BS13-SL-021: a system line reaches every socket that has a subject, and no other
+            for (WebSocketSession client : clients) {
+                if (client != null && lineHealthOwnerTag(client) != null) send(client, event, json);
+            }
+            return;
+        }
         streamLineHealthTo(ownerTag, event, json);
     }
 
