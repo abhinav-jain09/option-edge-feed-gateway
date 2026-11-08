@@ -1,0 +1,569 @@
+{
+  "type": "record",
+  "name": "BreakLineState",
+  "namespace": "com.optionsedge.contracts.breakline",
+  "fields": [
+    {
+      "name": "schemaVersion",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "messageType",
+      "type": "string",
+      "default": "BREAK_LINE_STATE"
+    },
+    {
+      "name": "environment",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "environmentLabel",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "contract",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "codeVersion",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "settingsDigest",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "ledgerDigest",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "tableDigest",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "tradeDate",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "lineId",
+      "type": "string"
+    },
+    {
+      "name": "ownerTag",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "drawingId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "lineStatus",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "lineRevision",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "domain",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "priceUnits",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "esTick",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "basisCents",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "basisStatus",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "createdAtEpochMillis",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "sideAtCreation",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "measurement",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "measurementReason",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "coverageMilli",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "bandTicks",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "requiredBandTicks",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "state",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "dir",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "touchCount",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "episodeId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "episodeNumber",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "tBreakEpochMillis",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "tScoreEpochMillis",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "maxdTicks",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "jumped",
+      "type": [
+        "null",
+        "boolean"
+      ],
+      "default": null
+    },
+    {
+      "name": "scoreStatus",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "score",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "band",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "scoreRevision",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null
+    },
+    {
+      "name": "calibrationState",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "components",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "BreakLineComponent",
+          "namespace": "com.optionsedge.contracts.breakline",
+          "fields": [
+            {
+              "name": "code",
+              "type": "string"
+            },
+            {
+              "name": "measure",
+              "type": "string"
+            },
+            {
+              "name": "raw",
+              "type": [
+                "null",
+                "long"
+              ],
+              "default": null
+            },
+            {
+              "name": "rawUnit",
+              "type": "string"
+            },
+            {
+              "name": "available",
+              "type": "boolean"
+            },
+            {
+              "name": "reason",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            },
+            {
+              "name": "signedMilli",
+              "type": [
+                "null",
+                "int"
+              ],
+              "default": null
+            },
+            {
+              "name": "inputs",
+              "type": {
+                "type": "array",
+                "items": {
+                  "type": "record",
+                  "name": "BreakLineKv",
+                  "namespace": "com.optionsedge.contracts.breakline",
+                  "fields": [
+                    {
+                      "name": "name",
+                      "type": "string"
+                    },
+                    {
+                      "name": "value",
+                      "type": "long"
+                    }
+                  ]
+                }
+              },
+              "default": []
+            },
+            {
+              "name": "span",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "BreakLineSpan",
+                  "namespace": "com.optionsedge.contracts.breakline",
+                  "fields": [
+                    {
+                      "name": "firstBucketEnd",
+                      "type": [
+                        "null",
+                        "long"
+                      ],
+                      "default": null
+                    },
+                    {
+                      "name": "lastBucketEnd",
+                      "type": [
+                        "null",
+                        "long"
+                      ],
+                      "default": null
+                    },
+                    {
+                      "name": "usable",
+                      "type": [
+                        "null",
+                        "int"
+                      ],
+                      "default": null
+                    },
+                    {
+                      "name": "unusable",
+                      "type": [
+                        "null",
+                        "int"
+                      ],
+                      "default": null
+                    },
+                    {
+                      "name": "firstUnusableReason",
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "default": null
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            }
+          ]
+        }
+      },
+      "default": []
+    },
+    {
+      "name": "explanation",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "span",
+      "type": [
+        "null",
+        "BreakLineSpan"
+      ],
+      "default": null
+    },
+    {
+      "name": "gammaTag",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "BreakLineGammaTag",
+          "namespace": "com.optionsedge.contracts.breakline",
+          "fields": [
+            {
+              "name": "status",
+              "type": "string"
+            },
+            {
+              "name": "strikeCents",
+              "type": [
+                "null",
+                "long"
+              ],
+              "default": null
+            },
+            {
+              "name": "distanceCents",
+              "type": [
+                "null",
+                "long"
+              ],
+              "default": null
+            },
+            {
+              "name": "holdEligible",
+              "type": [
+                "null",
+                "boolean"
+              ],
+              "default": null
+            },
+            {
+              "name": "holdAgeMs",
+              "type": [
+                "null",
+                "long"
+              ],
+              "default": null
+            },
+            {
+              "name": "gexRank",
+              "type": [
+                "null",
+                "int"
+              ],
+              "default": null
+            },
+            {
+              "name": "gexWeightDollars",
+              "type": [
+                "null",
+                "long"
+              ],
+              "default": null
+            },
+            {
+              "name": "gexAgeMs",
+              "type": [
+                "null",
+                "long"
+              ],
+              "default": null
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "asOfEpochMillis",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "asOfSource",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "eventSequence",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    }
+  ]
+}

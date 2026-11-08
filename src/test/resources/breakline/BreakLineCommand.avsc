@@ -1,0 +1,89 @@
+{
+  "type": "record",
+  "name": "BreakLineCommand",
+  "namespace": "com.optionsedge.contracts.breakline",
+  "fields": [
+    {
+      "name": "schemaVersion",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "messageType",
+      "type": "string",
+      "default": "BREAK_LINE_COMMAND"
+    },
+    {
+      "name": "operation",
+      "type": "string"
+    },
+    {
+      "name": "lineId",
+      "type": "string"
+    },
+    {
+      "name": "ownerTag",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "drawingId",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "clientRevision",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "domain",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "priceUnits",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "commandEpochMillis",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "createdAtEpochMillis",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "sideAtCreation",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    }
+  ]
+}
