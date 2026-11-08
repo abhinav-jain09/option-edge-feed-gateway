@@ -148,6 +148,37 @@ public final class GatewaySettings {
         return value("LINE_HEALTH_STATUS_TOPIC", "futures.line-health.status");
     }
 
+    // ---- Break score (break-line-service; docs design/es-liquidity/liq-S-break-score-rev13-design.md sections 4.6 and 14.8) ----
+
+    /**
+     * Master switch of the break-line relay: the state, events and status topics below are consumed, the frames {@code break-line-state}, {@code break-line-event} and
+     * {@code break-line-status} are sent (state and event only to the owner's sockets), the hello gains the field {@code breakLine} and the message {@code break-line-resume} is
+     * answered. OFF by default; when off nothing is consumed, nothing is cached and the hello has no such field.
+     */
+    public boolean breakLineRelayEnabled() {
+        return boolValue("BREAK_LINE_RELAY_ENABLED", false);
+    }
+
+    /** The most bytes of line states the hello field carries inline (default 400,000, a transport size, not a product limit): a larger checkpoint follows the hello in parts. */
+    public long breakLineHelloMaxBytes() {
+        return longValue("BREAK_LINE_HELLO_MAX_BYTES", 400_000L, 1_000L);
+    }
+
+    /** futures.break-line.state ({@code BreakLineState}, fixed schema id 3902): the newest state of each user line, compacted. */
+    public String breakLineStateTopic() {
+        return value("BREAK_LINE_STATE_TOPIC", "futures.break-line.state");
+    }
+
+    /** futures.break-line.events ({@code BreakLineEvent}, fixed schema id 3903): every transition and score. */
+    public String breakLineEventsTopic() {
+        return value("BREAK_LINE_EVENTS_TOPIC", "futures.break-line.events");
+    }
+
+    /** futures.break-line.status ({@code BreakLineStatus}, fixed schema id 3904): the one-second heartbeat, compacted. */
+    public String breakLineStatusTopic() {
+        return value("BREAK_LINE_STATUS_TOPIC", "futures.break-line.status");
+    }
+
     // ---- liquidity-validator label relay (design/geometry-trade-rules/VALIDATOR-LABEL-ON-ORDER-PAGE-REQUIREMENT.md) ----
 
     /** Master switch of the liquidity-validator label relay: futures.liquidity-validator.evaluations is tailed and the global event {@code liquidity-validator} is broadcast. OFF by default (dev only topic). */

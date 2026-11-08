@@ -113,6 +113,9 @@ public class FeedGatewayService implements ReplayRunner {
     /** Line-health relay (level-absorption-service line-health loop, requirement LH-O-6): global frames, the hello field {@code lineHealth} and the resume message. */
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private org.springframework.beans.factory.ObjectProvider<LineHealthRelay> lineHealthRelay;
+    /** Break-score relay (break-line-service): the user's own lines only (owner filter), the global status heartbeat, the hello field {@code breakLine} and the resume message. */
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private org.springframework.beans.factory.ObjectProvider<BreakLineRelay> breakLineRelay;
     private final GatewaySettings settings;
     // ---- ES Footprint (ES-FOOTPRINT-GATEWAY-DESIGN.md G-R1..G-R11) — null unless the flag is on ----
     private final FootprintViews footprintViews;
@@ -1696,6 +1699,10 @@ public class FeedGatewayService implements ReplayRunner {
             var relay=lineHealthRelay.getIfAvailable();
             if(relay!=null)relay.checkpointParts(lineHealthOwnerTag(session)).forEach(part->send(session,LineHealthRelay.CHECKPOINT_EVENT,part));   // the states of a checkpoint too large for the hello follow it in parts
         }
+        if(breakLineRelay!=null&&settings.breakLineRelayEnabled()) {
+            var relay=breakLineRelay.getIfAvailable();
+            if(relay!=null)relay.checkpointParts(lineHealthOwnerTag(session)).forEach(part->send(session,BreakLineRelay.CHECKPOINT_EVENT,part));   // the owner's lines of a checkpoint too large for the hello follow it in parts
+        }
         // A client may reconnect after the one-shot readiness broadcast (for example after a
         // gateway restart or a transient socket failure). Re-announce the already-committed
         // readiness to this socket so its UI cannot remain stuck in source-switching forever.
@@ -2404,6 +2411,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + esLiquidityWallMetrics()
                 + liquidityValidatorMetrics()
                 + lineHealthMetrics()
+                + breakLineMetrics()
                 + "# HELP gateway_cvd_spx_levels_enabled Whether the U16 CVD SPX levels stream is enabled (the paging-alert gate).\n"
                 + "# TYPE gateway_cvd_spx_levels_enabled gauge\n"
                 + "gateway_cvd_spx_levels_enabled " + boolMetric(settings.esCvdSpxLevelsEnabled()) + "\n"
@@ -13412,6 +13420,11 @@ public class FeedGatewayService implements ReplayRunner {
         return topics;
     }
 
+    private String breakLineMetrics() {
+        var relay = breakLineRelay == null ? null : breakLineRelay.getIfAvailable();
+        return relay == null ? "" : relay.metrics();
+    }
+
     private String lineHealthMetrics() {
         var relay = lineHealthRelay == null ? null : lineHealthRelay.getIfAvailable();
         return relay == null ? "" : relay.metrics();
@@ -13785,6 +13798,7 @@ public class FeedGatewayService implements ReplayRunner {
         // G-R6.2 mutation (which drops the footprint term from the line below) still applies verbatim.
         if (settings.marketStructureEnabled()) return true;
         if (settings.lineHealthRelayEnabled()) return true;              // the line-health checkpoint rides the hello
+        if (settings.breakLineRelayEnabled()) return true;               // so does the break-score checkpoint
         if (settings.marketStructurePatternsEnabled()) return true;      // PATTERNS joins the hello too
         if (settings.studiesEnabled()) return true;                      // so do the INDICATOR-STUDIES studies
         if (!taRelays.isEmpty()) return true;                            // and the structure tools, geometry, trade tools, waves and break classification
@@ -13835,6 +13849,11 @@ public class FeedGatewayService implements ReplayRunner {
             // LINE HEALTH (LH-O-6): the checkpoint {status, states, watermark}; the FIELD's presence = flag on. Appended before the studies so their hello budget accounts for it.
             var lineHealth = lineHealthRelay == null ? null : lineHealthRelay.getIfAvailable();
             sb.append(",\"lineHealth\":").append(lineHealth == null ? "null" : lineHealth.helloField(lineHealthOwnerTag));
+        }
+        if (settings.breakLineRelayEnabled()) {
+            // BREAK SCORE: the checkpoint {status, states, version} of the socket's OWN lines; the FIELD's presence = flag on. The owner tag is the same one the line-health field uses.
+            var breakLine = breakLineRelay == null ? null : breakLineRelay.getIfAvailable();
+            sb.append(",\"breakLine\":").append(breakLine == null ? "null" : breakLine.helloField(lineHealthOwnerTag));
         }
         if (footprintViews != null) {
             // G-R6: ONE atomic snapshot of the footprint coordinator rides the SAME hello; the field's
@@ -14137,6 +14156,12 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The line-health relay's fan-out: the four {@code line-health-*} frames are global and never coalesced (every record counts for the page's gap detection). */
     void streamLineHealth(String event, String json) {broadcast(event, json);}
+
+    /** The break-line relay's global fan-out: only the status heartbeat is global (it names no line); state and event frames are owner-targeted through {@link #streamBreakLineTo}. */
+    void streamBreakLine(String event, String json) {
+        if (!BreakLineRelay.STATUS_EVENT.equals(event)) return;   // fail closed: a line record can never reach every socket, whatever the routing mode
+        broadcast(event, json);
+    }
 
     private void broadcast(String event, String json) {
         // Per-session routing: only explicitly allowlisted global events may fan out to every
@@ -15233,6 +15258,8 @@ public class FeedGatewayService implements ReplayRunner {
             LiquidityValidatorRelay.EVENT,
             // Line health (requirement LH-O-6): system-line records for every socket; user-line records are refused by the relay until the owner filter (M5).
             LineHealthRelay.STATE_EVENT, LineHealthRelay.EVENT_EVENT, LineHealthRelay.VOICE_EVENT, LineHealthRelay.STATUS_EVENT, LineHealthRelay.RESUME, LineHealthRelay.CHECKPOINT_EVENT,
+            // Break score: ONLY the heartbeat is global (no line in it). The state and event frames, the resume answer and the checkpoint parts carry a user's line and are NEVER in this list: they are sent to one socket (send) or one owner (streamBreakLineTo).
+            BreakLineRelay.STATUS_EVENT,
             "status", "reset", "source-switching", "source-ready", "source-stale",
             // Candlestick pattern annotation sets (market-structure service): global, verbatim, flag-gated.
             "market-structure-patterns",
@@ -15489,6 +15516,18 @@ public class FeedGatewayService implements ReplayRunner {
                 if (relay != null && LineHealthRelay.RESUME.equals(mapper.readTree(payload).path("type").asText())) {
                     send(session, LineHealthRelay.RESUME, relay.resumeReply(lineHealthOwnerTag(session)));
                     relay.checkpointParts(lineHealthOwnerTag(session)).forEach(part -> send(session, LineHealthRelay.CHECKPOINT_EVENT, part));
+                    return;
+                }
+            } catch (Exception invalid) {
+                // not a resume message: falls through to the other dispatchers
+            }
+        }
+        if (settings.breakLineRelayEnabled() && breakLineRelay != null && payload.contains(BreakLineRelay.RESUME)) {
+            // the page's request for a fresh checkpoint of its own lines (a gap, a reset)
+            var relay = breakLineRelay.getIfAvailable();
+            try {
+                if (relay != null && BreakLineRelay.RESUME.equals(mapper.readTree(payload).path("type").asText())) {
+                    sendBreakLineCheckpoint(session, relay);
                     return;
                 }
             } catch (Exception invalid) {
@@ -17214,6 +17253,28 @@ public class FeedGatewayService implements ReplayRunner {
         if (session == null || session.getAttributes() == null) return null;
         Object tag = session.getAttributes().get(LINE_HEALTH_OWNER_TAG_ATTR);
         return tag instanceof String text && !text.isBlank() ? text : null;
+    }
+
+    /** The resume answer of one socket and the parts that follow it, from one snapshot of the owner's checkpoint. */
+    private void sendBreakLineCheckpoint(WebSocketSession session, BreakLineRelay relay) {
+        BreakLineRelay.Snapshot snapshot = relay.snapshot(lineHealthOwnerTag(session));
+        send(session, BreakLineRelay.RESUME, relay.resumeReply(snapshot));
+        snapshot.parts().forEach(part -> send(session, BreakLineRelay.CHECKPOINT_EVENT, part));
+    }
+
+    /** The break-line bootstrap scan finished: every connected socket receives its own completed checkpoint (a socket that connected during the scan was told it was not ready). */
+    void breakLineReady() {
+        if (breakLineRelay == null || !settings.breakLineRelayEnabled()) return;
+        var relay = breakLineRelay.getIfAvailable();
+        if (relay == null) return;
+        for (WebSocketSession client : clients) {
+            if (client != null && client.isOpen()) sendBreakLineCheckpoint(client, relay);
+        }
+    }
+
+    /** BS13-W-008: a break-line frame (a state or an event of a user's line) reaches only the sockets whose owner tag equals {@code ownerTag}. */
+    void streamBreakLineTo(String ownerTag, String event, String json) {
+        streamLineHealthTo(ownerTag, event, json);
     }
 
     /** LH-O-6: a user-line frame reaches only the sockets whose owner tag equals {@code ownerTag}. */
