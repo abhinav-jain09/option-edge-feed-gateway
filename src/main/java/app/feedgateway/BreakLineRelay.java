@@ -34,7 +34,8 @@ import org.springframework.stereotype.Component;
  * committed), fanned out through the existing authenticated sockets as {@link #STATE_EVENT}, {@link #EVENT_EVENT} and {@link #STATUS_EVENT} and folded into the checkpoint that
  * the hello field {@code breakLine} carries: {@code {status, states, version}}.
  * <p>
- * Every break-score line belongs to a user. There are no system lines. So:
+ * A break-score line belongs to a user, or (rev 14, BS13-SL-021) is a system line with {@code lineOrigin = SYSTEM} and owner {@code SYSTEM}, which goes to every socket that has a
+ * subject and to no socket without one. Both schema versions are accepted (ids 3902-3904 and 3906-3908). So:
  * <ul>
  * <li>A state or event record goes only to the sockets whose authenticated subject maps to the record's {@code ownerTag} (the owner filter of the line-health user lines, same tag
  * function): live frames through the targeted sink, the hello and the resume answer built per socket with every other owner's states removed before serialization. A state or
@@ -62,6 +63,10 @@ final class BreakLineRelay {
     static final String REMOVED = "REMOVED";
 
     static final int STATE_ID = 3902, EVENT_ID = 3903, STATUS_ID = 3904;
+    /** Version 2 of the three subjects (rev 14, BS13-SL-019): the same record names, the optional system line fields. Both versions are accepted. */
+    static final int STATE_ID_V2 = 3906, EVENT_ID_V2 = 3907, STATUS_ID_V2 = 3908;
+    /** The owner literal of a system line (BS13-SL-002): not a valid 32-hex owner tag, so it can equal no user's tag. */
+    static final String SYSTEM_OWNER = "SYSTEM";
     static final String STATE_NAME = "com.optionsedge.contracts.breakline.BreakLineState";
     static final String EVENT_NAME = "com.optionsedge.contracts.breakline.BreakLineEvent";
     static final String STATUS_NAME = "com.optionsedge.contracts.breakline.BreakLineStatus";
@@ -281,6 +286,14 @@ final class BreakLineRelay {
         return kind == Kind.STATE ? STATE_ID : kind == Kind.EVENT ? EVENT_ID : STATUS_ID;
     }
 
+    static int expectedIdV2(Kind kind) {
+        return kind == Kind.STATE ? STATE_ID_V2 : kind == Kind.EVENT ? EVENT_ID_V2 : STATUS_ID_V2;
+    }
+
+    static boolean idAccepted(Kind kind, int id) {
+        return id == expectedId(kind) || id == expectedIdV2(kind);
+    }
+
     static String expectedName(Kind kind) {
         return kind == Kind.STATE ? STATE_NAME : kind == Kind.EVENT ? EVENT_NAME : STATUS_NAME;
     }
@@ -301,7 +314,7 @@ final class BreakLineRelay {
             return;
         }
         Lane lane = lane(kind);
-        if (frameId(value) != expectedId(kind)) {
+        if (!idAccepted(kind, frameId(value))) {
             lane.schemaIdRefused.incrementAndGet();
             return;
         }
@@ -311,7 +324,7 @@ final class BreakLineRelay {
             undecodable.incrementAndGet();
             return;
         }
-        ObjectNode node = render(kind, key, decoded);
+        ObjectNode node = render(kind, key, decoded, frameId(value) == expectedIdV2(kind) ? 2 : 1);
         if (node == null) {
             drops.incrementAndGet();
             return;
@@ -327,6 +340,11 @@ final class BreakLineRelay {
             return;
         }
         String owner = node.hasNonNull("ownerTag") ? node.get("ownerTag").asText() : null;
+        boolean systemOrigin = "SYSTEM".equals(node.path("lineOrigin").asText(null));
+        if (systemOrigin != SYSTEM_OWNER.equals(owner)) {
+            userRecordsRefused.incrementAndGet();   // fail closed: origin SYSTEM needs owner SYSTEM and the owner literal SYSTEM needs origin SYSTEM
+            return;
+        }
         if (owner == null || owner.isBlank()) {
             if (kind == Kind.EVENT && !node.hasNonNull("lineId")) {
                 internalEventsNotRelayed.incrementAndGet();   // the service's own bookkeeping (a watermark advance, a refusal of an input record)
@@ -369,8 +387,9 @@ final class BreakLineRelay {
         int inCurrent = 0;
         if (ownerTag != null) {   // a socket with no subject receives no line
             for (Map.Entry<String, String> entry : states.entrySet()) {
-                if (!ownerTag.equals(stateOwners.get(entry.getKey()))) {
-                    continue;   // another user's line
+                String lineOwner = stateOwners.get(entry.getKey());
+                if (!ownerTag.equals(lineOwner) && !SYSTEM_OWNER.equals(lineOwner)) {
+                    continue;   // another user's line (a system line is every signed-in user's)
                 }
                 String st = entry.getValue();
                 int bytes = st.getBytes(StandardCharsets.UTF_8).length + 1;
@@ -452,11 +471,16 @@ final class BreakLineRelay {
 
     /** The node for a record that passes the boundary, with null members omitted, else null. */
     static ObjectNode render(Kind kind, String key, Object value) {
+        return render(kind, key, value, 1);
+    }
+
+    /** {@code version} is the version of the frame's schema id (1 for 3902-3904, 2 for 3906-3908); the record's own {@code schemaVersion} must equal it. */
+    static ObjectNode render(Kind kind, String key, Object value, int version) {
         if (!(value instanceof GenericRecord r) || !expectedName(kind).equals(r.getSchema().getFullName())) {
             return null;
         }
         try {
-            if (!Integer.valueOf(1).equals(r.get("schemaVersion"))) {
+            if (!Integer.valueOf(version).equals(r.get("schemaVersion"))) {
                 return null;
             }
             String expectedKey = kind == Kind.STATUS ? STATUS_KEY : String.valueOf(r.get(kind == Kind.STATE ? "lineId" : "eventId"));
