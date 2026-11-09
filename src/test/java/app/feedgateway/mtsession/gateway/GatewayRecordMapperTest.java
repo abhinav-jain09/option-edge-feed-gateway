@@ -46,6 +46,41 @@ class GatewayRecordMapperTest {
         assertEquals(6050.0, rec.strike().getAsDouble());
     }
 
+    /** 2026-11-09 dev: the pre-open IBKR gamma value (source=IBKR, timeframe=IBKR_PREOPEN) rides the Databento
+     *  topic and is enriched to marketDataSource=DATABENTO; its `source` was read as a contradiction and ~280
+     *  records/s were dropped as non-routable, so no page ever received a pre-open gamma number. */
+    @Test
+    void theIbkrPreOpenGexValueRoutesOnTheDatabentoBinding() throws Exception {
+        String value = "{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400.0,"
+                + "\"marketDataSource\":\"DATABENTO\",\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\","
+                + "\"sessionId\":\"IBKR_PREOPEN:20261109\"}";
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike", node(value)).orElseThrow();
+        assertEquals(MarketDataSource.DATABENTO, rec.bindingSource());
+        assertEquals(EventType.GEX_BY_STRIKE, rec.eventType());
+        assertEquals(7400.0, rec.strike().getAsDouble());
+        assertNull(rec.payloadSource(), "the exempted source is not threaded onward to re-trigger the guard");
+    }
+
+    @Test
+    void theIbkrPreOpenExemptionIsExactlyTheProducersTuple() throws Exception {
+        // IBKR source without the pre-open timeframe: still a contradiction (a genuine IBKR record on a
+        // Databento binding is misrouted data).
+        assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400,\"source\":\"IBKR\"}")).isEmpty());
+        // the pre-open timeframe with another source: not the tuple
+        assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400,"
+                        + "\"source\":\"UNUSUAL_WHALES\",\"timeframe\":\"IBKR_PREOPEN\",\"marketDataSource\":\"IBKR\"}")).isEmpty());
+        // the tuple on a different event: the exemption is for the gex value only
+        assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "snapshot",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400,"
+                        + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\"}")).isEmpty());
+        // a marketDataSource that really contradicts the binding is still refused, tuple or not
+        assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike",
+                node("{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400,\"marketDataSource\":\"IBKR\","
+                        + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\"}")).isEmpty());
+    }
+
     @Test
     void mapsUnderlyingEventWithoutSymbolStrike() throws Exception {
         RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "vix-price",
