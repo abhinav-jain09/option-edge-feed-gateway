@@ -14324,7 +14324,8 @@ public class FeedGatewayService implements ReplayRunner {
                 int bar = key == null ? -1 : key.indexOf('|');
                 String source = bar > 0 ? key.substring(0, bar)
                         : (root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "");
-                Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
+                Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(
+                        source, event, root, preOpenValueOnOrdinaryPlane());
                 if (rec.isPresent() && routingEngine.shouldDeliverToSocket(rec.get(), socketId)) {
                     deliverable.add(json);
                 }
@@ -15405,6 +15406,12 @@ public class FeedGatewayService implements ReplayRunner {
      * dropped — never broadcast — unless it is an explicitly {@linkplain #GLOBAL_BROADCAST_EVENTS
      * allowlisted global event}. In legacy mode the behaviour is unchanged (broadcast).
      */
+    /** The IBKR pre-open gamma value is delivered on the ordinary gex-by-strike plane exactly while the value
+     *  plane is switched OFF (the kill switch, #169): with arbitration ON the arbitration plane owns it. */
+    private boolean preOpenValueOnOrdinaryPlane() {
+        return settings.ibkrPreOpenEnabled() && !settings.ibkrPreOpenGexArbitrationEnabled();
+    }
+
     private void routeOrBroadcast(String bindingSource, String event, String json) {
         if (perSessionRouting()) {
             SessionRoutingEngine engine = routingEngine;
@@ -15416,7 +15423,8 @@ public class FeedGatewayService implements ReplayRunner {
                 String source = (bindingSource != null && !bindingSource.isBlank())
                         ? bindingSource
                         : (root.hasNonNull("marketDataSource") ? root.get("marketDataSource").asText("") : "");
-                Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(source, event, root);
+                Optional<RoutableRecord> rec = GatewayRecordMapper.toRoutableRecord(
+                        source, event, root, preOpenValueOnOrdinaryPlane());
                 if (rec.isPresent()) {
                     for (String socketId : engine.route(rec.get())) {
                         WebSocketSession s = clientsById.get(socketId);

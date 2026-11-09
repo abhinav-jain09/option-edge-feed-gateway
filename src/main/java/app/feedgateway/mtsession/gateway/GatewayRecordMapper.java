@@ -21,6 +21,17 @@ public final class GatewayRecordMapper {
     }
 
     public static Optional<RoutableRecord> toRoutableRecord(String bindingSource, String event, JsonNode root) {
+        return toRoutableRecord(bindingSource, event, root, false);
+    }
+
+    /**
+     * @param preOpenValueOnOrdinaryPlane true ONLY while the pre-open value plane is OFF
+     *        ({@code GATEWAY_IBKR_PREOPEN_ENABLED=true} and {@code GATEWAY_IBKR_PREOPEN_GEX_ARBITRATION_ENABLED=false}),
+     *        i.e. when the IBKR pre-open gamma value rides the ordinary gex-by-strike delivery. With the plane
+     *        ON the arbitration plane owns that tuple and nothing here may change.
+     */
+    public static Optional<RoutableRecord> toRoutableRecord(
+            String bindingSource, String event, JsonNode root, boolean preOpenValueOnOrdinaryPlane) {
         Optional<MarketDataSource> source = MarketDataSource.parse(bindingSource);
         if (source.isEmpty() || root == null) {
             return Optional.empty();
@@ -35,6 +46,14 @@ public final class GatewayRecordMapper {
         // a session of the binding source.
         String payloadMarketDataSource = textOrNull(root, "marketDataSource");
         String payloadSource = textOrNull(root, "source");
+        if (preOpenValueOnOrdinaryPlane && isIbkrPreOpenGexValue(event, root)) {
+            // The pre-open IBKR gamma value is DESIGNED to be a Databento-board value from a different
+            // producer (the board joins it beside the Databento rows, D14): its `source` says IBKR on
+            // purpose, while the topic binding and the enriched marketDataSource say DATABENTO. Read as a
+            // contradiction it was dropped as non-routable — ~280 records/s on dev 2026-11-09, so a page
+            // saw the pre-open status stream and no gamma at all. The exemption is this exact tuple only.
+            payloadSource = null;
+        }
         if (contradicts(source.get(), payloadMarketDataSource) || contradicts(source.get(), payloadSource)) {
             return Optional.empty();
         }
@@ -57,6 +76,17 @@ public final class GatewayRecordMapper {
                 : OptionalDouble.empty();
         return Optional.of(new RoutableRecord(source.get(), type, symbol, expiry, strike, epoch,
                 payloadMarketDataSource, payloadSource));
+    }
+
+    /** The producer's own tuple, literally: a {@code gex-by-strike} record stamped {@code source=IBKR} AND
+     *  {@code timeframe=IBKR_PREOPEN} (the same fail-closed pair the web client's {@code isPreOpenGexPayload}
+     *  requires, byte-exact: the wire values are upper-case literals and a mis-cased copy is corrupt data,
+     *  not the producer's tuple). Anything less — a bare IBKR source, a different timeframe, another event — keeps the
+     *  contradiction rule. */
+    static boolean isIbkrPreOpenGexValue(String event, JsonNode root) {
+        return "gex-by-strike".equals(event)
+                && "IBKR".equals(textOrNull(root, "source"))
+                && "IBKR_PREOPEN".equals(textOrNull(root, "timeframe"));
     }
 
     private static String textOrNull(JsonNode root, String field) {
