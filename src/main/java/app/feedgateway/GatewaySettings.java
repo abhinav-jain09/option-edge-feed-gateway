@@ -278,6 +278,28 @@ public final class GatewaySettings {
         return boolValue("ES_LIQUIDITY_WALL_HISTORY_FROM_SESSION_OPEN", true);
     }
 
+    // ---- in-service outcomes (liq-V design section 10): the compacted scoreboard topics, read-only projection at /api/scorecard ----
+
+    /**
+     * The compacted scoreboard topics the services publish (comma separated; dev: {@code futures.level-absorption.scoreboard}). Empty (the default) = the reader
+     * is off, nothing is consumed and {@code /api/scorecard} answers an empty row list with a message that says so.
+     */
+    public java.util.List<String> scorecardScoreboardTopics() {
+        String v = value("KAFKA_SCORECARD_SCOREBOARD_TOPICS", "");
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (String t : v.split(",")) {
+            if (!t.isBlank() && !out.contains(t.trim())) {
+                out.add(t.trim());
+            }
+        }
+        return java.util.List.copyOf(out);
+    }
+
+    /** How often a missing scoreboard topic is looked for again (bounded: 5 s to 10 min). Default 30 s. */
+    public long scorecardTopicRetryMs() {
+        return Math.max(5_000L, Math.min(600_000L, longValue("SCORECARD_TOPIC_RETRY_MS", 30_000L, 0L)));
+    }
+
     public String bootstrapServers() {
         return value("KAFKA_BOOTSTRAP_SERVERS", DEFAULT_BOOTSTRAP_SERVERS);
     }
