@@ -49,12 +49,14 @@ class GatewayRecordMapperTest {
     /** 2026-11-09 dev: the pre-open IBKR gamma value (source=IBKR, timeframe=IBKR_PREOPEN) rides the Databento
      *  topic and is enriched to marketDataSource=DATABENTO; its `source` was read as a contradiction and ~280
      *  records/s were dropped as non-routable, so no page ever received a pre-open gamma number. */
+    private static final String PREOPEN_VALUE = "{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400.0,"
+            + "\"marketDataSource\":\"DATABENTO\",\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\","
+            + "\"sessionId\":\"IBKR_PREOPEN:20261109\"}";
+
     @Test
-    void theIbkrPreOpenGexValueRoutesOnTheDatabentoBinding() throws Exception {
-        String value = "{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400.0,"
-                + "\"marketDataSource\":\"DATABENTO\",\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\","
-                + "\"sessionId\":\"IBKR_PREOPEN:20261109\"}";
-        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike", node(value)).orElseThrow();
+    void theIbkrPreOpenGexValueRoutesOnTheDatabentoBindingWhileTheValuePlaneIsOff() throws Exception {
+        RoutableRecord rec = GatewayRecordMapper.toRoutableRecord(
+                "DATABENTO", "gex-by-strike", node(PREOPEN_VALUE), true).orElseThrow();
         assertEquals(MarketDataSource.DATABENTO, rec.bindingSource());
         assertEquals(EventType.GEX_BY_STRIKE, rec.eventType());
         assertEquals(7400.0, rec.strike().getAsDouble());
@@ -62,23 +64,33 @@ class GatewayRecordMapperTest {
     }
 
     @Test
+    void withoutTheValuePlaneOffPermissionTheTupleIsStillRefused() throws Exception {
+        // the 3-argument form and an explicit false are the arbitration-ON world: unchanged
+        assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike", node(PREOPEN_VALUE)).isEmpty());
+        assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike", node(PREOPEN_VALUE), false).isEmpty());
+    }
+
+    @Test
     void theIbkrPreOpenExemptionIsExactlyTheProducersTuple() throws Exception {
+        String base = "{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400,";
         // IBKR source without the pre-open timeframe: still a contradiction (a genuine IBKR record on a
         // Databento binding is misrouted data).
         assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike",
-                node("{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400,\"source\":\"IBKR\"}")).isEmpty());
+                node(base + "\"source\":\"IBKR\"}"), true).isEmpty());
         // the pre-open timeframe with another source: not the tuple
         assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike",
-                node("{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400,"
-                        + "\"source\":\"UNUSUAL_WHALES\",\"timeframe\":\"IBKR_PREOPEN\",\"marketDataSource\":\"IBKR\"}")).isEmpty());
+                node(base + "\"source\":\"UNUSUAL_WHALES\",\"timeframe\":\"IBKR_PREOPEN\",\"marketDataSource\":\"IBKR\"}"), true).isEmpty());
         // the tuple on a different event: the exemption is for the gex value only
         assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "snapshot",
-                node("{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400,"
-                        + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\"}")).isEmpty());
+                node(base + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\"}"), true).isEmpty());
         // a marketDataSource that really contradicts the binding is still refused, tuple or not
         assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike",
-                node("{\"symbol\":\"SPX\",\"expiry\":\"20261109\",\"strike\":7400,\"marketDataSource\":\"IBKR\","
-                        + "\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\"}")).isEmpty());
+                node(base + "\"marketDataSource\":\"IBKR\",\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\"}"), true).isEmpty());
+        // the wire values are exact upper-case literals: a mis-cased copy is corrupt, not the producer's tuple
+        assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike",
+                node(base + "\"source\":\"ibkr\",\"timeframe\":\"ibkr_preopen\"}"), true).isEmpty());
+        assertTrue(GatewayRecordMapper.toRoutableRecord("DATABENTO", "gex-by-strike",
+                node(base + "\"source\":\"IBKR\",\"timeframe\":\"Ibkr_PreOpen\"}"), true).isEmpty());
     }
 
     @Test

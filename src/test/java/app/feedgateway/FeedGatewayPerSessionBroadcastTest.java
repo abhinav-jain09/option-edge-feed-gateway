@@ -141,6 +141,59 @@ class FeedGatewayPerSessionBroadcastTest {
         assertTrue(u2.isEmpty());
     }
 
+    // ---- 2026-11-09: the IBKR pre-open gamma value rides the ordinary plane while the value plane is OFF ----
+
+    private static final String PREOPEN_GEX = "{\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":7500,"
+            + "\"marketDataSource\":\"DATABENTO\",\"source\":\"IBKR\",\"timeframe\":\"IBKR_PREOPEN\","
+            + "\"sessionId\":\"IBKR_PREOPEN:20260612\"}";
+
+    /** Routes {@code json} through a fresh service whose pre-open flags are held for the whole call (the settings
+     *  are read when a record is routed, not only at construction). */
+    private void routeWithFlags(String preOpen, String arbitration, String source, String event, String json)
+            throws Exception {
+        System.setProperty("GATEWAY_IBKR_PREOPEN_ENABLED", preOpen);
+        System.setProperty("GATEWAY_IBKR_PREOPEN_GEX_ARBITRATION_ENABLED", arbitration);
+        try {
+            FeedGatewayService s = new FeedGatewayService(new GatewaySettings(), new ObjectMapper(),
+                    new HpsfGatewayViewMapper(), engine);
+            s.runOutboundWritesInline();
+            s.addClient(socket("s1", u1));
+            s.addClient(socket("s2", u2));
+            u1.clear();
+            u2.clear();
+            Method m = FeedGatewayService.class.getDeclaredMethod("routeOrBroadcast", String.class, String.class, String.class);
+            m.setAccessible(true);
+            m.invoke(s, source, event, json);
+        } finally {
+            System.clearProperty("GATEWAY_IBKR_PREOPEN_ENABLED");
+            System.clearProperty("GATEWAY_IBKR_PREOPEN_GEX_ARBITRATION_ENABLED");
+        }
+    }
+
+    @Test
+    void thePreOpenGammaValueReachesTheMatchingSessionOnlyWhileTheValuePlaneIsOff() throws Exception {
+        routeWithFlags("true", "false", "DATABENTO", "gex-by-strike", PREOPEN_GEX);
+        assertEquals(1, u1.size(), "the pre-open gamma value must reach the SPX/20260612 session");
+        assertTrue(u1.get(0).contains("\"type\":\"gex-by-strike\""));
+        assertTrue(u2.isEmpty(), "and not another session's selection");
+
+        // arbitration ON (the default): the arbitration plane owns this tuple, so the ordinary plane still refuses it
+        routeWithFlags("true", "true", "DATABENTO", "gex-by-strike", PREOPEN_GEX);
+        assertTrue(u1.isEmpty(), "with the value plane ON nothing about the ordinary plane changes");
+
+        // pre-open disabled altogether: no exemption either
+        routeWithFlags("false", "false", "DATABENTO", "gex-by-strike", PREOPEN_GEX);
+        assertTrue(u1.isEmpty(), "a gateway with the pre-open feature dark never exempts it");
+    }
+
+    @Test
+    void aGenuineIbkrGexRecordStillCannotReachADatabentoSessionWithTheValuePlaneOff() throws Exception {
+        routeWithFlags("true", "false", "DATABENTO", "gex-by-strike",
+                "{\"symbol\":\"SPX\",\"expiry\":\"20260612\",\"strike\":7500,\"source\":\"IBKR\"}");
+        assertTrue(u1.isEmpty());
+        assertTrue(u2.isEmpty());
+    }
+
     // ---- P0: HPSF signals/audit must route per-session, never via the all-client batch ----
 
     private void routeHpsf(String event, String key, String json, String expiry) throws Exception {
