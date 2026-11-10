@@ -366,7 +366,7 @@ class WsJwtHandshakeInterceptorTest {
         assertEquals("rejected [token] and [token] now", WsJwtHandshakeInterceptor.sanitize(
                 "rejected " + token + " and zzzzzzzzzz.yyyyyyyyyy.xxxxxxxxxx now", token));
         assertEquals("a b", WsJwtHandshakeInterceptor.sanitize("a\r\nb", null));
-        assertEquals(200 + 3, WsJwtHandshakeInterceptor.sanitize("x ".repeat(500), null).length());
+        assertEquals(200, WsJwtHandshakeInterceptor.sanitize("x ".repeat(500), null).length());
         assertEquals("", WsJwtHandshakeInterceptor.sanitize(null, token));
 
         withSymbolAndExpiry("SPX", "20260612", () -> {
@@ -412,6 +412,56 @@ class WsJwtHandshakeInterceptorTest {
 
             assertEquals(2, lines.size(), "50 refusals in 5 s log once; the next interval logs again: " + lines);
             assertTrue(lines.get(1).contains("49 similar refusals not logged"), lines.get(1));
+        });
+    }
+
+    @Test
+    void suppressedRefusalsAreCountedPerReasonAndConcurrentRefusalsLogOnce() throws Exception {
+        withSymbolAndExpiry("SPX", "20260612", () -> {
+            WsTicketService svc = multiTenantService("good",
+                    new VerifiedPrincipal("u1", "d", Set.of("user"), "options-edge-web", null),
+                    q -> ApprovalAuthority.ApprovalDecision.DENY);
+            WsJwtHandshakeInterceptor interceptor =
+                    new WsJwtHandshakeInterceptor(new GatewaySettings(), failingDecoder(), svc);
+            long[] now = {5_000_000L};
+            interceptor.setClockForTest(() -> now[0]);
+            HttpHeaders none = new HttpHeaders();
+            HttpHeaders bad = new HttpHeaders();
+            bad.add("Sec-WebSocket-Protocol", "oc.bearer, wrong");
+            ServerHttpResponse resp = mock(ServerHttpResponse.class);
+
+            List<String> lines = captureInterceptorLog(() -> {
+                for (int i = 0; i < 7; i++) {
+                    interceptor.beforeHandshake(requestWith(none), resp, null, new HashMap<>()); // reason A, 7 times
+                }
+                interceptor.beforeHandshake(requestWith(bad), resp, null, new HashMap<>());       // reason B, once
+                now[0] += 10_000;
+                interceptor.beforeHandshake(requestWith(bad), resp, null, new HashMap<>());       // B again, nothing suppressed
+                interceptor.beforeHandshake(requestWith(none), resp, null, new HashMap<>());      // A again
+            });
+            assertEquals(4, lines.size(), lines.toString());
+            assertFalse(lines.get(2).contains("not logged"), "B suppressed nothing: " + lines.get(2));
+            assertTrue(lines.get(3).contains("6 similar refusals not logged"), lines.get(3));
+
+            // 64 threads refuse at the same instant after the interval: exactly one line.
+            now[0] += 10_000;
+            List<String> burst = captureInterceptorLog(() -> {
+                java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+                java.util.List<Thread> threads = new java.util.ArrayList<>();
+                for (int i = 0; i < 64; i++) {
+                    Thread t = new Thread(() -> {
+                        try { go.await(); } catch (InterruptedException e) { return; }
+                        interceptor.beforeHandshake(requestWith(none), mock(ServerHttpResponse.class), null, new HashMap<>());
+                    });
+                    threads.add(t);
+                    t.start();
+                }
+                go.countDown();
+                for (Thread t : threads) {
+                    try { t.join(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                }
+            });
+            assertEquals(1, burst.size(), "concurrent refusals must log once: " + burst.size());
         });
     }
 

@@ -31,8 +31,7 @@ import org.springframework.web.socket.server.HandshakeInterceptor;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.LinkedHashMap;
 import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
 
@@ -64,10 +63,9 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
 
     private static final Logger LOG = LoggerFactory.getLogger(WsJwtHandshakeInterceptor.class);
     private static final long LOG_INTERVAL_MS = 10_000L;
-    private static final int MAX_LOG_KEYS = 1_000;
+    private static final int MAX_LOG_KEYS = 256;
     private static final int MAX_DETAIL = 200;
-    private final Map<String, AtomicLong> lastLogged = new ConcurrentHashMap<>();
-    private final AtomicLong suppressed = new AtomicLong();
+    private final RefusalLog refusalLog = new RefusalLog();
     /** Clock for the log rate limit; replaceable so a test does not sleep. */
     private volatile LongSupplier nowMs = System::currentTimeMillis;
 
@@ -203,19 +201,10 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
         // token so the key set is bounded by real users): a client that retries every few seconds, or a caller
         // sending garbage on purpose, must not turn the log into noise.
         String key = "not approved".equals(reason) ? reason + ':' + detail : reason;
-        long now = nowMs.getAsLong();
-        if (lastLogged.size() > MAX_LOG_KEYS) {
-            lastLogged.clear();
-        }
-        AtomicLong last = lastLogged.computeIfAbsent(key, k -> new AtomicLong(Long.MIN_VALUE));
-        long previous = last.get();
-        if (previous != Long.MIN_VALUE && now - previous < LOG_INTERVAL_MS) {
-            suppressed.incrementAndGet();
+        String suffix = refusalLog.admit(key, nowMs.getAsLong());
+        if (suffix == null) {
             return false;
         }
-        last.set(now);
-        long skipped = suppressed.getAndSet(0);
-        String suffix = skipped > 0 ? " (" + skipped + " similar refusals not logged)" : "";
         LOG.warn("ws handshake refused (401): {}{}{}", reason, detail.isEmpty() ? "" : ": " + detail, suffix);
         return false;
     }
@@ -238,7 +227,46 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
         }
         out = JWT_SHAPE.matcher(out).replaceAll("[token]");
         out = out.replaceAll("[\\p{Cntrl}]+", " ").trim();
-        return out.length() > MAX_DETAIL ? out.substring(0, MAX_DETAIL) + "..." : out;
+        return out.length() > MAX_DETAIL ? out.substring(0, MAX_DETAIL - 3) + "..." : out;
+    }
+
+    /**
+     * Decides, per key, whether a refusal is logged now. All state sits behind one lock, so concurrent
+     * handshakes cannot all see an expired timestamp and each log; the table holds at most
+     * {@link #MAX_LOG_KEYS} keys (the oldest is dropped, never the whole table) and each key counts the
+     * refusals it did not log, so a line never reports another reason's suppressed refusals.
+     */
+    private static final class RefusalLog {
+        private static final class State {
+            long lastLoggedMs;
+            long suppressed;
+        }
+
+        private final Map<String, State> states = new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, State> eldest) {
+                return size() > MAX_LOG_KEYS;
+            }
+        };
+
+        /** The suffix to append to the log line ("" or the suppressed count), or null when this one is not logged. */
+        synchronized String admit(String key, long nowMs) {
+            State st = states.get(key);
+            if (st == null) {
+                st = new State();
+                st.lastLoggedMs = nowMs;
+                states.put(key, st);
+                return "";
+            }
+            if (nowMs - st.lastLoggedMs < LOG_INTERVAL_MS) {
+                st.suppressed++;
+                return null;
+            }
+            String suffix = st.suppressed > 0 ? " (" + st.suppressed + " similar refusals not logged)" : "";
+            st.lastLoggedMs = nowMs;
+            st.suppressed = 0;
+            return suffix;
+        }
     }
 
     @Override
