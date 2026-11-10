@@ -97,7 +97,11 @@ public final class WsTicketService {
             // P0 (role revocation): refresh entitlements from THIS verified token before re-validating, so a
             // revoked role (e.g. ibkr-user) cannot persist for the life of the session.
             engine.refreshEntitlements(appSessionId, principal.roles());
-            engine.changeSelection(appSessionId, selection); // re-validates the selection vs the fresh roles
+            // Re-validates the selection vs the fresh roles. An UNCHANGED selection is not re-applied: a
+            // new socket of an account that already has live sockets must not release/re-acquire the
+            // subscription or bump the session epoch under them, least of all one that is about to be
+            // refused at the socket limit (the first sockets must keep working when the Nth is refused).
+            engine.changeSelectionIfDifferent(appSessionId, selection);
         } else {
             engine.registerAppSession(appSessionId, userId, selection, principal.roles(),
                     ApprovalState.APPROVED, UserSessionPolicy.systemDefault());

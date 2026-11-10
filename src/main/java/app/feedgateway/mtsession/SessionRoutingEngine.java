@@ -192,6 +192,26 @@ public final class SessionRoutingEngine {
         });
     }
 
+    /**
+     * {@link #changeSelection} unless the session already holds exactly this selection. The entitlement
+     * check still runs in both cases (a revoked role must fail here), but an identical selection is not
+     * torn down and rebuilt: no reindex, no subscription release/acquire, no epoch bump.
+     */
+    public void changeSelectionIfDifferent(String appSessionId, Selection newSelection) {
+        Objects.requireNonNull(newSelection, "newSelection");
+        // ONE write-locked section: the check and the change cannot be split by a concurrent selection
+        // update (the write lock is reentrant, so changeSelection re-enters it).
+        runWrite(() -> {
+            AppSession app = require(appSessionId);
+            if (!EntitlementPolicy.canSelect(newSelection.source(), app.entitlements())) {
+                throw new NotEntitledException("AppSession " + appSessionId + " not entitled to source " + newSelection.source());
+            }
+            if (!newSelection.equals(app.selection())) {
+                changeSelection(appSessionId, newSelection);
+            }
+        });
+    }
+
     public void changeSelection(String appSessionId, Selection newSelection) {
         Objects.requireNonNull(newSelection, "newSelection");
         runWrite(() -> {

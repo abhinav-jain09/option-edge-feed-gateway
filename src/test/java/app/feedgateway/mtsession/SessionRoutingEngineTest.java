@@ -139,4 +139,48 @@ class SessionRoutingEngineTest {
         e.registerAppSession("app1", "u1", ibkr, IBKR);
         assertEquals(0, e.subscriptions().distinctSubscriptions());
     }
+
+    @Test
+    void theFifthSocketIsRefusedAndTheFirstFourKeepWorking() {
+        SessionRoutingEngine e = engine(new ConcurrencyLimits(1, 4, 100));
+        Selection sel = dbnto("SPX", "20260612", StrikeWindow.ALL);
+        e.registerAppSession("app1", "u1", sel, DBNTO);
+        for (int i = 1; i <= 4; i++) {
+            e.attachSocket("app1", "s" + i);
+        }
+        long epoch = e.appSession("app1").orElseThrow().epoch();
+        // the handshake of the fifth socket re-applies the same selection BEFORE the attach is refused
+        e.changeSelectionIfDifferent("app1", sel);
+        CapacityException ex = assertThrows(CapacityException.class, () -> e.attachSocket("app1", "s5"));
+        assertEquals(CapacityException.Limit.SOCKETS_PER_APP_SESSION, ex.limit());
+        assertEquals(epoch, e.appSession("app1").orElseThrow().epoch(), "a refused socket must not bump the session epoch");
+        assertEquals(Set.of("s1", "s2", "s3", "s4"), e.route(RoutableRecord.contract(
+                MarketDataSource.DATABENTO, EventType.PACE, "SPX", "20260612", 7500, 0)));
+        // a slot freed by a closed socket is usable again
+        e.detachSocket("s2");
+        e.attachSocket("app1", "s5");
+        assertEquals(Set.of("s1", "s3", "s4", "s5"), e.route(RoutableRecord.contract(
+                MarketDataSource.DATABENTO, EventType.PACE, "SPX", "20260612", 7500, 0)));
+    }
+
+    @Test
+    void anUnchangedSelectionIsNotReappliedButAChangedOneIs() {
+        SessionRoutingEngine e = engine();
+        Selection sel = dbnto("SPX", "20260612", StrikeWindow.ALL);
+        e.registerAppSession("app1", "u1", sel, DBNTO);
+        long epoch = e.appSession("app1").orElseThrow().epoch();
+        e.changeSelectionIfDifferent("app1", sel);
+        assertEquals(epoch, e.appSession("app1").orElseThrow().epoch());
+        e.changeSelectionIfDifferent("app1", dbnto("SPX", "20260613", StrikeWindow.ALL));
+        assertEquals(epoch + 1, e.appSession("app1").orElseThrow().epoch());
+    }
+
+    @Test
+    void anUnchangedSelectionIsStillCheckedAgainstTheCurrentEntitlements() {
+        SessionRoutingEngine e = engine();
+        Selection ib = new Selection(MarketDataSource.IBKR, "SPX", "20260612", StrikeWindow.ALL);
+        e.registerAppSession("app1", "u1", ib, IBKR);
+        e.refreshEntitlements("app1", Set.of());
+        assertThrows(NotEntitledException.class, () -> e.changeSelectionIfDifferent("app1", ib));
+    }
 }
