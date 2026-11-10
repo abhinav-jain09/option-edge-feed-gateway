@@ -2081,30 +2081,8 @@ public class FeedGatewayService implements ReplayRunner {
                 .append("options_edge_gateway_app_session_sockets_max ").append(most).append("\n")
                 .append("# HELP options_edge_gateway_socket_attach_refused_total Sockets refused because the account was at its limit.\n")
                 .append("# TYPE options_edge_gateway_socket_attach_refused_total counter\n")
-                .append("options_edge_gateway_socket_attach_refused_total ").append(socketAttachRefused.get()).append("\n")
-                .append("# HELP options_edge_gateway_app_session_sockets WebSockets held by one account (at most 20, the busiest). The label is a short hash, never the user id (the id is in the gateway log lines).\n")
-                .append("# TYPE options_edge_gateway_app_session_sockets gauge\n");
-        counts.entrySet().stream()
-                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed().thenComparing(Map.Entry.comparingByKey()))
-                .limit(20)
-                .forEach(e -> sb.append("options_edge_gateway_app_session_sockets{account=\"")
-                        .append(accountLabel(e.getKey())).append("\"} ").append(e.getValue()).append("\n"));
+                .append("options_edge_gateway_socket_attach_refused_total ").append(socketAttachRefused.get()).append("\n");
         return sb.toString();
-    }
-
-    /** An account id as a bounded, non-identifying metric label: the first 8 hex digits of its SHA-256. */
-    static String accountLabel(String appSessionId) {
-        try {
-            byte[] d = java.security.MessageDigest.getInstance("SHA-256")
-                    .digest(String.valueOf(appSessionId).getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            StringBuilder h = new StringBuilder();
-            for (int i = 0; i < 4; i++) {
-                h.append(String.format("%02x", d[i]));
-            }
-            return h.toString();
-        } catch (java.security.NoSuchAlgorithmException e) {
-            return "unknown";
-        }
     }
 
     private static void closeQuietly(WebSocketSession session) {

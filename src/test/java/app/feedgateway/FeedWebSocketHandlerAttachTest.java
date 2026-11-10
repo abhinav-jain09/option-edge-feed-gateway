@@ -172,7 +172,6 @@ class FeedWebSocketHandlerAttachTest {
 
         assertTrue(m.contains("options_edge_gateway_app_session_sockets_max 2"), m);
         assertTrue(m.contains("options_edge_gateway_app_sessions_at_socket_limit 1"), m);
-        assertTrue(m.contains("options_edge_gateway_app_session_sockets{account=\"" + FeedGatewayService.accountLabel("app:u1") + "\"} 2"), m);
         assertFalse(m.contains("app:u1"), "the user id must never be a metric label");
         assertTrue(m.contains("options_edge_gateway_app_session_socket_limit 2"), m);
         assertTrue(m.contains("options_edge_gateway_socket_attach_refused_total 1"), m);
@@ -225,7 +224,8 @@ class FeedWebSocketHandlerAttachTest {
         assertTrue(engine.socketIdsOf("app:u1").size() == 4);
         // and the metrics say so
         String m = svc.metrics();
-        assertTrue(m.contains("options_edge_gateway_app_session_sockets{account=\"" + FeedGatewayService.accountLabel("app:u1") + "\"} 4"), m);
+        assertTrue(m.contains("options_edge_gateway_app_session_sockets_max 4"), m);
+        assertTrue(m.contains("options_edge_gateway_app_sessions_at_socket_limit 1"), m);
         assertTrue(m.contains("options_edge_gateway_socket_attach_refused_total 1"), m);
     }
 }

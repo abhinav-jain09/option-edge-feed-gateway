@@ -60,10 +60,12 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
     }
 
     private static Origin originOf(WebSocketSession session) {
-        String forwarded = header(session, "X-Forwarded-For");
-        String remote = !"-".equals(forwarded) ? forwarded
-                : session.getRemoteAddress() == null ? "-" : session.getRemoteAddress().toString();
-        return new Origin(remote, header(session, "User-Agent"), header(session, "Origin"), System.currentTimeMillis());
+        // remote = the socket's own peer address (the proxy, behind one). X-Forwarded-For is client-supplied unless a
+        // trusted proxy overwrote it, so it is shown as a claim, never as the identity of the holder.
+        String remote = session.getRemoteAddress() == null ? "-" : safe(session.getRemoteAddress().toString());
+        String claimed = header(session, "X-Forwarded-For");
+        return new Origin(remote + " forwardedFor(unverified)=" + claimed, header(session, "User-Agent"),
+                header(session, "Origin"), System.currentTimeMillis());
     }
     private final FeedGatewayService gatewayService;
     private final ObjectProvider<SessionRoutingEngine> engineProvider;
