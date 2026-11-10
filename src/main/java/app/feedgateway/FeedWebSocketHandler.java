@@ -54,6 +54,11 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
         }
     }
 
+    /** An account id for a log line: control characters (a subject is token content) cannot forge a line. */
+    static String safe(String text) {
+        return text == null ? "-" : text.replaceAll("\\p{Cntrl}", " ");
+    }
+
     private static Origin originOf(WebSocketSession session) {
         String forwarded = header(session, "X-Forwarded-For");
         String remote = !"-".equals(forwarded) ? forwarded
@@ -102,7 +107,7 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
             try {
                 // attachSocket validates all limits before mutating, so a throw leaves no partial state.
                 engine.attachSocket(id, session.getId());
-                log.info("socket attached account={} sockets={}/{} {}", id, engine.socketIdsOf(id).size(),
+                log.info("socket attached account={} sockets={}/{} {}", safe(id), engine.socketIdsOf(id).size(),
                         engine.maxSocketsPerAppSession(), mine.describe(System.currentTimeMillis()));
             } catch (RuntimeException attachFailed) {
                 // AppSession expired between ticket mint and connect, or the per-AppSession socket
@@ -116,7 +121,7 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
                         Origin o = originAttr(gatewayService.clientSession(sid));
                         return sid + " " + (o == null ? "origin unknown" : o.describe(now));
                     }).collect(Collectors.joining(" | "));
-                    log.warn("socket REFUSED account={} limit={} refused: {} held by: {}", id, limit,
+                    log.warn("socket REFUSED account={} limit={} refused: {} held by: {}", safe(id), limit,
                             mine.describe(now), holders.isEmpty() ? "-" : holders);
                     gatewayService.recordSocketAttachRefused();
                     reject(session, "connection limit reached for this account (" + limit + " of " + limit + " in use)");

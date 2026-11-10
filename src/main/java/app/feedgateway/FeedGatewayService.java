@@ -2056,21 +2056,55 @@ public class FeedGatewayService implements ReplayRunner {
         if (routingEngine == null) {
             return "";
         }
-        StringBuilder sb = new StringBuilder();
-        sb.append("# HELP options_edge_gateway_app_session_sockets WebSockets each account (AppSession) holds right now.\n")
-                .append("# TYPE options_edge_gateway_app_session_sockets gauge\n");
-        for (Map.Entry<String, Integer> e : routingEngine.socketCountsByAppSession().entrySet()) {
-            String label = e.getKey().replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ");
-            sb.append("options_edge_gateway_app_session_sockets{app_session=\"").append(label).append("\"} ")
-                    .append(e.getValue()).append("\n");
+        Map<String, Integer> counts = routingEngine.socketCountsByAppSession();
+        int limit = routingEngine.maxSocketsPerAppSession();
+        int atLimit = 0;
+        int most = 0;
+        for (int n : counts.values()) {
+            most = Math.max(most, n);
+            if (n >= limit) {
+                atLimit++;
+            }
         }
+        StringBuilder sb = new StringBuilder();
         sb.append("# HELP options_edge_gateway_app_session_socket_limit The per-account WebSocket limit.\n")
                 .append("# TYPE options_edge_gateway_app_session_socket_limit gauge\n")
-                .append("options_edge_gateway_app_session_socket_limit ").append(routingEngine.maxSocketsPerAppSession()).append("\n")
+                .append("options_edge_gateway_app_session_socket_limit ").append(limit).append("\n")
+                .append("# HELP options_edge_gateway_app_sessions Accounts (AppSessions) known to the gateway.\n")
+                .append("# TYPE options_edge_gateway_app_sessions gauge\n")
+                .append("options_edge_gateway_app_sessions ").append(counts.size()).append("\n")
+                .append("# HELP options_edge_gateway_app_sessions_at_socket_limit Accounts that hold as many sockets as the limit allows.\n")
+                .append("# TYPE options_edge_gateway_app_sessions_at_socket_limit gauge\n")
+                .append("options_edge_gateway_app_sessions_at_socket_limit ").append(atLimit).append("\n")
+                .append("# HELP options_edge_gateway_app_session_sockets_max Sockets held by the account that holds the most.\n")
+                .append("# TYPE options_edge_gateway_app_session_sockets_max gauge\n")
+                .append("options_edge_gateway_app_session_sockets_max ").append(most).append("\n")
                 .append("# HELP options_edge_gateway_socket_attach_refused_total Sockets refused because the account was at its limit.\n")
                 .append("# TYPE options_edge_gateway_socket_attach_refused_total counter\n")
-                .append("options_edge_gateway_socket_attach_refused_total ").append(socketAttachRefused.get()).append("\n");
+                .append("options_edge_gateway_socket_attach_refused_total ").append(socketAttachRefused.get()).append("\n")
+                .append("# HELP options_edge_gateway_app_session_sockets WebSockets held by one account (at most 20, the busiest). The label is a short hash, never the user id (the id is in the gateway log lines).\n")
+                .append("# TYPE options_edge_gateway_app_session_sockets gauge\n");
+        counts.entrySet().stream()
+                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed().thenComparing(Map.Entry.comparingByKey()))
+                .limit(20)
+                .forEach(e -> sb.append("options_edge_gateway_app_session_sockets{account=\"")
+                        .append(accountLabel(e.getKey())).append("\"} ").append(e.getValue()).append("\n"));
         return sb.toString();
+    }
+
+    /** An account id as a bounded, non-identifying metric label: the first 8 hex digits of its SHA-256. */
+    static String accountLabel(String appSessionId) {
+        try {
+            byte[] d = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(String.valueOf(appSessionId).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder h = new StringBuilder();
+            for (int i = 0; i < 4; i++) {
+                h.append(String.format("%02x", d[i]));
+            }
+            return h.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            return "unknown";
+        }
     }
 
     private static void closeQuietly(WebSocketSession session) {
