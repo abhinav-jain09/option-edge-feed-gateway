@@ -57,7 +57,9 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
             } catch (RuntimeException attachFailed) {
                 // AppSession expired between ticket mint and connect, or the per-AppSession socket
                 // cap was reached. Close the socket; never register it as a live client.
-                reject(session, "attach rejected");
+                // Names the cause: a page shows this text, and "attach rejected" read as the whole feed being down.
+                reject(session, attachFailed instanceof app.feedgateway.mtsession.CapacityException
+                        ? "connection limit reached for this account" : "attach rejected");
                 return;
             }
         }
