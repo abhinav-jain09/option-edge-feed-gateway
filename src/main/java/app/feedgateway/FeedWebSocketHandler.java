@@ -11,9 +11,44 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Component
 public class FeedWebSocketHandler extends TextWebSocketHandler implements SubProtocolCapable {
+    private static final Logger log = LoggerFactory.getLogger(FeedWebSocketHandler.class);
+
+    /** Where an open socket came from: enough to tell WHICH browser/tab holds a slot, not who the user is. */
+    record Origin(String remote, String userAgent, String origin, long openedAtMs) {
+        String describe(long nowMs) {
+            return "remote=" + remote + " origin=" + origin + " ua=\"" + userAgent + "\" openFor=" + ((nowMs - openedAtMs) / 1000) + "s";
+        }
+    }
+
+    private final Map<String, Origin> origins = new ConcurrentHashMap<>();
+
+    private static String header(WebSocketSession session, String name) {
+        try {
+            String v = session.getHandshakeHeaders().getFirst(name);
+            if (v == null) {
+                return "-";
+            }
+            String clean = v.replace("\"", "'").replace("\n", " ");
+            return clean.length() > 120 ? clean.substring(0, 120) : clean;
+        } catch (RuntimeException e) {
+            return "-";
+        }
+    }
+
+    private static Origin originOf(WebSocketSession session) {
+        String forwarded = header(session, "X-Forwarded-For");
+        String remote = !"-".equals(forwarded) ? forwarded
+                : session.getRemoteAddress() == null ? "-" : session.getRemoteAddress().toString();
+        return new Origin(remote, header(session, "User-Agent"), header(session, "Origin"), System.currentTimeMillis());
+    }
     private final FeedGatewayService gatewayService;
     private final ObjectProvider<SessionRoutingEngine> engineProvider;
 
@@ -51,15 +86,33 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
                 reject(session, "no session bound");
                 return;
             }
+            origins.put(session.getId(), originOf(session));
             try {
                 // attachSocket validates all limits before mutating, so a throw leaves no partial state.
                 engine.attachSocket(id, session.getId());
+                log.info("socket attached account={} sockets={}/{} {}", id,
+                        engine.appSession(id).map(a -> a.socketIds().size()).orElse(-1),
+                        engine.maxSocketsPerAppSession(), origins.get(session.getId()).describe(System.currentTimeMillis()));
             } catch (RuntimeException attachFailed) {
                 // AppSession expired between ticket mint and connect, or the per-AppSession socket
                 // cap was reached. Close the socket; never register it as a live client.
                 // Names the cause: a page shows this text, and "attach rejected" read as the whole feed being down.
-                reject(session, attachFailed instanceof app.feedgateway.mtsession.CapacityException
-                        ? "connection limit reached for this account" : "attach rejected");
+                if (attachFailed instanceof app.feedgateway.mtsession.CapacityException) {
+                    int limit = engine.maxSocketsPerAppSession();
+                    Origin refused = origins.remove(session.getId());
+                    long now = System.currentTimeMillis();
+                    // WHO holds the slots: the one thing the refusal alone never said.
+                    String holders = engine.appSession(id).map(a -> a.socketIds().stream()
+                                    .map(sid -> sid + " " + (origins.containsKey(sid) ? origins.get(sid).describe(now) : "origin unknown"))
+                                    .collect(Collectors.joining(" | "))).orElse("-");
+                    log.warn("socket REFUSED account={} limit={} refused: {} held by: {}", id, limit,
+                            refused == null ? "-" : refused.describe(now), holders);
+                    gatewayService.recordSocketAttachRefused();
+                    reject(session, "connection limit reached for this account (" + limit + " of " + limit + " in use)");
+                } else {
+                    origins.remove(session.getId());
+                    reject(session, "attach rejected");
+                }
                 return;
             }
         }
@@ -82,12 +135,14 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        origins.remove(session.getId());
         detach(session);
         gatewayService.removeClient(session);
     }
 
     @Override
     public void handleTransportError(WebSocketSession session, Throwable exception) {
+        origins.remove(session.getId());
         detach(session);
         gatewayService.removeClient(session);
     }

@@ -144,6 +144,25 @@ public final class SessionRoutingEngine {
         });
     }
 
+    /** The per-AppSession socket limit this engine enforces (for reporting; the enforcement is in {@link #attachSocket}). */
+    public int maxSocketsPerAppSession() {
+        return limits.maxSocketsPerAppSession();
+    }
+
+    /**
+     * How many sockets each AppSession holds right now (an AppSession with none is listed with 0), so the
+     * server can say how many connections an account has open instead of only refusing the next one.
+     */
+    public Map<String, Integer> socketCountsByAppSession() {
+        return callRead(() -> {
+            Map<String, Integer> out = new LinkedHashMap<>();
+            for (Map.Entry<String, AppSession> e : appSessions.entrySet()) {
+                out.put(e.getKey(), e.getValue().socketIds().size());
+            }
+            return out;
+        });
+    }
+
     /** Attach a WebSocket to an AppSession, enforcing the per-AppSession socket limit (FR-27). */
     public void attachSocket(String appSessionId, String socketId) {
         runWrite(() -> {

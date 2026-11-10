@@ -183,4 +183,18 @@ class SessionRoutingEngineTest {
         e.refreshEntitlements("app1", Set.of());
         assertThrows(NotEntitledException.class, () -> e.changeSelectionIfDifferent("app1", ib));
     }
+
+    @Test
+    void theServerKnowsHowManySocketsEachAccountHolds() {
+        SessionRoutingEngine e = engine(new ConcurrencyLimits(5, 4, 100));
+        e.registerAppSession("app1", "u1", dbnto("SPX", "20260612", StrikeWindow.ALL), DBNTO);
+        e.registerAppSession("app2", "u2", dbnto("SPX", "20260612", StrikeWindow.ALL), DBNTO);
+        e.attachSocket("app1", "a");
+        e.attachSocket("app1", "b");
+        e.attachSocket("app2", "c");
+        assertEquals(java.util.Map.of("app1", 2, "app2", 1), e.socketCountsByAppSession());
+        assertEquals(4, e.maxSocketsPerAppSession());
+        e.detachSocket("a");
+        assertEquals(java.util.Map.of("app1", 1, "app2", 1), e.socketCountsByAppSession());
+    }
 }

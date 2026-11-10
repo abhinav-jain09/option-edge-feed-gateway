@@ -117,7 +117,7 @@ class FeedWebSocketHandlerAttachTest {
 
         handler.afterConnectionEstablished(fifth);
 
-        verify(fifth).close(CloseStatus.POLICY_VIOLATION.withReason("connection limit reached for this account"));
+        verify(fifth).close(CloseStatus.POLICY_VIOLATION.withReason("connection limit reached for this account (4 of 4 in use)"));
         for (WebSocketSession ws : live) {
             verify(ws, never()).close(any());                 // none of the first four was closed
         }
@@ -148,4 +148,23 @@ class FeedWebSocketHandlerAttachTest {
         verify(ws).sendMessage(any());                     // admitted as before
     }
 
+
+    @Test
+    void theMetricsSayHowManySocketsEachAccountHoldsAndHowManyWereRefused() throws Exception {
+        SessionRoutingEngine engine = new SessionRoutingEngine(new ConcurrencyLimits(1, 2, 100), new SubscriptionManager());
+        engine.registerAppSession("app:u1", "u1", SPX, Set.of());
+        FeedGatewayService svc =
+                new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), engine);
+        svc.runOutboundWritesInline();
+        FeedWebSocketHandler handler = new FeedWebSocketHandler(svc, provider(engine));
+        handler.afterConnectionEstablished(socket("s1", "app:u1"));
+        handler.afterConnectionEstablished(socket("s2", "app:u1"));
+        handler.afterConnectionEstablished(socket("s3", "app:u1"));   // refused
+
+        String m = svc.metrics();
+
+        assertTrue(m.contains("options_edge_gateway_app_session_sockets{app_session=\"app:u1\"} 2"), m);
+        assertTrue(m.contains("options_edge_gateway_app_session_socket_limit 2"), m);
+        assertTrue(m.contains("options_edge_gateway_socket_attach_refused_total 1"), m);
+    }
 }
