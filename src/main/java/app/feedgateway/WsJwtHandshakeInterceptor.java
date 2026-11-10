@@ -9,6 +9,8 @@ import app.feedgateway.mtsession.auth.JwtVerificationException;
 import app.feedgateway.mtsession.auth.VerifiedPrincipal;
 import app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor;
 import app.feedgateway.mtsession.gateway.WsTicketService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
@@ -29,6 +31,9 @@ import org.springframework.web.socket.server.HandshakeInterceptor;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.LinkedHashMap;
+import java.util.function.LongSupplier;
+import java.util.regex.Pattern;
 
 /**
  * Authenticates the WebSocket handshake with a Keycloak JWT. The browser {@code WebSocket(url, protocols)}
@@ -55,6 +60,18 @@ import java.util.Map;
  */
 @Component
 public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
+
+    private static final Logger LOG = LoggerFactory.getLogger(WsJwtHandshakeInterceptor.class);
+    private static final long LOG_INTERVAL_MS = 10_000L;
+    private static final int MAX_LOG_KEYS = 256;
+    private static final int MAX_DETAIL = 200;
+    private final RefusalLog refusalLog = new RefusalLog();
+    /** Clock for the log rate limit; replaceable so a test does not sleep. */
+    private volatile LongSupplier nowMs = System::currentTimeMillis;
+
+    void setClockForTest(LongSupplier clock) {
+        this.nowMs = clock;
+    }
 
     static final String BEARER_SUBPROTOCOL = "oc.bearer";
     /** Session attribute holding the token's expiry (epoch ms), so the reaper can close it when it lapses. */
@@ -115,8 +132,7 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
 
         String token = extractToken(request.getHeaders());
         if (token == null) {
-            response.setStatusCode(HttpStatus.UNAUTHORIZED);
-            return false;
+            return reject(response, "no oc.bearer token offered", null, null);
         }
 
         if (multiTenant) {
@@ -134,9 +150,10 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
                     attributes.put(AUTH_EXPIRES_AT_ATTR, principal.expiresAt().toEpochMilli());
                 }
                 return true;
-            } catch (JwtVerificationException | NotApprovedException denied) {
-                response.setStatusCode(HttpStatus.UNAUTHORIZED);
-                return false;
+            } catch (JwtVerificationException denied) {
+                return reject(response, "token not accepted", denied, token);
+            } catch (NotApprovedException denied) {
+                return reject(response, "not approved", denied, token);
             } catch (NotEntitledException notEntitled) {
                 // Codex round-2 L-2: the user is approved but not entitled to the operator-configured
                 // {@link MarketDataSource} (e.g. {@code APP_MARKET_DATA_SOURCE=IBKR} for a Databento-only
@@ -145,16 +162,14 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
                 // RuntimeException escape the interceptor and surface as an uncaught handshake error
                 // (HTTP 500-ish), not a controlled 401. We close the handshake with 401 — defence in depth
                 // alongside the operator-side check.
-                response.setStatusCode(HttpStatus.UNAUTHORIZED);
-                return false;
+                return reject(response, "not entitled", notEntitled, token);
             } catch (IllegalArgumentException badSelection) {
                 // The default Selection requires non-blank symbol+expiry (Selection record). If the gateway
                 // is misconfigured (no initialSymbol/initialExpiry, or an unparseable
                 // APP_MARKET_DATA_SOURCE — see {@link #defaultSelection()}), fail closed with 401 — better
                 // than a half-attached socket. Operator must set IB_SYMBOL + IB_EXPIRY (and a parseable
                 // source) when GATEWAY_AUTH_ENABLED=true.
-                response.setStatusCode(HttpStatus.UNAUTHORIZED);
-                return false;
+                return reject(response, "gateway selection misconfigured", badSelection, token);
             }
         }
 
@@ -168,8 +183,89 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
             }
             return true;
         } catch (JwtException e) {
-            response.setStatusCode(HttpStatus.UNAUTHORIZED);
+            return reject(response, "token not accepted", e, token);
+        }
+    }
+
+    /**
+     * Refuses the handshake with 401 and logs WHY. The browser only sees a failed upgrade (close 1006) and a 401
+     * has no body worth reading, so without this line a refused login is invisible: an unapproved account was
+     * mistaken for a socket-cap problem for hours (2026-11-10). Logs the reason and the exception message
+     * (token problem such as expired / wrong audience, or the user id for a not-approved account); never the
+     * token itself.
+     */
+    private boolean reject(ServerHttpResponse response, String reason, Exception cause, String offeredToken) {
+        response.setStatusCode(HttpStatus.UNAUTHORIZED);
+        String detail = cause == null ? "" : sanitize(cause.getMessage(), offeredToken);
+        // One line per reason per interval (per user for a not-approved account, whose id comes from a signed
+        // token so the key set is bounded by real users): a client that retries every few seconds, or a caller
+        // sending garbage on purpose, must not turn the log into noise.
+        String key = "not approved".equals(reason) ? reason + ':' + detail : reason;
+        String suffix = refusalLog.admit(key, nowMs.getAsLong());
+        if (suffix == null) {
             return false;
+        }
+        LOG.warn("ws handshake refused (401): {}{}{}", reason, detail.isEmpty() ? "" : ": " + detail, suffix);
+        return false;
+    }
+
+    private static final Pattern JWT_SHAPE = Pattern.compile("[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}(\\.[A-Za-z0-9_-]*)?");
+
+    /**
+     * Makes a verifier message safe for one log line: the offered token and anything shaped like a JWT is
+     * replaced, line breaks and other control characters become spaces (no forged log lines), and the
+     * text is cut to {@value #MAX_DETAIL}. The message is useful (expired, wrong audience, unexpected azp,
+     * the user id of an unapproved account) but comes from libraries whose wording is not guaranteed.
+     */
+    static String sanitize(String message, String offeredToken) {
+        if (message == null) {
+            return "";
+        }
+        String out = message;
+        if (offeredToken != null && !offeredToken.isBlank()) {
+            out = out.replace(offeredToken, "[token]");
+        }
+        out = JWT_SHAPE.matcher(out).replaceAll("[token]");
+        out = out.replaceAll("[\\p{Cntrl}]+", " ").trim();
+        return out.length() > MAX_DETAIL ? out.substring(0, MAX_DETAIL - 3) + "..." : out;
+    }
+
+    /**
+     * Decides, per key, whether a refusal is logged now. All state sits behind one lock, so concurrent
+     * handshakes cannot all see an expired timestamp and each log; the table holds at most
+     * {@link #MAX_LOG_KEYS} keys (the oldest is dropped, never the whole table) and each key counts the
+     * refusals it did not log, so a line never reports another reason's suppressed refusals.
+     */
+    private static final class RefusalLog {
+        private static final class State {
+            long lastLoggedMs;
+            long suppressed;
+        }
+
+        private final Map<String, State> states = new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, State> eldest) {
+                return size() > MAX_LOG_KEYS;
+            }
+        };
+
+        /** The suffix to append to the log line ("" or the suppressed count), or null when this one is not logged. */
+        synchronized String admit(String key, long nowMs) {
+            State st = states.get(key);
+            if (st == null) {
+                st = new State();
+                st.lastLoggedMs = nowMs;
+                states.put(key, st);
+                return "";
+            }
+            if (nowMs - st.lastLoggedMs < LOG_INTERVAL_MS) {
+                st.suppressed++;
+                return null;
+            }
+            String suffix = st.suppressed > 0 ? " (" + st.suppressed + " similar refusals not logged)" : "";
+            st.lastLoggedMs = nowMs;
+            st.suppressed = 0;
+            return suffix;
         }
     }
 

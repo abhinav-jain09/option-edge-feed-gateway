@@ -309,6 +309,162 @@ class WsJwtHandshakeInterceptorTest {
         });
     }
 
+    /** Runs {@code body} while capturing what the interceptor logs, so a refusal can be checked for its reason. */
+    private static List<String> captureInterceptorLog(Runnable body) {
+        ch.qos.logback.classic.Logger logger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(WsJwtHandshakeInterceptor.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            body.run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+        return appender.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+    }
+
+    @Test
+    void refusedHandshakeLogsTheReasonButNeverTheToken() {
+        // 2026-11-10: a login without the approval role got a silent 401 and was mistaken for a socket-cap
+        // fault for hours. Every refusal must now say why; the token must never reach the log.
+        withSymbolAndExpiry("SPX", "20260612", () -> {
+            GatewaySettings settings = new GatewaySettings();
+            VerifiedPrincipal principal =
+                    new VerifiedPrincipal("u-denied", "d", Set.of("user"), "options-edge-web", null);
+            WsTicketService svc = multiTenantService("secret.jwt.value", principal,
+                    q -> ApprovalAuthority.ApprovalDecision.DENY);
+            WsJwtHandshakeInterceptor interceptor =
+                    new WsJwtHandshakeInterceptor(settings, failingDecoder(), svc);
+
+            HttpHeaders notApproved = new HttpHeaders();
+            notApproved.add("Sec-WebSocket-Protocol", "oc.bearer, secret.jwt.value");
+            HttpHeaders badToken = new HttpHeaders();
+            badToken.add("Sec-WebSocket-Protocol", "oc.bearer, other.secret.value");
+            HttpHeaders noToken = new HttpHeaders();
+
+            List<String> lines = captureInterceptorLog(() -> {
+                interceptor.beforeHandshake(requestWith(notApproved), mock(ServerHttpResponse.class), null, new HashMap<>());
+                interceptor.beforeHandshake(requestWith(badToken), mock(ServerHttpResponse.class), null, new HashMap<>());
+                interceptor.beforeHandshake(requestWith(noToken), mock(ServerHttpResponse.class), null, new HashMap<>());
+            });
+
+            assertEquals(3, lines.size(), lines.toString());
+            assertTrue(lines.get(0).contains("not approved") && lines.get(0).contains("u-denied"), lines.get(0));
+            assertTrue(lines.get(1).contains("token not accepted") && lines.get(1).contains("bad token"), lines.get(1));
+            assertTrue(lines.get(2).contains("no oc.bearer token offered"), lines.get(2));
+            lines.forEach(l -> assertFalse(l.contains("secret"), "the token must never be logged: " + l));
+        });
+    }
+
+    @Test
+    void aVerifierMessageThatContainsTheTokenIsRedactedBeforeItIsLogged() {
+        // Codex: the verifier's message comes from Nimbus/Spring and its wording is not guaranteed; one that
+        // echoes the offered token (or any JWT-shaped text, or a line break) must not reach the log as is.
+        String token = "aaaaaaaaaa.bbbbbbbbbb.cccccccccc";
+        assertEquals("rejected [token] and [token] now", WsJwtHandshakeInterceptor.sanitize(
+                "rejected " + token + " and zzzzzzzzzz.yyyyyyyyyy.xxxxxxxxxx now", token));
+        assertEquals("a b", WsJwtHandshakeInterceptor.sanitize("a\r\nb", null));
+        assertEquals(200, WsJwtHandshakeInterceptor.sanitize("x ".repeat(500), null).length());
+        assertEquals("", WsJwtHandshakeInterceptor.sanitize(null, token));
+
+        withSymbolAndExpiry("SPX", "20260612", () -> {
+            TokenVerifier leaky = t -> { throw new JwtVerificationException("verification failed for " + t); };
+            SessionRoutingEngine engine =
+                    new SessionRoutingEngine(new ConcurrencyLimits(1, 4, 100), new SubscriptionManager());
+            WsTicketService svc = new WsTicketService(leaky,
+                    new InMemoryTicketStore(Clock.systemUTC(), () -> "tk"), engine,
+                    q -> ApprovalAuthority.ApprovalDecision.DENY, "https://kc.test/realms/optionsedge", Duration.ofSeconds(10));
+            WsJwtHandshakeInterceptor interceptor =
+                    new WsJwtHandshakeInterceptor(new GatewaySettings(), failingDecoder(), svc);
+            HttpHeaders headers = new HttpHeaders();
+            headers.add("Sec-WebSocket-Protocol", "oc.bearer, " + token);
+            List<String> lines = captureInterceptorLog(() ->
+                    interceptor.beforeHandshake(requestWith(headers), mock(ServerHttpResponse.class), null, new HashMap<>()));
+            assertEquals(1, lines.size(), lines.toString());
+            assertFalse(lines.get(0).contains("aaaaaaaaaa"), lines.get(0));
+            assertTrue(lines.get(0).contains("[token]"), lines.get(0));
+        });
+    }
+
+    @Test
+    void repeatedRefusalsAreLoggedOncePerIntervalAndCounted() {
+        withSymbolAndExpiry("SPX", "20260612", () -> {
+            WsTicketService svc = multiTenantService("good",
+                    new VerifiedPrincipal("u1", "d", Set.of("user"), "options-edge-web", null),
+                    q -> ApprovalAuthority.ApprovalDecision.DENY);
+            WsJwtHandshakeInterceptor interceptor =
+                    new WsJwtHandshakeInterceptor(new GatewaySettings(), failingDecoder(), svc);
+            long[] now = {1_000_000L};
+            interceptor.setClockForTest(() -> now[0]);
+            HttpHeaders none = new HttpHeaders();
+            ServerHttpResponse resp = mock(ServerHttpResponse.class);
+
+            List<String> lines = captureInterceptorLog(() -> {
+                for (int i = 0; i < 50; i++) {
+                    assertFalse(interceptor.beforeHandshake(requestWith(none), resp, null, new HashMap<>()));
+                    now[0] += 100; // 50 refusals in 5 s
+                }
+                now[0] += 10_000;
+                interceptor.beforeHandshake(requestWith(none), resp, null, new HashMap<>());
+            });
+
+            assertEquals(2, lines.size(), "50 refusals in 5 s log once; the next interval logs again: " + lines);
+            assertTrue(lines.get(1).contains("49 similar refusals not logged"), lines.get(1));
+        });
+    }
+
+    @Test
+    void suppressedRefusalsAreCountedPerReasonAndConcurrentRefusalsLogOnce() throws Exception {
+        withSymbolAndExpiry("SPX", "20260612", () -> {
+            WsTicketService svc = multiTenantService("good",
+                    new VerifiedPrincipal("u1", "d", Set.of("user"), "options-edge-web", null),
+                    q -> ApprovalAuthority.ApprovalDecision.DENY);
+            WsJwtHandshakeInterceptor interceptor =
+                    new WsJwtHandshakeInterceptor(new GatewaySettings(), failingDecoder(), svc);
+            long[] now = {5_000_000L};
+            interceptor.setClockForTest(() -> now[0]);
+            HttpHeaders none = new HttpHeaders();
+            HttpHeaders bad = new HttpHeaders();
+            bad.add("Sec-WebSocket-Protocol", "oc.bearer, wrong");
+            ServerHttpResponse resp = mock(ServerHttpResponse.class);
+
+            List<String> lines = captureInterceptorLog(() -> {
+                for (int i = 0; i < 7; i++) {
+                    interceptor.beforeHandshake(requestWith(none), resp, null, new HashMap<>()); // reason A, 7 times
+                }
+                interceptor.beforeHandshake(requestWith(bad), resp, null, new HashMap<>());       // reason B, once
+                now[0] += 10_000;
+                interceptor.beforeHandshake(requestWith(bad), resp, null, new HashMap<>());       // B again, nothing suppressed
+                interceptor.beforeHandshake(requestWith(none), resp, null, new HashMap<>());      // A again
+            });
+            assertEquals(4, lines.size(), lines.toString());
+            assertFalse(lines.get(2).contains("not logged"), "B suppressed nothing: " + lines.get(2));
+            assertTrue(lines.get(3).contains("6 similar refusals not logged"), lines.get(3));
+
+            // 64 threads refuse at the same instant after the interval: exactly one line.
+            now[0] += 10_000;
+            List<String> burst = captureInterceptorLog(() -> {
+                java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+                java.util.List<Thread> threads = new java.util.ArrayList<>();
+                for (int i = 0; i < 64; i++) {
+                    Thread t = new Thread(() -> {
+                        try { go.await(); } catch (InterruptedException e) { return; }
+                        interceptor.beforeHandshake(requestWith(none), mock(ServerHttpResponse.class), null, new HashMap<>());
+                    });
+                    threads.add(t);
+                    t.start();
+                }
+                go.countDown();
+                for (Thread t : threads) {
+                    try { t.join(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                }
+            });
+            assertEquals(1, burst.size(), "concurrent refusals must log once: " + burst.size());
+        });
+    }
+
     @Test
     void multiTenantBearerWithBlankSymbolFailsClosed() {
         // Selection requires non-blank symbol+expiry. With IB_SYMBOL unset (blank) we expect 401, not a
