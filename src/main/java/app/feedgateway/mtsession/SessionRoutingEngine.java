@@ -163,6 +163,14 @@ public final class SessionRoutingEngine {
         });
     }
 
+    /** A copy, taken under the engine's read lock, of the ids of the sockets an AppSession holds (empty if unknown). */
+    public java.util.List<String> socketIdsOf(String appSessionId) {
+        return callRead(() -> {
+            AppSession app = appSessions.get(appSessionId);
+            return app == null ? java.util.List.<String>of() : new java.util.ArrayList<>(app.socketIds());
+        });
+    }
+
     /** Attach a WebSocket to an AppSession, enforcing the per-AppSession socket limit (FR-27). */
     public void attachSocket(String appSessionId, String socketId) {
         runWrite(() -> {

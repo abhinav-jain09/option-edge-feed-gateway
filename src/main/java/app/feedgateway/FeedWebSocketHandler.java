@@ -11,8 +11,6 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,7 +26,20 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
         }
     }
 
-    private final Map<String, Origin> origins = new ConcurrentHashMap<>();
+    /** Kept on the session itself, so it ends with the session on every close path (no map to leak). */
+    private static final String ORIGIN_ATTR = "oe.socketOrigin";
+
+    private static Origin originAttr(WebSocketSession session) {
+        if (session == null) {
+            return null;
+        }
+        try {
+            Object o = session.getAttributes() == null ? null : session.getAttributes().get(ORIGIN_ATTR);
+            return o instanceof Origin origin ? origin : null;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
 
     private static String header(WebSocketSession session, String name) {
         try {
@@ -36,7 +47,7 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
             if (v == null) {
                 return "-";
             }
-            String clean = v.replace("\"", "'").replace("\n", " ");
+            String clean = v.replace("\"", "'").replaceAll("\\p{Cntrl}", " ");   // a logged header must not forge a log line
             return clean.length() > 120 ? clean.substring(0, 120) : clean;
         } catch (RuntimeException e) {
             return "-";
@@ -86,31 +97,30 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
                 reject(session, "no session bound");
                 return;
             }
-            origins.put(session.getId(), originOf(session));
+            Origin mine = originOf(session);
+            session.getAttributes().put(ORIGIN_ATTR, mine);
             try {
                 // attachSocket validates all limits before mutating, so a throw leaves no partial state.
                 engine.attachSocket(id, session.getId());
-                log.info("socket attached account={} sockets={}/{} {}", id,
-                        engine.appSession(id).map(a -> a.socketIds().size()).orElse(-1),
-                        engine.maxSocketsPerAppSession(), origins.get(session.getId()).describe(System.currentTimeMillis()));
+                log.info("socket attached account={} sockets={}/{} {}", id, engine.socketIdsOf(id).size(),
+                        engine.maxSocketsPerAppSession(), mine.describe(System.currentTimeMillis()));
             } catch (RuntimeException attachFailed) {
                 // AppSession expired between ticket mint and connect, or the per-AppSession socket
                 // cap was reached. Close the socket; never register it as a live client.
                 // Names the cause: a page shows this text, and "attach rejected" read as the whole feed being down.
                 if (attachFailed instanceof app.feedgateway.mtsession.CapacityException) {
                     int limit = engine.maxSocketsPerAppSession();
-                    Origin refused = origins.remove(session.getId());
                     long now = System.currentTimeMillis();
-                    // WHO holds the slots: the one thing the refusal alone never said.
-                    String holders = engine.appSession(id).map(a -> a.socketIds().stream()
-                                    .map(sid -> sid + " " + (origins.containsKey(sid) ? origins.get(sid).describe(now) : "origin unknown"))
-                                    .collect(Collectors.joining(" | "))).orElse("-");
+                    // WHO holds the slots: the one thing the refusal alone never said (a locked copy of the ids).
+                    String holders = engine.socketIdsOf(id).stream().map(sid -> {
+                        Origin o = originAttr(gatewayService.clientSession(sid));
+                        return sid + " " + (o == null ? "origin unknown" : o.describe(now));
+                    }).collect(Collectors.joining(" | "));
                     log.warn("socket REFUSED account={} limit={} refused: {} held by: {}", id, limit,
-                            refused == null ? "-" : refused.describe(now), holders);
+                            mine.describe(now), holders.isEmpty() ? "-" : holders);
                     gatewayService.recordSocketAttachRefused();
                     reject(session, "connection limit reached for this account (" + limit + " of " + limit + " in use)");
                 } else {
-                    origins.remove(session.getId());
                     reject(session, "attach rejected");
                 }
                 return;
@@ -135,14 +145,12 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
-        origins.remove(session.getId());
         detach(session);
         gatewayService.removeClient(session);
     }
 
     @Override
     public void handleTransportError(WebSocketSession session, Throwable exception) {
-        origins.remove(session.getId());
         detach(session);
         gatewayService.removeClient(session);
     }

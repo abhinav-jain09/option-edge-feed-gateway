@@ -2036,6 +2036,11 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** The live session of a socket this gateway holds (cleaned on every close path), or null. */
+    public WebSocketSession clientSession(String socketId) {
+        return socketId == null ? null : clientsById.get(socketId);
+    }
+
     private final java.util.concurrent.atomic.AtomicLong socketAttachRefused = new java.util.concurrent.atomic.AtomicLong();
 
     /** Counts a socket the per-account limit refused (the handler calls this; the number is in the metrics). */

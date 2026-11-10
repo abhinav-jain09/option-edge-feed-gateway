@@ -167,4 +167,55 @@ class FeedWebSocketHandlerAttachTest {
         assertTrue(m.contains("options_edge_gateway_app_session_socket_limit 2"), m);
         assertTrue(m.contains("options_edge_gateway_socket_attach_refused_total 1"), m);
     }
+
+    /**
+     * The owner's rule, end to end through the handler and the service: with a limit of 4, four sockets work,
+     * the fifth is refused with a message that says the connection count was exceeded, it is never opened as a
+     * client (it receives nothing), and the four that were already open keep receiving data afterwards.
+     */
+    @Test
+    void fourSocketsWorkTheFifthIsRefusedWithTheCountAndTheOldFourKeepReceiving() throws Exception {
+        SessionRoutingEngine engine = new SessionRoutingEngine(new ConcurrencyLimits(1, 4, 100), new SubscriptionManager());
+        engine.registerAppSession("app:u1", "u1", SPX, Set.of());
+        FeedGatewayService svc =
+                new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), engine);
+        svc.runOutboundWritesInline();
+        FeedWebSocketHandler handler = new FeedWebSocketHandler(svc, provider(engine));
+        java.util.List<WebSocketSession> old = new java.util.ArrayList<>();
+        for (int i = 1; i <= 4; i++) {
+            WebSocketSession ws = socket("old" + i, "app:u1");
+            handler.afterConnectionEstablished(ws);
+            old.add(ws);
+        }
+        WebSocketSession fifth = socket("new5", "app:u1");
+
+        handler.afterConnectionEstablished(fifth);
+
+        // 1. a clear message: the count was exceeded, with the numbers
+        verify(fifth).close(CloseStatus.POLICY_VIOLATION.withReason("connection limit reached for this account (4 of 4 in use)"));
+        // 2. no new connection is opened: it is not a client and was sent nothing
+        verify(fifth, never()).sendMessage(any());
+        assertTrue(svc.clientSession("new5") == null, "the refused socket must not be registered as a client");
+        assertFalse(engine.socketIdsOf("app:u1").contains("new5"));
+        // 3. the old connections still work: every one of them is open, attached, and receives the next frame
+        java.util.Map<WebSocketSession, Integer> sentBefore = new java.util.HashMap<>();
+        for (WebSocketSession ws : old) {
+            sentBefore.put(ws, org.mockito.Mockito.mockingDetails(ws).getInvocations().stream()
+                    .filter(i -> i.getMethod().getName().equals("sendMessage")).toList().size());
+        }
+        svc.streamRithmicDepth("{\"n\":1}");
+        for (WebSocketSession ws : old) {
+            verify(ws, never()).close();
+            verify(ws, never()).close(any());
+            int after = org.mockito.Mockito.mockingDetails(ws).getInvocations().stream()
+                    .filter(i -> i.getMethod().getName().equals("sendMessage")).toList().size();
+            assertTrue(after > sentBefore.get(ws), "an old socket stopped receiving (sent before=" + sentBefore.get(ws) + " after=" + after + ")");
+        }
+        assertTrue(engine.socketIdsOf("app:u1").containsAll(java.util.List.of("old1", "old2", "old3", "old4")));
+        assertTrue(engine.socketIdsOf("app:u1").size() == 4);
+        // and the metrics say so
+        String m = svc.metrics();
+        assertTrue(m.contains("options_edge_gateway_app_session_sockets{app_session=\"app:u1\"} 4"), m);
+        assertTrue(m.contains("options_edge_gateway_socket_attach_refused_total 1"), m);
+    }
 }
