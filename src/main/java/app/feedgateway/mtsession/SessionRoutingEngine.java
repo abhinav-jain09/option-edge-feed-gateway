@@ -199,16 +199,17 @@ public final class SessionRoutingEngine {
      */
     public void changeSelectionIfDifferent(String appSessionId, Selection newSelection) {
         Objects.requireNonNull(newSelection, "newSelection");
-        boolean same = callWrite(() -> {
+        // ONE write-locked section: the check and the change cannot be split by a concurrent selection
+        // update (the write lock is reentrant, so changeSelection re-enters it).
+        runWrite(() -> {
             AppSession app = require(appSessionId);
             if (!EntitlementPolicy.canSelect(newSelection.source(), app.entitlements())) {
                 throw new NotEntitledException("AppSession " + appSessionId + " not entitled to source " + newSelection.source());
             }
-            return newSelection.equals(app.selection());
+            if (!newSelection.equals(app.selection())) {
+                changeSelection(appSessionId, newSelection);
+            }
         });
-        if (!same) {
-            changeSelection(appSessionId, newSelection);
-        }
     }
 
     public void changeSelection(String appSessionId, Selection newSelection) {

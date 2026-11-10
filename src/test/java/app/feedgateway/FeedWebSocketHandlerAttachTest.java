@@ -103,6 +103,29 @@ class FeedWebSocketHandlerAttachTest {
     }
 
     @Test
+    void theFifthSocketIsToldWhyAndTheFirstFourAreUntouched() throws Exception {
+        SessionRoutingEngine engine = new SessionRoutingEngine(new ConcurrencyLimits(1, 4, 100), new SubscriptionManager());
+        engine.registerAppSession("app:u1", "u1", SPX, Set.of());
+        FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(engine));
+        java.util.List<WebSocketSession> live = new java.util.ArrayList<>();
+        for (int i = 1; i <= 4; i++) {
+            WebSocketSession ws = socket("s" + i, "app:u1");
+            handler.afterConnectionEstablished(ws);
+            live.add(ws);
+        }
+        WebSocketSession fifth = socket("s5", "app:u1");
+
+        handler.afterConnectionEstablished(fifth);
+
+        verify(fifth).close(CloseStatus.POLICY_VIOLATION.withReason("connection limit reached for this account"));
+        for (WebSocketSession ws : live) {
+            verify(ws, never()).close(any());                 // none of the first four was closed
+        }
+        assertTrue(engine.appSession("app:u1").orElseThrow().socketIds().containsAll(Set.of("s1", "s2", "s3", "s4")));
+        assertFalse(engine.appSession("app:u1").orElseThrow().socketIds().contains("s5"));
+    }
+
+    @Test
     void authOnButNoBoundSessionIsRejected() throws Exception {
         SessionRoutingEngine engine = new SessionRoutingEngine(new ConcurrencyLimits(5, 5, 100), new SubscriptionManager());
         FeedWebSocketHandler handler = new FeedWebSocketHandler(gateway(), provider(engine));
