@@ -18,6 +18,7 @@ import io.lettuce.core.api.StatefulRedisConnection;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -31,9 +32,15 @@ import org.springframework.context.annotation.Configuration;
 @ConditionalOnProperty(name = "gateway.auth.enabled", havingValue = "true")
 public class MtSessionAuthConfig {
 
+    /** Unset = the §6.8 default (1 AppSession per user, 4 sockets per AppSession, 200 in total). */
     @Bean
-    public SessionRoutingEngine sessionRoutingEngine() {
-        return new SessionRoutingEngine(ConcurrencyLimits.defaults(), new SubscriptionManager());
+    public SessionRoutingEngine sessionRoutingEngine(
+            @Value("${GATEWAY_MAX_APP_SESSIONS_PER_USER:#{null}}") Integer maxAppSessionsPerUser,
+            @Value("${GATEWAY_MAX_SOCKETS_PER_APP_SESSION:#{null}}") Integer maxSocketsPerAppSession,
+            @Value("${GATEWAY_MAX_TOTAL_APP_SESSIONS:#{null}}") Integer maxTotalAppSessions) {
+        return new SessionRoutingEngine(
+                ConcurrencyLimits.of(maxAppSessionsPerUser, maxSocketsPerAppSession, maxTotalAppSessions),
+                new SubscriptionManager());
     }
 
     @Bean
