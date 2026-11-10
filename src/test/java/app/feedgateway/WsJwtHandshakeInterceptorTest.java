@@ -309,6 +309,55 @@ class WsJwtHandshakeInterceptorTest {
         });
     }
 
+    /** Runs {@code body} while capturing what the interceptor logs, so a refusal can be checked for its reason. */
+    private static List<String> captureInterceptorLog(Runnable body) {
+        ch.qos.logback.classic.Logger logger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(WsJwtHandshakeInterceptor.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            body.run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+        return appender.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+    }
+
+    @Test
+    void refusedHandshakeLogsTheReasonButNeverTheToken() {
+        // 2026-11-10: a login without the approval role got a silent 401 and was mistaken for a socket-cap
+        // fault for hours. Every refusal must now say why; the token must never reach the log.
+        withSymbolAndExpiry("SPX", "20260612", () -> {
+            GatewaySettings settings = new GatewaySettings();
+            VerifiedPrincipal principal =
+                    new VerifiedPrincipal("u-denied", "d", Set.of("user"), "options-edge-web", null);
+            WsTicketService svc = multiTenantService("secret.jwt.value", principal,
+                    q -> ApprovalAuthority.ApprovalDecision.DENY);
+            WsJwtHandshakeInterceptor interceptor =
+                    new WsJwtHandshakeInterceptor(settings, failingDecoder(), svc);
+
+            HttpHeaders notApproved = new HttpHeaders();
+            notApproved.add("Sec-WebSocket-Protocol", "oc.bearer, secret.jwt.value");
+            HttpHeaders badToken = new HttpHeaders();
+            badToken.add("Sec-WebSocket-Protocol", "oc.bearer, other.secret.value");
+            HttpHeaders noToken = new HttpHeaders();
+
+            List<String> lines = captureInterceptorLog(() -> {
+                interceptor.beforeHandshake(requestWith(notApproved), mock(ServerHttpResponse.class), null, new HashMap<>());
+                interceptor.beforeHandshake(requestWith(badToken), mock(ServerHttpResponse.class), null, new HashMap<>());
+                interceptor.beforeHandshake(requestWith(noToken), mock(ServerHttpResponse.class), null, new HashMap<>());
+            });
+
+            assertEquals(3, lines.size(), lines.toString());
+            assertTrue(lines.get(0).contains("not approved") && lines.get(0).contains("u-denied"), lines.get(0));
+            assertTrue(lines.get(1).contains("token not accepted") && lines.get(1).contains("bad token"), lines.get(1));
+            assertTrue(lines.get(2).contains("no oc.bearer token offered"), lines.get(2));
+            lines.forEach(l -> assertFalse(l.contains("secret"), "the token must never be logged: " + l));
+        });
+    }
+
     @Test
     void multiTenantBearerWithBlankSymbolFailsClosed() {
         // Selection requires non-blank symbol+expiry. With IB_SYMBOL unset (blank) we expect 401, not a

@@ -9,6 +9,8 @@ import app.feedgateway.mtsession.auth.JwtVerificationException;
 import app.feedgateway.mtsession.auth.VerifiedPrincipal;
 import app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor;
 import app.feedgateway.mtsession.gateway.WsTicketService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
@@ -55,6 +57,8 @@ import java.util.Map;
  */
 @Component
 public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
+
+    private static final Logger LOG = LoggerFactory.getLogger(WsJwtHandshakeInterceptor.class);
 
     static final String BEARER_SUBPROTOCOL = "oc.bearer";
     /** Session attribute holding the token's expiry (epoch ms), so the reaper can close it when it lapses. */
@@ -115,8 +119,7 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
 
         String token = extractToken(request.getHeaders());
         if (token == null) {
-            response.setStatusCode(HttpStatus.UNAUTHORIZED);
-            return false;
+            return reject(response, "no oc.bearer token offered", null);
         }
 
         if (multiTenant) {
@@ -134,9 +137,10 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
                     attributes.put(AUTH_EXPIRES_AT_ATTR, principal.expiresAt().toEpochMilli());
                 }
                 return true;
-            } catch (JwtVerificationException | NotApprovedException denied) {
-                response.setStatusCode(HttpStatus.UNAUTHORIZED);
-                return false;
+            } catch (JwtVerificationException denied) {
+                return reject(response, "token not accepted", denied);
+            } catch (NotApprovedException denied) {
+                return reject(response, "not approved", denied);
             } catch (NotEntitledException notEntitled) {
                 // Codex round-2 L-2: the user is approved but not entitled to the operator-configured
                 // {@link MarketDataSource} (e.g. {@code APP_MARKET_DATA_SOURCE=IBKR} for a Databento-only
@@ -145,16 +149,14 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
                 // RuntimeException escape the interceptor and surface as an uncaught handshake error
                 // (HTTP 500-ish), not a controlled 401. We close the handshake with 401 — defence in depth
                 // alongside the operator-side check.
-                response.setStatusCode(HttpStatus.UNAUTHORIZED);
-                return false;
+                return reject(response, "not entitled", notEntitled);
             } catch (IllegalArgumentException badSelection) {
                 // The default Selection requires non-blank symbol+expiry (Selection record). If the gateway
                 // is misconfigured (no initialSymbol/initialExpiry, or an unparseable
                 // APP_MARKET_DATA_SOURCE — see {@link #defaultSelection()}), fail closed with 401 — better
                 // than a half-attached socket. Operator must set IB_SYMBOL + IB_EXPIRY (and a parseable
                 // source) when GATEWAY_AUTH_ENABLED=true.
-                response.setStatusCode(HttpStatus.UNAUTHORIZED);
-                return false;
+                return reject(response, "gateway selection misconfigured", badSelection);
             }
         }
 
@@ -168,9 +170,25 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
             }
             return true;
         } catch (JwtException e) {
-            response.setStatusCode(HttpStatus.UNAUTHORIZED);
-            return false;
+            return reject(response, "token not accepted", e);
         }
+    }
+
+    /**
+     * Refuses the handshake with 401 and logs WHY. The browser only sees a failed upgrade (close 1006) and a 401
+     * has no body worth reading, so without this line a refused login is invisible: an unapproved account was
+     * mistaken for a socket-cap problem for hours (2026-11-10). Logs the reason and the exception message
+     * (token problem such as expired / wrong audience, or the user id for a not-approved account); never the
+     * token itself.
+     */
+    private static boolean reject(ServerHttpResponse response, String reason, Exception cause) {
+        response.setStatusCode(HttpStatus.UNAUTHORIZED);
+        if (cause == null) {
+            LOG.warn("ws handshake refused (401): {}", reason);
+        } else {
+            LOG.warn("ws handshake refused (401): {}: {}", reason, cause.getMessage());
+        }
+        return false;
     }
 
     @Override
