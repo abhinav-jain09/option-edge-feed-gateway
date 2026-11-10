@@ -11,9 +11,62 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.util.List;
+import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Component
 public class FeedWebSocketHandler extends TextWebSocketHandler implements SubProtocolCapable {
+    private static final Logger log = LoggerFactory.getLogger(FeedWebSocketHandler.class);
+
+    /** Where an open socket came from: enough to tell WHICH browser/tab holds a slot, not who the user is. */
+    record Origin(String remote, String userAgent, String origin, long openedAtMs) {
+        String describe(long nowMs) {
+            return "remote=" + remote + " origin=" + origin + " ua=\"" + userAgent + "\" openFor=" + ((nowMs - openedAtMs) / 1000) + "s";
+        }
+    }
+
+    /** Kept on the session itself, so it ends with the session on every close path (no map to leak). */
+    private static final String ORIGIN_ATTR = "oe.socketOrigin";
+
+    private static Origin originAttr(WebSocketSession session) {
+        if (session == null) {
+            return null;
+        }
+        try {
+            Object o = session.getAttributes() == null ? null : session.getAttributes().get(ORIGIN_ATTR);
+            return o instanceof Origin origin ? origin : null;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static String header(WebSocketSession session, String name) {
+        try {
+            String v = session.getHandshakeHeaders().getFirst(name);
+            if (v == null) {
+                return "-";
+            }
+            String clean = v.replace("\"", "'").replaceAll("[\\p{Cc}\\u2028\\u2029]", " ");   // a logged header must not forge a log line
+            return clean.length() > 120 ? clean.substring(0, 120) : clean;
+        } catch (RuntimeException e) {
+            return "-";
+        }
+    }
+
+    /** An account id for a log line: control characters (a subject is token content) cannot forge a line. */
+    static String safe(String text) {
+        return text == null ? "-" : text.replaceAll("[\\p{Cc}\\u2028\\u2029]", " ");
+    }
+
+    private static Origin originOf(WebSocketSession session) {
+        // remote = the socket's own peer address (the proxy, behind one). X-Forwarded-For is client-supplied unless a
+        // trusted proxy overwrote it, so it is shown as a claim, never as the identity of the holder.
+        String remote = session.getRemoteAddress() == null ? "-" : safe(session.getRemoteAddress().toString());
+        String claimed = header(session, "X-Forwarded-For");
+        return new Origin(remote + " forwardedFor(unverified)=" + claimed, header(session, "User-Agent"),
+                header(session, "Origin"), System.currentTimeMillis());
+    }
     private final FeedGatewayService gatewayService;
     private final ObjectProvider<SessionRoutingEngine> engineProvider;
 
@@ -51,15 +104,32 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
                 reject(session, "no session bound");
                 return;
             }
+            Origin mine = originOf(session);
+            session.getAttributes().put(ORIGIN_ATTR, mine);
             try {
                 // attachSocket validates all limits before mutating, so a throw leaves no partial state.
                 engine.attachSocket(id, session.getId());
+                log.info("socket attached account={} sockets={}/{} {}", safe(id), engine.socketIdsOf(id).size(),
+                        engine.maxSocketsPerAppSession(), mine.describe(System.currentTimeMillis()));
             } catch (RuntimeException attachFailed) {
                 // AppSession expired between ticket mint and connect, or the per-AppSession socket
                 // cap was reached. Close the socket; never register it as a live client.
                 // Names the cause: a page shows this text, and "attach rejected" read as the whole feed being down.
-                reject(session, attachFailed instanceof app.feedgateway.mtsession.CapacityException
-                        ? "connection limit reached for this account" : "attach rejected");
+                if (attachFailed instanceof app.feedgateway.mtsession.CapacityException) {
+                    int limit = engine.maxSocketsPerAppSession();
+                    long now = System.currentTimeMillis();
+                    // WHO holds the slots: the one thing the refusal alone never said (a locked copy of the ids).
+                    String holders = engine.socketIdsOf(id).stream().map(sid -> {
+                        Origin o = originAttr(gatewayService.clientSession(sid));
+                        return sid + " " + (o == null ? "origin unknown" : o.describe(now));
+                    }).collect(Collectors.joining(" | "));
+                    log.warn("socket REFUSED account={} limit={} refused: {} held by: {}", safe(id), limit,
+                            mine.describe(now), holders.isEmpty() ? "-" : holders);
+                    gatewayService.recordSocketAttachRefused();
+                    reject(session, "connection limit reached for this account (" + limit + " of " + limit + " in use)");
+                } else {
+                    reject(session, "attach rejected");
+                }
                 return;
             }
         }

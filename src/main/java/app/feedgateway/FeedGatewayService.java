@@ -2036,6 +2036,55 @@ public class FeedGatewayService implements ReplayRunner {
         }
     }
 
+    /** The live session of a socket this gateway holds (cleaned on every close path), or null. */
+    public WebSocketSession clientSession(String socketId) {
+        return socketId == null ? null : clientsById.get(socketId);
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong socketAttachRefused = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Counts a socket the per-account limit refused (the handler calls this; the number is in the metrics). */
+    public void recordSocketAttachRefused() {
+        socketAttachRefused.incrementAndGet();
+    }
+
+    /**
+     * How many sockets each account holds against the limit, in the Prometheus text format. Empty when the
+     * multi-tenant engine is off (there is no per-account limit then).
+     */
+    private String socketUsageMetrics() {
+        if (routingEngine == null) {
+            return "";
+        }
+        Map<String, Integer> counts = routingEngine.socketCountsByAppSession();
+        int limit = routingEngine.maxSocketsPerAppSession();
+        int atLimit = 0;
+        int most = 0;
+        for (int n : counts.values()) {
+            most = Math.max(most, n);
+            if (n >= limit) {
+                atLimit++;
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("# HELP options_edge_gateway_app_session_socket_limit The per-account WebSocket limit.\n")
+                .append("# TYPE options_edge_gateway_app_session_socket_limit gauge\n")
+                .append("options_edge_gateway_app_session_socket_limit ").append(limit).append("\n")
+                .append("# HELP options_edge_gateway_app_sessions Accounts (AppSessions) known to the gateway.\n")
+                .append("# TYPE options_edge_gateway_app_sessions gauge\n")
+                .append("options_edge_gateway_app_sessions ").append(counts.size()).append("\n")
+                .append("# HELP options_edge_gateway_app_sessions_at_socket_limit Accounts that hold as many sockets as the limit allows.\n")
+                .append("# TYPE options_edge_gateway_app_sessions_at_socket_limit gauge\n")
+                .append("options_edge_gateway_app_sessions_at_socket_limit ").append(atLimit).append("\n")
+                .append("# HELP options_edge_gateway_app_session_sockets_max Sockets held by the account that holds the most.\n")
+                .append("# TYPE options_edge_gateway_app_session_sockets_max gauge\n")
+                .append("options_edge_gateway_app_session_sockets_max ").append(most).append("\n")
+                .append("# HELP options_edge_gateway_socket_attach_refused_total Sockets refused because the account was at its limit.\n")
+                .append("# TYPE options_edge_gateway_socket_attach_refused_total counter\n")
+                .append("options_edge_gateway_socket_attach_refused_total ").append(socketAttachRefused.get()).append("\n");
+        return sb.toString();
+    }
+
     private static void closeQuietly(WebSocketSession session) {
         try {
             if (session != null && session.isOpen()) {
@@ -2648,6 +2697,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_gateway_inactive_dropped_total Inactive-source records consumed but not forwarded.\n"
                 + "# TYPE options_edge_gateway_inactive_dropped_total counter\n"
                 + "options_edge_gateway_inactive_dropped_total " + inactiveDroppedEvents.get() + "\n"
+                + socketUsageMetrics()
                 + "# HELP options_edge_gateway_dropped_non_routable_total Malformed/unroutable market-data events dropped (per-session mode, not broadcast).\n"
                 + "# TYPE options_edge_gateway_dropped_non_routable_total counter\n"
                 + "options_edge_gateway_dropped_non_routable_total " + droppedNonRoutableEvents.get() + "\n"
