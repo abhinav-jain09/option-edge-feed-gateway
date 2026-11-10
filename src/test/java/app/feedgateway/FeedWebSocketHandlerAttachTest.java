@@ -153,6 +153,7 @@ class FeedWebSocketHandlerAttachTest {
     @Test
     void anAccountIdCannotForgeALogLine() {
         assertEquals("app:u1 FAKE   line", FeedWebSocketHandler.safe("app:u1\nFAKE\r\t line"));
+        assertEquals("a b c d", FeedWebSocketHandler.safe("a\u0085b\u2028c\u2029d"));   // NEL and the Unicode line separators too
     }
 
     @Test

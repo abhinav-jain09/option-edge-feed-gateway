@@ -47,7 +47,7 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
             if (v == null) {
                 return "-";
             }
-            String clean = v.replace("\"", "'").replaceAll("\\p{Cntrl}", " ");   // a logged header must not forge a log line
+            String clean = v.replace("\"", "'").replaceAll("[\\p{Cc}\\u2028\\u2029]", " ");   // a logged header must not forge a log line
             return clean.length() > 120 ? clean.substring(0, 120) : clean;
         } catch (RuntimeException e) {
             return "-";
@@ -56,7 +56,7 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
 
     /** An account id for a log line: control characters (a subject is token content) cannot forge a line. */
     static String safe(String text) {
-        return text == null ? "-" : text.replaceAll("\\p{Cntrl}", " ");
+        return text == null ? "-" : text.replaceAll("[\\p{Cc}\\u2028\\u2029]", " ");
     }
 
     private static Origin originOf(WebSocketSession session) {
