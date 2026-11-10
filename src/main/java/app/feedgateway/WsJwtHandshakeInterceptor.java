@@ -132,7 +132,7 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
 
         String token = extractToken(request.getHeaders());
         if (token == null) {
-            return reject(response, "no oc.bearer token offered", null, null);
+            return reject(request, response, "no oc.bearer token offered", null, null);
         }
 
         if (multiTenant) {
@@ -151,9 +151,9 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
                 }
                 return true;
             } catch (JwtVerificationException denied) {
-                return reject(response, "token not accepted", denied, token);
+                return reject(request, response, "token not accepted", denied, token);
             } catch (NotApprovedException denied) {
-                return reject(response, "not approved", denied, token);
+                return reject(request, response, "not approved", denied, token);
             } catch (NotEntitledException notEntitled) {
                 // Codex round-2 L-2: the user is approved but not entitled to the operator-configured
                 // {@link MarketDataSource} (e.g. {@code APP_MARKET_DATA_SOURCE=IBKR} for a Databento-only
@@ -162,14 +162,14 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
                 // RuntimeException escape the interceptor and surface as an uncaught handshake error
                 // (HTTP 500-ish), not a controlled 401. We close the handshake with 401 — defence in depth
                 // alongside the operator-side check.
-                return reject(response, "not entitled", notEntitled, token);
+                return reject(request, response, "not entitled", notEntitled, token);
             } catch (IllegalArgumentException badSelection) {
                 // The default Selection requires non-blank symbol+expiry (Selection record). If the gateway
                 // is misconfigured (no initialSymbol/initialExpiry, or an unparseable
                 // APP_MARKET_DATA_SOURCE — see {@link #defaultSelection()}), fail closed with 401 — better
                 // than a half-attached socket. Operator must set IB_SYMBOL + IB_EXPIRY (and a parseable
                 // source) when GATEWAY_AUTH_ENABLED=true.
-                return reject(response, "gateway selection misconfigured", badSelection, token);
+                return reject(request, response, "gateway selection misconfigured", badSelection, token);
             }
         }
 
@@ -183,7 +183,7 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
             }
             return true;
         } catch (JwtException e) {
-            return reject(response, "token not accepted", e, token);
+            return reject(request, response, "token not accepted", e, token);
         }
     }
 
@@ -194,7 +194,7 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
      * (token problem such as expired / wrong audience, or the user id for a not-approved account); never the
      * token itself.
      */
-    private boolean reject(ServerHttpResponse response, String reason, Exception cause, String offeredToken) {
+    private boolean reject(ServerHttpRequest request, ServerHttpResponse response, String reason, Exception cause, String offeredToken) {
         response.setStatusCode(HttpStatus.UNAUTHORIZED);
         String detail = cause == null ? "" : sanitize(cause.getMessage(), offeredToken);
         // One line per reason per interval (per user for a not-approved account, whose id comes from a signed
@@ -205,7 +205,8 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
         if (suffix == null) {
             return false;
         }
-        LOG.warn("ws handshake refused (401): {}{}{}", reason, detail.isEmpty() ? "" : ": " + detail, suffix);
+        LOG.warn("ws handshake refused (401): {}{} origin={}{}", reason, detail.isEmpty() ? "" : ": " + detail,
+                sanitize(request.getHeaders().getOrigin(), null), suffix);
         return false;
     }
 
