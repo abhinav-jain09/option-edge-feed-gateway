@@ -359,6 +359,63 @@ class WsJwtHandshakeInterceptorTest {
     }
 
     @Test
+    void aVerifierMessageThatContainsTheTokenIsRedactedBeforeItIsLogged() {
+        // Codex: the verifier's message comes from Nimbus/Spring and its wording is not guaranteed; one that
+        // echoes the offered token (or any JWT-shaped text, or a line break) must not reach the log as is.
+        String token = "aaaaaaaaaa.bbbbbbbbbb.cccccccccc";
+        assertEquals("rejected [token] and [token] now", WsJwtHandshakeInterceptor.sanitize(
+                "rejected " + token + " and zzzzzzzzzz.yyyyyyyyyy.xxxxxxxxxx now", token));
+        assertEquals("a b", WsJwtHandshakeInterceptor.sanitize("a\r\nb", null));
+        assertEquals(200 + 3, WsJwtHandshakeInterceptor.sanitize("x ".repeat(500), null).length());
+        assertEquals("", WsJwtHandshakeInterceptor.sanitize(null, token));
+
+        withSymbolAndExpiry("SPX", "20260612", () -> {
+            TokenVerifier leaky = t -> { throw new JwtVerificationException("verification failed for " + t); };
+            SessionRoutingEngine engine =
+                    new SessionRoutingEngine(new ConcurrencyLimits(1, 4, 100), new SubscriptionManager());
+            WsTicketService svc = new WsTicketService(leaky,
+                    new InMemoryTicketStore(Clock.systemUTC(), () -> "tk"), engine,
+                    q -> ApprovalAuthority.ApprovalDecision.DENY, "https://kc.test/realms/optionsedge", Duration.ofSeconds(10));
+            WsJwtHandshakeInterceptor interceptor =
+                    new WsJwtHandshakeInterceptor(new GatewaySettings(), failingDecoder(), svc);
+            HttpHeaders headers = new HttpHeaders();
+            headers.add("Sec-WebSocket-Protocol", "oc.bearer, " + token);
+            List<String> lines = captureInterceptorLog(() ->
+                    interceptor.beforeHandshake(requestWith(headers), mock(ServerHttpResponse.class), null, new HashMap<>()));
+            assertEquals(1, lines.size(), lines.toString());
+            assertFalse(lines.get(0).contains("aaaaaaaaaa"), lines.get(0));
+            assertTrue(lines.get(0).contains("[token]"), lines.get(0));
+        });
+    }
+
+    @Test
+    void repeatedRefusalsAreLoggedOncePerIntervalAndCounted() {
+        withSymbolAndExpiry("SPX", "20260612", () -> {
+            WsTicketService svc = multiTenantService("good",
+                    new VerifiedPrincipal("u1", "d", Set.of("user"), "options-edge-web", null),
+                    q -> ApprovalAuthority.ApprovalDecision.DENY);
+            WsJwtHandshakeInterceptor interceptor =
+                    new WsJwtHandshakeInterceptor(new GatewaySettings(), failingDecoder(), svc);
+            long[] now = {1_000_000L};
+            interceptor.setClockForTest(() -> now[0]);
+            HttpHeaders none = new HttpHeaders();
+            ServerHttpResponse resp = mock(ServerHttpResponse.class);
+
+            List<String> lines = captureInterceptorLog(() -> {
+                for (int i = 0; i < 50; i++) {
+                    assertFalse(interceptor.beforeHandshake(requestWith(none), resp, null, new HashMap<>()));
+                    now[0] += 100; // 50 refusals in 5 s
+                }
+                now[0] += 10_000;
+                interceptor.beforeHandshake(requestWith(none), resp, null, new HashMap<>());
+            });
+
+            assertEquals(2, lines.size(), "50 refusals in 5 s log once; the next interval logs again: " + lines);
+            assertTrue(lines.get(1).contains("49 similar refusals not logged"), lines.get(1));
+        });
+    }
+
+    @Test
     void multiTenantBearerWithBlankSymbolFailsClosed() {
         // Selection requires non-blank symbol+expiry. With IB_SYMBOL unset (blank) we expect 401, not a
         // half-attached socket. This guards against silent misconfiguration in GATEWAY_AUTH mode.

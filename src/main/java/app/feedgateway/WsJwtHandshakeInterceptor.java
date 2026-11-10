@@ -31,6 +31,10 @@ import org.springframework.web.socket.server.HandshakeInterceptor;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
+import java.util.regex.Pattern;
 
 /**
  * Authenticates the WebSocket handshake with a Keycloak JWT. The browser {@code WebSocket(url, protocols)}
@@ -59,6 +63,17 @@ import java.util.Map;
 public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
 
     private static final Logger LOG = LoggerFactory.getLogger(WsJwtHandshakeInterceptor.class);
+    private static final long LOG_INTERVAL_MS = 10_000L;
+    private static final int MAX_LOG_KEYS = 1_000;
+    private static final int MAX_DETAIL = 200;
+    private final Map<String, AtomicLong> lastLogged = new ConcurrentHashMap<>();
+    private final AtomicLong suppressed = new AtomicLong();
+    /** Clock for the log rate limit; replaceable so a test does not sleep. */
+    private volatile LongSupplier nowMs = System::currentTimeMillis;
+
+    void setClockForTest(LongSupplier clock) {
+        this.nowMs = clock;
+    }
 
     static final String BEARER_SUBPROTOCOL = "oc.bearer";
     /** Session attribute holding the token's expiry (epoch ms), so the reaper can close it when it lapses. */
@@ -119,7 +134,7 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
 
         String token = extractToken(request.getHeaders());
         if (token == null) {
-            return reject(response, "no oc.bearer token offered", null);
+            return reject(response, "no oc.bearer token offered", null, null);
         }
 
         if (multiTenant) {
@@ -138,9 +153,9 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
                 }
                 return true;
             } catch (JwtVerificationException denied) {
-                return reject(response, "token not accepted", denied);
+                return reject(response, "token not accepted", denied, token);
             } catch (NotApprovedException denied) {
-                return reject(response, "not approved", denied);
+                return reject(response, "not approved", denied, token);
             } catch (NotEntitledException notEntitled) {
                 // Codex round-2 L-2: the user is approved but not entitled to the operator-configured
                 // {@link MarketDataSource} (e.g. {@code APP_MARKET_DATA_SOURCE=IBKR} for a Databento-only
@@ -149,14 +164,14 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
                 // RuntimeException escape the interceptor and surface as an uncaught handshake error
                 // (HTTP 500-ish), not a controlled 401. We close the handshake with 401 — defence in depth
                 // alongside the operator-side check.
-                return reject(response, "not entitled", notEntitled);
+                return reject(response, "not entitled", notEntitled, token);
             } catch (IllegalArgumentException badSelection) {
                 // The default Selection requires non-blank symbol+expiry (Selection record). If the gateway
                 // is misconfigured (no initialSymbol/initialExpiry, or an unparseable
                 // APP_MARKET_DATA_SOURCE — see {@link #defaultSelection()}), fail closed with 401 — better
                 // than a half-attached socket. Operator must set IB_SYMBOL + IB_EXPIRY (and a parseable
                 // source) when GATEWAY_AUTH_ENABLED=true.
-                return reject(response, "gateway selection misconfigured", badSelection);
+                return reject(response, "gateway selection misconfigured", badSelection, token);
             }
         }
 
@@ -170,7 +185,7 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
             }
             return true;
         } catch (JwtException e) {
-            return reject(response, "token not accepted", e);
+            return reject(response, "token not accepted", e, token);
         }
     }
 
@@ -181,14 +196,49 @@ public class WsJwtHandshakeInterceptor implements HandshakeInterceptor {
      * (token problem such as expired / wrong audience, or the user id for a not-approved account); never the
      * token itself.
      */
-    private static boolean reject(ServerHttpResponse response, String reason, Exception cause) {
+    private boolean reject(ServerHttpResponse response, String reason, Exception cause, String offeredToken) {
         response.setStatusCode(HttpStatus.UNAUTHORIZED);
-        if (cause == null) {
-            LOG.warn("ws handshake refused (401): {}", reason);
-        } else {
-            LOG.warn("ws handshake refused (401): {}: {}", reason, cause.getMessage());
+        String detail = cause == null ? "" : sanitize(cause.getMessage(), offeredToken);
+        // One line per reason per interval (per user for a not-approved account, whose id comes from a signed
+        // token so the key set is bounded by real users): a client that retries every few seconds, or a caller
+        // sending garbage on purpose, must not turn the log into noise.
+        String key = "not approved".equals(reason) ? reason + ':' + detail : reason;
+        long now = nowMs.getAsLong();
+        if (lastLogged.size() > MAX_LOG_KEYS) {
+            lastLogged.clear();
         }
+        AtomicLong last = lastLogged.computeIfAbsent(key, k -> new AtomicLong(Long.MIN_VALUE));
+        long previous = last.get();
+        if (previous != Long.MIN_VALUE && now - previous < LOG_INTERVAL_MS) {
+            suppressed.incrementAndGet();
+            return false;
+        }
+        last.set(now);
+        long skipped = suppressed.getAndSet(0);
+        String suffix = skipped > 0 ? " (" + skipped + " similar refusals not logged)" : "";
+        LOG.warn("ws handshake refused (401): {}{}{}", reason, detail.isEmpty() ? "" : ": " + detail, suffix);
         return false;
+    }
+
+    private static final Pattern JWT_SHAPE = Pattern.compile("[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}(\\.[A-Za-z0-9_-]*)?");
+
+    /**
+     * Makes a verifier message safe for one log line: the offered token and anything shaped like a JWT is
+     * replaced, line breaks and other control characters become spaces (no forged log lines), and the
+     * text is cut to {@value #MAX_DETAIL}. The message is useful (expired, wrong audience, unexpected azp,
+     * the user id of an unapproved account) but comes from libraries whose wording is not guaranteed.
+     */
+    static String sanitize(String message, String offeredToken) {
+        if (message == null) {
+            return "";
+        }
+        String out = message;
+        if (offeredToken != null && !offeredToken.isBlank()) {
+            out = out.replace(offeredToken, "[token]");
+        }
+        out = JWT_SHAPE.matcher(out).replaceAll("[token]");
+        out = out.replaceAll("[\\p{Cntrl}]+", " ").trim();
+        return out.length() > MAX_DETAIL ? out.substring(0, MAX_DETAIL) + "..." : out;
     }
 
     @Override
