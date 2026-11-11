@@ -1432,6 +1432,37 @@ public final class GatewaySettings {
     }
 
     /**
+     * THE GAMMA ZONE, dev only. Two topics, both JSON, both keyed sessionDate|symbol|timeframe and
+     * both last-value-wins, so the browser can be handed the newest of each on connect:
+     *
+     *   options.spx.gamma-zone.current  the measurement -- the anchor where the session's traded
+     *                                   volume balances, the stretch, the projected edges, and the
+     *                                   evidence that WEAKENS the reading (refusals, the balance
+     *                                   plateau, whether the session's start was observed).
+     *   options.spx.gamma-zone.profile  the session's whole volume profile, every price level with
+     *                                   its aggressor split. It is what answers "how many contracts
+     *                                   traded between these two strikes"; the measurement cannot,
+     *                                   because it carries the ratio curve for +/-30 points and a
+     *                                   level COUNT.
+     *
+     * Forwarded VERBATIM (isRawPassThroughEvent). The service publishes no signal and names no level
+     * to sell, and the gateway must not become the first thing in the chain that implies one by
+     * reshaping the record.
+     */
+    public String gammaZoneTopic() {
+        return value("KAFKA_GAMMA_ZONE_TOPIC", "options.spx.gamma-zone.current");
+    }
+
+    public String gammaZoneProfileTopic() {
+        return value("KAFKA_GAMMA_ZONE_PROFILE_TOPIC", "options.spx.gamma-zone.profile");
+    }
+
+    /** Runtime kill switch; dark-safe off, like the navigation integration above. */
+    public boolean gammaZoneEnabled() {
+        return boolValue("GAMMA_ZONE_ENABLED", false);
+    }
+
+    /**
      * Peak ROTATION (Avro, per-chain last-value-wins). Broadcast as event "gamma-rotation".
      *
      * <p>A separate topic from {@link #gammaMigrationTopic()} because the snapshot record has no
