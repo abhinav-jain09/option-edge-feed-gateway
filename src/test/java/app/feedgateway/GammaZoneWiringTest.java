@@ -142,6 +142,32 @@ class GammaZoneWiringTest {
     }
 
     @Test
+    void theReplayHappensInLEGACYModeToo() throws IOException {
+        // replayCachedToSocket is reached only when perSessionRouting() is true, so a bespoke
+        // replay called from there alone never runs in legacy mode: a record published while
+        // nobody was connected is cached and never reaches a later socket (Codex round 2).
+        String source = source();
+        int legacy = source.indexOf("replayHotStrikeCached(session);");
+        int gammaInLegacy = source.indexOf("replayGammaZoneCached(session);", legacy);
+        assertTrue(legacy > 0 && gammaInLegacy > legacy && gammaInLegacy - legacy < 1200,
+                "the gamma-zone replay must sit in the legacy stateCaughtUp block too");
+        int calls = count(source, "replayGammaZoneCached(session);");
+        assertEquals(2, calls, "one call per routing mode, legacy and per-session");
+    }
+
+    @Test
+    void theReplayIsBOUNDEDBecauseNeitherEventCoalesces() throws IOException {
+        // Every replayed record is its own outbound queue item, and a joining socket that exceeded
+        // the queue bound would just be disconnected. The cap is a bound on what a misbehaving
+        // producer can do to a connecting client, not a policy about what a reader may see.
+        String source = source();
+        assertTrue(source.contains("static final int GAMMA_ZONE_REPLAY_LIMIT"));
+        assertTrue(source.contains("if (sent++ >= GAMMA_ZONE_REPLAY_LIMIT) {"));
+        assertTrue(source.contains("fresh.sort((a, b) -> b.getKey().compareTo(a.getKey()));"),
+                "newest session first, so a cap that bites keeps the one worth having");
+    }
+
+    @Test
     void theCacheTtlIsOneSessionsHorizon() {
         // Long enough that an intra-day reconnect is handed the live session; short enough that a
         // reconnect the next morning is not handed yesterday's as though it were current.

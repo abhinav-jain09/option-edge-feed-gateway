@@ -1783,6 +1783,12 @@ public class FeedGatewayService implements ReplayRunner {
             // hot-strike is likewise STANDALONE and GLOBAL: replay the fresh cached
             // envelope(s) so a legacy-mode reload restores the gold mark (§4.4).
             replayHotStrikeCached(session);
+            // The gamma zone and its profile are STANDALONE and GLOBAL in the same way. Without
+            // this they replayed only under per-session routing, because replayCachedToSocket is
+            // the only caller and addClient reaches it only when perSessionRouting() is true -- so
+            // in legacy mode a record published while nobody was connected was cached and never
+            // delivered to a later socket (Codex round 2).
+            replayGammaZoneCached(session);
             // short-premium recommendations are likewise STANDALONE; replay the day's cached recommendations
             // so a page reload mid-session (or a client that connects after Agent A acted) still shows the
             // active overlay rather than waiting for the next live broadcast.
@@ -9214,6 +9220,9 @@ public class FeedGatewayService implements ReplayRunner {
      * <p>Freshness is still enforced per entry, so a reconnect after the service has stopped
      * publishing cannot be handed yesterday's session as though it were live.
      */
+    /** Replay cap per gamma-zone event. See {@link #replayGammaZoneMap}. */
+    static final int GAMMA_ZONE_REPLAY_LIMIT = 4;
+
     private void replayGammaZoneCached(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
@@ -9221,8 +9230,21 @@ public class FeedGatewayService implements ReplayRunner {
         replayGammaZoneMap(session, "gamma-zone-profile", gammaZoneProfiles, nowMs);
     }
 
+    /**
+     * At most {@link #GAMMA_ZONE_REPLAY_LIMIT} entries per event, newest first.
+     *
+     * <p>Neither event is coalescible, so every replayed record is its own outbound queue item and
+     * a joining socket that exceeded the queue bound would simply be disconnected (Codex round 2).
+     * The live cardinality is one entry per session date over a 12-hour TTL -- in practice one, two
+     * across a roll -- so this cap is not a policy about what a reader may see. It is a bound on
+     * what a MISBEHAVING producer can do to a connecting client, and it is small enough that the
+     * profile's size cannot matter either.
+     *
+     * <p>Newest first because when the cap does bite, the current session is the one worth having.
+     */
     private void replayGammaZoneMap(WebSocketSession session, String event,
                                     Map<String, String> cache, long nowMs) {
+        List<Map.Entry<String, String>> fresh = new ArrayList<>();
         for (Map.Entry<String, String> entry : cache.entrySet()) {
             String json = entry.getValue();
             if (json == null || json.isBlank()) {
@@ -9231,7 +9253,17 @@ public class FeedGatewayService implements ReplayRunner {
             if (!isCacheFresh(event + ":" + entry.getKey(), nowMs)) {
                 continue;
             }
-            send(session, event, json);
+            fresh.add(entry);
+        }
+        // The cache key begins with the session date (yyyy-MM-dd), so descending by key is
+        // descending by session. A key that does not is simply ordered consistently, never dropped.
+        fresh.sort((a, b) -> b.getKey().compareTo(a.getKey()));
+        int sent = 0;
+        for (Map.Entry<String, String> entry : fresh) {
+            if (sent++ >= GAMMA_ZONE_REPLAY_LIMIT) {
+                break;
+            }
+            send(session, event, entry.getValue());
         }
     }
 
