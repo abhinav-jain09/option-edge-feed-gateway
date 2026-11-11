@@ -1457,6 +1457,15 @@ public final class GatewaySettings {
         return value("KAFKA_GAMMA_ZONE_PROFILE_TOPIC", "options.spx.gamma-zone.profile");
     }
 
+    /**
+     * How long a cached gamma-zone record stays replayable. One trading session's horizon (12h by
+     * default), so an intra-day reconnect is handed the live session and a reconnect the next
+     * morning is not handed yesterday's as though it were current.
+     */
+    public long gammaZoneTtlMs() {
+        return longValue("GAMMA_ZONE_TTL_MS", 12L * 60L * 60L * 1000L, 1L);
+    }
+
     /** Runtime kill switch; dark-safe off, like the navigation integration above. */
     public boolean gammaZoneEnabled() {
         return boolValue("GAMMA_ZONE_ENABLED", false);
