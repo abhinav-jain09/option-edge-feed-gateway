@@ -411,6 +411,13 @@ public class FeedGatewayService implements ReplayRunner {
     /** Corridor-gauge live state per symbol|expiry (JSON, last-value-wins). Standalone event. */
     private final Map<String, String> corridorGauges = new ConcurrentHashMap<>();
     /**
+     * The gamma zone, per sessionDate|symbol|timeframe (JSON, last-value-wins). Two caches because
+     * they are two records with different jobs: the measurement, and the session's whole volume
+     * profile that a strike-range count is taken from. Both forwarded verbatim.
+     */
+    private final Map<String, String> gammaZones = new ConcurrentHashMap<>();
+    private final Map<String, String> gammaZoneProfiles = new ConcurrentHashMap<>();
+    /**
      * Peak rotation windows and the raw move log, per chain. Same shape as gammaMigration.
      *
      * <p>REST-ONLY, deliberately: it is consumed by {@code GET /api/gamma-rotation} and nothing
@@ -1776,6 +1783,12 @@ public class FeedGatewayService implements ReplayRunner {
             // hot-strike is likewise STANDALONE and GLOBAL: replay the fresh cached
             // envelope(s) so a legacy-mode reload restores the gold mark (§4.4).
             replayHotStrikeCached(session);
+            // The gamma zone and its profile are STANDALONE and GLOBAL in the same way. Without
+            // this they replayed only under per-session routing, because replayCachedToSocket is
+            // the only caller and addClient reaches it only when perSessionRouting() is true -- so
+            // in legacy mode a record published while nobody was connected was cached and never
+            // delivered to a later socket (Codex round 2).
+            replayGammaZoneCached(session);
             // short-premium recommendations are likewise STANDALONE; replay the day's cached recommendations
             // so a page reload mid-session (or a client that connects after Agent A acted) still shows the
             // active overlay rather than waiting for the next live broadcast.
@@ -3042,6 +3055,14 @@ public class FeedGatewayService implements ReplayRunner {
             // Market commentary: CACHE consumer ONLY (polled REST view, no broadcast), like the early-auction verdict ledger.
             topicEvents.put(settings.marketCommentaryTopic(), new TopicBinding("DATABENTO", "market-commentary"));
         }
+        // THE GAMMA ZONE, on the JSON consumers. Both records are JSON on the wire -- binding them
+        // to the Avro consumers, which is where this first went, means GatewayAvroDeserializer
+        // throws on every record and the relay never reaches stringJson, updateCache or a socket.
+        // It compiles, it logs deserialization errors, and the page stays empty (Codex).
+        if (settings.gammaZoneEnabled()) {
+            topicEvents.put(settings.gammaZoneTopic(), new TopicBinding("DATABENTO", "gamma-zone"));
+            topicEvents.put(settings.gammaZoneProfileTopic(), new TopicBinding("DATABENTO", "gamma-zone-profile"));
+        }
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -3320,6 +3341,14 @@ public class FeedGatewayService implements ReplayRunner {
             // cache consumer is deliberately NOT subscribed: updateCache has no case for it, and
             // this event keeps its own latest-record retention for the connect replay.
             topicEvents.put(settings.esCvdSpxLevelsTopic(), new TopicBinding("DATABENTO", "es-cvd-spx-levels"));
+        }
+        // THE GAMMA ZONE, on the JSON consumers. Both records are JSON on the wire -- binding them
+        // to the Avro consumers, which is where this first went, means GatewayAvroDeserializer
+        // throws on every record and the relay never reaches stringJson, updateCache or a socket.
+        // It compiles, it logs deserialization errors, and the page stays empty (Codex).
+        if (settings.gammaZoneEnabled()) {
+            topicEvents.put(settings.gammaZoneTopic(), new TopicBinding("DATABENTO", "gamma-zone"));
+            topicEvents.put(settings.gammaZoneProfileTopic(), new TopicBinding("DATABENTO", "gamma-zone-profile"));
         }
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
@@ -4687,6 +4716,22 @@ public class FeedGatewayService implements ReplayRunner {
                             broadcast(binding.event(), forwardJson);
                             forwardedEvents.incrementAndGet();
                         }
+                    } else if ("gamma-zone".equals(binding.event())
+                            || "gamma-zone-profile".equals(binding.event())) {
+                        // A GLOBAL, dev-only measurement about the ES session, broadcast STANDALONE
+                        // and deliberately NOT gated by the per-market active selection -- the same
+                        // class as short-premium-recommendation below. That selection names an
+                        // options chain (source, symbol, expiry); the gamma zone names a futures
+                        // session, so matchesActiveSelection would drop every record and the page
+                        // would stay empty with nothing in the logs to say why.
+                        //
+                        // Low frequency by construction: the measurement is one record per folded
+                        // bar and the profile only when the fold or the refusal count moves, so a
+                        // global broadcast costs a page that is not looking at it almost nothing.
+                        if (cacheKey != null && cacheCaughtUpFlag.get()) {
+                            broadcast(binding.event(), forwardJson);
+                            forwardedEvents.incrementAndGet();
+                        }
                     } else if ("short-premium-recommendation".equals(binding.event())) {
                         // Advisory chain-level overlay: broadcast STANDALONE (its own message.type) to every
                         // connected dashboard as soon as a fresh recommendation is cached. Unlike market-data it
@@ -5368,6 +5413,12 @@ public class FeedGatewayService implements ReplayRunner {
                     || isIndicatorFamilyEvent(binding.event())
                     || "tapeZones".equals(binding.event())
                     || "es-auction".equals(binding.event())
+                    // Source-independent, like the pre-open status and the vol-premium advisories:
+                    // the gamma zone describes an ES session and is bound under DATABENTO only by
+                    // convention, so with another source selected it must STILL gate readiness or
+                    // the cache reads caught up over a session it has not read.
+                    || "gamma-zone".equals(binding.event())
+                    || "gamma-zone-profile".equals(binding.event())
                     || isVolPremiumEvent(binding.event())
                     || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 // Both vol-premium streams are GLOBAL advisories bound under DATABENTO only by
@@ -7112,6 +7163,20 @@ public class FeedGatewayService implements ReplayRunner {
                 gammaNavigation.put(key, json);
                 return key;
             }
+            case "gamma-zone" -> {
+                // Keyed by the record's own sessionDate|symbol|timeframe, last-value-wins, exactly
+                // as the compacted topic is. One live session is one entry.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gammaZones.put(key, json);
+                return key;
+            }
+            case "gamma-zone-profile" -> {
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gammaZoneProfiles.put(key, json);
+                return key;
+            }
             case "gamma-fragility" -> {
                 // Same contract as gamma-rotation: one record per chain is the whole panel.
                 cacheEventTimes.put(versionKey, eventTime);
@@ -7912,6 +7977,13 @@ public class FeedGatewayService implements ReplayRunner {
             // session — same long last-value-wins window as gex-by-strike/max-pain (default 12h).
             return CachePolicy.expiring(settings.gexOiStatusTtlMs());
         }
+        if ("gamma-zone".equals(event) || "gamma-zone-profile".equals(event)) {
+            // One trading session's horizon. Without a policy nothing ever evicted these, so every
+            // session date this process saw stayed in memory -- at roughly 9 KB a profile -- and was
+            // walked on every connect (Codex). Expiring also means a reconnect the morning after
+            // cannot be handed yesterday's session as live.
+            return CachePolicy.expiring(settings.gammaZoneTtlMs());
+        }
         if ("ibkr-preopen-status".equals(event)) {
             // Pre-open window state: one session's horizon (default 4h) — survives an intra-window
             // reconnect, can never replay yesterday's window as live (rev13 R-STATE).
@@ -8545,6 +8617,13 @@ public class FeedGatewayService implements ReplayRunner {
             gexOiStatus.remove(versionKey.substring("gex-oi-status:".length()));
         } else if (versionKey.startsWith("ibkr-preopen-status:")) {
             ibkrPreOpenStatus.remove(versionKey.substring("ibkr-preopen-status:".length()));
+        } else if (versionKey.startsWith("gamma-zone-profile:")) {
+            // BEFORE the "gamma-zone:" arm below: the profile's key starts with it, and a prefix
+            // test in the wrong order would route every profile eviction to the wrong map and
+            // leave the 9 KB records in place for ever.
+            gammaZoneProfiles.remove(versionKey.substring("gamma-zone-profile:".length()));
+        } else if (versionKey.startsWith("gamma-zone:")) {
+            gammaZones.remove(versionKey.substring("gamma-zone:".length()));
         } else if (versionKey.startsWith("tapeZones:")) {
             String tapeZonesKey = versionKey.substring("tapeZones:".length());
             tapeZonesBoards.remove(tapeZonesKey);
@@ -9125,6 +9204,66 @@ public class FeedGatewayService implements ReplayRunner {
             if (json != null && !json.isBlank() && matchesCachedSelection(json, selection)) {
                 send(session, "dealer-ledger", json);
             }
+        }
+    }
+
+
+    /**
+     * Connect replay for the two gamma-zone records: the newest measurement and the newest profile.
+     *
+     * <p>Direct, not through {@code replayCacheMap}. That helper resolves a routable record through
+     * {@link app.feedgateway.mtsession.gateway.GatewayRecordMapper}, which has no case for either
+     * event and returns nothing -- so the replay existed and delivered nothing. There is nothing for
+     * it to route on by design: the active selection names an options chain (source, symbol,
+     * expiry) and these records name a FUTURES session.
+     *
+     * <p>Freshness is still enforced per entry, so a reconnect after the service has stopped
+     * publishing cannot be handed yesterday's session as though it were live.
+     */
+    /** Replay cap per gamma-zone event. See {@link #replayGammaZoneMap}. */
+    static final int GAMMA_ZONE_REPLAY_LIMIT = 4;
+
+    private void replayGammaZoneCached(WebSocketSession session) {
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredCache(nowMs);
+        replayGammaZoneMap(session, "gamma-zone", gammaZones, nowMs);
+        replayGammaZoneMap(session, "gamma-zone-profile", gammaZoneProfiles, nowMs);
+    }
+
+    /**
+     * At most {@link #GAMMA_ZONE_REPLAY_LIMIT} entries per event, newest first.
+     *
+     * <p>Neither event is coalescible, so every replayed record is its own outbound queue item and
+     * a joining socket that exceeded the queue bound would simply be disconnected (Codex round 2).
+     * The live cardinality is one entry per session date over a 12-hour TTL -- in practice one, two
+     * across a roll -- so this cap is not a policy about what a reader may see. It is a bound on
+     * what a MISBEHAVING producer can do to a connecting client, and it is small enough that the
+     * profile's size cannot matter either.
+     *
+     * <p>Newest first because when the cap does bite, the current session is the one worth having.
+     */
+    private void replayGammaZoneMap(WebSocketSession session, String event,
+                                    Map<String, String> cache, long nowMs) {
+        List<Map.Entry<String, String>> fresh = new ArrayList<>();
+        for (Map.Entry<String, String> entry : cache.entrySet()) {
+            String json = entry.getValue();
+            if (json == null || json.isBlank()) {
+                continue;
+            }
+            if (!isCacheFresh(event + ":" + entry.getKey(), nowMs)) {
+                continue;
+            }
+            fresh.add(entry);
+        }
+        // The cache key begins with the session date (yyyy-MM-dd), so descending by key is
+        // descending by session. A key that does not is simply ordered consistently, never dropped.
+        fresh.sort((a, b) -> b.getKey().compareTo(a.getKey()));
+        int sent = 0;
+        for (Map.Entry<String, String> entry : fresh) {
+            if (sent++ >= GAMMA_ZONE_REPLAY_LIMIT) {
+                break;
+            }
+            send(session, event, entry.getValue());
         }
     }
 
@@ -11090,7 +11229,12 @@ public class FeedGatewayService implements ReplayRunner {
      * {@code marketDataSource}/{@code source}/{@code sessionDate} over the producer's own fields.
      */
     private static boolean isRawPassThroughEvent(String event) {
-        return "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
+        // gamma-zone and its profile are the producer's records, forwarded BYTE FOR BYTE. The
+        // service publishes no signal and names no level to sell; the gateway must not be the first
+        // thing in the chain that implies one by reshaping the record. Enriching would also re-serialise
+        // the 9 KB profile on every broadcast for two added fields nobody reads.
+        return "gamma-zone".equals(event) || "gamma-zone-profile".equals(event)
+                || "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
                 || "es-cvd-spx-levels".equals(event)
                 || "market-structure".equals(event)
                 || "market-structure-patterns".equals(event)
@@ -14286,6 +14430,12 @@ public class FeedGatewayService implements ReplayRunner {
         // event is registered in requiresFreshPerSessionReplay) and the routing engine's
         // shouldDeliverToSocket — the bespoke helper would bypass selection isolation here.
         replayCacheMap(session, "corridor-gauge", corridorGauges);
+        // The newest measurement and the newest profile per session, so a page that opens mid-day
+        // draws immediately instead of waiting for the next folded bar. NOT replayCacheMap: that
+        // routes through GatewayRecordMapper, which has no gamma-zone case and returns empty, so
+        // the replay silently delivered nothing (Codex). These are global advisories with no chain
+        // identity to route on, so they are sent directly, like the other global feeds.
+        replayGammaZoneCached(session);
         replayCacheMap(session, "opb-by-option", opbByOptions);
         replayCacheMap(session, "opb-session", opbSessions);
         // P1: replay each underlying cache with its ORIGINAL event type — VIX (SHARED) as vix-price, ES/index
@@ -15332,6 +15482,14 @@ public class FeedGatewayService implements ReplayRunner {
             // standalone broadcast reaches sockets in per-session (auth) mode too
             // (GatewayRecordMapper deliberately has no route for it).
             "ibkr-preopen-status",
+            // THE GAMMA ZONE and its session volume profile: a GLOBAL, dev-only measurement about
+            // one ES session, identical for every viewer. Allowlisted so the standalone broadcast
+            // reaches sockets in per-session (auth) mode too -- without this, broadcast() drops
+            // every frame while forwardedEvents still increments, so the metric reads "delivered"
+            // and no socket ever saw one (Codex). GatewayRecordMapper deliberately has no route for
+            // either: they name a futures session, not an options chain, so there is nothing for
+            // the selection router to match and replay goes through replayGammaZoneCached below.
+            "gamma-zone", "gamma-zone-profile",
             // Pre-open IBKR GEX value plane (rev13 R-ARB slice 2): the same GLOBAL wrapped-stream
             // class as its status sibling — sessionId-gated client-side, never selection-routed
             // (GatewayRecordMapper deliberately has no route for it).
