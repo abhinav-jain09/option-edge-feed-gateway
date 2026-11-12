@@ -1472,6 +1472,29 @@ public final class GatewaySettings {
     }
 
     /**
+     * THE GAMMA EFFORT reading: SPX gamma measured against ES contracts traded. JSON on the wire,
+     * like the gamma zone above and for the same reason -- binding a JSON topic to the Avro
+     * consumers compiles, logs a deserialization error per record, and leaves the page empty.
+     */
+    public String gammaEffortTopic() {
+        return value("KAFKA_GAMMA_EFFORT_CURRENT_TOPIC", "options.spx.gamma-effort.current");
+    }
+
+    /**
+     * How long a cached gamma-effort record stays replayable. One trading session's horizon, so an
+     * intra-day reconnect is handed the live session and a reconnect the next morning is not handed
+     * yesterday's as though it were current.
+     */
+    public long gammaEffortTtlMs() {
+        return longValue("GAMMA_EFFORT_TTL_MS", 12L * 60L * 60L * 1000L, 1L);
+    }
+
+    /** Runtime kill switch; dark-safe off, like the gamma zone above. */
+    public boolean gammaEffortEnabled() {
+        return boolValue("GAMMA_EFFORT_ENABLED", false);
+    }
+
+    /**
      * Peak ROTATION (Avro, per-chain last-value-wins). Broadcast as event "gamma-rotation".
      *
      * <p>A separate topic from {@link #gammaMigrationTopic()} because the snapshot record has no
