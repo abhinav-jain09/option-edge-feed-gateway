@@ -3063,6 +3063,11 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.gammaZoneTopic(), new TopicBinding("DATABENTO", "gamma-zone"));
             topicEvents.put(settings.gammaZoneProfileTopic(), new TopicBinding("DATABENTO", "gamma-zone-profile"));
         }
+        // THE GAMMA EFFORT reading, JSON on the wire like the gamma zone above and bound on the
+        // same JSON consumers for the same reason.
+        if (settings.gammaEffortEnabled()) {
+            topicEvents.put(settings.gammaEffortTopic(), new TopicBinding("DATABENTO", "gamma-effort"));
+        }
         runAssignedCacheConsumer("state", topicEvents, false, stateCaughtUp);
     }
 
@@ -3349,6 +3354,11 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.gammaZoneEnabled()) {
             topicEvents.put(settings.gammaZoneTopic(), new TopicBinding("DATABENTO", "gamma-zone"));
             topicEvents.put(settings.gammaZoneProfileTopic(), new TopicBinding("DATABENTO", "gamma-zone-profile"));
+        }
+        // THE GAMMA EFFORT reading, JSON on the wire like the gamma zone above and bound on the
+        // same JSON consumers for the same reason.
+        if (settings.gammaEffortEnabled()) {
+            topicEvents.put(settings.gammaEffortTopic(), new TopicBinding("DATABENTO", "gamma-effort"));
         }
         runLiveConsumer("state-live", topicEvents, false, stateCaughtUp);
     }
@@ -4717,7 +4727,8 @@ public class FeedGatewayService implements ReplayRunner {
                             forwardedEvents.incrementAndGet();
                         }
                     } else if ("gamma-zone".equals(binding.event())
-                            || "gamma-zone-profile".equals(binding.event())) {
+                            || "gamma-zone-profile".equals(binding.event())
+                            || "gamma-effort".equals(binding.event())) {
                         // A GLOBAL, dev-only measurement about the ES session, broadcast STANDALONE
                         // and deliberately NOT gated by the per-market active selection -- the same
                         // class as short-premium-recommendation below. That selection names an
@@ -5419,6 +5430,9 @@ public class FeedGatewayService implements ReplayRunner {
                     // the cache reads caught up over a session it has not read.
                     || "gamma-zone".equals(binding.event())
                     || "gamma-zone-profile".equals(binding.event())
+                    // Same class: gamma-effort describes an ES session, not an options chain, so it
+                    // is bound under DATABENTO by convention only and must still gate readiness.
+                    || "gamma-effort".equals(binding.event())
                     || isVolPremiumEvent(binding.event())
                     || requiresCatchUpForActiveSource(selection.source(), binding.source())) {
                 // Both vol-premium streams are GLOBAL advisories bound under DATABENTO only by
@@ -7983,6 +7997,12 @@ public class FeedGatewayService implements ReplayRunner {
             // walked on every connect (Codex). Expiring also means a reconnect the morning after
             // cannot be handed yesterday's session as live.
             return CachePolicy.expiring(settings.gammaZoneTtlMs());
+        }
+        if ("gamma-effort".equals(event)) {
+            // Same horizon and the same reason: without a policy every session date this process
+            // saw would stay in memory and be walked on every connect, and a reconnect the morning
+            // after could be handed yesterday's session as live.
+            return CachePolicy.expiring(settings.gammaEffortTtlMs());
         }
         if ("ibkr-preopen-status".equals(event)) {
             // Pre-open window state: one session's horizon (default 4h) — survives an intra-window
