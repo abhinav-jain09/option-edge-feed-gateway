@@ -63,6 +63,9 @@ class GammaZoneWiringTest {
         // first thing in the chain that implies one by reshaping the record -- and enriching would
         // re-serialise the 9 KB profile on every broadcast for two fields nobody reads.
         String source = source();
+        // Matched by what the expression CONTAINS. Pinning its exact tail made this fail the moment
+        // another raw event was added after it, which says nothing about whether these two are
+        // still pass-through.
         assertTrue(source.contains("return \"gamma-zone\".equals(event) || \"gamma-zone-profile\".equals(event)"),
                 "both events must be in isRawPassThroughEvent");
     }
@@ -73,10 +76,13 @@ class GammaZoneWiringTest {
         // a FUTURES session, so matchesActiveSelection would drop every record and the page would
         // stay empty with nothing in the logs to say why.
         String source = source();
+        // The branch is identified by its head and by the two events in it, NOT by the token that
+        // closes it: appending another event to the same branch leaves the behaviour this test
+        // exists for untouched, and pinning the "){" made it fail anyway.
         assertTrue(source.contains("} else if (\"gamma-zone\".equals(binding.event())\n"
-                        + "                            || \"gamma-zone-profile\".equals(binding.event())) {"),
+                        + "                            || \"gamma-zone-profile\".equals(binding.event())"),
                 "the standalone broadcast branch must exist, before the shouldForward branch");
-        int standalone = source.indexOf("|| \"gamma-zone-profile\".equals(binding.event())) {");
+        int standalone = source.indexOf("|| \"gamma-zone-profile\".equals(binding.event())");
         int selectionGated = source.indexOf("&& shouldForward(binding, forwardJson, record,");
         assertTrue(standalone > 0 && selectionGated > standalone,
                 "the standalone branch must come BEFORE the selection-gated one, or it never runs");
@@ -179,10 +185,14 @@ class GammaZoneWiringTest {
         // Bound under DATABENTO by convention only. With another source selected they must still
         // gate readiness, or the cache reads caught up over a session it has not read -- and the
         // page is handed a hello built from nothing.
-        assertTrue(source().contains("|| \"gamma-zone\".equals(binding.event())\n"
-                        + "                    || \"gamma-zone-profile\".equals(binding.event())\n"
-                        + "                    || isVolPremiumEvent(binding.event())"),
+        // Membership again: isVolPremiumEvent no longer follows immediately, and requiring it to
+        // would be pinning the order of an || chain rather than the fact that these gate catch-up.
+        String source = source();
+        assertTrue(source.contains("|| \"gamma-zone\".equals(binding.event())\n"
+                        + "                    || \"gamma-zone-profile\".equals(binding.event())"),
                 "both events must gate catch-up");
+        assertTrue(source.contains("|| isVolPremiumEvent(binding.event())"),
+                "and the vol-premium advisories still gate it too");
     }
 
     @Test

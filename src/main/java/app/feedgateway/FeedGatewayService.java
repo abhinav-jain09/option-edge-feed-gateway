@@ -11253,7 +11253,11 @@ public class FeedGatewayService implements ReplayRunner {
         // service publishes no signal and names no level to sell; the gateway must not be the first
         // thing in the chain that implies one by reshaping the record. Enriching would also re-serialise
         // the 9 KB profile on every broadcast for two added fields nobody reads.
+        // gamma-effort is the same: its record carries its OWN sessionDate, and enrichJson would
+        // stamp the gateway's over it -- so a page reading the session off the record would be told
+        // a session the service never measured.
         return "gamma-zone".equals(event) || "gamma-zone-profile".equals(event)
+                || "gamma-effort".equals(event)
                 || "ibkr-preopen-status".equals(event) || "tapeZones".equals(event)
                 || "es-cvd-spx-levels".equals(event)
                 || "market-structure".equals(event)
