@@ -9266,7 +9266,9 @@ public class FeedGatewayService implements ReplayRunner {
         purgeExpiredCache(nowMs);
         replayGammaZoneMap(session, "gamma-zone", gammaZones, nowMs);
         replayGammaZoneMap(session, "gamma-zone-profile", gammaZoneProfiles, nowMs);
-        // The helper is generic (event name + map); the gamma-zone name is historical.
+        // The helper is generic (event name + map); the gamma-zone name is historical. This is
+        // the third event on it, so the per-connect replay bound is now 3 x GAMMA_ZONE_REPLAY_LIMIT
+        // messages, still far inside the outbound queue bound.
         replayGammaZoneMap(session, "gamma-effort", gammaEfforts, nowMs);
     }
 
@@ -9295,8 +9297,12 @@ public class FeedGatewayService implements ReplayRunner {
             }
             fresh.add(entry);
         }
-        // The cache key begins with the session date (yyyy-MM-dd), so descending by key is
-        // descending by session. A key that does not is simply ordered consistently, never dropped.
+        // Descending by key is descending by session ONLY because every entry in a given map
+        // shares the same generic SOURCE prefix (updateCache prepends binding.source()), so the
+        // comparison reaches the yyyy-MM-dd session date at the same offset in each. Bind one of
+        // these events under a second source and that stops being true -- the ordering would then
+        // be by source first. A key of any other shape is simply ordered consistently, never
+        // dropped. (Codex: the previous wording claimed the key BEGINS with the session date.)
         fresh.sort((a, b) -> b.getKey().compareTo(a.getKey()));
         int sent = 0;
         for (Map.Entry<String, String> entry : fresh) {

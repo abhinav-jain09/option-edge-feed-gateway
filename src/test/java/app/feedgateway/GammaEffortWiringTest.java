@@ -150,7 +150,15 @@ class GammaEffortWiringTest {
         return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
     }
 
-    /** Feed one record through the REAL ingestion path and return the cache key it produced. */
+    /**
+     * Drive the real {@code updateCache} with one record and return the cache key it produced.
+     *
+     * <p>This is the admission decision itself, not the whole ingestion path: it does not go
+     * through the poll loop, the live-forward gate or a socket. It is enough to catch the defect
+     * these tests exist for -- a null key, which no later stage can recover from -- and claiming
+     * more than that is the mistake the pins above made. End-to-end delivery is established by
+     * connecting to the running gateway on dev and watching the event arrive.
+     */
     private static String ingest(FeedGatewayService service, String json) throws Exception {
         Class<?> bindingClass = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
         Constructor<?> ctor = bindingClass.getDeclaredConstructor(String.class, String.class);
