@@ -2,12 +2,28 @@ package app.feedgateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
 
 /**
  * The gamma-effort relay: one dev-only JSON topic forwarded verbatim to the browser.
@@ -26,6 +42,17 @@ import org.junit.jupiter.api.Test;
  * <p>They are matched by what the expressions CONTAIN rather than by their exact tails. The
  * gamma-zone equivalents pinned their closing tokens and broke the moment this event was appended
  * to the same branches, which said nothing about whether gamma-zone was still wired.
+ *
+ * <p><b>And the warning above came true.</b> Every pin in this file passed from the day the relay
+ * merged, and not one gamma-effort record ever reached a browser. {@code updateCache} had no
+ * {@code case "gamma-effort"}, so it fell to {@code default -> return null}; the standalone
+ * broadcast branch those pins assert is guarded by {@code cacheKey != null} and could therefore
+ * never run. {@code GLOBAL_BROADCAST_EVENTS} was missing it too, which would have dropped every
+ * frame a second time on any authenticated socket -- i.e. dev and prod. The page sat on "Waiting
+ * for the first reading" for a day while four tests reported the relay wired.
+ *
+ * <p>The tests below this line therefore DRIVE the real code instead of reading it. Each one fails
+ * on the commit before this one.
  */
 class GammaEffortWiringTest {
 
@@ -95,5 +122,121 @@ class GammaEffortWiringTest {
     @Test
     void theTopicIsTheDECLAREDOneAndOverridableOnlyByItsOwnKey() {
         assertEquals("options.spx.gamma-effort.current", new GatewaySettings().gammaEffortTopic());
+    }
+
+    /* ----------------------------------------------- what the pins above could not see */
+
+    private static final String TOPIC = "options.spx.gamma-effort.current";
+
+    /** The record key the service actually produces: sessionDate|symbol|timeframe. */
+    private static final String KEY = "2026-11-13|ES.v.0|1m";
+
+    /**
+     * What updateCache stores it under. Every event except pace/pace-rank gets the binding's
+     * SOURCE prefixed generically, so the map key is not the record key -- gamma-zone's entries
+     * carry the same prefix. Asserted rather than assumed: the first draft of this test expected
+     * the bare record key and failed here, which is the whole reason these tests drive the code.
+     */
+    private static final String CACHE_KEY = "DATABENTO|" + KEY;
+
+    /** Trimmed to the fields the gateway itself reads; the relay forwards the rest verbatim. */
+    private static final String RECORD =
+            "{\"schema\":\"gamma-effort.v1\",\"sessionDate\":\"2026-11-13\",\"symbol\":\"ES.v.0\","
+            + "\"timeframe\":\"1m\",\"asOfMs\":1794572704425,\"spotCents\":761000,"
+            + "\"gammaMap\":{\"present\":false,\"asOfMs\":null,\"strikes\":0},"
+            + "\"scalp\":{\"hotStrike\":{\"bandLowCents\":759500,\"volumeContracts\":18115}}}";
+
+    private static FeedGatewayService service() {
+        return new FeedGatewayService(new GatewaySettings(), new ObjectMapper(), new HpsfGatewayViewMapper(), null);
+    }
+
+    /** Feed one record through the REAL ingestion path and return the cache key it produced. */
+    private static String ingest(FeedGatewayService service, String json) throws Exception {
+        Class<?> bindingClass = Class.forName("app.feedgateway.FeedGatewayService$TopicBinding");
+        Constructor<?> ctor = bindingClass.getDeclaredConstructor(String.class, String.class);
+        ctor.setAccessible(true);
+        Object binding = ctor.newInstance("DATABENTO", "gamma-effort");
+        Method updateCache = FeedGatewayService.class.getDeclaredMethod(
+                "updateCache", bindingClass, ConsumerRecord.class, String.class);
+        updateCache.setAccessible(true);
+        ConsumerRecord<String, Object> record = new ConsumerRecord<>(TOPIC, 0, 1L, KEY, null);
+        return (String) updateCache.invoke(service, binding, record, json);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, String> cacheOf(FeedGatewayService service) throws Exception {
+        Field f = FeedGatewayService.class.getDeclaredField("gammaEfforts");
+        f.setAccessible(true);
+        return (Map<String, String>) f.get(service);
+    }
+
+    @Test
+    void aRecordIsCACHEDSoTheBroadcastGuardCanPass() throws Exception {
+        // THE bug. The standalone branch runs only `if (cacheKey != null && cacheCaughtUpFlag)`.
+        // A null key here is not a cache miss -- it is the whole relay, silently off, with no
+        // droppedBy* counter incremented and nothing in the log to say so.
+        FeedGatewayService service = service();
+        String key = ingest(service, RECORD);
+        assertNotNull(key, "updateCache returned null, so the broadcast guard can never pass");
+        assertEquals(CACHE_KEY, key, "source-prefixed record key, exactly as gamma-zone is keyed");
+        assertEquals(RECORD, cacheOf(service).get(CACHE_KEY), "the record must be cached VERBATIM");
+    }
+
+    @Test
+    void aSecondRecordREPLACESTheFirstForTheSameSession() throws Exception {
+        // One live session is one entry. The service publishes one record per folded bar, ~390 a
+        // session; a cache that appended would hold the day.
+        FeedGatewayService service = service();
+        ingest(service, RECORD);
+        String later = RECORD.replace("\"spotCents\":761000", "\"spotCents\":761500");
+        ingest(service, later);
+        assertEquals(1, cacheOf(service).size(), "last-value-wins, one entry per session");
+        assertEquals(later, cacheOf(service).get(CACHE_KEY), "the newer reading must win");
+    }
+
+    @Test
+    void theAuthenticatedBroadcastAllowlistCarriesIt() {
+        // Without this entry broadcast() drops every frame on a per-session (auth) socket while
+        // forwardedEvents still increments -- the metric reads "delivered" and no socket saw one.
+        // dev and prod are both authenticated, so this alone would have kept the page empty.
+        assertTrue(FeedGatewayService.GLOBAL_BROADCAST_EVENTS.contains("gamma-effort"),
+                "gamma-effort must be allowlisted for per-session broadcast");
+    }
+
+    @Test
+    void aPageConnectingMidSessionIsHandedTheLastReading() throws Exception {
+        // The service publishes once per folded bar. Without a replay on connect a page that opens
+        // at 10:00:05 shows "Waiting for the first reading" until 10:01 -- and shows it for ever if
+        // the session has already ended.
+        FeedGatewayService service = service();
+        ingest(service, RECORD);
+
+        WebSocketSession session = mock(WebSocketSession.class);
+        when(session.getId()).thenReturn("test-session");
+        when(session.isOpen()).thenReturn(true);
+
+        Method replay = FeedGatewayService.class.getDeclaredMethod(
+                "replayGammaZoneCached", WebSocketSession.class);
+        replay.setAccessible(true);
+        replay.invoke(service, session);
+
+        ArgumentCaptor<TextMessage> sent = ArgumentCaptor.forClass(TextMessage.class);
+        verify(session, atLeastOnce()).sendMessage(sent.capture());
+        boolean delivered = sent.getAllValues().stream()
+                .map(TextMessage::getPayload)
+                .anyMatch(payload -> payload.contains("\"gamma-effort\"") && payload.contains("18115"));
+        assertTrue(delivered, "the cached reading must be replayed to a connecting socket");
+    }
+
+    @Test
+    void anEvictedEntryLeavesItsOWNMapAndNotAnotherGammaMap() throws Exception {
+        // removeCacheEntry dispatches on a versionKey PREFIX. A missing arm leaves the record in
+        // memory for ever; an arm in the wrong place empties a sibling map instead.
+        FeedGatewayService service = service();
+        ingest(service, RECORD);
+        Method remove = FeedGatewayService.class.getDeclaredMethod("removeCacheEntry", String.class);
+        remove.setAccessible(true);
+        remove.invoke(service, "gamma-effort:" + CACHE_KEY);
+        assertTrue(cacheOf(service).isEmpty(), "the entry must be evicted from gammaEfforts");
     }
 }
