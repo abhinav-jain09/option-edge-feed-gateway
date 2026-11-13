@@ -417,6 +417,7 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private final Map<String, String> gammaZones = new ConcurrentHashMap<>();
     private final Map<String, String> gammaZoneProfiles = new ConcurrentHashMap<>();
+    private final Map<String, String> gammaEfforts = new ConcurrentHashMap<>();
     /**
      * Peak rotation windows and the raw move log, per chain. Same shape as gammaMigration.
      *
@@ -7191,6 +7192,21 @@ public class FeedGatewayService implements ReplayRunner {
                 gammaZoneProfiles.put(key, json);
                 return key;
             }
+            case "gamma-effort" -> {
+                // Same contract as gamma-zone, and the same record key shape
+                // (sessionDate|symbol|timeframe) -- one live session is one entry, last-value-wins.
+                //
+                // This case is what makes the event deliverable at all. The standalone broadcast
+                // branch is guarded by `cacheKey != null`, and `updateCache` ends in
+                // `default -> { return null; }`, so while gamma-effort had no case here every
+                // record was silently dropped: not by a named droppedBy* counter, just by a guard
+                // that could never pass. Four source pins in GammaEffortWiringTest asserted the
+                // relay was wired and all four passed.
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                gammaEfforts.put(key, json);
+                return key;
+            }
             case "gamma-fragility" -> {
                 // Same contract as gamma-rotation: one record per chain is the whole panel.
                 cacheEventTimes.put(versionKey, eventTime);
@@ -8644,6 +8660,8 @@ public class FeedGatewayService implements ReplayRunner {
             gammaZoneProfiles.remove(versionKey.substring("gamma-zone-profile:".length()));
         } else if (versionKey.startsWith("gamma-zone:")) {
             gammaZones.remove(versionKey.substring("gamma-zone:".length()));
+        } else if (versionKey.startsWith("gamma-effort:")) {
+            gammaEfforts.remove(versionKey.substring("gamma-effort:".length()));
         } else if (versionKey.startsWith("tapeZones:")) {
             String tapeZonesKey = versionKey.substring("tapeZones:".length());
             tapeZonesBoards.remove(tapeZonesKey);
@@ -9248,6 +9266,10 @@ public class FeedGatewayService implements ReplayRunner {
         purgeExpiredCache(nowMs);
         replayGammaZoneMap(session, "gamma-zone", gammaZones, nowMs);
         replayGammaZoneMap(session, "gamma-zone-profile", gammaZoneProfiles, nowMs);
+        // The helper is generic (event name + map); the gamma-zone name is historical. This is
+        // the third event on it, so the per-connect replay bound is now 3 x GAMMA_ZONE_REPLAY_LIMIT
+        // messages, still far inside the outbound queue bound.
+        replayGammaZoneMap(session, "gamma-effort", gammaEfforts, nowMs);
     }
 
     /**
@@ -9275,8 +9297,12 @@ public class FeedGatewayService implements ReplayRunner {
             }
             fresh.add(entry);
         }
-        // The cache key begins with the session date (yyyy-MM-dd), so descending by key is
-        // descending by session. A key that does not is simply ordered consistently, never dropped.
+        // Descending by key is descending by session ONLY because every entry in a given map
+        // shares the same generic SOURCE prefix (updateCache prepends binding.source()), so the
+        // comparison reaches the yyyy-MM-dd session date at the same offset in each. Bind one of
+        // these events under a second source and that stops being true -- the ordering would then
+        // be by source first. A key of any other shape is simply ordered consistently, never
+        // dropped. (Codex: the previous wording claimed the key BEGINS with the session date.)
         fresh.sort((a, b) -> b.getKey().compareTo(a.getKey()));
         int sent = 0;
         for (Map.Entry<String, String> entry : fresh) {
@@ -15514,6 +15540,10 @@ public class FeedGatewayService implements ReplayRunner {
             // either: they name a futures session, not an options chain, so there is nothing for
             // the selection router to match and replay goes through replayGammaZoneCached below.
             "gamma-zone", "gamma-zone-profile",
+            // THE GAMMA EFFORT reading is the same class and needs the same entry: it names an
+            // ES session, GatewayRecordMapper deliberately has no route for it, and dev runs
+            // per-session (auth) sockets -- so without this broadcast() drops every frame.
+            "gamma-effort",
             // Pre-open IBKR GEX value plane (rev13 R-ARB slice 2): the same GLOBAL wrapped-stream
             // class as its status sibling — sessionId-gated client-side, never selection-routed
             // (GatewayRecordMapper deliberately has no route for it).
