@@ -169,7 +169,7 @@ public class FeedGatewayService implements ReplayRunner {
      */
     static final String EVENT_VOL_PREMIUM_FRAME = "vol-premium-frame";
     private static final Set<String> COALESCABLE_EVENTS = Set.of(
-            "rithmic-liquidity", EsLiquidityWallRelay.HEATMAP_EVENT, "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "spot-band", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
+            "rithmic-liquidity", EsLiquidityWallRelay.HEATMAP_EVENT, EsLiquidityWallRelay.TARGETS_EVENT, "snapshot", "pace", "pace-rank", "directional-pressure", "strike-flow", "seller-activity", "spot-band", "delta-flow", "strike-intel", "option-truth", "strike-invasion", "mission-pace", "mission-control", "spread-skew", "volume-sandwich", "mission-sandwich", "gex-by-strike",
             "gex-oi-status",
             "strike-sr",
             "gex-magnet",
@@ -15504,7 +15504,7 @@ public class FeedGatewayService implements ReplayRunner {
     static final Set<String> GLOBAL_BROADCAST_EVENTS = Set.of(
             "rithmic-liquidity",
             // ES liquidity walls (es-liquidity-wall-service): ONE contract, no per-user data; the voice and the events are never coalesced.
-            EsLiquidityWallRelay.HEATMAP_EVENT, EsLiquidityWallRelay.WALL_EVENT, EsLiquidityWallRelay.VOICE_EVENT,
+            EsLiquidityWallRelay.HEATMAP_EVENT, EsLiquidityWallRelay.WALL_EVENT, EsLiquidityWallRelay.VOICE_EVENT, EsLiquidityWallRelay.TARGETS_EVENT,
             // Liquidity-validator labels (liquidity-validator-service): one research verdict per geometry release, no per-user data.
             LiquidityValidatorRelay.EVENT,
             // Line health (requirement LH-O-6): system-line records for every socket; user-line records are refused by the relay until the owner filter (M5).
@@ -15940,7 +15940,7 @@ public class FeedGatewayService implements ReplayRunner {
                 // additive fields must never split the coalescing identity.
                 return event + "|" + symbol;
             }
-            if (EsLiquidityWallRelay.HEATMAP_EVENT.equals(event)) {
+            if (EsLiquidityWallRelay.HEATMAP_EVENT.equals(event) || EsLiquidityWallRelay.TARGETS_EVENT.equals(event)) {
                 // One dashboard frame per contract (section 8: key CME|<contract>); the newest replaces a queued one behind a slow socket.
                 return event + "|" + root.path("contract").asText("");
             }

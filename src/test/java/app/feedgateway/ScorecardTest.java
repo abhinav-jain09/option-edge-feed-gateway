@@ -361,4 +361,29 @@ class ScorecardTest {
         assertEquals(0L, c.tryAcquire("p5", 2L), "a known principal keeps its budget");
         assertEquals(0L, c.tryAcquire("one-too-many", 61_000L), "expired windows leave, so the newcomer is admitted a minute later");
     }
+
+    @Test
+    void aRealWallScoreboardRowOfContracts096IsHeldWithItsMapAndEveryFieldByName() throws Exception {
+        org.apache.avro.Schema ws = com.optionsedge.contracts.liquiditywall.LiquidityWallSchemas.SCOREBOARD.schema();
+        GenericRecord w = new org.apache.avro.generic.GenericRecordBuilder(ws).set("schemaVersion", 1).set("outcomeRuleVersion", "liq-AA-v1").set("service", "es-liquidity-wall-service")
+                .set("depthEnvironment", "Rithmic").set("contract", "ESZ6").set("tradeDate", "2026-11-16").set("classKey", "SIDE=ABOVE/DIST=D25_50/SIZE=X4_6")
+                .set("side", "ABOVE").set("distanceBand", "D25_50").set("sizeBand", "X4_6").set("horizonSeconds", 1800).set("signals", 3L).set("decided", 2L).set("reached", 1L)
+                .set("reachedRateThousandths", 500).set("consumed", 1L).set("pulled", 0L).set("heldSize", 1L).set("fateUnknown", 0L).set("consumedShareThousandths", 1000)
+                .set("stopPastCount", 1L).set("stopPastMeanMilliTicks", 4000L).set("stopPastMaxTicks", 4L).set("secondsToReachMeanMillis", 90_000L)
+                .set("excluded", new HashMap<>(Map.of("SESSION_ENDED", 1L))).set("smallN", true).set("identityDigest", "d").set("configFingerprint", "f").set("bucketEnd", 5L)
+                .set("label", "DESCRIPTIVE_UNVALIDATED").build();
+        String wall = "futures.liquidity-wall.scoreboard";
+        ScorecardReader r = reader(Map.of(1, w), wall);
+        r.board().setState(wall, "LIVE");
+        r.accept(wall, "2026-11-16|d|SIDE=ABOVE/DIST=D25_50/SIZE=X4_6|M1800", ByteBuffer.allocate(9).put((byte) 0).putInt(3410).putInt(1).array());
+        JsonNode v = body(r, null);
+        assertEquals(1, v.get("rows").size());
+        JsonNode row = v.get("rows").get(0);
+        assertEquals(500, row.get("reachedRateThousandths").asInt());
+        assertEquals(1, row.get("excluded").get("SESSION_ENDED").asInt());
+        assertTrue(row.get("reachedRateThousandths").isNumber() && !row.has("stratum"));
+        for (org.apache.avro.Schema.Field f : ws.getFields()) {
+            assertTrue(row.has(f.name()), "the board copies " + f.name());   // including family and the role-flip counters of 0.96.0
+        }
+    }
 }

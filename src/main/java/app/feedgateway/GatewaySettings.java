@@ -226,6 +226,14 @@ public final class GatewaySettings {
         return value("ES_LIQUIDITY_WALL_EVENTS_TOPIC", "futures.liquidity-wall.events");
     }
 
+    /**
+     * futures.liquidity-wall.targets ({@code LiquidityWallTargets}, fixed schema id 3411, liq-AA): the displayed liquidity targets, compact, latest, key {@code CME|<contract>}.
+     * Optional at the broker: a missing topic is retried and never stops the other four lanes.
+     */
+    public String esLiquidityTargetsTopic() {
+        return value("ES_LIQUIDITY_TARGETS_TOPIC", "futures.liquidity-wall.targets");
+    }
+
     /** futures.liquidity-wall.voice ({@code LiquidityWallVoice}, fixed schema id 3407): the spoken flip, compact, latest. */
     public String esLiquidityWallVoiceTopic() {
         return value("ES_LIQUIDITY_WALL_VOICE_TOPIC", "futures.liquidity-wall.voice");
