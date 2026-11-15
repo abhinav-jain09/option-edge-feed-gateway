@@ -7,3 +7,7 @@ This change replaces only `ES-FOOTPRINT-CAMPAIGN.json` with the actual captured 
 Artifact: [build 851 campaign](http://localhost:8085/job/option-edge-feed-gateway/851/artifact/.jenkins-tmp/es4-tests-851/footprint-reverify.json). The local controller URL is session-specific; the committed record preserves its own source/patch/baseline/output provenance. It is a reproducible CI record, not a signed attestation or a passing release receipt.
 
 Validation: the existing requirement-state generator accepts all current source bindings, and `bash scripts/footprint-reqstate.sh --check` passes. Regenerating the design table produces no change because claims and outcomes are unchanged. `git diff --check` passes. The next Jenkins run must repeat the full suite/campaign and all release checks; this record refresh grants no deployment bypass.
+
+## Refresh for the liq-AA relay changes (build 872)
+
+Build 872 (gateway source `1696106671acf0663cce54deec23a5bd76941c2e`) passed the full suite and reproduced the 50-mutation campaign (49 killed, the same one characterized survivor), then refused to emit because `FeedGatewayService.java` had moved (PRs 332 and 333, the targets relay). `ES-FOOTPRINT-CAMPAIGN.json` is replaced by the record captured by that run (`.jenkins-tmp/es4-tests-872/footprint-reverify.json`, 395,779 bytes, SHA-256 `d3baeac0394c304db8f56f09c946081f5bd9b5babad38d0152921fd1547ba359`). No code, spec, gate or outcome changes; `bash scripts/footprint-reqstate.sh --check` reports the campaign matches. The next Jenkins run repeats everything.
