@@ -65,15 +65,17 @@ public class ScorecardController {
         return b.header(HttpHeaders.CACHE_CONTROL, "no-store");
     }
 
+    /** 0 when allowed, else the Retry-After seconds. The whole admission (sweep, bound, allocation, count) is one critical section, so the 4096 bound is hard under concurrency. */
     long tryAcquire(String principal, long nowMs) {
-        if (counters.size() >= 1024) {
-            counters.values().removeIf(w -> nowMs - w[0] >= 60_000L);   // expired minute windows leave
-            if (counters.size() >= 4096 && !counters.containsKey(principal == null ? "anonymous" : principal)) {
+        String who = principal == null ? "anonymous" : principal;
+        synchronized (counters) {
+            if (counters.size() >= 1024) {
+                counters.values().removeIf(w -> nowMs - w[0] >= 60_000L);   // expired minute windows leave
+            }
+            if (!counters.containsKey(who) && counters.size() >= 4096) {
                 return 60L;   // hard bound: no new principal is admitted while 4096 are active inside one minute
             }
-        }
-        long[] state = counters.computeIfAbsent(principal == null ? "anonymous" : principal, k -> new long[] {nowMs, 0});
-        synchronized (state) {
+            long[] state = counters.computeIfAbsent(who, k -> new long[] {nowMs, 0});
             if (nowMs - state[0] >= 60_000L) {
                 state[0] = nowMs;
                 state[1] = 0;
