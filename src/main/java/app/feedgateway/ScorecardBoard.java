@@ -22,7 +22,7 @@ import org.apache.avro.util.Utf8;
 final class ScorecardBoard {
     static final int MAX_TRADE_DATES = 120;
     /** A hard row ceiling on top of the date bound: past it a NEW key is refused and counted (status CAP_REACHED). */
-    static final int MAX_ROWS = 200_000;
+    static final int MAX_ROWS = 50_000;
     static final String LABEL = "DESCRIPTIVE_UNVALIDATED";
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -52,12 +52,23 @@ final class ScorecardBoard {
             rows.putIfAbsent(t, new LinkedHashMap<>());
             undecodable.putIfAbsent(t, 0L);
         capRefused.putIfAbsent(t, 0L);
-            state.putIfAbsent(t, "TOPIC_MISSING");
+            state.putIfAbsent(t, "CONNECTING");
         }
     }
 
     synchronized void setState(String topic, String s) {
         state.put(topic, s);
+    }
+
+    synchronized void setAllStates(String s) {
+        state.replaceAll((t, old) -> s);
+    }
+
+    synchronized void resetAll(String s) {
+        for (String t : new java.util.ArrayList<>(rows.keySet())) {
+            reset(t);
+            state.put(t, s);
+        }
     }
 
     /** The topic's epoch is lost (it disappeared, was recreated, or its offsets moved): nothing it held may be shown as current. */
@@ -88,7 +99,11 @@ final class ScorecardBoard {
     /** The newest record of {@code key} replaces the older one. A record without a readable trade date is counted undecodable and never held. */
     synchronized void put(String topic, String key, GenericRecord r) {
         Map<String, ObjectNode> m = rows.get(topic);
-        if (m == null || key == null) {
+        if (m == null) {
+            return;
+        }
+        if (key == null) {
+            countUndecodable(topic);   // a scoreboard row always has a key
             return;
         }
         ObjectNode row = JSON.createObjectNode();
@@ -101,6 +116,9 @@ final class ScorecardBoard {
         } catch (DateTimeParseException e) {
             countUndecodable(topic);
             return;
+        }
+        while (total >= maxRows && !m.containsKey(key) && !dateCounts.isEmpty() && dateCounts.firstKey().compareTo(date) < 0) {
+            evictOldestDate();   // a newer trade date displaces the oldest one before anything is refused
         }
         if (total >= maxRows && !m.containsKey(key)) {
             capRefused.merge(topic, 1L, Long::sum);   // a hard bound: the new key is refused and the source says so, never silently truncated
@@ -121,14 +139,18 @@ final class ScorecardBoard {
 
     private void bound() {
         while (dateCounts.size() > MAX_TRADE_DATES) {
-            String oldest = dateCounts.firstKey();
-            for (Map<String, ObjectNode> m : rows.values()) {
-                int before = m.size();
-                m.values().removeIf(row -> row.path("tradeDate").asText().equals(oldest));
-                evicted += before - m.size();
-            }
-            total -= dateCounts.remove(oldest);
+            evictOldestDate();
         }
+    }
+
+    private void evictOldestDate() {
+        String oldest = dateCounts.firstKey();
+        for (Map<String, ObjectNode> m : rows.values()) {
+            int before = m.size();
+            m.values().removeIf(row -> row.path("tradeDate").asText().equals(oldest));
+            evicted += before - m.size();
+        }
+        total -= dateCounts.remove(oldest);
     }
 
     private static com.fasterxml.jackson.databind.JsonNode node(Object v) {
@@ -181,28 +203,40 @@ final class ScorecardBoard {
     }
 
     /** The response body. {@code fromTradeDate} (yyyy-MM-dd, inclusive) keeps the rows of that date and later; null keeps all held. */
-    synchronized String render(String fromTradeDate, boolean readerOff) {
+    String render(String fromTradeDate, boolean readerOff) {
+        List<ObjectNode> all = new ArrayList<>();
+        ObjectNode out = renderHead(all, readerOff);
+        return finish(out, all, fromTradeDate, readerOff);
+    }
+
+    private synchronized ObjectNode renderHead(List<ObjectNode> all, boolean readerOff) {
         ObjectNode out = JSON.createObjectNode();
         out.put("label", LABEL);
         ArrayNode topics = out.putArray("generatedFromTopics");
         ArrayNode sources = out.putArray("sources");
         List<String> problems = new ArrayList<>();
-        List<ObjectNode> all = new ArrayList<>();
         for (Map.Entry<String, Map<String, ObjectNode>> e : rows.entrySet()) {
             String topic = e.getKey();
             topics.add(topic);
             long bad = undecodable.getOrDefault(topic, 0L);
             int held = e.getValue().size();
-            String st = state.getOrDefault(topic, "TOPIC_MISSING");
+            String st = state.getOrDefault(topic, "CONNECTING");
             long capped = capRefused.getOrDefault(topic, 0L);
             String status;
             if (st.equals("TOPIC_MISSING")) {
                 status = "TOPIC_MISSING";
                 problems.add(topic + ": the scoreboard topic does not exist yet (the service has not rolled)");
+            } else if (st.equals("PARTITIONS_INVALID")) {
+                status = "PARTITIONS_INVALID";
+                problems.add(topic + ": the scoreboard topic must have exactly one partition; nothing is read from it");
             } else {
-                boolean loading = st.equals("LOADING");
-                if (loading) {
+                boolean transitional = !st.equals("LIVE");
+                if (st.equals("LOADING")) {
                     problems.add(topic + ": still reading the topic from the beginning");
+                } else if (st.equals("RECOVERING")) {
+                    problems.add(topic + ": the reader lost its Kafka connection; the rows shown may be stale until it has read the topic again");
+                } else if (st.equals("CONNECTING")) {
+                    problems.add(topic + ": the reader has not reached Kafka yet");
                 }
                 if (bad > 0) {
                     problems.add(topic + ": " + bad + " record(s) could not be decoded and are not shown");
@@ -212,8 +246,8 @@ final class ScorecardBoard {
                 }
                 if (capped > 0) {
                     status = "CAP_REACHED";
-                } else if (loading) {
-                    status = bad > 0 ? "LOADING_UNDECODABLE" : "LOADING";
+                } else if (transitional) {
+                    status = bad > 0 ? st + "_UNDECODABLE" : st;
                 } else if (bad > 0) {
                     status = "UNDECODABLE";
                 } else if (held == 0) {
@@ -231,13 +265,6 @@ final class ScorecardBoard {
             s.put("capRefused", capped);
             all.addAll(e.getValue().values());
         }
-        all.removeIf(r -> fromTradeDate != null && r.path("tradeDate").asText().compareTo(fromTradeDate) < 0);
-        all.sort(Comparator.<ObjectNode, String>comparing(r -> r.path("tradeDate").asText()).reversed()
-                .thenComparing(r -> r.path("identityDigest").asText())
-                .thenComparing(r -> r.path("family").asText())
-                .thenComparing(r -> r.path("classKey").asText())
-                .thenComparing(r -> r.path("stratum").asText())
-                .thenComparingInt(r -> r.path("horizonSeconds").asInt()));
         if (readerOff) {
             ObjectNode off = sources.addObject();
             off.put("topic", "scorecard-reader");
@@ -249,6 +276,18 @@ final class ScorecardBoard {
         } else if (!problems.isEmpty()) {
             out.put("message", String.join("; ", problems));
         }
+        return out;
+    }
+
+    /** Outside the lock: the row objects are never mutated after they are put, so the snapshot can be filtered, sorted and serialised while ingestion goes on. */
+    private static String finish(ObjectNode out, List<ObjectNode> all, String fromTradeDate, boolean readerOff) {
+        all.removeIf(r -> fromTradeDate != null && r.path("tradeDate").asText().compareTo(fromTradeDate) < 0);
+        all.sort(Comparator.<ObjectNode, String>comparing(r -> r.path("tradeDate").asText()).reversed()
+                .thenComparing(r -> r.path("identityDigest").asText())
+                .thenComparing(r -> r.path("family").asText())
+                .thenComparing(r -> r.path("classKey").asText())
+                .thenComparing(r -> r.path("stratum").asText())
+                .thenComparingInt(r -> r.path("horizonSeconds").asInt()));
         ArrayNode rowsOut = out.putArray("rows");
         all.forEach(rowsOut::add);
         return out.toString();

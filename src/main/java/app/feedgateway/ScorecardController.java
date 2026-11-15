@@ -65,9 +65,12 @@ public class ScorecardController {
         return b.header(HttpHeaders.CACHE_CONTROL, "no-store");
     }
 
-    private long tryAcquire(String principal, long nowMs) {
-        if (counters.size() > 1024) {
-            counters.values().removeIf(w -> nowMs - w[0] >= 60_000L);   // bounded: expired minute windows leave
+    long tryAcquire(String principal, long nowMs) {
+        if (counters.size() >= 1024) {
+            counters.values().removeIf(w -> nowMs - w[0] >= 60_000L);   // expired minute windows leave
+            if (counters.size() >= 4096 && !counters.containsKey(principal == null ? "anonymous" : principal)) {
+                return 60L;   // hard bound: no new principal is admitted while 4096 are active inside one minute
+            }
         }
         long[] state = counters.computeIfAbsent(principal == null ? "anonymous" : principal, k -> new long[] {nowMs, 0});
         synchronized (state) {

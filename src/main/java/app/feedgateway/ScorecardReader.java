@@ -111,10 +111,15 @@ class ScorecardReader {
                 d.configure(cfg, false);
                 decoder = d;
                 consumer = c;
+                // a new consumer life rebuilds every topic from its earliest offset: a topic deleted and recreated while Kafka was unreachable
+                // can have kept a valid-looking offset, so nothing read before is trusted (the rows come back within one read of the compacted topics)
+                resumeAt.clear();
+                board.resetAll("CONNECTING");
                 loop(c);
             } catch (WakeupException stopped) {
                 // stop() woke the poll
             } catch (RuntimeException unavailable) {
+                board.setAllStates("RECOVERING");   // the rows held are stale until the next life has read the topics again
                 System.out.println("WARN scorecard reader consumer failed, retrying in 5s: " + unavailable);
             } finally {
                 consumer = null;
@@ -143,7 +148,15 @@ class ScorecardReader {
                 boolean changed = false;
                 for (String t : topics) {
                     List<PartitionInfo> parts = existing.get(t);
-                    if (parts == null || parts.isEmpty()) {
+                    if (parts != null && parts.size() > 1) {
+                        if (assigned.remove(t)) {
+                            changed = true;
+                            fence.remove(t);
+                        }
+                        board.reset(t);
+                        resumeAt.keySet().removeIf(tp -> tp.topic().equals(t));
+                        board.setState(t, "PARTITIONS_INVALID");   // latest-per-key is only defined on one partition
+                    } else if (parts == null || parts.isEmpty()) {
                         if (assigned.remove(t)) {
                             changed = true;
                             fence.remove(t);

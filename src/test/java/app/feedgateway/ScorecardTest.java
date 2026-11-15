@@ -98,6 +98,8 @@ class ScorecardTest {
     @Test
     void aMissingTopicIsReportedNeverShownAsData() throws Exception {
         ScorecardReader r = reader(Map.of(), TOPIC);
+        assertEquals("CONNECTING", body(r, null).get("sources").get(0).get("status").asText(), "before the first look at the broker the topic is not called missing");
+        r.board().setState(TOPIC, "TOPIC_MISSING");
         JsonNode v = body(r, null);
         assertEquals("TOPIC_MISSING", v.get("sources").get(0).get("status").asText());
         assertEquals(TOPIC, v.get("sources").get(0).get("topic").asText());
@@ -310,5 +312,53 @@ class ScorecardTest {
         assertEquals("CAP_REACHED", v.get("sources").get(0).get("status").asText());
         assertEquals(1, v.get("sources").get(0).get("capRefused").asInt());
         assertEquals(9, v.get("rows").get(0).get("decided").asLong());
+    }
+
+    @Test
+    void recoveringPartitionsAndNullKeysAreStated() throws Exception {
+        Map<Integer, Object> m = new HashMap<>();
+        m.put(1, row("2026-11-09", "d", "LA_LEAN", "LEAN=QUIET", 300, 1, 1, 1.0));
+        ScorecardReader r = reader(m, TOPIC);
+        r.board().setState(TOPIC, "LIVE");
+        r.accept(TOPIC, "a", payload(1));
+        r.accept(TOPIC, null, payload(1));   // a scoreboard row always has a key
+        assertEquals("UNDECODABLE", body(r, null).get("sources").get(0).get("status").asText());
+        r.board().setAllStates("RECOVERING");
+        JsonNode v = body(r, null);
+        assertEquals("RECOVERING_UNDECODABLE", v.get("sources").get(0).get("status").asText());
+        assertTrue(v.get("message").asText().contains("may be stale"));
+        r.board().resetAll("CONNECTING");
+        assertEquals(0, r.board().rowCount());
+        r.board().reset(TOPIC);
+        r.board().setState(TOPIC, "PARTITIONS_INVALID");
+        v = body(r, null);
+        assertEquals("PARTITIONS_INVALID", v.get("sources").get(0).get("status").asText());
+        assertTrue(v.get("message").asText().contains("exactly one partition"));
+    }
+
+    @Test
+    void aNewerTradeDateDisplacesTheOldestAtTheRowBound() throws Exception {
+        ScorecardBoard b = new ScorecardBoard(2);
+        b.configure(java.util.List.of(TOPIC));
+        b.setState(TOPIC, "LIVE");
+        b.put(TOPIC, "a", row("2026-11-06", "d", "LA_LEAN", "LEAN=A", 300, 1, 1, 1.0));
+        b.put(TOPIC, "b", row("2026-11-09", "d", "LA_LEAN", "LEAN=B", 300, 1, 1, 1.0));
+        b.put(TOPIC, "c", row("2026-11-10", "d", "LA_LEAN", "LEAN=C", 300, 1, 1, 1.0));   // full: 11-06 leaves, 11-10 is kept
+        b.put(TOPIC, "d", row("2026-11-01", "d", "LA_LEAN", "LEAN=D", 300, 1, 1, 1.0));   // older than everything held: refused
+        JsonNode v = JSON.readTree(b.render(null, false));
+        assertEquals(2, v.get("rows").size());
+        assertEquals("2026-11-10", v.get("rows").get(0).get("tradeDate").asText());
+        assertEquals("CAP_REACHED", v.get("sources").get(0).get("status").asText());
+    }
+
+    @Test
+    void theLimiterAdmitsNoNewPrincipalPastItsHardBound() {
+        ScorecardController c = new ScorecardController(reader(Map.of()), OPEN);
+        for (int i = 0; i < 4096; i++) {
+            assertEquals(0L, c.tryAcquire("p" + i, 1L));
+        }
+        assertEquals(60L, c.tryAcquire("one-too-many", 2L));
+        assertEquals(0L, c.tryAcquire("p5", 2L), "a known principal keeps its budget");
+        assertEquals(0L, c.tryAcquire("one-too-many", 61_000L), "expired windows leave, so the newcomer is admitted a minute later");
     }
 }
