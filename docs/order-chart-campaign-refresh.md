@@ -11,3 +11,7 @@ Validation: the existing requirement-state generator accepts all current source 
 ## Refresh for the liq-AA relay changes (build 872)
 
 Build 872 (gateway source `1696106671acf0663cce54deec23a5bd76941c2e`) passed the full suite and reproduced the 50-mutation campaign (49 killed, the same one characterized survivor), then refused to emit because `FeedGatewayService.java` had moved (PRs 332 and 333, the targets relay). `ES-FOOTPRINT-CAMPAIGN.json` is replaced by the record captured by that run (`.jenkins-tmp/es4-tests-872/footprint-reverify.json`, 395,779 bytes, SHA-256 `d3baeac0394c304db8f56f09c946081f5bd9b5babad38d0152921fd1547ba359`). No code, spec, gate or outcome changes; `bash scripts/footprint-reqstate.sh --check` reports the campaign matches. The next Jenkins run repeats everything.
+
+## Refresh for the ES MBO relay (build 874)
+
+Build 874 (gateway source `2df1beca9d9198fadd5dcb3f0d21eb30feb5284f`, the EsMboRelay change) passed the full suite (1,422 tests in the contracts run, the gateway suite on the Linux ES4 host) and reproduced the 50-mutation campaign (49 killed, the same one characterized survivor; every outcome identical to the checked-in record), then refused to emit because `FeedGatewayService.java` had moved. `ES-FOOTPRINT-CAMPAIGN.json` is replaced by the record captured by that run (`.jenkins-tmp/es4-tests-874/footprint-reverify.json`, 395,779 bytes, SHA-256 `1885305f26ab4ca8a041831bae6ec61113cc18c4df6cc92ddb69d1afa8470cdd`). No code, spec, gate or outcome changes. The next Jenkins run repeats everything.
