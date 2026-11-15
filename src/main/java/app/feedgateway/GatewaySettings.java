@@ -286,6 +286,47 @@ public final class GatewaySettings {
         return boolValue("ES_LIQUIDITY_WALL_HISTORY_FROM_SESSION_OPEN", true);
     }
 
+    // ---- ES MBO liquidity engine relay (es-liquidity-engine-service; es.mbo.level-flow, es.mbo.health, es.mbo.liquidity-events) ----
+
+    /**
+     * Master switch of the ES MBO relay: the three topics below are tailed and the global events {@code es-mbo-frame}, {@code es-mbo-event},
+     * {@code es-mbo-status} and the connect replay {@code es-mbo-history} are sent. OFF by default (the topics exist on dev only); when off no thread,
+     * no consumer and nothing cached.
+     */
+    public boolean esMboRelayEnabled() {
+        return boolValue("ES_MBO_RELAY_ENABLED", false);
+    }
+
+    /** es.mbo.level-flow ({@code EsMboLevelFlow}, fixed schema id 3502): one record per 1-second bucket per price level, key {@code <side>|<tick>}. */
+    public String esMboLevelFlowTopic() {
+        return value("ES_MBO_LEVEL_FLOW_TOPIC", "es.mbo.level-flow");
+    }
+
+    /** es.mbo.health ({@code EsMboHealth}, fixed schema id 3509 version 2; the prior version's id is still accepted): one record per bucket, it CLOSES the bucket. */
+    public String esMboHealthTopic() {
+        return value("ES_MBO_HEALTH_TOPIC", "es.mbo.health");
+    }
+
+    /** es.mbo.liquidity-events ({@code EsMboEvent}, fixed schema id 3503): sparse event lifecycle records. */
+    public String esMboEventTopic() {
+        return value("ES_MBO_EVENT_TOPIC", "es.mbo.liquidity-events");
+    }
+
+    /** A frame (or event) whose bucket end is older than this is replay-only ({@code cached:true}), never broadcast as live. Default 5 s, as the wall relay. */
+    public long esMboFreshMs() {
+        return longValue("ES_MBO_FRESH_MS", 5_000L, 0L);
+    }
+
+    /** An event record is broadcast live only while its bucket end is within this window of now; an older one (the catch-up read) is ringed and replayed only. Default 30 s. */
+    public long esMboEventLiveMs() {
+        return longValue("ES_MBO_EVENT_LIVE_MS", 30_000L, 0L);
+    }
+
+    /** Upper bound of the connect replay {@code es-mbo-history} in bytes: the oldest frames are dropped until it fits. Default 3 MB. */
+    public int esMboHistoryMaxBytes() {
+        return intValue("ES_MBO_HISTORY_MAX_BYTES", 3_000_000, 4_096);
+    }
+
     // ---- in-service outcomes (liq-V design section 10): the compacted scoreboard topics, read-only projection at /api/scorecard ----
 
     /**
