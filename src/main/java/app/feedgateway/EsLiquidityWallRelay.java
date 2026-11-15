@@ -60,6 +60,10 @@ final class EsLiquidityWallRelay {
     static final String HEATMAP_EVENT = "es-liquidity-heatmap";
     static final String WALL_EVENT = "es-liquidity-wall";
     static final String VOICE_EVENT = "es-liquidity-voice";
+    /** liq-AA liquidity targets: the displayed blocks above and below the spot, one frame per contract, the newest replaces a queued one. */
+    static final String TARGETS_EVENT = "es-liquidity-targets";
+    /** How often a missing targets topic is looked for again. */
+    static final long TARGETS_TOPIC_RETRY_MS = 30_000L;
     /** A frame more than this far ahead of the gateway clock is not fresh (clock skew), as the depth relay rules. */
     static final long FUTURE_SKEW_MS = 5_000L;
 
@@ -76,15 +80,17 @@ final class EsLiquidityWallRelay {
     private final BiConsumer<String, String> sink;
     private final EsLiquidityWallHistory history = new EsLiquidityWallHistory();
     private final AtomicBoolean running = new AtomicBoolean();
-    private final Lane dashboardLane = new Lane(), eventsLane = new Lane(), voiceLane = new Lane(), bucketsLane = new Lane();
+    private final Lane dashboardLane = new Lane(), eventsLane = new Lane(), voiceLane = new Lane(), bucketsLane = new Lane(), targetsLane = new Lane();
     private final AtomicLong drops = new AtomicLong();
     private final AtomicLong undecodable = new AtomicLong();
     private final AtomicLong staleFrames = new AtomicLong();
     private final AtomicLong staleEvents = new AtomicLong();
+    private final AtomicLong staleTargets = new AtomicLong();
     private final AtomicLong consumerFailures = new AtomicLong();
     private final ArrayDeque<Cached> wallRing = new ArrayDeque<>();
     private Cached dashboard;
     private Cached voice;
+    private Cached targets;
     /** The registry decoder of the current consumer life (set before the first poll), or the test seam's. */
     private volatile Deserializer<Object> decoder;
     private volatile KafkaConsumer<String, byte[]> consumer;
@@ -129,6 +135,7 @@ final class EsLiquidityWallRelay {
         while (running.get()) {
             String dashboardTopic = settings.esLiquidityWallDashboardTopic(), eventsTopic = settings.esLiquidityWallEventsTopic();
             String voiceTopic = settings.esLiquidityWallVoiceTopic(), bucketsTopic = settings.esLiquidityWallBucketsTopic();
+            String targetsTopic = settings.esLiquidityTargetsTopic();
             Properties p = new Properties();
             p.put("bootstrap.servers", settings.bootstrapServers());
             p.put("client.id", "es-liquidity-wall-relay");
@@ -149,14 +156,19 @@ final class EsLiquidityWallRelay {
             decoderConfig.put("http.read.timeout.ms", 1000);
             decoderConfig.put("max.schemas.per.subject", 64);
             decoderConfig.put(GatewayAvroDeserializer.SPX_PRICE_TOPIC, settings.underlyingSpxPriceTopic());
-            decoderConfig.put(GatewayAvroDeserializer.TOLERANT_TOPICS, dashboardTopic + "," + eventsTopic + "," + voiceTopic + "," + bucketsTopic);
+            decoderConfig.put(GatewayAvroDeserializer.TOLERANT_TOPICS, dashboardTopic + "," + eventsTopic + "," + voiceTopic + "," + bucketsTopic + "," + targetsTopic);
             try (var c = new KafkaConsumer<String, byte[]>(p); GatewayAvroDeserializer d = new GatewayAvroDeserializer()) {
                 d.configure(decoderConfig, false);
                 decoder = d;
                 consumer = c;
                 TopicPartition dashboardPartition = partitionZero(c, dashboardTopic), eventsPartition = partitionZero(c, eventsTopic);
                 TopicPartition voicePartition = partitionZero(c, voiceTopic), bucketsPartition = partitionZero(c, bucketsTopic);
-                List<TopicPartition> partitions = List.of(dashboardPartition, eventsPartition, voicePartition, bucketsPartition);
+                List<TopicPartition> partitions = new java.util.ArrayList<>(List.of(dashboardPartition, eventsPartition, voicePartition, bucketsPartition));
+                TopicPartition targetsPartition = optionalPartitionZero(c, targetsTopic);   // liq-AA: absent until the deploy creates it; never stops the other lanes
+                if (targetsPartition != null) {
+                    partitions.add(targetsPartition);
+                }
+                long nextTargetsLook = System.currentTimeMillis() + TARGETS_TOPIC_RETRY_MS;
                 c.assign(partitions);
                 for (TopicPartition tp : partitions) {
                     Long resume = resumeAt.get(tp);
@@ -172,6 +184,9 @@ final class EsLiquidityWallRelay {
                     }
                 }
                 while (running.get()) {
+                    if (targetsPartition == null && System.currentTimeMillis() >= nextTargetsLook) {
+                        break;   // look again for the topic: the loop rebuilds the consumer, resuming each lane at its next unread offset
+                    }
                     for (var record : c.poll(Duration.ofMillis(250))) {
                         accept(record.topic(), record.key(), record.value(), System.currentTimeMillis());
                         resumeAt.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
@@ -195,6 +210,23 @@ final class EsLiquidityWallRelay {
                 }
             }
         }
+    }
+
+    /** The optional lane's partition, or null when the topic does not exist (a topic with several partitions is refused loud like the others). */
+    private static TopicPartition optionalPartitionZero(Consumer<String, byte[]> c, String topic) {
+        List<PartitionInfo> partitions;
+        try {
+            partitions = c.partitionsFor(topic, Duration.ofSeconds(10));
+        } catch (org.apache.kafka.common.errors.TimeoutException | org.apache.kafka.common.errors.AuthorizationException absent) {
+            return null;
+        }
+        if (partitions == null || partitions.isEmpty()) {
+            return null;
+        }
+        if (partitions.size() != 1) {
+            throw new IllegalStateException(topic + " must have exactly one partition, found " + partitions.size());
+        }
+        return new TopicPartition(topic, 0);
     }
 
     /** Section 8: one partition each. A topic with another count is refused loud (retried every 2 s) rather than read in part. */
@@ -259,11 +291,14 @@ final class EsLiquidityWallRelay {
         if (topic.equals(settings.esLiquidityWallBucketsTopic())) {
             return LiquidityWallSchemas.BUCKET;
         }
+        if (topic.equals(settings.esLiquidityTargetsTopic())) {
+            return LiquidityWallSchemas.TARGETS;
+        }
         return null;
     }
 
     private Lane lane(LiquidityWallSchemas.Subject subject) {
-        return subject == LiquidityWallSchemas.DASHBOARD ? dashboardLane : subject == LiquidityWallSchemas.EVENT ? eventsLane : subject == LiquidityWallSchemas.VOICE ? voiceLane : bucketsLane;
+        return subject == LiquidityWallSchemas.DASHBOARD ? dashboardLane : subject == LiquidityWallSchemas.EVENT ? eventsLane : subject == LiquidityWallSchemas.VOICE ? voiceLane : subject == LiquidityWallSchemas.TARGETS ? targetsLane : bucketsLane;
     }
 
     /**
@@ -331,6 +366,20 @@ final class EsLiquidityWallRelay {
                 return;
             }
             sink.accept(WALL_EVENT, EsLiquidityWallJson.withCached(json, false));
+        } else if (subject == LiquidityWallSchemas.TARGETS) {
+            String json = EsLiquidityWallJson.targets(key, decoded);
+            if (json == null) {
+                drops.incrementAndGet();
+                return;
+            }
+            long bucketEnd = (Long) ((GenericRecord) decoded).get("bucketEnd");
+            lane.accepted.incrementAndGet();
+            if (!fresh(bucketEnd, now, settings.esLiquidityWallFreshMs())) {
+                staleTargets.incrementAndGet();   // never shown as live: the page must not show targets of a stopped service
+                return;
+            }
+            targets = new Cached(json, bucketEnd);
+            sink.accept(TARGETS_EVENT, EsLiquidityWallJson.withCached(json, false));
         } else if (subject == LiquidityWallSchemas.VOICE) {
             String json = EsLiquidityWallJson.voice(key, decoded);
             if (json == null) {
@@ -372,6 +421,10 @@ final class EsLiquidityWallRelay {
         if (d != null && fresh(d.bucketEnd(), now, settings.esLiquidityWallFreshMs())) {
             send.accept(HEATMAP_EVENT, EsLiquidityWallJson.withCached(d.json(), true));
         }
+        Cached t = targets;
+        if (t != null && fresh(t.bucketEnd(), now, settings.esLiquidityWallFreshMs())) {
+            send.accept(TARGETS_EVENT, EsLiquidityWallJson.withCached(t.json(), true));
+        }
         long window = settings.esLiquidityWallEventReplayMs();
         for (Cached e : wallRing) {
             if (fresh(e.bucketEnd(), now, window)) {   // two-sided: neither older than the window nor ahead of the clock beyond the skew allowance
@@ -389,8 +442,8 @@ final class EsLiquidityWallRelay {
         StringBuilder sb = new StringBuilder();
         sb.append("# HELP ").append(p).append("enabled Whether the ES liquidity-wall relay is enabled.\n# TYPE ").append(p).append("enabled gauge\n").append(p).append("enabled ")
                 .append(settings.esLiquidityWallRelayEnabled() ? 1 : 0).append('\n');
-        String[] names = {"dashboard", "events", "voice", "buckets"};
-        Lane[] lanes = {dashboardLane, eventsLane, voiceLane, bucketsLane};
+        String[] names = {"dashboard", "events", "voice", "buckets", "targets"};
+        Lane[] lanes = {dashboardLane, eventsLane, voiceLane, bucketsLane, targetsLane};
         for (int i = 0; i < names.length; i++) {
             sb.append("# HELP ").append(p).append(names[i]).append("_accepted_total ").append(names[i]).append(" records that passed the gateway boundary.\n# TYPE ").append(p).append(names[i])
                     .append("_accepted_total counter\n").append(p).append(names[i]).append("_accepted_total ").append(lanes[i].accepted.get()).append('\n');
@@ -400,6 +453,8 @@ final class EsLiquidityWallRelay {
         }
         sb.append("# HELP ").append(p).append("stale_frames_total Dashboard records folded but not broadcast because their bucket end was outside the freshness bound.\n# TYPE ").append(p)
                 .append("stale_frames_total counter\n").append(p).append("stale_frames_total ").append(staleFrames.get()).append('\n');
+        sb.append("# HELP ").append(p).append("stale_targets_total Targets records not broadcast because their bucket end was outside the freshness bound.\n# TYPE ").append(p)
+                .append("stale_targets_total counter\n").append(p).append("stale_targets_total ").append(staleTargets.get()).append('\n');
         sb.append("# HELP ").append(p).append("stale_events_total Event records folded and ringed but not broadcast because their bucket end was outside the replay window (the boot catch-up).\n# TYPE ").append(p)
                 .append("stale_events_total counter\n").append(p).append("stale_events_total ").append(staleEvents.get()).append('\n');
         sb.append("# HELP ").append(p).append("drops_total Records refused at the gateway boundary (foreign topic, tombstone, wrong record, key, version, oversize).\n# TYPE ").append(p)
@@ -419,6 +474,10 @@ final class EsLiquidityWallRelay {
 
     long staleFramesForTest() {
         return staleFrames.get();
+    }
+
+    long staleTargetsForTest() {
+        return staleTargets.get();
     }
 
     long staleEventsForTest() {

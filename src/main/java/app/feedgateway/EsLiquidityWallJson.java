@@ -24,6 +24,8 @@ final class EsLiquidityWallJson {
     /** A band of a few hundred ticks per side; a dashboard listing more levels than this is refused. */
     static final int MAX_LEVELS = 4096;
     static final String FLIP = "FLIP";
+    /** At most 3 per side by the service's own rule; the gateway refuses a record listing more than this many, whatever the setting. */
+    static final int MAX_TARGETS = 64;
     /** The dashboard has two versions (ids 3403 and 3408, contracts 0.84.0): a version 1 record is still on the compacted topic until the wall service writes its next one. */
     static final Set<Integer> DASHBOARD_VERSIONS = Set.of(1, 2);
     /** The event, voice and bucket records have one version. */
@@ -40,6 +42,18 @@ final class EsLiquidityWallJson {
         }
         Object levels = r.get("levels");
         if (!(levels instanceof List<?> rows) || rows.size() > MAX_LEVELS) {
+            return null;
+        }
+        return render(r);
+    }
+
+    /** The targets view (liq-AA), or null when the record is refused. The key is {@code CME|<contract>}. */
+    static String targets(String key, Object value) {
+        GenericRecord r = record(LiquidityWallSchemas.TARGETS, value, ONLY_VERSION_1);
+        if (r == null || !dashboardKey(r).equals(key)) {
+            return null;
+        }
+        if (!(r.get("targets") instanceof List<?> rows) || rows.size() > MAX_TARGETS || text(r.get("state")).isBlank()) {
             return null;
         }
         return render(r);

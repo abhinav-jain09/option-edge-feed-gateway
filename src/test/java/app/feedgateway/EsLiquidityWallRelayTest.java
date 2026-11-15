@@ -378,4 +378,65 @@ class EsLiquidityWallRelayTest {
         assertTrue(relay.metrics().contains("gateway_es_liquidity_wall_enabled 0\n"));
         relay.stop();
     }
+
+    // ---------------------------------------------------------------- liq-AA liquidity targets (id 3411)
+
+    private static final String TARGETS = SETTINGS.esLiquidityTargetsTopic();
+
+    private static GenericRecord target(String side, long tick, long distance, long size, long multiple, String status, boolean live) {
+        org.apache.avro.Schema t = LiquidityWallSchemas.TARGETS.schema().getField("targets").schema().getElementType();
+        return new org.apache.avro.generic.GenericRecordBuilder(t).set("targetId", side + "|" + tick + "|" + NOW).set("side", side).set("tick", tick).set("distanceTicks", distance)
+                .set("size", size).set("multipleThousandths", multiple).set("firstShownBucketEnd", NOW).set("status", status).set("reachedAfterMs", null).set("pastTicks", 0L)
+                .set("resolvedAtBucketEnd", null).set("live", live).build();
+    }
+
+    private static GenericRecord targets(long bucketEnd, String state, List<GenericRecord> list) {
+        return new org.apache.avro.generic.GenericRecordBuilder(LiquidityWallSchemas.TARGETS.schema())
+                .set("schemaVersion", 1).set("depthEnvironment", EsLiquidityWallFixtures.ENV).set("contract", EsLiquidityWallFixtures.CONTRACT)
+                .set("configFingerprint", EsLiquidityWallFixtures.FINGERPRINT).set("bucketEnd", bucketEnd).set("quality", "LIVE").set("state", state)
+                .set("sessionDate", "2026-11-13").set("spotTick", 30449L).set("thresholdThousandths", 3000).set("maxPerSide", 3).set("reachTicksWanted", 200)
+                .set("typicalAbove", 31L).set("typicalBelow", 30L).set("reachAboveTicks", 200L).set("reachBelowTicks", 200L)
+                .set("nearContractsAbove", 230L).set("nearContractsBelow", 250L).set("nearPrices", 8).set("targets", list).set("label", "DISPLAY_NOT_A_FINDING").build();
+    }
+
+    @Test
+    void theTargetsRecordIsCheckedForId3411RelayedAsItsEventAndReplayedToAConnectingSocket() throws Exception {
+        Sink sink = new Sink();
+        EsLiquidityWallRelay relay = wire.relay(sink);
+        byte[] bytes = wire.bytes(targets(NOW, "READY", List.of(target("ABOVE", 30487L, 35L, 136L, 4400L, "WAITING", true), target("ABOVE", 30583L, 103L, 145L, 4700L, "WAITING", true))));
+        assertEquals(3411, LiquidityWallSchemas.assertFramedAs(bytes, LiquidityWallSchemas.TARGETS));
+        relay.accept(TARGETS, KEY, bytes, NOW + 500);
+        assertEquals(List.of("es-liquidity-targets"), sink.events());
+        JsonNode j = sink.json(0);
+        assertEquals("READY", j.get("state").asText());
+        assertEquals(2, j.get("targets").size());
+        assertEquals(136L, j.get("targets").get(0).get("size").longValue());
+        assertEquals(4700L, j.get("targets").get(1).get("multipleThousandths").longValue());
+        assertTrue(j.get("targets").get(0).get("reachedAfterMs").isNull());
+        for (org.apache.avro.Schema.Field f : LiquidityWallSchemas.TARGETS.schema().getField("targets").schema().getElementType().getFields()) {
+            assertTrue(j.get("targets").get(0).has(f.name()), "every target field reaches the page by name: " + f.name());
+        }
+        assertFalse(j.get("cached").booleanValue());
+        assertTrue(FeedGatewayService.isGlobalBroadcastEvent("es-liquidity-targets"));
+        List<String> replayed = new ArrayList<>();
+        relay.replay((e, json) -> replayed.add(e), NOW + 1000);
+        assertEquals(List.of("es-liquidity-targets"), replayed);
+        replayed.clear();
+        relay.replay((e, json) -> replayed.add(e), NOW + 10 * 60_000L);
+        assertTrue(replayed.isEmpty(), "targets of a stopped service are never replayed as current");
+    }
+
+    @Test
+    void aTargetsFrameWithAnotherIdWrongKeyOrStaleBucketIsRefusedAndNeverRelayed() throws Exception {
+        Sink sink = new Sink();
+        EsLiquidityWallRelay relay = wire.relay(sink);
+        relay.accept(TARGETS, KEY, wire.bytes(EsLiquidityWallFixtures.dashboard(NOW)), NOW);   // 3408 on the targets topic
+        assertEquals(1, relay.schemaIdRefusedForTest(LiquidityWallSchemas.TARGETS));
+        assertEquals(0, wire.decodes.get());
+        relay.accept(TARGETS, "CME|OTHER", wire.bytes(targets(NOW, "READY", List.of())), NOW);
+        assertEquals(1, relay.dropsForTest());
+        relay.accept(TARGETS, KEY, wire.bytes(targets(NOW - 10 * 60_000L, "READY", List.of())), NOW);
+        assertEquals(1, relay.staleTargetsForTest());
+        assertTrue(sink.frames.isEmpty());
+    }
 }
