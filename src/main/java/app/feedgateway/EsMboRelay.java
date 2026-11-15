@@ -88,7 +88,7 @@ final class EsMboRelay {
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicLong levelFlowRefused = new AtomicLong(), healthRefused = new AtomicLong(), eventRefused = new AtomicLong();
     private final AtomicLong undecodable = new AtomicLong(), drops = new AtomicLong(), consumerFailures = new AtomicLong();
-    private final AtomicLong otherContract = new AtomicLong(), eventsOutsideWindow = new AtomicLong();
+    private final AtomicLong otherContract = new AtomicLong(), eventsOutsideWindow = new AtomicLong(), eventsFuture = new AtomicLong();
     private final AtomicLong duplicateEvents = new AtomicLong();
     private final AtomicLong framesSeen = new AtomicLong(), eventsSeen = new AtomicLong(), lateRows = new AtomicLong(), rowsDropped = new AtomicLong();
     /**
@@ -106,6 +106,7 @@ final class EsMboRelay {
     static final long LEDGER_PRUNE_EVERY_MS = 60_000L;
     /** Wall-clock instant the level-flow lane was last seen caught up (position at its end offset) continuously, or null while it is behind. */
     private Long levelFlowCaughtUpSince;
+    private boolean levelFlowAbsent;
     private final ArrayDeque<Frame> frames = new ArrayDeque<>();
     private final LinkedHashMap<String, Event> events = new LinkedHashMap<>();
     private long levelFlowWatermark, lastFrameBucketEnd, lastEventBucketEnd;
@@ -204,7 +205,8 @@ final class EsMboRelay {
                 }
                 long nextLook = System.currentTimeMillis() + TOPIC_RETRY_MS;
                 TopicPartition flowPartition = partitions.stream().filter(tp -> tp.topic().equals(topics[0])).findFirst().orElse(null);
-                levelFlowCaughtUp(flowPartition == null, System.currentTimeMillis());
+                levelFlowLaneAbsent(flowPartition == null);
+                levelFlowCaughtUp(false, System.currentTimeMillis());
                 c.assign(partitions);
                 long now = System.currentTimeMillis();
                 for (TopicPartition tp : partitions) {
@@ -223,8 +225,8 @@ final class EsMboRelay {
                         accept(record.topic(), record.key(), record.value(), System.currentTimeMillis());
                         resumeAt.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
                     }
-                    // the deterministic barrier: is the level-flow lane at its end offset NOW (after this poll's records were accepted)? A missing lane has nothing pending.
-                    boolean caughtUp = flowPartition == null || c.position(flowPartition) >= c.endOffsets(List.of(flowPartition)).get(flowPartition);
+                    // the deterministic barrier: is the level-flow lane at its end offset NOW (after this poll's records were accepted)? A MISSING lane is NOT caught up: rows may still arrive.
+                    boolean caughtUp = flowPartition != null && laneCaughtUp(true, c.position(flowPartition), c.endOffsets(List.of(flowPartition)).get(flowPartition));
                     levelFlowCaughtUp(caughtUp, System.currentTimeMillis());
                 }
             } catch (WakeupException stopped) {
@@ -344,10 +346,21 @@ final class EsMboRelay {
         if (contract.equals(current)) {
             return;
         }
+        String previous = current;
         boolean firstAndMatchesRows = current == null && contract.equals(provisional);   // rows read before the first health are this contract's: keep them
         current = contract;
         provisional = null;
         if (!firstAndMatchesRows) {
+            long lost = 0;
+            for (List<EsMboJson.Row> rows : open.values()) {
+                lost += rows.size();
+            }
+            if (previous == null) {
+                otherContract.addAndGet(lost);   // rows read before the first health that belong to another contract: counted, not silent
+            } else {
+                rowsDropped.addAndGet(lost);
+            }
+            drops.addAndGet(pending.size());
             open.clear();
             pending.clear();
             levelFlowWatermark = 0;
@@ -358,6 +371,16 @@ final class EsMboRelay {
         lastFrameBucketEnd = 0;
         lastEpochStatus = null;
         events.values().removeIf(e -> !e.contract().equals(contract));
+    }
+
+    /** The level-flow lane is caught up only if it EXISTS and its position has reached its end offset: an absent lane may still receive rows. */
+    static boolean laneCaughtUp(boolean exists, long position, long endOffset) {
+        return exists && position >= endOffset;
+    }
+
+    /** The consumer loop reports whether the level-flow topic exists; while it does not, health is held and nothing is emitted. */
+    synchronized void levelFlowLaneAbsent(boolean absent) {
+        levelFlowAbsent = absent;
     }
 
     /** Called by the consumer loop after each poll: the level-flow lane is (or is not) at its end offset. A seam for tests with an injected clock. */
@@ -456,6 +479,10 @@ final class EsMboRelay {
         return current;
     }
 
+    long eventsFutureForTest() {
+        return eventsFuture.get();
+    }
+
     long otherContractForTest() {
         return otherContract.get();
     }
@@ -475,6 +502,10 @@ final class EsMboRelay {
         }
         if (bucketEnd < now - EVENTS_LOOKBACK_MS) {
             eventsOutsideWindow.incrementAndGet();   // outside the window the ledger covers: never accepted, so a pruned ledger entry can never let it in
+            return;
+        }
+        if (bucketEnd > now + EsLiquidityWallRelay.FUTURE_SKEW_MS) {
+            eventsFuture.incrementAndGet();   // ahead of the clock beyond the skew allowance: never ledgered or ringed, so it can neither grow them nor outlive the window
             return;
         }
         pruneLedger(now);
@@ -504,7 +535,7 @@ final class EsMboRelay {
 
     /** The heartbeat body, so the page can say "engine not publishing" honestly. */
     synchronized String statusJson() {
-        return "{\"enabled\":true,\"contract\":" + (current == null ? "null" : EsMboJson.quote(current)) + ",\"lastFrameBucketEnd\":" + (anyFrame ? lastFrameBucketEnd : null) + ",\"lastEventBucketEnd\":" + (anyEvent ? lastEventBucketEnd : null)
+        return "{\"enabled\":true,\"contract\":" + (current == null ? "null" : EsMboJson.quote(current)) + ",\"levelFlowLane\":\"" + (levelFlowAbsent ? "absent" : "present") + "\",\"lastFrameBucketEnd\":" + (anyFrame ? lastFrameBucketEnd : null) + ",\"lastEventBucketEnd\":" + (anyEvent ? lastEventBucketEnd : null)
                 + ",\"epochStatus\":" + (lastEpochStatus == null ? "null" : EsMboJson.quote(lastEpochStatus)) + ",\"framesSeen\":" + framesSeen.get() + ",\"eventsSeen\":" + eventsSeen.get()
                 + ",\"schemaIdRefused\":" + (levelFlowRefused.get() + healthRefused.get() + eventRefused.get()) + ",\"undecodable\":" + undecodable.get()
                 + ",\"consumerFailures\":" + consumerFailures.get() + "}";
@@ -566,6 +597,7 @@ final class EsMboRelay {
         counter(sb, p + "duplicate_events_total", "Event records ignored because their revision was not newer than the stored one.", duplicateEvents.get());
         counter(sb, p + "other_contract_total", "Rows and events of a contract other than the one served (the newest health record's).", otherContract.get());
         counter(sb, p + "events_outside_window_total", "Event records whose bucket end is older than the events read window.", eventsOutsideWindow.get());
+        counter(sb, p + "events_future_total", "Event records whose bucket end is ahead of the clock by more than the skew allowance.", eventsFuture.get());
         counter(sb, p + "late_rows_total", "Level-flow rows for a bucket already closed.", lateRows.get());
         counter(sb, p + "rows_dropped_total", "Level-flow rows dropped by the buffer bounds.", rowsDropped.get());
         counter(sb, p + "consumer_failures_total", "Consumer loop failures (each followed by a 2 s retry).", consumerFailures.get());

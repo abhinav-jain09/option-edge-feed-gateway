@@ -534,6 +534,56 @@ class EsMboRelayTest {
     }
 
     @Test
+    void aMissingLevelFlowTopicHoldsTheHealthAndSaysSoUntilItsRowsArrive() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        assertFalse(EsMboRelay.laneCaughtUp(false, 0, 0), "an absent lane is NOT caught up, even with position == end == 0");
+        assertTrue(EsMboRelay.laneCaughtUp(true, 7, 7));
+        assertFalse(EsMboRelay.laneCaughtUp(true, 6, 7));
+        relay.levelFlowLaneAbsent(true);
+        relay.levelFlowCaughtUp(false, NOW);   // what the consumer loop reports for an absent lane
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW, "LIVE", MID, MID + 1)), NOW);
+        relay.tick(NOW + 5_000L);
+        assertEquals(0, sink.of("es-mbo-frame").size(), "the lane does not exist: nothing closes, not even empty");
+        assertEquals(0, relay.framesHeldForTest());
+        assertEquals("absent", JSON.readTree(relay.statusJson()).get("levelFlowLane").asText());
+        relay.levelFlowLaneAbsent(false);   // the topic appears
+        relay.levelFlowCaughtUp(false, NOW + 5_100L);
+        relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 40, 0, 0, 1)), NOW + 5_200L);
+        assertEquals(1, relay.framesHeldForTest());
+        assertEquals("present", JSON.readTree(relay.statusJson()).get("levelFlowLane").asText());
+        assertEquals(0, relay.lateRowsForTest());
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW + 1000, "LIVE", MID, MID + 1)), NOW + 5_300L);   // and the history carries the row
+        assertTrue(relay.historyJson().contains("[\"B\",30000,40,0,0,1]"));
+    }
+
+    @Test
+    void rowsOfAnotherContractDiscardedAtTheFirstHealthAreCounted() throws Exception {
+        EsMboRelay relay = relay(new Sink());
+        relay.accept(FLOW, "B|30000", bytes(row("ESH7", NOW, "B", MID, 40, 0, 0, 1)), NOW);
+        relay.accept(FLOW, "B|30001", bytes(row("ESH7", NOW, "B", MID + 1, 40, 0, 0, 1)), NOW);
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health("ESZ6", NOW, "LIVE", MID, MID + 1)), NOW);
+        assertEquals(2, relay.otherContractForTest(), "two provisional rows thrown away, both counted");
+        assertEquals(0, relay.openBucketsForTest());
+    }
+
+    @Test
+    void aFutureDatedEventIsNeverLedgeredOrRinged() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        long future = NOW + 365L * 86_400_000L;
+        for (int i = 0; i < 30; i++) {
+            relay.accept(EVENTS, "F" + i, bytes(event("F" + i, 1, future, "VACUUM_ABOVE", null, null)), NOW);
+        }
+        assertEquals(0, relay.ledgerSizeForTest());
+        assertEquals(0, relay.eventsHeldForTest());
+        assertEquals(0, sink.of("es-mbo-event").size());
+        assertEquals(30, relay.eventsFutureForTest());
+        relay.accept(EVENTS, "OK", bytes(event("OK", 1, NOW + 4_000L, "VACUUM_ABOVE", null, null)), NOW);   // inside the 5 s skew
+        assertEquals(1, relay.ledgerSizeForTest());
+    }
+
+    @Test
     void aDisabledRelayConsumesNothing() {
         EsMboRelay relay = new EsMboRelay(new GatewaySettings(), new Sink(), null);
         assertFalse(SETTINGS.esMboRelayEnabled(), "the flag defaults OFF");
