@@ -28,8 +28,13 @@ import org.springframework.stereotype.Component;
  */
 @Component
 class ScorecardReader {
-    /** Fixed registry id of LevelAbsorptionScoreboard (liq-V design section 6). A frame with another id is not a scoreboard row. */
+    /** Fixed registry id of LevelAbsorptionScoreboard (liq-V design section 6). */
     static final int SCOREBOARD_ID = 2814;
+    /** The fixed scoreboard schema id of each family's topic (liq-V design section 6): a frame carrying another id is not a scoreboard row of that topic. */
+    static final Map<String, Integer> ALLOWED_ID = Map.of(
+            "futures.level-absorption.scoreboard", SCOREBOARD_ID,
+            "futures.liquidity-wall.scoreboard", 3410,
+            "futures.line-health.scoreboard", 3712);
 
     private final GatewaySettings settings;
     private final List<String> topics;
@@ -142,6 +147,7 @@ class ScorecardReader {
                         if (assigned.remove(t)) {
                             changed = true;
                             fence.remove(t);
+                            board.reset(t);   // its old rows are not current data any more
                             resumeAt.keySet().removeIf(tp -> tp.topic().equals(t));   // a recreated topic starts again from its beginning
                         }
                         board.setState(t, "TOPIC_MISSING");
@@ -180,7 +186,19 @@ class ScorecardReader {
                 }
                 continue;
             }
-            for (var record : c.poll(Duration.ofMillis(250))) {
+            org.apache.kafka.clients.consumer.ConsumerRecords<String, byte[]> polled;
+            try {
+                polled = c.poll(Duration.ofMillis(250));
+            } catch (org.apache.kafka.clients.consumer.OffsetOutOfRangeException moved) {
+                // the retained log no longer holds our position: forget it and rebuild the topic from its earliest offset (the consumer is recreated by run())
+                for (TopicPartition tp : moved.partitions()) {
+                    resumeAt.keySet().removeIf(x -> x.topic().equals(tp.topic()));
+                    board.reset(tp.topic());
+                    board.setState(tp.topic(), "LOADING");
+                }
+                throw moved;
+            }
+            for (var record : polled) {
                 accept(record.topic(), record.key(), record.value());
                 resumeAt.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
             }
@@ -204,7 +222,7 @@ class ScorecardReader {
             board.remove(topic, key);
             return;
         }
-        if (value.length < 5 || value[0] != 0 || ByteBuffer.wrap(value, 1, 4).getInt() != SCOREBOARD_ID) {
+        if (value.length < 5 || value[0] != 0 || ByteBuffer.wrap(value, 1, 4).getInt() != ALLOWED_ID.getOrDefault(topic, -1)) {
             board.countUndecodable(topic);
             return;
         }

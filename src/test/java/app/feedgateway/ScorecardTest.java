@@ -91,7 +91,7 @@ class ScorecardTest {
         JsonNode v = body(r, null);
         assertEquals("DESCRIPTIVE_UNVALIDATED", v.get("label").asText());
         assertEquals(0, v.get("rows").size());
-        assertEquals(0, v.get("sources").size());
+        assertEquals("NOT_CONFIGURED", v.get("sources").get(0).get("status").asText());
         assertTrue(v.get("message").asText().contains("not configured"));
     }
 
@@ -248,5 +248,67 @@ class ScorecardTest {
         System.setProperty("KAFKA_SCORECARD_SCOREBOARD_TOPICS", " a.b , c.d,a.b,, ");
         assertEquals(java.util.List.of("a.b", "c.d"), new GatewaySettings().scorecardScoreboardTopics());
         assertTrue(new GatewaySettings().scorecardTopicRetryMs() >= 5_000L);
+    }
+
+    @Test
+    void eachFamilyTopicAcceptsOnlyItsOwnFixedSchemaId() throws Exception {
+        String wall = "futures.liquidity-wall.scoreboard", lh = "futures.line-health.scoreboard";
+        Map<Integer, Object> m = new HashMap<>();
+        m.put(1, row("2026-11-09", "w", "WALL_DEFENDED", "WALL=DEFENDED", 300, 1, 1, 1.0));
+        m.put(2, row("2026-11-09", "h", "LH_TOUCH", "GAUGE=HIGH", 300, 1, 1, 1.0));
+        ScorecardReader r = reader(m, TOPIC, wall, lh);
+        for (String t : new String[] {TOPIC, wall, lh}) {
+            r.board().setState(t, "LIVE");
+        }
+        r.accept(wall, "a", ByteBuffer.allocate(9).put((byte) 0).putInt(3410).putInt(1).array());
+        r.accept(lh, "b", ByteBuffer.allocate(9).put((byte) 0).putInt(3712).putInt(2).array());
+        r.accept(wall, "c", ByteBuffer.allocate(9).put((byte) 0).putInt(2814).putInt(1).array());   // the Level Absorption id on the wall topic
+        JsonNode v = body(r, null);
+        assertEquals(2, v.get("rows").size());
+        assertEquals(1, v.get("sources").get(1).get("undecodable").asInt());
+        assertEquals("UNDECODABLE", v.get("sources").get(1).get("status").asText());
+    }
+
+    @Test
+    void loadingAndUndecodableAreBothStated() throws Exception {
+        ScorecardReader r = reader(Map.of(), TOPIC);
+        r.board().setState(TOPIC, "LOADING");
+        r.accept(TOPIC, "a", payload(99));
+        JsonNode v = body(r, null);
+        assertEquals("LOADING_UNDECODABLE", v.get("sources").get(0).get("status").asText());
+        assertTrue(v.get("message").asText().contains("still reading") && v.get("message").asText().contains("could not be decoded"));
+    }
+
+    @Test
+    void aLostTopicEpochClearsItsRows() throws Exception {
+        Map<Integer, Object> m = new HashMap<>();
+        m.put(1, row("2026-11-09", "d", "LA_LEAN", "LEAN=QUIET", 300, 1, 1, 1.0));
+        ScorecardReader r = reader(m, TOPIC);
+        r.board().setState(TOPIC, "LIVE");
+        r.accept(TOPIC, "a", payload(1));
+        r.accept(TOPIC, "b", payload(99));
+        assertEquals(1, r.board().rowCount());
+        r.board().reset(TOPIC);
+        r.board().setState(TOPIC, "TOPIC_MISSING");
+        JsonNode v = body(r, null);
+        assertEquals(0, v.get("rows").size());
+        assertEquals(0, v.get("sources").get(0).get("undecodable").asInt());
+        assertEquals(0, r.board().rowCount());
+    }
+
+    @Test
+    void theRowBoundRefusesNewKeysAndSaysSoButStillUpdatesHeldKeys() throws Exception {
+        ScorecardBoard b = new ScorecardBoard(2);
+        b.configure(java.util.List.of(TOPIC));
+        b.setState(TOPIC, "LIVE");
+        b.put(TOPIC, "a", row("2026-11-09", "d", "LA_LEAN", "LEAN=A", 300, 1, 1, 1.0));
+        b.put(TOPIC, "b", row("2026-11-09", "d", "LA_LEAN", "LEAN=B", 300, 1, 1, 1.0));
+        b.put(TOPIC, "c", row("2026-11-09", "d", "LA_LEAN", "LEAN=C", 300, 1, 1, 1.0));
+        b.put(TOPIC, "a", row("2026-11-09", "d", "LA_LEAN", "LEAN=A", 300, 9, 9, 1.0));
+        assertEquals(2, b.rowCount());
+        JsonNode v = JSON.readTree(b.render(null, false));
+        assertEquals("CAP_REACHED", v.get("sources").get(0).get("status").asText());
+        assertEquals(1, v.get("sources").get(0).get("capRefused").asInt());
+        assertEquals(9, v.get("rows").get(0).get("decided").asLong());
     }
 }

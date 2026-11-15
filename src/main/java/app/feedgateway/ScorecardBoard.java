@@ -21,16 +21,28 @@ import org.apache.avro.util.Utf8;
  */
 final class ScorecardBoard {
     static final int MAX_TRADE_DATES = 120;
-    /** A hard row ceiling on top of the date bound, so a producer writing many classes cannot grow the heap without limit. */
+    /** A hard row ceiling on top of the date bound: past it a NEW key is refused and counted (status CAP_REACHED). */
     static final int MAX_ROWS = 200_000;
     static final String LABEL = "DESCRIPTIVE_UNVALIDATED";
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    private final int maxRows;
+
+    ScorecardBoard() {
+        this(MAX_ROWS);
+    }
+
+    /** Test seam: a smaller row bound. */
+    ScorecardBoard(int maxRows) {
+        this.maxRows = maxRows;
+    }
 
     /** topic to (record key to row). */
     private final Map<String, Map<String, ObjectNode>> rows = new LinkedHashMap<>();
     private final Map<String, Long> undecodable = new LinkedHashMap<>();
     private final Map<String, String> state = new LinkedHashMap<>();   // topic to LOADING, LIVE or TOPIC_MISSING
     private long evicted;
+    private final Map<String, Long> capRefused = new LinkedHashMap<>();
     /** trade date to the number of rows held for it, kept in step with every put, remove and eviction so the bound is O(dates), not O(rows), per record. */
     private final TreeMap<String, Integer> dateCounts = new TreeMap<>();
     private int total;
@@ -39,12 +51,26 @@ final class ScorecardBoard {
         for (String t : topics) {
             rows.putIfAbsent(t, new LinkedHashMap<>());
             undecodable.putIfAbsent(t, 0L);
+        capRefused.putIfAbsent(t, 0L);
             state.putIfAbsent(t, "TOPIC_MISSING");
         }
     }
 
     synchronized void setState(String topic, String s) {
         state.put(topic, s);
+    }
+
+    /** The topic's epoch is lost (it disappeared, was recreated, or its offsets moved): nothing it held may be shown as current. */
+    synchronized void reset(String topic) {
+        Map<String, ObjectNode> m = rows.get(topic);
+        if (m != null) {
+            for (ObjectNode row : m.values()) {
+                forget(row);
+            }
+            m.clear();
+        }
+        undecodable.put(topic, 0L);
+        capRefused.put(topic, 0L);
     }
 
     synchronized void countUndecodable(String topic) {
@@ -76,6 +102,10 @@ final class ScorecardBoard {
             countUndecodable(topic);
             return;
         }
+        if (total >= maxRows && !m.containsKey(key)) {
+            capRefused.merge(topic, 1L, Long::sum);   // a hard bound: the new key is refused and the source says so, never silently truncated
+            return;
+        }
         forget(m.put(key, row));
         dateCounts.merge(date, 1, Integer::sum);
         total++;
@@ -90,7 +120,7 @@ final class ScorecardBoard {
     }
 
     private void bound() {
-        while (dateCounts.size() > MAX_TRADE_DATES || (total > MAX_ROWS && dateCounts.size() > 1)) {
+        while (dateCounts.size() > MAX_TRADE_DATES) {
             String oldest = dateCounts.firstKey();
             for (Map<String, ObjectNode> m : rows.values()) {
                 int before = m.size();
@@ -164,27 +194,41 @@ final class ScorecardBoard {
             long bad = undecodable.getOrDefault(topic, 0L);
             int held = e.getValue().size();
             String st = state.getOrDefault(topic, "TOPIC_MISSING");
+            long capped = capRefused.getOrDefault(topic, 0L);
             String status;
             if (st.equals("TOPIC_MISSING")) {
                 status = "TOPIC_MISSING";
                 problems.add(topic + ": the scoreboard topic does not exist yet (the service has not rolled)");
-            } else if (st.equals("LOADING")) {
-                status = "LOADING";
-                problems.add(topic + ": still reading the topic from the beginning");
-            } else if (bad > 0) {
-                status = "UNDECODABLE";
-                problems.add(topic + ": " + bad + " record(s) could not be decoded and are not shown");
-            } else if (held == 0) {
-                status = "NO_DATA";
-                problems.add(topic + ": the topic exists and holds no scoreboard row");
             } else {
-                status = "OK";
+                boolean loading = st.equals("LOADING");
+                if (loading) {
+                    problems.add(topic + ": still reading the topic from the beginning");
+                }
+                if (bad > 0) {
+                    problems.add(topic + ": " + bad + " record(s) could not be decoded and are not shown");
+                }
+                if (capped > 0) {
+                    problems.add(topic + ": " + capped + " new key(s) were refused at the " + maxRows + "-row bound and are not shown");
+                }
+                if (capped > 0) {
+                    status = "CAP_REACHED";
+                } else if (loading) {
+                    status = bad > 0 ? "LOADING_UNDECODABLE" : "LOADING";
+                } else if (bad > 0) {
+                    status = "UNDECODABLE";
+                } else if (held == 0) {
+                    status = "NO_DATA";
+                    problems.add(topic + ": the topic exists and holds no scoreboard row");
+                } else {
+                    status = "OK";
+                }
             }
             ObjectNode s = sources.addObject();
             s.put("topic", topic);
             s.put("status", status);
             s.put("rows", held);
             s.put("undecodable", bad);
+            s.put("capRefused", capped);
             all.addAll(e.getValue().values());
         }
         all.removeIf(r -> fromTradeDate != null && r.path("tradeDate").asText().compareTo(fromTradeDate) < 0);
@@ -195,6 +239,12 @@ final class ScorecardBoard {
                 .thenComparing(r -> r.path("stratum").asText())
                 .thenComparingInt(r -> r.path("horizonSeconds").asInt()));
         if (readerOff) {
+            ObjectNode off = sources.addObject();
+            off.put("topic", "scorecard-reader");
+            off.put("status", "NOT_CONFIGURED");
+            off.put("rows", 0);
+            off.put("undecodable", 0);
+            off.put("capRefused", 0);
             out.put("message", "the scoreboard reader is not configured on this gateway (KAFKA_SCORECARD_SCOREBOARD_TOPICS is empty); there is no data to show");
         } else if (!problems.isEmpty()) {
             out.put("message", String.join("; ", problems));

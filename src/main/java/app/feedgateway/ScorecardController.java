@@ -66,6 +66,9 @@ public class ScorecardController {
     }
 
     private long tryAcquire(String principal, long nowMs) {
+        if (counters.size() > 1024) {
+            counters.values().removeIf(w -> nowMs - w[0] >= 60_000L);   // bounded: expired minute windows leave
+        }
         long[] state = counters.computeIfAbsent(principal == null ? "anonymous" : principal, k -> new long[] {nowMs, 0});
         synchronized (state) {
             if (nowMs - state[0] >= 60_000L) {
