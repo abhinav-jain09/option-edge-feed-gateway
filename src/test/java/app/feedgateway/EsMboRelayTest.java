@@ -423,7 +423,7 @@ class EsMboRelayTest {
         assertEquals(0, relay.framesHeldForTest(), "the other contract's frames are not served");
         assertEquals(0, relay.eventsHeldForTest(), "nor its events");
         relay.accept(FLOW, "B|30000", bytes(row(NOW + 6000, "B", MID, 6, 0, 0, 1)), NOW + 6000);   // ESZ6 goes on speaking: dropped, counted
-        assertEquals(1, relay.otherContractForTest());
+        assertEquals(2, relay.otherContractForTest(), "the ringed ESZ6 event removed at the switch, and this row");
         assertEquals(0, relay.openBucketsForTest());
         assertEquals(1, sink.of("es-mbo-frame").size(), "the held ESZ6 health never closes after the reset");
         relay.accept(FLOW, "B|30100", bytes(row("ESH7", NOW + 2000, "B", MID + 100, 9, 0, 0, 1)), NOW + 2100);
@@ -581,6 +581,21 @@ class EsMboRelayTest {
         assertEquals(30, relay.eventsFutureForTest());
         relay.accept(EVENTS, "OK", bytes(event("OK", 1, NOW + 4_000L, "VACUUM_ABOVE", null, null)), NOW);   // inside the 5 s skew
         assertEquals(1, relay.ledgerSizeForTest());
+    }
+
+    @Test
+    void rowsOfAnEarlierBucketThatNeverGotAHealthAreCountedWhenALaterBucketCloses() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.levelFlowCaughtUp(false, NOW);   // behind: only rows close buckets
+        relay.accept(FLOW, "B|30000", bytes(row(NOW + 100, "B", MID, 5, 0, 0, 1)), NOW + 100);   // a row for bucket 100, no health ever
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW + 200, "LIVE", MID, MID + 1)), NOW + 200);   // health for 200, held
+        assertEquals(0, relay.rowsDroppedForTest());
+        relay.accept(FLOW, "B|30001", bytes(row(NOW + 200, "B", MID + 1, 6, 0, 0, 1)), NOW + 210);   // row for 200: the watermark reaches 200 and closes it
+        assertEquals(1, sink.of("es-mbo-frame").size());
+        assertEquals(1, sink.of("es-mbo-frame").get(0).get("levels").size(), "bucket 200 carries only its own row");
+        assertEquals(1, relay.rowsDroppedForTest(), "bucket 100's row was discarded and is counted");
+        assertEquals(0, relay.openBucketsForTest());
     }
 
     @Test

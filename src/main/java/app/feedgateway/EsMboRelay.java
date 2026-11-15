@@ -88,7 +88,7 @@ final class EsMboRelay {
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicLong levelFlowRefused = new AtomicLong(), healthRefused = new AtomicLong(), eventRefused = new AtomicLong();
     private final AtomicLong undecodable = new AtomicLong(), drops = new AtomicLong(), consumerFailures = new AtomicLong();
-    private final AtomicLong otherContract = new AtomicLong(), eventsOutsideWindow = new AtomicLong(), eventsFuture = new AtomicLong();
+    private final AtomicLong otherContract = new AtomicLong(), eventsOutsideWindow = new AtomicLong(), eventsFuture = new AtomicLong(), ringEvicted = new AtomicLong();
     private final AtomicLong duplicateEvents = new AtomicLong();
     private final AtomicLong framesSeen = new AtomicLong(), eventsSeen = new AtomicLong(), lateRows = new AtomicLong(), rowsDropped = new AtomicLong();
     /**
@@ -370,6 +370,8 @@ final class EsMboRelay {
         anyFrame = false;
         lastFrameBucketEnd = 0;
         lastEpochStatus = null;
+        long otherEvents = events.values().stream().filter(e -> !e.contract().equals(contract)).count();
+        otherContract.addAndGet(otherEvents);   // the previous contract's ringed events leave the replay: counted
         events.values().removeIf(e -> !e.contract().equals(contract));
     }
 
@@ -446,6 +448,10 @@ final class EsMboRelay {
         List<EsMboJson.Row> rows = open.getOrDefault(bucketEnd, List.of());
         String epochStatus = EsMboJson.text(health.get("epochStatus"));
         String base = EsMboJson.frameBase(EsMboJson.text(health.get("contract")), bucketEnd, epochStatus, (Long) health.get("bestBidTick"), (Long) health.get("bestAskTick"), rows);
+        var earlier = open.headMap(bucketEnd, false);   // buckets that never got a health: their rows are discarded, and counted
+        for (List<EsMboJson.Row> lost : earlier.values()) {
+            rowsDropped.addAndGet(lost.size());
+        }
         open.headMap(bucketEnd, true).clear();
         closedThrough = Math.max(closedThrough, bucketEnd);
         framesSeen.incrementAndGet();
@@ -455,6 +461,7 @@ final class EsMboRelay {
         frames.addLast(new Frame(base, bucketEnd, base.getBytes(StandardCharsets.UTF_8).length + 16));
         while (frames.size() > FRAME_RING) {
             frames.removeFirst();
+            ringEvicted.incrementAndGet();
         }
         if (fresh(bucketEnd, now, settings.esMboFreshMs())) {
             sink.accept(FRAME_EVENT, EsMboJson.close(base, false));
@@ -468,6 +475,7 @@ final class EsMboRelay {
         lastLedgerPrune = now;
         long floor = now - EVENTS_LOOKBACK_MS;
         ledger.values().removeIf(v -> v[1] < floor);
+        ringEvicted.addAndGet(events.values().stream().filter(e -> e.bucketEnd() < floor).count());
         events.values().removeIf(e -> e.bucketEnd() < floor);   // the replay ring covers the same window, so a pruned ledger entry is also gone from the replay
     }
 
@@ -481,6 +489,10 @@ final class EsMboRelay {
 
     long eventsFutureForTest() {
         return eventsFuture.get();
+    }
+
+    long rowsDroppedForTest() {
+        return rowsDropped.get();
     }
 
     long otherContractForTest() {
@@ -522,6 +534,7 @@ final class EsMboRelay {
         events.put(key, new Event(base, base.getBytes(StandardCharsets.UTF_8).length + 16, contract, bucketEnd));
         while (events.size() > EVENT_RING) {
             events.remove(events.keySet().iterator().next());
+            ringEvicted.incrementAndGet();
         }
         if (fresh(bucketEnd, now, settings.esMboEventLiveMs())) {
             sink.accept(EVENT_EVENT, EsMboJson.close(base, false));
@@ -598,6 +611,7 @@ final class EsMboRelay {
         counter(sb, p + "other_contract_total", "Rows and events of a contract other than the one served (the newest health record's).", otherContract.get());
         counter(sb, p + "events_outside_window_total", "Event records whose bucket end is older than the events read window.", eventsOutsideWindow.get());
         counter(sb, p + "events_future_total", "Event records whose bucket end is ahead of the clock by more than the skew allowance.", eventsFuture.get());
+        counter(sb, p + "ring_evicted_total", "Frames and events that left their replay ring (capacity or the events window).", ringEvicted.get());
         counter(sb, p + "late_rows_total", "Level-flow rows for a bucket already closed.", lateRows.get());
         counter(sb, p + "rows_dropped_total", "Level-flow rows dropped by the buffer bounds.", rowsDropped.get());
         counter(sb, p + "consumer_failures_total", "Consumer loop failures (each followed by a 2 s retry).", consumerFailures.get());
