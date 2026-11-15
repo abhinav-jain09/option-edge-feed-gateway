@@ -1,0 +1,397 @@
+package app.feedgateway;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.optionsedge.contracts.esmbo.EsMboSchemas;
+import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
+import io.confluent.kafka.schemaregistry.testutil.MockSchemaRegistry;
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.kafka.common.serialization.Deserializer;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+
+/** The ES MBO relay at its boundary, fed the RAW bytes a consumer hands it. */
+class EsMboRelayTest {
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final GatewaySettings SETTINGS = new GatewaySettings();
+    private static final String FLOW = SETTINGS.esMboLevelFlowTopic(), HEALTH = SETTINGS.esMboHealthTopic(), EVENTS = SETTINGS.esMboEventTopic();
+    private static final AtomicLong SCOPES = new AtomicLong();
+    private static final long NOW = 1_794_780_000_000L;
+    private static final long MID = 30_000L;
+
+    private static final class Sink implements java.util.function.BiConsumer<String, String> {
+        final List<String[]> frames = new ArrayList<>();
+
+        @Override
+        public void accept(String event, String json) {
+            frames.add(new String[] {event, json});
+        }
+
+        List<JsonNode> of(String event) throws Exception {
+            List<JsonNode> out = new ArrayList<>();
+            for (String[] f : frames) {
+                if (f[0].equals(event)) {
+                    out.add(JSON.readTree(f[1]));
+                }
+            }
+            return out;
+        }
+    }
+
+    private final KafkaAvroSerializer serializer = new KafkaAvroSerializer();
+    private final GatewayAvroDeserializer deserializer = new GatewayAvroDeserializer();
+    private final AtomicLong decodes = new AtomicLong();
+    private final Deserializer<Object> counting = (topic, data) -> {
+        decodes.incrementAndGet();
+        return deserializer.deserialize(topic, data);
+    };
+
+    EsMboRelayTest() {
+        String scope = "es-mbo-relay-" + SCOPES.incrementAndGet();
+        SchemaRegistryClient registry = MockSchemaRegistry.getClientForScope(scope);
+        EsMboSchemas.register(registry);
+        serializer.configure(EsMboSchemas.serdeConfig("mock://" + scope), false);
+        Map<String, Object> reader = new HashMap<>();
+        reader.put("schema.registry.url", "mock://" + scope);
+        reader.put("specific.avro.reader", "false");
+        reader.put(GatewayAvroDeserializer.SPX_PRICE_TOPIC, "underlying.spx.price");
+        reader.put(GatewayAvroDeserializer.TOLERANT_TOPICS, FLOW + "," + HEALTH + "," + EVENTS);
+        deserializer.configure(reader, false);
+    }
+
+    @AfterEach
+    void close() {
+        serializer.close();
+        deserializer.close();
+    }
+
+    private byte[] bytes(GenericRecord r) {
+        return serializer.serialize("any-topic", r);
+    }
+
+    private EsMboRelay relay(Sink sink) {
+        return new EsMboRelay(SETTINGS, sink, counting);
+    }
+
+    private static GenericRecord row(long bucketEnd, String side, long tick, long resting, long in, long out, long orders) {
+        GenericRecord r = new GenericData.Record(EsMboSchemas.LEVEL_FLOW.schema());
+        r.put("schemaVersion", 1);
+        r.put("environment", "Test");
+        r.put("contract", "ESZ6");
+        r.put("bucketEnd", bucketEnd);
+        r.put("configFingerprint", "fp");
+        r.put("side", side);
+        r.put("tick", tick);
+        r.put("attributionStatus", "PROVISIONAL");
+        r.put("epochStatus", "LIVE");
+        r.put("availability", "AVAILABLE");
+        for (String f : new String[] {"addCount", "addQty", "reductionQty", "increaseQty", "maxOrderQty"}) {
+            r.put(f, 0L);
+        }
+        r.put("moveInQty", in);
+        r.put("moveOutQty", out);
+        r.put("restingQty", resting);
+        r.put("orderCount", orders);
+        return r;
+    }
+
+    private static GenericRecord health(long bucketEnd, String epoch, Long bid, Long ask) {
+        Schema s = EsMboSchemas.HEALTH.schema();
+        GenericRecord r = new GenericData.Record(s);
+        r.put("schemaVersion", 2);
+        r.put("environment", "Test");
+        r.put("contract", "ESZ6");
+        r.put("bucketEnd", bucketEnd);
+        r.put("configFingerprint", "fp");
+        r.put("epochId", 1L);
+        r.put("epochStatus", epoch);
+        r.put("degradedReason", null);
+        for (String f : new String[] {"admittedTotal", "sequenceGaps", "streamChanges", "bookOrderCount", "bookBidLevels", "bookAskLevels", "lastReceivedAtMs", "bucketsClosed", "bucketsDegraded", "gapBucketsSkipped"}) {
+            r.put(f, 0L);
+        }
+        r.put("refusedByReason", new GenericData.Array<>(s.getField("refusedByReason").schema(), List.of()));
+        r.put("bestBidTick", bid);
+        r.put("bestAskTick", ask);
+        return r;
+    }
+
+    private static GenericRecord event(String id, int revision, long bucketEnd, String kind, Long lo, Long hi) {
+        Schema s = EsMboSchemas.EVENT.schema();
+        GenericRecord r = new GenericData.Record(s);
+        r.put("schemaVersion", 1);
+        r.put("environment", "Test");
+        r.put("contract", "ESZ6");
+        r.put("bucketEnd", bucketEnd);
+        r.put("configFingerprint", "fp");
+        r.put("eventId", id);
+        r.put("revision", revision);
+        r.put("kind", kind);
+        r.put("status", "PROVISIONAL");
+        r.put("startMs", bucketEnd - 5000);
+        r.put("endMs", null);
+        r.put("direction", "ABOVE");
+        r.put("loTick", lo);
+        r.put("hiTick", hi);
+        r.put("availability", "AVAILABLE");
+        Schema valueSchema = s.getField("values").schema().getElementType();
+        GenericRecord v1 = new GenericData.Record(valueSchema), v2 = new GenericData.Record(valueSchema);
+        v1.put("name", "depthQty");
+        v1.put("value", 12L);
+        v2.put("name", "emptyRun");
+        v2.put("value", 3L);
+        r.put("values", new GenericData.Array<>(s.getField("values").schema(), List.of(v1, v2)));
+        return r;
+    }
+
+    private void feedBucket(EsMboRelay relay, long bucketEnd, Long bid, Long ask, GenericRecord... rows) {
+        for (GenericRecord r : rows) {
+            relay.accept(FLOW, r.get("side") + "|" + r.get("tick"), bytes(r), bucketEnd + 100);
+        }
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(bucketEnd, "LIVE", bid, ask)), bucketEnd + 150);
+    }
+
+    @Test
+    void rowsAndTheHealthRecordFoldIntoOneFrameWithinSixtyTicksOfTheMid() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        long b = NOW;
+        feedBucket(relay, b, MID, MID + 1, row(b, "B", MID, 40, 1, 2, 5), row(b, "A", MID + 1, 30, 0, 0, 3),
+                row(b, "B", MID - 60, 7, 0, 0, 1),   // 60.5 ticks below the mid 30000.5: out (beyond 60)
+                row(b, "B", MID - 59, 8, 0, 0, 1),   // 59.5: in
+                row(b, "A", MID + 60, 9, 0, 0, 1),   // 59.5 above: in
+                row(b, "A", MID + 62, 9, 0, 0, 1));  // 61.5 above: out
+        List<JsonNode> frames = sink.of("es-mbo-frame");
+        assertEquals(1, frames.size());
+        JsonNode f = frames.get(0);
+        assertEquals("ESZ6", f.get("contract").asText());
+        assertEquals(b, f.get("bucketEnd").asLong());
+        assertEquals("LIVE", f.get("epochStatus").asText());
+        assertEquals(MID, f.get("bestBidTick").asLong());
+        assertEquals(MID + 1, f.get("bestAskTick").asLong());
+        assertFalse(f.get("cached").asBoolean());
+        JsonNode levels = f.get("levels");
+        assertEquals(4, levels.size());
+        assertEquals("[\"B\",30000,40,1,2,5]", levels.get(0).toString());
+        assertEquals("[\"A\",30001,30,0,0,3]", levels.get(1).toString());
+        assertEquals(List.of(MID - 59, MID + 60), List.of(levels.get(2).get(1).asLong(), levels.get(3).get(1).asLong()));
+        assertEquals(0, relay.openBucketsForTest(), "the closed bucket is dropped from the buffer");
+    }
+
+    @Test
+    void noBestBidOrAskKeepsNoLevelAndSaysWhyByEpochStatus() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 40, 0, 0, 1)), NOW);
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW, "UNAVAILABLE", null, null)), NOW);
+        JsonNode f = sink.of("es-mbo-frame").get(0);
+        assertEquals(0, f.get("levels").size());
+        assertTrue(f.get("bestBidTick").isNull() && f.get("bestAskTick").isNull());
+        assertEquals("UNAVAILABLE", f.get("epochStatus").asText());
+        // one side only is also no mid
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW + 1000, "LIVE", MID, null)), NOW + 1000);
+        relay.tick(NOW + 3000);
+        assertEquals(0, sink.of("es-mbo-frame").get(1).get("levels").size());
+    }
+
+    @Test
+    void aQuietBucketIsClosedAfterTheHoldAndAHealthAheadOfLevelFlowWaitsForIt() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW, "LIVE", MID, MID + 1)), NOW);
+        assertEquals(0, sink.of("es-mbo-frame").size(), "level-flow has not reached the bucket yet");
+        relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 40, 0, 0, 1)), NOW + 10);
+        assertEquals(1, sink.of("es-mbo-frame").size());
+        assertEquals(1, sink.of("es-mbo-frame").get(0).get("levels").size(), "the row that arrived after the health record is in its frame");
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW + 1000, "LIVE", MID, MID + 1)), NOW + 1000);
+        assertEquals(1, sink.of("es-mbo-frame").size());
+        relay.tick(NOW + 2500);
+        assertEquals(2, sink.of("es-mbo-frame").size(), "no rows for a quiet bucket: closed when the hold runs out");
+    }
+
+    @Test
+    void theRowBufferIsBoundedAndALateRowOrReplayedHealthMakesNoSecondFrame() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        for (int i = 0; i < EsMboRelay.MAX_OPEN_BUCKETS + 50; i++) {   // rows of buckets whose health never arrives
+            relay.accept(FLOW, "B|30000", bytes(row(NOW + i * 1000L, "B", MID, 1, 0, 0, 1)), NOW);
+        }
+        assertEquals(EsMboRelay.MAX_OPEN_BUCKETS, relay.openBucketsForTest());
+        feedBucket(relay, NOW + 1_000_000L, MID, MID + 1);
+        relay.tick(NOW + 1_002_000L);   // no rows for this bucket: closed when the hold runs out
+        assertEquals(0, relay.openBucketsForTest(), "a health record drops every buffered bucket at or before it");
+        relay.accept(FLOW, "B|30000", bytes(row(NOW + 5000L, "B", MID, 1, 0, 0, 1)), NOW);
+        assertEquals(1, relay.lateRowsForTest());
+        assertEquals(0, relay.openBucketsForTest());
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW + 1_000_000L, "LIVE", MID, MID + 1)), NOW + 1_000_150L);
+        assertEquals(1, sink.of("es-mbo-frame").size(), "the same bucket is never closed twice");
+    }
+
+    @Test
+    void aStaleFrameIsReplayOnlyAndTheHistoryIsOneCachedMessageOldestFirst() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW - 600_000L, "LIVE", MID, MID + 1)), NOW);   // 10 minutes old: catch-up
+        relay.tick(NOW + 2000);
+        feedBucket(relay, NOW, MID, MID + 1, row(NOW, "B", MID, 4, 0, 0, 1));
+        assertEquals(1, sink.of("es-mbo-frame").size(), "only the fresh frame is broadcast live");
+        List<String[]> replay = new ArrayList<>();
+        relay.replay((e, j) -> replay.add(new String[] {e, j}));
+        assertEquals("es-mbo-history", replay.get(0)[0]);
+        JsonNode h = JSON.readTree(replay.get(0)[1]);
+        assertTrue(h.get("cached").asBoolean());
+        assertEquals(2, h.get("frames").size());
+        assertTrue(h.get("frames").get(0).get("bucketEnd").asLong() < h.get("frames").get(1).get("bucketEnd").asLong());
+        assertTrue(h.get("frames").get(0).get("cached").asBoolean() && h.get("frames").get(1).get("cached").asBoolean());
+        assertEquals("es-mbo-status", replay.get(1)[0]);
+    }
+
+    @Test
+    void theHistoryDropsTheOldestFramesToFitTheByteBound() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        for (int i = 0; i < 40; i++) {
+            long b = NOW + i * 1000L;
+            GenericRecord[] rows = new GenericRecord[40];
+            for (int k = 0; k < 40; k++) {
+                rows[k] = row(b, "B", MID - k, 10, 1, 1, 1);
+            }
+            feedBucket(relay, b, MID, MID + 1, rows);
+        }
+        String history = relay.historyJson();
+        int limit = SETTINGS.esMboHistoryMaxBytes();
+        assertTrue(history.length() < limit);
+        // a tiny bound through the real settings path: env-less settings subclass
+        EsMboRelay small = new EsMboRelay(SETTINGS, new Sink(), counting, 10_000);
+        for (int i = 0; i < 40; i++) {
+            long b = NOW + i * 1000L;
+            GenericRecord[] rows = new GenericRecord[40];
+            for (int k = 0; k < 40; k++) {
+                rows[k] = row(b, "B", MID - k, 10, 1, 1, 1);
+            }
+            feedBucket(small, b, MID, MID + 1, rows);
+        }
+        String capped = small.historyJson();
+        assertTrue(capped.length() <= 10_000, "was " + capped.length());
+        JsonNode h = JSON.readTree(capped);
+        int n = h.get("frames").size();
+        assertTrue(n > 0 && n < 40);
+        assertEquals(NOW + 39_000L, h.get("frames").get(n - 1).get("bucketEnd").asLong(), "the NEWEST frames are kept");
+    }
+
+    @Test
+    void anEventIsForwardedWithItsValuesMapAndNullTicksAndTheRingKeepsTheLatestRevisionPerId() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.accept(EVENTS, "E1", bytes(event("E1", 1, NOW, "VACUUM_ABOVE", null, null)), NOW + 100);
+        relay.accept(EVENTS, "E2", bytes(event("E2", 1, NOW, "BOOK_SWEEP_UP", 30010L, 30020L)), NOW + 100);
+        relay.accept(EVENTS, "E1", bytes(event("E1", 2, NOW + 1000, "VACUUM_CLEARED", null, null)), NOW + 1100);
+        List<JsonNode> out = sink.of("es-mbo-event");
+        assertEquals(3, out.size());
+        JsonNode e = out.get(0);
+        assertEquals("E1", e.get("eventId").asText());
+        assertEquals(1, e.get("revision").asInt());
+        assertEquals("VACUUM_ABOVE", e.get("kind").asText());
+        assertTrue(e.get("loTick").isNull() && e.get("hiTick").isNull() && e.get("endMs").isNull());
+        assertEquals("ABOVE", e.get("direction").asText());
+        assertEquals(12, e.get("values").get("depthQty").asLong());
+        assertEquals(3, e.get("values").get("emptyRun").asLong());
+        assertFalse(e.get("cached").asBoolean());
+        assertEquals(30010, out.get(1).get("loTick").asLong());
+        assertEquals(2, relay.eventsHeldForTest(), "one entry per eventId");
+        JsonNode h = JSON.readTree(relay.historyJson());
+        assertEquals("E2", h.get("events").get(0).get("eventId").asText());
+        assertEquals(2, h.get("events").get(1).get("revision").asInt(), "E1's latest revision, moved to the end");
+        assertTrue(h.get("events").get(1).get("cached").asBoolean());
+        for (int i = 0; i < EsMboRelay.EVENT_RING + 20; i++) {
+            relay.accept(EVENTS, "X" + i, bytes(event("X" + i, 1, NOW, "VACUUM_ABOVE", null, null)), NOW);
+        }
+        assertEquals(EsMboRelay.EVENT_RING, relay.eventsHeldForTest());
+    }
+
+    @Test
+    void anOldEventIsRingedAndNotBroadcastLive() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.accept(EVENTS, "E1", bytes(event("E1", 1, NOW - 3_600_000L, "VACUUM_ABOVE", null, null)), NOW);
+        assertEquals(0, sink.of("es-mbo-event").size());
+        assertEquals(1, relay.eventsHeldForTest());
+    }
+
+    @Test
+    void aWrongSchemaIdIsRefusedAndCountedBeforeAnyDecode() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.accept(FLOW, "B|30000", bytes(health(NOW, "LIVE", MID, MID + 1)), NOW);   // a health frame on the level-flow topic
+        relay.accept(EVENTS, "E1", bytes(row(NOW, "B", MID, 1, 0, 0, 1)), NOW);
+        relay.accept(HEALTH, "CME|ESZ6", bytes(event("E1", 1, NOW, "VACUUM_ABOVE", null, null)), NOW);
+        assertEquals(1, relay.schemaIdRefusedForTest(EsMboSchemas.LEVEL_FLOW));
+        assertEquals(1, relay.schemaIdRefusedForTest(EsMboSchemas.EVENT));
+        assertEquals(1, relay.schemaIdRefusedForTest(EsMboSchemas.HEALTH));
+        assertEquals(0, decodes.get(), "refused before the registry is asked");
+        assertTrue(sink.frames.isEmpty());
+        assertTrue(relay.statusJson().contains("\"schemaIdRefused\":3"));
+    }
+
+    @Test
+    void aRecordWithTheWrongKeyIsADropAndAGarbageBodyIsUndecodable() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.accept(FLOW, "B|1", bytes(row(NOW, "B", MID, 1, 0, 0, 1)), NOW);
+        relay.accept(EVENTS, "WRONG", bytes(event("E1", 1, NOW, "VACUUM_ABOVE", null, null)), NOW);
+        assertEquals(2, relay.dropsForTest());
+        byte[] framed = bytes(row(NOW, "B", MID, 1, 0, 0, 1));
+        byte[] corrupt = java.util.Arrays.copyOf(framed, 8);
+        relay.accept(FLOW, "B|30000", corrupt, NOW);
+        assertTrue(relay.statusJson().contains("\"undecodable\":1"));
+    }
+
+    @Test
+    void theStatusSaysWhatTheRelayHasSeen() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        JsonNode empty = JSON.readTree(relay.statusJson());
+        assertTrue(empty.get("enabled").asBoolean());
+        assertTrue(empty.get("lastFrameBucketEnd").isNull() && empty.get("lastEventBucketEnd").isNull() && empty.get("epochStatus").isNull());
+        feedBucket(relay, NOW, MID, MID + 1, row(NOW, "B", MID, 1, 0, 0, 1));
+        relay.accept(EVENTS, "E1", bytes(event("E1", 1, NOW, "VACUUM_ABOVE", null, null)), NOW);
+        JsonNode s = JSON.readTree(relay.statusJson());
+        assertEquals(NOW, s.get("lastFrameBucketEnd").asLong());
+        assertEquals(NOW, s.get("lastEventBucketEnd").asLong());
+        assertEquals("LIVE", s.get("epochStatus").asText());
+        assertEquals(1, s.get("framesSeen").asInt());
+        assertEquals(1, s.get("eventsSeen").asInt());
+        assertEquals(0, s.get("consumerFailures").asInt());
+    }
+
+    @Test
+    void aDisabledRelayConsumesNothing() {
+        EsMboRelay relay = new EsMboRelay(new GatewaySettings(), new Sink(), null);
+        assertFalse(SETTINGS.esMboRelayEnabled(), "the flag defaults OFF");
+        relay.start();
+        assertFalse(relay.consuming(), "no thread, no consumer");
+        assertEquals(0, relay.framesHeldForTest());
+        relay.stop();
+    }
+
+    @Test
+    void theTopicDefaultsAreTheEnginesTopics() {
+        assertEquals("es.mbo.level-flow", SETTINGS.esMboLevelFlowTopic());
+        assertEquals("es.mbo.health", SETTINGS.esMboHealthTopic());
+        assertEquals("es.mbo.liquidity-events", SETTINGS.esMboEventTopic());
+        assertEquals(3502, EsMboSchemas.LEVEL_FLOW.id());
+        assertEquals(3509, EsMboSchemas.HEALTH.id());
+        assertEquals(3503, EsMboSchemas.EVENT.id());
+    }
+}

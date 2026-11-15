@@ -107,6 +107,9 @@ public class FeedGatewayService implements ReplayRunner {
     /** ES liquidity-wall relay (es-liquidity-wall-service), wired like the depth relay: connect replay + global broadcast, nothing in the ui-batch cache. */
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private org.springframework.beans.factory.ObjectProvider<EsLiquidityWallRelay> esLiquidityWallRelay;
+    /** ES MBO relay (es-liquidity-engine-service): global broadcast + one connect-time history message, nothing in the ui-batch cache. */
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private org.springframework.beans.factory.ObjectProvider<EsMboRelay> esMboRelay;
     /** Liquidity-validator label relay (liquidity-validator-service): connect replay + global broadcast, display only. */
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     private org.springframework.beans.factory.ObjectProvider<LiquidityValidatorRelay> liquidityValidatorRelay;
@@ -1699,6 +1702,10 @@ public class FeedGatewayService implements ReplayRunner {
             var relay=esLiquidityWallRelay.getIfAvailable();
             if(relay!=null)relay.replay((event,json)->send(session,event,json));
         }
+        if(esMboRelay!=null&&settings.esMboRelayEnabled()) {
+            var relay=esMboRelay.getIfAvailable();
+            if(relay!=null)relay.replay((event,json)->send(session,event,json));
+        }
         if(liquidityValidatorRelay!=null&&settings.liquidityValidatorRelayEnabled()) {
             var relay=liquidityValidatorRelay.getIfAvailable();
             if(relay!=null)relay.replay((event,json)->send(session,event,json));
@@ -2472,6 +2479,7 @@ public class FeedGatewayService implements ReplayRunner {
                 + studiesMetrics()
                 + taMetrics()
                 + esLiquidityWallMetrics()
+                + esMboMetrics()
                 + liquidityValidatorMetrics()
                 + lineHealthMetrics()
                 + breakLineMetrics()
@@ -13684,6 +13692,11 @@ public class FeedGatewayService implements ReplayRunner {
         return relay == null ? "" : relay.metrics();
     }
 
+    private String esMboMetrics() {
+        var relay = esMboRelay == null ? null : esMboRelay.getIfAvailable();
+        return relay == null ? "" : relay.metrics();
+    }
+
     private String taMetrics() {
         StringBuilder metrics = new StringBuilder();
         for (TaRelay relay : taRelays) {
@@ -14396,6 +14409,12 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** The ES liquidity-wall relay's fan-out: {@code es-liquidity-heatmap}, {@code es-liquidity-wall} and {@code es-liquidity-voice} are global events. */
     void streamEsLiquidityWall(String event, String json) {broadcast(event, json);}
+
+    /** The ES MBO relay's fan-out: {@code es-mbo-frame}, {@code es-mbo-event} and {@code es-mbo-status} are global events (no per-user data); anything else is refused. */
+    void streamEsMbo(String event, String json) {
+        if (!EsMboRelay.FRAME_EVENT.equals(event) && !EsMboRelay.EVENT_EVENT.equals(event) && !EsMboRelay.STATUS_EVENT.equals(event)) return;
+        broadcast(event, json);
+    }
     void streamLiquidityValidator(String event, String json) {broadcast(event, json);}
 
     /** The line-health relay's fan-out: the four {@code line-health-*} frames are global and never coalesced (every record counts for the page's gap detection). */
@@ -15505,6 +15524,8 @@ public class FeedGatewayService implements ReplayRunner {
             "rithmic-liquidity",
             // ES liquidity walls (es-liquidity-wall-service): ONE contract, no per-user data; the voice and the events are never coalesced.
             EsLiquidityWallRelay.HEATMAP_EVENT, EsLiquidityWallRelay.WALL_EVENT, EsLiquidityWallRelay.VOICE_EVENT, EsLiquidityWallRelay.TARGETS_EVENT,
+            // ES MBO liquidity engine (es-liquidity-engine-service): ONE contract, no per-user data; frames, events and the heartbeat.
+            EsMboRelay.FRAME_EVENT, EsMboRelay.EVENT_EVENT, EsMboRelay.STATUS_EVENT,
             // Liquidity-validator labels (liquidity-validator-service): one research verdict per geometry release, no per-user data.
             LiquidityValidatorRelay.EVENT,
             // Line health (requirement LH-O-6): system-line records for every socket; user-line records are refused by the relay until the owner filter (M5).
