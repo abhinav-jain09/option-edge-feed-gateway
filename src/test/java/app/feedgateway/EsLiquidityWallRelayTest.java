@@ -426,6 +426,58 @@ class EsLiquidityWallRelayTest {
         assertTrue(replayed.isEmpty(), "targets of a stopped service are never replayed as current");
     }
 
+    private static GenericRecord fullTarget(int n) {
+        org.apache.avro.Schema t = LiquidityWallSchemas.TARGETS.schema().getField("targets").schema().getElementType();
+        org.apache.avro.generic.GenericRecordBuilder b = new org.apache.avro.generic.GenericRecordBuilder(t);
+        for (org.apache.avro.Schema.Field f : t.getFields()) {
+            org.apache.avro.Schema s = f.schema();
+            if (s.getType() == org.apache.avro.Schema.Type.UNION) {
+                s = s.getTypes().stream().filter(x -> x.getType() != org.apache.avro.Schema.Type.NULL).findFirst().orElseThrow();
+            }
+            Object v = switch (s.getType()) {
+                case STRING -> "s" + n;
+                case LONG -> 1_000L + n;
+                case INT -> n;
+                case BOOLEAN -> true;
+                case ARRAY -> {
+                    List<Long> l = new ArrayList<>();
+                    for (int k = 0; k < 7; k++) {
+                        l.add(k == 1 ? null : (long) (100 + k));
+                    }
+                    yield l;
+                }
+                default -> throw new AssertionError(f.name());
+            };
+            b.set(f.name(), v);
+        }
+        return b.build();
+    }
+
+    @Test
+    void aFullTargetsFrameOfTwentyFourPopulatedTargetsRelaysEveryFieldAndTwentyFiveIsRefused() throws Exception {
+        Sink sink = new Sink();
+        EsLiquidityWallRelay relay = wire.relay(sink);
+        List<GenericRecord> list = new ArrayList<>();
+        for (int n = 0; n < 24; n++) {
+            list.add(fullTarget(n));
+        }
+        relay.accept(TARGETS, KEY, wire.bytes(targets(NOW, "READY", list)), NOW + 500);
+        assertEquals(List.of("es-liquidity-targets"), sink.events());
+        JsonNode j = sink.json(0);
+        assertEquals(24, j.get("targets").size());
+        for (org.apache.avro.Schema.Field f : LiquidityWallSchemas.TARGETS.schema().getField("targets").schema().getElementType().getFields()) {
+            assertTrue(j.get("targets").get(23).has(f.name()), "field reaches the page by name: " + f.name());
+        }
+        JsonNode tape = j.get("targets").get(0).get("sizeHistory");
+        assertEquals(7, tape.size());
+        assertTrue(tape.get(1).isNull());
+        assertEquals(100L, tape.get(0).longValue());
+        list.add(fullTarget(24));
+        Sink refused = new Sink();
+        wire.relay(refused).accept(TARGETS, KEY, wire.bytes(targets(NOW, "READY", list)), NOW + 500);
+        assertTrue(refused.events().isEmpty(), "25 targets are refused");
+    }
+
     @Test
     void aTargetsFrameWithAnotherIdWrongKeyOrStaleBucketIsRefusedAndNeverRelayed() throws Exception {
         Sink sink = new Sink();

@@ -24,8 +24,8 @@ final class EsLiquidityWallJson {
     /** A band of a few hundred ticks per side; a dashboard listing more levels than this is refused. */
     static final int MAX_LEVELS = 4096;
     static final String FLIP = "FLIP";
-    /** At most 3 per side by the service's own rule; the gateway refuses a record listing more than 6 in all (maxPerSide 3 times two sides). */
-    static final int MAX_TARGETS = 6;
+    /** The service shows at most 3 live targets per side plus the records it pins for display (a fate for 2 minutes, a role flip for 30), at most 24 in all by its own bound; the gateway refuses a record listing more (counted, never relayed). */
+    static final int MAX_TARGETS = 24;
     /** The dashboard has two versions (ids 3403 and 3408, contracts 0.84.0): a version 1 record is still on the compacted topic until the wall service writes its next one. */
     static final Set<Integer> DASHBOARD_VERSIONS = Set.of(1, 2);
     /** The event, voice and bucket records have one version. */
