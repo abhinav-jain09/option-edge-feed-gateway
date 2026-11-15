@@ -64,7 +64,7 @@ final class EsMboRelay {
     static final long STATUS_PERIOD_MS = 5_000L;
     static final long FRAMES_LOOKBACK_MS = 15 * 60_000L;
     static final long EVENTS_LOOKBACK_MS = 6 * 3_600_000L;
-    /** A health record waits at most this long (wall clock) for level-flow to reach its bucket. */
+    /** A health record whose bucket level-flow has not reached waits this long (wall clock) AND only while the level-flow lane is caught up and quiet; never while it is behind. */
     static final long HEALTH_HOLD_MS = 1_000L;
     /** Open level-flow buckets kept, rows kept per bucket, health records held: an unmatched bucket never leaks memory. */
     static final int MAX_OPEN_BUCKETS = 120;
@@ -74,7 +74,7 @@ final class EsMboRelay {
     private record Frame(String base, long bucketEnd, int bytes) {
     }
 
-    private record Event(String base, int bytes) {
+    private record Event(String base, int bytes, int revision) {
     }
 
     private record PendingHealth(GenericRecord record, long arrivedAt) {
@@ -86,12 +86,22 @@ final class EsMboRelay {
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicLong levelFlowRefused = new AtomicLong(), healthRefused = new AtomicLong(), eventRefused = new AtomicLong();
     private final AtomicLong undecodable = new AtomicLong(), drops = new AtomicLong(), consumerFailures = new AtomicLong();
+    private final AtomicLong duplicateEvents = new AtomicLong();
     private final AtomicLong framesSeen = new AtomicLong(), eventsSeen = new AtomicLong(), lateRows = new AtomicLong(), rowsDropped = new AtomicLong();
-    private final TreeMap<Long, List<EsMboJson.Row>> open = new TreeMap<>();
-    private final TreeMap<Long, PendingHealth> pending = new TreeMap<>();
+    /** One contract's open level-flow buckets, held health records and closed watermark: a roll (ESH7 after ESZ6) never mixes two contracts' rows. */
+    private static final class ContractState {
+        final TreeMap<Long, List<EsMboJson.Row>> open = new TreeMap<>();
+        final TreeMap<Long, PendingHealth> pending = new TreeMap<>();
+        long closedThrough;
+    }
+
+    static final int MAX_CONTRACTS = 16;
+    private final Map<String, ContractState> states = new LinkedHashMap<>();
+    /** Wall-clock instant the level-flow lane was last seen caught up (position at its end offset) continuously, or null while it is behind. */
+    private Long levelFlowCaughtUpSince;
     private final ArrayDeque<Frame> frames = new ArrayDeque<>();
     private final LinkedHashMap<String, Event> events = new LinkedHashMap<>();
-    private long levelFlowWatermark, closedThrough, lastFrameBucketEnd, lastEventBucketEnd;
+    private long levelFlowWatermark, lastFrameBucketEnd, lastEventBucketEnd;
     private boolean anyFrame, anyEvent;
     private String lastEpochStatus;
     private volatile Deserializer<Object> decoder;
@@ -186,6 +196,8 @@ final class EsMboRelay {
                     }
                 }
                 long nextLook = System.currentTimeMillis() + TOPIC_RETRY_MS;
+                TopicPartition flowPartition = partitions.stream().filter(tp -> tp.topic().equals(topics[0])).findFirst().orElse(null);
+                levelFlowCaughtUp(flowPartition == null, System.currentTimeMillis());
                 c.assign(partitions);
                 long now = System.currentTimeMillis();
                 for (TopicPartition tp : partitions) {
@@ -204,7 +216,9 @@ final class EsMboRelay {
                         accept(record.topic(), record.key(), record.value(), System.currentTimeMillis());
                         resumeAt.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
                     }
-                    tick(System.currentTimeMillis());
+                    // the deterministic barrier: is the level-flow lane at its end offset NOW (after this poll's records were accepted)? A missing lane has nothing pending.
+                    boolean caughtUp = flowPartition == null || c.position(flowPartition) >= c.endOffsets(List.of(flowPartition)).get(flowPartition);
+                    levelFlowCaughtUp(caughtUp, System.currentTimeMillis());
                 }
             } catch (WakeupException stopped) {
                 // stop() woke the poll
@@ -302,17 +316,40 @@ final class EsMboRelay {
                 return;
             }
             long bucketEnd = (Long) r.get("bucketEnd");
-            if (bucketEnd <= closedThrough) {
+            ContractState st = state(EsMboJson.text(r.get("contract")));
+            if (bucketEnd <= st.closedThrough) {
                 drops.incrementAndGet();   // a bucket already closed (a re-read): never a second frame
                 return;
             }
-            pending.put(bucketEnd, new PendingHealth(r, now));
-            while (pending.size() > MAX_PENDING_HEALTH) {
-                pending.pollFirstEntry();
+            st.pending.put(bucketEnd, new PendingHealth(r, now));
+            while (st.pending.size() > MAX_PENDING_HEALTH) {
+                st.pending.pollFirstEntry();
                 drops.incrementAndGet();
             }
         } else {
             acceptEvent(key, EsMboJson.checked(subject, decoded, EsMboJson.ONLY_VERSION_1), now);
+        }
+        tick(now);
+    }
+
+    private ContractState state(String contract) {
+        ContractState st = states.get(contract);
+        if (st == null) {
+            st = new ContractState();
+            states.put(contract, st);
+            while (states.size() > MAX_CONTRACTS) {
+                states.remove(states.keySet().iterator().next());
+            }
+        }
+        return st;
+    }
+
+    /** Called by the consumer loop after each poll: the level-flow lane is (or is not) at its end offset. A seam for tests with an injected clock. */
+    synchronized void levelFlowCaughtUp(boolean caughtUp, long now) {
+        if (!caughtUp) {
+            levelFlowCaughtUpSince = null;
+        } else if (levelFlowCaughtUpSince == null) {
+            levelFlowCaughtUpSince = now;
         }
         tick(now);
     }
@@ -324,40 +361,50 @@ final class EsMboRelay {
             return;
         }
         long bucketEnd = (Long) r.get("bucketEnd");
-        if (bucketEnd <= closedThrough) {
+        ContractState st = state(EsMboJson.text(r.get("contract")));
+        if (bucketEnd <= st.closedThrough) {
             lateRows.incrementAndGet();   // its bucket was closed by the health record: never a second frame
             return;
         }
         levelFlowWatermark = Math.max(levelFlowWatermark, bucketEnd);
-        List<EsMboJson.Row> rows = open.computeIfAbsent(bucketEnd, k -> new ArrayList<>());
+        List<EsMboJson.Row> rows = st.open.computeIfAbsent(bucketEnd, k -> new ArrayList<>());
         if (rows.size() >= MAX_ROWS_PER_BUCKET) {
             rowsDropped.incrementAndGet();
         } else {
             rows.add(row);
         }
-        while (open.size() > MAX_OPEN_BUCKETS) {
-            rowsDropped.addAndGet(open.pollFirstEntry().getValue().size());
+        while (st.open.size() > MAX_OPEN_BUCKETS) {
+            rowsDropped.addAndGet(st.open.pollFirstEntry().getValue().size());
         }
     }
 
-    /** Closes every held bucket whose rows level-flow has reached or whose hold ran out. Called with the record clock and by the loop. */
+    /**
+     * Closes every held bucket that is PROVEN complete: level-flow has delivered a record at or after its bucket end (the lane is in bucket order), or the
+     * level-flow lane is at its end offset and has been quiet for {@link #HEALTH_HOLD_MS} since both the health record and the catch-up (so no row can be
+     * pending). Wall time alone never closes a bucket while level-flow is behind.
+     */
     synchronized void tick(long now) {
-        while (!pending.isEmpty()) {
-            var first = pending.firstEntry();
-            if (first.getKey() > levelFlowWatermark && now - first.getValue().arrivedAt() < HEALTH_HOLD_MS) {
-                break;
+        for (var entry : states.entrySet()) {
+            ContractState st = entry.getValue();
+            while (!st.pending.isEmpty()) {
+                var first = st.pending.firstEntry();
+                boolean reached = first.getKey() <= levelFlowWatermark;
+                boolean quiet = levelFlowCaughtUpSince != null && now - Math.max(first.getValue().arrivedAt(), levelFlowCaughtUpSince) >= HEALTH_HOLD_MS;
+                if (!reached && !quiet) {
+                    break;
+                }
+                st.pending.pollFirstEntry();
+                close(st, first.getValue().record(), first.getKey(), now);
             }
-            pending.pollFirstEntry();
-            close(first.getValue().record(), first.getKey(), now);
         }
     }
 
-    private void close(GenericRecord health, long bucketEnd, long now) {
-        List<EsMboJson.Row> rows = open.getOrDefault(bucketEnd, List.of());
+    private void close(ContractState st, GenericRecord health, long bucketEnd, long now) {
+        List<EsMboJson.Row> rows = st.open.getOrDefault(bucketEnd, List.of());
         String epochStatus = EsMboJson.text(health.get("epochStatus"));
         String base = EsMboJson.frameBase(EsMboJson.text(health.get("contract")), bucketEnd, epochStatus, (Long) health.get("bestBidTick"), (Long) health.get("bestAskTick"), rows);
-        open.headMap(bucketEnd, true).clear();
-        closedThrough = Math.max(closedThrough, bucketEnd);
+        st.open.headMap(bucketEnd, true).clear();
+        st.closedThrough = Math.max(st.closedThrough, bucketEnd);
         framesSeen.incrementAndGet();
         anyFrame = true;
         lastFrameBucketEnd = bucketEnd;
@@ -378,11 +425,17 @@ final class EsMboRelay {
             return;
         }
         long bucketEnd = (Long) r.get("bucketEnd");
+        int revision = (Integer) r.get("revision");
+        Event stored = events.get(key);
+        if (stored != null && revision <= stored.revision()) {
+            duplicateEvents.incrementAndGet();   // equal = a duplicate, lower = a delayed older revision: neither is stored or forwarded
+            return;
+        }
         eventsSeen.incrementAndGet();
         anyEvent = true;
         lastEventBucketEnd = Math.max(lastEventBucketEnd, bucketEnd);
         events.remove(key);   // the latest revision of an eventId replaces the earlier and moves to the end
-        events.put(key, new Event(base, base.getBytes(StandardCharsets.UTF_8).length + 16));
+        events.put(key, new Event(base, base.getBytes(StandardCharsets.UTF_8).length + 16, revision));
         while (events.size() > EVENT_RING) {
             events.remove(events.keySet().iterator().next());
         }
@@ -457,6 +510,7 @@ final class EsMboRelay {
         counter(sb, p + "event_schema_id_refused_total", "Event values refused BEFORE decoding (wrong schema id).", eventRefused.get());
         counter(sb, p + "undecodable_total", "Framed values the registry could not decode.", undecodable.get());
         counter(sb, p + "drops_total", "Records refused at the gateway boundary.", drops.get());
+        counter(sb, p + "duplicate_events_total", "Event records ignored because their revision was not newer than the stored one.", duplicateEvents.get());
         counter(sb, p + "late_rows_total", "Level-flow rows for a bucket already closed.", lateRows.get());
         counter(sb, p + "rows_dropped_total", "Level-flow rows dropped by the buffer bounds.", rowsDropped.get());
         counter(sb, p + "consumer_failures_total", "Consumer loop failures (each followed by a 2 s retry).", consumerFailures.get());
@@ -468,7 +522,15 @@ final class EsMboRelay {
     }
 
     synchronized int openBucketsForTest() {
-        return open.size();
+        int n = 0;
+        for (ContractState st : states.values()) {
+            n += st.open.size();
+        }
+        return n;
+    }
+
+    long duplicateEventsForTest() {
+        return duplicateEvents.get();
     }
 
     synchronized int framesHeldForTest() {

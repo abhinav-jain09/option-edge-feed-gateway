@@ -81,6 +81,7 @@ class EsMboLiveProbeTest {
             for (var r : merged) {
                 relay.accept(r.topic(), r.key(), r.value(), r.timestamp());
             }
+            relay.levelFlowCaughtUp(true, lastTs);   // the tail was read to its end
             relay.tick(lastTs + 5000);
             System.out.println("LIVE-PROBE read level-flow=" + all.size() + " health=" + healthRecs.size() + " events=" + eventRecs.size());
             System.out.println("LIVE-PROBE frames built=" + relay.framesHeldForTest() + " events held=" + relay.eventsHeldForTest() + " drops=" + relay.dropsForTest()

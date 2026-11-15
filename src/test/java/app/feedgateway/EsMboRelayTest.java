@@ -82,14 +82,20 @@ class EsMboRelayTest {
     }
 
     private EsMboRelay relay(Sink sink) {
-        return new EsMboRelay(SETTINGS, sink, counting);
+        EsMboRelay relay = new EsMboRelay(SETTINGS, sink, counting);
+        relay.levelFlowCaughtUp(true, 0);   // the level-flow lane is at its end offset unless a test says it is behind
+        return relay;
     }
 
     private static GenericRecord row(long bucketEnd, String side, long tick, long resting, long in, long out, long orders) {
+        return row("ESZ6", bucketEnd, side, tick, resting, in, out, orders);
+    }
+
+    private static GenericRecord row(String contract, long bucketEnd, String side, long tick, long resting, long in, long out, long orders) {
         GenericRecord r = new GenericData.Record(EsMboSchemas.LEVEL_FLOW.schema());
         r.put("schemaVersion", 1);
         r.put("environment", "Test");
-        r.put("contract", "ESZ6");
+        r.put("contract", contract);
         r.put("bucketEnd", bucketEnd);
         r.put("configFingerprint", "fp");
         r.put("side", side);
@@ -108,11 +114,15 @@ class EsMboRelayTest {
     }
 
     private static GenericRecord health(long bucketEnd, String epoch, Long bid, Long ask) {
+        return health("ESZ6", bucketEnd, epoch, bid, ask);
+    }
+
+    private static GenericRecord health(String contract, long bucketEnd, String epoch, Long bid, Long ask) {
         Schema s = EsMboSchemas.HEALTH.schema();
         GenericRecord r = new GenericData.Record(s);
         r.put("schemaVersion", 2);
         r.put("environment", "Test");
-        r.put("contract", "ESZ6");
+        r.put("contract", contract);
         r.put("bucketEnd", bucketEnd);
         r.put("configFingerprint", "fp");
         r.put("epochId", 1L);
@@ -274,6 +284,7 @@ class EsMboRelayTest {
         assertTrue(history.length() < limit);
         // a tiny bound through the real settings path: env-less settings subclass
         EsMboRelay small = new EsMboRelay(SETTINGS, new Sink(), counting, 10_000);
+        small.levelFlowCaughtUp(true, 0);
         for (int i = 0; i < 40; i++) {
             long b = NOW + i * 1000L;
             GenericRecord[] rows = new GenericRecord[40];
@@ -373,6 +384,73 @@ class EsMboRelayTest {
         assertEquals(1, s.get("framesSeen").asInt());
         assertEquals(1, s.get("eventsSeen").asInt());
         assertEquals(0, s.get("consumerFailures").asInt());
+    }
+
+    @Test
+    void aContractRollNeverMixesTwoContractsRowsOfTheSameBucket() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.accept(FLOW, "B|30000", bytes(row("ESZ6", NOW, "B", MID, 11, 0, 0, 1)), NOW);
+        relay.accept(FLOW, "B|30010", bytes(row("ESH7", NOW, "B", MID + 10, 22, 0, 0, 1)), NOW);
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health("ESZ6", NOW, "LIVE", MID, MID + 1)), NOW);
+        List<JsonNode> frames = sink.of("es-mbo-frame");
+        assertEquals(1, frames.size());
+        assertEquals("ESZ6", frames.get(0).get("contract").asText());
+        assertEquals(1, frames.get(0).get("levels").size(), "only the closing contract's row");
+        assertEquals(11, frames.get(0).get("levels").get(0).get(2).asLong());
+        assertEquals(1, relay.openBucketsForTest(), "ESH7's bucket is still open, not dropped by ESZ6's close");
+        relay.accept(HEALTH, "CME|ESH7", bytes(health("ESH7", NOW, "LIVE", MID + 10, MID + 11)), NOW);
+        frames = sink.of("es-mbo-frame");
+        assertEquals(2, frames.size(), "the same bucketEnd of the other contract still closes");
+        assertEquals("ESH7", frames.get(1).get("contract").asText());
+        assertEquals(22, frames.get(1).get("levels").get(0).get(2).asLong());
+    }
+
+    @Test
+    void aHealthRecordIsNeverClosedByWallTimeWhileLevelFlowIsBehind() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.levelFlowCaughtUp(false, NOW);   // the catch-up backlog: level-flow is behind its end offset
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW, "LIVE", MID, MID + 1)), NOW);
+        relay.tick(NOW + 3_000L);   // three times the 1 s hold, the injected clock says (still inside the 5 s live window)
+        assertEquals(0, sink.of("es-mbo-frame").size(), "behind: no frame, however long");
+        relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 40, 0, 0, 1)), NOW + 3_001L);   // the backlog reaches the bucket
+        List<JsonNode> frames = sink.of("es-mbo-frame");
+        assertEquals(1, frames.size());
+        assertEquals(1, frames.get(0).get("levels").size(), "the frame carries its rows");
+        assertEquals(0, relay.lateRowsForTest());
+    }
+
+    @Test
+    void aCaughtUpQuietLaneClosesAnEmptyBucketOnlyAfterTheHoldSinceTheCatchUp() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.levelFlowCaughtUp(false, NOW);
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW, "LIVE", MID, MID + 1)), NOW);
+        relay.levelFlowCaughtUp(true, NOW + 5_000L);   // caught up only now
+        relay.tick(NOW + 5_500L);
+        assertEquals(0, sink.of("es-mbo-frame").size(), "less than the hold since the catch-up");
+        assertEquals(0, relay.framesHeldForTest());
+        relay.tick(NOW + 6_100L);
+        assertEquals(1, relay.framesHeldForTest(), "closed (replay-only: its bucket is older than the live window)");
+    }
+
+    @Test
+    void aDelayedOlderOrEqualRevisionIsIgnoredAndCounted() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.accept(EVENTS, "E1", bytes(event("E1", 2, NOW + 1000, "VACUUM_CLEARED", null, null)), NOW + 1100);
+        relay.accept(EVENTS, "E1", bytes(event("E1", 1, NOW, "VACUUM_ABOVE", null, null)), NOW + 1200);   // delayed revision 1 after 2
+        relay.accept(EVENTS, "E1", bytes(event("E1", 2, NOW + 1000, "VACUUM_CLEARED", null, null)), NOW + 1300);   // duplicate
+        assertEquals(1, sink.of("es-mbo-event").size());
+        assertEquals(2, relay.duplicateEventsForTest());
+        JsonNode h = JSON.readTree(relay.historyJson());
+        assertEquals(1, h.get("events").size());
+        assertEquals(2, h.get("events").get(0).get("revision").asInt());
+        assertEquals("VACUUM_CLEARED", h.get("events").get(0).get("kind").asText());
+        relay.accept(EVENTS, "E1", bytes(event("E1", 3, NOW + 2000, "VACUUM_RAISED", null, null)), NOW + 2100);
+        assertEquals(2, sink.of("es-mbo-event").size(), "a newer revision still passes");
+        assertTrue(relay.statusJson().contains("\"eventsSeen\":2"));
     }
 
     @Test
