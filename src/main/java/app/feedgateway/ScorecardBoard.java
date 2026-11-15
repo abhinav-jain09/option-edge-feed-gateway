@@ -11,7 +11,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.TreeSet;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.util.Utf8;
 
@@ -32,6 +31,9 @@ final class ScorecardBoard {
     private final Map<String, Long> undecodable = new LinkedHashMap<>();
     private final Map<String, String> state = new LinkedHashMap<>();   // topic to LOADING, LIVE or TOPIC_MISSING
     private long evicted;
+    /** trade date to the number of rows held for it, kept in step with every put, remove and eviction so the bound is O(dates), not O(rows), per record. */
+    private final TreeMap<String, Integer> dateCounts = new TreeMap<>();
+    private int total;
 
     synchronized void configure(List<String> topics) {
         for (String t : topics) {
@@ -53,7 +55,7 @@ final class ScorecardBoard {
     synchronized void remove(String topic, String key) {
         Map<String, ObjectNode> m = rows.get(topic);
         if (m != null && key != null) {
-            m.remove(key);
+            forget(m.remove(key));
         }
     }
 
@@ -74,28 +76,28 @@ final class ScorecardBoard {
             countUndecodable(topic);
             return;
         }
-        m.put(key, row);
+        forget(m.put(key, row));
+        dateCounts.merge(date, 1, Integer::sum);
+        total++;
         bound();
     }
 
-    private void bound() {
-        TreeSet<String> dates = new TreeSet<>(Comparator.reverseOrder());
-        int n = 0;
-        for (Map<String, ObjectNode> m : rows.values()) {
-            for (ObjectNode row : m.values()) {
-                dates.add(row.path("tradeDate").asText());
-                n++;
-            }
+    private void forget(ObjectNode old) {
+        if (old != null) {
+            dateCounts.computeIfPresent(old.path("tradeDate").asText(), (d, n) -> n <= 1 ? null : n - 1);
+            total--;
         }
-        while (dates.size() > MAX_TRADE_DATES || (n > MAX_ROWS && dates.size() > 1)) {
-            String oldest = dates.pollLast();
+    }
+
+    private void bound() {
+        while (dateCounts.size() > MAX_TRADE_DATES || (total > MAX_ROWS && dateCounts.size() > 1)) {
+            String oldest = dateCounts.firstKey();
             for (Map<String, ObjectNode> m : rows.values()) {
                 int before = m.size();
                 m.values().removeIf(row -> row.path("tradeDate").asText().equals(oldest));
-                int gone = before - m.size();
-                evicted += gone;
-                n -= gone;
+                evicted += before - m.size();
             }
+            total -= dateCounts.remove(oldest);
         }
     }
 
@@ -141,11 +143,7 @@ final class ScorecardBoard {
     }
 
     synchronized int rowCount() {
-        int n = 0;
-        for (Map<String, ObjectNode> m : rows.values()) {
-            n += m.size();
-        }
-        return n;
+        return total;
     }
 
     synchronized long evicted() {
