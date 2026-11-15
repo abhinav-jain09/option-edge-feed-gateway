@@ -387,23 +387,103 @@ class EsMboRelayTest {
     }
 
     @Test
-    void aContractRollNeverMixesTwoContractsRowsOfTheSameBucket() throws Exception {
+    void anOtherContractRowForTheSameBucketNeverClosesOrMixesWithTheCurrentContract() throws Exception {
         Sink sink = new Sink();
         EsMboRelay relay = relay(sink);
-        relay.accept(FLOW, "B|30000", bytes(row("ESZ6", NOW, "B", MID, 11, 0, 0, 1)), NOW);
-        relay.accept(FLOW, "B|30010", bytes(row("ESH7", NOW, "B", MID + 10, 22, 0, 0, 1)), NOW);
+        relay.levelFlowCaughtUp(false, NOW - 2000);   // behind: only a current-contract row can close a bucket
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health("ESZ6", NOW - 1000, "LIVE", MID, MID + 1)), NOW - 1000);   // ESZ6 is the newest health: current
+        relay.tick(NOW + 500);
+        assertEquals("ESZ6", relay.currentContractForTest());
         relay.accept(HEALTH, "CME|ESZ6", bytes(health("ESZ6", NOW, "LIVE", MID, MID + 1)), NOW);
+        relay.accept(FLOW, "B|30010", bytes(row("ESH7", NOW, "B", MID + 10, 22, 0, 0, 1)), NOW + 10);   // the other contract's row for T arrives FIRST
+        assertEquals(0, sink.of("es-mbo-frame").size(), "an ESH7 row must not advance ESZ6's watermark and close its bucket");
+        assertEquals(1, relay.otherContractForTest());
+        relay.accept(FLOW, "B|30000", bytes(row("ESZ6", NOW, "B", MID, 11, 0, 0, 1)), NOW + 20);
         List<JsonNode> frames = sink.of("es-mbo-frame");
-        assertEquals(1, frames.size());
-        assertEquals("ESZ6", frames.get(0).get("contract").asText());
-        assertEquals(1, frames.get(0).get("levels").size(), "only the closing contract's row");
-        assertEquals(11, frames.get(0).get("levels").get(0).get(2).asLong());
-        assertEquals(1, relay.openBucketsForTest(), "ESH7's bucket is still open, not dropped by ESZ6's close");
-        relay.accept(HEALTH, "CME|ESH7", bytes(health("ESH7", NOW, "LIVE", MID + 10, MID + 11)), NOW);
-        frames = sink.of("es-mbo-frame");
-        assertEquals(2, frames.size(), "the same bucketEnd of the other contract still closes");
+        assertEquals(2, frames.size(), "the held earlier bucket and this one");
+        assertEquals(1, frames.get(1).get("levels").size(), "only the current contract's row");
+        assertEquals(11, frames.get(1).get("levels").get(0).get(2).asLong());
+    }
+
+    @Test
+    void aChangeOfTheCurrentContractResetsTheFoldingStateAndSaysSoInTheStatus() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        feedBucket(relay, NOW, MID, MID + 1, row(NOW, "B", MID, 5, 0, 0, 1));
+        relay.levelFlowCaughtUp(false, NOW + 1);   // level-flow is behind from here: only rows close buckets
+        relay.accept(EVENTS, "VAC|ESZ6|1", bytes(event("VAC|ESZ6|1", 1, NOW, "VACUUM_ABOVE", null, null)), NOW);
+        relay.accept(FLOW, "B|30000", bytes(row(NOW + 1000, "B", MID, 6, 0, 0, 1)), NOW + 1000);   // an open ESZ6 bucket
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health("ESZ6", NOW + 5000, "LIVE", MID, MID + 1)), NOW + 1100);   // held: level-flow has not reached it
+        assertEquals(1, relay.framesHeldForTest());
+        assertTrue(JSON.readTree(relay.statusJson()).get("contract").asText().equals("ESZ6"));
+        relay.accept(HEALTH, "CME|ESH7", bytes(health("ESH7", NOW + 2000, "LIVE", MID + 100, MID + 101)), NOW + 2000);   // the engine now speaks ESH7
+        assertEquals("ESH7", relay.currentContractForTest());
+        assertEquals("ESH7", JSON.readTree(relay.statusJson()).get("contract").asText());
+        assertEquals(0, relay.openBucketsForTest(), "open buckets reset");
+        assertEquals(0, relay.framesHeldForTest(), "the other contract's frames are not served");
+        assertEquals(0, relay.eventsHeldForTest(), "nor its events");
+        relay.accept(FLOW, "B|30000", bytes(row(NOW + 6000, "B", MID, 6, 0, 0, 1)), NOW + 6000);   // ESZ6 goes on speaking: dropped, counted
+        assertEquals(1, relay.otherContractForTest());
+        assertEquals(0, relay.openBucketsForTest());
+        assertEquals(1, sink.of("es-mbo-frame").size(), "the held ESZ6 health never closes after the reset");
+        relay.accept(FLOW, "B|30100", bytes(row("ESH7", NOW + 2000, "B", MID + 100, 9, 0, 0, 1)), NOW + 2100);
+        List<JsonNode> frames = sink.of("es-mbo-frame");
+        assertEquals(2, frames.size(), "ESH7's bucket closes on ESH7's own row");
         assertEquals("ESH7", frames.get(1).get("contract").asText());
-        assertEquals(22, frames.get(1).get("levels").get(0).get(2).asLong());
+        assertEquals(1, frames.get(1).get("levels").size());
+    }
+
+    @Test
+    void theFirstHealthEverBecomesCurrentAndKeepsTheRowsReadBeforeItWhenTheyAreTheSameContract() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        assertEquals(null, relay.currentContractForTest());
+        relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 40, 0, 0, 1)), NOW);   // level-flow ahead of health at the start of a catch-up
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health("ESZ6", NOW, "LIVE", MID, MID + 1)), NOW);
+        assertEquals("ESZ6", relay.currentContractForTest());
+        assertEquals(1, sink.of("es-mbo-frame").get(0).get("levels").size());
+        // rows of a different contract read first are provisional and thrown away when the first health names another
+        EsMboRelay other = relay(new Sink());
+        other.accept(FLOW, "B|30000", bytes(row("ESH7", NOW, "B", MID, 40, 0, 0, 1)), NOW);
+        other.accept(HEALTH, "CME|ESZ6", bytes(health("ESZ6", NOW, "LIVE", MID, MID + 1)), NOW);
+        assertEquals("ESZ6", other.currentContractForTest());
+        assertEquals(0, other.openBucketsForTest());
+    }
+
+    @Test
+    void evictingAnEventFromTheRingNeverForgetsItsHighRevision() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.accept(EVENTS, "E1", bytes(event("E1", 2, NOW, "VACUUM_CLEARED", null, null)), NOW);
+        for (int i = 0; i < EsMboRelay.EVENT_RING + 5; i++) {
+            relay.accept(EVENTS, "X" + i, bytes(event("X" + i, 1, NOW, "VACUUM_ABOVE", null, null)), NOW);
+        }
+        assertFalse(JSON.readTree(relay.historyJson()).toString().contains("\"E1\""), "E1 left the ring");
+        int before = sink.of("es-mbo-event").size();
+        relay.accept(EVENTS, "E1", bytes(event("E1", 1, NOW, "VACUUM_ABOVE", null, null)), NOW + 100);   // a stale revision after the eviction
+        assertEquals(before, sink.of("es-mbo-event").size());
+        assertEquals(1, relay.duplicateEventsForTest());
+        assertFalse(JSON.readTree(relay.historyJson()).toString().contains("\"E1\""), "and it did not re-enter the ring");
+        relay.accept(EVENTS, "E1", bytes(event("E1", 3, NOW + 200, "VACUUM_RAISED", null, null)), NOW + 200);
+        assertEquals(before + 1, sink.of("es-mbo-event").size(), "a newer revision still passes");
+    }
+
+    @Test
+    void theLedgerIsPrunedByAgeToTheEventsWindowAndAnythingOutsideTheWindowIsNeverAccepted() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        for (int i = 0; i < 50; i++) {
+            relay.accept(EVENTS, "E" + i, bytes(event("E" + i, 1, NOW, "VACUUM_ABOVE", null, null)), NOW);
+        }
+        assertEquals(50, relay.ledgerSizeForTest());
+        long later = NOW + EsMboRelay.EVENTS_LOOKBACK_MS + 120_000L;
+        relay.accept(EVENTS, "NEW", bytes(event("NEW", 1, later, "VACUUM_ABOVE", null, null)), later);
+        assertEquals(1, relay.ledgerSizeForTest(), "entries older than the window are pruned: bounded by age");
+        int before = sink.of("es-mbo-event").size();
+        relay.accept(EVENTS, "E0", bytes(event("E0", 1, NOW, "VACUUM_ABOVE", null, null)), later + 1);   // pruned id, but its bucket end is outside the window
+        assertEquals(before, sink.of("es-mbo-event").size(), "outside the window it is not re-accepted either");
+        assertEquals(1, relay.ledgerSizeForTest());
+        assertEquals(1, relay.eventsHeldForTest(), "and it is outside the replay ring too");
     }
 
     @Test

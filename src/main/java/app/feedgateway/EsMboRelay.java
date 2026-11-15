@@ -40,6 +40,8 @@ import org.springframework.stereotype.Component;
  * 3503 events; {@link EsMboSchemas#assertFramedAs}) BEFORE any decoding, a mismatch being refused and counted; then the bytes are decoded by the registry
  * through {@link GatewayAvroDeserializer} (tolerant: unknown id / corrupt body is counted, not relayed); then {@link EsMboJson}'s record checks.
  * <ul>
+ * <li>ONE contract at a time: the contract of the newest health record. Rows and events of another contract are dropped and counted
+ * ({@code gateway_es_mbo_other_contract_total}); a change of contract resets the folding state completely and is shown as {@code contract} in the status.</li>
  * <li>Level-flow rows are folded by bucket end in a bounded buffer. The health record of a bucket CLOSES it: one {@code es-mbo-frame} is emitted and every
  * buffered bucket at or before it is dropped. The two topics are separate partitions, so a health record is held (bounded) until level-flow has reached its
  * bucket (or {@link #HEALTH_HOLD_MS} passes: a quiet bucket has no rows) so a catch-up read never closes a bucket before its rows are read.</li>
@@ -74,7 +76,7 @@ final class EsMboRelay {
     private record Frame(String base, long bucketEnd, int bytes) {
     }
 
-    private record Event(String base, int bytes, int revision) {
+    private record Event(String base, int bytes, String contract, long bucketEnd) {
     }
 
     private record PendingHealth(GenericRecord record, long arrivedAt) {
@@ -86,17 +88,22 @@ final class EsMboRelay {
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicLong levelFlowRefused = new AtomicLong(), healthRefused = new AtomicLong(), eventRefused = new AtomicLong();
     private final AtomicLong undecodable = new AtomicLong(), drops = new AtomicLong(), consumerFailures = new AtomicLong();
+    private final AtomicLong otherContract = new AtomicLong(), eventsOutsideWindow = new AtomicLong();
     private final AtomicLong duplicateEvents = new AtomicLong();
     private final AtomicLong framesSeen = new AtomicLong(), eventsSeen = new AtomicLong(), lateRows = new AtomicLong(), rowsDropped = new AtomicLong();
-    /** One contract's open level-flow buckets, held health records and closed watermark: a roll (ESH7 after ESZ6) never mixes two contracts' rows. */
-    private static final class ContractState {
-        final TreeMap<Long, List<EsMboJson.Row>> open = new TreeMap<>();
-        final TreeMap<Long, PendingHealth> pending = new TreeMap<>();
-        long closedThrough;
-    }
-
-    static final int MAX_CONTRACTS = 16;
-    private final Map<String, ContractState> states = new LinkedHashMap<>();
+    /**
+     * ONE contract at a time: the contract of the newest health record (the engine publishes one contract; a roll is a contract-table change). Before the
+     * first health record the contract of the first level-flow row is provisional. Rows and events of any other contract are dropped and counted; a change of
+     * the current contract resets the folding state completely.
+     */
+    private String current, provisional;
+    private final TreeMap<Long, List<EsMboJson.Row>> open = new TreeMap<>();
+    private final TreeMap<Long, PendingHealth> pending = new TreeMap<>();
+    private long closedThrough;
+    /** eventId -> {highest revision accepted, its bucketEnd}: separate from the replay ring, pruned by age to the events read window, so evicting from the ring never forgets a revision. */
+    private final Map<String, long[]> ledger = new HashMap<>();
+    private long lastLedgerPrune;
+    static final long LEDGER_PRUNE_EVERY_MS = 60_000L;
     /** Wall-clock instant the level-flow lane was last seen caught up (position at its end offset) continuously, or null while it is behind. */
     private Long levelFlowCaughtUpSince;
     private final ArrayDeque<Frame> frames = new ArrayDeque<>();
@@ -316,14 +323,14 @@ final class EsMboRelay {
                 return;
             }
             long bucketEnd = (Long) r.get("bucketEnd");
-            ContractState st = state(EsMboJson.text(r.get("contract")));
-            if (bucketEnd <= st.closedThrough) {
+            adopt(EsMboJson.text(r.get("contract")));   // the newest health record names the contract served
+            if (bucketEnd <= closedThrough) {
                 drops.incrementAndGet();   // a bucket already closed (a re-read): never a second frame
                 return;
             }
-            st.pending.put(bucketEnd, new PendingHealth(r, now));
-            while (st.pending.size() > MAX_PENDING_HEALTH) {
-                st.pending.pollFirstEntry();
+            pending.put(bucketEnd, new PendingHealth(r, now));
+            while (pending.size() > MAX_PENDING_HEALTH) {
+                pending.pollFirstEntry();
                 drops.incrementAndGet();
             }
         } else {
@@ -332,16 +339,25 @@ final class EsMboRelay {
         tick(now);
     }
 
-    private ContractState state(String contract) {
-        ContractState st = states.get(contract);
-        if (st == null) {
-            st = new ContractState();
-            states.put(contract, st);
-            while (states.size() > MAX_CONTRACTS) {
-                states.remove(states.keySet().iterator().next());
-            }
+    /** The newest health record's contract becomes the one served; a change resets the folding state completely (open buckets, held health, watermark, frames, the other contract's events). */
+    private void adopt(String contract) {
+        if (contract.equals(current)) {
+            return;
         }
-        return st;
+        boolean firstAndMatchesRows = current == null && contract.equals(provisional);   // rows read before the first health are this contract's: keep them
+        current = contract;
+        provisional = null;
+        if (!firstAndMatchesRows) {
+            open.clear();
+            pending.clear();
+            levelFlowWatermark = 0;
+            closedThrough = 0;
+        }
+        frames.clear();
+        anyFrame = false;
+        lastFrameBucketEnd = 0;
+        lastEpochStatus = null;
+        events.values().removeIf(e -> !e.contract().equals(contract));
     }
 
     /** Called by the consumer loop after each poll: the level-flow lane is (or is not) at its end offset. A seam for tests with an injected clock. */
@@ -361,20 +377,27 @@ final class EsMboRelay {
             return;
         }
         long bucketEnd = (Long) r.get("bucketEnd");
-        ContractState st = state(EsMboJson.text(r.get("contract")));
-        if (bucketEnd <= st.closedThrough) {
+        String contract = EsMboJson.text(r.get("contract"));
+        if (current == null && provisional == null) {
+            provisional = contract;
+        }
+        if (!contract.equals(current != null ? current : provisional)) {
+            otherContract.incrementAndGet();   // not the served contract: dropped, and it never advances the served contract's watermark
+            return;
+        }
+        if (bucketEnd <= closedThrough) {
             lateRows.incrementAndGet();   // its bucket was closed by the health record: never a second frame
             return;
         }
         levelFlowWatermark = Math.max(levelFlowWatermark, bucketEnd);
-        List<EsMboJson.Row> rows = st.open.computeIfAbsent(bucketEnd, k -> new ArrayList<>());
+        List<EsMboJson.Row> rows = open.computeIfAbsent(bucketEnd, k -> new ArrayList<>());
         if (rows.size() >= MAX_ROWS_PER_BUCKET) {
             rowsDropped.incrementAndGet();
         } else {
             rows.add(row);
         }
-        while (st.open.size() > MAX_OPEN_BUCKETS) {
-            rowsDropped.addAndGet(st.open.pollFirstEntry().getValue().size());
+        while (open.size() > MAX_OPEN_BUCKETS) {
+            rowsDropped.addAndGet(open.pollFirstEntry().getValue().size());
         }
     }
 
@@ -384,27 +407,24 @@ final class EsMboRelay {
      * pending). Wall time alone never closes a bucket while level-flow is behind.
      */
     synchronized void tick(long now) {
-        for (var entry : states.entrySet()) {
-            ContractState st = entry.getValue();
-            while (!st.pending.isEmpty()) {
-                var first = st.pending.firstEntry();
-                boolean reached = first.getKey() <= levelFlowWatermark;
-                boolean quiet = levelFlowCaughtUpSince != null && now - Math.max(first.getValue().arrivedAt(), levelFlowCaughtUpSince) >= HEALTH_HOLD_MS;
-                if (!reached && !quiet) {
-                    break;
-                }
-                st.pending.pollFirstEntry();
-                close(st, first.getValue().record(), first.getKey(), now);
+        while (!pending.isEmpty()) {
+            var first = pending.firstEntry();
+            boolean reached = first.getKey() <= levelFlowWatermark;
+            boolean quiet = levelFlowCaughtUpSince != null && now - Math.max(first.getValue().arrivedAt(), levelFlowCaughtUpSince) >= HEALTH_HOLD_MS;
+            if (!reached && !quiet) {
+                break;
             }
+            pending.pollFirstEntry();
+            close(first.getValue().record(), first.getKey(), now);
         }
     }
 
-    private void close(ContractState st, GenericRecord health, long bucketEnd, long now) {
-        List<EsMboJson.Row> rows = st.open.getOrDefault(bucketEnd, List.of());
+    private void close(GenericRecord health, long bucketEnd, long now) {
+        List<EsMboJson.Row> rows = open.getOrDefault(bucketEnd, List.of());
         String epochStatus = EsMboJson.text(health.get("epochStatus"));
         String base = EsMboJson.frameBase(EsMboJson.text(health.get("contract")), bucketEnd, epochStatus, (Long) health.get("bestBidTick"), (Long) health.get("bestAskTick"), rows);
-        st.open.headMap(bucketEnd, true).clear();
-        st.closedThrough = Math.max(st.closedThrough, bucketEnd);
+        open.headMap(bucketEnd, true).clear();
+        closedThrough = Math.max(closedThrough, bucketEnd);
         framesSeen.incrementAndGet();
         anyFrame = true;
         lastFrameBucketEnd = bucketEnd;
@@ -418,6 +438,28 @@ final class EsMboRelay {
         }
     }
 
+    private void pruneLedger(long now) {
+        if (now - lastLedgerPrune < LEDGER_PRUNE_EVERY_MS) {
+            return;
+        }
+        lastLedgerPrune = now;
+        long floor = now - EVENTS_LOOKBACK_MS;
+        ledger.values().removeIf(v -> v[1] < floor);
+        events.values().removeIf(e -> e.bucketEnd() < floor);   // the replay ring covers the same window, so a pruned ledger entry is also gone from the replay
+    }
+
+    synchronized int ledgerSizeForTest() {
+        return ledger.size();
+    }
+
+    synchronized String currentContractForTest() {
+        return current;
+    }
+
+    long otherContractForTest() {
+        return otherContract.get();
+    }
+
     private void acceptEvent(String key, GenericRecord r, long now) {
         String base = r == null ? null : EsMboJson.eventBase(key, r);
         if (base == null) {
@@ -426,16 +468,27 @@ final class EsMboRelay {
         }
         long bucketEnd = (Long) r.get("bucketEnd");
         int revision = (Integer) r.get("revision");
-        Event stored = events.get(key);
-        if (stored != null && revision <= stored.revision()) {
+        String contract = EsMboJson.text(r.get("contract"));
+        if (current != null && !contract.equals(current)) {
+            otherContract.incrementAndGet();
+            return;
+        }
+        if (bucketEnd < now - EVENTS_LOOKBACK_MS) {
+            eventsOutsideWindow.incrementAndGet();   // outside the window the ledger covers: never accepted, so a pruned ledger entry can never let it in
+            return;
+        }
+        pruneLedger(now);
+        long[] known = ledger.get(key);
+        if (known != null && revision <= known[0]) {
             duplicateEvents.incrementAndGet();   // equal = a duplicate, lower = a delayed older revision: neither is stored or forwarded
             return;
         }
+        ledger.put(key, new long[] {revision, bucketEnd});
         eventsSeen.incrementAndGet();
         anyEvent = true;
         lastEventBucketEnd = Math.max(lastEventBucketEnd, bucketEnd);
         events.remove(key);   // the latest revision of an eventId replaces the earlier and moves to the end
-        events.put(key, new Event(base, base.getBytes(StandardCharsets.UTF_8).length + 16, revision));
+        events.put(key, new Event(base, base.getBytes(StandardCharsets.UTF_8).length + 16, contract, bucketEnd));
         while (events.size() > EVENT_RING) {
             events.remove(events.keySet().iterator().next());
         }
@@ -451,7 +504,7 @@ final class EsMboRelay {
 
     /** The heartbeat body, so the page can say "engine not publishing" honestly. */
     synchronized String statusJson() {
-        return "{\"enabled\":true,\"lastFrameBucketEnd\":" + (anyFrame ? lastFrameBucketEnd : null) + ",\"lastEventBucketEnd\":" + (anyEvent ? lastEventBucketEnd : null)
+        return "{\"enabled\":true,\"contract\":" + (current == null ? "null" : EsMboJson.quote(current)) + ",\"lastFrameBucketEnd\":" + (anyFrame ? lastFrameBucketEnd : null) + ",\"lastEventBucketEnd\":" + (anyEvent ? lastEventBucketEnd : null)
                 + ",\"epochStatus\":" + (lastEpochStatus == null ? "null" : EsMboJson.quote(lastEpochStatus)) + ",\"framesSeen\":" + framesSeen.get() + ",\"eventsSeen\":" + eventsSeen.get()
                 + ",\"schemaIdRefused\":" + (levelFlowRefused.get() + healthRefused.get() + eventRefused.get()) + ",\"undecodable\":" + undecodable.get()
                 + ",\"consumerFailures\":" + consumerFailures.get() + "}";
@@ -511,6 +564,8 @@ final class EsMboRelay {
         counter(sb, p + "undecodable_total", "Framed values the registry could not decode.", undecodable.get());
         counter(sb, p + "drops_total", "Records refused at the gateway boundary.", drops.get());
         counter(sb, p + "duplicate_events_total", "Event records ignored because their revision was not newer than the stored one.", duplicateEvents.get());
+        counter(sb, p + "other_contract_total", "Rows and events of a contract other than the one served (the newest health record's).", otherContract.get());
+        counter(sb, p + "events_outside_window_total", "Event records whose bucket end is older than the events read window.", eventsOutsideWindow.get());
         counter(sb, p + "late_rows_total", "Level-flow rows for a bucket already closed.", lateRows.get());
         counter(sb, p + "rows_dropped_total", "Level-flow rows dropped by the buffer bounds.", rowsDropped.get());
         counter(sb, p + "consumer_failures_total", "Consumer loop failures (each followed by a 2 s retry).", consumerFailures.get());
@@ -522,10 +577,7 @@ final class EsMboRelay {
     }
 
     synchronized int openBucketsForTest() {
-        int n = 0;
-        for (ContractState st : states.values()) {
-            n += st.open.size();
-        }
+        int n = open.size();
         return n;
     }
 
