@@ -9240,7 +9240,15 @@ public class FeedGatewayService implements ReplayRunner {
      * what a MISBEHAVING producer can do to a connecting client, and it is small enough that the
      * profile's size cannot matter either.
      *
-     * <p>Newest first because when the cap does bite, the current session is the one worth having.
+     * <p><b>SELECTED newest-first, SENT oldest-first, and the two are not the same question.</b>
+     * The cap is chosen newest-first because when it bites, the current session is the one worth
+     * having. But the page replaces its whole gamma-zone state on every message it receives -- it
+     * has no notion of which session is the current one -- so whichever record is DELIVERED LAST
+     * is the one the viewer ends up looking at. Sending newest-first therefore handed the page the
+     * current session and then overwrote it with an older one, and a reader who connected on
+     * Monday could be shown Friday (Codex). Sorting once and sending in reverse makes the newest
+     * arrive last, so last-write-wins lands on the session the reader wants, whatever the page
+     * does with the ones before it.
      */
     private void replayGammaZoneMap(WebSocketSession session, String event,
                                     Map<String, String> cache, long nowMs) {
@@ -9255,16 +9263,29 @@ public class FeedGatewayService implements ReplayRunner {
             }
             fresh.add(entry);
         }
-        // The cache key begins with the session date (yyyy-MM-dd), so descending by key is
-        // descending by session. A key that does not is simply ordered consistently, never dropped.
-        fresh.sort((a, b) -> b.getKey().compareTo(a.getKey()));
-        int sent = 0;
-        for (Map.Entry<String, String> entry : fresh) {
-            if (sent++ >= GAMMA_ZONE_REPLAY_LIMIT) {
-                break;
-            }
-            send(session, event, entry.getValue());
+        for (String json : gammaZoneReplayOrder(fresh)) {
+            send(session, event, json);
         }
+    }
+
+    /**
+     * The whole ordering decision, as a pure function so it can be tested on values rather than on
+     * the shape of the source text around it.
+     *
+     * <p>Sorts descending by key -- the key begins with the session date (yyyy-MM-dd), so that is
+     * descending by session, and a key that does not is simply ordered consistently, never dropped
+     * -- keeps the NEWEST {@link #GAMMA_ZONE_REPLAY_LIMIT}, then returns them OLDEST FIRST so the
+     * newest is the last write the page applies.
+     */
+    static List<String> gammaZoneReplayOrder(List<Map.Entry<String, String>> fresh) {
+        List<Map.Entry<String, String>> sorted = new ArrayList<>(fresh);
+        sorted.sort((a, b) -> b.getKey().compareTo(a.getKey()));
+        List<String> out = new ArrayList<>();
+        int kept = Math.min(GAMMA_ZONE_REPLAY_LIMIT, sorted.size());
+        for (int i = kept - 1; i >= 0; i--) {
+            out.add(sorted.get(i).getValue());
+        }
+        return out;
     }
 
     /** Legacy-mode cached replay of the standalone corridor-gauge state on connect. Fresh

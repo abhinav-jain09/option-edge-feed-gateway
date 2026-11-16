@@ -155,16 +155,51 @@ class GammaZoneWiringTest {
         assertEquals(2, calls, "one call per routing mode, legacy and per-session");
     }
 
+    private static java.util.List<java.util.Map.Entry<String, String>> sessions(String... dates) {
+        java.util.List<java.util.Map.Entry<String, String>> out = new java.util.ArrayList<>();
+        for (String d : dates) {
+            out.add(java.util.Map.entry(d + "|ES.v.0|1m", "payload-" + d));
+        }
+        return out;
+    }
+
     @Test
-    void theReplayIsBOUNDEDBecauseNeitherEventCoalesces() throws IOException {
+    void theReplayIsBOUNDEDBecauseNeitherEventCoalesces() {
         // Every replayed record is its own outbound queue item, and a joining socket that exceeded
         // the queue bound would just be disconnected. The cap is a bound on what a misbehaving
         // producer can do to a connecting client, not a policy about what a reader may see.
-        String source = source();
-        assertTrue(source.contains("static final int GAMMA_ZONE_REPLAY_LIMIT"));
-        assertTrue(source.contains("if (sent++ >= GAMMA_ZONE_REPLAY_LIMIT) {"));
-        assertTrue(source.contains("fresh.sort((a, b) -> b.getKey().compareTo(a.getKey()));"),
-                "newest session first, so a cap that bites keeps the one worth having");
+        // RUNS the real ordering, rather than pinning the text that implements it.
+        java.util.List<String> sent = FeedGatewayService.gammaZoneReplayOrder(
+                sessions("2026-11-09", "2026-11-10", "2026-11-11", "2026-11-12", "2026-11-13",
+                        "2026-11-16"));
+        assertEquals(FeedGatewayService.GAMMA_ZONE_REPLAY_LIMIT, sent.size());
+        assertFalse(sent.contains("payload-2026-11-09"), "the cap drops the OLDEST, never the newest");
+        assertFalse(sent.contains("payload-2026-11-10"));
+        assertTrue(sent.contains("payload-2026-11-16"), "a cap that bites must keep the current session");
+    }
+
+    @Test
+    void theNEWESTSessionIsTheLASTRecordThePageReceives() {
+        // The page replaces its whole gamma-zone state on every message -- it has no notion of
+        // which session is current -- so whichever record arrives LAST is the one on screen.
+        // Delivering newest-first meant a reader connecting on Monday was handed Monday and then
+        // had Friday written over it.
+        for (java.util.List<java.util.Map.Entry<String, String>> order : java.util.List.of(
+                sessions("2026-11-13", "2026-11-16"),      // already ascending
+                sessions("2026-11-16", "2026-11-13"),      // descending
+                sessions("2026-11-16", "2026-11-09", "2026-11-13"))) {  // arbitrary
+            java.util.List<String> sent = FeedGatewayService.gammaZoneReplayOrder(order);
+            assertEquals("payload-2026-11-16", sent.get(sent.size() - 1),
+                    "last write wins, so the newest session must be delivered last");
+        }
+    }
+
+    @Test
+    void oneSessionIsSentOnceAndNoneIsSentAtAllWhenThereAreNoFreshEntries() {
+        assertEquals(java.util.List.of("payload-2026-11-16"),
+                FeedGatewayService.gammaZoneReplayOrder(sessions("2026-11-16")));
+        assertEquals(java.util.List.of(),
+                FeedGatewayService.gammaZoneReplayOrder(java.util.List.of()));
     }
 
     @Test
