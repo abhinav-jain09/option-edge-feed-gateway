@@ -99,6 +99,35 @@ public final class SessionRoutingEngine {
     }
 
     /**
+     * The session for this id, registered if absent, otherwise refreshed - as ONE write-locked step.
+     *
+     * <p>Callers used to ask {@link #appSession} and then call {@link #registerAppSession} or
+     * {@link #refreshEntitlements}/{@link #changeSelectionIfDifferent} as separate steps. Two requests of the
+     * same account arriving together (a page loads several REST calls at once, right after the idle-session
+     * reaper has just removed its session) both saw "absent": one registered, the other threw
+     * {@code AppSession already registered} and the caller answered 500. The reaper can equally remove the
+     * session between the check and a refresh, which then threw from {@code require}. The lock is reentrant,
+     * so the three engine calls below run inside this one critical section and no other thread can interleave.
+     *
+     * <p>Present: the entitlements are replaced from the fresh token (a revoked role must not outlive the
+     * session) and the selection is re-validated against them; an unchanged selection is not re-applied.
+     * Absent: registered with the given approval state and policy (limits and entitlement still enforced).
+     */
+    public void registerOrRefreshAppSession(String appSessionId, String userId, Selection selection,
+                                            Set<String> entitlements, ApprovalState approvalState,
+                                            UserSessionPolicy policy) {
+        Objects.requireNonNull(appSessionId, "appSessionId");
+        runWrite(() -> {
+            if (appSessions.containsKey(appSessionId)) {
+                refreshEntitlements(appSessionId, entitlements);
+                changeSelectionIfDifferent(appSessionId, selection);
+            } else {
+                registerAppSession(appSessionId, userId, selection, entitlements, approvalState, policy);
+            }
+        });
+    }
+
+    /**
      * Register a new AppSession with explicit approval state and session policy. Rejects
      * unapproved users (FR-15), enforces concurrency limits (FR-27) and source entitlement (FR-12),
      * stamps activity/deadline timestamps from the engine clock, and acquires the Databento

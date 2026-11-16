@@ -197,4 +197,65 @@ class SessionRoutingEngineTest {
         e.detachSocket("a");
         assertEquals(java.util.Map.of("app1", 1, "app2", 1), e.socketCountsByAppSession());
     }
+
+    @Test
+    void registerOrRefreshRegistersWhenAbsentAndRefreshesWhenPresent() {
+        SessionRoutingEngine e = engine();
+        Selection sel = dbnto("SPX", "20260612", StrikeWindow.ALL);
+        e.registerOrRefreshAppSession("app1", "u1", sel, DBNTO, ApprovalState.APPROVED, UserSessionPolicy.systemDefault());
+        assertTrue(e.appSession("app1").isPresent());
+        // present: no throw, the entitlements are replaced from the fresh token
+        e.registerOrRefreshAppSession("app1", "u1", sel, IBKR, ApprovalState.APPROVED, UserSessionPolicy.systemDefault());
+        assertEquals(IBKR, e.appSession("app1").orElseThrow().entitlements());
+        assertEquals(1, e.appSession("app1").stream().count());
+    }
+
+    @Test
+    void registerOrRefreshStillRefusesAnUnapprovedNewSession() {
+        SessionRoutingEngine e = engine();
+        assertThrows(NotApprovedException.class, () -> e.registerOrRefreshAppSession("app1", "u1",
+                dbnto("SPX", "20260612", StrikeWindow.ALL), DBNTO, ApprovalState.SUSPENDED, UserSessionPolicy.systemDefault()));
+    }
+
+    @Test
+    void registerOrRefreshRevokesARoleOnAnExistingSession() {
+        SessionRoutingEngine e = engine();
+        Selection ibkr = new Selection(MarketDataSource.IBKR, "SPX", "20260617", StrikeWindow.ALL);
+        e.registerOrRefreshAppSession("app1", "u1", ibkr, IBKR, ApprovalState.APPROVED, UserSessionPolicy.systemDefault());
+        // the fresh token no longer carries ibkr-user: the same selection must now be refused, not kept
+        assertThrows(NotEntitledException.class, () -> e.registerOrRefreshAppSession("app1", "u1", ibkr, DBNTO,
+                ApprovalState.APPROVED, UserSessionPolicy.systemDefault()));
+    }
+
+    /**
+     * The 2026-11-16 defect: many concurrent requests of ONE account at the moment its session is absent.
+     * With check-then-register every loser threw "AppSession already registered".
+     */
+    @Test
+    void concurrentRegisterOrRefreshOfOneAccountNeverThrows() throws Exception {
+        for (int round = 0; round < 300; round++) {
+            SessionRoutingEngine e = engine();
+            Selection sel = dbnto("SPX", "20260612", StrikeWindow.ALL);
+            int threads = 8;
+            java.util.concurrent.CyclicBarrier go = new java.util.concurrent.CyclicBarrier(threads);
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+            try {
+                java.util.List<java.util.concurrent.Future<?>> fs = new java.util.ArrayList<>();
+                for (int i = 0; i < threads; i++) {
+                    fs.add(pool.submit(() -> {
+                        go.await();
+                        e.registerOrRefreshAppSession("app1", "u1", sel, DBNTO, ApprovalState.APPROVED,
+                                UserSessionPolicy.systemDefault());
+                        return null;
+                    }));
+                }
+                for (java.util.concurrent.Future<?> f : fs) {
+                    f.get(10, java.util.concurrent.TimeUnit.SECONDS);   // rethrows any worker's exception
+                }
+            } finally {
+                pool.shutdownNow();
+            }
+            assertTrue(e.appSession("app1").isPresent());
+        }
+    }
 }
