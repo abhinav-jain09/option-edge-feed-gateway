@@ -15,3 +15,7 @@ Build 872 (gateway source `1696106671acf0663cce54deec23a5bd76941c2e`) passed the
 ## Refresh for the ES MBO relay (build 874)
 
 Build 874 (gateway source `2df1beca9d9198fadd5dcb3f0d21eb30feb5284f`, the EsMboRelay change) passed the full suite (1,422 tests in the contracts run, the gateway suite on the Linux ES4 host) and reproduced the 50-mutation campaign (49 killed, the same one characterized survivor; every outcome identical to the checked-in record), then refused to emit because `FeedGatewayService.java` had moved. `ES-FOOTPRINT-CAMPAIGN.json` is replaced by the record captured by that run (`.jenkins-tmp/es4-tests-874/footprint-reverify.json`, 395,779 bytes, SHA-256 `1885305f26ab4ca8a041831bae6ec61113cc18c4df6cc92ddb69d1afa8470cdd`). No code, spec, gate or outcome changes. The next Jenkins run repeats everything.
+
+## Refresh for the connect-replay change (build 881)
+
+Build 881 (gateway source `55635c1aa0f0ddddd579883bd8f4817a5ed54ae8`, the replay-tagged OutboundChannel change) reproduced the 50-mutation campaign (49 killed, the same one characterized survivor; every outcome identical to the checked-in record), then refused to emit because `FeedGatewayService.java` and `OutboundChannel.java` had moved. `ES-FOOTPRINT-CAMPAIGN.json` is replaced by the record captured by that run (`.jenkins-tmp/es4-tests-881/footprint-reverify.json`, 395,780 bytes, SHA-256 `b0dfca93749c0dc746aac380f4c1bf96f3eb529498eaadc1cf04919eda10d437`). No code, spec, gate or outcome changes. The next Jenkins run repeats everything.
