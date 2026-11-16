@@ -207,7 +207,8 @@ class SessionRoutingEngineTest {
         // present: no throw, the entitlements are replaced from the fresh token
         e.registerOrRefreshAppSession("app1", "u1", sel, IBKR, ApprovalState.APPROVED, UserSessionPolicy.systemDefault());
         assertEquals(IBKR, e.appSession("app1").orElseThrow().entitlements());
-        assertEquals(1, e.appSession("app1").stream().count());
+        assertEquals(1, e.appSessionCount());
+        assertEquals(1, e.appSessionCountForUser("u1"));
     }
 
     @Test
@@ -256,6 +257,8 @@ class SessionRoutingEngineTest {
                 pool.shutdownNow();
             }
             assertTrue(e.appSession("app1").isPresent());
+            assertEquals(1, e.appSessionCount());
+            assertEquals(1, e.appSessionCountForUser("u1"));
         }
     }
 }
