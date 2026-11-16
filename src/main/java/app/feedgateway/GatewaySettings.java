@@ -1787,6 +1787,36 @@ public final class GatewaySettings {
         return longValue("GATEWAY_WS_WRITE_DEADLINE_MS", 5_000L, 100L);
     }
 
+    /**
+     * How often each attached socket is sent a liveness PING.
+     *
+     * <p>WHY THIS EXISTS. Until 2026-11-16 nothing in this gateway ever asked a client whether it was
+     * still there. {@code afterConnectionClosed} and {@code handleTransportError} both detach correctly
+     * — they simply never fire when a client VANISHES without closing the connection: a browser quit, a
+     * laptop asleep, a network dropped. The socket then stayed counted against
+     * {@code GATEWAY_MAX_SOCKETS_PER_APP_SESSION} for the life of the pod. Measured that day: eight
+     * sockets held, several {@code openFor=5546s}, their browsers long gone, and the owner's ninth
+     * connection refused with "connection limit reached for this account" on a page that was working.
+     *
+     * <p>The write deadline does not catch it. A dead TCP peer keeps absorbing writes into the kernel
+     * send buffer, so the send neither fails nor blocks for a long time — those eight sat there for an
+     * hour and a half while the gateway happily broadcast to them.
+     */
+    public long socketPingMs() {
+        return longValue("GATEWAY_SOCKET_PING_MS", 30_000L, 1_000L);
+    }
+
+    /**
+     * Silence after which a socket is declared dead and its slot released.
+     *
+     * <p>Measured from the last thing the CLIENT sent — a pong, or any message of its own. Deliberately
+     * several ping periods, so one lost ping, one long GC pause or one slow mobile link cannot evict a
+     * live client; the cost of being wrong here is a working page losing its feed.
+     */
+    public long socketDeadAfterMs() {
+        return longValue("GATEWAY_SOCKET_DEAD_AFTER_MS", 120_000L, 5_000L);
+    }
+
     /** Size of the shared pool of outbound writer threads (one active drain per socket at a time). */
     public int wsWriterThreads() {
         return intValue("GATEWAY_WS_WRITER_THREADS", 8, 1);

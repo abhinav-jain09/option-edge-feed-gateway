@@ -138,6 +138,13 @@ public class FeedGatewayService implements ReplayRunner {
     private final HpsfGatewayViewMapper hpsfViewMapper;
     private final Set<WebSocketSession> clients = new CopyOnWriteArraySet<>();
     private final Map<String, WebSocketSession> clientsById = new ConcurrentHashMap<>();
+    /**
+     * When each socket was last heard FROM — a pong, or any message the client sent of its own accord.
+     *
+     * <p>This is the only evidence that a client is still there. Everything else the gateway knows about a
+     * socket is evidence that WE are still here.
+     */
+    private final Map<String, Long> socketLastInboundMs = new ConcurrentHashMap<>();
     // P0 (slow-client isolation): per-socket bounded async outbound queues. The Kafka thread enqueues here
     // and returns; dedicated writers do the network I/O, so one slow client never stalls polling.
     private final Map<String, OutboundChannel> outbound = new ConcurrentHashMap<>();
@@ -1560,6 +1567,16 @@ public class FeedGatewayService implements ReplayRunner {
         // AUTO-expiry daily roll (no-op unless IB_EXPIRY is empty/AUTO). 60s cadence catches the overnight
         // ET trading-date change well before the open; the date never changes mid-session.
         batchExecutor.scheduleAtFixedRate(this::maybeAutoRollExpiry, 60L, 60L, TimeUnit.SECONDS);
+        // Socket liveness: ping everybody, release whoever stopped answering. Wrapped, because an
+        // exception escaping a scheduleAtFixedRate task kills the whole chain — and this chain also
+        // carries the batch flush, so a liveness bug must never take the feed down with it.
+        batchExecutor.scheduleAtFixedRate(() -> {
+            try {
+                sweepSocketLiveness();
+            } catch (RuntimeException e) {
+                System.out.println("Feed gateway socket liveness sweep FAILED " + e);
+            }
+        }, settings.socketPingMs(), settings.socketPingMs(), TimeUnit.MILLISECONDS);
         if (settings.ibkrPreOpenEnabled()) {
             // rev13 slice 2: the pre-open window transitions (fence capture / takeover snapshot /
             // 09:35 destruction) are consumer-LOCAL — they must fire on wall clock even when both
@@ -1668,6 +1685,9 @@ public class FeedGatewayService implements ReplayRunner {
         outbound.put(session.getId(), channel);
         clients.add(session);
         clientsById.put(session.getId(), session);
+        // A socket is alive the moment it attaches; without this seed the first sweep would judge it on
+        // a silence that began before it existed.
+        socketLastInboundMs.put(session.getId(), System.currentTimeMillis());
         send(session, "status", statusJson());
         if(nativeHistoryAuthorized(session,channel)&&RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem())){
             boolean subscribed; synchronized(nativeHistorySubscribers){subscribed=nativeHistorySubscribers.size()<1024;if(subscribed)nativeHistorySubscribers.put(session.getId(),session);}
@@ -1902,6 +1922,7 @@ public class FeedGatewayService implements ReplayRunner {
         forgetAlertSocket(id);
         spotBandSwitchDelivered.remove(id);
         WebSocketSession stored = clientsById.remove(id);
+        socketLastInboundMs.remove(id);
         if (stored != null) {
             clients.remove(stored);
         }
@@ -1996,6 +2017,83 @@ public class FeedGatewayService implements ReplayRunner {
         }
         closeSockets(result.closedSocketIds());
         return result.expiredAppSessionIds().size();
+    }
+
+    /**
+     * The rule that decides whether a socket has gone: silent for LONGER than the deadline.
+     *
+     * <p>Pulled out as a pure function because it is the one judgement here that can hurt somebody. Get
+     * it wrong in the lenient direction and the leak stays; get it wrong in the strict direction and a
+     * working page loses its feed mid-session. Strictly greater, so a socket sitting exactly on the
+     * deadline survives — a boundary a timer can land on exactly, and the safe side of it is "alive".
+     *
+     * <p>An UNKNOWN last-heard time (null) is never dead. A socket with no entry is one that attached
+     * between the registry read and this check; judging it on a silence that began before it existed
+     * would evict the newest connection every time.
+     */
+    static boolean socketIsDead(Long lastInboundMs, long nowMs, long deadAfterMs) {
+        return lastInboundMs != null && nowMs - lastInboundMs > deadAfterMs;
+    }
+
+    /** A client spoke — a pong, or a message of its own. The only proof the far end still exists. */
+    void noteSocketAlive(String socketId) {
+        if (socketId != null) {
+            socketLastInboundMs.put(socketId, System.currentTimeMillis());
+        }
+    }
+
+    /** How many sockets this sweep has released. Counted, so the leak is visible rather than inferred. */
+    private final java.util.concurrent.atomic.AtomicLong deadSocketsReleased =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    long deadSocketsReleasedCount() {
+        return deadSocketsReleased.get();
+    }
+
+    /**
+     * PING every attached socket, and release the slot of any that has stopped answering.
+     *
+     * <p>THE LEAK THIS CLOSES. A socket was counted against its account's cap until the connection was
+     * ACTIVELY closed. A browser quit, a laptop asleep, a network dropped — none of those send a close
+     * frame, so {@code afterConnectionClosed} never fired and the entry lived until the pod restarted.
+     * On 2026-11-16 eight slots were held by browsers that no longer existed, several of them
+     * {@code openFor=5546s}, and the owner's next connection was refused on a page that was working.
+     * The write deadline does not catch it either: a dead peer absorbs writes into the kernel buffer,
+     * so the send neither fails nor blocks for a long time.
+     *
+     * <p>ORDER MATTERS. The dead are judged FIRST and released before any ping is queued, so a socket
+     * that is already past the deadline is never handed another ping to coalesce against.
+     *
+     * <p>Detach happens HERE rather than waiting for {@code afterConnectionClosed} — which, for a socket
+     * whose peer is gone, may never arrive. It is idempotent, so the container's later callback (if it
+     * ever comes) is a no-op. Same contract as {@link #onSlowDisconnect}.
+     */
+    private void sweepSocketLiveness() {
+        long now = System.currentTimeMillis();
+        long deadAfter = settings.socketDeadAfterMs();
+        for (Map.Entry<String, WebSocketSession> entry : clientsById.entrySet()) {
+            String id = entry.getKey();
+            WebSocketSession session = entry.getValue();
+            Long last = socketLastInboundMs.get(id);
+            if (socketIsDead(last, now, deadAfter)) {
+                // This class logs on stdout throughout; a logger introduced for one line would be the
+                // only one in the file. The line is deliberately greppable beside the handler's
+                // "socket REFUSED", because those two together are the whole story of the leak.
+                System.out.println("socket DEAD releasing id=" + id + " silentForMs=" + (now - last)
+                        + " deadAfterMs=" + deadAfter
+                        + " — no pong and nothing sent by the client; its account slot is returned");
+                if (routingEngine != null) {
+                    routingEngine.detachSocket(id);
+                }
+                removeClient(session);
+                deadSocketsReleased.incrementAndGet();
+                continue;
+            }
+            OutboundChannel channel = outbound.get(id);
+            if (channel != null) {
+                channel.enqueuePing();
+            }
+        }
     }
 
     /** Detach a client the channel just disconnected for being too slow (the socket is already closed). */

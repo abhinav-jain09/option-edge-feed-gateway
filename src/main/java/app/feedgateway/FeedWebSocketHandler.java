@@ -5,6 +5,7 @@ import app.feedgateway.mtsession.gateway.TicketHandshakeInterceptor;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.PongMessage;
 import org.springframework.web.socket.SubProtocolCapable;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.TextMessage;
@@ -147,7 +148,22 @@ public class FeedWebSocketHandler extends TextWebSocketHandler implements SubPro
 
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) {
+        // A client that is talking is a client that is there; it need not wait to be asked.
+        gatewayService.noteSocketAlive(session.getId());
         gatewayService.handleFootprintBasicMessage(session, message.getPayload());
+    }
+
+    /**
+     * THE ONLY PROOF A CLIENT IS STILL THERE.
+     *
+     * <p>A browser answers a PING with a PONG at the protocol level, with no cooperation from the page,
+     * so this works for every client including ones whose code we do not own. Silence here past
+     * {@code GATEWAY_SOCKET_DEAD_AFTER_MS} is what releases a leaked account slot — see
+     * {@code FeedGatewayService.sweepSocketLiveness}.
+     */
+    @Override
+    protected void handlePongMessage(WebSocketSession session, PongMessage message) {
+        gatewayService.noteSocketAlive(session.getId());
     }
 
     @Override

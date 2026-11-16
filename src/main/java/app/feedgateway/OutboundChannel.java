@@ -1,5 +1,6 @@
 package app.feedgateway;
 
+import org.springframework.web.socket.PingMessage;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.WebSocketMessage;
@@ -277,6 +278,45 @@ final class OutboundChannel {
         if(closed.get()||envelope==null)return false;
         if(!authorized(authorized)){close(CloseReason.AUTH_REVOKED);return false;}
         return enqueueText(envelope,coalesceKey,authorized);
+    }
+
+    /**
+     * The coalesce key a liveness PING travels under.
+     *
+     * <p>A NUL cannot appear in an envelope's coalesce key — those are built from event names, symbols and
+     * strike keys — so a ping can never replace a real frame, and a second ping can only ever replace a
+     * first one that has not gone out yet. Pings therefore cannot accumulate behind a stalled writer,
+     * which matters because the whole point of them is to notice a writer that has stopped.
+     */
+    static final String PING_COALESCE_KEY = "\u0000liveness-ping";
+
+    /** A ping is a 2-byte control frame on the wire; it is charged so the byte budget stays honest. */
+    private static final int PING_WIRE_BYTES = 2;
+
+    /**
+     * Queue a liveness PING behind whatever this socket is already sending.
+     *
+     * <p>IT GOES THROUGH THE QUEUE, NOT AROUND IT. {@code WebSocketSession.sendMessage} is not safe to
+     * call concurrently, and every other write for this socket is serialised by the single drainer. A
+     * ping written straight from the sweeper thread would interleave with a frame mid-send and corrupt
+     * the stream — a far worse failure than the leak it is meant to fix.
+     *
+     * <p>A browser answers a PING with a PONG at the protocol level, with no cooperation from the page,
+     * which is why this works for every client including ones whose code we do not own.
+     */
+    boolean enqueuePing() {
+        if (closed.get()) {
+            return false;
+        }
+        Insert inserted;
+        synchronized (lock) {
+            if (closed.get()) {
+                return false;
+            }
+            inserted = insertLocked(new Pending(new PingMessage(), PING_WIRE_BYTES, null, null),
+                    PING_COALESCE_KEY);
+        }
+        return finishInsert(inserted);
     }
 
     private boolean enqueueText(String envelope,String coalesceKey,BooleanSupplier authorized){
