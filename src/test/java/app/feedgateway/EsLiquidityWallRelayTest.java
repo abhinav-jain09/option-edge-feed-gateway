@@ -379,7 +379,7 @@ class EsLiquidityWallRelayTest {
         relay.stop();
     }
 
-    // ---------------------------------------------------------------- liq-AA liquidity targets (id 3411)
+    // ---------------------------------------------------------------- liq-AA liquidity targets (id 3413, version 1 = 3411)
 
     private static final String TARGETS = SETTINGS.esLiquidityTargetsTopic();
 
@@ -400,16 +400,25 @@ class EsLiquidityWallRelayTest {
     }
 
     @Test
-    void theTargetsRecordIsCheckedForId3411RelayedAsItsEventAndReplayedToAConnectingSocket() throws Exception {
+    void theTargetsRecordIsCheckedForId3413RelayedAsItsEventAndReplayedToAConnectingSocket() throws Exception {
         Sink sink = new Sink();
         EsLiquidityWallRelay relay = wire.relay(sink);
         byte[] bytes = wire.bytes(targets(NOW, "READY", List.of(target("ABOVE", 30487L, 35L, 136L, 4400L, "WAITING", true), target("ABOVE", 30583L, 103L, 145L, 4700L, "WAITING", true))));
-        assertEquals(3411, LiquidityWallSchemas.assertFramedAs(bytes, LiquidityWallSchemas.TARGETS));
+        assertEquals(3413, LiquidityWallSchemas.assertFramedAsAnyVersion(bytes, LiquidityWallSchemas.TARGETS));
+        // the lane accepts version 1 (3411, may linger on the compacted topic) and version 2 (3413) and nothing else
+        assertEquals(3411, LiquidityWallSchemas.assertFramedAsAnyVersion(new byte[] {0, 0, 0, 0x0d, 0x53, 1}, LiquidityWallSchemas.TARGETS));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> LiquidityWallSchemas.assertFramedAsAnyVersion(new byte[] {0, 0, 0, 0x0d, 0x54, 1}, LiquidityWallSchemas.TARGETS));
         relay.accept(TARGETS, KEY, bytes, NOW + 500);
         assertEquals(List.of("es-liquidity-targets"), sink.events());
         JsonNode j = sink.json(0);
         assertEquals("READY", j.get("state").asText());
         assertEquals(2, j.get("targets").size());
+        for (String f : List.of("bookState", "lastLiveBucketEnd", "carriedBuckets")) {
+            assertTrue(j.has(f), "record field reaches the page by name: " + f);
+        }
+        for (String f : List.of("cellKey", "cellPrimary", "cellCount", "resolved")) {
+            assertTrue(j.get("targets").get(0).has(f), "cell flag reaches the page by name: " + f);
+        }
         assertEquals(136L, j.get("targets").get(0).get("size").longValue());
         assertEquals(4700L, j.get("targets").get(1).get("multipleThousandths").longValue());
         assertTrue(j.get("targets").get(0).get("reachedAfterMs").isNull());

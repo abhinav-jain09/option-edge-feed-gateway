@@ -314,8 +314,8 @@ final class EsLiquidityWallRelay {
         }
         Lane lane = lane(subject);
         try {
-            if (subject == LiquidityWallSchemas.DASHBOARD) {
-                LiquidityWallSchemas.assertFramedAsAnyVersion(value, subject);   // 3403 (version 1) or 3408 (version 2)
+            if (subject == LiquidityWallSchemas.DASHBOARD || subject == LiquidityWallSchemas.TARGETS) {
+                LiquidityWallSchemas.assertFramedAsAnyVersion(value, subject);   // dashboard 3403 or 3408; targets 3411 (version 1, may linger on the compacted topic) or 3413 (version 2)
             } else {
                 LiquidityWallSchemas.assertFramedAs(value, subject);
             }
