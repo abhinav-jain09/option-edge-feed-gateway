@@ -91,6 +91,141 @@ class OutboundChannelTest {
         return new OutboundChannel(ws, writers, maxMessages, maxBytes, metrics, c -> closedCb.countDown());
     }
 
+    private void awaitSent(int n) throws Exception {
+        long deadline = System.currentTimeMillis() + 15_000;
+        while (sent.size() < n && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+    }
+
+    @Test
+    void aConnectReplayOfElevenThousandMessagesIsNotClosedAsSlowAndArrivesInOrder() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        OutboundChannel ch = channel(blockingSession(entered, release), 1000, 1L << 26);
+        assertTrue(ch.enqueueReplay("{\"r\":0}", null));
+        assertTrue(entered.await(2, TimeUnit.SECONDS), "the writer is stuck on the first message, as behind a big hello");
+        for (int i = 1; i < 11_000; i++) {
+            assertTrue(ch.enqueueReplay("{\"r\":" + i + "}", null), "replay message " + i + " accepted without waiting");
+        }
+        assertEquals(0, slowDisconnects.get(), "a replay burst far above maxMessages is not a slow client");
+        assertEquals(0, ch.liveDepth());
+        assertEquals(10_999, ch.queueDepth());
+        release.countDown();
+        awaitSent(11_000);
+        assertEquals(11_000, sent.size());
+        for (int i = 0; i < 11_000; i++) {
+            assertEquals("{\"r\":" + i + "}", sent.get(i), "in order at " + i);
+        }
+        assertEquals(0, ch.liveDepth());
+    }
+
+    @Test
+    void liveMessagesAboveTheBoundBehindAStalledWriterStillCloseTheSocket() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        OutboundChannel ch = channel(blockingSession(entered, release), 1000, 1L << 26);
+        ch.enqueue("{\"l\":0}", null);
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+        for (int i = 1; i <= 1000; i++) {
+            assertTrue(ch.enqueue("{\"l\":" + i + "}", null), "1000 queued live entries are within the bound");
+        }
+        assertEquals(0, slowDisconnects.get());
+        assertFalse(ch.enqueue("{\"l\":1001}", null), "the 1001st queued LIVE entry overflows");
+        assertEquals(1, slowDisconnects.get());
+        release.countDown();
+    }
+
+    @Test
+    void theByteBoundStillClosesAReplayBurst() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        OutboundChannel ch = channel(blockingSession(entered, release), 1000, 1L << 20);   // 1 MiB
+        ch.enqueueReplay("{\"b\":0}", null);
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+        String big = "x".repeat(100_000);
+        int accepted = 0;
+        for (int i = 0; i < 20; i++) {
+            if (ch.enqueueReplay("{\"b\":\"" + big + "\"}", null)) {
+                accepted++;
+            }
+        }
+        assertTrue(accepted < 12, "about 10 messages of 100 KB fit in 1 MiB; the rest overflow (accepted " + accepted + ")");
+        assertEquals(1, slowDisconnects.get(), "a replay burst above the byte bound still closes the socket");
+        release.countDown();
+    }
+
+    @Test
+    void theLiveCountStaysExactAcrossCoalescingDrainAndDiscard() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        OutboundChannel ch = channel(blockingSession(entered, release), 1000, 1L << 26);
+        ch.enqueue("{\"stuck\":1}", null);
+        assertTrue(entered.await(2, TimeUnit.SECONDS), "the first message is in the writer: not queued, not counted");
+        assertEquals(0, ch.liveDepth());
+        ch.enqueue("{\"k\":\"live1\"}", "K");
+        assertEquals(1, ch.liveDepth());
+        ch.enqueueReplay("{\"k\":\"replay over live\"}", "K");
+        assertEquals(0, ch.liveDepth(), "a replay entry replacing a live one of the same key: the live count drops");
+        assertEquals(1, ch.queueDepth());
+        ch.enqueue("{\"k\":\"live over replay\"}", "K");
+        assertEquals(1, ch.liveDepth(), "a live entry replacing a replay one: the live count rises");
+        ch.enqueue("{\"k\":\"live over live\"}", "K");
+        assertEquals(1, ch.liveDepth(), "live over live: unchanged");
+        ch.enqueueReplay("{\"k\":\"replay2\"}", "R");
+        ch.enqueueReplay("{\"k\":\"replay over replay\"}", "R");
+        assertEquals(1, ch.liveDepth());
+        assertEquals(2, ch.queueDepth());
+        ch.enqueue("{\"u\":1}", null);
+        ch.enqueueReplay("{\"u\":2}", null);
+        assertEquals(2, ch.liveDepth());
+        release.countDown();
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (ch.queueDepth() > 0 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        assertEquals(0, ch.queueDepth());
+        assertEquals(0, ch.liveDepth(), "drained: the live count is back to 0");
+
+        // discard on close
+        CountDownLatch entered2 = new CountDownLatch(1);
+        CountDownLatch release2 = new CountDownLatch(1);
+        OutboundChannel ch2 = new OutboundChannel(blockingSession(entered2, release2), writers, 5, 1L << 26, metrics, c -> { });
+        ch2.enqueue("{\"s\":1}", null);
+        assertTrue(entered2.await(2, TimeUnit.SECONDS));
+        for (int i = 0; i < 5; i++) {
+            ch2.enqueue("{\"d\":" + i + "}", null);
+        }
+        ch2.enqueueReplay("{\"d\":\"r\"}", null);
+        assertEquals(5, ch2.liveDepth());
+        assertFalse(ch2.enqueue("{\"d\":\"overflow\"}", null));
+        assertEquals(0, ch2.liveDepth(), "discarded on close: back to 0");
+        assertEquals(0, ch2.queueDepth());
+        release2.countDown();
+    }
+
+    @Test
+    void aLargeReplayBacklogStillQueuedDoesNotMakeAHandfulOfLiveMessagesOverflow() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        OutboundChannel ch = channel(blockingSession(entered, release), 1000, 1L << 26);
+        ch.enqueueReplay("{\"r\":0}", null);
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+        for (int i = 1; i <= 5000; i++) {
+            ch.enqueueReplay("{\"r\":" + i + "}", null);
+        }
+        for (int i = 0; i < 5; i++) {
+            assertTrue(ch.enqueue("{\"live\":" + i + "}", null), "live message " + i + " behind a 5000-message replay backlog");
+        }
+        assertEquals(0, slowDisconnects.get());
+        assertEquals(5, ch.liveDepth());
+        assertEquals(5005, ch.queueDepth());
+        release.countDown();
+        awaitSent(5006);
+        assertEquals(5006, sent.size());
+        assertEquals("{\"live\":4}", sent.get(5005), "the live messages follow the backlog, in order");
+    }
+
     @Test
     void enqueueDoesNotBlockTheProducerWhileTheWriterIsStuck() throws Exception {
         CountDownLatch entered = new CountDownLatch(1);

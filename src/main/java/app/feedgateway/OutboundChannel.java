@@ -8,6 +8,7 @@ import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.WebSocketSession;
 
 import java.io.IOException;
+import java.util.concurrent.TimeUnit;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -116,9 +117,12 @@ final class OutboundChannel {
         boolean counted;
         ChartCopy(ChartOutboundBudget.Lease lease,ChartOutboundBudget.Owner owner) { this.lease = lease; this.owner=owner; }
     }
-    private record Pending(WebSocketMessage<?> message,int bytes,BooleanSupplier authorized,RithmicHistoryInvalidation invalidation,ChartCopy chart) {
+    private record Pending(WebSocketMessage<?> message,int bytes,BooleanSupplier authorized,RithmicHistoryInvalidation invalidation,ChartCopy chart,boolean replay) {
         Pending(WebSocketMessage<?> message,int bytes,BooleanSupplier authorized,RithmicHistoryInvalidation invalidation) {
-            this(message,bytes,authorized,invalidation,null);
+            this(message,bytes,authorized,invalidation,null,false);
+        }
+        Pending(WebSocketMessage<?> message,int bytes,BooleanSupplier authorized,RithmicHistoryInvalidation invalidation,ChartCopy chart) {
+            this(message,bytes,authorized,invalidation,chart,false);
         }
     }
     private record Insert(boolean overflow,boolean startDrain) {}
@@ -149,6 +153,12 @@ final class OutboundChannel {
     private final Object lock = new Object();
     private final LinkedHashMap<String, Pending> queue = new LinkedHashMap<>();
     private long queuedBytes;
+    /**
+     * Queued entries that are LIVE (not tagged as connect replay). The message-count bound applies to these only: a connect replay is thousands of
+     * per-entry messages enqueued in a burst (measured 7,000+ in 6 s), which a real link drains slower than they arrive, and counting them closed the
+     * socket as slow (code 1000, empty reason) before the replay finished. The byte bound still covers everything. Guarded by {@code lock}.
+     */
+    private int liveCount;
     private long chartOwnedBytes;
     private int chartOwnedFrames;
     private long seq;
@@ -205,6 +215,13 @@ final class OutboundChannel {
 
     WebSocketSession session() {
         return session;
+    }
+
+    /** Live (non-replay) entries queued: what the message-count bound applies to. */
+    int liveDepth() {
+        synchronized (lock) {
+            return liveCount;
+        }
     }
 
     int queueDepth() {
@@ -269,7 +286,18 @@ final class OutboundChannel {
         if (closed.get() || envelope == null) {
             return false;
         }
-        return enqueueText(envelope,coalesceKey,null);
+        return enqueueText(envelope,coalesceKey,null,false);
+    }
+
+    /**
+     * Enqueue a message of the CONNECT REPLAY (cached state sent to a socket that has just attached, or re-attached to live). Same ordering, same
+     * coalescing, same byte bound; it just does not count against {@code maxMessages}, which bounds LIVE entries. Nothing waits.
+     */
+    boolean enqueueReplay(String envelope, String coalesceKey) {
+        if (closed.get() || envelope == null) {
+            return false;
+        }
+        return enqueueText(envelope,coalesceKey,null,true);
     }
 
     void revokeAuthorization(){close(CloseReason.AUTH_REVOKED);}
@@ -277,7 +305,7 @@ final class OutboundChannel {
     boolean enqueueAuthorizedText(String envelope,String coalesceKey,BooleanSupplier authorized){
         if(closed.get()||envelope==null)return false;
         if(!authorized(authorized)){close(CloseReason.AUTH_REVOKED);return false;}
-        return enqueueText(envelope,coalesceKey,authorized);
+        return enqueueText(envelope,coalesceKey,authorized,false);
     }
 
     /**
@@ -319,14 +347,14 @@ final class OutboundChannel {
         return finishInsert(inserted);
     }
 
-    private boolean enqueueText(String envelope,String coalesceKey,BooleanSupplier authorized){
+    private boolean enqueueText(String envelope,String coalesceKey,BooleanSupplier authorized,boolean replay){
         envelope=utf8Safe(envelope);TextMessage message=new TextMessage(envelope);int wireBytes=utf8Length(envelope);
         Insert inserted;
         synchronized (lock) {
             if (closed.get()) {
                 return false;
             }
-            inserted=insertLocked(new Pending(message,wireBytes,authorized,null),coalesceKey);
+            inserted=insertLocked(new Pending(message,wireBytes,authorized,null,null,replay),coalesceKey);
         }
         return finishInsert(inserted);
     }
@@ -352,9 +380,10 @@ final class OutboundChannel {
 
     private Insert insertLocked(Pending pending,String coalesceKey){
         String key=coalesceKey!=null?"c "+coalesceKey:"u "+seq++;
-        Pending previous=queue.put(key,pending);if(previous!=null){queuedBytes-=previous.bytes();metrics.coalesced();}
+        Pending previous=queue.put(key,pending);if(previous!=null){queuedBytes-=previous.bytes();if(!previous.replay())liveCount--;metrics.coalesced();}
+        if(!pending.replay())liveCount++;
         queuedBytes+=pending.bytes();metrics.enqueued(pending.bytes());peakDepth=Math.max(peakDepth,queue.size());
-        boolean overflow=queue.size()>maxMessages||queuedBytes>maxBytes,start=!overflow&&!draining;
+        boolean overflow=liveCount>maxMessages||queuedBytes>maxBytes,start=!overflow&&!draining;
         if(start)draining=true;return new Insert(overflow,start);
     }
 
@@ -383,8 +412,8 @@ final class OutboundChannel {
         Insert inserted=null;boolean saturated=false;
         synchronized(lock){
             if(closed.get())return HistoryAdmission.CLOSED;
-            if(queue.size()+1>maxMessages||queuedBytes+HISTORY_CONTROL_RESERVE>maxBytes)saturated=true;
-            else if(queue.size()+2>maxMessages||queuedBytes+payload.length+HISTORY_CONTROL_RESERVE>maxBytes)return HistoryAdmission.BUSY;
+            if(liveCount+1>maxMessages||queuedBytes+HISTORY_CONTROL_RESERVE>maxBytes)saturated=true;
+            else if(liveCount+2>maxMessages||queuedBytes+payload.length+HISTORY_CONTROL_RESERVE>maxBytes)return HistoryAdmission.BUSY;
             else{
                 BinaryMessage message=new BinaryMessage(payload.clone());
                 inserted=insertLocked(new Pending(message,payload.length,authorized,null),null);
@@ -427,7 +456,7 @@ final class OutboundChannel {
     /** Caller holds lock; includes any chart copy already handed to the blocking writer. */
     private boolean chartRoom(int bytes) {
         return chartOwnedFrames<ChartOutboundBudget.OWNER_FRAMES && chartOwnedBytes+bytes<=Math.min(ChartOutboundBudget.OWNER_BYTES,maxBytes/4)
-                && queue.size()+2<=maxMessages && queuedBytes+bytes+HISTORY_CONTROL_RESERVE<=maxBytes;
+                && liveCount+2<=maxMessages && queuedBytes+bytes+HISTORY_CONTROL_RESERVE<=maxBytes;
     }
     private void releaseChart(ChartCopy copy,int bytes) {
         if(copy==null||!copy.released.compareAndSet(false,true))return;
@@ -466,6 +495,9 @@ final class OutboundChannel {
                 next = it.next().getValue();
                 it.remove();
                 queuedBytes -= next.bytes();
+                if (!next.replay()) {
+                    liveCount--;
+                }
             }
             sendStartedAtMs = System.currentTimeMillis(); // arm the watchdog deadline
             try {
@@ -631,6 +663,7 @@ final class OutboundChannel {
             for(Pending pending:queue.values())if(pending.chart()!=null)charts.add(pending);
             queue.clear();
             queuedBytes = 0;
+            liveCount = 0;
         }
         for(Pending pending:charts)releaseChart(pending.chart(),pending.bytes());
         return dropped;

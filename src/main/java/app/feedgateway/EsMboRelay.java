@@ -204,6 +204,8 @@ final class EsMboRelay {
                     }
                 }
                 long nextLook = System.currentTimeMillis() + TOPIC_RETRY_MS;
+                TopicPartition healthPartition = partitions.stream().filter(tp -> tp.topic().equals(topics[1])).findFirst().orElse(null);
+                boolean flowPaused = false;
                 TopicPartition flowPartition = partitions.stream().filter(tp -> tp.topic().equals(topics[0])).findFirst().orElse(null);
                 levelFlowLaneAbsent(flowPartition == null);
                 levelFlowCaughtUp(false, System.currentTimeMillis());
@@ -226,6 +228,20 @@ final class EsMboRelay {
                         resumeAt.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
                     }
                     // the deterministic barrier: is the level-flow lane at its end offset NOW (after this poll's records were accepted)? A MISSING lane is NOT caught up: rows may still arrive.
+                    // Catch-up: level-flow races ahead of health (many rows per bucket), so rows of buckets whose health has not been read yet would be evicted
+                    // by the open-bucket bound (measured: 24,381 rows dropped on dev, 53,633 on a local run, every history frame short of rows). Hold level-flow
+                    // back while health is behind and half the bound is open; resume the moment health catches up.
+                    if (flowPartition != null && healthPartition != null) {
+                        boolean healthCaughtUp = laneCaughtUp(true, c.position(healthPartition), c.endOffsets(List.of(healthPartition)).get(healthPartition));
+                        boolean hold = levelFlowShouldPause(healthCaughtUp);
+                        if (hold && !flowPaused) {
+                            c.pause(List.of(flowPartition));
+                            flowPaused = true;
+                        } else if (!hold && flowPaused) {
+                            c.resume(List.of(flowPartition));
+                            flowPaused = false;
+                        }
+                    }
                     boolean caughtUp = flowPartition != null && laneCaughtUp(true, c.position(flowPartition), c.endOffsets(List.of(flowPartition)).get(flowPartition));
                     levelFlowCaughtUp(caughtUp, System.currentTimeMillis());
                 }
@@ -375,6 +391,11 @@ final class EsMboRelay {
         events.values().removeIf(e -> !e.contract().equals(contract));
     }
 
+    /** True while level-flow should be held back: half the open-bucket bound is already buffered and the health lane (which closes buckets) has not caught up. */
+    synchronized boolean levelFlowShouldPause(boolean healthCaughtUp) {
+        return !healthCaughtUp && open.size() >= MAX_OPEN_BUCKETS / 2;
+    }
+
     /** The level-flow lane is caught up only if it EXISTS and its position has reached its end offset: an absent lane may still receive rows. */
     static boolean laneCaughtUp(boolean exists, long position, long endOffset) {
         return exists && position >= endOffset;
@@ -427,14 +448,14 @@ final class EsMboRelay {
     }
 
     /**
-     * Closes every held bucket that is PROVEN complete: level-flow has delivered a record at or after its bucket end (the lane is in bucket order), or the
+     * Closes every held bucket that is PROVEN complete: level-flow has delivered a record of a LATER bucket (the lane is in bucket order, so every row of this one has been read), or the
      * level-flow lane is at its end offset and has been quiet for {@link #HEALTH_HOLD_MS} since both the health record and the catch-up (so no row can be
      * pending). Wall time alone never closes a bucket while level-flow is behind.
      */
     synchronized void tick(long now) {
         while (!pending.isEmpty()) {
             var first = pending.firstEntry();
-            boolean reached = first.getKey() <= levelFlowWatermark;
+            boolean reached = first.getKey() < levelFlowWatermark;   // STRICT: a row of this very bucket does not prove the rest of its rows were read (a catch-up batch can end mid-bucket); a row of a LATER bucket does
             boolean quiet = levelFlowCaughtUpSince != null && now - Math.max(first.getValue().arrivedAt(), levelFlowCaughtUpSince) >= HEALTH_HOLD_MS;
             if (!reached && !quiet) {
                 break;
@@ -555,15 +576,21 @@ final class EsMboRelay {
     }
 
     /**
-     * The connect replay: ONE {@code es-mbo-history} = the last frames (oldest first) and the event ring, every member {@code cached:true}. Over
-     * {@code ES_MBO_HISTORY_MAX_BYTES} the oldest frames are dropped (then the oldest events) until it fits. The status follows so the page knows at once.
+     * The connect replay: the status FIRST (the page can say "engine publishing" at once), then ONE {@code es-mbo-history} = the frames (oldest first)
+     * and the event ring, every member {@code cached:true}, built from ONE snapshot taken under the relay lock (so two replays never mix frames of
+     * different instants). Over {@code ES_MBO_HISTORY_MAX_BYTES} the oldest frames are dropped (then the oldest events). The JSON is built outside the
+     * lock, so a connecting socket never holds up the consumer, the frames or the heartbeat.
      */
-    synchronized void replay(BiConsumer<String, String> send) {
-        send.accept(HISTORY_EVENT, historyJson());
+    void replay(BiConsumer<String, String> send) {
         send.accept(STATUS_EVENT, statusJson());
+        send.accept(HISTORY_EVENT, historyJson());
     }
 
-    synchronized String historyJson() {
+    /** Frames and events kept after the byte bound. */
+    private record Window(List<Frame> frames, int firstFrame, List<Event> events, int firstEvent) {
+    }
+
+    private synchronized Window window() {
         long budget = historyMaxBytes - 64;
         long total = 0;
         for (Event e : events.values()) {
@@ -584,13 +611,18 @@ final class EsMboRelay {
         while (frameBytes + eventBytes > budget && firstFrame < fs.size()) {
             frameBytes -= fs.get(firstFrame++).bytes();
         }
-        StringBuilder sb = new StringBuilder((int) Math.min(budget + 64, Integer.MAX_VALUE - 16)).append("{\"frames\":[");
-        for (int i = firstFrame; i < fs.size(); i++) {
-            sb.append(i > firstFrame ? "," : "").append(EsMboJson.close(fs.get(i).base(), true));
+        return new Window(fs, firstFrame, evs, firstEvent);
+    }
+
+    String historyJson() {
+        Window w = window();
+        StringBuilder sb = new StringBuilder(1 << 20).append("{\"frames\":[");
+        for (int i = w.firstFrame(); i < w.frames().size(); i++) {
+            sb.append(i > w.firstFrame() ? "," : "").append(EsMboJson.close(w.frames().get(i).base(), true));
         }
         sb.append("],\"events\":[");
-        for (int i = firstEvent; i < evs.size(); i++) {
-            sb.append(i > firstEvent ? "," : "").append(EsMboJson.close(evs.get(i).base(), true));
+        for (int i = w.firstEvent(); i < w.events().size(); i++) {
+            sb.append(i > w.firstEvent() ? "," : "").append(EsMboJson.close(w.events().get(i).base(), true));
         }
         return sb.append("],\"cached\":true}").toString();
     }

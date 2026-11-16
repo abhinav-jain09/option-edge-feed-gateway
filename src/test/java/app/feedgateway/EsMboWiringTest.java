@@ -1,6 +1,7 @@
 package app.feedgateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -38,5 +39,27 @@ class EsMboWiringTest {
         int at = source.indexOf("void streamEsMbo(");
         String body = source.substring(at, source.indexOf("broadcast(event, json);", at));
         assertTrue(body.contains("FRAME_EVENT") && body.contains("EVENT_EVENT") && body.contains("STATUS_EVENT") && body.contains("return;"));
+    }
+
+    @Test
+    void theMboReplayGoesRightBehindTheStatus() throws IOException {
+        String source = source();
+        int status = source.indexOf("send(session, \"status\", statusJson());");
+        int replay = source.indexOf("relay.replay((event,json)->send(session,event,json))", source.indexOf("esMboRelay.getIfAvailable()"));
+        int hello = source.indexOf("if (sendsCvdHello()) {", status);
+        int body = source.indexOf("private void addClientAndReplay(");
+        assertTrue(status > body && replay > status && replay < hello, "the mbo status+history are enqueued before the cvd-hello");
+        assertFalse(source.contains("replayOlder"), "one history message, from one snapshot");
+    }
+
+    @Test
+    void theWholeConnectReplayAndTheReturnToLiveReplayAreTaggedAsReplay() throws IOException {
+        String source = source();
+        int add = source.indexOf("public void addClient(WebSocketSession session) {");
+        assertTrue(source.indexOf("asConnectReplay(() -> addClientAndReplay(session));", add) > add, "addClient tags the whole replay");
+        assertTrue(source.contains("asConnectReplay(() -> replayCachedToSocket(s));"), "the return-to-live / readiness cache replay is tagged (the connect one runs inside addClient's tag)");
+        int send = source.indexOf("private void send(WebSocketSession session, String event, String json) {");
+        assertTrue(source.indexOf("CONNECT_REPLAY.get())", send) > send, "send() tags by the thread flag");
+        assertFalse(source.contains("awaitRoom"), "nothing waits");
     }
 }
