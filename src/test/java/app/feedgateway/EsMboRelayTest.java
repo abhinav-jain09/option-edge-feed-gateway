@@ -170,6 +170,7 @@ class EsMboRelayTest {
             relay.accept(FLOW, r.get("side") + "|" + r.get("tick"), bytes(r), bucketEnd + 100);
         }
         relay.accept(HEALTH, "CME|ESZ6", bytes(health(bucketEnd, "LIVE", bid, ask)), bucketEnd + 150);
+        relay.tick(bucketEnd + 1_500L);   // level-flow is caught up and quiet: the bucket is proven complete
     }
 
     @Test
@@ -205,6 +206,7 @@ class EsMboRelayTest {
         EsMboRelay relay = relay(sink);
         relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 40, 0, 0, 1)), NOW);
         relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW, "UNAVAILABLE", null, null)), NOW);
+        relay.tick(NOW + 1_500L);
         JsonNode f = sink.of("es-mbo-frame").get(0);
         assertEquals(0, f.get("levels").size());
         assertTrue(f.get("bestBidTick").isNull() && f.get("bestAskTick").isNull());
@@ -216,18 +218,22 @@ class EsMboRelayTest {
     }
 
     @Test
-    void aQuietBucketIsClosedAfterTheHoldAndAHealthAheadOfLevelFlowWaitsForIt() throws Exception {
+    void aQuietBucketIsClosedAfterTheHoldAndAHealthAheadOfLevelFlowWaitsForALaterBucket() throws Exception {
         Sink sink = new Sink();
         EsMboRelay relay = relay(sink);
+        relay.levelFlowCaughtUp(false, NOW - 1);   // behind: only a row of a LATER bucket proves a bucket complete
         relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW, "LIVE", MID, MID + 1)), NOW);
         assertEquals(0, sink.of("es-mbo-frame").size(), "level-flow has not reached the bucket yet");
         relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 40, 0, 0, 1)), NOW + 10);
+        assertEquals(0, sink.of("es-mbo-frame").size(), "a row of this very bucket does not prove the rest of its rows were read");
+        relay.accept(FLOW, "B|30001", bytes(row(NOW + 1000, "B", MID + 1, 41, 0, 0, 1)), NOW + 20);
         assertEquals(1, sink.of("es-mbo-frame").size());
-        assertEquals(1, sink.of("es-mbo-frame").get(0).get("levels").size(), "the row that arrived after the health record is in its frame");
+        assertEquals(1, sink.of("es-mbo-frame").get(0).get("levels").size(), "the frame carries the row of its own bucket only");
+        relay.levelFlowCaughtUp(true, NOW);   // caught up: a bucket with no later row closes once the lane has been quiet for the hold
         relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW + 1000, "LIVE", MID, MID + 1)), NOW + 1000);
         assertEquals(1, sink.of("es-mbo-frame").size());
         relay.tick(NOW + 2500);
-        assertEquals(2, sink.of("es-mbo-frame").size(), "no rows for a quiet bucket: closed when the hold runs out");
+        assertEquals(2, sink.of("es-mbo-frame").size(), "caught up and quiet: closed when the hold runs out");
     }
 
     @Test
@@ -258,13 +264,51 @@ class EsMboRelayTest {
         assertEquals(1, sink.of("es-mbo-frame").size(), "only the fresh frame is broadcast live");
         List<String[]> replay = new ArrayList<>();
         relay.replay((e, j) -> replay.add(new String[] {e, j}));
-        assertEquals("es-mbo-history", replay.get(0)[0]);
-        JsonNode h = JSON.readTree(replay.get(0)[1]);
+        assertEquals("es-mbo-status", replay.get(0)[0], "the status goes FIRST");
+        assertEquals("es-mbo-history", replay.get(1)[0]);
+        JsonNode h = JSON.readTree(replay.get(1)[1]);
         assertTrue(h.get("cached").asBoolean());
         assertEquals(2, h.get("frames").size());
         assertTrue(h.get("frames").get(0).get("bucketEnd").asLong() < h.get("frames").get(1).get("bucketEnd").asLong());
         assertTrue(h.get("frames").get(0).get("cached").asBoolean() && h.get("frames").get(1).get("cached").asBoolean());
-        assertEquals("es-mbo-status", replay.get(1)[0]);
+    }
+
+    @Test
+    void twoConsecutiveReplaysEachCarryOneConsistentDuplicateFreeOrderedHistoryEvenWithALiveFrameBetween() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        for (int i = 0; i < 150; i++) {
+            long b = NOW + i * 1000L;
+            feedBucket(relay, b, MID, MID + 1, row(b, "B", MID, 10, 1, 1, 1));
+        }
+        List<String[]> first = new ArrayList<>();
+        relay.replay((e, j) -> first.add(new String[] {e, j}));
+        feedBucket(relay, NOW + 150_000L, MID, MID + 1, row(NOW + 150_000L, "B", MID, 10, 1, 1, 1));   // a live frame arrives between the two replays
+        List<String[]> second = new ArrayList<>();
+        relay.replay((e, j) -> second.add(new String[] {e, j}));
+        for (List<String[]> replay : List.of(first, second)) {
+            assertEquals(List.of("es-mbo-status", "es-mbo-history"), List.of(replay.get(0)[0], replay.get(1)[0]), "status first, then ONE history");
+            assertEquals(2, replay.size(), "no second history message");
+        }
+        List<Long> a = bucketEnds(JSON.readTree(first.get(1)[1]));
+        List<Long> b = bucketEnds(JSON.readTree(second.get(1)[1]));
+        assertEquals(150, a.size());
+        assertEquals(151, b.size());
+        for (List<Long> list : List.of(a, b)) {
+            for (int i = 1; i < list.size(); i++) {
+                assertTrue(list.get(i) > list.get(i - 1), "strictly increasing: ordered and duplicate-free");
+            }
+        }
+        assertEquals(a, b.subList(0, 150), "the second history is the first plus the new frame, nothing missing or moved");
+        assertEquals(NOW + 150_000L, b.get(150).longValue());
+    }
+
+    private static List<Long> bucketEnds(JsonNode history) {
+        List<Long> out = new ArrayList<>();
+        for (JsonNode f : history.get("frames")) {
+            out.add(f.get("bucketEnd").asLong());
+        }
+        return out;
     }
 
     @Test
@@ -399,6 +443,7 @@ class EsMboRelayTest {
         assertEquals(0, sink.of("es-mbo-frame").size(), "an ESH7 row must not advance ESZ6's watermark and close its bucket");
         assertEquals(1, relay.otherContractForTest());
         relay.accept(FLOW, "B|30000", bytes(row("ESZ6", NOW, "B", MID, 11, 0, 0, 1)), NOW + 20);
+        relay.accept(FLOW, "B|30001", bytes(row("ESZ6", NOW + 1000, "B", MID + 1, 12, 0, 0, 1)), NOW + 30);   // a later bucket proves NOW complete
         List<JsonNode> frames = sink.of("es-mbo-frame");
         assertEquals(2, frames.size(), "the held earlier bucket and this one");
         assertEquals(1, frames.get(1).get("levels").size(), "only the current contract's row");
@@ -427,6 +472,7 @@ class EsMboRelayTest {
         assertEquals(0, relay.openBucketsForTest());
         assertEquals(1, sink.of("es-mbo-frame").size(), "the held ESZ6 health never closes after the reset");
         relay.accept(FLOW, "B|30100", bytes(row("ESH7", NOW + 2000, "B", MID + 100, 9, 0, 0, 1)), NOW + 2100);
+        relay.accept(FLOW, "B|30101", bytes(row("ESH7", NOW + 3000, "B", MID + 101, 9, 0, 0, 1)), NOW + 3100);   // a later bucket proves 2000 complete
         List<JsonNode> frames = sink.of("es-mbo-frame");
         assertEquals(2, frames.size(), "ESH7's bucket closes on ESH7's own row");
         assertEquals("ESH7", frames.get(1).get("contract").asText());
@@ -440,6 +486,7 @@ class EsMboRelayTest {
         assertEquals(null, relay.currentContractForTest());
         relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 40, 0, 0, 1)), NOW);   // level-flow ahead of health at the start of a catch-up
         relay.accept(HEALTH, "CME|ESZ6", bytes(health("ESZ6", NOW, "LIVE", MID, MID + 1)), NOW);
+        relay.tick(NOW + 1_500L);
         assertEquals("ESZ6", relay.currentContractForTest());
         assertEquals(1, sink.of("es-mbo-frame").get(0).get("levels").size());
         // rows of a different contract read first are provisional and thrown away when the first health names another
@@ -495,6 +542,7 @@ class EsMboRelayTest {
         relay.tick(NOW + 3_000L);   // three times the 1 s hold, the injected clock says (still inside the 5 s live window)
         assertEquals(0, sink.of("es-mbo-frame").size(), "behind: no frame, however long");
         relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 40, 0, 0, 1)), NOW + 3_001L);   // the backlog reaches the bucket
+        relay.accept(FLOW, "B|30001", bytes(row(NOW + 1000, "B", MID + 1, 40, 0, 0, 1)), NOW + 3_002L);   // and passes it
         List<JsonNode> frames = sink.of("es-mbo-frame");
         assertEquals(1, frames.size());
         assertEquals(1, frames.get(0).get("levels").size(), "the frame carries its rows");
@@ -550,6 +598,7 @@ class EsMboRelayTest {
         relay.levelFlowLaneAbsent(false);   // the topic appears
         relay.levelFlowCaughtUp(false, NOW + 5_100L);
         relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 40, 0, 0, 1)), NOW + 5_200L);
+        relay.accept(FLOW, "B|30001", bytes(row(NOW + 1000, "B", MID + 1, 40, 0, 0, 1)), NOW + 5_201L);
         assertEquals(1, relay.framesHeldForTest());
         assertEquals("present", JSON.readTree(relay.statusJson()).get("levelFlowLane").asText());
         assertEquals(0, relay.lateRowsForTest());
@@ -591,11 +640,38 @@ class EsMboRelayTest {
         relay.accept(FLOW, "B|30000", bytes(row(NOW + 100, "B", MID, 5, 0, 0, 1)), NOW + 100);   // a row for bucket 100, no health ever
         relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW + 200, "LIVE", MID, MID + 1)), NOW + 200);   // health for 200, held
         assertEquals(0, relay.rowsDroppedForTest());
-        relay.accept(FLOW, "B|30001", bytes(row(NOW + 200, "B", MID + 1, 6, 0, 0, 1)), NOW + 210);   // row for 200: the watermark reaches 200 and closes it
+        relay.accept(FLOW, "B|30001", bytes(row(NOW + 200, "B", MID + 1, 6, 0, 0, 1)), NOW + 210);   // row for 200: not yet proof (more rows of 200 may follow)
+        assertEquals(0, sink.of("es-mbo-frame").size());
+        relay.accept(FLOW, "B|30002", bytes(row(NOW + 300, "B", MID + 2, 7, 0, 0, 1)), NOW + 310);   // a row of bucket 300 proves 200 complete
         assertEquals(1, sink.of("es-mbo-frame").size());
         assertEquals(1, sink.of("es-mbo-frame").get(0).get("levels").size(), "bucket 200 carries only its own row");
         assertEquals(1, relay.rowsDroppedForTest(), "bucket 100's row was discarded and is counted");
-        assertEquals(0, relay.openBucketsForTest());
+        assertEquals(1, relay.openBucketsForTest(), "bucket 300 is still open");
+    }
+
+    @Test
+    void levelFlowIsHeldBackWhileHealthIsBehindAndHalfTheBucketBoundIsOpen() throws Exception {
+        EsMboRelay relay = relay(new Sink());
+        assertFalse(relay.levelFlowShouldPause(false), "nothing buffered");
+        for (int i = 0; i < EsMboRelay.MAX_OPEN_BUCKETS / 2; i++) {
+            relay.accept(FLOW, "B|30000", bytes(row(NOW + i * 1000L, "B", MID, 1, 0, 0, 1)), NOW);
+        }
+        assertTrue(relay.levelFlowShouldPause(false), "half the bound is open and health has not caught up: hold level-flow");
+        assertFalse(relay.levelFlowShouldPause(true), "health is at its end: buckets without a health will never close, so do not wait on it");
+    }
+
+    @Test
+    void aRowOfTheClosingBucketThatArrivesLaterIsNotLostBecauseARowOfItsOwnBucketNeverClosesIt() throws Exception {
+        Sink sink = new Sink();
+        EsMboRelay relay = relay(sink);
+        relay.levelFlowCaughtUp(false, NOW - 1);   // catch-up: level-flow is behind and a batch can end in the middle of a bucket
+        relay.accept(HEALTH, "CME|ESZ6", bytes(health(NOW, "LIVE", MID, MID + 1)), NOW);
+        relay.accept(FLOW, "B|30000", bytes(row(NOW, "B", MID, 1, 0, 0, 1)), NOW + 1);   // first row of the bucket: the batch ends here
+        relay.accept(FLOW, "B|30001", bytes(row(NOW, "B", MID + 1, 2, 0, 0, 1)), NOW + 2);   // the rest of the same bucket, in the next batch
+        relay.accept(FLOW, "B|30002", bytes(row(NOW + 1000, "B", MID + 2, 3, 0, 0, 1)), NOW + 3);
+        assertEquals(1, sink.of("es-mbo-frame").size());
+        assertEquals(2, sink.of("es-mbo-frame").get(0).get("levels").size(), "both rows of the bucket are in its frame");
+        assertEquals(0, relay.lateRowsForTest());
     }
 
     @Test

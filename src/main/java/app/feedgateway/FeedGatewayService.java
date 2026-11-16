@@ -1678,6 +1678,10 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     public void addClient(WebSocketSession session) {
+        asConnectReplay(() -> addClientAndReplay(session));
+    }
+
+    private void addClientAndReplay(WebSocketSession session) {
         long nowMs = System.currentTimeMillis();
         purgeExpiredCache(nowMs);
         OutboundChannel channel = new OutboundChannel(session, outboundWriterExecutor(), outboundCloserExecutor(), outboundIdleExecutor(), outboundCompatibilityExecutor(),
@@ -1689,6 +1693,11 @@ public class FeedGatewayService implements ReplayRunner {
         // a silence that began before it existed.
         socketLastInboundMs.put(session.getId(), System.currentTimeMillis());
         send(session, "status", statusJson());
+        // ES MBO first, right behind the status: its status and a SMALL history (the newest frames) must not wait behind the ~1 MB cvd-hello or any other replay.
+        if(esMboRelay!=null&&settings.esMboRelayEnabled()) {
+            var relay=esMboRelay.getIfAvailable();
+            if(relay!=null)relay.replay((event,json)->send(session,event,json));
+        }
         if(nativeHistoryAuthorized(session,channel)&&RithmicNativeHistoryRequest.supportedSystem(settings.rithmicSystem())){
             boolean subscribed; synchronized(nativeHistorySubscribers){subscribed=nativeHistorySubscribers.size()<1024;if(subscribed)nativeHistorySubscribers.put(session.getId(),session);}
             if(subscribed&&!nativeHistoryAuthorized(session,channel)){nativeHistorySubscribers.remove(session.getId(),session);subscribed=false;}
@@ -1720,10 +1729,6 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if(esLiquidityWallRelay!=null&&settings.esLiquidityWallRelayEnabled()) {
             var relay=esLiquidityWallRelay.getIfAvailable();
-            if(relay!=null)relay.replay((event,json)->send(session,event,json));
-        }
-        if(esMboRelay!=null&&settings.esMboRelayEnabled()) {
-            var relay=esMboRelay.getIfAvailable();
             if(relay!=null)relay.replay((event,json)->send(session,event,json));
         }
         if(liquidityValidatorRelay!=null&&settings.liquidityValidatorRelayEnabled()) {
@@ -15599,7 +15604,7 @@ public class FeedGatewayService implements ReplayRunner {
         for (String socketId : routingEngine.socketsForAppSession(appSessionId)) {
             WebSocketSession s = clientsById.get(socketId);
             if (s != null) {
-                replayCachedToSocket(s);
+                asConnectReplay(() -> replayCachedToSocket(s));   // return-to-live / readiness: a cache replay, tagged like the connect one
             }
         }
     }
@@ -15997,12 +16002,31 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private void send(WebSocketSession session, String event, String json) {
-        enqueueOutbound(session, envelopeJson(event, json), coalesceKeyFor(event, json));
+        enqueueOutbound(session, envelopeJson(event, json), coalesceKeyFor(event, json), CONNECT_REPLAY.get());
+    }
+
+    /** True on a thread that is replaying cached state to a socket: its sends are tagged REPLAY and do not count against the live message bound. */
+    private static final ThreadLocal<Boolean> CONNECT_REPLAY = ThreadLocal.withInitial(() -> Boolean.FALSE);
+
+    /**
+     * Run {@code replay} with every send it makes tagged as connect replay. The connect replay is thousands of per-entry messages (gex-by-strike,
+     * snapshot, pace, line-health-state ... measured 7,000+ in 6 s); counted against GATEWAY_WS_MAX_QUEUED_MESSAGES behind a ~1 MB hello they closed the
+     * socket as slow (code 1000, empty reason, no log line) before the replay finished. Nothing waits: the tag only decides which bound an entry counts
+     * against (the byte bound covers all of them). Live fan-out threads never set the flag.
+     */
+    private void asConnectReplay(Runnable replay) {
+        boolean outer = CONNECT_REPLAY.get();
+        CONNECT_REPLAY.set(Boolean.TRUE);
+        try {
+            replay.run();
+        } finally {
+            CONNECT_REPLAY.set(outer);
+        }
     }
 
     private void sendEnvelope(WebSocketSession session, String envelope) {
         // Control / batch / cached-state envelopes are never coalesced — every one must be delivered.
-        enqueueOutbound(session, envelope, null);
+        enqueueOutbound(session, envelope, null, CONNECT_REPLAY.get());
     }
 
     /**
@@ -16012,12 +16036,20 @@ public class FeedGatewayService implements ReplayRunner {
      * send — that path is never on the Kafka hot loop.
      */
     private void enqueueOutbound(WebSocketSession session, String envelope, String coalesceKey) {
+        enqueueOutbound(session, envelope, coalesceKey, false);
+    }
+
+    private void enqueueOutbound(WebSocketSession session, String envelope, String coalesceKey, boolean replay) {
         if (session == null || envelope == null) {
             return;
         }
         OutboundChannel channel = outbound.get(session.getId());
         if (channel != null) {
-            channel.enqueue(envelope, coalesceKey);
+            if (replay) {
+                channel.enqueueReplay(envelope, coalesceKey);
+            } else {
+                channel.enqueue(envelope, coalesceKey);
+            }
             return;
         }
         if (!session.isOpen()) {

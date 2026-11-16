@@ -87,7 +87,9 @@ class EsMboLiveProbeTest {
             System.out.println("LIVE-PROBE frames built=" + relay.framesHeldForTest() + " events held=" + relay.eventsHeldForTest() + " drops=" + relay.dropsForTest()
                     + " lateRows=" + relay.lateRowsForTest() + " status=" + relay.statusJson());
             System.out.println("LIVE-PROBE metrics\n" + relay.metrics());
+            long t0 = System.nanoTime();
             String history = relay.historyJson();
+            System.out.println("LIVE-PROBE historyJson build ms=" + (System.nanoTime() - t0) / 1_000_000.0 + " frames held=" + relay.framesHeldForTest());
             System.out.println("LIVE-PROBE history bytes=" + history.length());
             com.fasterxml.jackson.databind.JsonNode h = new com.fasterxml.jackson.databind.ObjectMapper().readTree(history);
             int nonEmpty = 0;
