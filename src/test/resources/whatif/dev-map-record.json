@@ -1,0 +1,241 @@
+{
+ "fingerprint": {
+  "valuationTime": 1795097758006,
+  "spotEpoch": 1795097757981,
+  "chainVersion": "be5ac67fc11dc5cc",
+  "signResolution": "SIGN_FROM_LOCAL_FLOW",
+  "configHash": "9bc582f7d98cf480",
+  "shortRate": 0.04
+ },
+ "service": "A",
+ "symbol": "SPX",
+ "expiry": "20261119",
+ "spot": 7401.6323,
+ "minutesToExpiry": 404.03366064000005,
+ "levels": [
+  {
+   "price": 7341.0,
+   "holdOrAccelerate": "HOLD",
+   "exposureChange": {
+    "low": 324811.0958781056,
+    "high": 324811.0958781056,
+    "units": "INDEX_DELTA"
+   },
+   "exposureChangePoints": null,
+   "subStepResolution": 0.05,
+   "label": {
+    "string": "FLOOR"
+   }
+  },
+  {
+   "price": 7342.0,
+   "holdOrAccelerate": "HOLD",
+   "exposureChange": {
+    "low": 322109.68600371125,
+    "high": 322109.68600371125,
+    "units": "INDEX_DELTA"
+   },
+   "exposureChangePoints": null,
+   "subStepResolution": 0.05,
+   "label": {
+    "string": "FLOOR"
+   }
+  }
+ ],
+ "strikes": [
+  {
+   "strikeCents": 731000,
+   "updatedAtMs": 1795097758006,
+   "deltaBand": {
+    "DeltaBand": {
+     "upperEdge": 7437.038955688477,
+     "lowerEdge": 7184.045181274414,
+     "innerBand": null,
+     "lowerThreshold": 0.05,
+     "upperThreshold": 0.95
+    }
+   },
+   "board": {
+    "netGex": -1154316.26,
+    "absGex": 164594425.22,
+    "gammaSign": "NEGATIVE",
+    "callGamma": 0.002519717924,
+    "callIv": 0.379449,
+    "netQuantity": {
+     "double": -8.362148491837495
+    },
+    "strength": 0.1140031228706515,
+    "holdOrAccelerate": "ACCELERATE",
+    "openInterest": 0,
+    "excluded": false,
+    "excludedReason": null,
+    "coverageConfidence": 0.0,
+    "oiQuality": "UNKNOWN",
+    "oiAgeMs": -1
+   },
+   "dayVolume": 0,
+   "fresh": false,
+   "charmDrift": {
+    "CharmDrift": {
+     "h15": 3.638742588390528,
+     "h30": 7.3882423598961395,
+     "h60": 15.233027324270324,
+     "horizonClamped": false
+    }
+   },
+   "vannaDrift": {
+    "VannaDrift": {
+     "value": 5.14509147271724,
+     "probeStep": 0.01,
+     "points": null
+    }
+   },
+   "moveState": null,
+   "decayToExpiry": {
+    "DecayToExpiry": {
+     "magnitude": 97.6448224863434,
+     "direction": "RISING"
+    }
+   },
+   "liveness": null,
+   "theses": []
+  },
+  {
+   "strikeCents": 731500,
+   "updatedAtMs": 1795097758006,
+   "deltaBand": {
+    "DeltaBand": {
+     "upperEdge": 7442.300643920898,
+     "lowerEdge": 7188.788070678711,
+     "innerBand": null,
+     "lowerThreshold": 0.05,
+     "upperThreshold": 0.95
+    }
+   },
+   "board": {
+    "netGex": -68289584.91,
+    "absGex": 164473092.71,
+    "gammaSign": "NEGATIVE",
+    "callGamma": 0.002717772364,
+    "callIv": 0.379968,
+    "netQuantity": {
+     "double": -458.65526385130636
+    },
+    "strength": 0.11391908427075818,
+    "holdOrAccelerate": "ACCELERATE",
+    "openInterest": 0,
+    "excluded": false,
+    "excludedReason": null,
+    "coverageConfidence": 0.0,
+    "oiQuality": "UNKNOWN",
+    "oiAgeMs": -1
+   },
+   "dayVolume": 0,
+   "fresh": false,
+   "charmDrift": {
+    "CharmDrift": {
+     "h15": 203.67676016765472,
+     "h30": 414.2009808211151,
+     "h60": 856.9476990870098,
+     "horizonClamped": false
+    }
+   },
+   "vannaDrift": {
+    "VannaDrift": {
+     "value": 287.83123180543043,
+     "probeStep": 0.01,
+     "points": null
+    }
+   },
+   "moveState": null,
+   "decayToExpiry": {
+    "DecayToExpiry": {
+     "magnitude": 5978.206403160853,
+     "direction": "RISING"
+    }
+   },
+   "liveness": null,
+   "theses": []
+  },
+  {
+   "strikeCents": 732000,
+   "updatedAtMs": 1795097758006,
+   "deltaBand": {
+    "DeltaBand": {
+     "upperEdge": 7447.758407592773,
+     "lowerEdge": 7193.33869934082,
+     "innerBand": null,
+     "lowerThreshold": 0.05,
+     "upperThreshold": 0.95
+    }
+   },
+   "board": {
+    "netGex": -67343508.43,
+    "absGex": 274219290.25,
+    "gammaSign": "NEGATIVE",
+    "callGamma": 0.002918235663,
+    "callIv": 0.381066,
+    "netQuantity": {
+     "double": -421.23103884063795
+    },
+    "strength": 0.1899326505019135,
+    "holdOrAccelerate": "ACCELERATE",
+    "openInterest": 0,
+    "excluded": false,
+    "excludedReason": null,
+    "coverageConfidence": 0.0,
+    "oiQuality": "UNKNOWN",
+    "oiAgeMs": -1
+   },
+   "dayVolume": 0,
+   "fresh": false,
+   "charmDrift": {
+    "CharmDrift": {
+     "h15": 189.3844942949654,
+     "h30": 385.71721797161445,
+     "h60": 800.6782232415135,
+     "horizonClamped": false
+    }
+   },
+   "vannaDrift": {
+    "VannaDrift": {
+     "value": 267.07064995539986,
+     "probeStep": 0.01,
+     "points": null
+    }
+   },
+   "moveState": null,
+   "decayToExpiry": {
+    "DecayToExpiry": {
+     "magnitude": 6119.632115468579,
+     "direction": "RISING"
+    }
+   },
+   "liveness": null,
+   "theses": []
+  }
+ ],
+ "charmTotal": {
+  "CharmDrift": {
+   "h15": 8818.158970294462,
+   "h30": 17991.60349719628,
+   "h60": 37501.282098718046,
+   "horizonClamped": false
+  }
+ },
+ "flips": [],
+ "nearestFlip": null,
+ "pivotLadder": null,
+ "moveFeatures": null,
+ "lean": [],
+ "chain": null,
+ "squeezeAlert": null,
+ "bounceTracker": [],
+ "regimeAroundSpot": {
+  "RegimeAroundSpot": {
+   "atSpot": "HOLD",
+   "changedThisEvaluation": false
+  }
+ },
+ "desert": null
+}

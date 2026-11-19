@@ -416,6 +416,17 @@ public class FeedGatewayService implements ReplayRunner {
     private final Map<String, String> strikeSr = new ConcurrentHashMap<>();
     private final Map<String, String> gexMagnet = new ConcurrentHashMap<>();
     private final Map<String, String> gammaMigration = new ConcurrentHashMap<>();
+    /**
+     * The What-If map board per chain (<b>D-71</b>, <b>D-72</b>): whatif-map-service's record,
+     * read so that {@code /api/gamma-migration} can carry the additive {@code whatIf} sibling.
+     *
+     * <p>Keyed like {@link #gammaMigration} — {@code SOURCE|SYMBOL|EXPIRY} — but the key is built
+     * from the RECORD's own {@code symbol} and {@code expiry} fields (<b>D-73</b>) rather than
+     * from its Kafka key, which is the cycle's valuation instant and therefore different on every
+     * record. Grouping on the Kafka key would make this map grow without bound through the
+     * session and never answer a lookup.
+     */
+    private final Map<String, String> whatIfMap = new ConcurrentHashMap<>();
     /** Gamma Navigator shadow view per chain. REST-only, like gammaRotation. */
     private final Map<String, String> gammaNavigation = new ConcurrentHashMap<>();
     /** Corridor-gauge live state per symbol|expiry (JSON, last-value-wins). Standalone event. */
@@ -2991,6 +3002,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
+        topicEvents.put(settings.whatIfMapTopic(), new TopicBinding("DATABENTO", "whatif-map"));
         topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
         topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
         if (settings.gammaNavigationEnabled()) {
@@ -3200,6 +3212,7 @@ public class FeedGatewayService implements ReplayRunner {
         topicEvents.put(settings.unifiedSrTopic(), new TopicBinding("DATABENTO", "strike-sr"));
         topicEvents.put(settings.databentoGexMagnetTopic(), new TopicBinding("DATABENTO", "gex-magnet"));
         topicEvents.put(settings.gammaMigrationTopic(), new TopicBinding("DATABENTO", "gamma-migration"));
+        topicEvents.put(settings.whatIfMapTopic(), new TopicBinding("DATABENTO", "whatif-map"));
         topicEvents.put(settings.gammaRotationTopic(), new TopicBinding("DATABENTO", "gamma-rotation"));
         topicEvents.put(settings.gammaFragilityTopic(), new TopicBinding("DATABENTO", "gamma-fragility"));
         if (settings.gammaNavigationEnabled()) {
@@ -6249,6 +6262,15 @@ public class FeedGatewayService implements ReplayRunner {
                     && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
                     && matchesActiveSelection(json, selection);
         }
+        if ("whatif-map".equals(binding.event())) {
+            // Same class as gamma-migration: a low-frequency derived per-chain board, published
+            // once a cycle and started independently of the gateway, so the source-switch offset
+            // barrier would suppress valid fresh boards indefinitely. Source, symbol/expiry and
+            // max-stale gates all apply; only the offset barrier is bypassed.
+            return binding.source().equals(selection.source())
+                    && passesSelectionTimeBarrier(cacheTimestamp(record), selection)
+                    && matchesActiveSelection(json, selection);
+        }
         if ("gamma-migration".equals(binding.event())) {
             // Same class as gex-magnet: a low-frequency derived per-chain signal that may be
             // (re)started after the source-switch offset barrier is captured, so applying that
@@ -6788,6 +6810,8 @@ public class FeedGatewayService implements ReplayRunner {
             key = directionalPressureCacheKey(json, key);
         } else if ("vix-price".equals(event) || "index-price".equals(event) || "spx-price".equals(event)) {
             key = indexPriceCacheKey(json, key);
+        } else if ("whatif-map".equals(event)) {
+            key = whatIfMapCacheKey(json);
         } else if ("strike-flow".equals(event)) {
             key = strikeFlowCacheKey(json, key);
         } else if ("spot-band".equals(event)) {
@@ -7281,6 +7305,14 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gammaMigration.put(key, json);
+                return key;
+            }
+            case "whatif-map" -> {
+                // Per-chain last-value-wins, same shape as gamma-migration. The key came from the
+                // record's own symbol and expiry, not from its Kafka key (see whatIfMapCacheKey).
+                cacheEventTimes.put(versionKey, eventTime);
+                cachePositions.put(versionKey, recordPosition(record));
+                whatIfMap.put(key, json);
                 return key;
             }
             case "gamma-navigation" -> {
@@ -8787,6 +8819,8 @@ public class FeedGatewayService implements ReplayRunner {
             corridorGauges.remove(versionKey.substring("corridor-gauge:".length()));
         } else if (versionKey.startsWith("gamma-migration:")) {
             gammaMigration.remove(versionKey.substring("gamma-migration:".length()));
+        } else if (versionKey.startsWith("whatif-map:")) {
+            whatIfMap.remove(versionKey.substring("whatif-map:".length()));
         } else if (versionKey.startsWith("gamma-navigation:")) {
             gammaNavigation.remove(versionKey.substring("gamma-navigation:".length()));
         } else if (versionKey.startsWith("gamma-rotation:")) {
@@ -8855,6 +8889,31 @@ public class FeedGatewayService implements ReplayRunner {
         return fallback;
     }
 
+    /**
+     * The What-If map record's chain key, from the record's OWN {@code symbol} and {@code expiry}
+     * (<b>D-73</b>).
+     *
+     * <p>There is deliberately <b>no fallback to the Kafka key</b>, which every other keyer here
+     * takes. The map record's Kafka key is the cycle's valuation instant, so falling back to it
+     * would key one entry per cycle: the cache would grow all session, every chain lookup would
+     * miss, and the screen would show four empty columns while the gateway held thousands of
+     * records. A record that does not name its chain is dropped instead, and {@code updateCache}
+     * treats a null key as "not cached" — which is a state D-71 already has a rule for.
+     */
+    private String whatIfMapCacheKey(String json) {
+        try {
+            JsonNode root = mapper.readTree(json);
+            String symbol = text(root, "symbol").toUpperCase(Locale.ROOT);
+            String expiry = normalizeExpiry(text(root, "expiry"));
+            if (!symbol.isBlank() && !expiry.isBlank()) {
+                return symbol + "|" + expiry;
+            }
+        } catch (JsonProcessingException ignored) {
+            // falls through to the drop below
+        }
+        return null;
+    }
+
     private String paceCacheKey(String json, String fallback) {
         try {
             JsonNode root = mapper.readTree(json);
@@ -8907,6 +8966,17 @@ public class FeedGatewayService implements ReplayRunner {
 
     public String cachedGammaMigration(String symbol, String expiry) {
         return cachedByChain(gammaMigration, symbol, expiry);
+    }
+
+    /**
+     * The What-If map board for one chain, or null when none is cached (<b>D-71</b>).
+     *
+     * <p>Null is the ordinary answer before the map service's first cycle of a session, and
+     * D-71 says what the caller does with it: the {@code whatIf} key is ABSENT from the response
+     * and the board renders exactly as it does today. Not a null field, not zeros.
+     */
+    public String cachedWhatIfMap(String symbol, String expiry) {
+        return cachedByChain(whatIfMap, symbol, expiry);
     }
 
     /** The bounded Gamma Navigator shadow record for one chain, or null when none is cached. */
@@ -15009,6 +15079,7 @@ public class FeedGatewayService implements ReplayRunner {
                 avroTopics.put(settings.unifiedSrTopic(), "strike-sr");
                 avroTopics.put(settings.databentoGexMagnetTopic(), "gex-magnet");
                 avroTopics.put(settings.gammaMigrationTopic(), "gamma-migration");
+                avroTopics.put(settings.whatIfMapTopic(), "whatif-map");
                 avroTopics.put(settings.gammaRotationTopic(), "gamma-rotation");
                 avroTopics.put(settings.gammaFragilityTopic(), "gamma-fragility");
                 avroTopics.put(settings.databentoGexStrikeLifecycleTopic(), "gex-strike-lifecycle");
