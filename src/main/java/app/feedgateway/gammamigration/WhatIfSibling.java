@@ -113,6 +113,11 @@ public final class WhatIfSibling {
         }
         ObjectNode out = mapper.createObjectNode();
         out.put("cycleTime", cycle.asLong());
+        // C-42: the gateway's own clock, sent WITH the cycle time so the page measures staleness
+        // between two readings of the same clock. The browser's clock is the viewer's machine --
+        // it can be minutes out, and a board that is current would then read STALE on one desk
+        // and LIVE on the next, from the same response.
+        out.put("serverTime", System.currentTimeMillis());
         out.put("symbol", recordSymbol);
         out.put("expiry", recordExpiry);
         ObjectNode strikes = mapper.createObjectNode();
@@ -122,18 +127,34 @@ public final class WhatIfSibling {
                 strikes.set(Long.toString(child(row, "strikeCents").asLong()), four);
             }
         }
+        if (strikes.isEmpty()) {
+            // Every strike was dropped, so there is no board to describe. D-71's rule is that
+            // the key is ABSENT rather than empty: an empty object would make the page render a
+            // legend and four blank columns over a board it does not have, which is the exact
+            // picture the owner has twice said is not proof.
+            return null;
+        }
         out.set("strikes", strikes);
         return out;
     }
 
     /**
      * The four values the owner's screen shows per strike: <b>Reading, Strength, Decay to close
-     * and Band</b>.
+     * and Band</b> — each sent when it exists, and the row kept when one does not (<b>C-43</b>).
      *
-     * <p>A row missing any of them is <b>left out</b> rather than published with a hole, the same
-     * discipline D-74(b) applies one service upstream: a strike that cannot be described is named
-     * by its absence, not by a zero that reads like a measurement. The board still renders every
-     * other strike.
+     * <p><b>This returned null for a row missing ANY of the four until C-43, and that was wrong
+     * in the common case rather than a rare one.</b> A strike more than 100 points from spot
+     * legitimately has no delta band: R-DB-3 computes bands only within that radius, by design.
+     * On a measured record 42 of 53 strikes were in exactly that position, so the page would have
+     * dropped four fifths of the owner's board and shown "no band" where the Reading and the
+     * Strength were both present and correct.
+     *
+     * <p>The guard was written against a corrupt row. The strike that simply has no band is not a
+     * corrupt row, and it is the majority of the board.
+     *
+     * <p>What survives from the old rule: a value that is absent is <b>omitted</b>, never sent as
+     * a zero. A zero reads like a measurement; a missing key lets the page print a dash. The row
+     * is dropped only when it carries <b>none</b> of the four, which is a row with nothing to say.
      */
     static ObjectNode fourValues(ObjectMapper mapper, JsonNode row) {
         JsonNode board = child(row, "board");
@@ -144,25 +165,34 @@ public final class WhatIfSibling {
         JsonNode lower = child(band, "lowerEdge");
         JsonNode upper = child(band, "upperEdge");
         JsonNode magnitude = child(decay, "magnitude");
-        if (reading == null || !strength.isNumber() || !lower.isNumber() || !upper.isNumber()
-                || !magnitude.isNumber()) {
-            return null;
-        }
+
         ObjectNode out = mapper.createObjectNode();
-        out.put("reading", reading);
-        out.put("strength", strength.asDouble());
-        ObjectNode decayOut = mapper.createObjectNode();
-        decayOut.put("magnitude", magnitude.asDouble());
-        String direction = text(decay, "direction");
-        if (direction != null) {
-            decayOut.put("direction", direction);
+        if (reading != null) {
+            out.put("reading", reading);
         }
-        out.set("decayToClose", decayOut);
-        ObjectNode bandOut = mapper.createObjectNode();
-        bandOut.put("lowerEdge", lower.asDouble());
-        bandOut.put("upperEdge", upper.asDouble());
-        out.set("band", bandOut);
-        return out;
+        if (strength.isNumber()) {
+            out.put("strength", strength.asDouble());
+        }
+        if (magnitude.isNumber()) {
+            ObjectNode decayOut = mapper.createObjectNode();
+            decayOut.put("magnitude", magnitude.asDouble());
+            String direction = text(decay, "direction");
+            if (direction != null) {
+                decayOut.put("direction", direction);
+            }
+            out.set("decayToClose", decayOut);
+        }
+        // The band needs BOTH edges or neither: half a band is not a band, and a page given one
+        // edge would have to invent the other to draw a width.
+        if (lower.isNumber() && upper.isNumber()) {
+            ObjectNode bandOut = mapper.createObjectNode();
+            bandOut.put("lowerEdge", lower.asDouble());
+            bandOut.put("upperEdge", upper.asDouble());
+            out.set("band", bandOut);
+        }
+        // A row carrying none of the four has nothing to say; everything else is published with
+        // the parts it has.
+        return out.isEmpty() ? null : out;
     }
 
     /**
