@@ -1492,6 +1492,22 @@ public final class GatewaySettings {
         return value("KAFKA_GAMMA_MIGRATION_TOPIC", "options.spx.gamma-migration.current");
     }
 
+    /**
+     * The What-If map board (<b>D-71</b>): whatif-map-service's per-cycle record, which carries
+     * every strike's Reading, Strength, Decay to close and delta Band.
+     *
+     * <p>This is the <b>map</b> topic and not the live one. D-71 decided it: the map record
+     * already carries every field the four board columns need, so reading it is one hop less and
+     * the screen does not wait on the live bridge.
+     *
+     * <p>Unlike the gamma topics this one is keyed by the CYCLE, not by the chain, so the
+     * gateway groups it by the record's own {@code symbol} and {@code expiry} (D-73) rather than
+     * by its Kafka key.
+     */
+    public String whatIfMapTopic() {
+        return value("KAFKA_WHATIF_MAP_TOPIC", "options.spx.whatif.map");
+    }
+
     /** Bounded shadow navigation record produced by gamma-migration-service. */
     public String gammaNavigationTopic() {
         return value("KAFKA_GAMMA_NAVIGATION_TOPIC", "options.spx.gamma-navigation.current");

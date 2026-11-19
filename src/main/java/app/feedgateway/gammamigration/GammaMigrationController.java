@@ -24,9 +24,15 @@ import java.util.Locale;
  * the same data as the live {@code gamma-migration} event; both read ONE cache, so the page and
  * the chain can never disagree about which strike is hot.
  *
- * <p>The cached record is served <b>verbatim</b>. Reshaping it here would create a second,
+ * <p>The cached gamma record is served <b>verbatim</b>. Reshaping it here would create a second,
  * silently-drifting view of a contract that already has one owner (the Avro schema), and every
  * field the page needs — regime, dwell, mass balance, hot strike, flips — is already on it.
+ *
+ * <p><b>D-72 adds one thing beside it, and nothing inside it.</b> The What-If board rides this
+ * same response as an additive sibling object named {@code whatIf} (see {@link WhatIfSibling}),
+ * so that the page makes one poll and computes nothing. That is not a softening of the paragraph
+ * above: no gamma field is read, renamed, moved or re-authored, and when there is no What-If
+ * record for the chain this method returns the cached string <b>unchanged</b>, byte for byte.
  *
  * <p>Bearer auth reuses {@link LiquidityHistoryAuth}, exactly as {@code /api/seller-activity} does:
  * invalid/expired → 401, valid-but-unentitled → 403. No concurrency semaphore: this is a single
@@ -93,7 +99,10 @@ public class GammaMigrationController {
             absent.put("expiry", expiry.trim());
             return ResponseEntity.ok(write(absent));
         }
-        return ResponseEntity.ok(cached);
+        // D-72: the What-If board beside the gamma fields. A chain with no map record gets the
+        // cached string back as it stands, so the board renders exactly as it does today (D-71).
+        return ResponseEntity.ok(WhatIfSibling.merge(mapper, cached,
+                service.cachedWhatIfMap(symbol, expiry), symbol, expiry));
     }
 
     private ResponseEntity<String> badRequest(String message) {
