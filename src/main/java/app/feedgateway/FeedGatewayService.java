@@ -2445,6 +2445,13 @@ public class FeedGatewayService implements ReplayRunner {
                 + "\"spxPrices\":" + spxPrices.size() + ","
                 + "\"currentStates\":" + currentStates.size() + ","
                 + "\"gexByStrike\":" + gexByStrike.size() + ","
+                // C-44: how many What-If boards this gateway is holding. The /api/gamma-migration
+                // response needs a bearer token, so "is the whatIf sibling actually being served?"
+                // could only be answered by someone who could sign in -- which meant the last link
+                // of the owner's chain was the one link nobody could check. This counter is on the
+                // UNAUTHENTICATED health payload beside the thirty already here, so that question
+                // is now answerable by anyone, at any time, with no login and no screenshot.
+                + "\"whatIfBoards\":" + whatIfMap.size() + ","
                 + "\"gammaLeadership\":" + gammaLeadership.size() + ","
                 + "\"direction\":" + directionCurrent.size() + ","
                 + "\"directionPush\":" + directionPush.size() + ","
@@ -2720,6 +2727,9 @@ public class FeedGatewayService implements ReplayRunner {
                 + "# HELP options_edge_feed_gateway_gex_by_strike Cached Unusual Whales GEX strike count.\n"
                 + "# TYPE options_edge_feed_gateway_gex_by_strike gauge\n"
                 + "options_edge_feed_gateway_gex_by_strike " + gexByStrike.size() + "\n"
+                + "# HELP options_edge_feed_gateway_whatif_boards Cached What-If map boards per chain (C-44).\n"
+                + "# TYPE options_edge_feed_gateway_whatif_boards gauge\n"
+                + "options_edge_feed_gateway_whatif_boards " + whatIfMap.size() + "\n"
                 + "# HELP options_edge_feed_gateway_gamma_leadership Cached gamma-leadership chain count.\n"
                 + "# TYPE options_edge_feed_gateway_gamma_leadership gauge\n"
                 + "options_edge_feed_gateway_gamma_leadership " + gammaLeadership.size() + "\n"
