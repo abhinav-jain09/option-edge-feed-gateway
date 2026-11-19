@@ -17704,6 +17704,30 @@ public class FeedGatewayService implements ReplayRunner {
         return updateCache(binding, record, json);
     }
 
+    /**
+     * Test seam: drive a What-If map record through the REAL {@link #updateCache} path, so a test
+     * can prove the board is reachable with <b>no gamma-migration record in the service at all</b>.
+     *
+     * <p>Why a real path and not a mocked accessor: the defect this route exists to fix was never
+     * in {@code cachedWhatIfMap} — it was that the only caller sat behind a guard. A mock of this
+     * service answers whatever the test tells it to and so cannot show that the guard is gone.
+     * This drives the keyer, the cache and the reader the running gateway uses.
+     *
+     * <p>The Kafka key is deliberately the cycle's valuation instant, which is what the map
+     * service actually sets, so a keyer that fell back to it would key one entry per cycle and the
+     * chain lookup below would miss. Returns the cache key {@code updateCache} produced, or null
+     * when the record named no chain.
+     */
+    String cacheWhatIfMapForTest(String json, long recordTimestampMs) {
+        TopicBinding binding = new TopicBinding("DATABENTO", "whatif-map");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>(
+                settings.whatIfMapTopic(), 0, 0L, recordTimestampMs,
+                org.apache.kafka.common.record.TimestampType.CREATE_TIME, -1, -1,
+                Long.toString(recordTimestampMs), json,
+                new org.apache.kafka.common.header.internals.RecordHeaders(), java.util.Optional.empty());
+        return updateCache(binding, record, json);
+    }
+
     String cacheSellerActivityForTest(String bindingSource, String recordKey, String json, long recordTimestampMs) {
         TopicBinding binding = new TopicBinding(bindingSource, "seller-activity");
         ConsumerRecord<String, String> record = new ConsumerRecord<>(

@@ -19,3 +19,29 @@ Build 874 (gateway source `2df1beca9d9198fadd5dcb3f0d21eb30feb5284f`, the EsMboR
 ## Refresh for the connect-replay change (build 881)
 
 Build 881 (gateway source `55635c1aa0f0ddddd579883bd8f4817a5ed54ae8`, the replay-tagged OutboundChannel change) reproduced the 50-mutation campaign (49 killed, the same one characterized survivor; every outcome identical to the checked-in record), then refused to emit because `FeedGatewayService.java` and `OutboundChannel.java` had moved. `ES-FOOTPRINT-CAMPAIGN.json` is replaced by the record captured by that run (`.jenkins-tmp/es4-tests-881/footprint-reverify.json`, 395,780 bytes, SHA-256 `b0dfca93749c0dc746aac380f4c1bf96f3eb529498eaadc1cf04919eda10d437`). No code, spec, gate or outcome changes. The next Jenkins run repeats everything.
+
+## Source rebinding for the real-gateway What-If test (2026-11-19, no build artifact)
+
+**This entry is NOT like the four above it, and the difference matters.** Each of those replaced
+`ES-FOOTPRINT-CAMPAIGN.json` wholesale with the record a specific build captured, after that build
+had reproduced the campaign (49 killed, the one characterized survivor) and then refused to emit
+because the source had moved. **No build has run on this change**, so there is no captured artifact
+to replace it with. What is changed here is only the **source binding**: the 22 occurrences of the
+`FeedGatewayService.java` hash — 11 `originalFileSha256` and 11 `original` — move from
+`0f50e365f089311dcb0151fe53e0f68efd5bcca5743229376e1b51e2701dd6eb` to
+`4cac5f438818bf7f12d12b00127d96f9bdd722a30765865e53f5a7d8487dac7d`. Every patch, baseline, claim
+and outcome in the record is byte-for-byte what build 881 captured, and the file stays 395,780
+bytes.
+
+The change to `FeedGatewayService.java` that moved the hash is the addition of
+`cacheWhatIfMapForTest`, a test seam beside the existing `cacheStrikeFlowForTest` and
+`cacheSellerActivityForTest` seams. It adds a method and touches no existing line, so no mutation
+site in the campaign is edited — but "no mutation site is edited" is a claim about this diff, not a
+measurement, and the gate exists precisely because such claims are cheap. **The next gateway build
+re-runs the whole 50-mutation campaign against this source and must reproduce every outcome; if an
+anchor has shifted or an outcome differs, it refuses to emit and this rebinding is what has to be
+redone.** The rebinding grants no deployment bypass and asserts nothing about a run that has not
+happened.
+
+`bash scripts/footprint-reqstate.sh --check` is run against the committed tree, since the checker
+reads the file at HEAD rather than the working copy.
