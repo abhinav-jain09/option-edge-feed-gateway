@@ -105,7 +105,7 @@ public final class WhatIfSibling {
                 || !recordExpiry.equals(expiry == null ? null : expiry.trim())) {
             return null;
         }
-        JsonNode cycle = whatIf.path("fingerprint").path("valuationTime");
+        JsonNode cycle = child(child(whatIf, "fingerprint"), "valuationTime");
         if (cycle.isMissingNode() || cycle.isNull()) {
             // Without the cycle time the page cannot say LIVE or STALE, and D-71 requires that it
             // can. A board whose age is unknowable is withheld rather than shown as current.
@@ -119,7 +119,7 @@ public final class WhatIfSibling {
         for (JsonNode row : whatIf.path("strikes")) {
             ObjectNode four = fourValues(mapper, row);
             if (four != null) {
-                strikes.set(Long.toString(row.path("strikeCents").asLong()), four);
+                strikes.set(Long.toString(child(row, "strikeCents").asLong()), four);
             }
         }
         out.set("strikes", strikes);
@@ -136,35 +136,75 @@ public final class WhatIfSibling {
      * other strike.
      */
     static ObjectNode fourValues(ObjectMapper mapper, JsonNode row) {
-        JsonNode board = row.path("board");
-        JsonNode band = row.path("deltaBand");
-        JsonNode decay = row.path("decayToExpiry");
+        JsonNode board = child(row, "board");
+        JsonNode band = child(row, "deltaBand");
+        JsonNode decay = child(row, "decayToExpiry");
         String reading = text(board, "holdOrAccelerate");
-        if (reading == null || !board.hasNonNull("strength")
-                || !band.hasNonNull("lowerEdge") || !band.hasNonNull("upperEdge")
-                || !decay.hasNonNull("magnitude")) {
+        JsonNode strength = child(board, "strength");
+        JsonNode lower = child(band, "lowerEdge");
+        JsonNode upper = child(band, "upperEdge");
+        JsonNode magnitude = child(decay, "magnitude");
+        if (reading == null || !strength.isNumber() || !lower.isNumber() || !upper.isNumber()
+                || !magnitude.isNumber()) {
             return null;
         }
         ObjectNode out = mapper.createObjectNode();
         out.put("reading", reading);
-        out.put("strength", board.get("strength").asDouble());
+        out.put("strength", strength.asDouble());
         ObjectNode decayOut = mapper.createObjectNode();
-        decayOut.put("magnitude", decay.get("magnitude").asDouble());
+        decayOut.put("magnitude", magnitude.asDouble());
         String direction = text(decay, "direction");
         if (direction != null) {
             decayOut.put("direction", direction);
         }
         out.set("decayToClose", decayOut);
         ObjectNode bandOut = mapper.createObjectNode();
-        bandOut.put("lowerEdge", band.get("lowerEdge").asDouble());
-        bandOut.put("upperEdge", band.get("upperEdge").asDouble());
+        bandOut.put("lowerEdge", lower.asDouble());
+        bandOut.put("upperEdge", upper.asDouble());
         out.set("band", bandOut);
         return out;
     }
 
+    /**
+     * A child node, with an Avro union envelope removed if there is one.
+     *
+     * <p>Avro's own JSON encoding writes a nullable record as {@code {"DeltaBand": {...}}} and a
+     * nullable double as {@code {"double": 1.0}} — the branch's type name wrapping the value.
+     * This gateway's {@link app.feedgateway.AvroJson} walks the {@code GenericRecord}'s fields
+     * directly and does NOT produce those envelopes, so in production this method finds the plain
+     * shape and does nothing.
+     *
+     * <p>It is here because the failure mode of guessing wrong is <b>silent</b>: every lookup
+     * would miss, every strike would be dropped as "missing one of the four", and the board would
+     * render four empty columns with no error anywhere. That is indistinguishable from "the map
+     * service has not published yet", which is a state the page is built to show. One cheap
+     * unwrap costs nothing and removes a whole class of quiet emptiness — including the case
+     * where something upstream changes renderer.
+     *
+     * <p>It unwraps only a single-field object whose key is an Avro type name: either a record
+     * name (initial capital) or one of the primitive branch names. A real field named
+     * {@code lowerEdge} is lower-case and is never mistaken for an envelope.
+     */
+    static JsonNode unwrap(JsonNode node) {
+        if (node == null || !node.isObject() || node.size() != 1) {
+            return node;
+        }
+        String only = node.fieldNames().next();
+        boolean typeName = Character.isUpperCase(only.charAt(0))
+                || "double".equals(only) || "long".equals(only) || "int".equals(only)
+                || "float".equals(only) || "string".equals(only) || "boolean".equals(only)
+                || "bytes".equals(only);
+        return typeName ? node.get(only) : node;
+    }
+
+    /** A child by name, unwrapped. Never null: an absent child reads as a missing node. */
+    private static JsonNode child(JsonNode parent, String field) {
+        return unwrap(parent == null ? null : parent.path(field));
+    }
+
     private static String text(JsonNode node, String field) {
-        JsonNode v = node == null ? null : node.get(field);
-        if (v == null || v.isNull()) {
+        JsonNode v = node == null ? null : unwrap(node.get(field));
+        if (v == null || v.isNull() || v.isMissingNode()) {
             return null;
         }
         String s = v.isTextual() ? v.textValue() : v.asText();

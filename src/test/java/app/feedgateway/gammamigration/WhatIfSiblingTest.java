@@ -132,6 +132,56 @@ class WhatIfSiblingTest {
     }
 
     @Test
+    @DisplayName("The record DEV actually published, union envelopes and all, yields the four values")
+    void theRealDevRecordYieldsTheFourValues() throws Exception {
+        // Captured from options.spx.whatif.map on dev at the service's first publish after the
+        // D-74 deploy (build 2354, digest 1536dbdf, cycle 1795097758006). Avro's own JSON
+        // encoding wraps a nullable record in its branch's type name -- deltaBand is
+        // {"DeltaBand": {...}} and netQuantity is {"double": ...} -- and this gateway's AvroJson
+        // does NOT produce those envelopes. Both shapes must read, because guessing wrong here
+        // fails SILENTLY: every strike would be dropped as "missing one of the four" and the
+        // board would show four empty columns, which is exactly what it shows when the map
+        // service has not published at all.
+        String real = new String(getClass().getResourceAsStream("/whatif/dev-map-record.json")
+                .readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        String gamma = """
+                {"symbol":"SPX","expiry":"20261119","regime":"SHORT"}""";
+
+        JsonNode whatIf = MAPPER.readTree(WhatIfSibling.merge(MAPPER, gamma, real, "SPX",
+                "20261119")).get("whatIf");
+
+        assertEquals(1795097758006L, whatIf.get("cycleTime").asLong());
+        JsonNode row = whatIf.get("strikes").get("731000");
+        assertEquals("ACCELERATE", row.get("reading").asText());
+        assertEquals(0.1140031228706515, row.get("strength").asDouble(), 1e-12);
+        assertEquals("RISING", row.get("decayToClose").get("direction").asText());
+        assertEquals(97.6448224863434, row.get("decayToClose").get("magnitude").asDouble(), 1e-9);
+
+        // the band D-74's widening produced: 7310's 0.05 edge is 125.95 points BELOW the strike,
+        // outside the 100-point span that refused for an hour and inside the 200-point one
+        assertEquals(7184.045181274414, row.get("band").get("lowerEdge").asDouble(), 1e-9);
+        assertEquals(7437.038955688477, row.get("band").get("upperEdge").asDouble(), 1e-9);
+        assertTrue(7310.0 - row.get("band").get("lowerEdge").asDouble() > 100.0,
+                "this edge is the whole reason D-74 exists");
+    }
+
+    @Test
+    @DisplayName("A real field is never mistaken for a union envelope")
+    void aRealSingleFieldObjectIsNotUnwrapped() throws Exception {
+        // one field, lower-case, not a primitive branch name: left alone
+        JsonNode plain = MAPPER.readTree("{\"lowerEdge\":1.0}");
+        assertSame(plain, WhatIfSibling.unwrap(plain));
+        // an envelope IS unwrapped, both forms
+        assertEquals(1.0, WhatIfSibling.unwrap(
+                MAPPER.readTree("{\"double\":1.0}")).asDouble(), 1e-12);
+        assertEquals(2.0, WhatIfSibling.unwrap(
+                MAPPER.readTree("{\"DeltaBand\":2.0}")).asDouble(), 1e-12);
+        // two fields is a record, never an envelope
+        JsonNode two = MAPPER.readTree("{\"double\":1.0,\"other\":2}");
+        assertSame(two, WhatIfSibling.unwrap(two));
+    }
+
+    @Test
     @DisplayName("An unparseable cache entry serves the gamma record unchanged rather than failing")
     void anUnparseableCacheEntryIsNotAFailure() {
         assertSame(GAMMA, WhatIfSibling.merge(MAPPER, GAMMA, "{not json", "SPX", "20261119"));
