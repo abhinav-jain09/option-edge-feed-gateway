@@ -117,18 +117,61 @@ class WhatIfSiblingTest {
     }
 
     @Test
-    @DisplayName("A strike missing one of the four is LEFT OUT; every other strike still publishes")
-    void aStrikeMissingOneOfTheFourIsLeftOut() throws Exception {
-        String holed = mapRecord("SPX", "20261119")
+    @DisplayName("C-43: a strike with NO BAND keeps its reading, strength and decay")
+    void aStrikeWithNoBandKeepsEverythingElse() throws Exception {
+        // The common case, not a rare one: R-DB-3 computes a band only within 100 points of
+        // spot, so on a measured record 42 of 53 strikes legitimately had none. Dropping them
+        // would blank four fifths of the owner's board.
+        String noBand = mapRecord("SPX", "20261119")
                 .replace("\"deltaBand\":{\"lowerEdge\":7398.5,\"upperEdge\":7481.5},", "");
-        JsonNode whatIf = MAPPER.readTree(WhatIfSibling.merge(MAPPER, GAMMA, holed,
-                "SPX", "20261119")).get("whatIf");
+        JsonNode row = MAPPER.readTree(WhatIfSibling.merge(MAPPER, GAMMA, noBand,
+                "SPX", "20261119")).get("whatIf").get("strikes").get("744000");
 
-        assertFalse(whatIf.get("strikes").has("744000"),
-                "a strike that cannot be described is named by its absence, not by a zero that "
-                        + "reads like a measurement");
-        assertTrue(whatIf.get("strikes").has("745000"),
-                "and the rest of the board still publishes");
+        assertTrue(row != null, "the strike stays on the board");
+        assertEquals("HOLD", row.get("reading").asText());
+        assertEquals(0.42, row.get("strength").asDouble(), 1e-12);
+        assertEquals(12.5, row.get("decayToClose").get("magnitude").asDouble(), 1e-12);
+        assertFalse(row.has("band"),
+                "the band is OMITTED, never zeroed -- a zero width reads like a measurement");
+    }
+
+    @Test
+    @DisplayName("C-43: half a band is not a band")
+    void oneEdgeIsNotABand() throws Exception {
+        String halfBand = mapRecord("SPX", "20261119")
+                .replace("\"lowerEdge\":7398.5,", "");
+        JsonNode row = MAPPER.readTree(WhatIfSibling.merge(MAPPER, GAMMA, halfBand,
+                "SPX", "20261119")).get("whatIf").get("strikes").get("744000");
+        assertFalse(row.has("band"), "a page given one edge would have to invent the other");
+        assertEquals("HOLD", row.get("reading").asText(), "and the rest of the row survives");
+    }
+
+    @Test
+    @DisplayName("C-43: a row carrying NONE of the four is still dropped")
+    void aRowWithNothingToSayIsStillDropped() throws Exception {
+        String empty = """
+                {"symbol":"SPX","expiry":"20261119",
+                 "fingerprint":{"valuationTime":1795093000000},
+                 "strikes":[{"strikeCents":744000}]}""";
+        assertFalse(MAPPER.readTree(WhatIfSibling.merge(MAPPER, GAMMA, empty, "SPX", "20261119"))
+                .has("whatIf"), "no strike has anything to say, so there is no board");
+    }
+
+    @Test
+    @DisplayName("C-42: the gateway's own clock travels with the board")
+    void theServerClockTravelsWithTheBoard() throws Exception {
+        long before = System.currentTimeMillis();
+        JsonNode whatIf = MAPPER.readTree(WhatIfSibling.merge(MAPPER, GAMMA,
+                mapRecord("SPX", "20261119"), "SPX", "20261119")).get("whatIf");
+        long after = System.currentTimeMillis();
+
+        long serverTime = whatIf.get("serverTime").asLong();
+        assertTrue(serverTime >= before && serverTime <= after,
+                "serverTime is read when the response is built: " + serverTime);
+        // the two the page subtracts are now readings of ONE clock
+        assertTrue(whatIf.has("cycleTime") && whatIf.has("serverTime"),
+                "staleness is measured between two readings of the gateway's clock, never "
+                        + "against the viewer's machine");
     }
 
     @Test
