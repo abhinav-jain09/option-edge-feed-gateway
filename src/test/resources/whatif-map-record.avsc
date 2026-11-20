@@ -1152,6 +1152,38 @@
               "type": "string"
             },
             {
+              "name": "remainingSell",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            },
+            {
+              "name": "remainingSellChange",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            },
+            {
+              "name": "priceChange",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            },
+            {
+              "name": "remainingSellAtSpot",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            },
+            {
               "name": "opposed",
               "type": [
                 "null",

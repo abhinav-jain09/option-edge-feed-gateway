@@ -31,7 +31,7 @@ import org.junit.jupiter.api.Test;
  * <p>So this test takes the <b>published schema itself</b> —
  * {@code src/test/resources/whatif-map-record.avsc}, the exact schema
  * {@code WhatIfGridAvro.schemaFor(WhatIfMapRecord.class)} generates, SHA-256
- * {@code f1722ef9c9b4d6249a89ee32a85dbb97b73362b887009e284072b50e2dc3084a}, the one the registry
+ * {@code 7c1c6868e1e9a6ca25dda96869c9623842870e2ad109883a7130eb37c50ef453}, the one the registry
  * answered {@code is_compatible: true} for against the deployed version [1] — writes a record
  * against it with a populated staircase block, serializes it through a real
  * {@link KafkaAvroSerializer}, and reads it back through {@link GatewayAvroDeserializer} and
@@ -116,6 +116,11 @@ final class WhatIfStaircaseDecodeTest {
                 "C-79: the browser can see that nothing has arbitrated this line");
         assertTrue(block.get("opposed").isNull(),
                 "RD-19's flag is absent and not false: nothing has compared the two sections yet");
+        assertEquals(-1.8e6, block.get("remainingSell").asDouble(), 1e-6,
+                "R-SC-10's review figures cross the wire with their values, not just their nulls");
+        assertEquals(-4.2e5, block.get("remainingSellChange").asDouble(), 1e-6);
+        assertEquals(1.25, block.get("priceChange").asDouble(), 1e-9);
+        assertEquals(-1.9e6, block.get("remainingSellAtSpot").asDouble(), 1e-6);
     }
 
     @Test
@@ -138,9 +143,12 @@ final class WhatIfStaircaseDecodeTest {
 
         // Two instances at most, one per orientation (RD-6), and §12b's two ladder blocks are of
         // the same order. Measured here so the margin is a fact and not a reassurance.
-        // Measured 2026-11-20: 447 bytes for a fully populated block -- every optional present,
-        // the phrase included. The bound is 1 KiB so a future field has room without a false red,
-        // and the real statement is the ratio two lines below.
+        // Measured 2026-11-20: 558 bytes for a fully populated block -- every optional present,
+        // the phrase and C-86's four review figures included. It was 447 before those four were
+        // added to the published block, which is the only reason this comment carries a date: a
+        // measurement with no date is a measurement of a shape nobody can name. The bound is
+        // 1 KiB so a further field has room without a false red, and the real statement is the
+        // ratio two lines below.
         assertTrue(measured < 1_024,
                 "one staircase block's JSON, measured: " + measured + " bytes");
         int worstCase = 2 * measured;
@@ -186,6 +194,13 @@ final class WhatIfStaircaseDecodeTest {
         block.put("hold", true);
         block.put("stepsTaken", 1);
         block.put("stairState", "ARMED");
+        // R-SC-10's review group (C-86), added to the published block after this test first ran.
+        // They are filled rather than left null on purpose: a nullable field left null proves the
+        // UNION decodes and says nothing about the value crossing the wire.
+        block.put("remainingSell", -1.8e6);
+        block.put("remainingSellChange", -4.2e5);
+        block.put("priceChange", 1.25);
+        block.put("remainingSellAtSpot", -1.9e6);
         block.put("opposed", null);
         GenericRecord phrase = new GenericData.Record(
                 nonNull(element.getField("phrase").schema()));
