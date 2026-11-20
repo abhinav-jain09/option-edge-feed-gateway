@@ -69,12 +69,29 @@ class NowPageTest {
         List<String> lines = page.lines().toList();
 
         assertTrue(lines.get(0).startsWith("last="), "the first line");
-        assertTrue(lines.get(1).startsWith("legend|"), "then the legend");
-        int close = indexOfPrefix(lines, "close|");
-        int vwap = indexOfPrefix(lines, "vwapes|");
-        int hold = indexOfPrefix(lines, "hold|");
-        int recent = indexOfPrefix(lines, "recent|");
-        int strikes = indexOfPrefix(lines, "strikes|");
+
+        // C-75 inserts the headline between the first line and the legend: short single-fact
+        // lines a summarising reader returns whole, above everything it would refuse to quote.
+        int legend = indexOfPrefix(lines, "legend|");
+        int headNow = indexOfPrefix(lines, "now|");
+        int headAbove = indexOfPrefix(lines, "above|");
+        int headStalled = indexOfPrefix(lines, "stalled|");
+        assertTrue(headNow == 1, "the headline opens immediately under the first line: " + headNow);
+        assertTrue(headAbove > headNow && headAbove < legend,
+                "the wall distances are in the headline, above the legend: " + headAbove);
+        assertTrue(headStalled > headNow && headStalled < legend,
+                "and so is the stalled-input line, which must precede every table: "
+                        + headStalled);
+
+        // The detail sections keep C-66's order BELOW the legend. Searched from the legend
+        // onwards, because `close|` now appears in the headline too and the first match would
+        // otherwise be that one.
+        List<String> detail = lines.subList(legend, lines.size());
+        int close = indexOfPrefix(detail, "close|");
+        int vwap = indexOfPrefix(detail, "vwapes|");
+        int hold = indexOfPrefix(detail, "hold|");
+        int recent = indexOfPrefix(detail, "recent|");
+        int strikes = indexOfPrefix(detail, "strikes|");
         assertTrue(close < vwap && vwap < hold && hold < recent && recent < strikes,
                 "close, vwap, hold, recent, strikes — in C-66's order: "
                         + close + "," + vwap + "," + hold + "," + recent + "," + strikes);
