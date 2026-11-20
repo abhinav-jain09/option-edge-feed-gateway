@@ -412,14 +412,20 @@ public final class ReadableBoardRenderer {
         switch (name == null ? "" : name) {
             case "board":
                 return Pages.board(nowMs, last, board);
-            case "now":
-                return Pages.now(nowMs, last, overnightNow(nowMs),
+            case "now": {
+                // the flag is read BEFORE the page is built, because building it moves the heap
+                boolean lowHeap = HeapGuard.low();
+                return withOvernightAbsence(Pages.now(nowMs, last, overnightNow(nowMs),
                         indicatorsJson == null ? null : VwapRead.of(indicatorsJson),
                         basisJson == null ? null : BasisRead.of(basisJson),
                         sides.result(), recentRows(), board, nowStalledInputs(), vwapHeld,
-                        feedGap.label());
-            case "overnight":
-                return Pages.overnight(nowMs, last, overnightNow(nowMs));
+                        feedGap.label()), lowHeap);
+            }
+            case "overnight": {
+                boolean lowHeap = HeapGuard.low();
+                return withOvernightAbsence(
+                        Pages.overnight(nowMs, last, overnightNow(nowMs)), lowHeap);
+            }
             case "footprint":
                 return onePage(Pages.footprint(nowMs, last, board == null ? null : board.spot(),
                         footprintLevels(board), basisOrNull()), part);
@@ -498,6 +504,28 @@ public final class ReadableBoardRenderer {
         }
         return OvernightGrid.build(nowMs, reference.epochMs(), reference.spx(),
                 source.bars(NIGHT_TIMEFRAME), null, null);
+    }
+
+    /**
+     * The heap's reason, appended to an on-demand page, or the page unchanged.
+     *
+     * <p><b>This closes a defect in my own guard, and the defect was a page telling the owner
+     * something false.</b> On low heap {@link #overnightNow} returns null, and
+     * {@code Pages.overnight} then falls into its pre-existing branch and prints "no reference
+     * price yet: the previous cash close is taken from the last print of the SPX index itself and
+     * none has been seen". A reference price exists; the heap is the reason. The cadence page had
+     * the truth appended and these two did not, so the one page the owner reads would have named
+     * the wrong cause on exactly the failure we are watching for.
+     *
+     * <p>It is appended rather than threaded through {@code Pages.now} and
+     * {@code Pages.overnight} so that the line is the SAME sentence on all three pages: two
+     * spellings of one absence is how they come to disagree.
+     */
+    String withOvernightAbsence(String page, boolean skipped) {
+        if (page == null || !skipped) {
+            return page;
+        }
+        return page + "\nOVERNIGHT ROWS ABSENT — " + HeapGuard.reason() + "\n";
     }
 
     /** The board the pages show: the map record where there is one, else the pre-open board. */
