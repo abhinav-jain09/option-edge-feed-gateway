@@ -40,7 +40,7 @@ class ReadablePageTest {
     @Test
     @DisplayName("the first line is in the owner's order: price time, price, then the write time")
     void theFirstLineCarriesBothClocksThenThePriceThenTheWriteTime() {
-        String page = ReadablePage.render(NOW, price(NOW - 30_000L, 7167.95), null, null);
+        String page = ReadablePage.render(NOW, price(NOW - 30_000L, 7167.95), null, null, List.of());
         String first = page.lines().findFirst().orElseThrow();
         assertTrue(first.startsWith("Last price 18:48:30 New York / 00:48:30 Amsterdam: 7167.95"),
                 "the price's own time comes first, in both zones: " + first);
@@ -56,12 +56,12 @@ class ReadablePageTest {
     @DisplayName("STALE opens the line past 20 minutes and says since when; 20 exactly does not")
     void staleOpensTheLineOnlyPastTheBound() {
         String atBound = ReadablePage.render(NOW,
-                price(NOW - ReadablePage.STALE_AFTER_SECONDS * 1000L, 7167.95), null, null);
+                price(NOW - ReadablePage.STALE_AFTER_SECONDS * 1000L, 7167.95), null, null, List.of());
         assertFalse(atBound.startsWith("STALE"),
                 "exactly twenty minutes is not yet stale, so the bound is not off by one");
 
         String past = ReadablePage.render(NOW,
-                price(NOW - (ReadablePage.STALE_AFTER_SECONDS + 60) * 1000L, 7167.95), null, null);
+                price(NOW - (ReadablePage.STALE_AFTER_SECONDS + 60) * 1000L, 7167.95), null, null, List.of());
         assertTrue(past.startsWith("STALE — the last price is 21 minutes old"),
                 "and past it the word is the first thing on the page: " + past.lines().findFirst());
         assertTrue(past.contains("unchanged since 18:28:00 New York"), "with since when");
@@ -75,7 +75,7 @@ class ReadablePageTest {
                 blank(PREV_CLOSE_MS + FIFTEEN),
                 filled(PREV_CLOSE_MS + 2 * FIFTEEN, 7156.74));
         String page = ReadablePage.render(NOW, price(NOW, 7167.95),
-                overnight(slots, 7181.74, 7148.74), null);
+                overnight(slots, 7181.74, 7148.74), null, List.of());
 
         assertTrue(page.contains("16:15"), "the blank slot's own timestamp is printed");
         assertTrue(page.contains("2 of 3 15-minute slots carry bars"),
@@ -95,7 +95,7 @@ class ReadablePageTest {
         // recomputed the extremes from its own rows would have understated the night's range.
         List<ReadablePage.Slot> slots = List.of(filled(PREV_CLOSE_MS, 7179.99));
         String page = ReadablePage.render(NOW, price(NOW, 7167.95),
-                overnight(slots, 7181.74, 7148.74), null);
+                overnight(slots, 7181.74, 7148.74), null, List.of());
         assertTrue(page.contains("High 7181.74, low 7148.74"),
                 "the figures given, not the ones the rows imply");
         assertFalse(page.contains("low 7175.99"), "which is what deriving from the one row gives");
@@ -104,7 +104,7 @@ class ReadablePageTest {
     @Test
     @DisplayName("with no board the page says so and does NOT show yesterday's")
     void noBoardSaysNoBoard() {
-        String page = ReadablePage.render(NOW, price(NOW, 7167.95), null, null);
+        String page = ReadablePage.render(NOW, price(NOW, 7167.95), null, null, List.of());
         assertTrue(page.contains("No board yet"));
         assertTrue(page.contains("reads as today's"),
                 "and it says WHY yesterday's is withheld, which is C-60 addendum (d)");
@@ -114,13 +114,20 @@ class ReadablePageTest {
     @DisplayName("a board carries its own cycle time and date, and rows N of M")
     void aBoardNamesItsOwnCycleAndItsCompleteness() {
         ReadablePage.Board board = new ReadablePage.Board(
-                1_795_120_362_000L, 7177.56, 31, 41,
-                List.of("7180  -8.31B  ACCELERATE", "7175  no row"));
-        String page = ReadablePage.render(NOW, price(NOW, 7167.95), null, board);
+                1_795_120_362_000L, 7177.56, 31, 41, BoardLines.SOURCE,
+                new ReadablePage.Extreme(7180.0, -8.31e9, 2.44),
+                new ReadablePage.Extreme(7175.0, 4.10e9, 2.56),
+                List.of("7180|-8.31B|A", "7175||norow"));
+        String page = ReadablePage.render(NOW, price(NOW, 7167.95), null, board, List.of());
         assertTrue(page.contains("cycle 2026-11-19 15:32:42 New York"),
                 "its own date AND time, so yesterday's board can never read as today's");
         assertTrue(page.contains("rows 31 of 41"), "the reviewer's own completeness figure");
-        assertTrue(page.contains("7175  no row"), "a missing strike is printed, never skipped");
+        assertTrue(page.contains("7175||norow"), "a missing strike is printed, never skipped");
+        assertTrue(page.contains("norow=gamma service published no row"),
+                "and the page defines that token itself, so `norow` is not a word the owner has "
+                        + "to infer from an empty cell");
+        assertTrue(page.contains("source whatif-map"),
+                "the board names which of the two boards this is");
     }
 
     @Test
@@ -130,8 +137,8 @@ class ReadablePageTest {
         for (int i = 0; i < 4_000; i++) {
             many.add("7000  -1.00B  ACCELERATE  padding padding padding padding padding");
         }
-        ReadablePage.Board huge = new ReadablePage.Board(NOW, 7177.56, 41, 41, many);
-        String page = ReadablePage.render(NOW, price(NOW, 7167.95), null, huge);
+        ReadablePage.Board huge = new ReadablePage.Board(NOW, 7177.56, 41, 41, BoardLines.SOURCE, null, null, many);
+        String page = ReadablePage.render(NOW, price(NOW, 7167.95), null, huge, List.of());
 
         assertTrue(page.length() <= ReadablePage.MAX_CHARS,
                 "C-61's bound is enforced, not hoped for: " + page.length());
@@ -143,7 +150,7 @@ class ReadablePageTest {
     @Test
     @DisplayName("no price at all is said plainly, not rendered as a zero")
     void noPriceIsSaidPlainly() {
-        String page = ReadablePage.render(NOW, null, null, null);
+        String page = ReadablePage.render(NOW, null, null, null, List.of());
         assertTrue(page.startsWith("NO PRICE"));
         assertFalse(page.contains("0.00"), "absence is not a zero price");
     }
@@ -161,7 +168,7 @@ class ReadablePageTest {
         ReadablePage.Slot quarantined = new ReadablePage.Slot(
                 PREV_CLOSE_MS, 7170.0, 7172.0, 7168.0, 7171.0, 500L, "QUARANTINED");
         String page = ReadablePage.render(NOW, price(NOW, 7167.95),
-                overnight(List.of(quarantined), 7172.0, 7168.0), null);
+                overnight(List.of(quarantined), 7172.0, 7168.0), null, List.of());
         assertTrue(page.contains("QUARANTINED"),
                 "C-60 item (4): print the row with the state named, do not drop it");
         assertTrue(page.contains("7171.00"), "and its prices are still there");
@@ -173,7 +180,8 @@ class ReadablePageTest {
         List<ReadablePage.Slot> slots = List.of(filled(PREV_CLOSE_MS, 7179.99));
         String page = ReadablePage.render(NOW, price(NOW, 7167.95),
                 overnight(slots, 7181.74, 7148.74),
-                new ReadablePage.Board(NOW, 7177.56, 41, 41, List.of("7180  -8.31B  ACCELERATE")));
+                new ReadablePage.Board(NOW, 7177.56, 41, 41, BoardLines.SOURCE,
+                        null, null, List.of("7180|-8.31B|A")), List.of());
         assertTrue(page.contains("SLOT(NY)") && page.contains("SLOT(AMS)"),
                 "the grid names both zones in its header");
         assertTrue(page.contains("16:00") && page.contains("22:00"),

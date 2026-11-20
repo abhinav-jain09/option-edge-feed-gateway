@@ -1572,6 +1572,13 @@ public class FeedGatewayService implements ReplayRunner {
         if (settings.esCvdSpxLevelsEnabled()) {
             hydrateCvdSpxLevels();
         }
+        // C-74: recover the previous cash close from history before the consumers start, for the
+        // same reason the hydration above runs here. The SPX index prints only during the cash
+        // session, so a gateway restarted overnight has never seen one and the readable page's
+        // overnight rows stayed empty until the cash open -- eleven hours of the owner's backfill
+        // gone, at the hour he needs it. Best effort by construction: a failure leaves the page
+        // saying NO REFERENCE PRICE with its reason, which is honest, and never stops start-up.
+        seedReadableReference();
         executor.submit(this::runSelectionConsumer);
         executor.submit(this::runAvroLiveConsumer);
         executor.submit(this::runJsonStateLiveConsumer);
@@ -3221,6 +3228,12 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.gammaZoneTopic(), new TopicBinding("DATABENTO", "gamma-zone"));
             topicEvents.put(settings.gammaZoneProfileTopic(), new TopicBinding("DATABENTO", "gamma-zone-profile"));
         }
+        // C-61: the pre-open gamma board, bound for the READABLE PAGE ONLY. Both consumers bind it
+        // and the tap is idempotent (newest-instant-wins per strike), so a double delivery costs
+        // nothing. Unconditional, because the owner's 06:30 board must not depend on a flag nobody
+        // remembers to set -- and nothing is exposed by binding it: its updateCache case caches
+        // nothing, returns null, and so can never satisfy a broadcast guard.
+        topicEvents.put(settings.gexPreopenTopic(), new TopicBinding("DATABENTO", "gex-preopen"));
         // THE GAMMA EFFORT reading, JSON on the wire like the gamma zone above and bound on the
         // same JSON consumers for the same reason.
         if (settings.gammaEffortEnabled()) {
@@ -3514,6 +3527,12 @@ public class FeedGatewayService implements ReplayRunner {
             topicEvents.put(settings.gammaZoneTopic(), new TopicBinding("DATABENTO", "gamma-zone"));
             topicEvents.put(settings.gammaZoneProfileTopic(), new TopicBinding("DATABENTO", "gamma-zone-profile"));
         }
+        // C-61: the pre-open gamma board, bound for the READABLE PAGE ONLY. Both consumers bind it
+        // and the tap is idempotent (newest-instant-wins per strike), so a double delivery costs
+        // nothing. Unconditional, because the owner's 06:30 board must not depend on a flag nobody
+        // remembers to set -- and nothing is exposed by binding it: its updateCache case caches
+        // nothing, returns null, and so can never satisfy a broadcast guard.
+        topicEvents.put(settings.gexPreopenTopic(), new TopicBinding("DATABENTO", "gex-preopen"));
         // THE GAMMA EFFORT reading, JSON on the wire like the gamma zone above and bound on the
         // same JSON consumers for the same reason.
         if (settings.gammaEffortEnabled()) {
@@ -7366,6 +7385,23 @@ public class FeedGatewayService implements ReplayRunner {
                 cachePositions.put(versionKey, recordPosition(record));
                 gammaZones.put(key, json);
                 return key;
+            }
+            case "gex-preopen" -> {
+                // C-61: the pre-open board, tapped for the readable page and NOTHING else.
+                //
+                // It returns null deliberately, and that return is the whole safety argument. The
+                // standalone broadcast branches are guarded by `cacheKey != null`, so a null here
+                // means this record can never reach a websocket, a ui-batch row or an /api cache,
+                // whatever is bound. The pre-open GEX feature's own rollout gates (shadow -> BETA
+                // -> GAMMA) govern UI visibility and are untouched by this: the readable page is
+                // not the UI, and nothing here publishes, enables or flips anything.
+                //
+                // The lesson from `gamma-effort` above applies in reverse: a missing case here is
+                // a silent drop, so this case is what makes the tap work at all, and
+                // PreopenWiringTest drives a record through this method rather than asserting the
+                // line exists.
+                readableBoard.onPreopenJson(json);
+                return null;
             }
             case "gamma-zone-profile" -> {
                 cacheEventTimes.put(versionKey, eventTime);
@@ -13140,6 +13176,33 @@ public class FeedGatewayService implements ReplayRunner {
      */
     /** Bounded: this runs on the startup path, so it must never hold the service down. */
     static final long CVD_SPX_LEVELS_HYDRATE_DEADLINE_MS = 15_000L;
+
+    /**
+     * C-74's start-up read-back. Package-private so the wiring test drives it with a fake history
+     * rather than asserting that a line of source exists.
+     */
+    void seedReadableReference(app.feedgateway.readable.ReferencePrice.History history) {
+        readableBoard.seedReference(app.feedgateway.readable.ReferencePrice.resolve(
+                System.currentTimeMillis(), history));
+    }
+
+    /** The real seeks: the gateway's own Avro client and its own record-to-JSON conversion. */
+    private void seedReadableReference() {
+        try {
+            seedReadableReference(new ReadableReferenceHistory(
+                    () -> new org.apache.kafka.clients.consumer.KafkaConsumer<String, Object>(
+                            avroConsumerProperties("readable-reference")),
+                    this::avroJson,
+                    settings.underlyingSpxPriceTopic(),
+                    settings.esFootprintBarsTopic()));
+            String label = readableBoard.referenceLabel();
+            System.out.println("readable reference: " + (label == null ? "unresolved" : label));
+        } catch (RuntimeException e) {
+            // Never abort @PostConstruct for this: the page states the absence and its reason.
+            System.err.println("readable reference not recovered at start-up: "
+                    + e.getClass().getSimpleName());
+        }
+    }
 
     void hydrateCvdSpxLevels() {
         String topic = settings.esCvdSpxLevelsTopic();

@@ -37,9 +37,30 @@ public final class OvernightGrid {
      *
      * @param basisState the producer's own {@code spxEqBasisState}; a bar whose basis is not
      *                   {@code ANCHORED} is kept and its state named, never dropped (C-60 item 4)
+     * @param timeframe  the producer's own bar length ({@code 30s} or {@code 1m}). <b>It is part of
+     *                   the identity</b>: the platform publishes the same minute at several lengths,
+     *                   and a 1-minute bar summed beside the two 30-second bars it contains would
+     *                   double every volume on the row
+     * @param buyers     buyer-initiated contracts, the producer's own {@code buyerContracts}, or
+     *                   null where the bar does not carry it
+     * @param sellers    seller-initiated contracts, {@code sellerContracts}, or null
+     * @param delta      the producer's own {@code delta}. <b>Kept even though buyers and sellers
+     *                   are here</b>: the two need not differ by delta when a bar carries
+     *                   unknown-side contracts, and the published delta is the producer's answer
+     *                   rather than our subtraction
      */
     public record Bar(long startMs, double open, double high, double low, double close,
-                      long volume, String basisState) {
+                      long volume, String basisState, String timeframe,
+                      Long buyers, Long sellers, Long delta) {
+
+        public Bar {
+            if (timeframe == null || timeframe.isBlank()) {
+                throw new IllegalArgumentException(
+                        "a bar without its timeframe cannot be kept apart from the bars it is made "
+                                + "of: a 30s and a 1m bar at the same instant would sum into one "
+                                + "slot and double-count the volume");
+            }
+        }
     }
 
     private OvernightGrid() {

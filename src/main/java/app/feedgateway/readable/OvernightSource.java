@@ -25,8 +25,12 @@ import java.util.TreeMap;
  */
 public final class OvernightSource {
 
-    /** Keyed by bar start, so a bar re-read after a restart replaces rather than duplicates. */
-    private final TreeMap<Long, OvernightGrid.Bar> bars = new TreeMap<>();
+    /**
+     * Keyed by <b>timeframe then bar start</b>, so a bar re-read after a restart replaces rather
+     * than duplicates, and a 30-second bar never collides with the minute that contains it.
+     */
+    private final java.util.Map<String, TreeMap<Long, OvernightGrid.Bar>> bars =
+            new java.util.LinkedHashMap<>();
     private ReadablePage.Price lastPrice;
     private ReadablePage.Price lastIndexPrice;
     private long nightStartMs;
@@ -41,7 +45,9 @@ public final class OvernightSource {
      */
     public void nightStartsAt(long epochMs) {
         this.nightStartMs = epochMs;
-        bars.headMap(epochMs, false).clear();
+        for (TreeMap<Long, OvernightGrid.Bar> byStart : bars.values()) {
+            byStart.headMap(epochMs, false).clear();
+        }
     }
 
     /** The night's start as this source understands it. */
@@ -59,7 +65,7 @@ public final class OvernightSource {
             barsRefused++;
             return;
         }
-        bars.put(bar.startMs(), bar);
+        bars.computeIfAbsent(bar.timeframe(), k -> new TreeMap<>()).put(bar.startMs(), bar);
     }
 
     /**
@@ -110,6 +116,20 @@ public final class OvernightSource {
     }
 
     /**
+     * <b>C-74</b>: seed the previous cash close from history at start-up.
+     *
+     * <p>It is taken ONLY when nothing has been learned from the live stream. A real index print
+     * observed on the topic is the better fact and must always win over one read back at boot —
+     * otherwise a restart would pin the page to a recovered value for the rest of the session even
+     * after the index began printing again.
+     */
+    public void seedPreviousClose(ReadablePage.Price close) {
+        if (close != null && lastIndexPrice == null) {
+            lastIndexPrice = close;
+        }
+    }
+
+    /**
      * Whether a price came from the index itself rather than from the ES-basis derivation.
      *
      * <p>Matched on the producer's own words. Overnight the topic reads {@code ES_BASIS_DERIVED} /
@@ -130,19 +150,46 @@ public final class OvernightSource {
         return source.contains("INDEX") || quality.contains("INDEX");
     }
 
-    /** Every bar held, oldest first. */
-    public List<OvernightGrid.Bar> bars() {
-        return new ArrayList<>(bars.values());
+    /**
+     * Every bar of ONE timeframe, oldest first.
+     *
+     * <p>The caller names the timeframe because the two lengths answer different questions: the
+     * owner's 30-second rows are built from {@code 30s}, the night's coarser grid from {@code 1m}.
+     * There is deliberately no method that returns them all together — that would be the
+     * double-count this class is keyed to prevent.
+     */
+    public List<OvernightGrid.Bar> bars(String timeframe) {
+        TreeMap<Long, OvernightGrid.Bar> byStart = bars.get(timeframe);
+        return byStart == null ? List.of() : new ArrayList<>(byStart.values());
     }
 
-    /** How many bars are held, for a health read. */
+    /** The timeframes this source is holding bars for. */
+    public java.util.Set<String> timeframes() {
+        return java.util.Set.copyOf(bars.keySet());
+    }
+
+    /** How many bars are held of one timeframe, for a health read. */
+    public int barCount(String timeframe) {
+        TreeMap<Long, OvernightGrid.Bar> byStart = bars.get(timeframe);
+        return byStart == null ? 0 : byStart.size();
+    }
+
+    /** How many bars are held in all, across every timeframe. */
     public int barCount() {
-        return bars.size();
+        int n = 0;
+        for (TreeMap<Long, OvernightGrid.Bar> byStart : bars.values()) {
+            n += byStart.size();
+        }
+        return n;
     }
 
-    /** The newest bar's start, or 0 — what says whether the bar chain is behind the price. */
-    public long newestBarStartMs() {
-        return bars.isEmpty() ? 0L : bars.lastKey();
+    /**
+     * The newest bar's start of one timeframe, or 0 — what says whether the bar chain is behind the
+     * price.
+     */
+    public long newestBarStartMs(String timeframe) {
+        TreeMap<Long, OvernightGrid.Bar> byStart = bars.get(timeframe);
+        return byStart == null || byStart.isEmpty() ? 0L : byStart.lastKey();
     }
 
     /** Records refused because they fell outside the night, counted rather than silent. */

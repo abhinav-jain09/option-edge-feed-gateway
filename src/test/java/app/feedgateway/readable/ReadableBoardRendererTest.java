@@ -92,7 +92,20 @@ class ReadableBoardRendererTest {
         assertTrue(page.contains("blank"), "and the count says how many");
 
         // 5. one strike row from the map record, with the record's OWN reading
-        assertTrue(page.contains("ACCELERATE"), "the reading the map service published");
+        assertTrue(page.contains("|A"),
+                "the reading the map service published, as C-66's one-letter code");
+        assertTrue(page.contains("A=accelerate"),
+                "and the page DEFINES that code on itself -- a bare `A` would leave the owner "
+                        + "guessing at a letter, which is what going compact nearly cost");
+
+        // 5a. the owner's 06:30 figures: the distance to the largest wall each side. The fixture
+        // has one strike, 7175, BELOW spot 7177.56 -- so below is that strike and above is stated
+        // as absent rather than left off the page.
+        assertTrue(page.contains("Largest net gamma BELOW spot: 7175"), page);
+        assertTrue(page.contains("2.56 points away"),
+                "measured from the board's own spot, not from the write time");
+        assertTrue(page.contains("Largest net gamma ABOVE spot: none on the board yet"),
+                "an absent side is printed, because a missing line reads as a page that forgot");
         assertTrue(page.contains("-8.31B"), "and its net gamma");
         assertTrue(page.contains("no row"),
                 "with the grid's gaps printed rather than skipped");

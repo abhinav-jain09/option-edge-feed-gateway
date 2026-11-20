@@ -21,7 +21,7 @@ class OvernightGridTest {
 
     private static OvernightGrid.Bar bar(long atMs, double o, double h, double l, double c,
             long vol) {
-        return new OvernightGrid.Bar(atMs, o, h, l, c, vol, "ANCHORED");
+        return new OvernightGrid.Bar(atMs, o, h, l, c, vol, "ANCHORED", "1m", null, null, null);
     }
 
     @Test
@@ -130,7 +130,7 @@ class OvernightGridTest {
     @DisplayName("a basis that is not ANCHORED is named on the row, not dropped")
     void anUnanchoredBasisIsKeptAndNamed() {
         List<OvernightGrid.Bar> bars = List.of(
-                new OvernightGrid.Bar(CLOSE, 7180, 7181, 7179, 7180.5, 100, "QUARANTINED"));
+                new OvernightGrid.Bar(CLOSE, 7180, 7181, 7179, 7180.5, 100, "QUARANTINED", "1m", null, null, null));
         ReadablePage.Slot slot = OvernightGrid
                 .build(CLOSE + MIN, CLOSE, 7176.24, bars, null, null).slots().get(0);
         assertTrue(slot.filled(), "the row is kept");
@@ -165,7 +165,7 @@ class OvernightGridTest {
                 OvernightGrid.build(CLOSE + span, CLOSE, 7176.24, bars, 7181.0, 7179.0);
         assertEquals(71, o.slots().size());
         String page = ReadablePage.render(CLOSE + span, new ReadablePage.Price(
-                CLOSE + span, 7180.5, "ES_BASIS_DERIVED", "LIVE_ES_BASIS"), o, null);
+                CLOSE + span, 7180.5, "ES_BASIS_DERIVED", "LIVE_ES_BASIS"), o, null, List.of());
         assertTrue(page.length() < ReadablePage.MAX_CHARS,
                 "a whole night of slots leaves room for the board: " + page.length());
     }
