@@ -38,10 +38,39 @@ public final class Pages {
     private static final ZoneId AMS = ZoneId.of("Europe/Amsterdam");
     private static final DateTimeFormatter HMS = DateTimeFormatter.ofPattern("HH:mm:ss");
 
+    /**
+     * <b>C-99: which SPX figures on these pages this page worked out, rather than read.</b>
+     *
+     * <p>The owner's order is that the SPX price comes from the SPX price topic and is never derived
+     * by us. Almost everything already obeys it: {@code now|} and {@code last=…px} are the topic's
+     * own {@code canonicalSpot} untouched, and the grid and the 30-second rows read the producer's
+     * published {@code spxEq*Cents} with its own {@code spxEqBasisState}.
+     *
+     * <p><b>Two figures are published in SPX terms by nothing, and those two this page
+     * translates.</b> They are named here rather than described, so a reader can tell at a glance
+     * which numbers are ours:
+     *
+     * <ul>
+     *   <li>the {@code vwapspx|} line and the SPX cells of the other VWAP lines — the indicators
+     *       service publishes its VWAP in ES only (C-69);</li>
+     *   <li>the SPX column of {@code /footprint}'s levels — the gamma-zone profile publishes
+     *       {@code priceCents} in ES.</li>
+     * </ul>
+     *
+     * <p>Both use the platform's <b>own published basis</b> from {@code spx.basis.state}, and only
+     * where it is {@code ANCHORED}; neither computes a basis. So what is ours is the subtraction, not
+     * the figure it is made from — and the legend says so in the owner's own terms rather than
+     * leaving him to ask which column he is reading.
+     */
+    static final String PAGE_COMPUTED =
+            "spx-by-this-page=vwapspx and the footprint SPX column are translated here from the "
+            + "published ES figure using the published basis; every other SPX price is the topic's";
+
     /** The reading codes, expanded by every page's legend. */
     static final String LEGEND =
             "legend|A=accelerate|H=hold|N=neutral|norow=gamma service published no row|"
-            + "empty=no data for that slot|px=SPX-equivalent|basis A=anchored, ?=none on that bar";
+            + "empty=no data for that slot|px=SPX-equivalent|basis A=anchored, ?=none on that bar|"
+            + PAGE_COMPUTED;
 
     /**
      * <b>C-73</b>: the one line that explains the empty columns on a pre-open board. Those columns
