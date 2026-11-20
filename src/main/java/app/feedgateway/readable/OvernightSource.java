@@ -67,7 +67,17 @@ public final class OvernightSource {
     private final java.util.Map<String, ConcurrentSkipListMap<Long, OvernightGrid.Bar>> bars =
             new ConcurrentHashMap<>();
     private volatile ReadablePage.Price lastPrice;
-    private volatile ReadablePage.Price lastIndexPrice;
+
+    /**
+     * <b>C-98's rule, holding the previous cash close.</b>
+     *
+     * <p>It replaces a {@code lastIndexPrice} field that simply kept the newest index print. That
+     * field was correct only while the premise behind it held — that the index prints during the
+     * cash session and not otherwise — and on 2026-11-20 the index printed once a second through
+     * the pre-market, so the newest print was a current price and {@code previousCashClose()}
+     * returned it. See {@link IndexSilence} for the measurement and the rule.
+     */
+    private final IndexSilence silence = new IndexSilence();
     private volatile long nightStartMs;
     private volatile long barsRefused;
     private volatile long pricesRefused;
@@ -128,7 +138,13 @@ public final class OvernightSource {
             return;
         }
         lastPrice = price;
+        // EVERY price advances the feed's clock, index or not. Overnight the topic carries the
+        // ES-basis derivation once a second while the index is quiet, and that is precisely when a
+        // trailing silence has to become visible -- so the derivation is the clock that closes it.
+        // Nothing is derived from its VALUE; only its instant is read.
+        silence.observeClock(price.epochMs());
         if (isIndexPrint(price)) {
+            silence.observe(price);
             // C-97 item 4: AN INDEX PRINT FROM INSIDE THIS NIGHT IS NOT THE PREVIOUS CLOSE.
             //
             // This single missing condition emptied the owner's page. On 2026-11-20
@@ -156,9 +172,13 @@ public final class OvernightSource {
             // calendar this class deliberately does not hold -- raised in the Discussion tab as its
             // own item. A frozen correct reference beats a reference that marches.
             if (nightStartMs > 0 && price.epochMs() > nightStartMs) {
+                // Kept as a COUNTER only. C-97 used this condition to freeze the reference, and
+                // C-98 replaced that with the silence rule -- which is stronger, because it also
+                // survives the restart that re-resolves from history. The count stays because it
+                // is the figure that says "the index is printing inside the night and we are
+                // correctly not treating it as a close", which is exactly what was invisible
+                // this morning.
                 closeCandidatesInsideTheNight++;
-            } else {
-                lastIndexPrice = price;
             }
         }
     }
@@ -187,7 +207,22 @@ public final class OvernightSource {
      * and says that rather than inventing one.
      */
     public ReadablePage.Price previousCashClose() {
-        return lastIndexPrice;
+        return silence.reference();
+    }
+
+    /** Why there is no previous close, or null when there is one (C-98: never a live price). */
+    public String closeAbsenceReason() {
+        return silence.absenceReason();
+    }
+
+    /** The newest index print, reference or not. For the instrument and for /now's source label. */
+    public ReadablePage.Price newestIndexPrint() {
+        return silence.newest();
+    }
+
+    /** How many session-ending silences the index feed has shown this process. */
+    public long indexSilencesSeen() {
+        return silence.silencesSeen();
     }
 
     /**
@@ -199,9 +234,11 @@ public final class OvernightSource {
      * after the index began printing again.
      */
     public void seedPreviousClose(ReadablePage.Price close) {
-        if (close != null && lastIndexPrice == null) {
-            lastIndexPrice = close;
-        }
+        // The reference resolved from history by the SAME rule (ReferencePrice runs
+        // IndexSilence.resolveFrom over its slices), adopted only where nothing has been learned
+        // live. One rule, two entry points -- and the rule itself lives in one class so the two
+        // cannot drift.
+        silence.adopt(close);
     }
 
     /**

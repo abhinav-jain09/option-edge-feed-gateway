@@ -23,7 +23,7 @@ import org.junit.jupiter.api.Test;
  * {@code /board}, {@code /footprint}, {@code /recent-full}, {@code /index} — together with C-64's
  * rows, C-65's holding times, C-69's VWAP and basis cells and C-75's headline, was written, tested
  * and <b>served by nothing</b>. `Pages` was not called from any controller. A suite of 2,317 green
- * tests said nothing about it, because every one of them called {@code Pages.now(..., new VwapHeld(), null)} directly.
+ * tests said nothing about it, because every one of them called {@code Pages.now(..., new VwapHeld(), null, null)} directly.
  * That is the same defect class as a module unreachable from {@code main}: the unit was correct and
  * nothing executed the wiring.
  *

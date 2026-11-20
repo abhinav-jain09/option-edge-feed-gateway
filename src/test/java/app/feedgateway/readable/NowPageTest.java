@@ -65,7 +65,7 @@ class NowPageTest {
     void everySectionIsPresentInOrder() {
         String page = Pages.now(NOW, price(), overnight(), VwapRead.of(ES_VWAP),
                 BasisRead.of("{\"level\":19.26,\"levelKind\":\"ANCHORED\"}"),
-                holding(), recent(), board(), List.of(), new VwapHeld(), null);
+                holding(), recent(), board(), List.of(), new VwapHeld(), null, null);
         List<String> lines = page.lines().toList();
 
         assertTrue(lines.get(0).startsWith("last="), "the first line");
@@ -103,7 +103,7 @@ class NowPageTest {
     void bothUnitsWithTheBasisNamed() {
         String page = Pages.now(NOW, price(), overnight(), VwapRead.of(ES_VWAP),
                 BasisRead.of("{\"level\":19.26,\"levelKind\":\"ANCHORED\"}"),
-                holding(), recent(), board(), List.of(), new VwapHeld(), null);
+                holding(), recent(), board(), List.of(), new VwapHeld(), null, null);
         assertTrue(page.contains("7187.01(LATCHED)"),
                 "the ES figure as published, with its state");
         assertTrue(page.contains("7167.75"),
@@ -117,7 +117,7 @@ class NowPageTest {
     void anUnanchoredBasisTranslatesNothing() {
         String page = Pages.now(NOW, price(), overnight(), VwapRead.of(ES_VWAP),
                 BasisRead.of("{\"level\":19.26,\"levelKind\":\"QUARANTINED\"}"),
-                holding(), recent(), board(), List.of(), new VwapHeld(), null);
+                holding(), recent(), board(), List.of(), new VwapHeld(), null, null);
         assertTrue(page.contains("vwapspx|absent|basis 19.26 QUARANTINED"), page);
         assertTrue(page.contains("7187.01(LATCHED)"), "the ES figures remain");
         assertFalse(page.contains("7167.75"), "and nothing is translated under it");
@@ -127,7 +127,7 @@ class NowPageTest {
     @DisplayName("the holding line names its anchor and when its figures start from")
     void theHoldingLineNamesItsAnchorAndMemory() {
         String page = Pages.now(NOW, price(), overnight(), VwapRead.of(ES_VWAP), null,
-                holding(), recent(), board(), List.of(), new VwapHeld(), null);
+                holding(), recent(), board(), List.of(), new VwapHeld(), null, null);
         String line = page.lines().filter(l -> l.startsWith("hold|")).findFirst().orElseThrow();
         assertTrue(line.contains("side=B"), "price is below the line now: " + line);
         assertTrue(line.contains("crosses=1"), line);
@@ -139,7 +139,7 @@ class NowPageTest {
     @Test
     @DisplayName("the five largest strikes are the largest by absolute net gamma")
     void theFiveLargestAreLargest() {
-        String page = Pages.now(NOW, price(), overnight(), null, null, null, null, board(), List.of(), new VwapHeld(), null);
+        String page = Pages.now(NOW, price(), overnight(), null, null, null, null, board(), List.of(), new VwapHeld(), null, null);
         List<String> rows = page.lines()
                 .filter(l -> l.matches("^7[0-9]{3}\\|.*"))
                 .toList();
@@ -154,7 +154,7 @@ class NowPageTest {
     @Test
     @DisplayName("every absent section gives one line of reason, and the page still renders")
     void absentSectionsDoNotCostThePage() {
-        String page = Pages.now(NOW, price(), null, null, null, null, null, null, List.of(), new VwapHeld(), null);
+        String page = Pages.now(NOW, price(), null, null, null, null, null, null, List.of(), new VwapHeld(), null, null);
         assertTrue(page.contains("vwap|absent|"), page);
         assertTrue(page.contains("hold|absent|"), page);
         assertTrue(page.contains("recent|absent|"), page);
@@ -168,7 +168,7 @@ class NowPageTest {
     void noLabelCarriesASeparator() {
         String page = Pages.now(NOW, price(), overnight(), VwapRead.of(ES_VWAP),
                 BasisRead.of("{\"level\":19.26,\"levelKind\":\"ANCHORED\"}"),
-                holding(), recent(), board(), List.of(), new VwapHeld(), null);
+                holding(), recent(), board(), List.of(), new VwapHeld(), null, null);
         for (String line : page.lines().toList()) {
             assertFalse(line.contains("||netgamma"),
                     "a pipe inside a label would split into a phantom column: " + line);

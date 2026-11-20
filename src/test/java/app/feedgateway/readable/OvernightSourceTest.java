@@ -1,6 +1,7 @@
 package app.feedgateway.readable;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -107,16 +108,25 @@ class OvernightSourceTest {
                 "NATIVE_SPX_INDEX", "LIVE_INDEX"));
         s.onPrice(new ReadablePage.Price(CLOSE - 66_000L, 7176.24,
                 "NATIVE_SPX_INDEX", "LIVE_INDEX"));
-        assertEquals(7176.24, s.previousCashClose().spx(), 1e-9, "the last index print");
+        // C-98: WHILE THE INDEX IS STILL PRINTING THERE IS NO CLOSE YET, and that is the change.
+        // Under the old rule the newest index print was the close immediately -- which is how a
+        // pre-market print became "yesterday's close" on 2026-11-20. A session is closed by the
+        // index going quiet, not by a print being the newest one.
+        assertNull(s.previousCashClose(), "no silence yet, so no session has ended");
+        assertNotNull(s.closeAbsenceReason());
 
-        // then the index stops and the night runs on the ES-basis derivation for hours
-        for (int i = 1; i <= 50; i++) {
+        // then the index stops and the night runs on the ES-basis derivation for hours. Those
+        // prints never become the close; they advance the clock, and after three hours of index
+        // silence the last index print IS the close.
+        int overnightTicks = 240;                 // four hours, so the three-hour silence elapses
+        for (int i = 1; i <= overnightTicks; i++) {
             s.onPrice(new ReadablePage.Price(CLOSE + i * 60_000L, 7150.0 + i,
                     "ES_BASIS_DERIVED", "LIVE_ES_BASIS"));
         }
         assertEquals(7176.24, s.previousCashClose().spx(), 1e-9,
                 "the reference price FREEZES at the close and the overnight ticks never move it");
-        assertEquals(7200.0, s.lastPrice().spx(), 1e-9, "while the last price keeps moving");
+        assertEquals(7150.0 + overnightTicks, s.lastPrice().spx(), 1e-9,
+                "while the last price keeps moving");
     }
 
     @Test

@@ -33,7 +33,7 @@ class HoldLineFiguresTest {
         t.observe(NOW, 7162.25, 7161.2319, null, null, "vwapAnalysis");
 
         String page = Pages.now(NOW, null, null, null, null, t.result(), List.of(), null,
-                List.of(), new VwapHeld(), null);
+                List.of(), new VwapHeld(), null, null);
         String hold = page.lines().filter(l -> l.startsWith("hold|")).findFirst().orElse("");
 
         assertTrue(hold.startsWith("hold|side=A|px=7162.25|vwap=7161.23|"),
@@ -49,7 +49,7 @@ class HoldLineFiguresTest {
         t.observe(NOW, 7150.00, 7161.2319, null, null, "vwapAnalysis");
 
         String hold = Pages.now(NOW, null, null, null, null, t.result(), List.of(), null,
-                        List.of(), new VwapHeld(), null)
+                        List.of(), new VwapHeld(), null, null)
                 .lines().filter(l -> l.startsWith("hold|")).findFirst().orElse("");
 
         assertTrue(hold.startsWith("hold|side=B|px=7150.00|vwap=7161.23|"),
@@ -65,7 +65,7 @@ class HoldLineFiguresTest {
         t.observe(NOW, 7162.25, 7161.2319, null, null, "vwapAnalysis");
 
         String head = Pages.now(NOW, null, null, null, null, t.result(), List.of(), null,
-                        List.of(), new VwapHeld(), null)
+                        List.of(), new VwapHeld(), null, null)
                 .lines().filter(l -> l.startsWith("vwap|")).findFirst().orElse("");
 
         assertTrue(head.startsWith("vwap|A|held "), "still side and held time only: " + head);

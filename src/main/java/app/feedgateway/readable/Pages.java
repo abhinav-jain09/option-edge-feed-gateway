@@ -145,7 +145,7 @@ public final class Pages {
     static String headline(long nowMs, ReadablePage.Price last, ReadablePage.Overnight overnight,
             VwapRead vwap, VwapSideTracker.Result holding, List<RecentRows.Row> recent,
             ReadablePage.Board board, List<StalledInputs.Input> stalledInputs,
-            String feedGap) {
+            String feedGap, String closeAbsenceReason) {
         StringBuilder s = new StringBuilder(512);
 
         s.append("now|").append(last == null ? "no price" : money(last.spx()) + " SPX")
@@ -153,7 +153,15 @@ public final class Pages {
                 .append('\n');
 
         if (overnight == null) {
-            s.append("close|absent\n");
+            // C-98 item 5: an unresolvable close is an absence WITH ITS REASON, never a price.
+            // `close|absent` on its own told the owner the figure was missing and nothing about
+            // why -- and the reason is the whole of what he needs, because "no silence has been
+            // seen in the index feed yet" and "the heap would not let the block be built" call for
+            // completely different reactions from him.
+            s.append("close|absent|")
+                    .append(closeAbsenceReason == null || closeAbsenceReason.isBlank()
+                            ? "no reason given" : closeAbsenceReason)
+                    .append('\n');
         } else {
             s.append("close|").append(money(overnight.previousClose())).append('|')
                     .append(last == null ? "" : String.format(Locale.ROOT, "%+.2f",
@@ -227,7 +235,7 @@ public final class Pages {
     public static String now(long nowMs, ReadablePage.Price last, ReadablePage.Overnight overnight,
             VwapRead vwap, BasisRead basis, VwapSideTracker.Result holding,
             List<RecentRows.Row> recent, ReadablePage.Board board,
-            List<StalledInputs.Input> stalled, VwapHeld held, String feedGap) {
+            List<StalledInputs.Input> stalled, VwapHeld held, String feedGap, String closeAbsenceReason) {
         StringBuilder s = new StringBuilder(8_192);
         s.append(firstLine(nowMs, last)).append('\n');
         // C-75: the facts the reviewer is asked for, as SHORT single-fact labelled lines, above
@@ -236,11 +244,19 @@ public final class Pages {
         // description of a table instead of the table. Each line here is one fact, short enough to
         // be quoted whole. The full tables stay below, unchanged.
         s.append(headline(nowMs, last, overnight, vwap, holding, recent, board, stalled,
-                feedGap));
+                feedGap, closeAbsenceReason));
         s.append(LEGEND).append("|A/B/==above/below/on VWAP|U1/L1=one-sigma bands\n");
 
         // the close and the range, once
-        if (overnight != null) {
+        if (overnight == null) {
+            // C-98 item 5 again, on the detailed line: before this, an absent reference printed
+            // NOTHING here, so the owner's page simply had no close row and he had to notice its
+            // absence rather than be told. An absence he can read beats a line that is not there.
+            s.append("close|absent|")
+                    .append(closeAbsenceReason == null || closeAbsenceReason.isBlank()
+                            ? "no reason given" : closeAbsenceReason)
+                    .append('\n');
+        } else {
             s.append("close|prev=").append(money(overnight.previousClose()))
                     .append("|diff=").append(last == null ? ""
                             : String.format(Locale.ROOT, "%+.2f",

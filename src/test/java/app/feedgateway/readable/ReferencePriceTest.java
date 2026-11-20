@@ -98,10 +98,16 @@ class ReferencePriceTest {
     @Test
     @DisplayName("started at 03:00 with history on the topic, the close is the index print 7176.24")
     void theIndexPrintIsRecovered() {
-        ReferencePrice.Resolved r = ReferencePrice.resolve(CLOSE,
+        // C-98: resolved AT the instant the test's own name says, rather than one second after the
+        // print. The rule is "the last index print before a silence of three hours or more", so
+        // the instant matters: this fixture's index print is followed by hours of basis derivation,
+        // and it is a close because the INDEX has been quiet across them. Asking one second after
+        // the print asks about a session that has not ended, and the answer there is the bar
+        // fallback -- which `aCloseBeforeTheSilenceHasElapsedUsesTheBar` below now covers.
+        ReferencePrice.Resolved r = ReferencePrice.resolve(STARTED_AT_0300,
                 history(theNightsPrices(), List.of(barJson(CLOSE - 60_000L, 717_624L))));
 
-        assertEquals(ReferencePrice.From.INDEX_PRINT, r.from());
+        assertEquals(ReferencePrice.From.INDEX_PRINT, r.from(), r.reason());
         assertEquals(7176.24, r.close().spx(), 1e-9,
                 "the previous cash close, recovered rather than waited for");
         assertTrue(r.label().contains("SPX index's own last print"), r.label());
@@ -191,7 +197,11 @@ class ReferencePriceTest {
     @DisplayName("a page restarted at 03:00 then carries the close and its source in words")
     void theRestartedPageCarriesIt() {
         ReadableBoardRenderer r = new ReadableBoardRenderer(() -> null, () -> STARTED_AT_0300);
-        r.seedReference(ReferencePrice.resolve(CLOSE,
+        // C-98: resolved at the instant the page is being rendered at, which is what a restart
+        // actually does. Resolving at CLOSE asked about a session that had not ended three hours
+        // earlier, so the answer was the bar fallback and the page carried the bar's label -- true,
+        // but not what this test is about.
+        r.seedReference(ReferencePrice.resolve(STARTED_AT_0300,
                 history(theNightsPrices(), List.of(barJson(CLOSE - 60_000L, 717_624L)))));
         // one overnight price so the page has something live to show
         r.onPriceJson(priceJson(STARTED_AT_0300 - 5_000L, 7159.95, "ES_BASIS_DERIVED",
@@ -248,16 +258,49 @@ class ReferencePriceTest {
         assertTrue(none.reason().contains("cannot read price history back"), none.reason());
     }
 
+    /**
+     * <b>C-98 changed this, and the change is the point rather than a cost.</b>
+     *
+     * <p>It used to assert that a live index print displaces a recovered close immediately. That is
+     * the old rule, and it is exactly how a pre-market print became "yesterday's close" this
+     * morning: any index print, merely by being newer, took the label. Under C-98 an index print
+     * becomes the close when the index then goes quiet for three hours — so the recovered close
+     * stands until that happens, and then the observed print takes over <b>with no restart</b>.
+     * The original worry, that a restart would pin the page to a recovered figure for the rest of
+     * the session, is answered by the second half of this test rather than by displacing it early.
+     */
     @Test
-    @DisplayName("a live index print always wins over a recovered one")
-    void aLivePrintBeatsARecoveredOne() {
+    @DisplayName("a recovered close holds until the index goes quiet, then the observed print wins")
+    void anObservedPrintTakesOverWhenTheIndexGoesQuiet() {
         OvernightSource s = new OvernightSource();
         s.onPrice(OvernightDecoders.price(
                 priceJson(CLOSE, 7176.24, "NATIVE_SPX_INDEX", "LIVE_INDEX"), CLOSE));
         s.seedPreviousClose(new ReadablePage.Price(CLOSE - 86_400_000L, 7000.00,
                 "FOOTPRINT_BAR_SPX_EQ", "CASH_SESSION_LAST_COMPLETE_BAR"));
+        assertEquals(7000.00, s.previousCashClose().spx(), 1e-9,
+                "while the index is still printing, no session has ended: the recovered close is "
+                        + "the only completed one, and a newer print is not a close for being newer");
+
+        // the night runs on: the basis derivation advances the clock while the index stays quiet
+        for (long t = CLOSE + 600_000L; t <= CLOSE + 4L * 3_600_000L; t += 600_000L) {
+            s.onPrice(OvernightDecoders.price(
+                    priceJson(t, 7160.00, "ES_BASIS_DERIVED", "LIVE_ES_BASIS"), t));
+        }
         assertEquals(7176.24, s.previousCashClose().spx(), 1e-9,
-                "a recovered close must never displace one actually observed on the topic, or a "
-                        + "restart would pin the page to it for the rest of the session");
+                "three hours of index silence ended that session, so the observed print is now the "
+                        + "close -- without a restart, which is what the old assertion wanted");
+    }
+
+    @Test
+    @DisplayName("before the silence has elapsed the close is the bar fallback, labelled as such")
+    void aCloseBeforeTheSilenceHasElapsedUsesTheBar() {
+        // The consequence of C-98 that is worth a test of its own: in the window between the
+        // index's last print and three hours later, no session has ended by the rule, so the
+        // resolver falls to the cash-session bar and SAYS it did. The owner is never shown an
+        // index figure labelled as a close before that close exists.
+        ReferencePrice.Resolved r = ReferencePrice.resolve(CLOSE,
+                history(theNightsPrices(), List.of(barJson(CLOSE - 60_000L, 717_624L))));
+        assertEquals(ReferencePrice.From.FOOTPRINT_BAR, r.from(), r.reason());
+        assertTrue(r.label().contains("footprint bar"), r.label());
     }
 }
