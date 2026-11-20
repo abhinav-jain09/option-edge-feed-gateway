@@ -45,3 +45,42 @@ happened.
 
 `bash scripts/footprint-reqstate.sh --check` is run against the committed tree, since the checker
 reads the file at HEAD rather than the working copy.
+
+---
+
+## 2026-11-20 — C-63's bar tap displaced G-R9.2's anchor, and the build was right to refuse
+
+Build **#892** of the gateway ran the full suite green (`Tests run: 1424, Failures: 0, Errors: 0`)
+and then refused with a bare `RuntimeError: remote full suite or campaign failed`. The reason was
+not in the console. `scripts/footprint-reqstate.sh --check` against the committed tree gave it:
+
+```
+G-R9: FeedGatewayService.java at HEAD is not the file the campaign mutated
+      (sha256 5e049ddac17d, the record says 4cac5f438818)
+G-R9: the clause this mutation claims to have broken is not in FeedGatewayService.java at HEAD
+```
+
+**Two different faults, and only one of them is bookkeeping.** Eleven of the twelve mutations that
+quote this file still matched their anchor exactly once; the sha had simply moved. But
+**`G-R9.2 every-record-is-counted-before-admission` no longer matched at all.** Its patch quotes
+`admitFootprintRecord` from the `records_total` counter line through the admission as one block, and
+C-63's bar tap had been inserted *inside* that span. The quoted text no longer existed in the file,
+so the mutation would have had nothing to apply itself to — and a campaign that cannot apply a
+mutation cannot claim the clause is still protected.
+
+**The fix is not a re-aimed anchor.** Rewriting that patch by hand would have meant inventing what
+the campaign "would have" mutated without running it, which is the kind of claim this gate exists to
+refuse. Instead **the tap moved above the anchor's first line**, to the top of
+`admitFootprintRecord`. The anchor is then verbatim again, every one of the twelve matches its
+recorded occurrence count, and the mutation still breaks the clause it names. The tap is also
+*better* there: it sees every bar record the consumer polled, before any admission, which is what
+"the page's store is bounded by the night and not by the view" was supposed to mean.
+
+Only after that was the file's sha rebound: **22 occurrences**, `4cac5f438818` → `ebf50c28b99a`.
+The rebinding is a source rebinding and nothing else. **It asserts nothing about a run that has not
+happened**: the next build re-runs the whole campaign against this source, and if any outcome
+differs it refuses again and this has to be redone.
+
+The lesson for the next change to this file: a mutation anchor can span twenty lines, so inserting
+anywhere inside a quoted block silently invalidates it. Run the checker against the committed tree
+*before* the 45-minute build, not after it.
