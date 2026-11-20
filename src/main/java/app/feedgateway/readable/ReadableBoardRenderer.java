@@ -51,6 +51,9 @@ public final class ReadableBoardRenderer {
             + "It is written every 30 seconds; if this line persists, the renderer is not running.\n";
     private volatile long renderedAtMs;
     private long nightStartedAt;
+    /** Moments the side path has observed. Counted so a flat zero is visible on /metrics. */
+    private volatile long sideObservations;
+
     /** C-74: where the reference price came from, in words, for the page. */
     private volatile String referenceLabel;
 
@@ -114,6 +117,22 @@ public final class ReadableBoardRenderer {
         preopen.observe(json);
     }
 
+    /** Moments the side path has observed, replayed ones included. For /metrics. */
+    public long sideObservations() {
+        return sideObservations;
+    }
+
+    /**
+     * Rows the board currently has, for /metrics. Zero where there is no board at all.
+     *
+     * <p>Read together with the pre-open record count this tells an operator which of two very
+     * different situations he is in: no records at all, or records that do not reach the grid.
+     */
+    public int boardRowsForMetrics() {
+        ReadablePage.Board b = currentBoard(clock.getAsLong());
+        return b == null ? 0 : b.rowsPresent();
+    }
+
     /** The pre-open store, for the status page and the tests. */
     public PreopenSource preopenSource() {
         return preopen;
@@ -135,6 +154,7 @@ public final class ReadableBoardRenderer {
         VwapRebuild.Moment m = VwapRebuild.decode(json);
         if (m != null) {
             sides.observe(m.atMs(), m.price(), m.vwap(), m.upper1(), m.lower1(), m.anchor());
+            sideObservations++;
         }
     }
 
@@ -160,7 +180,9 @@ public final class ReadableBoardRenderer {
      * a short memory.
      */
     public int rebuildSides(java.util.Collection<String> snapshots) {
-        return VwapRebuild.replay(sides, snapshots);
+        int replayed = VwapRebuild.replay(sides, snapshots);
+        sideObservations += replayed;
+        return replayed;
     }
 
     /** One SPX price record, as the gateway received it. */

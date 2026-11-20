@@ -221,6 +221,41 @@ class ReadablePageReachabilityTest {
     }
 
     @Test
+    @DisplayName("the metrics distinguish 'no records yet' from 'the tap is not running'")
+    void theMetricsTellBrokenFromEmpty() throws Exception {
+        // A fresh gateway: no pre-open records at all. This is what overnight looks like, and the
+        // page says "No board yet" either way -- which is exactly why these numbers exist.
+        FeedGatewayService empty = service();
+        String before = empty.metrics();
+        assertTrue(before.contains("gateway_readable_preopen_records_total 0"), "no records yet");
+        assertTrue(before.contains("gateway_readable_board_rows 0"), "and so no board");
+        assertTrue(before.contains("gateway_readable_reference_resolved 0"),
+                "and no recovered close");
+        assertTrue(before.contains("gateway_readable_side_observations_total 0"));
+
+        // One real pre-open record through the real path, and the numbers move.
+        ingest(empty, "gex-preopen", "SPX|20261120|7160", preopen(7160.0, 2.67E8));
+        String after = empty.metrics();
+        assertTrue(after.contains("gateway_readable_preopen_records_total 1"),
+                "a rising count is how an operator knows the tap is alive at 06:30 New York");
+        assertTrue(after.contains("gateway_readable_preopen_strikes 1"));
+        assertTrue(after.contains("gateway_readable_preopen_unreadable_total 0"));
+        assertTrue(after.contains("gateway_readable_preopen_refused_at_cap_total 0"),
+                "the ceiling never binds against the real feed");
+
+        // An unreadable record is counted separately, because a shape change on the topic must
+        // not look like a quiet feed.
+        ingest(empty, "gex-preopen", "SPX|20261120|7165", "not json at all");
+        assertTrue(empty.metrics().contains("gateway_readable_preopen_unreadable_total 1"),
+                "a shape change shows up here rather than as silence");
+
+        // And the side path and the reference both report once they have something.
+        ingestAt(empty, "indicators", "ES", indicators(7190.00, T0 - 10_000L, 18287), T0 - 10_000L);
+        assertTrue(empty.metrics().contains("gateway_readable_side_observations_total 1"),
+                "a flat zero during a session would mean the holding times are not advancing");
+    }
+
+    @Test
     @DisplayName("an unknown page name lists the names rather than leaving a reader guessing")
     void anUnknownNameListsTheNames() throws Exception {
         String body = new ReadableBoardController(fed()).namedPage("nope", 1).getBody();
