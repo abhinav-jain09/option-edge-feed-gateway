@@ -1,6 +1,7 @@
 package app.feedgateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -52,11 +53,25 @@ class ReadablePageReachabilityTest {
      * integral revision (measured on Dev: revision 18287).
      */
     private static String indicators(double price, long atMs, long revision) {
+        return indicators(price, atMs, atMs, revision);
+    }
+
+    /**
+     * A snapshot with its two instants SEPARATE, which is the shape of a frozen feed: the
+     * service keeps republishing (so {@code publishedAt} is current and the cache's freshness
+     * gate admits it) while the measurement stands still (so {@code asOfEventTime} is hours
+     * old). One instant for both made the record stale to that gate, so it never reached the
+     * tap at all -- which is how this test first reported the page broken when the FIXTURE
+     * was what the gateway would never have accepted.
+     */
+    private static String indicators(double price, long measuredAtMs, long publishedAtMs,
+            long revision) {
+        long atMs = measuredAtMs;
         // schemaVersion 1 and a parseable publishedAt are required too: indicatorsCacheKey is
         // STRICT and returns null without them, so the record never reaches the cache case at all.
         return "{\"symbol\":\"ES\",\"schemaVersion\":1,\"marketState\":\"OPEN\","
                 + "\"currentPrice\":\"" + price + "\","
-                + "\"publishedAt\":\"" + iso(atMs) + "\","
+                + "\"publishedAt\":\"" + iso(publishedAtMs) + "\","
                 + "\"runId\":\"14d0b4ba-3da1-4600-b08f-22cd54ca8e1a\",\"revision\":" + revision + ","
                 + "\"asOfEventTime\":\"" + iso(atMs) + "\",\"session\":{\"vwapAnalysis\":{"
                 + "\"vwap\":{\"value\":\"7187.0082\",\"state\":\"COMPLETE\"},"
@@ -253,6 +268,64 @@ class ReadablePageReachabilityTest {
         ingestAt(empty, "indicators", "ES", indicators(7190.00, T0 - 10_000L, 18287), T0 - 10_000L);
         assertTrue(empty.metrics().contains("gateway_readable_side_observations_total 1"),
                 "a flat zero during a session would mean the holding times are not advancing");
+    }
+
+    @Test
+    @DisplayName("/now names BOTH stalled inputs, with each feed's own instant")
+    void theNowPageNamesTheIndicatorSnapshotToo() throws Exception {
+        // The reviewer's check: "the stalled lines name the footprint bars AND the indicator
+        // snapshot with the time they stopped". /now used to get the long page's list, which named
+        // only the bars -- so the one feed that was actually down went unnamed on the one page
+        // whose VWAP cells it feeds.
+        // A gateway with a live price and NO bars at all -- which is tonight's real shape, since
+        // the trade path stopped before this pod started -- and an indicators snapshot whose own
+        // instant is five hours old.
+        FeedGatewayService service = service();
+        ingestAt(service, "spx-price", "SPX",
+                priceJson(T0 - 5_000L, 7160.50, "ES_BASIS_DERIVED", "LIVE_ES_BASIS"), T0 - 5_000L);
+        // Frozen five hours ago but STILL BEING REPUBLISHED, exactly as the live one is: the
+        // gateway admits it on publishedAt and the page must report its asOfEventTime.
+        long stoppedAt = T0 - 5L * 3_600_000L;
+        ingestAt(service, "indicators", "ES",
+                indicators(7190.00, stoppedAt, T0 - 5_000L, 18287), T0 - 5_000L);
+
+        String page = new ReadableBoardController(service).namedPage("now", 1).getBody();
+        assertNotNull(page);
+
+        assertTrue(page.contains("ES indicators snapshot"),
+                "the feed that is down must be named: " + page);
+        assertTrue(page.contains("footprint bars"),
+                "and so must the bars, which this pod has never received: " + page);
+        assertTrue(page.contains("never received"),
+                "an input with no record at all says so rather than being given an age");
+        // On /now the stalled lines are C-75's COMPACT form -- name, age, instant -- because every
+        // headline line has to stay inside 64 characters for the reviewer's reader to return it
+        // whole. "Which columns it freezes" is the long page's prose form, asserted in
+        // StalledInputsTest; here the contract is the reviewer's own words: name and the time it
+        // stopped.
+        assertTrue(page.contains("stalled|ES indicators snapshot|"),
+                "the compact stalled line names the feed: " + page);
+        assertTrue(page.contains("stalled|footprint bars|"), page);
+
+        // The instant is the snapshot's OWN asOfEventTime, not its arrival: a frozen snapshot is
+        // republished for hours with the same instant, and arrival would call it current.
+        String stalledLine = page.lines()
+                .filter(l -> l.contains("ES indicators snapshot")).findFirst().orElseThrow();
+        assertTrue(stalledLine.contains("5h00m") || stalledLine.contains("4h5"),
+                "the age is measured from the record's own instant: " + stalledLine);
+        assertTrue(stalledLine.contains("since ") && stalledLine.contains("NY"),
+                "and it names the time it stopped, which is the reviewer's own wording: "
+                        + stalledLine);
+        assertTrue(stalledLine.length() <= 64,
+                "and it still fits C-75's bound: " + stalledLine.length() + " chars");
+
+        // And a CURRENT snapshot produces no line for it, so the banner stays a list of what
+        // cannot be trusted rather than a status board.
+        FeedGatewayService fresh = fed();
+        ingestAt(fresh, "indicators", "ES", indicators(7190.00, T0 - 10_000L, 18288), T0 - 10_000L);
+        String ok = new ReadableBoardController(fresh).namedPage("now", 1).getBody();
+        assertFalse(ok.contains("ES indicators snapshot"),
+                "a live snapshot is not listed as stalled: " + ok);
     }
 
     @Test

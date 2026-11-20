@@ -42,6 +42,15 @@ public final class ReadableBoardRenderer {
     /** C-65's path of sides. Fed from the indicators snapshot, rebuilt at start-up by C-71. */
     private final VwapSideTracker sides = new VwapSideTracker();
     private volatile String indicatorsJson;
+    /**
+     * The instant of the newest indicators snapshot, from the record's OWN {@code asOfEventTime}.
+     *
+     * <p>Not a wall clock and not the arrival time: the snapshot that froze on 2026-11-19 kept
+     * being republished for hours with the same {@code asOfEventTime}, so arrival would have
+     * reported it as current. The question the page answers is "how old is the measurement", and
+     * only the record's own instant answers it.
+     */
+    private volatile long indicatorsAtMs;
     private volatile String basisJson;
     private volatile String profileJson;
     private final Supplier<String> boardJson;
@@ -155,6 +164,9 @@ public final class ReadableBoardRenderer {
         if (m != null) {
             sides.observe(m.atMs(), m.price(), m.vwap(), m.upper1(), m.lower1(), m.anchor());
             sideObservations++;
+            if (m.atMs() > indicatorsAtMs) {
+                indicatorsAtMs = m.atMs();
+            }
         }
     }
 
@@ -258,6 +270,30 @@ public final class ReadableBoardRenderer {
     }
 
     /**
+     * The inputs <b>{@code /now}</b> depends on — both of them.
+     *
+     * <p>This method exists because the long page's list did not do. I wrote into that list's
+     * documentation that the VWAP and holding inputs "belong to {@code /now}, which lists them
+     * itself" — and then never added them, so {@code /now} named the footprint bars and nothing
+     * else. The comment asserted something the code did not do.
+     *
+     * <p>It mattered in the one place it could matter most: the indicator snapshot is the feed
+     * that is actually down, frozen since 23:16Z with the footprint. A reader of {@code /now}
+     * would have seen the VWAP cells holding their last figures with a state code and <b>no line
+     * anywhere saying that feed had stopped</b> — which is the exact failure the stalled lines
+     * exist to prevent.
+     */
+    private java.util.List<StalledInputs.Input> nowStalledInputs() {
+        return java.util.List.of(
+                new StalledInputs.Input(
+                        "footprint bars", source.newestBarStartMs(RECENT_TIMEFRAME),
+                        "The 30-second rows' footprint figures and the footprint-by-price page"),
+                new StalledInputs.Input(
+                        "ES indicators snapshot", indicatorsAtMs,
+                        "The VWAP line with its bands, the side and the holding times"));
+    }
+
+    /**
      * The inputs THIS page depends on, with the newest instant the gateway has actually seen for
      * each. Only the footprint bars are listed here: this page's tables are the overnight grid and
      * the gamma board, and the board's own freshness is already on its heading as a cycle time.
@@ -309,7 +345,7 @@ public final class ReadableBoardRenderer {
                 return Pages.now(nowMs, last, overnightNow(nowMs),
                         indicatorsJson == null ? null : VwapRead.of(indicatorsJson),
                         basisJson == null ? null : BasisRead.of(basisJson),
-                        sides.result(), recentRows(), board, stalledInputs());
+                        sides.result(), recentRows(), board, nowStalledInputs());
             case "overnight":
                 return Pages.overnight(nowMs, last, overnightNow(nowMs));
             case "footprint":
