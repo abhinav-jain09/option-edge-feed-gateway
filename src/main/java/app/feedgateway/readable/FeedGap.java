@@ -33,11 +33,30 @@ import java.util.Collection;
  */
 public final class FeedGap {
 
-    /** A bar published later than this after its own start was not live when it described the market. */
+    /** A bar published later than this after it CLOSED was not live when it described the market. */
     static final long LATE_AFTER_MS = 180_000L;
 
-    /** One bar's own minute, and the instant the broker holds for the record carrying it. */
-    public record Published(long barStartMs, long publishedMs) {
+    /**
+     * One bar: the minute it describes, the instant it CLOSED, and the instant the broker holds
+     * for the record carrying it.
+     *
+     * <p>Both times are here because they answer different questions, and conflating them is the
+     * defect this record's shape exists to prevent. <b>Lateness is measured from the close</b>
+     * ({@code barEndMs}), because a bar cannot be published before it closes: the topic carries
+     * five timeframes — measured live on 2026-11-20: 30s, 1m, 5m, 15m, 30m — so a 30m bar is
+     * {@code 1,800 s} after its own START by construction, and a threshold applied to the start
+     * flags every bar above 1m. That is exactly what shipped: the page read
+     * {@code gap 18:00-01:45}, naming the whole session, which is the failure the reviewer
+     * predicted for a restart and which arrived instead through the timeframes. <b>The window is
+     * named from the start</b> ({@code barStartMs}), because what the owner needs is the minutes
+     * the missing bars describe, not the minutes they were written in.
+     */
+    public record Published(long barStartMs, long barEndMs, long publishedMs) {
+
+        /** How long after this bar CLOSED the broker holds its record. */
+        long lagMs() {
+            return publishedMs - barEndMs;
+        }
     }
 
     private long earliestLateStartMs = Long.MAX_VALUE;
@@ -62,7 +81,7 @@ public final class FeedGap {
         long latest = Long.MIN_VALUE;
         long late = 0;
         for (Published b : bars) {
-            if (b == null || b.publishedMs() - b.barStartMs() <= LATE_AFTER_MS) {
+            if (b == null || b.lagMs() <= LATE_AFTER_MS) {
                 continue;
             }
             late++;

@@ -157,23 +157,38 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
         drainInto(barTopic, fromMs, toMs, MAX_RECORDS, one -> {
             String json = barToJson.apply(one.value());
             Long start = barStartMs(json);
-            if (start == null) {
-                return false;
+            Long end = barEndMs(json);
+            if (start == null || end == null) {
+                return false;      // a bar that cannot say which minutes it covers is unusable
             }
-            out.add(new app.feedgateway.readable.FeedGap.Published(start, one.timestamp()));
+            out.add(new app.feedgateway.readable.FeedGap.Published(start, end, one.timestamp()));
             return true;
         });
         return out;
     }
 
+    /**
+     * The instant the bar CLOSED, from the record itself.
+     *
+     * <p>Read rather than derived from {@code barStartMs + widthMs}: the record carries it, and a
+     * derived end would be a second opinion about a figure the producer already states.
+     */
+    private static Long barEndMs(String json) {
+        return longAt(json, "barEndMs");
+    }
+
     /** The bar's own minute, from the record the gateway converted. */
     private static Long barStartMs(String json) {
+        return longAt(json, "barStartMs");
+    }
+
+    private static Long longAt(String json, String field) {
         if (json == null || json.isBlank()) {
             return null;
         }
         try {
             com.fasterxml.jackson.databind.JsonNode o =
-                    MAPPER.readTree(json).path("observations").path("barStartMs");
+                    MAPPER.readTree(json).path("observations").path(field);
             return o.isNumber() ? o.longValue() : null;
         } catch (Exception malformed) {
             return null;

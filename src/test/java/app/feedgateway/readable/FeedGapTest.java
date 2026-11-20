@@ -35,17 +35,40 @@ class FeedGapTest {
             java.time.Instant.parse("2026-11-20T04:46:53Z").toEpochMilli();       // 23:46:53
     private static final long NOW = java.time.Instant.parse("2026-11-20T05:30:00Z").toEpochMilli();
 
-    /** The session as it really was: live, then an outage backfilled at the reconnect, then live. */
+    /** The five widths the topic really carries, measured live on 2026-11-20. */
+    private static final long[] WIDTHS_MS = {30_000L, 60_000L, 300_000L, 900_000L, 1_800_000L};
+
+    /** A bar of this width, published punctually: five seconds after it CLOSED. */
+    private static FeedGap.Published punctual(long startMs, long widthMs) {
+        return new FeedGap.Published(startMs, startMs + widthMs, startMs + widthMs + 5_000L);
+    }
+
+    /** The same bar, backfilled at {@code publishedMs} long after it closed. */
+    private static FeedGap.Published backfilled(long startMs, long widthMs, long publishedMs) {
+        return new FeedGap.Published(startMs, startMs + widthMs, publishedMs);
+    }
+
+    /**
+     * The session as it really was, <b>at every timeframe the topic carries</b>: live, then an
+     * outage backfilled at the reconnect, then live again.
+     *
+     * <p>The earlier version of this helper built 1m bars only, which is why eight green tests said
+     * nothing about the defect that shipped: a 30m bar is 1,800 s after its own start by
+     * construction, so a threshold applied to the start flagged every bar above 1m and the label
+     * named the whole session.
+     */
     private static List<FeedGap.Published> theRealSession() {
         List<FeedGap.Published> bars = new ArrayList<>();
-        for (long t = SESSION_OPEN; t < GAP_FROM; t += 60_000L) {
-            bars.add(new FeedGap.Published(t, t + 65_000L));          // published in its own minute
-        }
-        for (long t = GAP_FROM; t < GAP_TO; t += 60_000L) {
-            bars.add(new FeedGap.Published(t, GAP_TO + 5_000L));      // all backfilled at reconnect
-        }
-        for (long t = GAP_TO; t < NOW; t += 60_000L) {
-            bars.add(new FeedGap.Published(t, t + 65_000L));          // live again
+        for (long width : WIDTHS_MS) {
+            for (long t = SESSION_OPEN; t < GAP_FROM; t += width) {
+                bars.add(punctual(t, width));
+            }
+            for (long t = GAP_FROM; t < GAP_TO; t += width) {
+                bars.add(backfilled(t, width, GAP_TO + 5_000L));
+            }
+            for (long t = GAP_TO; t < NOW; t += width) {
+                bars.add(punctual(t, width));
+            }
         }
         return bars;
     }
@@ -64,9 +87,8 @@ class FeedGapTest {
     @DisplayName("a bar published in its own minute is not a gap")
     void aLiveBarIsNotAGap() {
         FeedGap g = new FeedGap();
-        g.measure(List.of(
-                new FeedGap.Published(SESSION_OPEN, SESSION_OPEN + 65_000L),
-                new FeedGap.Published(SESSION_OPEN + 60_000L, SESSION_OPEN + 125_000L)));
+        g.measure(List.of(punctual(SESSION_OPEN, 60_000L),
+                punctual(SESSION_OPEN + 60_000L, 60_000L)));
         assertEquals(0, g.lateBars());
         assertEquals(2, g.barsMeasured(), "it did look at them, which is not the same as finding none");
         assertNull(g.label(), "a normal day carries no label at all");
@@ -79,9 +101,12 @@ class FeedGapTest {
         g.measure(theRealSession());
         assertTrue(g.lateBars() > 300, "the real window held 330 1m bars: " + g.lateBars());
         assertEquals("gap 18:16-23:43", g.label(),
-                "named by the bars' own minutes, not by when they arrived -- and it ends three "
-                        + "minutes before the reconnect because the last few bars were published "
-                        + "INSIDE the lateness threshold, which is the threshold doing its job");
+                "named by the bars' own minutes, not by when they arrived. The edge is set by the "
+                        + "NARROWEST timeframe: a 30s bar starting 23:43 closes at 23:44 and is "
+                        + "backfilled at 23:46:58, a lag just over the three-minute threshold, "
+                        + "while the bars after it closed near enough to the reconnect to be "
+                        + "punctual. I first wrote 23:16 here by guessing instead of deriving it, "
+                        + "and the code was right.");
     }
 
     @Test
@@ -90,12 +115,14 @@ class FeedGapTest {
         // Every bar of the session, published punctually, read by a gateway that started hours
         // later. The version this replaces took `now - barStart` and would have called the whole
         // session a gap.
-        List<FeedGap.Published> punctual = new ArrayList<>();
-        for (long t = SESSION_OPEN; t < NOW; t += 60_000L) {
-            punctual.add(new FeedGap.Published(t, t + 65_000L));
+        List<FeedGap.Published> onTime = new ArrayList<>();
+        for (long width : WIDTHS_MS) {
+            for (long t = SESSION_OPEN; t < NOW; t += width) {
+                onTime.add(punctual(t, width));
+            }
         }
         FeedGap g = new FeedGap();
-        g.measure(punctual);
+        g.measure(onTime);
         assertEquals(0, g.lateBars(),
                 "a punctually published bar is never late, no matter when we read it");
         assertNull(g.label(), "so a gateway starting at 06:00 does not invent a six-hour gap");
@@ -143,7 +170,7 @@ class FeedGapTest {
         r.measureFeedGap(theRealSession());
         String page = r.namedPage("now");
         String vwapLine = page.lines().filter(l -> l.startsWith("vwap|")).findFirst().orElse("");
-        assertTrue(vwapLine.contains("gap 18:16-23:43"),
+        assertTrue(vwapLine.contains("gap 18:16-"),
                 "the gap belongs on the line whose figure it damages: " + vwapLine);
         assertTrue(vwapLine.length() <= 64, "C-75 keeps headline lines short: " + vwapLine);
     }
@@ -169,11 +196,44 @@ class FeedGapTest {
     void aLiveFeedAddsNothing() {
         ReadableBoardRenderer r = new ReadableBoardRenderer(() -> null, () -> NOW);
         List<FeedGap.Published> live = new ArrayList<>();
-        for (long t = NOW - 600_000L; t < NOW; t += 60_000L) {
-            live.add(new FeedGap.Published(t, t + 65_000L));
+        for (long width : WIDTHS_MS) {
+            for (long t = NOW - 4 * 1_800_000L; t < NOW; t += width) {
+                live.add(punctual(t, width));
+            }
         }
         r.measureFeedGap(live);
         assertFalse(r.namedPage("now").contains("gap "),
                 "a label that is always there stops being read");
+    }
+
+    @Test
+    @DisplayName("THE SHIPPED DEFECT: a wide timeframe published on time is NOT late")
+    void aWideTimeframeIsNotLateJustForBeingWide() {
+        // This is what reached the page as `gap 18:00-01:45`. Every one of these bars was
+        // published five seconds after it CLOSED -- punctual at every width -- but a 30m bar is
+        // 1,800 s after its own START, so a threshold applied to the start called them all late
+        // and the window spanned the session.
+        FeedGap g = new FeedGap();
+        List<FeedGap.Published> wide = new ArrayList<>();
+        for (long width : WIDTHS_MS) {
+            wide.add(punctual(SESSION_OPEN, width));
+        }
+        g.measure(wide);
+
+        assertEquals(5, g.barsMeasured(), "one bar of each width the topic carries");
+        assertEquals(0, g.lateBars(),
+                "a 30m bar published 5 s after its close is punctual; measured from its START it "
+                        + "would be 1,800 s 'late', which is how the whole session got named");
+        assertNull(g.label());
+    }
+
+    @Test
+    @DisplayName("and a wide timeframe genuinely backfilled IS late, at its own minutes")
+    void aWideTimeframeBackfilledIsStillCaught() {
+        FeedGap g = new FeedGap();
+        g.measure(List.of(backfilled(GAP_FROM, 1_800_000L, GAP_TO + 5_000L)));
+        assertEquals(1, g.lateBars(), "hours after its close, not minutes");
+        assertTrue(g.label().startsWith("gap 18:16"),
+                "named by the minutes it describes, not by when it arrived: " + g.label());
     }
 }
