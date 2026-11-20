@@ -282,7 +282,39 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
 
     @Override
     public List<String> barsBetween(long fromMs, long toMs) {
-        return asJson(barTopic, fromMs, toMs, MAX_RECORDS, barToJson);
+        return barsByTheirOwnMinutes(fromMs, toMs);
+    }
+
+    /**
+     * Every bar whose OWN minute lies in the window, backfilled ones included.
+     *
+     * <p>{@code asJson} judges the window on the broker's stamp, which is right for the price
+     * topic: a price record's own instant and its publish instant are the same to within seconds,
+     * and it carries no minutes of its own. A BAR does carry them, and the two can be hours apart
+     * -- 2026-11-20's night bars were written up to five and a half hours after the minutes they
+     * describe. Every reader of this list keys on those minutes (the grid's slots, the previous
+     * close's cash-session test, the publish-lag measurement), so the window belongs on them.
+     */
+    private List<String> barsByTheirOwnMinutes(long fromMs, long toMs) {
+        List<String> out = new ArrayList<>();
+        drainInto(barTopic, fromMs, toMs, MAX_RECORDS, new Sink() {
+            @Override
+            public boolean take(ConsumerRecord<String, Object> one) {
+                String json = barToJson.apply(one.value());
+                if (json == null || json.isBlank()) {
+                    return false;
+                }
+                out.add(json);
+                return true;
+            }
+
+            @Override
+            public long ownTimeMs(ConsumerRecord<String, Object> one) {
+                Long start = barStartMs(barToJson.apply(one.value()));
+                return start == null ? Long.MIN_VALUE : start;
+            }
+        });
+        return out;
     }
 
     /**
@@ -293,15 +325,25 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
      */
     List<app.feedgateway.readable.FeedGap.Published> barPublishTimes(long fromMs, long toMs) {
         List<app.feedgateway.readable.FeedGap.Published> out = new ArrayList<>();
-        drainInto(barTopic, fromMs, toMs, MAX_RECORDS, one -> {
-            String json = barToJson.apply(one.value());
-            Long start = barStartMs(json);
-            Long end = barEndMs(json);
-            if (start == null || end == null) {
-                return false;      // a bar that cannot say which minutes it covers is unusable
+        drainInto(barTopic, fromMs, toMs, MAX_RECORDS, new Sink() {
+            @Override
+            public boolean take(ConsumerRecord<String, Object> one) {
+                String json = barToJson.apply(one.value());
+                Long start = barStartMs(json);
+                Long end = barEndMs(json);
+                if (start == null || end == null) {
+                    return false;  // a bar that cannot say which minutes it covers is unusable
+                }
+                out.add(new app.feedgateway.readable.FeedGap.Published(start, end,
+                        one.timestamp()));
+                return true;
             }
-            out.add(new app.feedgateway.readable.FeedGap.Published(start, end, one.timestamp()));
-            return true;
+
+            @Override
+            public long ownTimeMs(ConsumerRecord<String, Object> one) {
+                Long start = barStartMs(barToJson.apply(one.value()));
+                return start == null ? Long.MIN_VALUE : start;
+            }
         });
         return out;
     }
@@ -314,6 +356,17 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
      */
     private static Long barEndMs(String json) {
         return longAt(json, "barEndMs");
+    }
+
+    /** How many records of the last drain were in the window only by their OWN time. */
+    private volatile int lastLateButInWindow;
+
+    /**
+     * Records the last drain took because their own minutes were in the window, although the
+     * broker wrote them after it. Zero on a day with no backfill.
+     */
+    public int lastLateButInWindow() {
+        return lastLateButInWindow;
     }
 
     /** The bar's own minute, from the record the gateway converted. */
@@ -372,6 +425,24 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
      */
     private interface Sink {
         boolean take(ConsumerRecord<String, Object> record);
+
+        /**
+         * <b>The record's OWN time</b>, where it carries one, so the window can be judged on the
+         * minutes a record describes rather than the instant a broker happened to write it.
+         * {@link Long#MIN_VALUE} where the record carries none and the broker's stamp is all
+         * there is.
+         *
+         * <p><b>Why this exists.</b> The drain dropped every record whose broker stamp was past
+         * {@code toMs} and counted it {@code outsideWindow}. A BACKFILLED bar is exactly that: the
+         * bars for 18:16 to 23:46 on 2026-11-20 were published up to five and a half hours after
+         * the minutes they describe, so the night grid asked for the night and was handed the
+         * subset that happened to be punctual. The grid is keyed on {@code barStartMs} and the
+         * previous close is chosen by the bar's own minute, so the window belongs on that figure
+         * in both readers.
+         */
+        default long ownTimeMs(ConsumerRecord<String, Object> record) {
+            return Long.MIN_VALUE;
+        }
     }
 
     /**
@@ -388,6 +459,7 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
         int polled = 0;
         int outsideWindow = 0;
         int unconvertible = 0;
+        int lateButInWindow = 0;
         try (Consumer<String, Object> consumer = consumers.get()) {
             if (consumer == null) {
                 return record(new Drain(topic, fromMs, toMs, 0, 0, 0, 0, "no consumer"));
@@ -437,9 +509,19 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
                 empties = 0;
                 for (ConsumerRecord<String, Object> one : batch) {
                     polled++;
-                    if (one.timestamp() > toMs) {
+                    long own = sink.ownTimeMs(one);
+                    boolean inWindow = own == Long.MIN_VALUE
+                            ? one.timestamp() <= toMs
+                            : own >= fromMs && own <= toMs;
+                    if (!inWindow) {
                         outsideWindow++;
                         continue;             // past the window; a later partition may still be in it
+                    }
+                    if (own != Long.MIN_VALUE && one.timestamp() > toMs) {
+                        // A record whose own minutes are in the window and whose broker stamp is
+                        // not: a backfilled bar. Counted so "the grid took bars the publish-time
+                        // filter would have dropped" is a figure and not a belief.
+                        lateButInWindow++;
                     }
                     if (sink.take(one)) {
                         taken++;
@@ -463,6 +545,7 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
                     unconvertible, unreachable.getClass().getSimpleName() + ": "
                             + unreachable.getMessage()));
         }
+        lastLateButInWindow = lateButInWindow;
         return record(new Drain(topic, fromMs, toMs, polled, taken, outsideWindow,
                 unconvertible, null));
     }

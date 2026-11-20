@@ -341,6 +341,41 @@ class ReadableReferenceHistoryTest {
     }
 
     @Test
+    @DisplayName("the night grid takes every bar whose START is in the night, backfilled or not")
+    void aBackfilledBarIsInTheWindowByItsOwnMinute() {
+        long nightFrom = NOW - 12L * 3_600_000L;
+        long barStart = NOW - 6L * 3_600_000L;          // its minute is squarely in the night
+        long publishedLate = NOW + 2L * 3_600_000L;     // written two hours AFTER the window ends
+
+        TopicPartition tp = new TopicPartition(BARS, 0);
+        Seeking consumer = new Seeking();
+        consumer.hold(tp, List.of(
+                record(BARS, 0L, barStart + 65_000L, bar(barStart - 3_600_000L)),
+                record(BARS, 1L, publishedLate, bar(barStart)),
+                record(BARS, 2L, publishedLate, bar(NOW + 3L * 3_600_000L))));
+
+        ReadableReferenceHistory history = new ReadableReferenceHistory(
+                () -> consumer, v -> (String) v, PRICES, BARS);
+        List<String> bars = history.barsBetween(nightFrom, NOW);
+
+        assertEquals(2, bars.size(),
+                "THE DEFECT: the backfilled bar's minute is in the night and its broker stamp is "
+                        + "not, and the drain dropped it for the stamp. The 2026-11-20 night bars "
+                        + "were written up to five and a half hours after the minutes they "
+                        + "describe, so the grid asked for the night and got the punctual subset");
+        assertTrue(bars.get(1).contains("\"barStartMs\":" + barStart), bars.get(1));
+        assertEquals(1, history.lastLateButInWindow(),
+                "and the one it took on its own minute against the broker's stamp is counted, so "
+                        + "this is a figure rather than a belief");
+
+        var d = history.drains().get(0);
+        assertEquals(3, d.polled());
+        assertEquals(2, d.converted());
+        assertEquals(1, d.outsideWindow(),
+                "only the bar whose own minute is past the window is outside it");
+    }
+
+    @Test
     @DisplayName("a bar with no close instant is refused, not given a derived one")
     void aBarWithNoEndIsRefused() {
         String noEnd = "{\"schemaVersion\":6,\"timeframe\":\"1m\","
