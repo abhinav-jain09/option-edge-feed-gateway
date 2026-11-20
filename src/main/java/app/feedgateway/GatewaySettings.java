@@ -2253,6 +2253,21 @@ public final class GatewaySettings {
      * {@code es.options.indicators.snapshot.current} on dev/prod. On es4 the two
      * coincide and the set collapses to one — no duplicate subscription.
      */
+    /**
+     * The ES indicator CURRENT topic — the one the readable pages read (C-69 is ES against ES).
+     *
+     * <p>Named separately from {@link #indicatorsSnapshotTopic()} because that one resolves to the
+     * LOCAL topic, which on dev and production is the SPX computation: every record on it carries
+     * {@code vwap ABSENT / SOURCE_HAS_NO_VOLUME}, correctly, because the cash index has no traded
+     * volume. C-71's start-up rebuild was seeking it, so it drained thousands of records, converted
+     * them all and replayed ZERO moments — the records were fine and about the wrong instrument.
+     * On es4 the two coincide.
+     */
+    public String esIndicatorsSnapshotTopic() {
+        return "es." + com.optionsedge.contracts.indicators.IndicatorTopics
+                .INDICATORS_SNAPSHOT_CURRENT;
+    }
+
     public java.util.Set<String> indicatorsSnapshotTopics() {
         java.util.LinkedHashSet<String> topics = new java.util.LinkedHashSet<>();
         topics.add(indicatorsSnapshotTopic());

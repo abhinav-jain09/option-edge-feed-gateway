@@ -23,7 +23,7 @@ import org.junit.jupiter.api.Test;
  * {@code /board}, {@code /footprint}, {@code /recent-full}, {@code /index} — together with C-64's
  * rows, C-65's holding times, C-69's VWAP and basis cells and C-75's headline, was written, tested
  * and <b>served by nothing</b>. `Pages` was not called from any controller. A suite of 2,317 green
- * tests said nothing about it, because every one of them called {@code Pages.now(...)} directly.
+ * tests said nothing about it, because every one of them called {@code Pages.now(..., new VwapHeld(), null)} directly.
  * That is the same defect class as a module unreachable from {@code main}: the unit was correct and
  * nothing executed the wiring.
  *
@@ -39,6 +39,21 @@ class ReadablePageReachabilityTest {
      * this test would report the wiring broken when it is the fixture that is old.
      */
     private static final long T0 = System.currentTimeMillis();
+
+    /**
+     * The fixture's expiry, derived from the SAME clock that stamps {@code updatedAt}.
+     *
+     * <p>It was the literal {@code "20261119"} beside an {@code updatedAt} of
+     * {@code System.currentTimeMillis()}, which made the record self-contradictory the moment New
+     * York crossed midnight: {@link app.feedgateway.readable.PreopenSource} prunes expiries older
+     * than the newest record's own New York date, so the strike was pruned and
+     * {@code gateway_readable_preopen_strikes} read 0. The test passed all day and went red at
+     * 00:00 New York with no change to the code it covers. A fixture that mixes a wall clock with
+     * a hard-coded date is a test with an expiry date of its own.
+     */
+    private static final String EXPIRY = java.time.Instant.ofEpochMilli(T0)
+            .atZone(java.time.ZoneId.of("America/New_York")).toLocalDate()
+            .format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
 
     private static String iso(long ms) {
         return java.time.Instant.ofEpochMilli(ms).toString();
@@ -91,7 +106,7 @@ class ReadablePageReachabilityTest {
             + "\"levels\":[[716025,5,0,0],[716050,10,1,0],[716075,21,15,0],[716100,35,22,2]]}";
 
     private static String preopen(double strike, double netGex) {
-        return "{\"symbol\":\"SPX\",\"expiry\":\"20261119\",\"strike\":" + strike
+        return "{\"symbol\":\"SPX\",\"expiry\":\"" + EXPIRY + "\",\"strike\":" + strike
                 + ",\"netGex\":" + netGex + ",\"gammaSign\":\"POSITIVE\","
                 + "\"canonicalSpot\":7160.50,\"updatedAt\":\"" + iso(T0 - 60_000L) + "\","
                 + "\"staleAfterMs\":300000}";
@@ -154,9 +169,9 @@ class ReadablePageReachabilityTest {
     private static FeedGatewayService fed() throws Exception {
         FeedGatewayService s = service();
         ingest(s, "spx-basis", "SPX", BASIS);
-        ingest(s, "gex-preopen", "SPX|20261120|7160", preopen(7160.0, 2.67E8));
-        ingest(s, "gex-preopen", "SPX|20261120|7165", preopen(7165.0, 6.04E8));
-        ingest(s, "gex-preopen", "SPX|20261120|7155", preopen(7155.0, 3.28E8));
+        ingest(s, "gex-preopen", "SPX|" + EXPIRY + "|7160", preopen(7160.0, 2.67E8));
+        ingest(s, "gex-preopen", "SPX|" + EXPIRY + "|7165", preopen(7165.0, 6.04E8));
+        ingest(s, "gex-preopen", "SPX|" + EXPIRY + "|7155", preopen(7155.0, 3.28E8));
 
         // The index print that fixes the night and the reference price, then a live overnight
         // price, then 30-second bars for the Recent table. Without a price every page returns its
@@ -249,7 +264,7 @@ class ReadablePageReachabilityTest {
         assertTrue(before.contains("gateway_readable_side_observations_total 0"));
 
         // One real pre-open record through the real path, and the numbers move.
-        ingest(empty, "gex-preopen", "SPX|20261120|7160", preopen(7160.0, 2.67E8));
+        ingest(empty, "gex-preopen", "SPX|" + EXPIRY + "|7160", preopen(7160.0, 2.67E8));
         String after = empty.metrics();
         assertTrue(after.contains("gateway_readable_preopen_records_total 1"),
                 "a rising count is how an operator knows the tap is alive at 06:30 New York");
@@ -260,7 +275,7 @@ class ReadablePageReachabilityTest {
 
         // An unreadable record is counted separately, because a shape change on the topic must
         // not look like a quiet feed.
-        ingest(empty, "gex-preopen", "SPX|20261120|7165", "not json at all");
+        ingest(empty, "gex-preopen", "SPX|" + EXPIRY + "|7165", "not json at all");
         assertTrue(empty.metrics().contains("gateway_readable_preopen_unreadable_total 1"),
                 "a shape change shows up here rather than as silence");
 

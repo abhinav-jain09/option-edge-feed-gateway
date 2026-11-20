@@ -144,7 +144,8 @@ public final class Pages {
      */
     static String headline(long nowMs, ReadablePage.Price last, ReadablePage.Overnight overnight,
             VwapRead vwap, VwapSideTracker.Result holding, List<RecentRows.Row> recent,
-            ReadablePage.Board board, List<StalledInputs.Input> stalledInputs) {
+            ReadablePage.Board board, List<StalledInputs.Input> stalledInputs,
+            String feedGap) {
         StringBuilder s = new StringBuilder(512);
 
         s.append("now|").append(last == null ? "no price" : money(last.spx()) + " SPX")
@@ -161,10 +162,11 @@ public final class Pages {
         }
 
         if (holding == null) {
-            s.append("vwap|absent\n");
+            s.append("vwap|absent").append(gapSuffix(feedGap)).append('\n');
         } else {
             s.append("vwap|").append(holding.side()).append("|held ")
-                    .append(mins(nowMs - holding.sideSinceMs())).append('\n');
+                    .append(mins(nowMs - holding.sideSinceMs()))
+                    .append(gapSuffix(feedGap)).append('\n');
         }
 
         s.append(wall("above", board == null ? null : board.largestAbove()));
@@ -225,7 +227,7 @@ public final class Pages {
     public static String now(long nowMs, ReadablePage.Price last, ReadablePage.Overnight overnight,
             VwapRead vwap, BasisRead basis, VwapSideTracker.Result holding,
             List<RecentRows.Row> recent, ReadablePage.Board board,
-            List<StalledInputs.Input> stalled) {
+            List<StalledInputs.Input> stalled, VwapHeld held, String feedGap) {
         StringBuilder s = new StringBuilder(8_192);
         s.append(firstLine(nowMs, last)).append('\n');
         // C-75: the facts the reviewer is asked for, as SHORT single-fact labelled lines, above
@@ -233,7 +235,8 @@ public final class Pages {
         // lines reliably and will not reproduce a 60-row table, so it would hand the owner a
         // description of a table instead of the table. Each line here is one fact, short enough to
         // be quoted whole. The full tables stay below, unchanged.
-        s.append(headline(nowMs, last, overnight, vwap, holding, recent, board, stalled));
+        s.append(headline(nowMs, last, overnight, vwap, holding, recent, board, stalled,
+                feedGap));
         s.append(LEGEND).append("|A/B/==above/below/on VWAP|U1/L1=one-sigma bands\n");
 
         // the close and the range, once
@@ -248,18 +251,26 @@ public final class Pages {
         }
 
         // the VWAP line: ES as published, SPX-equivalent only where the basis says it may
-        if (vwap == null) {
+        if (vwap == null && (held == null || held.held() == 0)) {
+            // No record at all and nothing ever held: name the topic that is silent. Two
+            // per-line "not published" lines would have said less than this one does.
             s.append("vwap|absent|es.options.indicators.snapshot.current carries no vwap block\n");
+        } else if (vwap == null) {
+            // No readable record NOW, but figures were held earlier: keep them, with the time
+            // they were read -- "no vwap block at all" is a state of the record, not a reason to
+            // drop what the line last knew.
+            s.append(vwapLine("vwapes", null, null, held));
+            s.append(vwapLine("vwaprth", null, null, held));
         } else {
-            s.append(vwapLine("vwapes", vwap.session(), null));
-            s.append(vwapLine("vwaprth", vwap.rth(), null));
+            s.append(vwapLine("vwapes", vwap.session(), null, held));
+            s.append(vwapLine("vwaprth", vwap.rth(), null, held));
             if (basis == null) {
                 s.append("vwapspx|absent|no basis published on spx.basis.state\n");
             } else if (!basis.usableForDisplay()) {
                 s.append("vwapspx|absent|basis ").append(basis.cell())
                         .append("|not anchored, so nothing is translated\n");
             } else {
-                s.append(vwapLine("vwapspx", vwap.session(), basis))
+                s.append(vwapLine("vwapspx", vwap.session(), basis, held))
                         .append("basis|").append(basis.cell())
                         .append(basis.nextSessionQuarantinedOpen() ? "|nextopen=QUARANTINED" : "")
                         .append('\n');
@@ -327,17 +338,56 @@ public final class Pages {
     }
 
     /** One VWAP line, in ES as published or translated for display where the basis permits. */
-    private static String vwapLine(String label, VwapRead.Anchor a, BasisRead basis) {
-        if (a == null) {
-            return label + "|absent|not published\n";
+    /**
+     * One VWAP line. <b>It never loses the last known figures</b> (see {@link VwapHeld}).
+     *
+     * <p>Three shapes, and the middle one is the requirement: a line whose source carries a figure
+     * prints it; a line whose source has stopped carrying one prints the <b>last known</b> figures
+     * with their own states, the time they were read, and the <b>new</b> state beside them, so the
+     * reader can see both what was last true and that it is no longer being refreshed; a line that
+     * has never had a figure says so and names the state that is standing in its way. The absence
+     * is always reported — the held figures are never passed off as current.
+     */
+    private static String vwapLine(String label, VwapRead.Anchor a, BasisRead basis,
+            VwapHeld held) {
+        if (a != null && a.vwap() != null && a.vwap().value() != null) {
+            return label + "|" + figures(a, basis) + "\n";
         }
-        return label + "|" + cellOf(a.vwap(), basis)
+        VwapHeld.Snapshot last = held == null ? null : held.of(label);
+        if (last != null) {
+            return label + "|" + figures(last.anchor(), basis)
+                    + "|held=" + hms(last.atMs(), NY) + "NY"
+                    + "|now=" + stateOf(a)
+                    + "\n";
+        }
+        return label + "|absent|" + stateOf(a) + "\n";
+    }
+
+    /** The five cells and the deviation, in the order the legend names them. */
+    private static String figures(VwapRead.Anchor a, BasisRead basis) {
+        return cellOf(a.vwap(), basis)
                 + "|" + cellOf(a.lower2(), basis)
                 + "|" + cellOf(a.lower1(), basis)
                 + "|" + cellOf(a.upper1(), basis)
                 + "|" + cellOf(a.upper2(), basis)
-                + "|sd=" + cellOf(a.stdDev(), null)
-                + "\n";
+                + "|sd=" + cellOf(a.stdDev(), null);
+    }
+
+    /**
+     * What the source says instead of a figure, in its own words.
+     *
+     * <p>The record's {@code state} and {@code reason} are printed as published rather than
+     * translated: {@code ABSENT/SOURCE_HAS_NO_VOLUME} is the cash index having no traded volume
+     * and {@code WARMING_UP/WARMING_UP_WINDOW} is the morning, and a single word for both would
+     * have hidden which one the owner was looking at.
+     */
+    private static String stateOf(VwapRead.Anchor a) {
+        if (a == null || a.vwap() == null) {
+            return "not published";
+        }
+        VwapRead.Figure f = a.vwap();
+        String state = f.state() == null || f.state().isBlank() ? "no state" : f.state();
+        return f.reason() == null || f.reason().isBlank() ? state : state + "/" + f.reason();
     }
 
     private static String cellOf(VwapRead.Figure f, BasisRead basis) {
@@ -353,6 +403,19 @@ public final class Pages {
         }
         return f.complete() ? money(spx) : money(spx) + "(" + f.cell().replaceAll("^[0-9.]+", "")
                 .replaceAll("[()]", "") + ")";
+    }
+
+    /**
+     * The feed-gap label, as a suffix for the {@code vwap|} headline line.
+     *
+     * <p>On the VWAP line specifically, because that is the figure the gap damages: the volume of
+     * the missing window is not in it, and a reader who cannot see that would take a VWAP built on
+     * half a session for the session's VWAP. Nothing is added on a normal day — an empty suffix,
+     * not the word "none", because this line is read at a glance and a label that is always there
+     * stops being read.
+     */
+    private static String gapSuffix(String feedGap) {
+        return feedGap == null || feedGap.isBlank() ? "" : "|" + feedGap;
     }
 
     /** The rows with the largest absolute net gamma first; rows with none sort last. */
@@ -430,12 +493,14 @@ public final class Pages {
      * the next one; the owner's rule is that no level is summarised by us, and C-66's answer to a
      * page that will not fit is to split it rather than thin it.
      */
-    public static List<String> footprint(long nowMs, ReadablePage.Price last, double spxSpot,
+    public static List<String> footprint(long nowMs, ReadablePage.Price last, Double spxSpot,
             List<FootprintByPrice.Level> levels, BasisRead basis) {
         List<String> header = new ArrayList<>();
         header.add(firstLine(nowMs, last));
         header.add(LEGEND + "|px=SPX-equivalent|espx=as published in ES|unk=unknown side");
-        header.add("footprint|spot=" + money(spxSpot)
+        // A primitive double could not say "no spot", so a night with no board printed
+        // spot=0.00 -- a price, and one the index has never traded at. The absence is reported.
+        header.add("footprint|spot=" + (spxSpot == null ? "absent" : money(spxSpot))
                 + "|levels=" + (levels == null ? 0 : levels.size())
                 + "|basis=" + (basis == null ? "absent" : basis.cell()));
         header.add(FootprintByPrice.header());
