@@ -57,12 +57,25 @@ public final class FeedGap {
         long lagMs() {
             return publishedMs - barEndMs;
         }
+
+        /**
+         * This bar's timeframe, which it carries without a field of its own.
+         *
+         * <p>{@code barEndMs - barStartMs} <i>is</i> the width, so the timeframe needs no extra
+         * component and cannot disagree with the two times already here. That matters for
+         * {@link FeedGap#measure}: the window is named from the smallest timeframe alone, and a
+         * width taken from a separate field could be set while the times said otherwise.
+         */
+        long widthMs() {
+            return barEndMs - barStartMs;
+        }
     }
 
     private long earliestLateStartMs = Long.MAX_VALUE;
     private long latestLateStartMs = Long.MIN_VALUE;
     private long lateBars;
     private long barsMeasured;
+    private long finestWidthMs;
 
     /**
      * Measure the window from these records, replacing whatever was measured before.
@@ -77,21 +90,56 @@ public final class FeedGap {
         if (bars == null || bars.isEmpty()) {
             return;
         }
+        // THE WINDOW IS NAMED FROM THE SMALLEST TIMEFRAME ONLY (C-96 item 3).
+        //
+        // Measuring lateness from barEndMs stopped the whole session being called a gap, but it
+        // left the window's START wrong in a way that looked right: the page read
+        // `gap 18:00-23:43` while the feed died at 18:16:05. A 30-minute bar that OPENED at 18:00
+        // closed at 18:30, inside the outage, and was published hours late -- so it is genuinely
+        // late, and its barStartMs of 18:00 dragged the window's start back sixteen minutes. Every
+        // wider timeframe does the same thing by its own width; the 30-minute bar simply does it
+        // worst. A window built from mixed widths therefore names minutes the feed was alive.
+        //
+        // The smallest width PRESENT is used rather than a hardcoded 30s, because the topic's set
+        // of timeframes is a property of the producer and not of this class: on 2026-11-20 it
+        // carries 30s, 1m, 5m, 15m and 30m, and a literal would silently measure nothing the day
+        // the finest one changed. The width comes from barEndMs - barStartMs, so it cannot
+        // disagree with the times the lateness is measured from.
+        long finest = Long.MAX_VALUE;
+        for (Published b : bars) {
+            if (b != null && b.widthMs() > 0L) {
+                finest = Math.min(finest, b.widthMs());
+            }
+        }
         long earliest = Long.MAX_VALUE;
         long latest = Long.MIN_VALUE;
         long late = 0;
+        long measured = 0;
         for (Published b : bars) {
-            if (b == null || b.lagMs() <= LATE_AFTER_MS) {
+            if (b == null || b.widthMs() != finest) {
+                continue;                       // a wider bar's start is not this window's start
+            }
+            measured++;
+            if (b.lagMs() <= LATE_AFTER_MS) {
                 continue;
             }
             late++;
             earliest = Math.min(earliest, b.barStartMs());
             latest = Math.max(latest, b.barStartMs());
         }
-        barsMeasured = bars.size();
+        if (measured == 0) {
+            return;     // nothing of the finest width in this drain: leave the measurement standing
+        }
+        barsMeasured = measured;
+        finestWidthMs = finest;
         lateBars = late;
         earliestLateStartMs = earliest;
         latestLateStartMs = latest;
+    }
+
+    /** The timeframe the last measurement used, in milliseconds, or 0 before any measurement. */
+    public long finestWidthMs() {
+        return finestWidthMs;
     }
 
     /** How many bars were late in the last measurement. Zero is the normal day, and is published. */

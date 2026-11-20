@@ -2,7 +2,9 @@ package app.feedgateway.readable;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.TreeMap;
+import java.util.NavigableMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 
 /**
  * What the readable page needs from the two overnight inputs, held in memory and <b>bounded</b>.
@@ -28,14 +30,47 @@ public final class OvernightSource {
     /**
      * Keyed by <b>timeframe then bar start</b>, so a bar re-read after a restart replaces rather
      * than duplicates, and a 30-second bar never collides with the minute that contains it.
+     *
+     * <p><b>Concurrent, and C-96 item 2 is what a plain {@code TreeMap} here actually cost.</b>
+     * On 2026-11-20 {@code /overnight} showed <b>26 of 51</b> slots while the bars for the missing
+     * minutes were on the topic the whole time — measured: 331 distinct one-minute bar starts
+     * covering 23:16Z to 04:46Z continuously. The gateway was not failing to read them. It was
+     * failing to <b>keep</b> them:
+     *
+     * <pre>
+     * Feed gateway state consumer error: Cannot read field "left" because "&lt;local2&gt;" is null
+     * java.lang.NullPointerException
+     *   at java.util.TreeMap.rotateLeft
+     *   at java.util.TreeMap.fixAfterInsertion
+     *   at java.util.TreeMap.addEntry
+     *   at java.util.TreeMap.put
+     *   at app.feedgateway.readable.OvernightSource.onBar(OvernightSource.java:68)
+     * </pre>
+     *
+     * <p>Two threads call {@link #onBar}: the live state consumer, and the start-up drain that
+     * replays the night's history. A {@code TreeMap} under concurrent {@code put} does not throw at
+     * the collision — it <b>corrupts its own red-black structure</b> and throws later, inside a
+     * rotation, from whichever thread gets there next. The exception killed the state consumer, and
+     * whatever the drain had not yet inserted was simply lost. The surviving entries were the tail
+     * of each series, which is why both the 1m and 30s counts stood at about 45% of what the topic
+     * holds and why the holes were exactly the backfilled range.
+     *
+     * <p>A read-write race was there too, and that half is mine: {@link #bars(String)} returns an
+     * unmodifiable <b>view</b> rather than a copy — I made it a view earlier the same day to stop
+     * the page's rebuild allocating a list per request, which was part of the heap exhaustion. The
+     * view is the right call for the heap and it put HTTP request threads on the same unsynchronised
+     * structure. {@code ConcurrentSkipListMap} keeps both properties: it is a sorted
+     * {@link NavigableMap}, so {@code headMap(...).clear()} and the grid's ordered iteration are
+     * unchanged; its iterators are weakly consistent, so a reader cannot corrupt or be corrupted by
+     * a concurrent write; and reads still allocate nothing.
      */
-    private final java.util.Map<String, TreeMap<Long, OvernightGrid.Bar>> bars =
-            new java.util.LinkedHashMap<>();
-    private ReadablePage.Price lastPrice;
-    private ReadablePage.Price lastIndexPrice;
-    private long nightStartMs;
-    private long barsRefused;
-    private long pricesRefused;
+    private final java.util.Map<String, ConcurrentSkipListMap<Long, OvernightGrid.Bar>> bars =
+            new ConcurrentHashMap<>();
+    private volatile ReadablePage.Price lastPrice;
+    private volatile ReadablePage.Price lastIndexPrice;
+    private volatile long nightStartMs;
+    private volatile long barsRefused;
+    private volatile long pricesRefused;
 
     /**
      * Set where the night starts. Everything before it is dropped here and ignored by the grid.
@@ -45,7 +80,7 @@ public final class OvernightSource {
      */
     public void nightStartsAt(long epochMs) {
         this.nightStartMs = epochMs;
-        for (TreeMap<Long, OvernightGrid.Bar> byStart : bars.values()) {
+        for (ConcurrentSkipListMap<Long, OvernightGrid.Bar> byStart : bars.values()) {
             byStart.headMap(epochMs, false).clear();
         }
     }
@@ -65,7 +100,8 @@ public final class OvernightSource {
             barsRefused++;
             return;
         }
-        bars.computeIfAbsent(bar.timeframe(), k -> new TreeMap<>()).put(bar.startMs(), bar);
+        bars.computeIfAbsent(bar.timeframe(), k -> new ConcurrentSkipListMap<>())
+                .put(bar.startMs(), bar);
     }
 
     /**
@@ -159,7 +195,7 @@ public final class OvernightSource {
      * double-count this class is keyed to prevent.
      */
     public java.util.Collection<OvernightGrid.Bar> bars(String timeframe) {
-        TreeMap<Long, OvernightGrid.Bar> byStart = bars.get(timeframe);
+        ConcurrentSkipListMap<Long, OvernightGrid.Bar> byStart = bars.get(timeframe);
         // A VIEW, not a copy. This returned `new ArrayList<>(byStart.values())`, and that copy ran
         // on every render of the long page and on every /now and /overnight request -- three call
         // sites, one of them on the 30-second beat. It is the allocation that was holding the
@@ -177,14 +213,14 @@ public final class OvernightSource {
 
     /** How many bars are held of one timeframe, for a health read. */
     public int barCount(String timeframe) {
-        TreeMap<Long, OvernightGrid.Bar> byStart = bars.get(timeframe);
+        ConcurrentSkipListMap<Long, OvernightGrid.Bar> byStart = bars.get(timeframe);
         return byStart == null ? 0 : byStart.size();
     }
 
     /** How many bars are held in all, across every timeframe. */
     public int barCount() {
         int n = 0;
-        for (TreeMap<Long, OvernightGrid.Bar> byStart : bars.values()) {
+        for (ConcurrentSkipListMap<Long, OvernightGrid.Bar> byStart : bars.values()) {
             n += byStart.size();
         }
         return n;
@@ -195,7 +231,7 @@ public final class OvernightSource {
      * price.
      */
     public long newestBarStartMs(String timeframe) {
-        TreeMap<Long, OvernightGrid.Bar> byStart = bars.get(timeframe);
+        ConcurrentSkipListMap<Long, OvernightGrid.Bar> byStart = bars.get(timeframe);
         return byStart == null || byStart.isEmpty() ? 0L : byStart.lastKey();
     }
 

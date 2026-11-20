@@ -427,8 +427,10 @@ public final class ReadableBoardRenderer {
                         Pages.overnight(nowMs, last, overnightNow(nowMs)), lowHeap);
             }
             case "footprint":
-                return onePage(Pages.footprint(nowMs, last, board == null ? null : board.spot(),
-                        footprintLevels(board), basisOrNull()), part);
+                // C-96 item 1: the CENTRE is the live price, not the board's spot. The board is
+                // absent for most of the day the owner reads this page.
+                return onePage(Pages.footprint(nowMs, last, footprintCentre(last),
+                        footprintLevels(last), basisOrNull()), part);
             case "recent-full":
                 return onePage(Pages.recentFull(nowMs, last, recentRows()), part);
             case "index":
@@ -457,14 +459,45 @@ public final class ReadableBoardRenderer {
         return parts.get(index - 1);
     }
 
-    /** The footprint levels near spot, or an empty list where there is no profile or no board. */
-    private java.util.List<FootprintByPrice.Level> footprintLevels(ReadablePage.Board board) {
-        if (profileJson == null || board == null) {
+    /**
+     * <b>C-96 item 1: the footprint levels near the LIVE price, with no gamma board required.</b>
+     *
+     * <p>What this page showed before, and why it showed nothing. Both the centre and the levels
+     * came from the gamma board — {@code board == null} returned an empty list and
+     * {@code board.spot()} was the centre — so overnight, pre-market, and any other hour with no
+     * board, {@code /footprint} printed {@code spot=absent|levels=0} while the data it needed was
+     * on the broker the whole time. Measured on 2026-11-20 at 10:26:50Z:
+     * {@code options.spx.gamma-zone.profile}'s newest record was 47 seconds old. <b>The profile
+     * was never the missing part; the board gate was.</b>
+     *
+     * <p>The centre is now {@link #footprintCentre}, the live SPX-equivalent price — which is the
+     * figure the page's own first line already prints, so the levels are now centred on the number
+     * the reader is looking at rather than on a board that may be hours stale or absent.
+     *
+     * <p>An empty list still means something, and it means one thing now instead of two: <b>no
+     * profile has been published</b>, or no level of it lies within the radius of the live price.
+     * It no longer means "there is no gamma board", which was the case that made the page useless
+     * at exactly the hours the owner asked for it.
+     */
+    private java.util.List<FootprintByPrice.Level> footprintLevels(ReadablePage.Price last) {
+        Double centre = footprintCentre(last);
+        if (profileJson == null || centre == null) {
             return java.util.List.of();
         }
         java.util.List<FootprintByPrice.Level> all =
                 FootprintByPrice.levels(profileJson, basisOrNull());
-        return FootprintByPrice.near(all, board.spot(), BoardLines.GRID_RADIUS, basisOrNull());
+        return FootprintByPrice.near(all, centre, BoardLines.GRID_RADIUS, basisOrNull());
+    }
+
+    /**
+     * The price the footprint window is centred on: the live SPX-equivalent print, or null.
+     *
+     * <p>Null and not a zero, for the reason the page's own comment gives: a primitive would print
+     * {@code spot=0.00}, a price the index has never traded at, and an absence that reads as a
+     * quotation is worse than an absence that says so.
+     */
+    private Double footprintCentre(ReadablePage.Price last) {
+        return last == null ? null : last.spx();
     }
 
     private BasisRead basisOrNull() {
