@@ -134,10 +134,19 @@ public final class ReadablePage {
      * @param hold      the map record's own {@code boardHold} block, or null where the board is
      *                  live (R-B-9, C-116). A held board that the page draws as fresh is exactly
      *                  C-40's fault again, so it is carried here and printed
+     * @param chainLowCents  the lowest strike the record carries, in cents, or &minus;1 where it
+     *                  is not known. With {@code chainHighCents} this tells a SHORT GRID from a
+     *                  MISSING FEED: the reviewer met {@code rows=35/41} with {@code norow} at
+     *                  6,970&ndash;6,995 as price fell, and those two readings look identical on
+     *                  the row count alone. A chain that ends above the bottom of the owner's grid
+     *                  is the gamma service publishing a narrower chain than his window; a chain
+     *                  that spans the grid with holes in it is a feed losing strikes
+     * @param chainHighCents the highest strike the record carries, in cents, or &minus;1
      */
     public record Board(long cycleMs, double spot, int rowsPresent, int rowsExpected,
                         String source, Extreme largestAbove, Extreme largestBelow,
-                        List<String> lines, int published, Hold hold) {
+                        List<String> lines, int published, Hold hold,
+                        long chainLowCents, long chainHighCents) {
 
         /** A board held from an earlier cycle, as the map service published it (R-B-9). */
         public record Hold(long ageMs, String reason, int strikesSoFar) {
@@ -147,7 +156,12 @@ public final class ReadablePage {
         public Board(long cycleMs, double spot, int rowsPresent, int rowsExpected, String source,
                      Extreme largestAbove, Extreme largestBelow, List<String> lines) {
             this(cycleMs, spot, rowsPresent, rowsExpected, source, largestAbove, largestBelow,
-                    lines, -1, null);
+                    lines, -1, null, -1L, -1L);
+        }
+
+        /** True where the record named both ends of the chain it carried. */
+        public boolean hasChainRange() {
+            return chainLowCents >= 0 && chainHighCents >= 0;
         }
 
         public Board {

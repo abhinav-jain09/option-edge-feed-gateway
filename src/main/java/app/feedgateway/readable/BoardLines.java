@@ -105,7 +105,9 @@ public final class BoardLines {
         }
         return new ReadablePage.Board(cycleMs, spot, present, expected, SOURCE,
                 Extremes.largest(byCents, spot, true), Extremes.largest(byCents, spot, false),
-                lines, strikes.size(), holdOf(root));
+                lines, strikes.size(), holdOf(root),
+                byCents.isEmpty() ? -1L : java.util.Collections.min(byCents.keySet()),
+                byCents.isEmpty() ? -1L : java.util.Collections.max(byCents.keySet()));
     }
 
     /**
