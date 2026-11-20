@@ -64,7 +64,9 @@ public final class Pages {
      */
     static final String PAGE_COMPUTED =
             "spx-by-this-page=vwapspx and the footprint SPX column are translated here from the "
-            + "published ES figure using the published basis; every other SPX price is the topic's";
+            + "published ES figure using basis|state (the level on spx.basis.state); the bars' own "
+            + "px column was translated by the producer using basis|bars; every other SPX price is "
+            + "the topic's";
 
     /**
      * The reading codes, expanded by every page's legend.
@@ -426,6 +428,40 @@ public final class Pages {
     }
 
     /**
+     * <b>C-101 item 2</b>: {@code basis|state=19.26 ANCHORED@16:00|bars=18.30|drift=0.96}.
+     *
+     * <p><b>Two bases, because there are two.</b> The level on {@code spx.basis.state} is what this
+     * page translates with; the difference between a bar's own {@code closeCents} and its
+     * {@code spxEqCloseCents} is what the PRODUCER translated that bar with. They drift apart, and
+     * a reader comparing a page-computed SPX figure with a bar's SPX column has no way to see why
+     * they differ unless both bases are on the page. The drift is printed too, because a reader
+     * should not have to subtract two numbers on the same line to get the one that matters.
+     *
+     * <p>Nothing here derives a basis: the published level is read, and the bars' figure is the
+     * producer's own subtraction read back off a bar that carries both prices (C-103).
+     */
+    static String basisLine(BasisRead basis, List<RecentRows.Row> recent) {
+        StringBuilder s = new StringBuilder(64);
+        s.append("basis|state=");
+        if (basis == null) {
+            s.append("absent");
+        } else {
+            s.append(basis.cellWithTime());
+        }
+        Double bars = BasisRead.fromRows(recent);
+        s.append("|bars=").append(bars == null ? "absent"
+                : String.format(Locale.ROOT, "%.2f", bars));
+        if (basis != null && bars != null) {
+            s.append("|drift=")
+                    .append(String.format(Locale.ROOT, "%.2f", basis.level() - bars));
+        }
+        if (basis != null && basis.nextSessionQuarantinedOpen()) {
+            s.append("|nextopen=QUARANTINED");
+        }
+        return s.append('\n').toString();
+    }
+
+    /**
      * The ends of the chain the record carried: {@code |chain=6995-7395}.
      *
      * <p><b>Why the row count is not enough.</b> {@code rows=35/41} with {@code norow} on six
@@ -528,12 +564,19 @@ public final class Pages {
                 s.append("vwapspx|absent|basis ").append(basis.cell())
                         .append("|not anchored, so nothing is translated\n");
             } else {
-                s.append(vwapLine("vwapspx", vwap.session(), basis, held))
-                        .append("basis|").append(basis.cell())
-                        .append(basis.nextSessionQuarantinedOpen() ? "|nextopen=QUARANTINED" : "")
-                        .append('\n');
+                s.append(vwapLine("vwapspx", vwap.session(), basis, held));
             }
         }
+        // C-101 item 2: the basis line stands on its OWN, outside EVERY branch above.
+        //
+        // It was printed only inside the anchored one, so the two readings a reader most needs to
+        // compare -- the published level, and the level the bars were actually translated with --
+        // were both invisible in exactly the cases where the published one had stopped being
+        // usable. Moving it one level out was not enough either: it would still have been inside
+        // the "a vwap record exists" branch, and the basis has nothing to do with whether the
+        // indicators service published a vwap block. Two bars and a published level are all this
+        // line needs, so it is printed wherever those exist.
+        s.append(basisLine(basis, recent));
 
         // the holding line
         if (holding == null) {

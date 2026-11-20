@@ -108,7 +108,7 @@ class NowPageTest {
                 "the ES figure as published, with its state");
         assertTrue(page.contains("7167.75"),
                 "and the SPX-equivalent, 7187.0082 minus the 19.26 basis");
-        assertTrue(page.contains("basis|19.26 ANCHORED"),
+        assertTrue(page.contains("basis|state=19.26 ANCHORED"),
                 "with the level and state the translation rests on");
     }
 
