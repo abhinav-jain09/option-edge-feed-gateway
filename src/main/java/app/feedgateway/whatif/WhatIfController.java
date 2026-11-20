@@ -3,6 +3,7 @@ package app.feedgateway.whatif;
 import app.feedgateway.FeedGatewayService;
 import app.feedgateway.liquidityhistory.LiquidityHistoryAuth;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.util.Locale;
@@ -103,7 +104,38 @@ public class WhatIfController {
             return ResponseEntity.ok(write(absent));
         }
         // VERBATIM. No merge, no reshaping, no second owner of the contract.
-        return ResponseEntity.ok(cached);
+        //
+        // C-125: the per-strike deltas travel BESIDE it, spliced in before the record's final
+        // brace, so the record's own bytes are a PREFIX of what is served -- not re-serialised,
+        // not reordered. The figures are the gateway's own tap on the gamma strike topic (C-120)
+        // and are not on this record; the block names its source, its producer and the expiry it
+        // was read for, which is this BOARD's expiry and not the newest the topic carries.
+        return ResponseEntity.ok(withStrikeDeltas(cached));
+    }
+
+    /**
+     * The cached record with C-125's {@code strikeDeltas} block beside it, or the record unchanged.
+     *
+     * <p>Unchanged wherever anything is missing or unexpected: no store, no board expiry, no
+     * strike carrying a published delta, or a record this cannot extend without reshaping. A body
+     * that is not the record is worse than a body without the deltas.
+     */
+    private String withStrikeDeltas(String cached) {
+        try {
+            JsonNode record = mapper.readTree(cached);
+            if (record == null || !record.isObject()) {
+                return cached;
+            }
+            String boardExpiry = record.path("expiry").asText(null);
+            ObjectNode block = StrikeDeltasSibling.build(mapper,
+                    service.readableBoard().strikeDeltas(), boardExpiry,
+                    StrikeDeltasSibling.strikeCentsOf(record));
+            return StrikeDeltasSibling.attach(mapper, cached, block);
+        } catch (RuntimeException | com.fasterxml.jackson.core.JsonProcessingException e) {
+            // The route's job is to serve the board. A sibling that cannot be built is a cell the
+            // page prints a dash in, never a 500 on the screen the owner is reading.
+            return cached;
+        }
     }
 
     private ResponseEntity<String> badRequest(String message) {

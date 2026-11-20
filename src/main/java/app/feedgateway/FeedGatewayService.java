@@ -435,6 +435,22 @@ public class FeedGatewayService implements ReplayRunner {
      */
     private final app.feedgateway.readable.ReadableBoardRenderer readableBoard =
             new app.feedgateway.readable.ReadableBoardRenderer(this::newestWhatIfBoard, null);
+
+    /**
+     * <b>C-125</b>: the readable board's own stores, for the routes that need one of them.
+     *
+     * <p>{@code WhatIfController} reads the per-strike delta store from here. The alternative was
+     * a second tap on the same topic for the same figures, which is two readers that can disagree
+     * about one number; this is one store with two readers.
+     *
+     * <p><b>Touching this file costs a campaign re-capture.</b> The footprint attestation record
+     * pins it by sha256, so any change here has to ship with a regenerated
+     * {@code ES-FOOTPRINT-CAMPAIGN.json} in the SAME pull request. Build #908 found that out the
+     * hard way: 2,428 tests green and the build still refused to emit.
+     */
+    public app.feedgateway.readable.ReadableBoardRenderer readableBoard() {
+        return readableBoard;
+    }
     /** Gamma Navigator shadow view per chain. REST-only, like gammaRotation. */
     private final Map<String, String> gammaNavigation = new ConcurrentHashMap<>();
     /** Corridor-gauge live state per symbol|expiry (JSON, last-value-wins). Standalone event. */
