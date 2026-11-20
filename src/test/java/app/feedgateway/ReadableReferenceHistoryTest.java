@@ -103,7 +103,7 @@ class ReadableReferenceHistoryTest {
 
         ReadableReferenceHistory history = new ReadableReferenceHistory(
                 () -> consumer, v -> (String) v, PRICES, BARS);
-        List<String> got = history.pricesBefore(NOW, 500);
+        List<String> got = history.pricesBetween(NOW - 96L * 3_600_000L, NOW, 500);
 
         assertTrue(got.contains("in-window-a") && got.contains("in-window-b"), got.toString());
         assertTrue(!got.contains("far-too-old"),
@@ -126,7 +126,7 @@ class ReadableReferenceHistoryTest {
         consumer.hold(tp, many);
 
         List<String> got = new ReadableReferenceHistory(() -> consumer, v -> (String) v,
-                PRICES, BARS).pricesBefore(NOW, 10);
+                PRICES, BARS).pricesBetween(NOW - 96L * 3_600_000L, NOW, 10);
         assertEquals(10, got.size(), "a busy topic must not turn start-up into a replay");
     }
 
@@ -137,15 +137,15 @@ class ReadableReferenceHistoryTest {
                 () -> {
                     throw new org.apache.kafka.common.KafkaException("no broker");
                 }, v -> (String) v, PRICES, BARS);
-        assertEquals(List.of(), history.pricesBefore(NOW, 100),
+        assertEquals(List.of(), history.pricesBetween(NOW - 96L * 3_600_000L, NOW, 100),
                 "the page states the absence and its reason; the gateway still starts");
-        assertEquals(List.of(), history.cashSessionBars(NOW));
+        assertEquals(List.of(), history.barsBetween(NOW - 30L * 3_600_000L, NOW));
     }
 
     @Test
     @DisplayName("a blank topic name reads nothing rather than guessing one")
     void aBlankTopicIsRefused() {
         assertEquals(List.of(), new ReadableReferenceHistory(() -> new Seeking(),
-                v -> (String) v, "  ", BARS).pricesBefore(NOW, 100));
+                v -> (String) v, "  ", BARS).pricesBetween(NOW - 96L * 3_600_000L, NOW, 100));
     }
 }

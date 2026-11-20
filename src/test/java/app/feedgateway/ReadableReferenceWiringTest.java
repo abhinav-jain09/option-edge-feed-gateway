@@ -34,12 +34,12 @@ class ReadableReferenceWiringTest {
     private static ReferencePrice.History history(List<String> prices, List<String> bars) {
         return new ReferencePrice.History() {
             @Override
-            public List<String> pricesBefore(long beforeMs, int limit) {
+            public List<String> pricesBetween(long fromMs, long toMs, int limit) {
                 return prices;
             }
 
             @Override
-            public List<String> cashSessionBars(long beforeMs) {
+            public List<String> barsBetween(long fromMs, long toMs) {
                 return bars;
             }
         };
