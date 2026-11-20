@@ -41,8 +41,64 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
     /** A bound on the drain, so a busy topic cannot turn start-up into a replay. */
     static final int MAX_RECORDS = 20_000;
 
+    /**
+     * What one drain actually did.
+     *
+     * <p>This exists because the old {@code catch (RuntimeException) { return List.of(); }} made
+     * a failed read and an empty window indistinguishable, and C-71 then reported "rebuilt from 0
+     * snapshot(s)" for both. I could not say WHY the rebuild was empty, because my own catch block
+     * had thrown the reason away: the measurement that finally identified it (45,075 price records
+     * polled and ZERO converted) had to be taken outside the gateway, with a separate probe, to
+     * learn something the gateway already knew and discarded.
+     *
+     * <p>{@link #polledButConvertedNothing()} is the signature of a converter that cannot read the
+     * records on its topic at all — the C-74 defect, where every value on {@code
+     * underlying.spx.price} is a typed {@code UnderlyingPriceEvent} and the generic Avro renderer
+     * requires a {@code GenericRecord}. A window that is genuinely empty polls nothing; a
+     * converter that is wrong polls plenty and converts none.
+     */
+    record Drain(String topic, long fromMs, long toMs, int polled, int converted,
+                 int outsideWindow, int unconvertible, String failure) {
+
+        boolean polledButConvertedNothing() {
+            return polled > 0 && converted == 0;
+        }
+
+        String line() {
+            StringBuilder b = new StringBuilder("readable drain ").append(topic)
+                    .append(" window=").append(java.time.Instant.ofEpochMilli(fromMs))
+                    .append("..").append(java.time.Instant.ofEpochMilli(toMs))
+                    .append(" polled=").append(polled)
+                    .append(" converted=").append(converted)
+                    .append(" outsideWindow=").append(outsideWindow)
+                    .append(" unconvertible=").append(unconvertible);
+            if (failure != null) {
+                b.append(" failed=").append(failure);
+            }
+            if (polledButConvertedNothing()) {
+                b.append("  <- POLLED RECORDS AND CONVERTED NONE: the converter cannot read this"
+                        + " topic's records, which is not an empty window");
+            }
+            return b.toString();
+        }
+    }
+
+    private final List<Drain> drains = new java.util.ArrayList<>();
+
+    /** Every drain this instance performed, newest last. Read by the wiring tests. */
+    List<Drain> drains() {
+        return List.copyOf(drains);
+    }
+
+    private List<String> record(Drain d, List<String> out) {
+        drains.add(d);
+        System.out.println(d.line());
+        return out;
+    }
+
     private final Supplier<Consumer<String, Object>> consumers;
-    private final Function<Object, String> toJson;
+    private final Function<Object, String> priceToJson;
+    private final Function<Object, String> barToJson;
     private final String priceTopic;
     private final String barTopic;
 
@@ -53,20 +109,38 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
      */
     ReadableReferenceHistory(Supplier<Consumer<String, Object>> consumers,
             Function<Object, String> toJson, String priceTopic, String barTopic) {
+        this(consumers, toJson, toJson, priceTopic, barTopic);
+    }
+
+    /**
+     * <b>One converter per topic.</b> The single shared converter this replaces was the whole of
+     * C-74's wrong close: {@code underlying.spx.price} carries a TYPED
+     * {@code com.optionsedge.contracts.hpsf.UnderlyingPriceEvent} (the gateway's deserializer
+     * returns typed records for exactly that topic, {@code underlying.vix.price} and the spot-vol
+     * regime, and generic ones for everything else), while {@code avroJson} requires a
+     * {@code GenericRecord} and returned null for every one of them. Measured: 45,075 price
+     * records polled, ZERO converted. The bars on the other topic are generic and convert with
+     * {@code avroJson}, so a seek that reads two topics needs two boundaries, named here rather
+     * than guessed at from the record's runtime class.
+     */
+    ReadableReferenceHistory(Supplier<Consumer<String, Object>> consumers,
+            Function<Object, String> priceToJson, Function<Object, String> barToJson,
+            String priceTopic, String barTopic) {
         this.consumers = consumers;
-        this.toJson = toJson;
+        this.priceToJson = priceToJson;
+        this.barToJson = barToJson;
         this.priceTopic = priceTopic;
         this.barTopic = barTopic;
     }
 
     @Override
     public List<String> pricesBetween(long fromMs, long toMs, int limit) {
-        return drain(priceTopic, fromMs, toMs, limit);
+        return drain(priceTopic, fromMs, toMs, limit, priceToJson);
     }
 
     @Override
     public List<String> barsBetween(long fromMs, long toMs) {
-        return drain(barTopic, fromMs, toMs, MAX_RECORDS);
+        return drain(barTopic, fromMs, toMs, MAX_RECORDS, barToJson);
     }
 
     /**
@@ -76,7 +150,8 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
      * zero at every start-up would be a replay of a week for one session's worth of records.
      */
     List<String> sessionSnapshots(long beforeMs, String snapshotTopic) {
-        return drain(snapshotTopic, beforeMs - SNAPSHOT_LOOKBACK_MS, beforeMs, MAX_RECORDS);
+        return drain(snapshotTopic, beforeMs - SNAPSHOT_LOOKBACK_MS, beforeMs, MAX_RECORDS,
+                priceToJson);
     }
 
     /**
@@ -86,19 +161,26 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
      * are retained unlimited, and reading one from offset zero at every start-up would be minutes
      * of replay for a handful of records that matter.
      */
-    private List<String> drain(String topic, long fromMs, long toMs, int limit) {
+    private List<String> drain(String topic, long fromMs, long toMs, int limit,
+            Function<Object, String> toJson) {
         if (topic == null || topic.isBlank() || limit <= 0) {
-            return List.of();
+            return record(new Drain(String.valueOf(topic), fromMs, toMs, 0, 0, 0, 0,
+                    "no topic bound"), List.of());
         }
         List<String> out = new ArrayList<>();
+        int polled = 0;
+        int outsideWindow = 0;
+        int unconvertible = 0;
         try (Consumer<String, Object> consumer = consumers.get()) {
             if (consumer == null) {
-                return List.of();
+                return record(new Drain(topic, fromMs, toMs, 0, 0, 0, 0,
+                        "no consumer"), List.of());
             }
             List<TopicPartition> parts = new ArrayList<>();
             var infos = consumer.partitionsFor(topic, Duration.ofSeconds(10));
             if (infos == null || infos.isEmpty()) {
-                return List.of();
+                return record(new Drain(topic, fromMs, toMs, 0, 0, 0, 0,
+                        "topic has no partitions"), List.of());
             }
             for (var info : infos) {
                 parts.add(new TopicPartition(topic, info.partition()));
@@ -125,24 +207,29 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
                 any = true;
             }
             if (!any) {
-                return List.of();
+                return record(new Drain(topic, fromMs, toMs, 0, 0, 0, 0,
+                        "no partition holds a record at or after the window start"), List.of());
             }
 
             int empties = 0;
             while (out.size() < limit && empties < 3) {
-                ConsumerRecords<String, Object> polled = consumer.poll(Duration.ofSeconds(2));
-                if (polled == null || polled.isEmpty()) {
+                ConsumerRecords<String, Object> batch = consumer.poll(Duration.ofSeconds(2));
+                if (batch == null || batch.isEmpty()) {
                     empties++;
                     continue;
                 }
                 empties = 0;
-                for (ConsumerRecord<String, Object> record : polled) {
-                    if (record.timestamp() > toMs) {
+                for (ConsumerRecord<String, Object> one : batch) {
+                    polled++;
+                    if (one.timestamp() > toMs) {
+                        outsideWindow++;
                         continue;             // past the window; a later partition may still be in it
                     }
-                    String json = toJson.apply(record.value());
+                    String json = toJson.apply(one.value());
                     if (json != null && !json.isBlank()) {
                         out.add(json);
+                    } else {
+                        unconvertible++;
                     }
                     if (out.size() >= limit) {
                         break;
@@ -153,11 +240,16 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
                 }
             }
         } catch (RuntimeException unreachable) {
-            // A broker that cannot be read at start-up is not a reason to refuse to start: the
-            // page states the absence and its reason, which is the honest outcome.
-            return List.of();
+            // A broker that cannot be read at start-up is still not a reason to refuse to start --
+            // but it IS a reason to say so. The exception's class and message go into the report
+            // and onto stdout, because the version that returned an empty list here cost a
+            // separate out-of-process probe to diagnose.
+            return record(new Drain(topic, fromMs, toMs, polled, out.size(), outsideWindow,
+                    unconvertible, unreachable.getClass().getSimpleName() + ": "
+                            + unreachable.getMessage()), List.of());
         }
-        return out;
+        return record(new Drain(topic, fromMs, toMs, polled, out.size(), outsideWindow,
+                unconvertible, null), out);
     }
 
     private static boolean caughtUp(Consumer<String, Object> consumer, List<TopicPartition> parts,

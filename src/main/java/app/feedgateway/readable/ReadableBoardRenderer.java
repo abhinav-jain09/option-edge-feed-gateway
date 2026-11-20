@@ -85,6 +85,10 @@ public final class ReadableBoardRenderer {
         OvernightGrid.Bar bar = OvernightDecoders.bar(json);
         if (bar != null) {
             source.onBar(bar);
+            // Our own arrival time against the bar's own minute. This is the only measurement of
+            // feed lateness we can make ourselves, and the indicators service makes none. See
+            // FeedGap.
+            feedGap.observe(bar.startMs(), clock.getAsLong());
         }
     }
 
@@ -159,7 +163,24 @@ public final class ReadableBoardRenderer {
         if (json == null || json.isBlank()) {
             return;
         }
+        if (!VwapRebuild.isForReadablePages(json)) {
+            // The OTHER instrument's snapshot. Both indicator CURRENT topics are bound, and they
+            // publish at the same instants, so without this the cells below showed whichever
+            // record happened to arrive last while the side path (which drops them) kept
+            // measuring against ES. See VwapRebuild.READ_SYMBOL.
+            otherInstrumentSnapshots++;
+            return;
+        }
         indicatorsJson = json;
+        // The held figures, BEFORE the usability gate below: this record may be the one that
+        // carries the absence, and the line still has to say when the last present figure was
+        // read. See VwapHeld.
+        VwapRead read = VwapRead.of(json);
+        Long at = VwapRebuild.instantOf(json);
+        if (read != null && at != null) {
+            vwapHeld.observe("vwapes", read.session(), at);
+            vwapHeld.observe("vwaprth", read.rth(), at);
+        }
         VwapRebuild.Moment m = VwapRebuild.decode(json);
         if (m != null) {
             sides.observe(m.atMs(), m.price(), m.vwap(), m.upper1(), m.lower1(), m.anchor());
@@ -171,6 +192,31 @@ public final class ReadableBoardRenderer {
     }
 
     /** One basis state, as published — plain JSON on {@code spx.basis.state}, never Avro. */
+    /**
+     * Snapshots refused because they are not {@link VwapRebuild#READ_SYMBOL}'s. Counted rather
+     * than dropped silently: on dev this climbs at the same rate as the accepted ones, and a zero
+     * here where the SPX topic is bound would mean the filter is not running.
+     */
+    private long otherInstrumentSnapshots;
+
+    /** Bars that reached us long after their own minute, so the headline can say so. */
+    private final FeedGap feedGap = new FeedGap();
+
+    FeedGap feedGap() {
+        return feedGap;
+    }
+
+    /** The last present figure of each VWAP line, so the line never loses it. */
+    private final VwapHeld vwapHeld = new VwapHeld();
+
+    VwapHeld vwapHeld() {
+        return vwapHeld;
+    }
+
+    long otherInstrumentSnapshots() {
+        return otherInstrumentSnapshots;
+    }
+
     public void onBasisJson(String json) {
         if (json != null && !json.isBlank()) {
             basisJson = json;
@@ -345,11 +391,12 @@ public final class ReadableBoardRenderer {
                 return Pages.now(nowMs, last, overnightNow(nowMs),
                         indicatorsJson == null ? null : VwapRead.of(indicatorsJson),
                         basisJson == null ? null : BasisRead.of(basisJson),
-                        sides.result(), recentRows(), board, nowStalledInputs());
+                        sides.result(), recentRows(), board, nowStalledInputs(), vwapHeld,
+                        feedGap.label());
             case "overnight":
                 return Pages.overnight(nowMs, last, overnightNow(nowMs));
             case "footprint":
-                return onePage(Pages.footprint(nowMs, last, board == null ? 0.0 : board.spot(),
+                return onePage(Pages.footprint(nowMs, last, board == null ? null : board.spot(),
                         footprintLevels(board), basisOrNull()), part);
             case "recent-full":
                 return onePage(Pages.recentFull(nowMs, last, recentRows()), part);

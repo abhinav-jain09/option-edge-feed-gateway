@@ -1,6 +1,8 @@
 package app.feedgateway;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -105,5 +107,102 @@ class ReadableReferenceWiringTest {
         Field f = FeedGatewayService.class.getDeclaredField("readableBoard");
         f.setAccessible(true);
         assertNotNull(f.get(service()), "the renderer the seed writes to must exist");
+    }
+
+    @Test
+    @DisplayName("C-71's rebuild seeks the ES indicator topic, not the SPX one")
+    void theRebuildSeeksTheEsTopic() {
+        FeedGatewayService service = service();
+        GatewaySettings settings = new GatewaySettings();
+
+        String seeked = service.readableSidesTopic();
+        assertEquals("es.options.indicators.snapshot.current", seeked,
+                "the readable pages read ES against ES, so the rebuild reads the ES stream");
+        assertNotEquals(settings.indicatorsSnapshotTopic(), seeked,
+                "and NOT the prefix-resolved local topic, which on dev is the SPX computation: "
+                        + "every record on it carries vwap ABSENT / SOURCE_HAS_NO_VOLUME, so a "
+                        + "rebuild that seeked it converted thousands of records and replayed zero");
+        assertTrue(settings.indicatorsSnapshotTopics().contains(seeked),
+                "it is one of the topics the gateway already subscribes to, not a new binding");
+    }
+
+    @Test
+    @DisplayName("a snapshot of the other instrument replays nothing, by name")
+    void theOtherInstrumentReplaysNothing() {
+        FeedGatewayService service = service();
+        String spx = "{\"symbol\":\"SPX\",\"currentPrice\":\"6980.12\","
+                + "\"asOfEventTime\":\"2026-11-20T05:04:09.870Z\","
+                + "\"session\":{\"vwapAnalysis\":{\"vwap\":{\"value\":null,"
+                + "\"state\":\"ABSENT\",\"reason\":\"SOURCE_HAS_NO_VOLUME\"}}}}";
+        assertEquals(0, service.rebuildReadableSides(List.of(spx, spx)),
+                "SPX snapshots are refused on their symbol, so none is replayed");
+    }
+
+    /**
+     * The real basis record off `spx.basis.state`, 2026-11-19 16:47:44 New York, with the two
+     * `a1*ReportRef` fields left out: they carry a local filesystem path and the basis reading
+     * does not look at them.
+     */
+    private static final String BASIS = "{\"schemaVersion\":1,\"algorithmVersion\":\"v2.0\","
+            + "\"level\":19.26000000000022,\"valueReferenceMs\":1795122000000,"
+            + "\"levelKind\":\"ANCHORED\",\"expiryMs\":1797604200000,"
+            + "\"newestEvidenceMs\":null,\"epochId\":5,\"esContract\":\"10252\","
+            + "\"contractGeneration\":0,\"quarantine\":null,\"noAnchorBaseline\":false,"
+            + "\"driftGuardSuspendedByAck\":false,\"nextSessionQuarantinedOpen\":true,"
+            + "\"trustedAnchor\":{\"level\":19.26000000000022,"
+            + "\"referenceMs\":1795122000000,\"expiryMs\":1797604200000,"
+            + "\"esContract\":\"10252\",\"contractGeneration\":0},"
+            + "\"unavailableReason\":null,\"configHash\":\"e79ac06545a5115d\"}";
+
+    /** The real ES snapshot shape, with a session VWAP that carries a figure. */
+    private static final String ES_SNAPSHOT =
+            "{\"symbol\":\"ES\",\"schemaVersion\":1,\"marketState\":\"OPEN\","
+            + "\"currentPrice\":\"7158.75\","
+            + "\"asOfEventTime\":\"2026-11-20T05:04:09.870Z\","
+            + "\"session\":{\"vwapAnalysis\":{\"vwap\":{\"value\":\"7177.4637\","
+            + "\"state\":\"INCOMPLETE\",\"reason\":\"DEADLINE_FINALIZED\","
+            + "\"incompleteKind\":\"LATCHED\"},"
+            + "\"stdDev\":{\"value\":\"5.0993\",\"state\":\"INCOMPLETE\"}},"
+            + "\"vwapRth\":{\"vwap\":{\"value\":null,\"state\":\"WARMING_UP\","
+            + "\"reason\":\"WARMING_UP_WINDOW\"}}}}";
+
+    @Test
+    @DisplayName("a basis seeded at start-up fills the SPX-equivalent column the same minute")
+    void aSeededBasisFillsTheSpxColumn() throws Exception {
+        FeedGatewayService service = service();
+
+        // Without the seed, this is what the owner saw all night: the level had been on the topic
+        // for eight hours and the page said the producer had published nothing.
+        service.readableBoardForTest().onIndicatorsJson(ES_SNAPSHOT);
+        service.renderReadableBoard();
+        assertTrue(service.readableNamedPage("now", 1)
+                        .contains("vwapspx|absent|no basis published on spx.basis.state"),
+                "the absence as it stands before the seed");
+
+        service.seedReadableBasis(BASIS);
+        service.renderReadableBoard();
+        String page = service.readableNamedPage("now", 1);
+
+        assertTrue(page.contains("basis|"),
+                "the basis line appears once the level is known:\n" + page);
+        assertFalse(page.contains("vwapspx|absent"),
+                "and the SPX-equivalent column is no longer blank:\n" + page);
+        assertTrue(page.contains("7158.20"),
+                "7177.4637 ES minus the 19.26 ANCHORED level, translated by the platform's own "
+                        + "published basis and never by arithmetic of ours:\n" + page);
+        assertTrue(page.contains("nextopen=QUARANTINED"),
+                "and the record's own next-open quarantine travels with it:\n" + page);
+    }
+
+    @Test
+    @DisplayName("a blank or unreadable basis leaves the column absent rather than guessing a level")
+    void anUnreadableBasisLeavesTheColumnAbsent() throws Exception {
+        FeedGatewayService service = service();
+        service.readableBoardForTest().onIndicatorsJson(ES_SNAPSHOT);
+        service.seedReadableBasis("not json at all");
+        service.renderReadableBoard();
+        String page = service.readableNamedPage("now", 1);
+        assertTrue(page.contains("vwapspx|absent"),
+                "an unreadable level is no level:\n" + page);
     }
 }

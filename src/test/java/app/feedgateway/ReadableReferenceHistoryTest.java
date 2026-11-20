@@ -148,4 +148,117 @@ class ReadableReferenceHistoryTest {
         assertEquals(List.of(), new ReadableReferenceHistory(() -> new Seeking(),
                 v -> (String) v, "  ", BARS).pricesBetween(NOW - 96L * 3_600_000L, NOW, 100));
     }
+
+    @Test
+    @DisplayName("a converter that reads NONE of the records is reported, not returned as empty")
+    void aConverterThatReadsNothingIsReported() {
+        TopicPartition tp = new TopicPartition(PRICES, 0);
+        Seeking consumer = new Seeking();
+        consumer.hold(tp, List.of(
+                record(PRICES, 0L, NOW - 2L * 3_600_000L, "a"),
+                record(PRICES, 1L, NOW - 1L * 3_600_000L, "b")));
+
+        // The C-74 defect in miniature: the records are fine and the converter cannot read them.
+        ReadableReferenceHistory history = new ReadableReferenceHistory(
+                () -> consumer, v -> null, PRICES, BARS);
+        assertEquals(List.of(), history.pricesBetween(NOW - 96L * 3_600_000L, NOW, 500));
+
+        var drains = history.drains();
+        assertEquals(1, drains.size(), "one seek, one report");
+        var d = drains.get(0);
+        assertEquals(2, d.polled(), "it polled both records");
+        assertEquals(0, d.converted(), "and converted neither");
+        assertEquals(2, d.unconvertible());
+        assertTrue(d.polledButConvertedNothing(),
+                "which is a wrong converter, NOT an empty window -- the distinction the old "
+                        + "catch-and-return-empty threw away");
+        assertTrue(d.line().contains("CONVERTED NONE"),
+                "and it says so where anyone reading the log will see it: " + d.line());
+        assertTrue(d.line().contains(PRICES), d.line());
+    }
+
+    @Test
+    @DisplayName("an empty window is reported as an empty window, not as a broken converter")
+    void anEmptyWindowIsNotABrokenConverter() {
+        TopicPartition tp = new TopicPartition(PRICES, 0);
+        Seeking consumer = new Seeking();
+        consumer.hold(tp, List.of(record(PRICES, 0L, NOW - 500L * 3_600_000L, "ancient")));
+
+        ReadableReferenceHistory history = new ReadableReferenceHistory(
+                () -> consumer, v -> (String) v, PRICES, BARS);
+        history.pricesBetween(NOW - 2L * 3_600_000L, NOW, 500);
+
+        var d = history.drains().get(0);
+        assertTrue(!d.polledButConvertedNothing(),
+                "nothing was polled, so nothing failed to convert: " + d.line());
+        assertEquals(0, d.polled());
+    }
+
+    @Test
+    @DisplayName("an unreachable broker's report names the exception class and its message")
+    void anUnreachableBrokerNamesItsException() {
+        ReadableReferenceHistory history = new ReadableReferenceHistory(
+                () -> {
+                    throw new org.apache.kafka.common.KafkaException("no broker");
+                }, v -> (String) v, PRICES, BARS);
+        history.pricesBetween(NOW - 96L * 3_600_000L, NOW, 100);
+
+        var d = history.drains().get(0);
+        assertTrue(d.failure() != null && d.failure().contains("KafkaException"),
+                "the reason a start-up read failed must not be swallowed: " + d.failure());
+        assertTrue(d.failure().contains("no broker"), d.failure());
+        assertTrue(d.line().contains("failed=KafkaException"), d.line());
+    }
+
+    @Test
+    @DisplayName("a successful drain reports what it read, so 'rebuilt from 0' is never the whole story")
+    void aSuccessfulDrainReportsItsCounts() {
+        TopicPartition tp = new TopicPartition(PRICES, 0);
+        Seeking consumer = new Seeking();
+        consumer.hold(tp, List.of(
+                record(PRICES, 0L, NOW - 3L * 3_600_000L, "a"),
+                record(PRICES, 1L, NOW - 2L * 3_600_000L, "b"),
+                record(PRICES, 2L, NOW + 3_600_000L, "after")));
+
+        ReadableReferenceHistory history = new ReadableReferenceHistory(
+                () -> consumer, v -> (String) v, PRICES, BARS);
+        history.pricesBetween(NOW - 96L * 3_600_000L, NOW, 500);
+
+        var d = history.drains().get(0);
+        assertEquals(3, d.polled());
+        assertEquals(2, d.converted());
+        assertEquals(1, d.outsideWindow());
+        assertEquals(0, d.unconvertible());
+        assertTrue(d.failure() == null, d.line());
+    }
+
+    @Test
+    @DisplayName("the price topic and the bar topic each convert through their OWN boundary")
+    void eachTopicConvertsThroughItsOwnBoundary() {
+        // A FRESH consumer per seek, because drain() closes the one it was handed -- a single
+        // shared mock would make the second seek read nothing for a reason that is not the
+        // converter's.
+        java.util.function.Supplier<org.apache.kafka.clients.consumer.Consumer<String, Object>>
+                consumers = () -> {
+                    Seeking c = new Seeking();
+                    c.hold(new TopicPartition(PRICES, 0),
+                            List.of(record(PRICES, 0L, NOW - 3_600_000L, "typed-price")));
+                    c.hold(new TopicPartition(BARS, 0),
+                            List.of(record(BARS, 0L, NOW - 3_600_000L, "generic-bar")));
+                    return c;
+                };
+
+        // Two converters, and each must be used on its own topic. The single shared converter this
+        // replaces returned null for every typed UnderlyingPriceEvent on the price topic.
+        ReadableReferenceHistory history = new ReadableReferenceHistory(
+                consumers,
+                v -> "price:" + v,
+                v -> "bar:" + v,
+                PRICES, BARS);
+
+        assertEquals(List.of("price:typed-price"),
+                history.pricesBetween(NOW - 96L * 3_600_000L, NOW, 10));
+        assertEquals(List.of("bar:generic-bar"),
+                history.barsBetween(NOW - 30L * 3_600_000L, NOW));
+    }
 }

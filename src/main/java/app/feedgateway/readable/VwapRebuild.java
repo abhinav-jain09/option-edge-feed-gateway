@@ -33,6 +33,73 @@ public final class VwapRebuild {
     private VwapRebuild() {
     }
 
+    /**
+     * The instrument the readable pages read: <b>ES</b> (C-69 is ES against ES throughout).
+     *
+     * <p>The gateway subscribes to <b>both</b> indicator CURRENT topics —
+     * {@code GatewaySettings.indicatorsSnapshotTopics()}, the prefix-resolved local topic plus the
+     * es4-mirrored ES one — so on dev and production an SPX record and an ES record arrive at the
+     * SAME instant, every 5 seconds. Measured 2026-11-20 00:07:37 to 00:08:02 New York: ES carried
+     * {@code vwap 7175.3366 INCOMPLETE/DEADLINE_FINALIZED} while SPX carried
+     * {@code vwap null ABSENT/SOURCE_HAS_NO_VOLUME} at each of the same six instants. The SPX
+     * record is CORRECT — the cash index has no traded volume, so it has no VWAP to publish — and
+     * useless here.
+     *
+     * <p>Both the live tap and the start-up replay go through this one predicate, because the
+     * defect it fixes was two paths filtering DIFFERENTLY: {@link #decode} dropped the SPX moments
+     * incidentally (their anchor has no usable VWAP, so they make no moment), while the cells
+     * beside the headline kept whichever record arrived last. The page therefore flipped
+     * instruments on every poll, and the holding count was measured against a figure the cells
+     * were no longer showing. Incidental agreement is not a filter; this is.
+     */
+    static final String READ_SYMBOL = "ES";
+
+    /**
+     * The snapshot's own event instant, independent of whether its figures are usable.
+     *
+     * <p>{@link #decode} returns null for a snapshot whose anchor has no usable VWAP, so its
+     * instant was unreachable in exactly the case the held-figure line needs it: to say WHEN the
+     * last present figure was read and that the record carrying the absence is current.
+     */
+    static Long instantOf(String json) {
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode n = MAPPER.readTree(json);
+            if (n == null || !n.isObject() || !n.path("asOfEventTime").isTextual()) {
+                return null;
+            }
+            return Instant.parse(n.path("asOfEventTime").textValue()).toEpochMilli();
+        } catch (Exception malformed) {
+            return null;
+        }
+    }
+
+    /**
+     * Whether this snapshot is about {@link #READ_SYMBOL}.
+     *
+     * <p>Judged on the payload's own {@code symbol}, not on the topic it arrived from: the two
+     * topics coincide on es4, and a binding that moved would otherwise change which instrument the
+     * pages read without anything here saying so. A snapshot with no readable {@code symbol} is
+     * refused rather than assumed to be ES.
+     */
+    static boolean isForReadablePages(String json) {
+        if (json == null || json.isBlank()) {
+            return false;
+        }
+        try {
+            JsonNode n = MAPPER.readTree(json);
+            if (n == null || !n.isObject()) {
+                return false;
+            }
+            JsonNode symbol = n.path("symbol");
+            return symbol.isTextual() && READ_SYMBOL.equals(symbol.textValue());
+        } catch (Exception malformed) {
+            return false;
+        }
+    }
+
     /** One decoded moment: the price and the line as they both stood then. */
     record Moment(long atMs, double price, double vwap, Double upper1, Double lower1,
                   String anchor) {
@@ -71,6 +138,9 @@ public final class VwapRebuild {
     static Moment decode(String json) {
         if (json == null || json.isBlank()) {
             return null;
+        }
+        if (!isForReadablePages(json)) {
+            return null;      // the other instrument's snapshot, refused by name (see READ_SYMBOL)
         }
         try {
             JsonNode n = MAPPER.readTree(json);

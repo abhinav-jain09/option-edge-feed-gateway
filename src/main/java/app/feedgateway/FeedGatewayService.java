@@ -1583,6 +1583,19 @@ public class FeedGatewayService implements ReplayRunner {
         // the owner's crossings and holding times at zero, which reads as a quiet session rather
         // than a short memory. Best effort, like the seed above.
         rebuildReadableSides();
+        // The basis level, for the same reason and a different one. The reference and the sides
+        // are recovered because the page needs HISTORY; the basis is recovered because the page
+        // cannot otherwise see the PRESENT. spx.basis.state publishes about once a session and
+        // every tap starts at `latest`, so after any restart the gateway reported "no basis
+        // published on spx.basis.state" while the level had been sitting on the topic for eight
+        // hours -- a claim about the producer that was really about our own subscription.
+        //
+        // The rule this applies, learned on the pre-open board and then missed here: state that is
+        // republished continuously refills itself after a restart (every pre-open strike returns
+        // within 27 seconds, which is why no rebuild was built for them); state published ONCE
+        // must be seeded. One topic, one partition, one record -- not a change of offset reset,
+        // which would replay every large topic at every start.
+        seedReadableBasis();
         executor.submit(this::runSelectionConsumer);
         executor.submit(this::runAvroLiveConsumer);
         executor.submit(this::runJsonStateLiveConsumer);
@@ -13254,15 +13267,100 @@ public class FeedGatewayService implements ReplayRunner {
                 System.currentTimeMillis(), history));
     }
 
+    /**
+     * <b>Item 7</b>: the newest basis record, so the SPX-equivalent column is not blank all day
+     * after a restart. Package-private so a test drives the real tap with a real record rather
+     * than asserting that a line of source exists.
+     */
+    void seedReadableBasis(String json) {
+        readableBoard.onBasisJson(json);
+    }
+
+    /** The renderer the controller serves from, so a test drives the real one. */
+    app.feedgateway.readable.ReadableBoardRenderer readableBoardForTest() {
+        return readableBoard;
+    }
+
+    /** The real seek: the last record of the basis state topic, which has exactly one partition. */
+    private void seedReadableBasis() {
+        String topic = settings.basisStateTopic();
+        if (topic == null || topic.isBlank()) {
+            return;
+        }
+        try (org.apache.kafka.clients.consumer.Consumer<String, String> consumer =
+                new org.apache.kafka.clients.consumer.KafkaConsumer<>(
+                        stringConsumerProperties("readable-basis"))) {
+            var infos = consumer.partitionsFor(topic, Duration.ofSeconds(10));
+            if (infos == null || infos.isEmpty()) {
+                System.out.println("readable basis: " + topic + " has no partitions yet");
+                return;
+            }
+            // Named rather than assumed: the topic is declared with one partition, and "the last
+            // record" of a multi-partition topic would be the newest of an arbitrary one. If that
+            // ever changes this says so, instead of seeding a level from one partition of several.
+            if (infos.size() != 1) {
+                System.err.println("readable basis not seeded: " + topic + " has " + infos.size()
+                        + " partitions, expected 1");
+                return;
+            }
+            TopicPartition tp = new TopicPartition(topic, infos.get(0).partition());
+            consumer.assign(java.util.List.of(tp));
+            long end = consumer.endOffsets(java.util.List.of(tp), Duration.ofSeconds(10))
+                    .getOrDefault(tp, 0L);
+            long begin = consumer.beginningOffsets(java.util.List.of(tp), Duration.ofSeconds(10))
+                    .getOrDefault(tp, 0L);
+            if (end <= begin) {
+                System.out.println("readable basis: nothing on " + topic + " to seed from");
+                return;
+            }
+            // One record back from the END, not from the beginning: this is a state topic and only
+            // its newest record is the state.
+            consumer.seek(tp, end - 1);
+            String newest = null;
+            for (int attempt = 0; attempt < 3 && newest == null; attempt++) {
+                for (ConsumerRecord<String, String> record
+                        : consumer.poll(Duration.ofSeconds(2))) {
+                    if (record.value() != null && !record.value().isBlank()) {
+                        newest = record.value();      // a tombstone leaves the page saying absent
+                    }
+                }
+            }
+            if (newest == null) {
+                System.out.println("readable basis: " + topic + " offset " + (end - 1)
+                        + " carried no readable value");
+                return;
+            }
+            seedReadableBasis(newest);
+            System.out.println("readable basis seeded from " + topic + " offset " + (end - 1));
+        } catch (RuntimeException e) {
+            // Never abort @PostConstruct for this: the page states the absence and its reason.
+            System.err.println("readable basis not seeded: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
+        }
+    }
+
     /** C-71's start-up rebuild. Package-private so the wiring test drives it with real records. */
     int rebuildReadableSides(java.util.Collection<String> snapshots) {
         return readableBoard.rebuildSides(snapshots);
     }
 
+    /**
+     * The topic C-71's rebuild seeks.
+     *
+     * <p>A method rather than an inline call so a test can assert the CHOICE against the real
+     * wiring: the version that seeked {@code settings.indicatorsSnapshotTopic()} drained thousands
+     * of records, converted every one and replayed ZERO moments, because on dev and production that
+     * topic is the SPX computation whose VWAP is correctly ABSENT (the cash index has no traded
+     * volume). A test that restated the expected topic name would have agreed with the wrong code.
+     */
+    String readableSidesTopic() {
+        return settings.esIndicatorsSnapshotTopic();
+    }
+
     /** The real seek: this session's snapshots off the indicators topic. */
     private void rebuildReadableSides() {
         try {
-            String topic = settings.indicatorsSnapshotTopic();
+            String topic = readableSidesTopic();
             if (topic == null || topic.isBlank()) {
                 return;
             }
@@ -13299,6 +13397,11 @@ public class FeedGatewayService implements ReplayRunner {
             seedReadableReference(new ReadableReferenceHistory(
                     () -> new org.apache.kafka.clients.consumer.KafkaConsumer<String, Object>(
                             avroConsumerProperties("readable-reference")),
+                    // The price topic's OWN boundary. Every value on underlying.spx.price is a
+                    // typed UnderlyingPriceEvent, and avroJson requires a GenericRecord, so the
+                    // one shared converter converted none of 45,075 records and C-74 fell through
+                    // to a footprint bar for its close. The live tap has always used this one.
+                    value -> SpxPriceJson.render(mapper, value),
                     this::avroJson,
                     settings.underlyingSpxPriceTopic(),
                     settings.esFootprintBarsTopic()));
