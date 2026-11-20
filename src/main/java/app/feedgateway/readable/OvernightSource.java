@@ -73,6 +73,15 @@ public final class OvernightSource {
     private volatile long pricesRefused;
 
     /**
+     * Index prints seen INSIDE the night, which are today's trading and not the previous close.
+     *
+     * <p>Published rather than private: on a pre-market day this counts into the thousands, and a
+     * reader of the instrument needs to be able to tell "the index is printing and we are correctly
+     * ignoring it" from "no index print has been seen".
+     */
+    private volatile long closeCandidatesInsideTheNight;
+
+    /**
      * Set where the night starts. Everything before it is dropped here and ignored by the grid.
      *
      * <p>Called when the session rolls. It is explicit rather than derived, because the cash close
@@ -120,7 +129,37 @@ public final class OvernightSource {
         }
         lastPrice = price;
         if (isIndexPrint(price)) {
-            lastIndexPrice = price;
+            // C-97 item 4: AN INDEX PRINT FROM INSIDE THIS NIGHT IS NOT THE PREVIOUS CLOSE.
+            //
+            // This single missing condition emptied the owner's page. On 2026-11-20
+            // `underlying.spx.price` published source=NATIVE_SPX_INDEX / quality=LIVE_INDEX once
+            // per second through the pre-market -- measured, thirteen consecutive records from
+            // 10:50:53Z to 10:51:05Z. Every one of them passed isIndexPrint, correctly by its own
+            // labels, and each one replaced `lastIndexPrice`. So `previousCashClose()` returned
+            // the CURRENT price, and the page printed `close|7160.54|+0.00`: a close equal to now,
+            // with a zero difference by construction.
+            //
+            // The damage went further than the label. ReadableBoardRenderer.onPriceJson treats a
+            // moved reference as a session roll and calls nightStartsAt(reference), which clears
+            // every bar before the new start -- so the night's start marched forward once a second
+            // and the history behind it was deleted. `slots=0/1` and `bars night=0` are that loop,
+            // not the map corruption it sat beside.
+            //
+            // The rule, and why it is this one: the previous close is the last index print from
+            // BEFORE the night began. `>` and not `>=` because the print AT the night's start is
+            // the close itself. Once a start is known the reference is frozen, which is what makes
+            // the loop impossible rather than merely unlikely.
+            //
+            // WHAT THIS GIVES UP, stated rather than left to be found at 16:00: the reference will
+            // not roll to TODAY's close on its own; it holds yesterday's until the night start is
+            // set again. Rolling it properly needs a cash-close boundary, which is the session
+            // calendar this class deliberately does not hold -- raised in the Discussion tab as its
+            // own item. A frozen correct reference beats a reference that marches.
+            if (nightStartMs > 0 && price.epochMs() > nightStartMs) {
+                closeCandidatesInsideTheNight++;
+            } else {
+                lastIndexPrice = price;
+            }
         }
     }
 
@@ -241,6 +280,11 @@ public final class OvernightSource {
     }
 
     /** Prices refused for going backwards, counted. */
+    /** How many index prints were seen inside the night and so not taken as the previous close. */
+    public long closeCandidatesInsideTheNight() {
+        return closeCandidatesInsideTheNight;
+    }
+
     public long pricesRefused() {
         return pricesRefused;
     }
