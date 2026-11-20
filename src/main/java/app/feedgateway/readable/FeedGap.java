@@ -30,6 +30,21 @@ import java.util.Collection;
  * <p>The threshold is deliberately far above a normal bar: a 1m bar is normally published about 65
  * seconds after it opens (its own minute, plus ~5 s), so three minutes cannot be tripped by
  * ordinary jitter and was tripped by every bar in that window by two orders of magnitude.
+ *
+ * <p><b>C-107: a LIST of episodes, not one window.</b> The single earliest-to-latest window is a
+ * lie whenever the session has more than one outage: two separate ten-minute gaps eight hours
+ * apart named the eight hours between them, which is most of a session the feed was alive for. An
+ * episode is <b>two or more consecutive late bars of the finest width</b>, and it <b>ends at the
+ * first measured bar that is not late</b> &mdash; that is what "lateness returns to normal" means,
+ * taken off the measured bars themselves rather than from a clock. A single late bar is jitter
+ * above the threshold and is counted but is not an episode, because one bar cannot show a window
+ * the owner's VWAP was built without.
+ *
+ * <p><b>The daily maintenance break is not an episode.</b> The ES contract halts between 17:00 and
+ * 18:00 New York, and the bars either side of it are published in a burst afterwards. That is the
+ * exchange's own schedule and not a feed fault, so an episode lying wholly inside that hour is
+ * dropped. One that merely overlaps it is kept whole: the 2026-11-20 outage ran 18:16 to 23:46 and
+ * clipping it at the break's edge would shorten the only episode that mattered.
  */
 public final class FeedGap {
 
@@ -71,11 +86,48 @@ public final class FeedGap {
         }
     }
 
-    private long earliestLateStartMs = Long.MAX_VALUE;
-    private long latestLateStartMs = Long.MIN_VALUE;
+    /**
+     * The New York hour the ES contract is halted in. A run of late bars wholly inside it is the
+     * exchange's own schedule and not a feed fault (C-107).
+     */
+    static final int BREAK_START_HOUR_NY = 17;
+    static final int BREAK_END_HOUR_NY = 18;
+
+    /**
+     * One run of consecutive late bars (C-107).
+     *
+     * @param fromStartMs the first late bar's own minute
+     * @param toStartMs   the last late bar's own minute
+     * @param bars        how many consecutive late bars the run holds, always two or more
+     */
+    public record Episode(long fromStartMs, long toStartMs, int bars) {
+
+        public Episode {
+            if (bars < 2) {
+                throw new IllegalArgumentException(
+                        "one late bar is jitter above the threshold, not an episode: " + bars);
+            }
+            if (toStartMs < fromStartMs) {
+                throw new IllegalArgumentException("an episode cannot end before it began");
+            }
+        }
+
+        /** The minutes this run describes, which is what the owner's VWAP was built without. */
+        public long spanMs() {
+            return toStartMs - fromStartMs;
+        }
+
+        /** {@code 18:16-23:43}, the New York minutes, for the page. */
+        public String window() {
+            return ReadablePage.hms(fromStartMs, ReadablePage.NY).substring(0, 5)
+                    + "-" + ReadablePage.hms(toStartMs, ReadablePage.NY).substring(0, 5);
+        }
+    }
+
     private long lateBars;
     private long barsMeasured;
     private long finestWidthMs;
+    private java.util.List<Episode> episodes = java.util.List.of();
 
     /**
      * Measure the window from these records, replacing whatever was measured before.
@@ -111,30 +163,87 @@ public final class FeedGap {
                 finest = Math.min(finest, b.widthMs());
             }
         }
-        long earliest = Long.MAX_VALUE;
-        long latest = Long.MIN_VALUE;
-        long late = 0;
-        long measured = 0;
+        // C-107: the finest-width bars IN TIME ORDER, so "consecutive" is a property of the
+        // session and not of whatever order the drain handed them over in. The previous version
+        // never needed the order, because a minimum and a maximum do not care about it; a run
+        // does, and reading runs off an unordered collection would split one outage into as many
+        // episodes as the iteration order had inversions.
+        java.util.List<Published> finestBars = new java.util.ArrayList<>();
         for (Published b : bars) {
-            if (b == null || b.widthMs() != finest) {
-                continue;                       // a wider bar's start is not this window's start
+            if (b != null && b.widthMs() == finest) {
+                finestBars.add(b);
             }
-            measured++;
-            if (b.lagMs() <= LATE_AFTER_MS) {
-                continue;
-            }
-            late++;
-            earliest = Math.min(earliest, b.barStartMs());
-            latest = Math.max(latest, b.barStartMs());
         }
-        if (measured == 0) {
+        if (finestBars.isEmpty()) {
             return;     // nothing of the finest width in this drain: leave the measurement standing
         }
-        barsMeasured = measured;
+        finestBars.sort(java.util.Comparator.comparingLong(Published::barStartMs));
+
+        long late = 0;
+        java.util.List<Episode> found = new java.util.ArrayList<>();
+        long runFrom = -1L;
+        long runTo = -1L;
+        int runBars = 0;
+        for (Published b : finestBars) {
+            if (b.lagMs() > LATE_AFTER_MS) {
+                late++;
+                if (runBars == 0) {
+                    runFrom = b.barStartMs();
+                }
+                runTo = b.barStartMs();
+                runBars++;
+                continue;
+            }
+            // THE RUN ENDS HERE: a measured bar that is not late is lateness returning to normal.
+            closeRun(found, runFrom, runTo, runBars);
+            runBars = 0;
+        }
+        closeRun(found, runFrom, runTo, runBars);
+
+        barsMeasured = finestBars.size();
         finestWidthMs = finest;
         lateBars = late;
-        earliestLateStartMs = earliest;
-        latestLateStartMs = latest;
+        episodes = java.util.List.copyOf(found);
+    }
+
+    /**
+     * Add a finished run as an episode, unless it is one bar or lies wholly in the daily break.
+     */
+    private static void closeRun(java.util.List<Episode> into, long from, long to, int bars) {
+        if (bars < 2) {
+            return;                 // one late bar is jitter, not a window the VWAP missed
+        }
+        if (whollyInTheBreak(from, to)) {
+            return;                 // the exchange's own halt, not a feed fault
+        }
+        into.add(new Episode(from, to, bars));
+    }
+
+    /** True where both ends of the run fall inside the same New York maintenance hour. */
+    static boolean whollyInTheBreak(long fromMs, long toMs) {
+        java.time.ZonedDateTime a =
+                java.time.Instant.ofEpochMilli(fromMs).atZone(ReadablePage.NY);
+        java.time.ZonedDateTime b =
+                java.time.Instant.ofEpochMilli(toMs).atZone(ReadablePage.NY);
+        return a.toLocalDate().equals(b.toLocalDate())
+                && a.getHour() >= BREAK_START_HOUR_NY && a.getHour() < BREAK_END_HOUR_NY
+                && b.getHour() >= BREAK_START_HOUR_NY && b.getHour() < BREAK_END_HOUR_NY;
+    }
+
+    /**
+     * <b>C-107</b>: every late episode of the last measurement, in time order, longest-first
+     * ordering left to the caller that needs it.
+     */
+    public java.util.List<Episode> episodes() {
+        return episodes;
+    }
+
+    /** The two longest episodes by span, longest first (C-107: "show the two longest"). */
+    public java.util.List<Episode> twoLongest() {
+        java.util.List<Episode> bySpan = new java.util.ArrayList<>(episodes);
+        bySpan.sort(java.util.Comparator.comparingLong(Episode::spanMs).reversed()
+                .thenComparingLong(Episode::fromStartMs));
+        return java.util.List.copyOf(bySpan.subList(0, Math.min(2, bySpan.size())));
     }
 
     /** The timeframe the last measurement used, in milliseconds, or 0 before any measurement. */
@@ -159,10 +268,21 @@ public final class FeedGap {
      * because the owner reads that line at a glance and a sentence there would not be read at all.
      */
     public String label() {
-        if (lateBars == 0) {
+        if (episodes.isEmpty()) {
+            // C-107: late bars with no episode among them is jitter above the threshold, and
+            // naming it a gap on the owner's vwap| line would cry wolf. The count is still
+            // published through lateBars() for anyone who wants it.
             return null;
         }
-        return "gap " + ReadablePage.hms(earliestLateStartMs, ReadablePage.NY).substring(0, 5)
-                + "-" + ReadablePage.hms(latestLateStartMs, ReadablePage.NY).substring(0, 5);
+        StringBuilder s = new StringBuilder(40);
+        s.append("gap ").append(episodes.size()).append(episodes.size() == 1 ? " ep " : " eps ");
+        java.util.List<Episode> longest = twoLongest();
+        for (int i = 0; i < longest.size(); i++) {
+            if (i > 0) {
+                s.append(", ");
+            }
+            s.append(longest.get(i).window());
+        }
+        return s.toString();
     }
 }

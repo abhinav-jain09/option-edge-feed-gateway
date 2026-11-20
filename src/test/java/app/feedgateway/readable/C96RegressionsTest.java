@@ -160,10 +160,15 @@ final class C96RegressionsTest {
         // the window must START at 18:16 and not at 18:00 -- the whole point of the fix
         String expectedStart = ReadablePage.hms(eighteen16, ReadablePage.NY).substring(0, 5);
         String wrongStart = ReadablePage.hms(eighteen00, ReadablePage.NY).substring(0, 5);
-        assertTrue(label.startsWith("gap " + expectedStart),
+        // C-107 put the episode count on the label, so the window now follows "gap N ep(s) ".
+        // The assertion is on the EPISODE's own window rather than the label's prefix, which is
+        // what this test was always about and no longer depends on the label's shape.
+        assertEquals(1, gap.episodes().size(), "one outage, one episode: " + label);
+        assertEquals(expectedStart, gap.episodes().get(0).window().substring(0, 5),
                 "window should start at the first LATE 30-second bar (" + expectedStart
                         + "), got: " + label);
-        assertTrue(!label.startsWith("gap " + wrongStart) || expectedStart.equals(wrongStart),
+        assertTrue(!expectedStart.equals(wrongStart)
+                        && !gap.episodes().get(0).window().startsWith(wrongStart),
                 "the 30-minute bar's own open must not name the window: " + label);
         // and only the finest bars were counted
         assertEquals(bars.size() - 1 - 10, gap.lateBars(),
@@ -191,7 +196,11 @@ final class C96RegressionsTest {
     void anEmptyFinestDrainDoesNotWipeTheWindow() {
         long open = 1_795_000_000_000L;
         FeedGap gap = new FeedGap();
-        gap.measure(List.of(new FeedGap.Published(open, open + 30_000L, open + 9_000_000L)));
+        // TWO consecutive late bars, because C-107 needs two to make an episode and this test is
+        // about the empty drain, not about the episode rule.
+        gap.measure(List.of(
+                new FeedGap.Published(open, open + 30_000L, open + 9_000_000L),
+                new FeedGap.Published(open + 30_000L, open + 60_000L, open + 9_000_000L)));
         String first = gap.label();
         assertNotNull(first);
         gap.measure(new ArrayList<>());          // nothing at all
