@@ -52,9 +52,12 @@ public final class RecentRows {
      *
      * @param nowMs the write instant; the newest slot is the one containing it
      * @param rows  how many 30-second slots to cover
-     * @param bars  the {@code 30s} bars held for the night, in any order
+     * @param bars  the {@code 30s} bars held for the night, in any order. A
+     *              {@code Collection} because this only iterates it, so the source can hand
+     *              over a view instead of copying the night on every render
      */
-    public static List<Row> build(long nowMs, int rows, List<OvernightGrid.Bar> bars) {
+    public static List<Row> build(long nowMs, int rows,
+            java.util.Collection<OvernightGrid.Bar> bars) {
         if (rows < 1) {
             throw new IllegalArgumentException("a table of no rows is not a table: " + rows);
         }

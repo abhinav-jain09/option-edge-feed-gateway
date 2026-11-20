@@ -158,9 +158,16 @@ public final class OvernightSource {
      * There is deliberately no method that returns them all together — that would be the
      * double-count this class is keyed to prevent.
      */
-    public List<OvernightGrid.Bar> bars(String timeframe) {
+    public java.util.Collection<OvernightGrid.Bar> bars(String timeframe) {
         TreeMap<Long, OvernightGrid.Bar> byStart = bars.get(timeframe);
-        return byStart == null ? List.of() : new ArrayList<>(byStart.values());
+        // A VIEW, not a copy. This returned `new ArrayList<>(byStart.values())`, and that copy ran
+        // on every render of the long page and on every /now and /overnight request -- three call
+        // sites, one of them on the 30-second beat. It is the allocation that was holding the
+        // stack when the heap finally ran out on 2026-11-20 (OvernightSource.java:163). Copying it
+        // bought nothing: every caller iterates once and keeps nothing, and an unmodifiable view
+        // is as safe against a caller that tries to add as a copy is.
+        return byStart == null ? List.of()
+                : java.util.Collections.unmodifiableCollection(byStart.values());
     }
 
     /** The timeframes this source is holding bars for. */

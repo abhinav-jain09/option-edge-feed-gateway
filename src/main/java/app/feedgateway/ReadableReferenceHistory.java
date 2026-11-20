@@ -86,7 +86,18 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private final List<Drain> drains = new java.util.ArrayList<>();
+    /**
+     * Every drain this instance performed, newest last, <b>bounded</b>.
+     *
+     * <p>It was an unbounded {@code ArrayList} and I wrote it that way this morning. A {@code
+     * Drain} holds counters and two strings, so 28 of them are a few kilobytes and it is not what
+     * exhausted the heap at 09:56 — but an unbounded collection on a long-running service is a
+     * leak waiting for a longer session, and the day's lesson is that the entry point is where
+     * these hide. The bound is generous against what the wiring tests read (the last few).
+     */
+    static final int DRAINS_MAX = 256;
+
+    private final java.util.ArrayDeque<Drain> drains = new java.util.ArrayDeque<>();
 
     /** Every drain this instance performed, newest last. Read by the wiring tests. */
     List<Drain> drains() {
@@ -94,7 +105,10 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
     }
 
     private Drain record(Drain d) {
-        drains.add(d);
+        drains.addLast(d);
+        while (drains.size() > DRAINS_MAX) {
+            drains.removeFirst();
+        }
         System.out.println(d.line());
         return d;
     }
