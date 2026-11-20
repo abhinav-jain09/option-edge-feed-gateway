@@ -325,6 +325,19 @@ public final class BoardLines {
         }
     }
 
+    /**
+     * <b>C-139</b>: the board record's own expiry, for the page that prints which chain it is.
+     *
+     * <p>The same field {@link #from} takes the deltas by, read through the same {@code text}
+     * helper, so the page cannot print one expiry while the lookup used another.
+     *
+     * @return the expiry as the record spells it, or null where the record carries none
+     */
+    public static String expiryOf(String mapJson) {
+        JsonNode root = parse(mapJson);
+        return root == null ? null : text(root, "expiry");
+    }
+
     private static String text(JsonNode node, String field) {
         JsonNode v = node.path(field);
         if (v.isMissingNode() || v.isNull()) {

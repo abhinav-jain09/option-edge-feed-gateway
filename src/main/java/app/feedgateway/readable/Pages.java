@@ -195,6 +195,15 @@ public final class Pages {
             VwapRead vwap, VwapSideTracker.Result holding, List<RecentRows.Row> recent,
             ReadablePage.Board board, List<StalledInputs.Input> stalledInputs,
             String feedGap, String closeAbsenceReason) {
+        return headline(nowMs, last, overnight, vwap, holding, recent, board, stalledInputs,
+                feedGap, closeAbsenceReason, null);
+    }
+
+    /** <b>C-139</b>: the same headline, naming the expiry its delta lines belong to. */
+    static String headline(long nowMs, ReadablePage.Price last, ReadablePage.Overnight overnight,
+            VwapRead vwap, VwapSideTracker.Result holding, List<RecentRows.Row> recent,
+            ReadablePage.Board board, List<StalledInputs.Input> stalledInputs,
+            String feedGap, String closeAbsenceReason, String expiry) {
         StringBuilder s = new StringBuilder(512);
 
         s.append("now|").append(last == null ? "no price" : money(last.spx()) + " SPX")
@@ -231,7 +240,7 @@ public final class Pages {
 
         // C-120: the strike nearest above and nearest below price, with their published deltas,
         // so a stab through a strike can be read in delta terms instead of in points.
-        s.append(deltaLines(last, board));
+        s.append(deltaLines(last, board, expiry));
 
         // The three newest 30-second rows, newest first, one line each.
         //
@@ -295,6 +304,29 @@ public final class Pages {
      * forgot to look".
      */
     static String deltaLines(ReadablePage.Price last, ReadablePage.Board board) {
+        return deltaLines(last, board, null);
+    }
+
+    /**
+     * <b>C-139</b>: the two lines, naming the expiry and skipping a strike that has no figure.
+     *
+     * <p>Two corrections the reviewer saw on the live page at 15:07 New York:
+     *
+     * <ul>
+     *   <li><b>the expiry is printed.</b> The topic carries today's 0DTE and the next session's
+     *       together and the board asks for its own; the page said which nowhere, so a reader had
+     *       to take on trust that the figures were today's. Proven today that they are, which is
+     *       exactly why it should be on the line rather than in a tab entry.</li>
+     *   <li><b>a strike with no record is not the nearest strike with a delta.</b> With spot at
+     *       6946.28 the page printed {@code delta|below|6945|cd=norec|pd=norec}, because 6945 is
+     *       the nearest strike below and the topic carries no record for it. That line is a strike
+     *       the owner cannot read anything from, standing in front of one he could. The nearest
+     *       strike carrying an actual FIGURE is taken instead, and where none of them does the
+     *       nearest reason is printed rather than nothing &mdash; "no figure anywhere below" and
+     *       "this one strike has no record" are different facts.</li>
+     * </ul>
+     */
+    static String deltaLines(ReadablePage.Price last, ReadablePage.Board board, String expiry) {
         if (last == null) {
             return "delta|absent|no price, so there is no strike above or below it\n";
         }
@@ -303,8 +335,13 @@ public final class Pages {
         }
         String above = null;
         String below = null;
+        String aboveNoFigure = null;
+        String belowNoFigure = null;
         double bestAbove = Double.MAX_VALUE;
         double bestBelow = Double.MAX_VALUE;
+        double bestAboveNoFigure = Double.MAX_VALUE;
+        double bestBelowNoFigure = Double.MAX_VALUE;
+        String exp = expiry == null || expiry.isBlank() ? "" : "|exp=" + expiry;
         for (String row : board.lines()) {
             Double strike = strikeOfRow(row);
             if (strike == null) {
@@ -314,14 +351,32 @@ public final class Pages {
             if (cells == null) {
                 continue;               // this row carries no delta cells at all
             }
-            if (strike >= last.spx() && strike - last.spx() < bestAbove) {
-                bestAbove = strike - last.spx();
-                above = "delta|above|" + BoardLines.strikeOf(strike) + cells;
+            boolean hasFigure = carriesAFigure(cells);
+            if (strike >= last.spx()) {
+                double distance = strike - last.spx();
+                if (hasFigure && distance < bestAbove) {
+                    bestAbove = distance;
+                    above = "delta" + exp + "|above|" + BoardLines.strikeOf(strike) + cells;
+                } else if (!hasFigure && distance < bestAboveNoFigure) {
+                    bestAboveNoFigure = distance;
+                    aboveNoFigure = "delta" + exp + "|above|" + BoardLines.strikeOf(strike) + cells;
+                }
+            } else {
+                double distance = last.spx() - strike;
+                if (hasFigure && distance < bestBelow) {
+                    bestBelow = distance;
+                    below = "delta" + exp + "|below|" + BoardLines.strikeOf(strike) + cells;
+                } else if (!hasFigure && distance < bestBelowNoFigure) {
+                    bestBelowNoFigure = distance;
+                    belowNoFigure = "delta" + exp + "|below|" + BoardLines.strikeOf(strike) + cells;
+                }
             }
-            if (strike < last.spx() && last.spx() - strike < bestBelow) {
-                bestBelow = last.spx() - strike;
-                below = "delta|below|" + BoardLines.strikeOf(strike) + cells;
-            }
+        }
+        if (above == null) {
+            above = aboveNoFigure;          // no figure anywhere above: the nearest REASON, not nothing
+        }
+        if (below == null) {
+            below = belowNoFigure;
         }
         StringBuilder s = new StringBuilder(96);
         // C-75 keeps every headline line at 64 characters or fewer, because a summarising reader
@@ -359,6 +414,36 @@ public final class Pages {
      * here: it belongs on each row, and repeating it twice at the top would be two figures of the
      * same thing one line apart.
      */
+    /**
+     * Does this row's delta block carry an actual figure on either side?
+     *
+     * <p>A cell is a figure or it is a REASON &mdash; {@code norec} where the topic has no record
+     * for the strike, or the producer's own invalid reason, or {@code none} where it gave none. The
+     * page's headline pair is for reading a stab in delta terms, so a reason there is a line that
+     * cannot be read; it is kept as the fallback and not as the first choice.
+     */
+    private static boolean carriesAFigure(String cells) {
+        for (String cell : cells.split("\\|")) {
+            int eq = cell.indexOf('=');
+            if (eq < 0) {
+                continue;
+            }
+            String name = cell.substring(0, eq);
+            if (!"cd".equals(name) && !"pd".equals(name)) {
+                continue;               // age= and anything else is not a delta
+            }
+            String value = cell.substring(eq + 1);
+            if (value.isEmpty()) {
+                continue;
+            }
+            char c = value.charAt(0);
+            if (c == '-' || c == '+' || (c >= '0' && c <= '9')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static String deltaCellsOfRow(String row) {
         int at = row.indexOf("|cd=");
         if (at < 0) {
@@ -531,6 +616,25 @@ public final class Pages {
             List<RecentRows.Row> recent, ReadablePage.Board board,
             List<StalledInputs.Input> stalled, VwapHeld held, String feedGap,
             String closeAbsenceReason, LatchWatch latches) {
+        return now(nowMs, last, overnight, vwap, basis, holding, recent, board, stalled, held,
+                feedGap, closeAbsenceReason, latches, null);
+    }
+
+    /**
+     * <b>C-139</b>: the same page, told WHICH EXPIRY the deltas on it belong to.
+     *
+     * <p>An overload rather than a changed signature, and deliberately: the reviewer asked for the
+     * expiry on the delta lines at 21:12 against a 22:00 build, this page has eighteen call sites,
+     * and a parameter added in the middle of that is how a hand-written call site is left at the
+     * old arity. The existing form delegates with no expiry and prints exactly what it printed.
+     *
+     * @param expiry the board's own expiry, or null where the caller does not know it
+     */
+    public static String now(long nowMs, ReadablePage.Price last, ReadablePage.Overnight overnight,
+            VwapRead vwap, BasisRead basis, VwapSideTracker.Result holding,
+            List<RecentRows.Row> recent, ReadablePage.Board board,
+            List<StalledInputs.Input> stalled, VwapHeld held, String feedGap,
+            String closeAbsenceReason, LatchWatch latches, String expiry) {
         StringBuilder s = new StringBuilder(8_192);
         s.append(firstLine(nowMs, last)).append('\n');
         // C-75: the facts the reviewer is asked for, as SHORT single-fact labelled lines, above
@@ -539,7 +643,7 @@ public final class Pages {
         // description of a table instead of the table. Each line here is one fact, short enough to
         // be quoted whole. The full tables stay below, unchanged.
         s.append(headline(nowMs, last, overnight, vwap, holding, recent, board, stalled,
-                feedGap, closeAbsenceReason));
+                feedGap, closeAbsenceReason, expiry));
         s.append(LEGEND).append("|A/B/==above/below/on VWAP|U1/L1=one-sigma bands\n");
 
         // the close and the range, once
