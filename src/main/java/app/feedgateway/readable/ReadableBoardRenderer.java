@@ -435,7 +435,12 @@ public final class ReadableBoardRenderer {
                         indicatorsJson == null ? null : VwapRead.of(indicatorsJson),
                         basisJson == null ? null : BasisRead.of(basisJson),
                         sides.result(), recentRows(), board, nowStalledInputs(), vwapHeld,
-                        feedGap.label()), lowHeap);
+                        feedGap.label(),
+                        // C-98 item 5: the reason the close is absent, where it is. On low heap the
+                        // block is skipped and the heap's own reason is appended by
+                        // withOvernightAbsence; here the reason is the reference's, which is the
+                        // silence rule's: "no silence of three hours or more has been seen yet".
+                        lowHeap ? HeapGuard.reason() : source.closeAbsenceReason()), lowHeap);
             }
             case "overnight": {
                 boolean lowHeap = HeapGuard.low();

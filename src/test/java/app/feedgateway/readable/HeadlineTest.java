@@ -46,7 +46,7 @@ class HeadlineTest {
                         row(NOW - 90_000L, 7155.90, "-")),
                 board(),
                 List.of(new StalledInputs.Input("footprint bars",
-                        NOW - 12L * 3_600_000L, "The slots")), null);
+                        NOW - 12L * 3_600_000L, "The slots")), null, null);
 
         List<String> lines = head.lines().toList();
         assertTrue(lines.stream().anyMatch(l -> l.startsWith("now|7155.45 SPX|")), head);
@@ -69,7 +69,7 @@ class HeadlineTest {
     void nothingStalledIsStatedExplicitly() {
         String head = Pages.headline(NOW, price(NOW - 5_000L, 7155.45), null, null, null,
                 List.of(), board(),
-                List.of(new StalledInputs.Input("footprint bars", NOW - 30_000L, "The slots")), null);
+                List.of(new StalledInputs.Input("footprint bars", NOW - 30_000L, "The slots")), null, null);
         assertTrue(head.contains("stalled|none"),
                 "the absence of a stalled line cannot be told apart from an unchecked page: "
                         + head);
@@ -78,7 +78,7 @@ class HeadlineTest {
     @Test
     @DisplayName("every absent fact still gets its line, so the reader can see what is missing")
     void absencesStillGetALine() {
-        String head = Pages.headline(NOW, null, null, null, null, null, null, null, null);
+        String head = Pages.headline(NOW, null, null, null, null, null, null, null, null, null);
         assertTrue(head.contains("now|no price"), head);
         assertTrue(head.contains("close|absent"), head);
         assertTrue(head.contains("vwap|absent"), head);
@@ -91,7 +91,7 @@ class HeadlineTest {
     @DisplayName("the headline sits at the top of /now, above the legend and every table")
     void theHeadlineIsAtTheTop() {
         String page = Pages.now(NOW, price(NOW - 5_000L, 7155.45), null, null, null, null,
-                List.of(), board(), List.of(), new VwapHeld(), null);
+                List.of(), board(), List.of(), new VwapHeld(), null, null);
         int nowLine = page.indexOf("\nnow|");
         int legend = page.indexOf("legend|");
         assertTrue(nowLine > 0, "the headline is on the page: " + page);

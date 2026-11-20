@@ -143,18 +143,40 @@ public final class ReferencePrice {
                             + "learned by waiting for the next index print");
         }
 
-        // The index print, in widening slices. The newest one at or before the instant IS the
-        // previous cash close, because the index prints only while the cash session is open.
+        // C-98: THE INDEX PRINT, BY THE SILENCE RULE, in widening slices.
+        //
+        // What stood here was: "the newest one at or before the instant IS the previous cash
+        // close, because the index prints only while the cash session is open." That sentence was
+        // a comment stating a premise as a fact, and the premise is false -- measured on
+        // 2026-11-20, the index published once a second right through the pre-market. So the
+        // "newest index print" was a price from this morning, and this resolver handed it back as
+        // yesterday's close on every restart.
+        //
+        // The rule is now IndexSilence's: the last index print BEFORE the most recent gap of three
+        // hours or more. The same class runs live in OvernightSource, so the start-up answer and
+        // the running answer come from one implementation.
+        //
+        // A SLICE MUST SPAN THE SILENCE, which is why the widening matters more than it did. The
+        // narrowest slice is two hours and cannot contain a three-hour gap, so it can never
+        // resolve; it is kept because it is cheap and because a slice that resolves nothing costs
+        // one drain. The eight-hour slice is the first that can see a normal overnight quiet, and
+        // the wider ones exist for a weekend. A resolution says which slice found it, so a reader
+        // can tell a close found in eight hours from one found in ninety-six.
         for (long slice : PRICE_SLICES_MS) {
-            ReadablePage.Price newest = newestIndexPrint(
+            List<ReadablePage.Price> prints = indexPrintsInOrder(
                     safe(history.pricesBetween(beforeMs - slice, beforeMs, SLICE_LIMIT)), beforeMs);
-            if (newest != null) {
+            // beforeMs closes a trailing silence: a boot in the middle of the night has no index
+            // print after the gap, which is exactly when the overnight page needs the reference
+            IndexSilence silence = IndexSilence.resolveFrom(prints, beforeMs);
+            ReadablePage.Price reference = silence.reference();
+            if (reference != null) {
                 List<String> bars = safe(history.barsBetween(
-                        sessionOpenMsFor(newest.epochMs()), newest.epochMs()));
+                        sessionOpenMsFor(reference.epochMs()), reference.epochMs()));
                 double[] range = rangeOf(bars);
-                return new Resolved(newest, range[0], range[1], From.INDEX_PRINT,
-                        "the last index print at or before the close, found within "
-                                + (slice / 3_600_000L) + " hours");
+                return new Resolved(reference, range[0], range[1], From.INDEX_PRINT,
+                        "the last index print before a silence of "
+                                + (IndexSilence.SILENCE_MS / 3_600_000L) + " hours or more, found "
+                                + "within " + (slice / 3_600_000L) + " hours");
             }
         }
 
@@ -198,18 +220,25 @@ public final class ReferencePrice {
     }
 
     /** The newest index print at or before the instant, or null. */
-    private static ReadablePage.Price newestIndexPrint(List<String> records, long beforeMs) {
-        ReadablePage.Price newest = null;
+    /**
+     * Every index print in the slice, in time order, up to {@code beforeMs}.
+     *
+     * <p><b>Sorted, and the sort is load-bearing.</b> {@link IndexSilence} measures the gap between
+     * consecutive prints, so a list in arrival order would manufacture silences out of a
+     * multi-partition drain's interleaving. It replaces {@code newestIndexPrint}, which needed no
+     * order because it only took a maximum — and taking that maximum was the defect.
+     */
+    private static List<ReadablePage.Price> indexPrintsInOrder(List<String> records, long beforeMs) {
+        List<ReadablePage.Price> out = new ArrayList<>();
         for (String json : records) {
             ReadablePage.Price p = OvernightDecoders.price(json, 0L);
             if (p == null || !OvernightSource.isIndexPrint(p) || p.epochMs() > beforeMs) {
                 continue;               // the overnight derivation is never a close
             }
-            if (newest == null || p.epochMs() > newest.epochMs()) {
-                newest = p;
-            }
+            out.add(p);
         }
-        return newest;
+        out.sort(java.util.Comparator.comparingLong(ReadablePage.Price::epochMs));
+        return out;
     }
 
     /** Is this bar inside the cash session, which is what the label claims? */
