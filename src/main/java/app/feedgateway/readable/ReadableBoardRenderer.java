@@ -537,6 +537,12 @@ public final class ReadableBoardRenderer {
                         footprintLevels(last), basisOrNull()), part);
             case "recent-full":
                 return onePage(Pages.recentFull(nowMs, last, recentRows()), part);
+            case "whatif":
+                // C-150 item 4: the What-If SCREEN as text. It reads the same cached map record
+                // the screen reads, so the two cannot disagree about a figure; the one clock it
+                // needs is this renderer's own, which is the clock the gateway's Date header
+                // carries and therefore the one the screen measures its age against.
+                return onePage(WhatIfMirror.render(nowMs, boardJson.get()), part);
             case "index":
                 return Pages.index(nowMs, last, pageStats(nowMs));
             default:
@@ -620,7 +626,8 @@ public final class ReadableBoardRenderer {
 
     /** Every page name this renderer answers to, in the order /index lists them. */
     public static final java.util.List<String> PAGES =
-            java.util.List.of("board", "now", "overnight", "footprint", "recent-full", "index");
+            java.util.List.of("board", "now", "overnight", "footprint", "recent-full", "whatif",
+                    "index");
 
     /** The 30-second rows C-64 asks for, from the bars the gateway already holds. */
     private java.util.List<RecentRows.Row> recentRows() {
