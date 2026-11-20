@@ -522,7 +522,7 @@ public final class ReadableBoardRenderer {
                         // withOvernightAbsence; here the reason is the reference's, which is the
                         // silence rule's: "no silence of three hours or more has been seen yet".
                         lowHeap ? HeapGuard.reason() : source.closeAbsenceReason(),
-                        latches), lowHeap)
+                        latches, BoardLines.expiryOf(boardJson.get())), lowHeap)
                         + referenceLine();
             }
             case "overnight": {
