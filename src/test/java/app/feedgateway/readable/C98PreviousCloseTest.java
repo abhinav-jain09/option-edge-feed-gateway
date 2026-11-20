@@ -159,20 +159,19 @@ final class C98PreviousCloseTest {
     // ---------------------------------------------------------------- (d) the start-up window
 
     @Test
-    @DisplayName("(d) the resolver's narrowest slice CANNOT span the silence, and that is stated")
-    void theNarrowestSliceCannotResolve() {
-        // A slice must be wider than the silence to contain it. The two-hour slice therefore never
-        // resolves an index close, by arithmetic rather than by luck -- which is worth asserting,
-        // because the widening is what makes the start-up path work and a reader of
-        // PRICE_SLICES_MS would otherwise have to infer it.
-        assertTrue(ReferencePrice.PRICE_SLICES_MS[0] < IndexSilence.SILENCE_MS,
-                "the first slice is narrower than the silence, so it cannot resolve one");
-        long widest = ReferencePrice.PRICE_SLICES_MS[ReferencePrice.PRICE_SLICES_MS.length - 1];
-        assertTrue(widest >= IndexSilence.SILENCE_MS * 2,
-                "the widest slice must comfortably span a weekend's silence");
-        // the eight-hour slice is the first that can hold a three-hour gap AND a session either side
-        assertTrue(ReferencePrice.PRICE_SLICES_MS[1] > IndexSilence.SILENCE_MS,
-                "the second slice is the first that can span the silence");
+    @DisplayName("(d) C-133: the walk is bounded in pages, and the bound is an absence not a guess")
+    void theWalkIsBoundedAndSaysSo() {
+        // The widening slices this once asserted are gone: every one of them read forward from its
+        // own start and dropped the newest records in its window, which is how a 09:58 print became
+        // the previous close on 2026-11-20. The walk now starts at the newest record, so what a
+        // bound cuts off is always OLDER than what has been read -- it can delay an answer and
+        // cannot manufacture one. These are the two properties that makes that safe.
+        assertTrue(ReferencePrice.MAX_PAGES * (long) ReferencePrice.SLICE_LIMIT
+                        > 3L * 24L * 3_600L * 2L,
+                "the bound must span a long weekend of this feed at about two records a second");
+        assertTrue(ReferencePrice.SLICE_LIMIT * 1_000L / 2L > IndexSilence.SILENCE_MS,
+                "one page must be able to hold the silence itself, so page 0 resolves an "
+                        + "ordinary overnight boot without walking at all");
     }
 
     @Test
