@@ -279,6 +279,8 @@ public final class Pages {
                     .append("|maxbelow=").append(mins(holding.longestBelowMs()))
                     .append("|anchor=").append(holding.anchorName())
                     .append("|observedfrom=").append(hms(holding.observedFromMs(), NY)).append("NY")
+                    .append(holding.anchorChanges() > 0
+                            ? "|anchorchanges=" + holding.anchorChanges() : "")
                     .append('\n');
             if (!holding.attempts().isEmpty()) {
                 s.append("attempt|band|at|heldmin|open\n");

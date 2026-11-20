@@ -43,7 +43,7 @@ public final class VwapSideTracker {
     /** What the page prints. */
     public record Result(String side, long sideSinceMs, Long lastCrossMs, int crosses,
                          long longestAboveMs, long longestBelowMs, long observedFromMs,
-                         List<Attempt> attempts, String anchorName) {
+                         List<Attempt> attempts, String anchorName, int anchorChanges) {
     }
 
     private String side;
@@ -55,6 +55,11 @@ public final class VwapSideTracker {
     private long observedFrom;
     private long lastSeen;
     private String anchorName = "";
+    /**
+     * How many times the anchor changed under this tracker. Not decoration: see the reset in
+     * {@link #observe}. The page prints it so a short path is explained rather than puzzling.
+     */
+    private int anchorChanges;
     private final Deque<Attempt> attempts = new ArrayDeque<>();
     private Attempt openAttempt;
 
@@ -72,7 +77,26 @@ public final class VwapSideTracker {
         if (observedFrom == 0) {
             observedFrom = atMs;
         }
-        if (anchor != null) {
+        if (anchor != null && !anchor.isBlank()) {
+            if (!anchorName.isEmpty() && !anchorName.equals(anchor)) {
+                // THE ANCHOR CHANGED, so this is a different line and the old path cannot be
+                // continued onto it. forHolding() moves from vwapAnalysis to vwapRth once RTH
+                // leaves WARMING_UP, and the two lines sit at different prices -- so carrying the
+                // side across would record a cross that price never made, and the owner would be
+                // shown a crossing caused by our own choice of anchor. The path therefore RESTARTS
+                // here, observedFromMs moves to this instant so the page tells the truth about how
+                // much was rebuilt, and nothing is counted across the boundary.
+                side = null;
+                sideSince = 0;
+                lastCross = null;
+                crosses = 0;
+                longestAbove = 0;
+                longestBelow = 0;
+                observedFrom = atMs;
+                attempts.clear();
+                openAttempt = null;
+                anchorChanges++;
+            }
             this.anchorName = anchor;
         }
         String now = esPrice > esVwap ? ABOVE : esPrice < esVwap ? BELOW : ON;
@@ -160,6 +184,6 @@ public final class VwapSideTracker {
         }
         out.addAll(attempts);
         return new Result(side, sideSince, lastCross, crosses, above, below, observedFrom,
-                List.copyOf(out), anchorName);
+                List.copyOf(out), anchorName, anchorChanges);
     }
 }
