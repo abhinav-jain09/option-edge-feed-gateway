@@ -281,7 +281,14 @@ public final class Pages {
         if (holding == null) {
             s.append("hold|absent|no side observed yet\n");
         } else {
+            // C-83: px and vwap directly after the side, both in ES as the comparison uses them,
+            // so a reader can check the letter from the page instead of reconstructing it from
+            // now| plus the basis -- which is a different source and gives a different answer.
             s.append("hold|side=").append(holding.side())
+                    .append("|px=").append(holding.esPrice() == null
+                            ? "" : money(holding.esPrice()))
+                    .append("|vwap=").append(holding.esVwap() == null
+                            ? "" : money(holding.esVwap()))
                     .append("|since=").append(hms(holding.sideSinceMs(), NY)).append("NY")
                     .append("|lastcross=").append(holding.lastCrossMs() == null ? ""
                             : hms(holding.lastCrossMs(), NY) + "NY")
