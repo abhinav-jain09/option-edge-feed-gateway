@@ -138,7 +138,10 @@ public final class Pages {
                 .append("|spot=").append(money(board.spot()))
                 .append("|src=").append(board.source())
                 .append("|rows=").append(board.rowsPresent()).append('/')
-                .append(board.rowsExpected()).append('\n');
+                .append(board.rowsExpected())
+                .append(board.published() < 0 ? "" : "|published=" + board.published())
+                .append(holdCell(board.hold()))
+                .append('\n');
         if (PreopenBoard.SOURCE.equals(board.source())) {
             s.append(PREOPEN_LEGEND).append('\n');
         }
@@ -214,6 +217,11 @@ public final class Pages {
         s.append(deltaLines(last, board));
 
         // The three newest 30-second rows, newest first, one line each.
+        //
+        // C-118: the price cell follows the same rule as the table's -- the SPX-equivalent price
+        // where the platform translated the bar, otherwise the bar's own futures price marked ES,
+        // and the side is printed either way. These three lines are what the owner reads first, so
+        // a bar hidden here is hidden where it matters most.
         int n = 0;
         if (recent != null) {
             for (RecentRows.Row r : recent) {
@@ -221,7 +229,7 @@ public final class Pages {
                     break;
                 }
                 s.append('r').append(n + 1).append('|').append(hms(r.startMs(), NY)).append("NY")
-                        .append('|').append(r.price() == null ? "" : money(r.price()))
+                        .append('|').append(headlinePriceCell(r))
                         .append('|').append(r.dominant() == null ? "" : r.dominant())
                         .append('\n');
                 n++;
@@ -230,6 +238,7 @@ public final class Pages {
         while (n < 3) {
             s.append('r').append(++n).append("|absent\n");
         }
+        s.append(gridStateLine(recent));
 
         boolean anyStalled = false;
         if (stalledInputs != null) {
@@ -348,6 +357,80 @@ public final class Pages {
             rest = rest.substring(0, spot);
         }
         return rest;
+    }
+
+
+    /**
+     * The headline row's price cell (C-118): the index price, else the bar's own futures price
+     * marked, else empty for a slot with no bar.
+     */
+    private static String headlinePriceCell(RecentRows.Row r) {
+        if (r.price() != null) {
+            return money(r.price());
+        }
+        if (r.barPresent() && r.futuresPrice() != null) {
+            return RecentRows.FUTURES_MARK + money(r.futuresPrice());
+        }
+        return "";
+    }
+
+    /**
+     * <b>C-118</b>: what the grid above actually shows, counted off the RENDERED rows.
+     *
+     * <p>Three states, named apart, because collapsing any two of them is how C-117 happened:
+     * <ul>
+     *   <li>{@code missing} &mdash; the slot has no bar at all. Nothing arrived for it, and the
+     *       page's legend "no data for that slot" is about these and only these.</li>
+     *   <li>{@code noSPX} &mdash; a bar is here, with its volume and its side, and the platform
+     *       never translated its price, so the row shows futures prices marked {@code ES}. This is
+     *       the state that used to render identically to {@code missing}.</li>
+     *   <li>{@code complete} &mdash; a bar is here and carries its index price.</li>
+     * </ul>
+     *
+     * <p>It is counted from the rows the renderer is about to print rather than from the bars held
+     * upstream, so the line cannot say one thing while the grid shows another.
+     */
+    static String gridStateLine(List<RecentRows.Row> recent) {
+        if (recent == null || recent.isEmpty()) {
+            return "grid|rows=0\n";
+        }
+        int missing = 0;
+        int noSpx = 0;
+        int complete = 0;
+        for (RecentRows.Row r : recent) {
+            if (!r.barPresent()) {
+                missing++;
+            } else if (r.price() == null) {
+                noSpx++;
+            } else {
+                complete++;
+            }
+        }
+        return "grid|rows=" + recent.size() + "|missing=" + missing
+                + "|noSPX=" + noSpx + "|complete=" + complete + "\n";
+    }
+
+    /**
+     * <b>R-B-9</b>: {@code |held|age=2m10s|reason=…} where the board is held, nothing where it is
+     * live.
+     *
+     * <p>On the same line as the cycle time, deliberately. A reader who takes in
+     * {@code cycle=10:38:58NY} and stops has read a fresh-looking board; the hold has to be in the
+     * same glance or the page is drawing a held board as a current one, which is C-40's fault
+     * again. The age is the map service's own figure and is not derived from the cycle time here.
+     */
+    static String holdCell(ReadablePage.Board.Hold hold) {
+        if (hold == null) {
+            return "";
+        }
+        StringBuilder s = new StringBuilder(48);
+        s.append("|held");
+        s.append("|age=").append(hold.ageMs() < 0 ? "unknown" : StalledInputs.ago(hold.ageMs()));
+        if (hold.strikesSoFar() >= 0) {
+            s.append("|sofar=").append(hold.strikesSoFar());
+        }
+        s.append("|reason=").append(hold.reason());
+        return s.toString();
     }
 
     /** One wall as a short line: {@code above|7455|36.54pts}. */
@@ -623,8 +706,12 @@ public final class Pages {
             s.append(hms(slot.startMs(), NY)).append('|').append(hms(slot.startMs(), AMS))
                     .append('|');
             if (slot.filled()) {
-                s.append(money(slot.open())).append('|').append(money(slot.high())).append('|')
-                        .append(money(slot.low())).append('|').append(money(slot.close()))
+                // C-118: a slot the platform never translated still shows its volume and says
+                // noSPX, rather than printing as a slot that never had a bar.
+                s.append(slot.hasPrices() ? money(slot.open()) : "").append('|')
+                        .append(slot.hasPrices() ? money(slot.high()) : "").append('|')
+                        .append(slot.hasPrices() ? money(slot.low()) : "").append('|')
+                        .append(slot.hasPrices() ? money(slot.close()) : "")
                         .append('|').append(slot.volume() == null ? "" : slot.volume())
                         .append('|').append(slot.basisState() == null ? "" : slot.basisState());
             } else {

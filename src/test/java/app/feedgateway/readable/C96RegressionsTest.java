@@ -25,7 +25,7 @@ import org.junit.jupiter.api.Test;
 final class C96RegressionsTest {
 
     private static OvernightGrid.Bar bar(String timeframe, long startMs) {
-        return new OvernightGrid.Bar(startMs, 7100.0, 7105.0, 7095.0, 7102.0, 10L,
+        return OvernightGrid.Bar.spx(startMs, 7100.0, 7105.0, 7095.0, 7102.0, 10L,
                 "ANCHORED", timeframe, null, null, null);
     }
 

@@ -32,7 +32,7 @@ class HeadlineTest {
 
     private static RecentRows.Row row(long atMs, double spx, String dominant) {
         return new RecentRows.Row(atMs, spx, spx + 0.5, spx - 0.5, 120L, 70L, 50L, 20L,
-                dominant, "ANCHORED");
+                dominant, "ANCHORED", true, null, null, null);
     }
 
     @Test

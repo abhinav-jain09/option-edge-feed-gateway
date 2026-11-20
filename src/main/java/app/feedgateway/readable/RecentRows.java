@@ -37,13 +37,37 @@ public final class RecentRows {
     private RecentRows() {
     }
 
-    /** One row, already formatted for C-66's compact table. */
+    /**
+     * One row, already formatted for C-66's compact table.
+     *
+     * <p><b>C-118: {@code barPresent} is what decides whether a row has anything to say, and the
+     * price does not.</b> {@code filled()} used to be {@code price != null}, so a bar that existed
+     * and carried volume, both side counts and a delta printed as eight empty cells merely because
+     * the platform had not translated its price. That is the row hiding the bar.
+     *
+     * @param price  the SPX-equivalent close, or null where the platform did not translate this bar
+     * @param futuresPrice the bar's own futures close, printed marked as futures where there is no
+     *                     SPX-equivalent price. Never translated and never shown as an index price
+     */
     public record Row(long startMs, Double price, Double high, Double low, Long volume,
-                      Long buyers, Long sellers, Long delta, String dominant, String basisState) {
+                      Long buyers, Long sellers, Long delta, String dominant, String basisState,
+                      boolean barPresent, Double futuresPrice, Double futuresHigh,
+                      Double futuresLow) {
 
-        /** True where a bar delivered this slot. */
+        /** True where a bar delivered this slot, whether or not it carries an index price. */
         public boolean filled() {
-            return price != null;
+            return barPresent;
+        }
+
+        /** True where a bar is here but the platform never translated its price (C-118). */
+        public boolean barWithoutSpxPrice() {
+            return barPresent && price == null;
+        }
+
+        /** The row with no bar at all: the slot exists, nothing arrived for it. */
+        public static Row empty(long startMs) {
+            return new Row(startMs, null, null, null, null, null, null, null, null, null,
+                    false, null, null, null);
         }
     }
 
@@ -76,11 +100,12 @@ public final class RecentRows {
             long at = newest - (long) i * SLOT_MS;
             OvernightGrid.Bar bar = bySlot.get(at);
             if (bar == null) {
-                out.add(new Row(at, null, null, null, null, null, null, null, null, null));
+                out.add(Row.empty(at));
             } else {
                 out.add(new Row(at, bar.close(), bar.high(), bar.low(), bar.volume(),
                         bar.buyers(), bar.sellers(), bar.delta(), dominant(bar.delta()),
-                        bar.basisState()));
+                        bar.basisState(), true,
+                        bar.futuresClose(), bar.futuresHigh(), bar.futuresLow()));
             }
         }
         return out;
@@ -117,7 +142,20 @@ public final class RecentRows {
         return "ny|px|h|l|vol|buy|sell|delta|dom|basis";
     }
 
-    /** One compact line: empty cells are nothing between separators. */
+    /**
+     * One compact line: empty cells are nothing between separators.
+     *
+     * <p><b>C-118: a row never hides a bar that exists.</b> Where a bar is here, volume, bought,
+     * sold, delta and side are printed whatever the price situation is &mdash; they are the bar's
+     * own counts and need no translation. Only the three price cells depend on it: the
+     * SPX-equivalent prices where the platform translated the bar, and otherwise the bar's own
+     * FUTURES prices marked {@code ES}, with {@code noSPX} in the basis cell to say which is on
+     * the row. No translation happens on this page (C-103): what is printed is what the bar
+     * carried.
+     *
+     * <p>Only a slot with NO bar prints as empty cells, and that is the one case the legend's
+     * "no data for that slot" was ever about.
+     */
     public static String line(Row r, java.time.ZoneId zone) {
         StringBuilder s = new StringBuilder(64);
         s.append(Pages.hms(r.startMs(), zone)).append('|');
@@ -125,15 +163,39 @@ public final class RecentRows {
             s.append("||||||||");
             return s.toString();
         }
-        s.append(num(r.price())).append('|').append(num(r.high())).append('|')
-                .append(num(r.low())).append('|')
+        s.append(priceCell(r.price(), r.futuresPrice())).append('|')
+                .append(priceCell(r.high(), r.futuresHigh())).append('|')
+                .append(priceCell(r.low(), r.futuresLow())).append('|')
                 .append(r.volume() == null ? "" : r.volume()).append('|')
                 .append(r.buyers() == null ? "" : r.buyers()).append('|')
                 .append(r.sellers() == null ? "" : r.sellers()).append('|')
                 .append(r.delta() == null ? "" : r.delta()).append('|')
                 .append(r.dominant() == null ? "" : r.dominant()).append('|')
-                .append(basisCell(r.basisState()));
+                .append(r.barWithoutSpxPrice() ? NO_SPX : basisCell(r.basisState()));
         return s.toString();
+    }
+
+    /** The basis cell for a bar the platform never translated. */
+    public static final String NO_SPX = "noSPX";
+
+    /** The futures marker, so a futures price can never be read as an index price. */
+    public static final String FUTURES_MARK = "ES";
+
+    /**
+     * One price cell: the SPX-equivalent price where there is one, else the bar's own futures
+     * price marked {@code ES}, else empty.
+     *
+     * <p>The marker is a prefix and not a suffix or a separate column so that it cannot be lost by
+     * a reader scanning the column, and so that a cell can never be parsed as a bare index price.
+     */
+    static String priceCell(Double spx, Double futures) {
+        if (spx != null) {
+            return num(spx);
+        }
+        if (futures != null) {
+            return FUTURES_MARK + num(futures);
+        }
+        return "";
     }
 
     /**
