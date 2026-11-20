@@ -47,7 +47,7 @@ public final class ReadablePage {
     public static final long STALE_AFTER_SECONDS = 20 * 60;
 
     /** The owner trades New York hours from Amsterdam, so every time is given in both. */
-    private static final ZoneId NY = ZoneId.of("America/New_York");
+    static final ZoneId NY = ZoneId.of("America/New_York");
     private static final ZoneId AMS = ZoneId.of("Europe/Amsterdam");
     private static final DateTimeFormatter HM = DateTimeFormatter.ofPattern("HH:mm");
     private static final DateTimeFormatter HMS = DateTimeFormatter.ofPattern("HH:mm:ss");
@@ -101,9 +101,30 @@ public final class ReadablePage {
      * reviewer's own item 3: the owner sees at once how complete the morning board is, because the
      * first pre-market boards are thin in the same way 7,170 was.
      */
+    /**
+     * The largest net-gamma strike on one side of spot, and how far away it is.
+     *
+     * <p>"Largest" is by the MAGNITUDE of net gamma, not by strike price: the highest strike above
+     * spot is just the edge of the grid, which tells a reader nothing, whereas the biggest wall on
+     * each side is what the owner reads the ladder for. The distance is in index points and is
+     * computed from the board's own spot, so it is the distance at the board's instant rather than
+     * at the moment the page happened to be written.
+     */
+    public record Extreme(double strike, double netGex, double distancePoints) {
+    }
+
     public record Board(long cycleMs, double spot, int rowsPresent, int rowsExpected,
+                        String source, Extreme largestAbove, Extreme largestBelow,
                         List<String> lines) {
         public Board {
+            // The source is required and never blank. Two boards reach this page -- the map
+            // service's and the pre-open projection's -- and they carry different things: the
+            // pre-open one has no what-if reading at all. A board that did not say which it was
+            // would let a reader take a pre-open ladder for the map's.
+            if (source == null || source.isBlank()) {
+                throw new IllegalArgumentException("a board that does not name its source cannot "
+                        + "be told apart from the other one");
+            }
             lines = List.copyOf(lines);
         }
     }
@@ -119,10 +140,18 @@ public final class ReadablePage {
      * @param overnight the overnight grid, or null before there is one
      * @param board     the gamma block, or null when no board exists yet — in which case the page
      *                  says so rather than showing yesterday's as today's (C-60 addendum d)
+     * @param stalled   the inputs THIS page depends on, so a frozen column is named at the top
+     *                  rather than left to be inferred from a timestamp in a table
      */
-    public static String render(long nowMs, Price last, Overnight overnight, Board board) {
+    public static String render(long nowMs, Price last, Overnight overnight, Board board,
+            List<StalledInputs.Input> stalled) {
         StringBuilder out = new StringBuilder(4_096);
         out.append(firstLine(nowMs, last)).append('\n');
+        // Before ANY table: which inputs have stopped, and since when. A column that is frozen
+        // hours back still prints its last value, correctly stamped and entirely plausible, so
+        // the page says so in words at the top rather than leaving it to be inferred from a
+        // timestamp further down.
+        out.append(StalledInputs.banner(nowMs, stalled));
         if (overnight != null) {
             out.append('\n').append(overnightSection(nowMs, overnight));
         }
@@ -200,6 +229,20 @@ public final class ReadablePage {
     }
 
     /** C-60 addendum (d): the board's own cycle time and date, so it is never read as today's. */
+    /**
+     * One side's largest wall, or a stated absence. An absent side is printed rather than omitted:
+     * a missing line reads as a page that forgot, and the owner is making a decision on the
+     * distance to these two numbers.
+     */
+    private static String extremeLine(String label, Extreme e) {
+        if (e == null) {
+            return label + "none on the board yet\n";
+        }
+        return label + money(e.strike()) + ", net gamma " + BoardLines.money(e.netGex())
+                + ", " + String.format(java.util.Locale.ROOT, "%.2f", e.distancePoints())
+                + " points away\n";
+    }
+
     private static String boardSection(Board b) {
         StringBuilder s = new StringBuilder(2_048);
         s.append("GAMMA BOARD — cycle ")
@@ -208,10 +251,22 @@ public final class ReadablePage {
                 .append(" New York (")
                 .append(hms(b.cycleMs(), AMS)).append(" Amsterdam)\n");
         s.append("  Spot ").append(money(b.spot()))
+                .append(" — source ").append(b.source())
                 .append(" — rows ").append(b.rowsPresent()).append(" of ")
                 .append(b.rowsExpected())
                 .append(". A strike the gamma service published no row for is printed as "
-                        + "\"no row\" and never skipped.\n\n");
+                        + "\"no row\" and never skipped.\n");
+        s.append(extremeLine("  Largest net gamma ABOVE spot: ", b.largestAbove()));
+        s.append(extremeLine("  Largest net gamma BELOW spot: ", b.largestBelow()));
+        // The rows below are C-66's compact form, so the one-letter readings are spelled out HERE,
+        // on the page that carries them. Without this the page shows `A`, `H`, `N` and `norow`
+        // with nothing to decode them -- which is what a reader would be left guessing at, and
+        // what ReadableBoardRendererTest caught when the rows went compact.
+        s.append("  ").append(Pages.LEGEND).append('\n');
+        if (PreopenBoard.SOURCE.equals(b.source())) {
+            s.append("  ").append(Pages.PREOPEN_LEGEND).append('\n');
+        }
+        s.append('\n');
         for (String line : b.lines()) {
             s.append("  ").append(line).append('\n');
         }
@@ -245,7 +300,7 @@ public final class ReadablePage {
         return HM.format(Instant.ofEpochMilli(ms).atZone(zone));
     }
 
-    private static String hms(long ms, ZoneId zone) {
+    static String hms(long ms, ZoneId zone) {
         return HMS.format(Instant.ofEpochMilli(ms).atZone(zone));
     }
 }

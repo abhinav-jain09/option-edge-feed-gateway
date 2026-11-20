@@ -2,9 +2,11 @@ package app.feedgateway.readable;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.DisplayName;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /** The two overnight chains, held apart and bounded to one night. */
@@ -14,7 +16,7 @@ class OvernightSourceTest {
     private static final long MIN = 60_000L;
 
     private static OvernightGrid.Bar bar(long at, double close) {
-        return new OvernightGrid.Bar(at, close, close, close, close, 10L, "ANCHORED");
+        return new OvernightGrid.Bar(at, close, close, close, close, 10L, "ANCHORED", "1m", null, null, null);
     }
 
     private static ReadablePage.Price price(long at, double spx) {
@@ -43,7 +45,7 @@ class OvernightSourceTest {
 
         s.nightStartsAt(CLOSE + 30 * MIN);
         assertEquals(1, s.barCount(), "the previous night's bars are gone");
-        assertEquals(CLOSE + 60 * MIN, s.newestBarStartMs());
+        assertEquals(CLOSE + 60 * MIN, s.newestBarStartMs("1m"));
     }
 
     @Test
@@ -80,9 +82,9 @@ class OvernightSourceTest {
         s.onBar(bar(CLOSE + 76 * MIN, 7171.45));
         s.onPrice(price(CLOSE + 116 * MIN, 7161.20));
 
-        assertEquals(CLOSE + 76 * MIN, s.newestBarStartMs(), "the bar chain is behind");
+        assertEquals(CLOSE + 76 * MIN, s.newestBarStartMs("1m"), "the bar chain is behind");
         assertEquals(7161.20, s.lastPrice().spx(), 1e-9, "the price is not");
-        assertTrue(s.lastPrice().epochMs() - s.newestBarStartMs() > 30 * MIN,
+        assertTrue(s.lastPrice().epochMs() - s.newestBarStartMs("1m") > 30 * MIN,
                 "and the gap between them is visible, which is what the page reports");
     }
 
@@ -92,7 +94,7 @@ class OvernightSourceTest {
         OvernightSource s = new OvernightSource();
         assertNull(s.lastPrice());
         assertEquals(0, s.barCount());
-        String page = ReadablePage.render(CLOSE, s.lastPrice(), null, null);
+        String page = ReadablePage.render(CLOSE, s.lastPrice(), null, null, List.of());
         assertTrue(page.startsWith("NO PRICE"));
     }
 
@@ -133,5 +135,38 @@ class OvernightSourceTest {
         OvernightSource s = new OvernightSource();
         s.onPrice(new ReadablePage.Price(CLOSE, 7160.0, "ES_BASIS_DERIVED", "LIVE_ES_BASIS"));
         assertNull(s.previousCashClose());
+    }
+
+    @Test
+    @DisplayName("a 30-second bar never collides with the minute that contains it")
+    void theTwoTimeframesAreKeptApart() {
+        // The platform publishes the same stretch at several lengths. If they shared a key, a
+        // minute laid beside its own two halves would double every volume on the row.
+        OvernightSource s = new OvernightSource();
+        s.nightStartsAt(CLOSE);
+        s.onBar(new OvernightGrid.Bar(CLOSE, 7180, 7180, 7180, 7180, 100L, "ANCHORED", "1m", null, null, null));
+        s.onBar(new OvernightGrid.Bar(CLOSE, 7180, 7180, 7180, 7180, 60L, "ANCHORED", "30s", null, null, null));
+        s.onBar(new OvernightGrid.Bar(CLOSE + 30_000L, 7181, 7181, 7181, 7181, 40L, "ANCHORED",
+                "30s", null, null, null));
+
+        assertEquals(1, s.barCount("1m"), "the minute is held once");
+        assertEquals(2, s.barCount("30s"), "and its two halves separately");
+        assertEquals(3, s.barCount(), "three records in all");
+        assertEquals(1, s.bars("1m").size(), "and a reader of one timeframe sees only that one");
+        assertEquals(100L, s.bars("1m").get(0).volume());
+        assertEquals(100L, s.bars("30s").stream().mapToLong(OvernightGrid.Bar::volume).sum(),
+                "the halves sum to the minute, which is exactly why they must not be mixed");
+        assertEquals(java.util.Set.of("1m", "30s"), s.timeframes());
+    }
+
+    @Test
+    @DisplayName("a bar with no timeframe is refused outright, not given a default")
+    void aBarWithoutATimeframeIsRefused() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new OvernightGrid.Bar(CLOSE, 7180, 7180, 7180, 7180, 1L, "ANCHORED", null,
+                        null, null, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> new OvernightGrid.Bar(CLOSE, 7180, 7180, 7180, 7180, 1L, "ANCHORED", " ",
+                        null, null, null));
     }
 }

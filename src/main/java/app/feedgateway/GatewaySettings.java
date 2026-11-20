@@ -1540,6 +1540,23 @@ public final class GatewaySettings {
         return value("KAFKA_GAMMA_ZONE_TOPIC", "options.spx.gamma-zone.current");
     }
 
+    /**
+     * The pre-open gamma board (<b>C-61</b>, for the owner's 06:30 New York start).
+     *
+     * <p>{@code databento-gex-history} projects the IBKR pre-open records onto this topic; the
+     * deploy repository declares it <b>plain delete, never compacted</b>, because the context tape
+     * seeks back and replays it. The gateway only taps it for the readable page: see the
+     * {@code gex-preopen} case in {@code updateCache}, which caches nothing and broadcasts nothing.
+     *
+     * <p>Why the gateway needs it at all: {@code whatif-map-service} consumes only
+     * {@code options.databento.gex.strike}, so it has no board to publish before the cash path
+     * comes round. Measured on 2026-11-19, its first record was 09:15:58 New York while this
+     * topic's board was already complete at 06:43:02 — 41 of the owner's 41 grid rows.
+     */
+    public String gexPreopenTopic() {
+        return value("KAFKA_DATABENTO_GEX_PREOPEN_TOPIC", "options.databento.gex.strike.preopen");
+    }
+
     public String gammaZoneProfileTopic() {
         return value("KAFKA_GAMMA_ZONE_PROFILE_TOPIC", "options.spx.gamma-zone.profile");
     }

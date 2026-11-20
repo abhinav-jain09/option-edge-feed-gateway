@@ -26,6 +26,9 @@ import java.util.Map;
  */
 public final class BoardLines {
 
+    /** The source this board names itself by: the map service's own published record. */
+    public static final String SOURCE = "whatif-map";
+
     /** The owner's grid: 5-point strikes within 100 points of spot, his strike included. */
     public static final double GRID_STEP = 5.0;
     public static final double GRID_RADIUS = 100.0;
@@ -81,24 +84,28 @@ public final class BoardLines {
             expected++;
             long cents = Math.round(k * 100.0);
             JsonNode s = byCents.get(cents);
-            String marker = i == 0 ? " <- spot" : "";
+            // C-66's compact form: strike|netgamma|read, no padding, no alignment, an empty
+            // cell is nothing between two separators, and the reading is a one-letter code the
+            // page's legend expands. The spot row is marked with a trailing field rather than a
+            // column, so 40 of the 41 rows do not carry an empty one.
+            String marker = i == 0 ? "|spot" : "";
             if (s == null) {
-                lines.add(String.format(Locale.ROOT, "%8.0f  %12s  %-12s%s", k, "no row", "", marker));
+                lines.add(strikeOf(k) + "||norow" + marker);
                 continue;
             }
             present++;
             JsonNode board = s.path("board");
-            String reading = text(board, "holdOrAccelerate");
             JsonNode net = board.path("netGex");
             String excluded = text(board, "excludedReason");
-            lines.add(String.format(Locale.ROOT, "%8.0f  %12s  %-12s%s%s",
-                    k,
-                    net.isNumber() ? money(net.doubleValue()) : "-",
-                    reading == null ? "-" : reading,
-                    excluded == null ? "" : "  excluded: " + excluded,
-                    marker));
+            lines.add(strikeOf(k)
+                    + "|" + (net.isNumber() ? money(net.doubleValue()) : "")
+                    + "|" + code(text(board, "holdOrAccelerate"))
+                    + (excluded == null ? "" : "|excluded=" + excluded)
+                    + marker);
         }
-        return new ReadablePage.Board(cycleMs, spot, present, expected, lines);
+        return new ReadablePage.Board(cycleMs, spot, present, expected, SOURCE,
+                Extremes.largest(byCents, spot, true), Extremes.largest(byCents, spot, false),
+                lines);
     }
 
     /**
@@ -125,6 +132,31 @@ public final class BoardLines {
             return root == null || !root.isObject() ? null : root;
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    /** A strike with no decimals where it has none, so a row costs as little as possible. */
+    static String strikeOf(double k) {
+        return k == Math.rint(k) ? String.valueOf((long) k) : String.format(Locale.ROOT, "%.1f", k);
+    }
+
+    /**
+     * The reading as the one-letter code C-66's legend expands. An unrecognised word is passed
+     * through whole rather than mapped to a letter that would be a guess.
+     */
+    static String code(String reading) {
+        if (reading == null) {
+            return "";
+        }
+        switch (reading) {
+            case "ACCELERATE":
+                return "A";
+            case "HOLD":
+                return "H";
+            case "NEUTRAL":
+                return "N";
+            default:
+                return reading;
         }
     }
 

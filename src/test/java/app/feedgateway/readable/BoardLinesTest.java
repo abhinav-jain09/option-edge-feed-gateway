@@ -44,7 +44,7 @@ class BoardLinesTest {
         assertEquals(41, b.rowsExpected(),
                 "the 5-point grid a hundred points either side of spot is 41 strikes");
         assertEquals(41, b.lines().size(), "and every one of them is a line");
-        long noRow = b.lines().stream().filter(l -> l.contains("no row")).count();
+        long noRow = b.lines().stream().filter(l -> l.contains("|norow")).count();
         assertEquals(39, noRow, "the 39 the gamma service did not publish are printed as no row");
     }
 
@@ -54,18 +54,18 @@ class BoardLinesTest {
         ReadablePage.Board b = BoardLines.from(
                 board(strike(717_500L, -8.31e9, "ACCELERATE")), CYCLE);
         String row = b.lines().stream().filter(l -> l.contains("7175")).findFirst().orElseThrow();
-        assertTrue(row.contains("-8.31B"), "the record's netGex, abbreviated: " + row);
-        assertTrue(row.contains("ACCELERATE"), "and its own reading: " + row);
+        assertEquals("7175|-8.31B|A", row,
+                "C-66's compact row: strike|netgamma|read, no padding, the reading as its code");
     }
 
     @Test
     @DisplayName("spot's own strike is marked, so the owner finds price without counting")
     void spotIsMarked() {
         ReadablePage.Board b = BoardLines.from(board(strike(717_500L, -1e9, "HOLD")), CYCLE);
-        long marked = b.lines().stream().filter(l -> l.contains("<- spot")).count();
+        long marked = b.lines().stream().filter(l -> l.endsWith("|spot")).count();
         assertEquals(1, marked, "exactly one line carries the spot marker");
-        String row = b.lines().stream().filter(l -> l.contains("<- spot")).findFirst().orElseThrow();
-        assertTrue(row.trim().startsWith("7180"),
+        String row = b.lines().stream().filter(l -> l.endsWith("|spot")).findFirst().orElseThrow();
+        assertTrue(row.startsWith("7180|"),
                 "spot 7177.56 rounds to the 7180 grid line: " + row);
     }
 
@@ -76,8 +76,8 @@ class BoardLinesTest {
                 + "\"absGex\":0.0,\"gammaSign\":\"POSITIVE\",\"holdOrAccelerate\":\"NEUTRAL\","
                 + "\"excluded\":true,\"excludedReason\":\"under GAMMA_DIVIDE_FLOOR\"}}";
         ReadablePage.Board b = BoardLines.from(board(excluded), CYCLE);
-        String row = b.lines().stream().filter(l -> l.contains("7175")).findFirst().orElseThrow();
-        assertTrue(row.contains("excluded: under GAMMA_DIVIDE_FLOOR"), row);
+        String row = b.lines().stream().filter(l -> l.startsWith("7175|")).findFirst().orElseThrow();
+        assertTrue(row.contains("excluded=under GAMMA_DIVIDE_FLOOR"), row);
     }
 
     @Test
@@ -87,12 +87,10 @@ class BoardLinesTest {
         assertEquals(CYCLE, b.cycleMs());
         assertEquals(7177.56, b.spot(), 1e-9);
         // and it survives into the rendered page's heading
-        String page = ReadablePage.render(CYCLE + 60_000L,
-                new ReadablePage.Price(CYCLE, 7177.0, "ES_BASIS_DERIVED", "LIVE_ES_BASIS"),
-                null, b);
-        assertTrue(page.contains("cycle 2026-11-19"), "the date is on the page: " + page.lines()
-                .filter(l -> l.startsWith("GAMMA BOARD")).findFirst().orElse(""));
-        assertTrue(page.contains("rows 1 of 41"));
+        String page = Pages.board(CYCLE + 60_000L,
+                new ReadablePage.Price(CYCLE, 7177.0, "ES_BASIS_DERIVED", "LIVE_ES_BASIS"), b);
+        assertTrue(page.contains("date=2026-11-19"), "the date is on the page");
+        assertTrue(page.contains("rows=1/41"), "and the completeness figure, compactly");
     }
 
     @Test
@@ -113,7 +111,7 @@ class BoardLinesTest {
         assertNotNull(b);
         assertEquals(0, b.rowsPresent());
         assertEquals(41, b.lines().size());
-        assertEquals(41, b.lines().stream().filter(l -> l.contains("no row")).count(),
+        assertEquals(41, b.lines().stream().filter(l -> l.contains("|norow")).count(),
                 "a board that published nothing is 41 printed absences, not a blank section");
     }
 

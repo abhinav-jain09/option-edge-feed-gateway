@@ -41,16 +41,23 @@ public final class OvernightDecoders {
      * forming, and a forming minute's high and low are not the minute's. Admitting it would show a
      * close that moves backwards when the finished bar replaces it.
      *
-     * <p><b>Only one-minute bars are read.</b> The gateway's view holds several timeframes keyed
-     * together; taking a 5-minute bar as if it were a minute would double-count its volume into a
-     * slot that already has the minutes it is made of.
+     * <p><b>Only the two finest timeframes are read, and each keeps its own.</b> The platform
+     * publishes the same stretch of time at {@code 30s}, {@code 1m}, {@code 5m}, {@code 15m},
+     * {@code 30m}, {@code 4h} and {@code session} — measured on Dev, 241 of the last 400 records
+     * were {@code 30s}. The owner's rows are 30-second rows (C-64), so {@code 30s} is read and so is
+     * {@code 1m} for the night's coarser grid; everything longer is refused, because a 5-minute bar
+     * laid beside the minutes it contains would double every volume.
      */
     public static OvernightGrid.Bar bar(String json) {
         JsonNode root = parse(json);
         if (root == null) {
             return null;
         }
-        if (!"1m".equals(text(root, "timeframe"))) {
+        String timeframe = text(root, "timeframe");
+        if (!"30s".equals(timeframe) && !"1m".equals(timeframe)) {
+            // The platform publishes 30s, 1m, 5m, 15m, 30m, 4h and session. Only the two finest are
+            // read: the owner's rows are 30-second rows, the night's grid is built from minutes,
+            // and a 5-minute bar would double-count the minutes it is made of.
             return null;
         }
         JsonNode o = root.path("observations");
@@ -70,7 +77,9 @@ public final class OvernightDecoders {
         }
         Long volume = longOrNull(o, "volume");
         return new OvernightGrid.Bar(start, open / 100.0, high / 100.0, low / 100.0, close / 100.0,
-                volume == null ? 0L : volume, text(o, "spxEqBasisState"));
+                volume == null ? 0L : volume, text(o, "spxEqBasisState"), timeframe,
+                longOrNull(o, "buyerContracts"), longOrNull(o, "sellerContracts"),
+                longOrNull(o, "delta"));
     }
 
     /**
