@@ -94,7 +94,16 @@ class RecentRowsTest {
         assertTrue(filled.contains("|7174.45|"), filled);
         assertTrue(filled.contains("|180|120|60|B|"), "buy, sell, delta, dominant: " + filled);
         assertFalse(filled.contains("  "), "no padding anywhere: " + filled);
-        assertTrue(filled.endsWith("|"), "ANCHORED is the normal case and costs no characters");
+        // CHANGED 2026-11-20 on the reviewer's instruction, and the old assertion was not wrong
+        // so much as outvoted by a reader. It said "ANCHORED is the normal case and costs no
+        // characters" -- a deliberate choice to spend nothing on the common case and show only the
+        // exception. But the page's own legend says "empty=no data for that slot", so the blank
+        // read as "this bar has no basis" when the bar had one and it was anchored; the reviewer
+        // read the whole column as always-empty and asked for it filled or removed. One letter is
+        // the compromise: it costs one character, it keeps the column meaningful, and an unusual
+        // state still stands out because it carries its full name.
+        assertTrue(filled.endsWith("|A"),
+                "the normal case is one letter now, not nothing: " + filled);
         assertTrue(blank.endsWith("||||||||"), "a blank row is empty cells: " + blank);
     }
 
@@ -130,5 +139,35 @@ class RecentRowsTest {
         }
         assertTrue(page.length() < 4_000,
                 "the whole Recent table costs under 4,000 characters: " + page.length());
+    }
+
+    @Test
+    @DisplayName("the basis cell is ALWAYS written, because an empty cell means 'no data' here")
+    void theBasisCellIsAlwaysWritten() {
+        // The reviewer read this column as always-empty and asked for it filled or removed. It was
+        // blank whenever the state was ANCHORED -- the normal case -- while the page's own legend
+        // says "empty=no data for that slot", so the blank said the bar had no basis when it had
+        // one.
+        String anchored = RecentRows.line(RecentRows.build(NOW, 1,
+                List.of(bar(NOW - 1_000L, 7142.45, 67, 33, 34, "30s"))).get(0), NY);
+        assertTrue(anchored.endsWith("|A"),
+                "one letter for the normal case, so sixty rows do not carry eight characters of "
+                        + "ANCHORED: " + anchored);
+
+        OvernightGrid.Bar odd = new OvernightGrid.Bar(NOW - 1_000L, 7141.0, 7144.0, 7139.0,
+                7142.45, 67L, "QUARANTINED", "30s", 33L, 34L, -1L);
+        String quarantined = RecentRows.line(
+                RecentRows.build(NOW, 1, List.of(odd)).get(0), NY);
+        assertTrue(quarantined.endsWith("|QUARANTINED"),
+                "and an unusual state gets its full name, so it stands out: " + quarantined);
+    }
+
+    @Test
+    @DisplayName("a bar with no basis state at all reads ? -- the only 'no data' this column has")
+    void aBarWithNoBasisStateReadsQuestionMark() {
+        OvernightGrid.Bar none = new OvernightGrid.Bar(NOW - 1_000L, 7141.0, 7144.0, 7139.0,
+                7142.45, 67L, null, "30s", 33L, 34L, -1L);
+        String line = RecentRows.line(RecentRows.build(NOW, 1, List.of(none)).get(0), NY);
+        assertTrue(line.endsWith("|?"), line);
     }
 }

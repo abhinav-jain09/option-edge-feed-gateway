@@ -41,7 +41,7 @@ public final class Pages {
     /** The reading codes, expanded by every page's legend. */
     static final String LEGEND =
             "legend|A=accelerate|H=hold|N=neutral|norow=gamma service published no row|"
-            + "empty=no data for that slot|px=SPX-equivalent";
+            + "empty=no data for that slot|px=SPX-equivalent|basis A=anchored, ?=none on that bar";
 
     /**
      * <b>C-73</b>: the one line that explains the empty columns on a pre-open board. Those columns

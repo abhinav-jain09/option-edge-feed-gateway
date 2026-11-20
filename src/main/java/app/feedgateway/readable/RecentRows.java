@@ -129,8 +129,31 @@ public final class RecentRows {
                 .append(r.sellers() == null ? "" : r.sellers()).append('|')
                 .append(r.delta() == null ? "" : r.delta()).append('|')
                 .append(r.dominant() == null ? "" : r.dominant()).append('|')
-                .append("ANCHORED".equals(r.basisState()) ? "" : nullToEmpty(r.basisState()));
+                .append(basisCell(r.basisState()));
         return s.toString();
+    }
+
+    /**
+     * The row's own basis state, <b>always written</b>.
+     *
+     * <p>This cell was blank whenever the state was {@code ANCHORED} — the normal case — on the
+     * theory that an exception is worth showing and the rule is not. The page's own legend says
+     * {@code empty=no data for that slot}, so a blank here read as "this bar has no basis" when the
+     * bar had one and it was anchored. The reviewer read the column as always-empty and asked for
+     * it filled or removed; filled is right, because the state is genuinely <b>per bar</b> — each
+     * carries its own {@code spxEqBasisState} — so a row that differs from its neighbours is a real
+     * thing to see, and it can only stand out if the others say something.
+     *
+     * <p>One letter for the normal case so sixty rows do not carry eight characters of
+     * {@code ANCHORED}, and the state verbatim for anything else, because an unusual state is
+     * worth its full name. {@code ?} where the bar carried none at all, which is the only case the
+     * legend's "no data" now covers.
+     */
+    private static String basisCell(String state) {
+        if (state == null || state.isBlank()) {
+            return "?";
+        }
+        return "ANCHORED".equals(state) ? "A" : state;
     }
 
     private static String nullToEmpty(String s) {
