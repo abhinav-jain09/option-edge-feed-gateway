@@ -65,6 +65,8 @@ public final class ReadableBoardRenderer {
 
     /** C-74: where the reference price came from, in words, for the page. */
     private volatile String referenceLabel;
+    /** C-133: the resolution's own words, printed rather than discarded. */
+    private volatile String referenceReason;
 
     /** Whether a pre-open board has ever been served, which is what makes a switch a switch. */
     private boolean servedPreopen;
@@ -110,6 +112,20 @@ public final class ReadableBoardRenderer {
             return;
         }
         referenceLabel = resolved.label();
+        referenceReason = resolved.reason();
+        // C-133: THE RESOLUTION SAYS SO, in the log and on the page.
+        //
+        // The reason string already existed and was discarded at this line. On 2026-11-20 it held
+        // exactly what an hour of investigation had to recover by hand -- which slice answered, and
+        // therefore that the answer had come out of a capped read. A figure that cannot say where
+        // it came from cannot be checked, so from here it is printed where both the operator and
+        // the owner can see it.
+        System.out.println("readable reference resolved from=" + resolved.from()
+                + " close=" + (resolved.close() == null ? "none"
+                        : resolved.close().spx() + "@"
+                                + ReadablePage.hms(resolved.close().epochMs(), ReadablePage.NY)
+                                + "NY")
+                + " reason=" + resolved.reason());
         if (resolved.close() != null) {
             source.seedPreviousClose(resolved.close());
             nightStartedAt = resolved.close().epochMs();
@@ -120,6 +136,27 @@ public final class ReadableBoardRenderer {
     /** Where the reference price came from, or null before anything has been resolved. */
     public String referenceLabel() {
         return referenceLabel;
+    }
+
+    /** The resolution's own reason, or null before anything has been resolved. */
+    public String referenceReason() {
+        return referenceReason;
+    }
+
+    /**
+     * <b>C-133</b>: one line on {@code /now} saying how the previous close was reached.
+     *
+     * <p>Empty before anything has been resolved, because an empty line is better than a line that
+     * says nothing. It is appended rather than threaded through {@link Pages#now} on purpose: the
+     * page's signature is long already, and this is a property of the resolution rather than of
+     * anything the page is rendering.
+     */
+    String referenceLine() {
+        if (referenceReason == null || referenceReason.isBlank()) {
+            return "";
+        }
+        return "reference|" + (referenceLabel == null ? "" : referenceLabel + "|")
+                + referenceReason + "\n";
     }
 
     public void onPreopenJson(String json) {
@@ -373,7 +410,9 @@ public final class ReadableBoardRenderer {
         } else if (referenceLabel != null) {
             // C-74: an index print and a futures bar's SPX-equivalent are different facts, so the
             // page names which one this close is rather than leaving the reader to assume.
-            rendered = rendered + "\nREFERENCE — " + referenceLabel + "\n";
+            // C-133: and HOW it was reached, so a close out of a capped read is visible as one.
+            rendered = rendered + "\nREFERENCE — " + referenceLabel
+                    + (referenceReason == null ? "" : " (" + referenceReason + ")") + "\n";
         }
         page = rendered;
         renderedAtMs = now;
@@ -464,7 +503,8 @@ public final class ReadableBoardRenderer {
                         // block is skipped and the heap's own reason is appended by
                         // withOvernightAbsence; here the reason is the reference's, which is the
                         // silence rule's: "no silence of three hours or more has been seen yet".
-                        lowHeap ? HeapGuard.reason() : source.closeAbsenceReason()), lowHeap);
+                        lowHeap ? HeapGuard.reason() : source.closeAbsenceReason()), lowHeap)
+                        + referenceLine();
             }
             case "overnight": {
                 boolean lowHeap = HeapGuard.low();

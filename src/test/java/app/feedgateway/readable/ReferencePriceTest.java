@@ -259,19 +259,22 @@ class ReferencePriceTest {
     }
 
     /**
-     * <b>C-98 changed this, and the change is the point rather than a cost.</b>
+     * <b>C-133 changed this, and the trade-off is stated rather than left to be found.</b>
      *
-     * <p>It used to assert that a live index print displaces a recovered close immediately. That is
-     * the old rule, and it is exactly how a pre-market print became "yesterday's close" this
-     * morning: any index print, merely by being newer, took the label. Under C-98 an index print
-     * becomes the close when the index then goes quiet for three hours — so the recovered close
-     * stands until that happens, and then the observed print takes over <b>with no restart</b>.
-     * The original worry, that a restart would pin the page to a recovered figure for the rest of
-     * the session, is answered by the second half of this test rather than by displacing it early.
+     * <p>C-98 made a live index print become the close once the index went quiet for three hours,
+     * so a recovered close could be displaced without a restart. C-133 anchors a close that was
+     * resolved from history: a gap in the feed can be manufactured — by a stall, or by a read that
+     * stopped short — and must not rewrite the owner's previous close in the middle of his night.
+     * So a seeded close now HOLDS. What that gives up is the live roll at 16:00, which this class
+     * never had either; it needs a cash-close boundary applied to the running service, and that is
+     * the open item in the Discussion tab.
+     *
+     * <p>The second half keeps the silence rule under test where it still governs: a source that
+     * has resolved nothing is not anchored, and there the quiet still promotes the print.
      */
     @Test
-    @DisplayName("a recovered close holds until the index goes quiet, then the observed print wins")
-    void anObservedPrintTakesOverWhenTheIndexGoesQuiet() {
+    @DisplayName("C-133: a seeded close is ANCHORED and the quiet cannot displace it")
+    void aSeededCloseIsAnchoredAgainstTheQuiet() {
         OvernightSource s = new OvernightSource();
         s.onPrice(OvernightDecoders.price(
                 priceJson(CLOSE, 7176.24, "NATIVE_SPX_INDEX", "LIVE_INDEX"), CLOSE));
@@ -281,14 +284,28 @@ class ReferencePriceTest {
                 "while the index is still printing, no session has ended: the recovered close is "
                         + "the only completed one, and a newer print is not a close for being newer");
 
-        // the night runs on: the basis derivation advances the clock while the index stays quiet
+        for (long t = CLOSE + 600_000L; t <= CLOSE + 4L * 3_600_000L; t += 600_000L) {
+            s.onPrice(OvernightDecoders.price(
+                    priceJson(t, 7160.00, "ES_BASIS_DERIVED", "LIVE_ES_BASIS"), t));
+        }
+        assertEquals(7000.00, s.previousCashClose().spx(), 1e-9,
+                "the resolved close is anchored, so four hours of quiet do not rewrite it");
+    }
+
+    @Test
+    @DisplayName("with nothing seeded the silence rule still governs: the quiet promotes the print")
+    void withNothingSeededTheQuietStillPromotesThePrint() {
+        OvernightSource s = new OvernightSource();
+        s.onPrice(OvernightDecoders.price(
+                priceJson(CLOSE, 7176.24, "NATIVE_SPX_INDEX", "LIVE_INDEX"), CLOSE));
+        assertNull(s.previousCashClose(), "no session has ended yet, so there is no close");
         for (long t = CLOSE + 600_000L; t <= CLOSE + 4L * 3_600_000L; t += 600_000L) {
             s.onPrice(OvernightDecoders.price(
                     priceJson(t, 7160.00, "ES_BASIS_DERIVED", "LIVE_ES_BASIS"), t));
         }
         assertEquals(7176.24, s.previousCashClose().spx(), 1e-9,
-                "three hours of index silence ended that session, so the observed print is now the "
-                        + "close -- without a restart, which is what the old assertion wanted");
+                "unanchored, three hours of index quiet still end the session and promote the "
+                        + "print -- the live rule is unchanged where nothing was resolved");
     }
 
     @Test

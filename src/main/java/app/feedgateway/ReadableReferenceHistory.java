@@ -155,6 +155,131 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
         return asJson(priceTopic, fromMs, toMs, limit, priceToJson);
     }
 
+    /**
+     * <b>C-133</b>: one page of the price topic, taken from the NEW end by offset.
+     *
+     * <p>Page 0 is the newest {@code limit} records of each partition at or before the instant,
+     * page 1 the {@code limit} before those. The seek is {@code endOffset - (pagesBack + 1) *
+     * limit}, clamped at the partition's beginning, so a page costs one bounded drain and the walk
+     * never scans the topic.
+     *
+     * <p><b>On several partitions this over-reads rather than under-reads</b>, and that is the right
+     * direction: it takes {@code limit} records from EACH partition, so a page holds up to
+     * {@code limit * partitions} records and is a superset of the true page. A superset can only
+     * resolve the same silence earlier; a subset could miss the end of a session. The price topic
+     * has one partition today, which is why this is a note rather than a design.
+     *
+     * <p>{@code morePages} is true where any partition still holds records before this page's
+     * start, so the walk knows the difference between "nothing older exists" and "I have not looked
+     * further".
+     */
+    @Override
+    public ReferencePrice.Page pricePage(long notAfterMs, int limit, int pagesBack) {
+        if (priceTopic == null || priceTopic.isBlank() || limit <= 0 || pagesBack < 0) {
+            return new ReferencePrice.Page(List.of(), false);
+        }
+        List<String> out = new ArrayList<>();
+        int polled = 0;
+        int outsideWindow = 0;
+        int unconvertible = 0;
+        boolean morePages = false;
+        try (Consumer<String, Object> consumer = consumers.get()) {
+            if (consumer == null) {
+                record(new Drain(priceTopic, 0L, notAfterMs, 0, 0, 0, 0, "no consumer"));
+                return new ReferencePrice.Page(List.of(), false);
+            }
+            var infos = consumer.partitionsFor(priceTopic, Duration.ofSeconds(10));
+            if (infos == null || infos.isEmpty()) {
+                record(new Drain(priceTopic, 0L, notAfterMs, 0, 0, 0, 0,
+                        "topic has no partitions"));
+                return new ReferencePrice.Page(List.of(), false);
+            }
+            List<TopicPartition> parts = new ArrayList<>();
+            for (var info : infos) {
+                parts.add(new TopicPartition(priceTopic, info.partition()));
+            }
+            consumer.assign(parts);
+            Map<TopicPartition, Long> ends = consumer.endOffsets(parts, Duration.ofSeconds(10));
+            Map<TopicPartition, Long> begins =
+                    consumer.beginningOffsets(parts, Duration.ofSeconds(10));
+            Map<TopicPartition, Long> stopAt = new java.util.HashMap<>();
+            for (TopicPartition tp : parts) {
+                long end = ends.getOrDefault(tp, 0L);
+                long begin = begins.getOrDefault(tp, 0L);
+                long pageEnd = end - (long) pagesBack * limit;
+                if (pageEnd <= begin) {
+                    consumer.seek(tp, end);              // this partition has no such page
+                    stopAt.put(tp, end);
+                    continue;
+                }
+                long pageStart = Math.max(begin, pageEnd - limit);
+                morePages |= pageStart > begin;
+                consumer.seek(tp, pageStart);
+                stopAt.put(tp, pageEnd);
+            }
+            int empties = 0;
+            int budget = limit * parts.size();
+            while (out.size() < budget && empties < 3) {
+                ConsumerRecords<String, Object> batch = consumer.poll(Duration.ofSeconds(2));
+                if (batch == null || batch.isEmpty()) {
+                    empties++;
+                    continue;
+                }
+                empties = 0;
+                boolean done = true;
+                for (ConsumerRecord<String, Object> one : batch) {
+                    polled++;
+                    TopicPartition tp = new TopicPartition(one.topic(), one.partition());
+                    if (one.offset() >= stopAt.getOrDefault(tp, Long.MAX_VALUE)) {
+                        continue;                        // past this page's end
+                    }
+                    if (one.timestamp() > notAfterMs) {
+                        outsideWindow++;
+                        continue;
+                    }
+                    String json = priceToJson.apply(one.value());
+                    if (json == null || json.isBlank()) {
+                        unconvertible++;
+                        continue;
+                    }
+                    out.add(json);
+                }
+                for (TopicPartition tp : parts) {
+                    if (consumer.position(tp) < stopAt.getOrDefault(tp, 0L)) {
+                        done = false;
+                        break;
+                    }
+                }
+                if (done) {
+                    break;
+                }
+            }
+        } catch (RuntimeException unreachable) {
+            record(new Drain(priceTopic, 0L, notAfterMs, polled, out.size(), outsideWindow,
+                    unconvertible, unreachable.getClass().getSimpleName() + ": "
+                            + unreachable.getMessage()));
+            return new ReferencePrice.Page(List.of(), false);
+        }
+        record(new Drain(priceTopic, 0L, notAfterMs, polled, out.size(), outsideWindow,
+                unconvertible, null));
+        out.sort(java.util.Comparator.comparingLong(ReadableReferenceHistory::priceEventMs));
+        return new ReferencePrice.Page(out, morePages);
+    }
+
+    /**
+     * A price record's own instant, for ordering a multi-partition page.
+     *
+     * <p>Read from {@code spotEventTimeNs} where the record carries it, which is the same field
+     * {@code OvernightDecoders.price} reads, so the page's order is the order the rule will see.
+     */
+    private static long priceEventMs(String json) {
+        java.util.regex.Matcher m = PRICE_EVENT_NS.matcher(json);
+        return m.find() ? Long.parseLong(m.group(1)) / 1_000_000L : 0L;
+    }
+
+    private static final java.util.regex.Pattern PRICE_EVENT_NS =
+            java.util.regex.Pattern.compile("\"spotEventTimeNs\"\\s*:\\s*(\\d+)");
+
     @Override
     public List<String> barsBetween(long fromMs, long toMs) {
         return asJson(barTopic, fromMs, toMs, MAX_RECORDS, barToJson);

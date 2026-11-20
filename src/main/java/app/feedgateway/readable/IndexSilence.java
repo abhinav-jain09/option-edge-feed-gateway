@@ -54,6 +54,7 @@ public final class IndexSilence {
     private final long silenceMs;
     private ReadablePage.Price previous;          // the newest index print seen so far
     private ReadablePage.Price reference;         // the last print before the newest long silence
+    private boolean anchored;                     // C-133: resolved from history, not from a gap
     private long silencesSeen;
 
     public IndexSilence() {
@@ -82,8 +83,12 @@ public final class IndexSilence {
             return;                               // out of order: not a gap, just a late arrival
         }
         if (previous != null && print.epochMs() - previous.epochMs() >= silenceMs) {
-            // A silence just ended. The print BEFORE it is the close of the session that ended.
-            reference = previous;
+            // A silence just ended. The print BEFORE it is the close of the session that ended --
+            // unless the reference was resolved from history and is therefore ANCHORED, in which
+            // case the gap is counted without being acted on (C-133).
+            if (!anchored) {
+                reference = previous;
+            }
             silencesSeen++;
         }
         previous = print;
@@ -108,7 +113,7 @@ public final class IndexSilence {
      * @param nowMs the newest instant this service has seen on the feed
      */
     public void observeClock(long nowMs) {
-        if (previous == null || reference == previous) {
+        if (previous == null || reference == previous || anchored) {
             return;
         }
         if (nowMs - previous.epochMs() >= silenceMs) {
@@ -174,6 +179,28 @@ public final class IndexSilence {
     void adopt(ReadablePage.Price resolved) {
         if (resolved != null && reference == null) {
             reference = resolved;
+            anchored = true;
         }
+    }
+
+    /**
+     * <b>C-133: a close RESOLVED FROM HISTORY is anchored, and a later gap cannot rewrite it.</b>
+     *
+     * <p>Until C-133 an adopted reference was an ordinary one: a silence seen afterwards, or a
+     * clock reading that closed a trailing gap, would replace it. That is harmless while every
+     * silence is a real session boundary, and it is not harmless once we know how a silence can be
+     * manufactured — a feed stall of three hours on a quiet afternoon would otherwise rewrite the
+     * owner's previous close in the middle of his night, and he would have no way to tell. A
+     * reference that came out of a deliberate read of history is the better evidence of the two,
+     * so it holds.
+     *
+     * <p><b>What this gives up, stated here rather than left to be found at 16:00:</b> an anchored
+     * reference does not roll to today's close on its own; it holds the prior session's until the
+     * next start-up resolution. That was already true of the frozen reference this replaces.
+     * Rolling it live needs a cash-close boundary applied to the running service, which is the open
+     * item in the Discussion tab and not something to infer from a tick.
+     */
+    boolean anchored() {
+        return anchored;
     }
 }

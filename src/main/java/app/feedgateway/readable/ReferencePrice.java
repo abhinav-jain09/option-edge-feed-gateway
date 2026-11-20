@@ -100,6 +100,59 @@ public final class ReferencePrice {
          * Bars in {@code [fromMs, toMs]}, as published, oldest first.
          */
         List<String> barsBetween(long fromMs, long toMs);
+
+        /**
+         * <b>C-133: THE NEWEST RECORDS FIRST, A PAGE AT A TIME, WALKING BACK.</b>
+         *
+         * <p><b>The measurement.</b> {@link #pricesBetween} reads FORWARD from a window's start and
+         * stops at its cap, and that direction was the whole of the 2026-11-20 wrong close. Every
+         * widening slice the resolver tried began earlier and still read about the same 60,000
+         * records -- roughly 7.2 hours at the 2.3 records a second this topic carries -- so each one
+         * dropped the NEWEST part of its window, which is the only part that can hold the end of the
+         * previous session. The 16-hour slice's cap fell at 09:58:23 that morning, the five hours
+         * from there to the boot instant looked like a silence the feed never had, and the page
+         * showed {@code prevclose=7175.68|at=09:58:23NY|slots=18/18} instead of 7175.83 at 16:49:16
+         * over 85 slots. Widening could not have fixed it and would have made it worse: the 96-hour
+         * slice's own 7.2 hours contain an OLDER session's close and the quiet after it, so a
+         * resolver that widened to the end and trusted the widest slice would answer with a price
+         * from four days earlier and call it yesterday's.
+         *
+         * <p><b>So the read is anchored at the new end instead.</b> Page 0 is the newest
+         * {@code limit} records at or before the instant, page 1 the {@code limit} before those,
+         * and so on. Every page is bounded exactly as the old slice was, so nothing reads more at
+         * once than the code it replaces; and an incomplete read can now only be incomplete at the
+         * OLD end, where it can delay an answer but never manufacture one. A normal overnight boot
+         * resolves on page 0.
+         *
+         * <p>The default walks an in-memory history and exists for tests and fakes. The real
+         * implementation seeks by offset from the end of each partition, which is what makes a page
+         * cost one bounded drain rather than a scan.
+         *
+         * @param notAfterMs the instant to look back from; no record newer than this is returned
+         * @param limit      the page size, in records
+         * @param pagesBack  0 for the newest page, 1 for the one before it, and so on
+         */
+        default Page pricePage(long notAfterMs, int limit, int pagesBack) {
+            List<String> all = pricesBetween(Long.MIN_VALUE / 4, notAfterMs, Integer.MAX_VALUE);
+            if (all == null || all.isEmpty() || limit <= 0 || pagesBack < 0) {
+                return new Page(List.of(), false);
+            }
+            int end = all.size() - pagesBack * limit;
+            if (end <= 0) {
+                return new Page(List.of(), false);
+            }
+            int start = Math.max(0, end - limit);
+            return new Page(List.copyOf(all.subList(start, Math.min(end, all.size()))), start > 0);
+        }
+    }
+
+    /**
+     * One page of the price topic, newest-first in the walk, oldest-first within the page.
+     *
+     * @param records    the page's records, oldest first
+     * @param morePages  true where older records remain beyond this page, so the walk may continue
+     */
+    public record Page(List<String> records, boolean morePages) {
     }
 
     private ReferencePrice() {
@@ -112,17 +165,23 @@ public final class ReferencePrice {
      * @param history  the seeks, or null where the gateway cannot read back at all
      */
     /**
-     * How far back to look for the index print, in widening steps.
+     * How many pages the walk will read before it says it cannot resolve, and why this many.
      *
-     * <p>The index prints only during the cash session, so from any overnight hour the answer is a
-     * few hours back and the FIRST or second slice finds it. The wider slices exist for a weekend
-     * or a holiday. Each is drained on its own, so no step is unbounded.
+     * <p>A page is {@link #SLICE_LIMIT} records, about 7.2 hours of this feed. An ordinary
+     * overnight boot resolves on page 0, because the quiet it is looking for is the most recent
+     * thing on the topic. A boot in the middle of the cash session reaches the previous evening in
+     * about four pages. A Monday morning has to cross a weekend of ES-basis derivation -- the index
+     * is quiet but the topic is not -- and that is about fourteen pages, so the bound is twenty:
+     * generous enough for a long weekend with a holiday on either side, and still only 1.2 million
+     * records read one bounded page at a time, none of them held after the page that produced them.
+     *
+     * <p>When the bound is reached the answer is an ABSENCE WITH ITS REASON, which names the page
+     * count. That is deliberately not "the oldest thing I managed to read": a stale close wearing
+     * today's label is the failure this whole class exists to prevent.
      */
-    static final long[] PRICE_SLICES_MS = {
-        2L * 3_600_000L, 8L * 3_600_000L, 16L * 3_600_000L, 30L * 3_600_000L, 96L * 3_600_000L
-    };
+    static final int MAX_PAGES = 20;
 
-    /** A bound on one slice's drain. A slice that needs more than this is already too wide. */
+    /** A bound on ONE PAGE's drain, in records. The walk is bounded by {@link #MAX_PAGES}. */
     static final int SLICE_LIMIT = 60_000;
 
     private static final ZoneId NY = ZoneId.of("America/New_York");
@@ -162,12 +221,30 @@ public final class ReferencePrice {
         // one drain. The eight-hour slice is the first that can see a normal overnight quiet, and
         // the wider ones exist for a weekend. A resolution says which slice found it, so a reader
         // can tell a close found in eight hours from one found in ninety-six.
-        for (long slice : PRICE_SLICES_MS) {
-            List<ReadablePage.Price> prints = indexPrintsInOrder(
-                    safe(history.pricesBetween(beforeMs - slice, beforeMs, SLICE_LIMIT)), beforeMs);
+        // C-133: THE PAGE WALK. One rule, read from the new end backwards.
+        //
+        // The collected prints are kept in time order and handed to IndexSilence after every page,
+        // so there is still exactly ONE implementation of "the last print before the most recent
+        // silence" and the start-up answer cannot drift from the running one. Only the reading
+        // changed, because only the reading was broken.
+        List<ReadablePage.Price> collected = new ArrayList<>();
+        int pagesRead = 0;
+        boolean moreBeyond = false;
+        for (int page = 0; page < MAX_PAGES; page++) {
+            Page read = history.pricePage(beforeMs, SLICE_LIMIT, page);
+            if (read == null) {
+                break;
+            }
+            pagesRead++;
+            List<ReadablePage.Price> olderFirst = indexPrintsInOrder(safe(read.records()), beforeMs);
+            // the page is OLDER than everything collected so far, so it goes in front
+            collected.addAll(0, olderFirst);
             // beforeMs closes a trailing silence: a boot in the middle of the night has no index
-            // print after the gap, which is exactly when the overnight page needs the reference
-            IndexSilence silence = IndexSilence.resolveFrom(prints, beforeMs);
+            // print after the gap, which is exactly when the overnight page needs the reference.
+            // Sound here because the walk starts at the NEW end: whatever is missing is older than
+            // what we hold, so a trailing gap measured against beforeMs is a gap the feed really
+            // had.
+            IndexSilence silence = IndexSilence.resolveFrom(collected, beforeMs);
             ReadablePage.Price reference = silence.reference();
             if (reference != null) {
                 List<String> bars = safe(history.barsBetween(
@@ -176,7 +253,15 @@ public final class ReferencePrice {
                 return new Resolved(reference, range[0], range[1], From.INDEX_PRINT,
                         "the last index print before a silence of "
                                 + (IndexSilence.SILENCE_MS / 3_600_000L) + " hours or more, found "
-                                + "within " + (slice / 3_600_000L) + " hours");
+                                + "on page " + page + " of a walk back from the newest record, "
+                                + pagesRead + " " + (pagesRead == 1 ? "page" : "pages") + " read "
+                                + "at " + SLICE_LIMIT + " records each");
+            }
+            moreBeyond = read.morePages();
+            if (!moreBeyond) {
+                // The topic itself ends here. Nothing older exists to read, so no further page can
+                // change the answer and reading twenty of them would only say so twenty times.
+                break;
             }
         }
 
@@ -210,13 +295,21 @@ public final class ReferencePrice {
                             "CASH_SESSION_LAST_COMPLETE_BAR"),
                     range[0], range[1], From.FOOTPRINT_BAR,
                     "no index print remains on the price topic, so the close is the last complete "
-                            + "cash-session bar's SPX-equivalent");
+                            + "cash-session bar's SPX-equivalent; no silence of "
+                            + (IndexSilence.SILENCE_MS / 3_600_000L) + " hours or more was found in "
+                            + pagesRead + " " + (pagesRead == 1 ? "page" : "pages") + " of index "
+                            + "prints" + (moreBeyond ? ", and older records remain unread" : ""));
         }
 
         return new Resolved(null, Double.NaN, Double.NaN, From.NONE,
                 "neither an index print nor a complete cash-session bar remains in the history "
                         + "this gateway can read, so the close is not recoverable and the "
-                        + "overnight rows appear at the next index print");
+                        + "overnight rows appear at the next index print; the walk read "
+                        + pagesRead + " " + (pagesRead == 1 ? "page" : "pages") + " of "
+                        + SLICE_LIMIT + " records"
+                        + (moreBeyond ? " and stopped with older records still unread, so the "
+                                + "close is older than this gateway is willing to read back"
+                                : " and reached the beginning of the topic"));
     }
 
     /** The newest index print at or before the instant, or null. */
