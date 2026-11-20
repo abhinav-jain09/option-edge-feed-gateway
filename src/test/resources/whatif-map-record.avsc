@@ -1,0 +1,1193 @@
+{
+  "type": "record",
+  "name": "WhatIfMapRecord",
+  "namespace": "app.options.whatif",
+  "doc": "Service A's record on options.spx.whatif.map -- the whole of R-PUB-1, the Intraday Hedge Pressure Map. Carries no trading signal, entry, level to act at or hit rate: the signal layer emits trades and the map does not (R-PUB-5). The subject is this record's full name under RecordNameStrategy.",
+  "fields": [
+    {
+      "name": "fingerprint",
+      "type": {
+        "type": "record",
+        "name": "Fingerprint",
+        "fields": [
+          {
+            "name": "valuationTime",
+            "type": {
+              "type": "long",
+              "logicalType": "timestamp-millis"
+            },
+            "doc": "The instant the engine valued the board. Required: a record missing any fingerprint component is INVALID, not degraded (R-PUB-2)."
+          },
+          {
+            "name": "spotEpoch",
+            "type": "long"
+          },
+          {
+            "name": "chainVersion",
+            "type": "string"
+          },
+          {
+            "name": "signResolution",
+            "type": "string"
+          },
+          {
+            "name": "configHash",
+            "type": "string"
+          },
+          {
+            "name": "shortRate",
+            "type": "double",
+            "doc": "The short rate read FOR THAT VALUATION DATE (R-IN-14, DEP-RATE-1). Two records computed at different rates are not comparable and nothing else in the record would say so."
+          }
+        ]
+      },
+      "doc": "R-PUB-2, on every record, and one of the five fields nobody changes."
+    },
+    {
+      "name": "service",
+      "type": "string"
+    },
+    {
+      "name": "symbol",
+      "type": "string",
+      "doc": "The underlying this board is of, as the gamma exposure service publishes it (D-73). A board is ONE symbol and ONE expiry (C-16); the record did not say which until D-73, so a consumer holding two records could not tell which chain each described. The fingerprint's chainVersion is the producer's model fingerprint and is not an identity. Never absent."
+    },
+    {
+      "name": "expiry",
+      "type": "string",
+      "doc": "The expiry this board is of, as published (D-73). Same source as symbol -- the board key the cycle builder already held -- and the same reason. Never absent."
+    },
+    {
+      "name": "spot",
+      "type": "double"
+    },
+    {
+      "name": "minutesToExpiry",
+      "type": "double"
+    },
+    {
+      "name": "levels",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "LevelRow",
+          "fields": [
+            {
+              "name": "price",
+              "type": "double",
+              "doc": "The level, in SPX points."
+            },
+            {
+              "name": "holdOrAccelerate",
+              "type": "string"
+            },
+            {
+              "name": "exposureChange",
+              "type": {
+                "type": "record",
+                "name": "Interval",
+                "fields": [
+                  {
+                    "name": "low",
+                    "type": "double",
+                    "doc": "The low end. The ends are NAMED, never sorted, so a reader never has to guess which rule chose which end (R-LAG-4's own reason)."
+                  },
+                  {
+                    "name": "high",
+                    "type": "double"
+                  },
+                  {
+                    "name": "units",
+                    "type": "string",
+                    "doc": "The unit of both ends, as a string from the Units vocabulary. Always present: an interval without its unit is not publishable."
+                  }
+                ]
+              },
+              "doc": "The change in the board's net delta exposure across this level's band, in INDEX DELTA units, as a range (R-ENG-5). An integral over the band, not a derivative at the price (R-ENG-8b). A DIFFERENCE, which is the only form R-ENG-1a publishes. One of the five fields nobody changes."
+            },
+            {
+              "name": "exposureChangePoints",
+              "type": [
+                "null",
+                "double"
+              ],
+              "doc": "The same quantity in points. NULL in revision 1: R-ENG-5 publishes points only where a validated conversion exists (R-REL-2).",
+              "default": null
+            },
+            {
+              "name": "subStepResolution",
+              "type": "double"
+            },
+            {
+              "name": "label",
+              "type": [
+                "null",
+                "string"
+              ],
+              "doc": "One of the owner's five level names, or NULL where holdOrAccelerate is NEUTRAL, which carries no label at all (R-DIF-1).",
+              "default": null
+            }
+          ]
+        }
+      },
+      "doc": "The grid around spot, one row per level (R-A-2). Never absent: for Service A this and strikes ARE the record (C-6, R-IN-2).",
+      "default": []
+    },
+    {
+      "name": "strikes",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "StrikeRow",
+          "fields": [
+            {
+              "name": "strikeCents",
+              "type": "long",
+              "doc": "The strike in CENTS of SPX: this row's identity and the key of every map it is looked up in. Never a float (C-1)."
+            },
+            {
+              "name": "updatedAtMs",
+              "type": "long",
+              "doc": "Broker time of the chain record this row was last written from. A row KEPT across a partial chain record keeps its old stamp, which is what makes an unmentioned strike visibly stale (R-IN-8, RD-53 item 5)."
+            },
+            {
+              "name": "deltaBand",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "DeltaBand",
+                  "fields": [
+                    {
+                      "name": "upperEdge",
+                      "type": "double"
+                    },
+                    {
+                      "name": "lowerEdge",
+                      "type": "double"
+                    },
+                    {
+                      "name": "innerBand",
+                      "type": [
+                        "null",
+                        "Interval"
+                      ],
+                      "default": null
+                    },
+                    {
+                      "name": "lowerThreshold",
+                      "type": "double",
+                      "doc": "The delta the lower edge was computed at -- 0.05 (R-PUB-1 row d). A NAMED field and not one element of an array: avro 1.12.0 reads an array of double back at float precision, and a threshold that cannot be read back exactly cannot re-derive its edge."
+                    },
+                    {
+                      "name": "upperThreshold",
+                      "type": "double"
+                    }
+                  ]
+                }
+              ],
+              "doc": "The 0.05 and 0.95 delta edges at the current T and IV (R-PUB-1 row d). One of the five fields nobody changes.",
+              "default": null
+            },
+            {
+              "name": "board",
+              "type": {
+                "type": "record",
+                "name": "BoardAtStrike",
+                "fields": [
+                  {
+                    "name": "netGex",
+                    "type": "double"
+                  },
+                  {
+                    "name": "absGex",
+                    "type": "double"
+                  },
+                  {
+                    "name": "gammaSign",
+                    "type": "string"
+                  },
+                  {
+                    "name": "callGamma",
+                    "type": "double"
+                  },
+                  {
+                    "name": "callIv",
+                    "type": "double"
+                  },
+                  {
+                    "name": "netQuantity",
+                    "type": [
+                      "null",
+                      "double"
+                    ],
+                    "doc": "netGex / (callGamma * multiplier * spot^2 * 0.01) -- the inverse of the gamma exposure service's own dollarGammaPer1Pct, so the two cannot drift. It is the net quantity that reprices to that service's netGex at the CALL gamma, and it is NOT a contract count: netGex is a sum over two legs whose gammas differ. NULL where the strike is excluded.",
+                    "default": null
+                  },
+                  {
+                    "name": "strength",
+                    "type": "double"
+                  },
+                  {
+                    "name": "holdOrAccelerate",
+                    "type": "string"
+                  },
+                  {
+                    "name": "openInterest",
+                    "type": "long"
+                  },
+                  {
+                    "name": "excluded",
+                    "type": "boolean",
+                    "doc": "True where abs(callGamma) is under GAMMA_DIVIDE_FLOOR. Such a strike is EXCLUDED and never divided (R-ENG-1a): dividing by a near-zero gamma is how one far strike becomes the whole board."
+                  },
+                  {
+                    "name": "excludedReason",
+                    "type": [
+                      "null",
+                      "string"
+                    ],
+                    "default": null
+                  },
+                  {
+                    "name": "coverageConfidence",
+                    "type": "double",
+                    "doc": "The gamma exposure service's own confidence in its coverage, in [0,1], carried through UNCHANGED (R-BD-5). This service applies no threshold to it: a gate here would be this service deciding what that service's confidence means (RD-56). Published so a reader can apply their own."
+                  },
+                  {
+                    "name": "oiQuality",
+                    "type": "string",
+                    "doc": "That service's provenance word for the open interest behind this strike, carried through unchanged (R-BD-5). UNKNOWN is its own default."
+                  },
+                  {
+                    "name": "oiAgeMs",
+                    "type": "long",
+                    "doc": "The age in millis of the open-interest baseline that record used, carried through unchanged. -1 is that service's \"not stated\" and is kept as it arrived rather than clamped to zero (R-IN-2)."
+                  }
+                ]
+              },
+              "doc": "The strike's own board row: netGex as the gamma exposure service published it, its gammaSign, the call gamma, the inverted netQuantity, the strength and the reading (RD-57, R-ENG-1a). One of the five fields nobody changes. There is no position ledger behind it and no call/put split in it."
+            },
+            {
+              "name": "dayVolume",
+              "type": "long"
+            },
+            {
+              "name": "fresh",
+              "type": "boolean"
+            },
+            {
+              "name": "charmDrift",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "CharmDrift",
+                  "fields": [
+                    {
+                      "name": "h15",
+                      "type": "double",
+                      "doc": "The exposure change if price stands still for 15 minutes, index delta units, WITH SIGN (R-ENG-11)."
+                    },
+                    {
+                      "name": "h30",
+                      "type": "double"
+                    },
+                    {
+                      "name": "h60",
+                      "type": "double"
+                    },
+                    {
+                      "name": "horizonClamped",
+                      "type": "boolean",
+                      "doc": "True where a horizon was clamped to the session end (R-ENG-11a). A clamped 60-minute drift with 20 minutes left is a 20-minute drift, and a reader comparing it with an unclamped one compares two horizons."
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "vannaDrift",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "VannaDrift",
+                  "fields": [
+                    {
+                      "name": "value",
+                      "type": "double"
+                    },
+                    {
+                      "name": "probeStep",
+                      "type": "double"
+                    },
+                    {
+                      "name": "points",
+                      "type": [
+                        "null",
+                        "double"
+                      ],
+                      "default": null
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "moveState",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "MoveStateReading",
+                  "fields": [
+                    {
+                      "name": "state",
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "doc": "UNCHECKED, CHECKED or MIXED (R-MV-2). THREE values and not the old four renamed: the ratio route is withdrawn (R-MV-3) and there is no state meaning 'could not tell' -- that withholds the branch.",
+                      "default": null
+                    },
+                    {
+                      "name": "features",
+                      "type": [
+                        "null",
+                        {
+                          "type": "record",
+                          "name": "MoveFeatures",
+                          "fields": [
+                            {
+                              "name": "pullbackCount",
+                              "type": "int",
+                              "doc": "Count of M1 counter-pivots inside the leg anchored on the last confirmed M15 pivot (R-MV-1, R-MV-2). A COUNT, never compared with a ratio -- the ratio it used to be compared with is withdrawn (R-MV-3)."
+                            },
+                            {
+                              "name": "maxPullbackPoints",
+                              "type": "double"
+                            },
+                            {
+                              "name": "movePoints",
+                              "type": "double"
+                            },
+                            {
+                              "name": "minutes",
+                              "type": "double"
+                            },
+                            {
+                              "name": "speed",
+                              "type": "double",
+                              "doc": "SPX points per MINUTE, which is what MOVE_STRAIGHT_SPEED is compared against (R-MV-2). A rate, never compared with a point figure."
+                            }
+                          ]
+                        }
+                      ],
+                      "default": null
+                    },
+                    {
+                      "name": "confidence",
+                      "type": [
+                        "null",
+                        "double"
+                      ],
+                      "default": null
+                    },
+                    {
+                      "name": "withheldReason",
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "doc": "Non-null exactly when the move is withheld: the BRANCH withholds and the record still publishes (R-IN-10). features is then absent as a block, not zeroed (R-LAG-1b's discipline).",
+                      "default": null
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "decayToExpiry",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "DecayToExpiry",
+                  "fields": [
+                    {
+                      "name": "magnitude",
+                      "type": "double",
+                      "doc": "The size of the exposure change still to come between now and expiry, never negative: the direction is its own field (R-ENG-15). The one implemented form is exposure_K(expiry) - exposure_K(now) (R-DIF-3a); the owner's two source formulas are its negation and are historical."
+                    },
+                    {
+                      "name": "direction",
+                      "type": "string"
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "liveness",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "Liveness",
+                  "fields": [
+                    {
+                      "name": "statistic",
+                      "type": "double"
+                    },
+                    {
+                      "name": "live",
+                      "type": "string"
+                    },
+                    {
+                      "name": "subStepResolution",
+                      "type": "double",
+                      "doc": "The sweep resolution the statistic was computed at. A coarser sweep is a LOWER BOUND on a finer one (R-B-5b), so comparing two figures without this compares two different measurements."
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "theses",
+              "type": {
+                "type": "array",
+                "items": "string"
+              },
+              "default": []
+            }
+          ]
+        }
+      },
+      "doc": "Every listed strike within 100 points of spot (R-PUB-1 row d). Never absent.",
+      "default": []
+    },
+    {
+      "name": "charmTotal",
+      "type": [
+        "null",
+        "CharmDrift"
+      ],
+      "default": null
+    },
+    {
+      "name": "flips",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "Flip",
+          "fields": [
+            {
+              "name": "price",
+              "type": "double"
+            },
+            {
+              "name": "direction",
+              "type": "string"
+            },
+            {
+              "name": "bridgeLow",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            },
+            {
+              "name": "bridgeHigh",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            },
+            {
+              "name": "bridgeWidth",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            }
+          ]
+        }
+      },
+      "default": []
+    },
+    {
+      "name": "nearestFlip",
+      "type": [
+        "null",
+        "Flip"
+      ],
+      "default": null
+    },
+    {
+      "name": "pivotLadder",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "PivotLadder",
+          "fields": [
+            {
+              "name": "spot",
+              "type": "double"
+            },
+            {
+              "name": "minutesToExpiry",
+              "type": "double"
+            },
+            {
+              "name": "strikes",
+              "type": {
+                "type": "array",
+                "items": {
+                  "type": "record",
+                  "name": "StrikeBar",
+                  "fields": [
+                    {
+                      "name": "strike",
+                      "type": "double"
+                    },
+                    {
+                      "name": "netGamma",
+                      "type": "double"
+                    },
+                    {
+                      "name": "deltaBandLow",
+                      "type": "double"
+                    },
+                    {
+                      "name": "deltaBandHigh",
+                      "type": "double"
+                    }
+                  ]
+                }
+              },
+              "doc": "The per-strike bars. Every gamma figure in this block is in the BOARD's own gamma units (OD-15) and every price in SPX points; nothing here is index delta units or compared with one (R-LAD-1).",
+              "default": []
+            },
+            {
+              "name": "pivotUp",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "Pivot",
+                  "fields": [
+                    {
+                      "name": "strike",
+                      "type": "double"
+                    },
+                    {
+                      "name": "netGamma",
+                      "type": "double"
+                    },
+                    {
+                      "name": "jobDoneLevel",
+                      "type": "double"
+                    },
+                    {
+                      "name": "dealerAction",
+                      "type": "string"
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "pivotDown",
+              "type": [
+                "null",
+                "Pivot"
+              ],
+              "default": null
+            },
+            {
+              "name": "standingStillLean",
+              "type": "string"
+            },
+            {
+              "name": "outsideForce",
+              "type": "string"
+            },
+            {
+              "name": "outsideForceSide",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            },
+            {
+              "name": "outsideForceSinceMinutes",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            },
+            {
+              "name": "outsideForceReason",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "moveFeatures",
+      "type": [
+        "null",
+        "MoveFeatures"
+      ],
+      "doc": "Section 9's five operands, or NULL as a BLOCK where the move is withheld (R-LAG-1b's discipline) -- never zeroed.",
+      "default": null
+    },
+    {
+      "name": "lean",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "LeanAtDistance",
+          "fields": [
+            {
+              "name": "distancePoints",
+              "type": "double"
+            },
+            {
+              "name": "lean",
+              "type": "double"
+            },
+            {
+              "name": "upPush",
+              "type": "double"
+            },
+            {
+              "name": "downPush",
+              "type": "double"
+            },
+            {
+              "name": "alertRatio",
+              "type": "double"
+            }
+          ]
+        }
+      },
+      "default": []
+    },
+    {
+      "name": "chain",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "AccelerateChain",
+          "fields": [
+            {
+              "name": "levelsCents",
+              "type": {
+                "type": "array",
+                "items": "long"
+              },
+              "default": []
+            },
+            {
+              "name": "pathEnd",
+              "type": "double"
+            },
+            {
+              "name": "totalPoints",
+              "type": "double"
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "squeezeAlert",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "SqueezeAlert",
+          "fields": [
+            {
+              "name": "side",
+              "type": "string"
+            },
+            {
+              "name": "ratio",
+              "type": "double"
+            },
+            {
+              "name": "message",
+              "type": "string"
+            },
+            {
+              "name": "futuresCount",
+              "type": "int"
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "bounceTracker",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "BounceTracker",
+          "fields": [
+            {
+              "name": "strike",
+              "type": "double"
+            },
+            {
+              "name": "bouncePoints",
+              "type": "double"
+            },
+            {
+              "name": "decayUsed",
+              "type": "double"
+            },
+            {
+              "name": "pointsPerDecay",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            },
+            {
+              "name": "predictedBounce",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            },
+            {
+              "name": "decayExhausted",
+              "type": [
+                "null",
+                "boolean"
+              ],
+              "default": null
+            }
+          ]
+        }
+      },
+      "default": []
+    },
+    {
+      "name": "regimeAroundSpot",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "RegimeAroundSpot",
+          "fields": [
+            {
+              "name": "atSpot",
+              "type": "string"
+            },
+            {
+              "name": "changedThisEvaluation",
+              "type": "boolean"
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "desert",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "Desert",
+          "fields": [
+            {
+              "name": "desert",
+              "type": "boolean"
+            },
+            {
+              "name": "searchPoints",
+              "type": "double"
+            },
+            {
+              "name": "notradeReason",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "ladders",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "LadderBlock",
+          "fields": [
+            {
+              "name": "orientation",
+              "type": "string",
+              "doc": "UP or DOWN. A block read without it cannot be attributed to an instance (F-219)."
+            },
+            {
+              "name": "lowRung",
+              "type": "double"
+            },
+            {
+              "name": "highRung",
+              "type": "double"
+            },
+            {
+              "name": "rungCount",
+              "type": "int"
+            },
+            {
+              "name": "totalAbsGamma",
+              "type": "double"
+            },
+            {
+              "name": "largestRung",
+              "type": "double"
+            },
+            {
+              "name": "ladderPosition",
+              "type": "string"
+            },
+            {
+              "name": "rungsBelow",
+              "type": "int"
+            },
+            {
+              "name": "rungsAbove",
+              "type": "int"
+            },
+            {
+              "name": "expectedBottom",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "ExpectedBottom",
+                  "fields": [
+                    {
+                      "name": "strike",
+                      "type": "double"
+                    },
+                    {
+                      "name": "absGamma",
+                      "type": "double"
+                    },
+                    {
+                      "name": "reachableBy",
+                      "type": "string"
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "touch",
+              "type": "boolean"
+            },
+            {
+              "name": "fail",
+              "type": "boolean"
+            },
+            {
+              "name": "reclaim",
+              "type": "boolean"
+            },
+            {
+              "name": "unwindBias",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "UnwindBias",
+                  "fields": [
+                    {
+                      "name": "value",
+                      "type": "double"
+                    },
+                    {
+                      "name": "label",
+                      "type": "string"
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "unwindTarget",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "UnwindTarget",
+                  "fields": [
+                    {
+                      "name": "strike",
+                      "type": "double"
+                    },
+                    {
+                      "name": "stoppedBy",
+                      "type": "string"
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "ladderState",
+              "type": "string"
+            },
+            {
+              "name": "radarReads",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "RadarReads",
+                  "fields": [
+                    {
+                      "name": "sellersAbsorbed",
+                      "type": "boolean"
+                    },
+                    {
+                      "name": "aggressiveBuyer",
+                      "type": "boolean"
+                    },
+                    {
+                      "name": "tradingOffPeak",
+                      "type": "boolean"
+                    },
+                    {
+                      "name": "levelVolume",
+                      "type": "double"
+                    },
+                    {
+                      "name": "peakLevelVolume",
+                      "type": "double"
+                    },
+                    {
+                      "name": "liquidityBelowGone",
+                      "type": "boolean"
+                    },
+                    {
+                      "name": "nearContractsBelow",
+                      "type": "double"
+                    },
+                    {
+                      "name": "typicalBelow",
+                      "type": "double"
+                    },
+                    {
+                      "name": "changeThousandths",
+                      "type": "long"
+                    },
+                    {
+                      "name": "armedBy",
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "default": null
+                    },
+                    {
+                      "name": "rejectionStrength",
+                      "type": [
+                        "null",
+                        "double"
+                      ],
+                      "default": null
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            }
+          ]
+        }
+      },
+      "default": []
+    },
+    {
+      "name": "staircases",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "StaircaseBlock",
+          "fields": [
+            {
+              "name": "orientation",
+              "type": "string",
+              "doc": "UP or DOWN, for the same reason as the ladder's (F-219, R-SC-12)."
+            },
+            {
+              "name": "topRung",
+              "type": "double"
+            },
+            {
+              "name": "lowRung",
+              "type": "double"
+            },
+            {
+              "name": "rungCount",
+              "type": "int"
+            },
+            {
+              "name": "totalAbsGamma",
+              "type": "double"
+            },
+            {
+              "name": "topStep",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "TopStep",
+                  "fields": [
+                    {
+                      "name": "strike",
+                      "type": "double"
+                    },
+                    {
+                      "name": "absGamma",
+                      "type": "double"
+                    },
+                    {
+                      "name": "brake",
+                      "type": "double"
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "netPullAtSpot",
+              "type": "double"
+            },
+            {
+              "name": "netPullBelowTopStep",
+              "type": "double"
+            },
+            {
+              "name": "pinTarget",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "PinTarget",
+                  "fields": [
+                    {
+                      "name": "strike",
+                      "type": "double"
+                    },
+                    {
+                      "name": "stoppedBy",
+                      "type": "string"
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "touch",
+              "type": "boolean"
+            },
+            {
+              "name": "hold",
+              "type": "boolean"
+            },
+            {
+              "name": "stepsTaken",
+              "type": "int"
+            },
+            {
+              "name": "stairState",
+              "type": "string"
+            },
+            {
+              "name": "opposed",
+              "type": [
+                "null",
+                "boolean"
+              ],
+              "default": null
+            },
+            {
+              "name": "phrase",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "Phrase",
+                  "fields": [
+                    {
+                      "name": "text",
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "default": null
+                    },
+                    {
+                      "name": "arbitrated",
+                      "type": "boolean"
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            }
+          ]
+        }
+      },
+      "default": []
+    }
+  ]
+}
