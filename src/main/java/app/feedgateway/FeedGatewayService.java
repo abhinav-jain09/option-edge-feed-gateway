@@ -1188,6 +1188,22 @@ public class FeedGatewayService implements ReplayRunner {
      * may broadcast the record (everything except an oversize drop; the cache consumer never broadcasts).
      */
     boolean admitFootprintRecord(String event, String json, String consumer) {   // package-private: the wiring tests drive both consumer paths through it
+        // C-63: the readable page's own store is fed HERE, above the counting line and before any
+        // admission. Two reasons, and the second one is not about this feature at all.
+        //
+        // FootprintViews keeps ONE session date and clears every bar when it rolls; the page's night
+        // runs from the previous CASH close and so crosses that roll, so taking the view's bars
+        // would silently drop the first hour of the owner's night. The page's store is bounded by
+        // the night instead, and sees every bar record this consumer polled.
+        //
+        // And it sits ABOVE the line below rather than further down because G-R9.2's mutation
+        // quotes this method from that line through the admission as one block. Placing the tap
+        // inside that span left the quoted text no longer present in the file and the build refused
+        // to emit -- correctly. Keeping it above leaves that anchor verbatim, so the campaign still
+        // mutates the clause it claims to.
+        if ("es-footprint-bar".equals(event)) {
+            readableBoard.onBarJson(json);
+        }
         footprintCounter("records_total{event=\"" + event + "\",consumer=\"" + consumer + "\"}").incrementAndGet();
         if ("es-footprint-strike".equals(event)) {
             // ES-FOOTPRINT-STRIKE-INTERACTION.md R14: the strike log folds by identity/revision; a refused
@@ -1205,13 +1221,6 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (!"es-footprint-bar".equals(event) && !"es-footprint-outcome".equals(event)) {
             return true;                                            // live snapshots: never admitted to a view
-        }
-        if ("es-footprint-bar".equals(event)) {
-            // C-63: tapped BEFORE admitBar on purpose. FootprintViews keeps ONE session date and
-            // clears every bar when it rolls, but the readable page's night runs from the previous
-            // CASH close and so crosses that roll -- taking the view's bars would silently drop the
-            // first hour of the owner's night. The page's own store is bounded by the night instead.
-            readableBoard.onBarJson(json);
         }
         FootprintViews.Admission a = "es-footprint-bar".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);
         if (a.reason() != FootprintViews.Reason.ADMITTED) {
