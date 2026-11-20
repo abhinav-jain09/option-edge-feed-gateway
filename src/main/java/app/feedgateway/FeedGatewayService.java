@@ -1596,6 +1596,10 @@ public class FeedGatewayService implements ReplayRunner {
         // must be seeded. One topic, one partition, one record -- not a change of offset reset,
         // which would replay every large topic at every start.
         seedReadableBasis();
+        // Item 6: the feed gap, from the bars' OWN broker stamps. At start-up because the label
+        // has to survive a restart, and on a cadence because an outage that ends later is only
+        // visible once its backfill lands.
+        measureReadableFeedGap();
         executor.submit(this::runSelectionConsumer);
         executor.submit(this::runAvroLiveConsumer);
         executor.submit(this::runJsonStateLiveConsumer);
@@ -1615,6 +1619,14 @@ public class FeedGatewayService implements ReplayRunner {
                 settings.webSocketBatchMs(),
                 TimeUnit.MILLISECONDS
         );
+        // Item 6's re-measure, HERE and not beside its start-up call: batchExecutor is assigned
+        // immediately above, and scheduling against it any earlier threw a NullPointerException
+        // out of @PostConstruct -- the gateway would not have started at all. Caught by
+        // SocketLimitOverTheWireTest, which boots a real context; every test that does not boot one
+        // passed. An outage that ENDS mid-session is only visible once its backfill lands, which is
+        // why this repeats rather than running once.
+        batchExecutor.scheduleAtFixedRate(this::measureReadableFeedGap,
+                FEED_GAP_MEASURE_SECONDS, FEED_GAP_MEASURE_SECONDS, TimeUnit.SECONDS);
         // P0 (write deadline): force-close any socket whose send has been stuck past the deadline, freeing
         // its writer-pool thread so a few stuck/adversarial clients can never starve the healthy ones.
         batchExecutor.scheduleAtFixedRate(
@@ -13335,6 +13347,54 @@ public class FeedGatewayService implements ReplayRunner {
         } catch (RuntimeException e) {
             // Never abort @PostConstruct for this: the page states the absence and its reason.
             System.err.println("readable basis not seeded: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
+        }
+    }
+
+    /** One session plus the evening before it, the same window the snapshot rebuild uses. */
+    static final long FEED_GAP_WINDOW_MS = 30L * 3_600_000L;
+
+    /** How often the gap is re-measured, so an outage that ENDS mid-session is labelled too. */
+    static final long FEED_GAP_MEASURE_SECONDS = 300L;
+
+    /**
+     * <b>Item 6</b>: measure the feed gap from these bars' own broker stamps. Package-private so a
+     * test drives the real renderer with real pairs rather than asserting a line of source exists.
+     */
+    void measureReadableFeedGap(
+            java.util.Collection<app.feedgateway.readable.FeedGap.Published> bars) {
+        readableBoard.measureFeedGap(bars);
+    }
+
+    /**
+     * The real read: the bars of this session with the instant the broker holds for each.
+     *
+     * <p>Run at start-up AND on a cadence. At start-up because the measurement must survive a
+     * restart -- the first version took lateness from our own arrival clock, so #898's own rollout
+     * would have erased the label. On a cadence because a gap that ENDS after start-up only
+     * becomes visible when its backfill lands, and the backfill is exactly what this measures.
+     * Bounded by the same record ceiling as the other reads, and a failure leaves the previous
+     * measurement standing rather than flickering the owner's headline.
+     */
+    private void measureReadableFeedGap() {
+        try {
+            ReadableReferenceHistory history = new ReadableReferenceHistory(
+                    () -> new org.apache.kafka.clients.consumer.KafkaConsumer<String, Object>(
+                            avroConsumerProperties("readable-feedgap")),
+                    this::avroJson,
+                    this::avroJson,
+                    settings.underlyingSpxPriceTopic(),
+                    settings.esFootprintBarsTopic());
+            long now = System.currentTimeMillis();
+            measureReadableFeedGap(
+                    history.barPublishTimes(now - FEED_GAP_WINDOW_MS, now));
+            System.out.println("readable feed gap: "
+                    + (readableBoard.feedGap().label() == null
+                            ? "none" : readableBoard.feedGap().label())
+                    + " (" + readableBoard.feedGap().lateBars() + " late of "
+                    + readableBoard.feedGap().barsMeasured() + " bars measured)");
+        } catch (RuntimeException e) {
+            System.err.println("readable feed gap not measured: " + e.getClass().getSimpleName()
                     + ": " + e.getMessage());
         }
     }

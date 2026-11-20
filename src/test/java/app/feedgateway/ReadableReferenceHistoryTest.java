@@ -261,4 +261,68 @@ class ReadableReferenceHistoryTest {
         assertEquals(List.of("bar:generic-bar"),
                 history.barsBetween(NOW - 30L * 3_600_000L, NOW));
     }
+
+    @Test
+    @DisplayName("barPublishTimes pairs each bar's own minute with the BROKER's stamp")
+    void barPublishTimesUsesTheBrokerStamp() {
+        long barStart = NOW - 6L * 3_600_000L;
+        long publishedLate = barStart + 3L * 3_600_000L;      // backfilled three hours later
+        long punctual = barStart + 65_000L;
+
+        String late = bar(barStart);
+        String onTime = bar(barStart + 60_000L);
+
+        java.util.function.Supplier<org.apache.kafka.clients.consumer.Consumer<String, Object>>
+                consumers = () -> {
+                    Seeking c = new Seeking();
+                    c.hold(new TopicPartition(BARS, 0), List.of(
+                            record(BARS, 0L, publishedLate, late),
+                            record(BARS, 1L, punctual + 60_000L, onTime)));
+                    return c;
+                };
+
+        ReadableReferenceHistory history = new ReadableReferenceHistory(
+                consumers, v -> (String) v, v -> (String) v, PRICES, BARS);
+
+        var pairs = history.barPublishTimes(NOW - 30L * 3_600_000L, NOW);
+        assertEquals(2, pairs.size(), "both bars read: " + pairs);
+
+        var first = pairs.get(0);
+        assertEquals(barStart, first.barStartMs(),
+                "the bar's own minute comes from its own observations block");
+        assertEquals(publishedLate, first.publishedMs(),
+                "and the publish instant is the RECORD's timestamp, which is what survives a "
+                        + "restart -- not anything taken from our own clock");
+
+        app.feedgateway.readable.FeedGap gap = new app.feedgateway.readable.FeedGap();
+        gap.measure(pairs);
+        assertEquals(1, gap.lateBars(), "exactly the backfilled one is late");
+    }
+
+    @Test
+    @DisplayName("a bar with no readable minute is counted unconvertible, not paired with a guess")
+    void aBarWithNoMinuteIsRefused() {
+        java.util.function.Supplier<org.apache.kafka.clients.consumer.Consumer<String, Object>>
+                consumers = () -> {
+                    Seeking c = new Seeking();
+                    c.hold(new TopicPartition(BARS, 0), List.of(
+                            record(BARS, 0L, NOW - 3_600_000L, "{\"observations\":{}}")));
+                    return c;
+                };
+        ReadableReferenceHistory history = new ReadableReferenceHistory(
+                consumers, v -> (String) v, v -> (String) v, PRICES, BARS);
+
+        assertTrue(history.barPublishTimes(NOW - 30L * 3_600_000L, NOW).isEmpty());
+        var d = history.drains().get(0);
+        assertEquals(1, d.polled());
+        assertEquals(1, d.unconvertible(),
+                "a bar whose minute cannot be read is reported, never paired with a guessed one");
+        assertTrue(d.polledButConvertedNothing(), d.line());
+    }
+
+    /** A footprint bar carrying the one field the publish-time reader needs. */
+    private static String bar(long startMs) {
+        return "{\"schemaVersion\":6,\"symbol\":\"ES.v.0\",\"timeframe\":\"1m\","
+                + "\"observations\":{\"barStartMs\":" + startMs + ",\"volume\":1200}}";
+    }
 }
