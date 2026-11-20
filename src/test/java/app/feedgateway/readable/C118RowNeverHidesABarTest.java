@@ -242,6 +242,22 @@ final class C118RowNeverHidesABarTest {
         assertFalse(plain.contains("held"), "a live board says nothing about a hold: " + plain);
     }
 
+    @Test
+    @DisplayName("board| names the chain's own ends, so a SHORT GRID is not a MISSING FEED")
+    void theBoardLineNamesTheChainsEnds() {
+        ReadablePage.Board board = BoardLines.from(mapJson(false), FIRST);
+        assertNotNull(board);
+        assertEquals(710_000L, board.chainLowCents());
+        assertEquals(710_500L, board.chainHighCents());
+
+        String line = firstLineStartingWith(Pages.board(FIRST, null, board), "board|");
+        assertTrue(line.contains("|chain=7100-7105"), line);
+        assertTrue(line.contains("|rows="), "beside the row count and not instead of it: " + line);
+        // rows=N/41 with norow on six lines reads the same whether the chain stopped above the
+        // bottom of the owner's window (a short grid, following price) or spanned it and lost six
+        // strikes (a feed fault). These two numbers are what tell them apart.
+    }
+
     private static String firstLineStartingWith(String page, String prefix) {
         for (String line : page.split("\n")) {
             if (line.startsWith(prefix)) {

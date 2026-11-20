@@ -140,6 +140,7 @@ public final class Pages {
                 .append("|rows=").append(board.rowsPresent()).append('/')
                 .append(board.rowsExpected())
                 .append(board.published() < 0 ? "" : "|published=" + board.published())
+                .append(chainCell(board))
                 .append(holdCell(board.hold()))
                 .append('\n');
         if (PreopenBoard.SOURCE.equals(board.source())) {
@@ -408,6 +409,23 @@ public final class Pages {
         }
         return "grid|rows=" + recent.size() + "|missing=" + missing
                 + "|noSPX=" + noSpx + "|complete=" + complete + "\n";
+    }
+
+    /**
+     * The ends of the chain the record carried: {@code |chain=6995-7395}.
+     *
+     * <p><b>Why the row count is not enough.</b> {@code rows=35/41} with {@code norow} on six
+     * lines reads the same whether the gamma service published a chain that stops above the bottom
+     * of the owner's window, or published across it and lost six strikes. The first is a short
+     * grid and follows price; the second is a feed fault. The chain's own ends tell them apart in
+     * one glance, which is why the reviewer asked for them here rather than in a count.
+     */
+    static String chainCell(ReadablePage.Board board) {
+        if (!board.hasChainRange()) {
+            return "";
+        }
+        return "|chain=" + BoardLines.strikeOf(board.chainLowCents() / 100.0)
+                + "-" + BoardLines.strikeOf(board.chainHighCents() / 100.0);
     }
 
     /**
