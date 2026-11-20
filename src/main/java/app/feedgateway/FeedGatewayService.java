@@ -1579,6 +1579,10 @@ public class FeedGatewayService implements ReplayRunner {
         // gone, at the hour he needs it. Best effort by construction: a failure leaves the page
         // saying NO REFERENCE PRICE with its reason, which is honest, and never stops start-up.
         seedReadableReference();
+        // C-71: and the session's path of sides, from the same history. A restart otherwise left
+        // the owner's crossings and holding times at zero, which reads as a quiet session rather
+        // than a short memory. Best effort, like the seed above.
+        rebuildReadableSides();
         executor.submit(this::runSelectionConsumer);
         executor.submit(this::runAvroLiveConsumer);
         executor.submit(this::runJsonStateLiveConsumer);
@@ -3234,6 +3238,9 @@ public class FeedGatewayService implements ReplayRunner {
         // remembers to set -- and nothing is exposed by binding it: its updateCache case caches
         // nothing, returns null, and so can never satisfy a broadcast guard.
         topicEvents.put(settings.gexPreopenTopic(), new TopicBinding("DATABENTO", "gex-preopen"));
+        // C-69: the basis state, for the readable page's display cells only. Same shape as the
+        // pre-open tap: its cache case returns null, so it can never satisfy a broadcast guard.
+        topicEvents.put(settings.basisStateTopic(), new TopicBinding("DATABENTO", "spx-basis"));
         // THE GAMMA EFFORT reading, JSON on the wire like the gamma zone above and bound on the
         // same JSON consumers for the same reason.
         if (settings.gammaEffortEnabled()) {
@@ -3533,6 +3540,9 @@ public class FeedGatewayService implements ReplayRunner {
         // remembers to set -- and nothing is exposed by binding it: its updateCache case caches
         // nothing, returns null, and so can never satisfy a broadcast guard.
         topicEvents.put(settings.gexPreopenTopic(), new TopicBinding("DATABENTO", "gex-preopen"));
+        // C-69: the basis state, for the readable page's display cells only. Same shape as the
+        // pre-open tap: its cache case returns null, so it can never satisfy a broadcast guard.
+        topicEvents.put(settings.basisStateTopic(), new TopicBinding("DATABENTO", "spx-basis"));
         // THE GAMMA EFFORT reading, JSON on the wire like the gamma zone above and bound on the
         // same JSON consumers for the same reason.
         if (settings.gammaEffortEnabled()) {
@@ -7174,6 +7184,10 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 indicatorsCurrent.put(key, json);
+                // C-69/C-65/C-71: the readable page's VWAP cells and its path of sides. Tapped
+                // here, after the supersession gate above, so a retired-run or regressed record
+                // can never advance the owner's crossing count.
+                readableBoard.onIndicatorsJson(json);
                 return key;
             }
             case "indicator-signals" -> {
@@ -7386,6 +7400,13 @@ public class FeedGatewayService implements ReplayRunner {
                 gammaZones.put(key, json);
                 return key;
             }
+            case "spx-basis" -> {
+                // C-69: tapped for the readable page and nothing else. Returns null for the same
+                // reason the pre-open case does: a null cacheKey cannot satisfy any broadcast
+                // guard, so this record reaches no websocket, no ui-batch row and no /api cache.
+                readableBoard.onBasisJson(json);
+                return null;
+            }
             case "gex-preopen" -> {
                 // C-61: the pre-open board, tapped for the readable page and NOTHING else.
                 //
@@ -7407,6 +7428,7 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gammaZoneProfiles.put(key, json);
+                readableBoard.onProfileJson(json);   // C-66's footprint-by-price page
                 return key;
             }
             case "gamma-effort" -> {
@@ -9095,6 +9117,16 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     /** <b>C-61</b>: the bytes of the readable page, as last rendered. Never null, never empty. */
+    /** A footprint bar straight into the readable store, for the reachability test. */
+    void readableBarForTest(String json) {
+        readableBoard.onBarJson(json);
+    }
+
+    /** C-66: one named page of the readable record, or null where the name is not a page. */
+    public String readableNamedPage(String name, int part) {
+        return readableBoard.namedPage(name, part);
+    }
+
     public String readableBoardPage() {
         return readableBoard.page();
     }
@@ -13184,6 +13216,45 @@ public class FeedGatewayService implements ReplayRunner {
     void seedReadableReference(app.feedgateway.readable.ReferencePrice.History history) {
         readableBoard.seedReference(app.feedgateway.readable.ReferencePrice.resolve(
                 System.currentTimeMillis(), history));
+    }
+
+    /** C-71's start-up rebuild. Package-private so the wiring test drives it with real records. */
+    int rebuildReadableSides(java.util.Collection<String> snapshots) {
+        return readableBoard.rebuildSides(snapshots);
+    }
+
+    /** The real seek: this session's snapshots off the indicators topic. */
+    private void rebuildReadableSides() {
+        try {
+            String topic = settings.indicatorsSnapshotTopic();
+            if (topic == null || topic.isBlank()) {
+                return;
+            }
+            // The INDICATOR converter, not the generic one. The indicator bindings have their own
+            // boundary (Kafka Serialization Rule): indicatorJson re-emits the contract's JSON with
+            // decimals as the exact numbers they were, while AvroJson's generic rendering is
+            // explicitly not to be used for this record. Converting the history with the generic
+            // renderer would have produced JSON the rebuild cannot read, and C-71 would have
+            // replayed ZERO snapshots in production while every test passed.
+            ReadableReferenceHistory history = new ReadableReferenceHistory(
+                    () -> new org.apache.kafka.clients.consumer.KafkaConsumer<String, Object>(
+                            avroConsumerProperties("readable-sides")),
+                    v -> {
+                        try {
+                            return indicatorJson(v, "indicators");
+                        } catch (RuntimeException notTheSnapshot) {
+                            return null;      // counted as unusable, never guessed at
+                        }
+                    }, topic, topic);
+            int replayed = rebuildReadableSides(
+                    history.sessionSnapshots(System.currentTimeMillis(), topic));
+            System.out.println("readable side path rebuilt from " + replayed + " snapshot(s)");
+        } catch (RuntimeException e) {
+            // The page prints observedFromMs, so a failed rebuild shows as a short path rather
+            // than as a wrong one. Never abort @PostConstruct for it.
+            System.err.println("readable side path not rebuilt at start-up: "
+                    + e.getClass().getSimpleName());
+        }
     }
 
     /** The real seeks: the gateway's own Avro client and its own record-to-JSON conversion. */

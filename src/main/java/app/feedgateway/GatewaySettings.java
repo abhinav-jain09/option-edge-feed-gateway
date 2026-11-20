@@ -1553,6 +1553,20 @@ public final class GatewaySettings {
      * comes round. Measured on 2026-11-19, its first record was 09:15:58 New York while this
      * topic's board was already complete at 06:43:02 — 41 of the owner's 41 grid rows.
      */
+    /**
+     * The ES-to-SPX basis state (<b>C-69</b>), for the readable page's display cells.
+     *
+     * <p><b>Plain JSON, not Avro.</b> A Confluent-framed reader returns nothing from this topic,
+     * which has caught this estate before, so the reader says so in its own documentation rather
+     * than letting it be rediscovered. Retention is unlimited and the topic has one partition.
+     *
+     * <p>Nothing here applies a basis: only an {@code ANCHORED} state translates anything, and the
+     * reader refuses to produce an SPX-equivalent under any other state.
+     */
+    public String basisStateTopic() {
+        return value("KAFKA_SPX_BASIS_STATE_TOPIC", "spx.basis.state");
+    }
+
     public String gexPreopenTopic() {
         return value("KAFKA_DATABENTO_GEX_PREOPEN_TOPIC", "options.databento.gex.strike.preopen");
     }

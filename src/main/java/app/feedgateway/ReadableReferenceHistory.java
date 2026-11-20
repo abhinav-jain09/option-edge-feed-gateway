@@ -36,6 +36,9 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
     /** How far back to look for the session's bars. One session plus the evening before it. */
     static final long BAR_LOOKBACK_MS = 30L * 3_600_000L;
 
+    /** One session plus the evening before it: enough to rebuild the path, not a week of it. */
+    static final long SNAPSHOT_LOOKBACK_MS = 30L * 3_600_000L;
+
     /** A bound on the drain, so a busy topic cannot turn start-up into a replay. */
     static final int MAX_RECORDS = 20_000;
 
@@ -65,6 +68,16 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
     @Override
     public List<String> cashSessionBars(long beforeMs) {
         return drain(barTopic, beforeMs - BAR_LOOKBACK_MS, beforeMs, MAX_RECORDS);
+    }
+
+    /**
+     * <b>C-71</b>: the ES indicators snapshots of this session, for the side-path rebuild.
+     *
+     * <p>The same bounded, by-time seek: the topic holds seven days and reading it from offset
+     * zero at every start-up would be a replay of a week for one session's worth of records.
+     */
+    List<String> sessionSnapshots(long beforeMs, String snapshotTopic) {
+        return drain(snapshotTopic, beforeMs - SNAPSHOT_LOOKBACK_MS, beforeMs, MAX_RECORDS);
     }
 
     /**
