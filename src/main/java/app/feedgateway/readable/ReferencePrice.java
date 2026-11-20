@@ -1,5 +1,9 @@
 package app.feedgateway.readable;
 
+import java.time.Instant;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -80,16 +84,22 @@ public final class ReferencePrice {
      */
     public interface History {
         /**
-         * Price records at or before {@code beforeMs}, newest first, as published.
-         * May return fewer than asked, or none.
+         * Every price record in {@code [fromMs, toMs]}, as published, up to {@code limit}.
+         *
+         * <p>A <b>window</b>, not a look-back with a record cap. The first version of this took
+         * {@code (beforeMs, limit)} and the implementation seeked to {@code beforeMs - 96h} and
+         * read 500 records FORWARD — so it returned 500 records from four days ago and never saw
+         * the recent close. Reaching the 16:04 index print from 22:39 meant scanning about 24,000
+         * basis-derived records (measured: the newest 4,003 carry no index print at all). The
+         * caller now asks for the window it wants and steps outward, so the work is bounded at
+         * each step and the answer is the one it was looking for.
          */
-        List<String> pricesBefore(long beforeMs, int limit);
+        List<String> pricesBetween(long fromMs, long toMs, int limit);
 
         /**
-         * The complete bars of the cash session that ended at or before {@code beforeMs}, oldest
-         * first, as published.
+         * Bars in {@code [fromMs, toMs]}, as published, oldest first.
          */
-        List<String> cashSessionBars(long beforeMs);
+        List<String> barsBetween(long fromMs, long toMs);
     }
 
     private ReferencePrice() {
@@ -101,6 +111,31 @@ public final class ReferencePrice {
      * @param beforeMs the instant to look back from — the previous cash close
      * @param history  the seeks, or null where the gateway cannot read back at all
      */
+    /**
+     * How far back to look for the index print, in widening steps.
+     *
+     * <p>The index prints only during the cash session, so from any overnight hour the answer is a
+     * few hours back and the FIRST or second slice finds it. The wider slices exist for a weekend
+     * or a holiday. Each is drained on its own, so no step is unbounded.
+     */
+    static final long[] PRICE_SLICES_MS = {
+        2L * 3_600_000L, 8L * 3_600_000L, 16L * 3_600_000L, 30L * 3_600_000L, 96L * 3_600_000L
+    };
+
+    /** A bound on one slice's drain. A slice that needs more than this is already too wide. */
+    static final int SLICE_LIMIT = 60_000;
+
+    private static final ZoneId NY = ZoneId.of("America/New_York");
+    /** The cash session, which is what "a cash-session bar" has to mean. */
+    static final LocalTime CASH_OPEN = LocalTime.of(9, 30);
+    static final LocalTime CASH_CLOSE = LocalTime.of(16, 0);
+
+    /**
+     * Resolve the reference, preferring the index print.
+     *
+     * @param beforeMs the instant to look back from
+     * @param history  the seeks, or null where the gateway cannot read back at all
+     */
     public static Resolved resolve(long beforeMs, History history) {
         if (history == null) {
             return new Resolved(null, Double.NaN, Double.NaN, From.NONE,
@@ -108,33 +143,31 @@ public final class ReferencePrice {
                             + "learned by waiting for the next index print");
         }
 
-        List<String> prices = safe(history.pricesBefore(beforeMs, 500));
-        ReadablePage.Price newestIndexPrint = null;
-        for (String json : prices) {
-            ReadablePage.Price p = OvernightDecoders.price(json, 0L);
-            if (p == null || !OvernightSource.isIndexPrint(p)) {
-                continue;                       // the overnight derivation is never a close
+        // The index print, in widening slices. The newest one at or before the instant IS the
+        // previous cash close, because the index prints only while the cash session is open.
+        for (long slice : PRICE_SLICES_MS) {
+            ReadablePage.Price newest = newestIndexPrint(
+                    safe(history.pricesBetween(beforeMs - slice, beforeMs, SLICE_LIMIT)), beforeMs);
+            if (newest != null) {
+                List<String> bars = safe(history.barsBetween(
+                        sessionOpenMsFor(newest.epochMs()), newest.epochMs()));
+                double[] range = rangeOf(bars);
+                return new Resolved(newest, range[0], range[1], From.INDEX_PRINT,
+                        "the last index print at or before the close, found within "
+                                + (slice / 3_600_000L) + " hours");
             }
-            if (p.epochMs() > beforeMs) {
-                continue;                       // after the close is not this session's close
-            }
-            if (newestIndexPrint == null || p.epochMs() > newestIndexPrint.epochMs()) {
-                newestIndexPrint = p;
-            }
-        }
-        if (newestIndexPrint != null) {
-            double[] range = rangeOf(history.cashSessionBars(beforeMs));
-            return new Resolved(newestIndexPrint, range[0], range[1], From.INDEX_PRINT,
-                    "the last index print at or before the close");
         }
 
-        // The index print is gone from the topic. The bars are the other measurement of the same
-        // session, and they carry their own SPX-equivalent, so nothing is derived here.
-        List<String> bars = safe(history.cashSessionBars(beforeMs));
+        // No index print anywhere we can read. The bars are the other measurement of the same
+        // session and carry their own SPX-equivalent, so nothing is derived here -- but only a bar
+        // INSIDE the cash session may be called a cash-session bar. The first version of this took
+        // the newest bar in a 30-hour window, which overnight is an evening bar, and labelled it
+        // as the cash session's. That label was false and the figure was 4.8 points out.
+        List<String> window = safe(history.barsBetween(beforeMs - 30L * 3_600_000L, beforeMs));
         OvernightGrid.Bar last = null;
-        for (String json : bars) {
+        for (String json : window) {
             OvernightGrid.Bar b = OvernightDecoders.bar(json);
-            if (b == null) {
+            if (b == null || !inCashSession(b.startMs())) {
                 continue;
             }
             if (last == null || b.startMs() > last.startMs()) {
@@ -142,7 +175,14 @@ public final class ReferencePrice {
             }
         }
         if (last != null) {
-            double[] range = rangeOf(bars);
+            List<String> sessionBars = new ArrayList<>();
+            for (String json : window) {
+                OvernightGrid.Bar b = OvernightDecoders.bar(json);
+                if (b != null && inCashSession(b.startMs()) && sameNyDate(b.startMs(), last.startMs())) {
+                    sessionBars.add(json);
+                }
+            }
+            double[] range = rangeOf(sessionBars);
             return new Resolved(
                     new ReadablePage.Price(last.startMs(), last.close(), "FOOTPRINT_BAR_SPX_EQ",
                             "CASH_SESSION_LAST_COMPLETE_BAR"),
@@ -155,6 +195,38 @@ public final class ReferencePrice {
                 "neither an index print nor a complete cash-session bar remains in the history "
                         + "this gateway can read, so the close is not recoverable and the "
                         + "overnight rows appear at the next index print");
+    }
+
+    /** The newest index print at or before the instant, or null. */
+    private static ReadablePage.Price newestIndexPrint(List<String> records, long beforeMs) {
+        ReadablePage.Price newest = null;
+        for (String json : records) {
+            ReadablePage.Price p = OvernightDecoders.price(json, 0L);
+            if (p == null || !OvernightSource.isIndexPrint(p) || p.epochMs() > beforeMs) {
+                continue;               // the overnight derivation is never a close
+            }
+            if (newest == null || p.epochMs() > newest.epochMs()) {
+                newest = p;
+            }
+        }
+        return newest;
+    }
+
+    /** Is this bar inside the cash session, which is what the label claims? */
+    static boolean inCashSession(long atMs) {
+        LocalTime t = Instant.ofEpochMilli(atMs).atZone(NY).toLocalTime();
+        return !t.isBefore(CASH_OPEN) && t.isBefore(CASH_CLOSE);
+    }
+
+    private static boolean sameNyDate(long a, long b) {
+        return Instant.ofEpochMilli(a).atZone(NY).toLocalDate()
+                .equals(Instant.ofEpochMilli(b).atZone(NY).toLocalDate());
+    }
+
+    /** The cash open of the New York date the given instant falls in. */
+    private static long sessionOpenMsFor(long atMs) {
+        return Instant.ofEpochMilli(atMs).atZone(NY).toLocalDate()
+                .atTime(CASH_OPEN).atZone(NY).toInstant().toEpochMilli();
     }
 
     /** The session's high and low from its bars, or NaN where there are none. */

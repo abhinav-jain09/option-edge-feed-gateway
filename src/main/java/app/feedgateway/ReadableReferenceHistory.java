@@ -30,12 +30,11 @@ import org.apache.kafka.common.TopicPartition;
  */
 final class ReadableReferenceHistory implements ReferencePrice.History {
 
-    /** How far back to look for the index print. Comfortably past a weekend plus a holiday. */
-    static final long PRICE_LOOKBACK_MS = 96L * 3_600_000L;
-
-    /** How far back to look for the session's bars. One session plus the evening before it. */
-    static final long BAR_LOOKBACK_MS = 30L * 3_600_000L;
-
+    /**
+     * A bound on one drain. The caller asks for a time WINDOW and chooses how wide; this class
+     * only reads what it is asked for, so a look-back constant here would be a second opinion
+     * about a question the caller already answered.
+     */
     /** One session plus the evening before it: enough to rebuild the path, not a week of it. */
     static final long SNAPSHOT_LOOKBACK_MS = 30L * 3_600_000L;
 
@@ -61,13 +60,13 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
     }
 
     @Override
-    public List<String> pricesBefore(long beforeMs, int limit) {
-        return drain(priceTopic, beforeMs - PRICE_LOOKBACK_MS, beforeMs, limit);
+    public List<String> pricesBetween(long fromMs, long toMs, int limit) {
+        return drain(priceTopic, fromMs, toMs, limit);
     }
 
     @Override
-    public List<String> cashSessionBars(long beforeMs) {
-        return drain(barTopic, beforeMs - BAR_LOOKBACK_MS, beforeMs, MAX_RECORDS);
+    public List<String> barsBetween(long fromMs, long toMs) {
+        return drain(barTopic, fromMs, toMs, MAX_RECORDS);
     }
 
     /**

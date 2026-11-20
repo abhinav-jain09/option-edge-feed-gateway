@@ -41,19 +41,47 @@ class ReferencePriceTest {
                 + "\"volume\":1200}}";
     }
 
-    /** History as the gateway would read it back: newest-first prices, oldest-first bars. */
+    /**
+     * History as the gateway reads it: a real time WINDOW, so a test cannot accidentally hand the
+     * resolver records it would never have seen. Every fixture record carries its own instant and
+     * only those inside the asked-for window are returned.
+     */
     private static ReferencePrice.History history(List<String> prices, List<String> bars) {
         return new ReferencePrice.History() {
             @Override
-            public List<String> pricesBefore(long beforeMs, int limit) {
-                return prices;
+            public List<String> pricesBetween(long fromMs, long toMs, int limit) {
+                return within(prices, fromMs, toMs, ReferencePriceTest::priceAt);
             }
 
             @Override
-            public List<String> cashSessionBars(long beforeMs) {
-                return bars;
+            public List<String> barsBetween(long fromMs, long toMs) {
+                return within(bars, fromMs, toMs, ReferencePriceTest::barAt);
             }
         };
+    }
+
+    private static List<String> within(List<String> all, long fromMs, long toMs,
+            java.util.function.ToLongFunction<String> at) {
+        List<String> out = new ArrayList<>();
+        for (String j : all) {
+            long t = at.applyAsLong(j);
+            if (t >= fromMs && t <= toMs) {
+                out.add(j);
+            }
+        }
+        return out;
+    }
+
+    private static long priceAt(String json) {
+        java.util.regex.Matcher m =
+                java.util.regex.Pattern.compile("\"spotEventTimeNs\":(\\d+)").matcher(json);
+        return m.find() ? Long.parseLong(m.group(1)) / 1_000_000L : 0L;
+    }
+
+    private static long barAt(String json) {
+        java.util.regex.Matcher m =
+                java.util.regex.Pattern.compile("\"barStartMs\":(\\d+)").matcher(json);
+        return m.find() ? Long.parseLong(m.group(1)) : 0L;
     }
 
     /** The real shape: an index print at the close, then hours of ES-basis derivation after it. */
@@ -77,6 +105,74 @@ class ReferencePriceTest {
         assertEquals(7176.24, r.close().spx(), 1e-9,
                 "the previous cash close, recovered rather than waited for");
         assertTrue(r.label().contains("SPX index's own last print"), r.label());
+    }
+
+    @Test
+    @DisplayName("THE LIVE FAILURE: asked at 22:39, it finds the 16:04 index print, not an 18:15 bar")
+    void theIndexPrintIsReachedFromTheMiddleOfTheNight() {
+        // Exactly what the deployed page got wrong on 2026-11-20. The index print is at 16:04:03
+        // New York; the price topic then carries hours of ES_BASIS_DERIVED on top of it (measured
+        // live: the newest 4,003 records contain no index print at all); and the bars run on until
+        // they stall at 18:16. Asked at 22:39, the first version seeked to 96 hours back, read 500
+        // records FORWARD, saw nothing useful, and fell through to an 18:15 bar -- labelling an
+        // evening bar "a cash-session bar" and putting the close 4.8 points out.
+        long close = CLOSE + 4L * 60_000L + 3_000L;          // 16:04:03 New York
+        long askedAt = CLOSE + 6L * 3_600_000L + 39L * 60_000L;   // 22:39 New York
+
+        List<String> prices = new ArrayList<>();
+        prices.add(priceJson(close, 7176.24, "NATIVE_SPX_INDEX", "LIVE_INDEX"));
+        // six and a half hours of basis-derived prints after it, every ten seconds
+        for (long t = close + 10_000L; t <= askedAt; t += 10_000L) {
+            prices.add(priceJson(t, 7160.00, "ES_BASIS_DERIVED", "LIVE_ES_BASIS"));
+        }
+        List<String> bars = List.of(
+                barJson(CLOSE - 60_000L, 717_624L),                       // inside the session
+                barJson(CLOSE + 2L * 3_600_000L + 15L * 60_000L, 717_145L));  // 18:15, outside it
+
+        ReferencePrice.Resolved r = ReferencePrice.resolve(askedAt, history(prices, bars));
+
+        assertEquals(ReferencePrice.From.INDEX_PRINT, r.from(),
+                "the index print is there and must be found: " + r.reason());
+        assertEquals(7176.24, r.close().spx(), 1e-9, "and it is the close, not an evening bar");
+        assertEquals(close, r.close().epochMs(), "stamped 16:04:03, not 18:15");
+        assertTrue(prices.size() > 2000,
+                "the fixture really does bury the print under hours of basis prints: "
+                        + prices.size() + " records");
+    }
+
+    @Test
+    @DisplayName("an evening bar is never called a cash-session bar")
+    void onlyACashSessionBarCanBeTheFallback() {
+        // No index print at all, and the only bars are after the close. The label would be false,
+        // so there is no resolution rather than a mislabelled one.
+        long askedAt = CLOSE + 6L * 3_600_000L;
+        ReferencePrice.Resolved r = ReferencePrice.resolve(askedAt, history(List.of(),
+                List.of(barJson(CLOSE + 2L * 3_600_000L + 15L * 60_000L, 717_145L))));
+        assertEquals(ReferencePrice.From.NONE, r.from(),
+                "an 18:15 bar is not the cash session's and must not be presented as it: "
+                        + r.reason());
+        assertNull(r.close());
+
+        // Add one bar INSIDE the session and it becomes the fallback.
+        ReferencePrice.Resolved ok = ReferencePrice.resolve(askedAt, history(List.of(),
+                List.of(barJson(CLOSE - 60_000L, 717_624L),
+                        barJson(CLOSE + 2L * 3_600_000L + 15L * 60_000L, 717_145L))));
+        assertEquals(ReferencePrice.From.FOOTPRINT_BAR, ok.from());
+        assertEquals(7176.24, ok.close().spx(), 1e-9,
+                "the last bar INSIDE the session, not the newest bar in the window");
+    }
+
+    @Test
+    @DisplayName("the cash session is 09:30 to 16:00 New York, and the boundaries are checked")
+    void theCashSessionBoundsAreTheRealOnes() {
+        long open = java.time.LocalDate.of(2026, 11, 19).atTime(9, 30)
+                .atZone(java.time.ZoneId.of("America/New_York")).toInstant().toEpochMilli();
+        assertTrue(ReferencePrice.inCashSession(open), "09:30 is in");
+        assertTrue(ReferencePrice.inCashSession(open + 6L * 3_600_000L + 29L * 60_000L),
+                "15:59 is in");
+        assertFalse(ReferencePrice.inCashSession(open - 60_000L), "09:29 is not");
+        assertFalse(ReferencePrice.inCashSession(open + 6L * 3_600_000L + 30L * 60_000L),
+                "16:00 itself is not: the close ENDS the session");
     }
 
     @Test
