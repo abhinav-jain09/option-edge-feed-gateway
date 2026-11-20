@@ -5,6 +5,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import org.apache.kafka.clients.consumer.Consumer;
@@ -83,6 +84,8 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
         }
     }
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     private final List<Drain> drains = new java.util.ArrayList<>();
 
     /** Every drain this instance performed, newest last. Read by the wiring tests. */
@@ -90,10 +93,10 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
         return List.copyOf(drains);
     }
 
-    private List<String> record(Drain d, List<String> out) {
+    private Drain record(Drain d) {
         drains.add(d);
         System.out.println(d.line());
-        return out;
+        return d;
     }
 
     private final Supplier<Consumer<String, Object>> consumers;
@@ -135,12 +138,60 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
 
     @Override
     public List<String> pricesBetween(long fromMs, long toMs, int limit) {
-        return drain(priceTopic, fromMs, toMs, limit, priceToJson);
+        return asJson(priceTopic, fromMs, toMs, limit, priceToJson);
     }
 
     @Override
     public List<String> barsBetween(long fromMs, long toMs) {
-        return drain(barTopic, fromMs, toMs, MAX_RECORDS, barToJson);
+        return asJson(barTopic, fromMs, toMs, MAX_RECORDS, barToJson);
+    }
+
+    /**
+     * <b>Item 6</b>: each bar's own minute with the instant the BROKER holds for its record.
+     *
+     * <p>The publish lag is the one measurement of feed lateness that survives a restart, because
+     * it travels with the record instead of being taken from our own clock as the record arrives.
+     */
+    List<app.feedgateway.readable.FeedGap.Published> barPublishTimes(long fromMs, long toMs) {
+        List<app.feedgateway.readable.FeedGap.Published> out = new ArrayList<>();
+        drainInto(barTopic, fromMs, toMs, MAX_RECORDS, one -> {
+            String json = barToJson.apply(one.value());
+            Long start = barStartMs(json);
+            if (start == null) {
+                return false;
+            }
+            out.add(new app.feedgateway.readable.FeedGap.Published(start, one.timestamp()));
+            return true;
+        });
+        return out;
+    }
+
+    /** The bar's own minute, from the record the gateway converted. */
+    private static Long barStartMs(String json) {
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode o =
+                    MAPPER.readTree(json).path("observations").path("barStartMs");
+            return o.isNumber() ? o.longValue() : null;
+        } catch (Exception malformed) {
+            return null;
+        }
+    }
+
+    private List<String> asJson(String topic, long fromMs, long toMs, int limit,
+            Function<Object, String> toJson) {
+        List<String> out = new ArrayList<>();
+        drainInto(topic, fromMs, toMs, limit, one -> {
+            String json = toJson.apply(one.value());
+            if (json == null || json.isBlank()) {
+                return false;
+            }
+            out.add(json);
+            return true;
+        });
+        return out;
     }
 
     /**
@@ -150,7 +201,7 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
      * zero at every start-up would be a replay of a week for one session's worth of records.
      */
     List<String> sessionSnapshots(long beforeMs, String snapshotTopic) {
-        return drain(snapshotTopic, beforeMs - SNAPSHOT_LOOKBACK_MS, beforeMs, MAX_RECORDS,
+        return asJson(snapshotTopic, beforeMs - SNAPSHOT_LOOKBACK_MS, beforeMs, MAX_RECORDS,
                 priceToJson);
     }
 
@@ -161,26 +212,37 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
      * are retained unlimited, and reading one from offset zero at every start-up would be minutes
      * of replay for a handful of records that matter.
      */
-    private List<String> drain(String topic, long fromMs, long toMs, int limit,
-            Function<Object, String> toJson) {
+    /**
+     * What one in-window record is turned into. Returns whether it yielded something usable, so
+     * the drain can report "polled plenty, converted none" without knowing what a reader wants.
+     */
+    private interface Sink {
+        boolean take(ConsumerRecord<String, Object> record);
+    }
+
+    /**
+     * <b>One seek, for every reader.</b> The JSON reader and the publish-time reader share this
+     * because two copies of a by-timestamp seek is two places for the next fix to miss — the same
+     * shape of defect as the two differently-filtered indicator paths this change set also closes.
+     */
+    private Drain drainInto(String topic, long fromMs, long toMs, int limit, Sink sink) {
         if (topic == null || topic.isBlank() || limit <= 0) {
             return record(new Drain(String.valueOf(topic), fromMs, toMs, 0, 0, 0, 0,
-                    "no topic bound"), List.of());
+                    "no topic bound"));
         }
-        List<String> out = new ArrayList<>();
+        int taken = 0;
         int polled = 0;
         int outsideWindow = 0;
         int unconvertible = 0;
         try (Consumer<String, Object> consumer = consumers.get()) {
             if (consumer == null) {
-                return record(new Drain(topic, fromMs, toMs, 0, 0, 0, 0,
-                        "no consumer"), List.of());
+                return record(new Drain(topic, fromMs, toMs, 0, 0, 0, 0, "no consumer"));
             }
             List<TopicPartition> parts = new ArrayList<>();
             var infos = consumer.partitionsFor(topic, Duration.ofSeconds(10));
             if (infos == null || infos.isEmpty()) {
                 return record(new Drain(topic, fromMs, toMs, 0, 0, 0, 0,
-                        "topic has no partitions"), List.of());
+                        "topic has no partitions"));
             }
             for (var info : infos) {
                 parts.add(new TopicPartition(topic, info.partition()));
@@ -208,11 +270,11 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
             }
             if (!any) {
                 return record(new Drain(topic, fromMs, toMs, 0, 0, 0, 0,
-                        "no partition holds a record at or after the window start"), List.of());
+                        "no partition holds a record at or after the window start"));
             }
 
             int empties = 0;
-            while (out.size() < limit && empties < 3) {
+            while (taken < limit && empties < 3) {
                 ConsumerRecords<String, Object> batch = consumer.poll(Duration.ofSeconds(2));
                 if (batch == null || batch.isEmpty()) {
                     empties++;
@@ -225,13 +287,12 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
                         outsideWindow++;
                         continue;             // past the window; a later partition may still be in it
                     }
-                    String json = toJson.apply(one.value());
-                    if (json != null && !json.isBlank()) {
-                        out.add(json);
+                    if (sink.take(one)) {
+                        taken++;
                     } else {
                         unconvertible++;
                     }
-                    if (out.size() >= limit) {
+                    if (taken >= limit) {
                         break;
                     }
                 }
@@ -244,12 +305,12 @@ final class ReadableReferenceHistory implements ReferencePrice.History {
             // but it IS a reason to say so. The exception's class and message go into the report
             // and onto stdout, because the version that returned an empty list here cost a
             // separate out-of-process probe to diagnose.
-            return record(new Drain(topic, fromMs, toMs, polled, out.size(), outsideWindow,
+            return record(new Drain(topic, fromMs, toMs, polled, taken, outsideWindow,
                     unconvertible, unreachable.getClass().getSimpleName() + ": "
-                            + unreachable.getMessage()), List.of());
+                            + unreachable.getMessage()));
         }
-        return record(new Drain(topic, fromMs, toMs, polled, out.size(), outsideWindow,
-                unconvertible, null), out);
+        return record(new Drain(topic, fromMs, toMs, polled, taken, outsideWindow,
+                unconvertible, null));
     }
 
     private static boolean caughtUp(Consumer<String, Object> consumer, List<TopicPartition> parts,

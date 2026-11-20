@@ -1,7 +1,9 @@
 package app.feedgateway.readable;
 
+import java.util.Collection;
+
 /**
- * A window of the session whose bars arrived <b>long after the minutes they describe</b>.
+ * A window of the session whose bars were <b>published long after the minutes they describe</b>.
  *
  * <p><b>Why the page must say this.</b> On 2026-11-20 the ES feed stopped at 18:16:05 New York and
  * resumed at 23:46:53. The bars for those five and a half hours were backfilled afterwards —
@@ -11,48 +13,80 @@ package app.feedgateway.readable;
  * session while the service's own {@code session.volume.cumulativeAnalysis} read 17,208. So the
  * VWAP the owner trades against was built without a large part of the session, and nothing in the
  * record says so — the service has {@code FEED_GAP}, {@code STALE_FEED} and {@code RETENTION_GAP}
- * in its reason vocabulary and reports {@code DEADLINE_FINALIZED} instead.
+ * in its reason vocabulary and reports {@code DEADLINE_FINALIZED} instead. We do not repair the
+ * indicators service; we label what it gives us.
  *
- * <p>We do not repair the indicators service; we label what it gives us. This class is the label,
- * and it is derived from <b>our own arrival times</b> — the one thing we can measure ourselves —
- * never from a claim in the record.
+ * <p><b>The lateness is the BROKER's publish time against the bar's own minute</b>, and the window
+ * is {@link #measure measured afresh} from a set of records rather than accumulated as they arrive.
+ * The first version of this class used the gateway's own wall clock at arrival, which the reviewer
+ * rejected for a reason I had not seen: a restart rewinds nothing and re-reads nothing, so after a
+ * restart every bar either looks late against its own minute (naming the whole session a gap) or is
+ * never seen at all (losing the real gap). <b>#898's own rollout is such a restart</b>, so the
+ * label would have disappeared exactly when it was first needed. The broker's stamp travels with
+ * the record, so the same records always give the same window — which is why this takes a
+ * collection and replaces its state, instead of counting events. The measurement is a pure
+ * function of the records, and that is the whole of its restart-invariance.
  *
- * <p>The threshold is deliberately far above a normal bar: a 1m bar normally reaches us about 65
+ * <p>The threshold is deliberately far above a normal bar: a 1m bar is normally published about 65
  * seconds after it opens (its own minute, plus ~5 s), so three minutes cannot be tripped by
  * ordinary jitter and was tripped by every bar in that window by two orders of magnitude.
  */
 public final class FeedGap {
 
-    /** A bar later than this after its own start was not live when it described the market. */
+    /** A bar published later than this after its own start was not live when it described the market. */
     static final long LATE_AFTER_MS = 180_000L;
+
+    /** One bar's own minute, and the instant the broker holds for the record carrying it. */
+    public record Published(long barStartMs, long publishedMs) {
+    }
 
     private long earliestLateStartMs = Long.MAX_VALUE;
     private long latestLateStartMs = Long.MIN_VALUE;
     private long lateBars;
+    private long barsMeasured;
 
     /**
-     * One bar, with the instant it reached us.
+     * Measure the window from these records, replacing whatever was measured before.
      *
-     * <p>Only the window's edges are kept. A gap is one outage in practice, and two outages in one
-     * session would widen these edges to cover both — which is the honest summary for a label of a
-     * few characters, and the per-bar detail stays on {@code /footprint} and {@code /recent-full}.
+     * <p>Replacing rather than accumulating is deliberate: the same records must always produce the
+     * same window, whether this is the first measurement after a start-up or the twentieth of the
+     * session. An empty collection measures nothing and <b>leaves the previous measurement
+     * standing</b> — a drain that failed or a window with no bars in it is not evidence that the
+     * gap has closed, and the one thing worse than no label is a label that flickers.
      */
-    public void observe(long barStartMs, long arrivedMs) {
-        if (arrivedMs - barStartMs <= LATE_AFTER_MS) {
+    public void measure(Collection<Published> bars) {
+        if (bars == null || bars.isEmpty()) {
             return;
         }
-        lateBars++;
-        earliestLateStartMs = Math.min(earliestLateStartMs, barStartMs);
-        latestLateStartMs = Math.max(latestLateStartMs, barStartMs);
+        long earliest = Long.MAX_VALUE;
+        long latest = Long.MIN_VALUE;
+        long late = 0;
+        for (Published b : bars) {
+            if (b == null || b.publishedMs() - b.barStartMs() <= LATE_AFTER_MS) {
+                continue;
+            }
+            late++;
+            earliest = Math.min(earliest, b.barStartMs());
+            latest = Math.max(latest, b.barStartMs());
+        }
+        barsMeasured = bars.size();
+        lateBars = late;
+        earliestLateStartMs = earliest;
+        latestLateStartMs = latest;
     }
 
-    /** How many bars arrived late. Zero is the normal day, and it is a fact worth publishing. */
+    /** How many bars were late in the last measurement. Zero is the normal day, and is published. */
     public long lateBars() {
         return lateBars;
     }
 
+    /** How many bars the last measurement looked at, so "measured nothing" is distinguishable. */
+    public long barsMeasured() {
+        return barsMeasured;
+    }
+
     /**
-     * The label for the headline, or null when no bar arrived late.
+     * The label for the headline, or null when no bar was published late.
      *
      * <p>Short on purpose — the reviewer asked for a few characters on the {@code vwap|} line,
      * because the owner reads that line at a glance and a sentence there would not be read at all.

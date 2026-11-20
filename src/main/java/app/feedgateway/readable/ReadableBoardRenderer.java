@@ -85,10 +85,6 @@ public final class ReadableBoardRenderer {
         OvernightGrid.Bar bar = OvernightDecoders.bar(json);
         if (bar != null) {
             source.onBar(bar);
-            // Our own arrival time against the bar's own minute. This is the only measurement of
-            // feed lateness we can make ourselves, and the indicators service makes none. See
-            // FeedGap.
-            feedGap.observe(bar.startMs(), clock.getAsLong());
         }
     }
 
@@ -199,10 +195,22 @@ public final class ReadableBoardRenderer {
      */
     private long otherInstrumentSnapshots;
 
-    /** Bars that reached us long after their own minute, so the headline can say so. */
+    /** Bars PUBLISHED long after their own minute, so the headline can say so. */
     private final FeedGap feedGap = new FeedGap();
 
-    FeedGap feedGap() {
+    /**
+     * Measure the feed gap from these records' own broker stamps.
+     *
+     * <p>Not fed from {@link #onBarJson}: that path has no broker timestamp, and the gateway's own
+     * arrival clock cannot survive a restart (see {@link FeedGap}). The service measures this from
+     * a bounded read of the bars topic, at start-up and on a cadence.
+     */
+    public void measureFeedGap(java.util.Collection<FeedGap.Published> bars) {
+        feedGap.measure(bars);
+    }
+
+    /** What the last measurement found. Public so the service can log and publish it. */
+    public FeedGap feedGap() {
         return feedGap;
     }
 
