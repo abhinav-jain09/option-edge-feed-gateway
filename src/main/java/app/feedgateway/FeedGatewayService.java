@@ -7461,6 +7461,17 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 gexByStrike.put(key, json);
+                // C-120: the readable page's per-strike delta, from the LIVE Databento topic only.
+                // This event is bound to four topics -- the Databento live and history ones and
+                // the IBKR live and history ones -- so the gate is on the topic's own name. A
+                // history row or another producer's row in the live board would put a wrong delta
+                // on a strike the owner is trading with nothing on the page to say where it came
+                // from. The lesson from the pre-open tap applies: a missing case here is a silent
+                // drop, so a test drives a record through this method rather than asserting a
+                // line exists.
+                if (settings.databentoGexTopic().equals(record.topic())) {
+                    readableBoard.onGexStrikeJson(json);
+                }
                 return key;
             }
             case "gex-oi-status" -> {
