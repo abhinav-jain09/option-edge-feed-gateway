@@ -209,6 +209,10 @@ public final class Pages {
         s.append(wall("above", board == null ? null : board.largestAbove()));
         s.append(wall("below", board == null ? null : board.largestBelow()));
 
+        // C-120: the strike nearest above and nearest below price, with their published deltas,
+        // so a stab through a strike can be read in delta terms instead of in points.
+        s.append(deltaLines(last, board));
+
         // The three newest 30-second rows, newest first, one line each.
         int n = 0;
         if (recent != null) {
@@ -250,6 +254,100 @@ public final class Pages {
             s.append("stalled|none\n");
         }
         return s.toString();
+    }
+
+    /**
+     * <b>C-120</b>: {@code delta|above|7100|cd=0.423|pd=-0.577} and the same below.
+     *
+     * <p><b>The two strikes that bracket price</b>, taken off the board's own rows so the figures
+     * on this line and the figures in the grid below it are the same ones. The owner reads a stab
+     * through a strike by how close that strike's delta comes to one, so the pair that brackets
+     * price is what he needs at a glance; the rest of the ladder is in the grid.
+     *
+     * <p>Where there is no price or no board the lines say which is missing, because a reader who
+     * sees nothing cannot tell "the market is between two strikes with no deltas" from "this page
+     * forgot to look".
+     */
+    static String deltaLines(ReadablePage.Price last, ReadablePage.Board board) {
+        if (last == null) {
+            return "delta|absent|no price, so there is no strike above or below it\n";
+        }
+        if (board == null) {
+            return "delta|absent|no board, so no strike carries a published delta\n";
+        }
+        String above = null;
+        String below = null;
+        double bestAbove = Double.MAX_VALUE;
+        double bestBelow = Double.MAX_VALUE;
+        for (String row : board.lines()) {
+            Double strike = strikeOfRow(row);
+            if (strike == null) {
+                continue;
+            }
+            String cells = deltaCellsOfRow(row);
+            if (cells == null) {
+                continue;               // this row carries no delta cells at all
+            }
+            if (strike >= last.spx() && strike - last.spx() < bestAbove) {
+                bestAbove = strike - last.spx();
+                above = "delta|above|" + BoardLines.strikeOf(strike) + cells;
+            }
+            if (strike < last.spx() && last.spx() - strike < bestBelow) {
+                bestBelow = last.spx() - strike;
+                below = "delta|below|" + BoardLines.strikeOf(strike) + cells;
+            }
+        }
+        StringBuilder s = new StringBuilder(96);
+        // C-75 keeps every headline line at 64 characters or fewer, because a summarising reader
+        // has to be able to return one whole. These two absent forms are written to that bound.
+        s.append(above == null
+                ? "delta|above|absent|no strike above price has a delta" : above)
+                .append('\n');
+        s.append(below == null
+                ? "delta|below|absent|no strike below price has a delta" : below)
+                .append('\n');
+        return s.toString();
+    }
+
+    /** The strike a compact board row begins with, or null where the row is not one. */
+    private static Double strikeOfRow(String row) {
+        if (row == null) {
+            return null;
+        }
+        int bar = row.indexOf('|');
+        if (bar <= 0) {
+            return null;
+        }
+        try {
+            return Double.parseDouble(row.substring(0, bar));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The {@code |cd=…|pd=…} part of a compact board row, or null where the row has none.
+     *
+     * <p>Taken off the rendered row rather than from the delta source a second time, so the line
+     * above the grid and the grid itself cannot disagree. The age cell is deliberately left out
+     * here: it belongs on each row, and repeating it twice at the top would be two figures of the
+     * same thing one line apart.
+     */
+    private static String deltaCellsOfRow(String row) {
+        int at = row.indexOf("|cd=");
+        if (at < 0) {
+            return null;
+        }
+        String rest = row.substring(at);
+        int age = rest.indexOf("|age=");
+        if (age >= 0) {
+            rest = rest.substring(0, age);
+        }
+        int spot = rest.indexOf("|spot");
+        if (spot >= 0) {
+            rest = rest.substring(0, spot);
+        }
+        return rest;
     }
 
     /** One wall as a short line: {@code above|7455|36.54pts}. */

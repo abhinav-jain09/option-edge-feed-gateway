@@ -9437,9 +9437,29 @@ private static final String IBKR_SESSION = "IBKR_PREOPEN:20260804";
         // call sites rather than inside the interceptor.
         String source = java.nio.file.Files.readString(java.nio.file.Path.of(
                 "src/main/java/app/feedgateway/FeedGatewayService.java"));
-        int guards = source.split("settings\\.databentoGexTopic\\(\\)\\.equals\\(record\\.topic\\(\\)\\)", -1).length - 1;
+        // Counted at the CALL SITES rather than over the whole file. The file-wide count was a
+        // proxy that broke the first time another feature needed the same gate for its own
+        // reason: C-120's readable-page delta tap gates on this very expression, correctly, and
+        // the count went to three while both arbitration call sites were still guarded. A guard
+        // that fails on a third legitimate use of the condition it is about is counting the
+        // wrong thing.
+        String gate = "settings.databentoGexTopic().equals(record.topic())";
+        String[] beforeCallSites = source.split("interceptSharedGexRecord\\(record", -1);
+        int guards = 0;
+        for (int i = 0; i < beforeCallSites.length - 1; i++) {
+            // the gate must appear in the 600 characters leading up to this call site
+            String chunk = beforeCallSites[i];
+            String tail = chunk.length() <= 600 ? chunk : chunk.substring(chunk.length() - 600);
+            if (tail.contains(gate)) {
+                guards++;
+            }
+        }
         assertEquals(2, guards,
                 "both interceptSharedGexRecord call sites must require the shared LIVE topic");
+        assertEquals(2, beforeCallSites.length - 1,
+                "and there are exactly two such call sites, so neither is unguarded");
+        assertTrue(source.contains("readableBoard.onGexStrikeJson(json)"),
+                "C-120's own tap is wired, and C120DeltaWiringTest drives a record through it");
         for (String callSite : source.split("interceptSharedGexRecord\\(record")) {
             // every call site's guard block must mention the topic check before it
             if (!callSite.endsWith("(")) {

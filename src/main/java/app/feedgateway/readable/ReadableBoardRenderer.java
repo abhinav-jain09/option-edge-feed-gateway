@@ -143,6 +143,29 @@ public final class ReadableBoardRenderer {
     }
 
     /** The pre-open store, for the status page and the tests. */
+    /**
+     * <b>C-120</b>: the published per-strike deltas, so the board rows and the {@code delta|}
+     * lines carry the producer's own figures.
+     */
+    private final StrikeDeltaSource strikeDeltas = new StrikeDeltaSource();
+
+    /**
+     * One record off the LIVE Databento strike topic.
+     *
+     * <p>The caller gates on that topic by name. The gateway binds the same {@code gex-by-strike}
+     * event to four topics -- the Databento live and history ones and the IBKR live and history
+     * ones -- and a history row or another producer's row in the live board would be a wrong delta
+     * on a strike the owner is trading, with nothing on the page to say where it came from.
+     */
+    public void onGexStrikeJson(String json) {
+        strikeDeltas.observe(json);
+    }
+
+    /** C-120: the delta store, for the metrics page and a readiness probe. */
+    public StrikeDeltaSource strikeDeltas() {
+        return strikeDeltas;
+    }
+
     public PreopenSource preopenSource() {
         return preopen;
     }
@@ -310,7 +333,8 @@ public final class ReadableBoardRenderer {
             }
         }
         String json = boardJson.get();
-        ReadablePage.Board board = json == null ? null : BoardLines.from(json, boardCycleMs(json, now));
+        ReadablePage.Board board = json == null ? null
+                : BoardLines.from(json, boardCycleMs(json, now), strikeDeltas, now);
         if (board == null) {
             // The map record is always preferred where there is one: it is the fuller board and it
             // carries the what-if readings. The pre-open board stands in only while there is no map
@@ -585,8 +609,8 @@ public final class ReadableBoardRenderer {
     /** The board the pages show: the map record where there is one, else the pre-open board. */
     private ReadablePage.Board currentBoard(long nowMs) {
         String json = boardJson.get();
-        ReadablePage.Board board =
-                json == null ? null : BoardLines.from(json, boardCycleMs(json, nowMs));
+        ReadablePage.Board board = json == null ? null
+                : BoardLines.from(json, boardCycleMs(json, nowMs), strikeDeltas, nowMs);
         return board != null ? board : preopen.board(nowMs);
     }
 
