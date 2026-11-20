@@ -56,7 +56,7 @@ class NowPageTest {
     private static List<RecentRows.Row> recent() {
         long slot = RecentRows.slotOf(NOW);
         return RecentRows.build(NOW, 3, List.of(
-                new OvernightGrid.Bar(slot, 7163, 7165, 7162, 7163.95, 300L, "ANCHORED", "30s",
+                OvernightGrid.Bar.spx(slot, 7163, 7165, 7162, 7163.95, 300L, "ANCHORED", "30s",
                         180L, 120L, 60L)));
     }
 
@@ -108,7 +108,7 @@ class NowPageTest {
                 "the ES figure as published, with its state");
         assertTrue(page.contains("7167.75"),
                 "and the SPX-equivalent, 7187.0082 minus the 19.26 basis");
-        assertTrue(page.contains("basis|19.26 ANCHORED"),
+        assertTrue(page.contains("basis|state=19.26 ANCHORED"),
                 "with the level and state the translation rests on");
     }
 

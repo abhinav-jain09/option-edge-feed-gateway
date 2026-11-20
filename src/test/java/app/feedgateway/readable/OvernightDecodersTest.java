@@ -2,6 +2,8 @@ package app.feedgateway.readable;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 import org.junit.jupiter.api.DisplayName;
@@ -55,17 +57,56 @@ class OvernightDecodersTest {
     }
 
     @Test
-    @DisplayName("a bar with ONLY the raw ES cents is refused, not translated here")
-    void aBarWithNoTranslationIsAbsent() {
+    @DisplayName("C-118: a bar with ONLY the raw ES cents is ADMITTED, carrying futures prices")
+    void anUntranslatedBarIsAdmittedWithItsFuturesPrices() {
         String untranslated = REAL_BAR
                 .replace("\"spxEqOpenCents\":716720,", "")
                 .replace("\"spxEqHighCents\":717170,", "")
                 .replace("\"spxEqLowCents\":716720,", "")
                 .replace("\"spxEqCloseCents\":717145,", "");
-        assertNull(OvernightDecoders.bar(untranslated),
-                "the one arithmetic this estate must not hold twice is ES to SPX, so an "
-                        + "untranslated bar is ABSENT rather than converted here");
+        OvernightGrid.Bar bar = OvernightDecoders.bar(untranslated);
+        assertNotNull(bar,
+                "C-118: this bar EXISTS. Dropping it hid its volume, its delta and its side as "
+                        + "well as its price, and nine such bars rendered as nine blank rows on "
+                        + "2026-11-20 (C-117)");
+        assertFalse(bar.hasSpx(), "and it says it was never translated");
+        assertNull(bar.close());
+        assertTrue(bar.hasFutures());
+        assertEquals(7185.50, bar.futuresOpen(), 1e-9);
+        assertEquals(7190.00, bar.futuresHigh(), 1e-9);
+        assertEquals(7185.50, bar.futuresLow(), 1e-9);
+        assertEquals(7189.75, bar.futuresClose(), 1e-9);
+        assertEquals(301L, bar.volume(), "the volume is the bar's own count and never needed a basis");
+        assertEquals(63L, bar.delta());
+        // The 19-point basis is STILL not computed anywhere: these are the raw ES cents as the bar
+        // carried them, and the renderer prints them marked ES. Reading a number the bar holds is
+        // the opposite of deriving one (C-103).
     }
+
+    @Test
+    @DisplayName("C-118: a HALF-translated bar is still refused — one row, two kinds of price")
+    void aHalfTranslatedBarIsRefused() {
+        assertNull(OvernightDecoders.bar(REAL_BAR.replace("\"spxEqCloseCents\":717145,", "")),
+                "three index prices and one futures price on one row read as four prices of the "
+                        + "same kind, which is worse than showing neither");
+        assertNull(OvernightDecoders.bar(REAL_BAR.replace("\"spxEqOpenCents\":716720,", "")));
+    }
+
+    @Test
+    @DisplayName("C-118: a bar with NO price of either kind is refused — there is nothing to show")
+    void aBarWithNoPriceAtAllIsRefused() {
+        String priceless = REAL_BAR
+                .replace("\"spxEqOpenCents\":716720,", "")
+                .replace("\"spxEqHighCents\":717170,", "")
+                .replace("\"spxEqLowCents\":716720,", "")
+                .replace("\"spxEqCloseCents\":717145,", "")
+                .replace("\"openCents\":718550,", "")
+                .replace("\"highCents\":719000,", "")
+                .replace("\"lowCents\":718550,", "")
+                .replace("\"closeCents\":718975,", "");
+        assertNull(OvernightDecoders.bar(priceless));
+    }
+
 
     @Test
     @DisplayName("an INCOMPLETE bar is refused: a forming minute's high and low are not the minute's")

@@ -64,12 +64,28 @@ public final class Pages {
      */
     static final String PAGE_COMPUTED =
             "spx-by-this-page=vwapspx and the footprint SPX column are translated here from the "
-            + "published ES figure using the published basis; every other SPX price is the topic's";
+            + "published ES figure using basis|state (the level on spx.basis.state); the bars' own "
+            + "px column was translated by the producer using basis|bars; every other SPX price is "
+            + "the topic's";
 
-    /** The reading codes, expanded by every page's legend. */
+    /**
+     * The reading codes, expanded by every page's legend.
+     *
+     * <p><b>C-118 made {@code empty} mean one thing, and the legend now says which.</b> It read
+     * "no data for that slot" while a blank row could also be a bar the platform had not
+     * translated &mdash; nine of them on 2026-11-20, each with a real volume and a real delta. A
+     * blank row is now only a slot with no bar at all, so the legend's old words are true for the
+     * first time; and the two states that used to hide behind it have their own entries, because a
+     * reader meeting {@code ES7168.25} or {@code noSPX} for the first time should not have to
+     * guess whether the page is showing him a different instrument.
+     */
     static final String LEGEND =
             "legend|A=accelerate|H=hold|N=neutral|norow=gamma service published no row|"
-            + "empty=no data for that slot|px=SPX-equivalent|basis A=anchored, ?=none on that bar|"
+            + "empty=no bar arrived for that slot (and nothing else)|"
+            + "ES0000.00=the bar's OWN futures price, printed because the platform published no "
+            + "SPX-equivalent for it; never translated here|"
+            + "noSPX=that bar carries no SPX-equivalent price, so its prices are futures|"
+            + "px=SPX-equivalent|basis A=anchored, ?=none on that bar|"
             + PAGE_COMPUTED;
 
     /**
@@ -138,7 +154,11 @@ public final class Pages {
                 .append("|spot=").append(money(board.spot()))
                 .append("|src=").append(board.source())
                 .append("|rows=").append(board.rowsPresent()).append('/')
-                .append(board.rowsExpected()).append('\n');
+                .append(board.rowsExpected())
+                .append(board.published() < 0 ? "" : "|published=" + board.published())
+                .append(chainCell(board))
+                .append(holdCell(board.hold()))
+                .append('\n');
         if (PreopenBoard.SOURCE.equals(board.source())) {
             s.append(PREOPEN_LEGEND).append('\n');
         }
@@ -214,6 +234,11 @@ public final class Pages {
         s.append(deltaLines(last, board));
 
         // The three newest 30-second rows, newest first, one line each.
+        //
+        // C-118: the price cell follows the same rule as the table's -- the SPX-equivalent price
+        // where the platform translated the bar, otherwise the bar's own futures price marked ES,
+        // and the side is printed either way. These three lines are what the owner reads first, so
+        // a bar hidden here is hidden where it matters most.
         int n = 0;
         if (recent != null) {
             for (RecentRows.Row r : recent) {
@@ -221,7 +246,7 @@ public final class Pages {
                     break;
                 }
                 s.append('r').append(n + 1).append('|').append(hms(r.startMs(), NY)).append("NY")
-                        .append('|').append(r.price() == null ? "" : money(r.price()))
+                        .append('|').append(headlinePriceCell(r))
                         .append('|').append(r.dominant() == null ? "" : r.dominant())
                         .append('\n');
                 n++;
@@ -230,6 +255,7 @@ public final class Pages {
         while (n < 3) {
             s.append('r').append(++n).append("|absent\n");
         }
+        s.append(gridStateLine(recent));
 
         boolean anyStalled = false;
         if (stalledInputs != null) {
@@ -350,6 +376,131 @@ public final class Pages {
         return rest;
     }
 
+
+    /**
+     * The headline row's price cell (C-118): the index price, else the bar's own futures price
+     * marked, else empty for a slot with no bar.
+     */
+    private static String headlinePriceCell(RecentRows.Row r) {
+        if (r.price() != null) {
+            return money(r.price());
+        }
+        if (r.barPresent() && r.futuresPrice() != null) {
+            return RecentRows.FUTURES_MARK + money(r.futuresPrice());
+        }
+        return "";
+    }
+
+    /**
+     * <b>C-118</b>: what the grid above actually shows, counted off the RENDERED rows.
+     *
+     * <p>Three states, named apart, because collapsing any two of them is how C-117 happened:
+     * <ul>
+     *   <li>{@code missing} &mdash; the slot has no bar at all. Nothing arrived for it, and the
+     *       page's legend "no data for that slot" is about these and only these.</li>
+     *   <li>{@code noSPX} &mdash; a bar is here, with its volume and its side, and the platform
+     *       never translated its price, so the row shows futures prices marked {@code ES}. This is
+     *       the state that used to render identically to {@code missing}.</li>
+     *   <li>{@code complete} &mdash; a bar is here and carries its index price.</li>
+     * </ul>
+     *
+     * <p>It is counted from the rows the renderer is about to print rather than from the bars held
+     * upstream, so the line cannot say one thing while the grid shows another.
+     */
+    static String gridStateLine(List<RecentRows.Row> recent) {
+        if (recent == null || recent.isEmpty()) {
+            return "grid|rows=0\n";
+        }
+        int missing = 0;
+        int noSpx = 0;
+        int complete = 0;
+        for (RecentRows.Row r : recent) {
+            if (!r.barPresent()) {
+                missing++;
+            } else if (r.price() == null) {
+                noSpx++;
+            } else {
+                complete++;
+            }
+        }
+        return "grid|rows=" + recent.size() + "|missing=" + missing
+                + "|noSPX=" + noSpx + "|complete=" + complete + "\n";
+    }
+
+    /**
+     * <b>C-101 item 2</b>: {@code basis|state=19.26 ANCHORED@16:00|bars=18.30|drift=0.96}.
+     *
+     * <p><b>Two bases, because there are two.</b> The level on {@code spx.basis.state} is what this
+     * page translates with; the difference between a bar's own {@code closeCents} and its
+     * {@code spxEqCloseCents} is what the PRODUCER translated that bar with. They drift apart, and
+     * a reader comparing a page-computed SPX figure with a bar's SPX column has no way to see why
+     * they differ unless both bases are on the page. The drift is printed too, because a reader
+     * should not have to subtract two numbers on the same line to get the one that matters.
+     *
+     * <p>Nothing here derives a basis: the published level is read, and the bars' figure is the
+     * producer's own subtraction read back off a bar that carries both prices (C-103).
+     */
+    static String basisLine(BasisRead basis, List<RecentRows.Row> recent) {
+        StringBuilder s = new StringBuilder(64);
+        s.append("basis|state=");
+        if (basis == null) {
+            s.append("absent");
+        } else {
+            s.append(basis.cellWithTime());
+        }
+        Double bars = BasisRead.fromRows(recent);
+        s.append("|bars=").append(bars == null ? "absent"
+                : String.format(Locale.ROOT, "%.2f", bars));
+        if (basis != null && bars != null) {
+            s.append("|drift=")
+                    .append(String.format(Locale.ROOT, "%.2f", basis.level() - bars));
+        }
+        if (basis != null && basis.nextSessionQuarantinedOpen()) {
+            s.append("|nextopen=QUARANTINED");
+        }
+        return s.append('\n').toString();
+    }
+
+    /**
+     * The ends of the chain the record carried: {@code |chain=6995-7395}.
+     *
+     * <p><b>Why the row count is not enough.</b> {@code rows=35/41} with {@code norow} on six
+     * lines reads the same whether the gamma service published a chain that stops above the bottom
+     * of the owner's window, or published across it and lost six strikes. The first is a short
+     * grid and follows price; the second is a feed fault. The chain's own ends tell them apart in
+     * one glance, which is why the reviewer asked for them here rather than in a count.
+     */
+    static String chainCell(ReadablePage.Board board) {
+        if (!board.hasChainRange()) {
+            return "";
+        }
+        return "|chain=" + BoardLines.strikeOf(board.chainLowCents() / 100.0)
+                + "-" + BoardLines.strikeOf(board.chainHighCents() / 100.0);
+    }
+
+    /**
+     * <b>R-B-9</b>: {@code |held|age=2m10s|reason=…} where the board is held, nothing where it is
+     * live.
+     *
+     * <p>On the same line as the cycle time, deliberately. A reader who takes in
+     * {@code cycle=10:38:58NY} and stops has read a fresh-looking board; the hold has to be in the
+     * same glance or the page is drawing a held board as a current one, which is C-40's fault
+     * again. The age is the map service's own figure and is not derived from the cycle time here.
+     */
+    static String holdCell(ReadablePage.Board.Hold hold) {
+        if (hold == null) {
+            return "";
+        }
+        StringBuilder s = new StringBuilder(48);
+        s.append("|held");
+        s.append("|age=").append(hold.ageMs() < 0 ? "unknown" : StalledInputs.ago(hold.ageMs()));
+        if (hold.strikesSoFar() >= 0) {
+            s.append("|sofar=").append(hold.strikesSoFar());
+        }
+        s.append("|reason=").append(hold.reason());
+        return s.toString();
+    }
+
     /** One wall as a short line: {@code above|7455|36.54pts}. */
     private static String wall(String side, ReadablePage.Extreme e) {
         if (e == null) {
@@ -362,7 +513,24 @@ public final class Pages {
     public static String now(long nowMs, ReadablePage.Price last, ReadablePage.Overnight overnight,
             VwapRead vwap, BasisRead basis, VwapSideTracker.Result holding,
             List<RecentRows.Row> recent, ReadablePage.Board board,
-            List<StalledInputs.Input> stalled, VwapHeld held, String feedGap, String closeAbsenceReason) {
+            List<StalledInputs.Input> stalled, VwapHeld held, String feedGap,
+            String closeAbsenceReason) {
+        return now(nowMs, last, overnight, vwap, basis, holding, recent, board, stalled, held,
+                feedGap, closeAbsenceReason, null);
+    }
+
+    /**
+     * The same page, with the figures' movement (C-“latched is still updating”).
+     *
+     * <p>The watch is LAST and nullable so the twelve-argument form above keeps working unchanged:
+     * every existing caller and test is positional, and inserting a parameter in the middle of a
+     * twelve-argument call is how a test ends up asserting about the wrong column.
+     */
+    public static String now(long nowMs, ReadablePage.Price last, ReadablePage.Overnight overnight,
+            VwapRead vwap, BasisRead basis, VwapSideTracker.Result holding,
+            List<RecentRows.Row> recent, ReadablePage.Board board,
+            List<StalledInputs.Input> stalled, VwapHeld held, String feedGap,
+            String closeAbsenceReason, LatchWatch latches) {
         StringBuilder s = new StringBuilder(8_192);
         s.append(firstLine(nowMs, last)).append('\n');
         // C-75: the facts the reviewer is asked for, as SHORT single-fact labelled lines, above
@@ -402,23 +570,33 @@ public final class Pages {
             // No readable record NOW, but figures were held earlier: keep them, with the time
             // they were read -- "no vwap block at all" is a state of the record, not a reason to
             // drop what the line last knew.
-            s.append(vwapLine("vwapes", null, null, held));
-            s.append(vwapLine("vwaprth", null, null, held));
+            s.append(vwapLine("vwapes", null, null, held, ""));
+            s.append(vwapLine("vwaprth", null, null, held, ""));
         } else {
-            s.append(vwapLine("vwapes", vwap.session(), null, held));
-            s.append(vwapLine("vwaprth", vwap.rth(), null, held));
+            s.append(vwapLine("vwapes", vwap.session(), null, held,
+                    movement(latches, "vwapes", nowMs)));
+            s.append(vwapLine("vwaprth", vwap.rth(), null, held,
+                    movement(latches, "vwaprth", nowMs)));
             if (basis == null) {
                 s.append("vwapspx|absent|no basis published on spx.basis.state\n");
             } else if (!basis.usableForDisplay()) {
                 s.append("vwapspx|absent|basis ").append(basis.cell())
                         .append("|not anchored, so nothing is translated\n");
             } else {
-                s.append(vwapLine("vwapspx", vwap.session(), basis, held))
-                        .append("basis|").append(basis.cell())
-                        .append(basis.nextSessionQuarantinedOpen() ? "|nextopen=QUARANTINED" : "")
-                        .append('\n');
+                s.append(vwapLine("vwapspx", vwap.session(), basis, held,
+                        movement(latches, "vwapes", nowMs)));
             }
         }
+        // C-101 item 2: the basis line stands on its OWN, outside EVERY branch above.
+        //
+        // It was printed only inside the anchored one, so the two readings a reader most needs to
+        // compare -- the published level, and the level the bars were actually translated with --
+        // were both invisible in exactly the cases where the published one had stopped being
+        // usable. Moving it one level out was not enough either: it would still have been inside
+        // the "a vwap record exists" branch, and the basis has nothing to do with whether the
+        // indicators service published a vwap block. Two bars and a published level are all this
+        // line needs, so it is printed wherever those exist.
+        s.append(basisLine(basis, recent));
 
         // the holding line
         if (holding == null) {
@@ -498,14 +676,24 @@ public final class Pages {
      * has never had a figure says so and names the state that is standing in its way. The absence
      * is always reported — the held figures are never passed off as current.
      */
+    /**
+     * The movement cell for a figure, or empty where nothing is watching or nothing has moved yet.
+     *
+     * <p>Only the VWAP figure carries it. The five band figures move with it by construction, so
+     * repeating the same age six times on one line would spend a reader's attention on one fact.
+     */
+    private static String movement(LatchWatch latches, String name, long nowMs) {
+        return latches == null ? "" : latches.movementCell(name, nowMs);
+    }
+
     private static String vwapLine(String label, VwapRead.Anchor a, BasisRead basis,
-            VwapHeld held) {
+            VwapHeld held, String movement) {
         if (a != null && a.vwap() != null && a.vwap().value() != null) {
-            return label + "|" + figures(a, basis) + "\n";
+            return label + "|" + figures(a, basis, movement) + "\n";
         }
         VwapHeld.Snapshot last = held == null ? null : held.of(label);
         if (last != null) {
-            return label + "|" + figures(last.anchor(), basis)
+            return label + "|" + figures(last.anchor(), basis, movement)
                     + "|held=" + hms(last.atMs(), NY) + "NY"
                     + "|now=" + stateOf(a)
                     + "\n";
@@ -514,8 +702,8 @@ public final class Pages {
     }
 
     /** The five cells and the deviation, in the order the legend names them. */
-    private static String figures(VwapRead.Anchor a, BasisRead basis) {
-        return cellOf(a.vwap(), basis)
+    private static String figures(VwapRead.Anchor a, BasisRead basis, String movement) {
+        return cellOf(a.vwap(), basis, movement)
                 + "|" + cellOf(a.lower2(), basis)
                 + "|" + cellOf(a.lower1(), basis)
                 + "|" + cellOf(a.upper1(), basis)
@@ -541,18 +729,33 @@ public final class Pages {
     }
 
     private static String cellOf(VwapRead.Figure f, BasisRead basis) {
+        return cellOf(f, basis, "");
+    }
+
+    /**
+     * One figure's cell, with the movement appended INSIDE its state brackets.
+     *
+     * <p>Inside the brackets and not after them, so {@code 7130.21(LATCHED,moved 3s)} reads as one
+     * qualified figure rather than a figure followed by a separate cell. A COMPLETE figure has no
+     * brackets and takes no movement: the producer calls it finished, and how long ago it last
+     * changed is then a fact about the market and not about the figure's state.
+     */
+    private static String cellOf(VwapRead.Figure f, BasisRead basis, String movement) {
         if (f == null) {
             return "";
         }
+        String moved = movement == null ? "" : movement;
         if (basis == null) {
-            return f.cell();
+            return f.complete() || moved.isEmpty() || f.value() == null
+                    ? f.cell()
+                    : f.cell().substring(0, f.cell().length() - 1) + moved + ")";
         }
         Double spx = basis.spxEquivalentOf(f.value());
         if (spx == null) {
             return f.cell();
         }
         return f.complete() ? money(spx) : money(spx) + "(" + f.cell().replaceAll("^[0-9.]+", "")
-                .replaceAll("[()]", "") + ")";
+                .replaceAll("[()]", "") + moved + ")";
     }
 
     /**
@@ -623,8 +826,12 @@ public final class Pages {
             s.append(hms(slot.startMs(), NY)).append('|').append(hms(slot.startMs(), AMS))
                     .append('|');
             if (slot.filled()) {
-                s.append(money(slot.open())).append('|').append(money(slot.high())).append('|')
-                        .append(money(slot.low())).append('|').append(money(slot.close()))
+                // C-118: a slot the platform never translated still shows its volume and says
+                // noSPX, rather than printing as a slot that never had a bar.
+                s.append(slot.hasPrices() ? money(slot.open()) : "").append('|')
+                        .append(slot.hasPrices() ? money(slot.high()) : "").append('|')
+                        .append(slot.hasPrices() ? money(slot.low()) : "").append('|')
+                        .append(slot.hasPrices() ? money(slot.close()) : "")
                         .append('|').append(slot.volume() == null ? "" : slot.volume())
                         .append('|').append(slot.basisState() == null ? "" : slot.basisState());
             } else {

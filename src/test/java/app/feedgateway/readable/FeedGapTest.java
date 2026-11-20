@@ -100,7 +100,7 @@ class FeedGapTest {
         FeedGap g = new FeedGap();
         g.measure(theRealSession());
         assertTrue(g.lateBars() > 300, "the real window held 330 1m bars: " + g.lateBars());
-        assertEquals("gap 18:16-23:43", g.label(),
+        assertEquals("gap 1 ep 18:16-23:43", g.label(),
                 "named by the bars' own minutes, not by when they arrived. The edge is set by the "
                         + "NARROWEST timeframe: a 30s bar starting 23:43 closes at 23:44 and is "
                         + "backfilled at 23:46:58, a lag just over the three-minute threshold, "
@@ -143,7 +143,7 @@ class FeedGapTest {
         assertEquals(before.label(), after.label(),
                 "the label is a pure function of the records, which is the whole of its "
                         + "restart-invariance");
-        assertEquals("gap 18:16-23:43", after.label());
+        assertEquals("gap 1 ep 18:16-23:43", after.label());
 
         // And measuring twice on the same instance replaces rather than accumulates.
         after.measure(session);
@@ -170,8 +170,10 @@ class FeedGapTest {
         r.measureFeedGap(theRealSession());
         String page = r.namedPage("now");
         String vwapLine = page.lines().filter(l -> l.startsWith("vwap|")).findFirst().orElse("");
-        assertTrue(vwapLine.contains("gap 18:16-"),
-                "the gap belongs on the line whose figure it damages: " + vwapLine);
+        assertTrue(vwapLine.contains("gap 1 ep 18:16-"),
+                "the gap belongs on the line whose figure it damages, and C-107 puts the episode "
+                        + "COUNT there too, so one outage and seven cannot read alike: "
+                        + vwapLine);
         assertTrue(vwapLine.length() <= 64, "C-75 keeps headline lines short: " + vwapLine);
     }
 
@@ -264,9 +266,25 @@ class FeedGapTest {
     @DisplayName("and a wide timeframe genuinely backfilled IS late, at its own minutes")
     void aWideTimeframeBackfilledIsStillCaught() {
         FeedGap g = new FeedGap();
-        g.measure(List.of(backfilled(GAP_FROM, 1_800_000L, GAP_TO + 5_000L)));
-        assertEquals(1, g.lateBars(), "hours after its close, not minutes");
-        assertTrue(g.label().startsWith("gap 18:16"),
+        // C-107 needs two consecutive late bars to make an episode, which is also what a real
+        // backfilled outage delivers: a single late bar is jitter above the threshold.
+        g.measure(List.of(
+                backfilled(GAP_FROM, 1_800_000L, GAP_TO + 5_000L),
+                backfilled(GAP_FROM + 1_800_000L, 1_800_000L, GAP_TO + 6_000L)));
+        assertEquals(2, g.lateBars(), "hours after their close, not minutes");
+        assertTrue(g.label().startsWith("gap 1 ep 18:16"),
                 "named by the minutes it describes, not by when it arrived: " + g.label());
+    }
+
+    @Test
+    @DisplayName("C-107: ONE late bar is counted but is not an episode, so the line stays quiet")
+    void oneLateBarIsNotAnEpisode() {
+        FeedGap g = new FeedGap();
+        g.measure(List.of(backfilled(GAP_FROM, 1_800_000L, GAP_TO + 5_000L)));
+        assertEquals(1, g.lateBars(), "the bar was late and the count says so");
+        assertTrue(g.episodes().isEmpty(),
+                "but one bar cannot show a window the owner's VWAP was built without");
+        assertNull(g.label(),
+                "and the vwap| line stays quiet rather than crying wolf over jitter");
     }
 }

@@ -20,7 +20,7 @@ class RecentRowsTest {
 
     private static OvernightGrid.Bar bar(long at, double close, long vol, long buy, long sell,
             String tf) {
-        return new OvernightGrid.Bar(at, close - 1, close + 2, close - 3, close, vol, "ANCHORED",
+        return OvernightGrid.Bar.spx(at, close - 1, close + 2, close - 3, close, vol, "ANCHORED",
                 tf, buy, sell, buy - sell);
     }
 
@@ -45,7 +45,7 @@ class RecentRowsTest {
         long newest = RecentRows.slotOf(NOW);
         // A bar with unknown-side contracts: buyers minus sellers is 60, but the producer's own
         // delta says 50. The row must carry 50.
-        OvernightGrid.Bar bar = new OvernightGrid.Bar(newest, 7173, 7175, 7172, 7174.45, 300L,
+        OvernightGrid.Bar bar = OvernightGrid.Bar.spx(newest, 7173, 7175, 7172, 7174.45, 300L,
                 "ANCHORED", "30s", 180L, 120L, 50L);
         RecentRows.Row r = RecentRows.build(NOW, 1, List.of(bar)).get(0);
         assertEquals(300L, r.volume());
@@ -111,7 +111,7 @@ class RecentRowsTest {
     @DisplayName("a basis that is not ANCHORED is named on the row")
     void anUnanchoredBasisShows() {
         long newest = RecentRows.slotOf(NOW);
-        OvernightGrid.Bar q = new OvernightGrid.Bar(newest, 7173, 7175, 7172, 7174.45, 10L,
+        OvernightGrid.Bar q = OvernightGrid.Bar.spx(newest, 7173, 7175, 7172, 7174.45, 10L,
                 "QUARANTINED", "30s", 5L, 5L, 0L);
         String line = RecentRows.line(RecentRows.build(NOW, 1, List.of(q)).get(0), NY);
         assertTrue(line.endsWith("QUARANTINED"), line);
@@ -154,7 +154,7 @@ class RecentRowsTest {
                 "one letter for the normal case, so sixty rows do not carry eight characters of "
                         + "ANCHORED: " + anchored);
 
-        OvernightGrid.Bar odd = new OvernightGrid.Bar(NOW - 1_000L, 7141.0, 7144.0, 7139.0,
+        OvernightGrid.Bar odd = OvernightGrid.Bar.spx(NOW - 1_000L, 7141.0, 7144.0, 7139.0,
                 7142.45, 67L, "QUARANTINED", "30s", 33L, 34L, -1L);
         String quarantined = RecentRows.line(
                 RecentRows.build(NOW, 1, List.of(odd)).get(0), NY);
@@ -165,7 +165,7 @@ class RecentRowsTest {
     @Test
     @DisplayName("a bar with no basis state at all reads ? -- the only 'no data' this column has")
     void aBarWithNoBasisStateReadsQuestionMark() {
-        OvernightGrid.Bar none = new OvernightGrid.Bar(NOW - 1_000L, 7141.0, 7144.0, 7139.0,
+        OvernightGrid.Bar none = OvernightGrid.Bar.spx(NOW - 1_000L, 7141.0, 7144.0, 7139.0,
                 7142.45, 67L, null, "30s", 33L, 34L, -1L);
         String line = RecentRows.line(RecentRows.build(NOW, 1, List.of(none)).get(0), NY);
         assertTrue(line.endsWith("|?"), line);

@@ -233,7 +233,7 @@ class ReadablePageReachabilityTest {
                 "C-69's ES VWAP cell, which only this page renders: " + page);
         assertTrue(page.contains("7187.01"),
                 "with the producer's own figure, which nothing else on the service renders");
-        assertTrue(page.contains("basis|19.26 ANCHORED"),
+        assertTrue(page.contains("basis|state=19.26 ANCHORED"),
                 "and the basis cell, which proves the basis tap reached the page too");
         assertTrue(page.contains("hold|side="),
                 "C-65's holding line, advanced by the indicators tap: " + page);

@@ -121,11 +121,39 @@ public final class BoardLines {
                     + "|" + code(text(board, "holdOrAccelerate"))
                     + (excluded == null ? "" : "|excluded=" + excluded)
                     + deltaCells(deltas, boardExpiry, cents, nowMs)
+                    + deltaBandCells(s.path("deltaBand"))
                     + marker);
         }
         return new ReadablePage.Board(cycleMs, spot, present, expected, SOURCE,
                 Extremes.largest(byCents, spot, true), Extremes.largest(byCents, spot, false),
-                lines);
+                lines, strikes.size(), holdOf(root),
+                byCents.isEmpty() ? -1L : java.util.Collections.min(byCents.keySet()),
+                byCents.isEmpty() ? -1L : java.util.Collections.max(byCents.keySet()));
+    }
+
+    /**
+     * <b>R-B-9 / C-116</b>: the record's own {@code boardHold} block, or null where it is live.
+     *
+     * <p>Read off the record as JSON, like everything else here. The map service decides whether a
+     * board is held and says so in the record; this page's only job is not to draw a held board as
+     * a fresh one, which is C-40's fault over again and the reason the reviewer asked for this line.
+     */
+    static ReadablePage.Board.Hold holdOf(JsonNode root) {
+        JsonNode hold = root.path("boardHold");
+        if (hold.isMissingNode() || hold.isNull() || !hold.isObject()) {
+            return null;                    // absent means live, which is the normal case
+        }
+        JsonNode age = hold.path("ageMs");
+        String reason = text(hold, "reason");
+        if (!age.isNumber() || reason == null) {
+            // A hold block that does not say how old it is or why cannot be printed honestly, and
+            // printing the board without it would be the very thing this exists to prevent.
+            return new ReadablePage.Board.Hold(-1L, reason == null ? "held, reason absent" : reason,
+                    -1);
+        }
+        JsonNode soFar = hold.path("strikesSoFar");
+        return new ReadablePage.Board.Hold(age.longValue(), reason,
+                soFar.isNumber() ? soFar.intValue() : -1);
     }
 
     /**
@@ -188,6 +216,61 @@ public final class BoardLines {
             return String.format(Locale.ROOT, "%.3f", delta);
         }
         return reason == null ? "none" : reason;
+    }
+
+    /**
+     * <b>C-122</b>: the two edges of the strike's delta band, as the map record publishes them:
+     * {@code |d95=7042.50|d05=6975.00}.
+     *
+     * <p><b>These are PRICES, not deltas</b>, and that is the point of them. The owner's reading of
+     * a stab is how far price has to travel to bring the strike's delta close to one, and that
+     * distance widens with volatility and time to expiry. {@code upperEdge} is the price at which
+     * this strike's delta reaches the band's upper threshold and {@code lowerEdge} the price at
+     * which it reaches the lower one, both computed by the map service from the strike's own IV and
+     * its time to expiry (R-PUB-1 row d). So the cell is the distance he measures in points, from
+     * the one service that holds the model for it.
+     *
+     * <p><b>The names come from the record's own thresholds and are not assumed.</b> The record
+     * publishes {@code lowerThreshold} and {@code upperThreshold} precisely so a reader can
+     * re-derive the edges, so a cell called {@code d95} where the record said 0.90 would be a
+     * figure wearing the wrong name. Where they are the document's 0.05 and 0.95 the cells read
+     * {@code d05} and {@code d95}; where they are anything else the names carry the published
+     * numbers.
+     */
+    static String deltaBandCells(JsonNode band) {
+        if (band == null || band.isMissingNode() || band.isNull() || !band.isObject()) {
+            return "";              // no band published for this strike: no cells, not empty ones
+        }
+        JsonNode upper = band.path("upperEdge");
+        JsonNode lower = band.path("lowerEdge");
+        if (!upper.isNumber() && !lower.isNumber()) {
+            return "";
+        }
+        String upperName = thresholdName(band.path("upperThreshold"), "d95");
+        String lowerName = thresholdName(band.path("lowerThreshold"), "d05");
+        return "|" + upperName + "=" + (upper.isNumber() ? edgeOf(upper.doubleValue()) : "")
+                + "|" + lowerName + "=" + (lower.isNumber() ? edgeOf(lower.doubleValue()) : "");
+    }
+
+    /**
+     * An edge price to the cent.
+     *
+     * <p>Deliberately NOT {@link #strikeOf}: that formatter rounds to one decimal, which is exact
+     * for a strike on the owner's 5-point grid and silently drops a cent from an edge the map
+     * service computed from the strike's IV. These two cells are prices he measures a distance
+     * with, so they keep the precision the record published.
+     */
+    private static String edgeOf(double price) {
+        return String.format(Locale.ROOT, "%.2f", price);
+    }
+
+    /** {@code d95} where the threshold is 0.95, else the published threshold's own digits. */
+    private static String thresholdName(JsonNode threshold, String expected) {
+        if (!threshold.isNumber()) {
+            return expected + "?";          // the edge is published and the threshold is not
+        }
+        long hundredths = Math.round(threshold.doubleValue() * 100.0);
+        return "d" + String.format(Locale.ROOT, "%02d", hundredths);
     }
 
     /**

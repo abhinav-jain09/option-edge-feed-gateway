@@ -50,7 +50,7 @@ final class C98PreviousCloseTest {
     }
 
     private static OvernightGrid.Bar bar(long startMs) {
-        return new OvernightGrid.Bar(startMs, 7100.0, 7105.0, 7095.0, 7102.0, 10L,
+        return OvernightGrid.Bar.spx(startMs, 7100.0, 7105.0, 7095.0, 7102.0, 10L,
                 "ANCHORED", "1m", null, null, null);
     }
 
