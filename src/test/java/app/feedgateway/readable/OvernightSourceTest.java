@@ -153,7 +153,10 @@ class OvernightSourceTest {
         assertEquals(2, s.barCount("30s"), "and its two halves separately");
         assertEquals(3, s.barCount(), "three records in all");
         assertEquals(1, s.bars("1m").size(), "and a reader of one timeframe sees only that one");
-        assertEquals(100L, s.bars("1m").get(0).volume());
+        assertEquals(100L, s.bars("1m").iterator().next().volume(),
+                "a Collection and no longer a List: bars() hands over a VIEW of the held map "
+                        + "rather than copying the night on every render, which is the "
+                        + "allocation that was on the stack when the heap ran out on 2026-11-20");
         assertEquals(100L, s.bars("30s").stream().mapToLong(OvernightGrid.Bar::volume).sum(),
                 "the halves sum to the minute, which is exactly why they must not be mixed");
         assertEquals(java.util.Set.of("1m", "30s"), s.timeframes());

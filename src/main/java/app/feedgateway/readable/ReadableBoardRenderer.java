@@ -273,11 +273,25 @@ public final class ReadableBoardRenderer {
      */
     public String render() {
         long now = clock.getAsLong();
+        // THE INSTRUMENT, before anything else is attempted, so the line is there even on the
+        // render that fails: 2026-11-20's OutOfMemoryError left no figure anywhere saying how the
+        // heap had got there, and no histogram could be taken because the image is a JRE.
+        System.out.println(HeapGuard.line(source.barCount(NIGHT_TIMEFRAME),
+                source.barCount(RECENT_TIMEFRAME)));
         ReadablePage.Price reference = source.previousCashClose();
         ReadablePage.Overnight overnight = null;
+        boolean skippedForHeap = false;
         if (reference != null) {
-            overnight = OvernightGrid.build(now, reference.epochMs(), reference.spx(),
-                    source.bars(NIGHT_TIMEFRAME), null, null);
+            if (HeapGuard.low()) {
+                // The page's own rule, restored: a read that cannot be taken is published ABSENT
+                // WITH ITS REASON, and no one block may refuse the whole page. On 2026-11-20 this
+                // block threw OutOfMemoryError and took /now with it for seventeen minutes while
+                // liveness answered 200 and restartCount stayed 0.
+                skippedForHeap = true;
+            } else {
+                overnight = OvernightGrid.build(now, reference.epochMs(), reference.spx(),
+                        source.bars(NIGHT_TIMEFRAME), null, null);
+            }
         }
         String json = boardJson.get();
         ReadablePage.Board board = json == null ? null : BoardLines.from(json, boardCycleMs(json, now));
@@ -308,6 +322,9 @@ public final class ReadableBoardRenderer {
         }
         String rendered = ReadablePage.render(now, source.lastPrice(), overnight, board,
                 stalledInputs());
+        if (skippedForHeap) {
+            rendered = rendered + "\nOVERNIGHT ROWS ABSENT — " + HeapGuard.reason() + "\n";
+        }
         if (reference == null) {
             rendered = rendered + "\nNO REFERENCE PRICE YET — the previous cash close is taken from "
                     + "the last print of the SPX index itself, and this gateway has not seen one "
@@ -472,6 +489,11 @@ public final class ReadableBoardRenderer {
     private ReadablePage.Overnight overnightNow(long nowMs) {
         ReadablePage.Price reference = source.previousCashClose();
         if (reference == null) {
+            return null;
+        }
+        if (HeapGuard.low()) {
+            // /now and /overnight are rendered on demand and took the same OutOfMemoryError as
+            // the cadence render did. Absent is a page the owner can read; a 500 is not.
             return null;
         }
         return OvernightGrid.build(nowMs, reference.epochMs(), reference.spx(),

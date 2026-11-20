@@ -72,12 +72,16 @@ public final class OvernightGrid {
      * @param nowMs            the build instant; the last slot is the one containing it
      * @param previousCloseMs  the previous cash close, which is where the night starts
      * @param previousClose    its SPX price
-     * @param bars             every bar in the span, in any order; bars outside it are ignored
+     * @param bars             every bar in the span, in any order; bars outside it are ignored.
+     *                         A {@code Collection} and not a {@code List} because this only
+     *                         iterates it, which lets the source hand over a VIEW rather than
+     *                         a copy per call (OvernightSource.bars)
      * @param tickHigh         the high over the live tick path, or null where there is none
      * @param tickLow          the low over the live tick path, or null
      */
     public static ReadablePage.Overnight build(long nowMs, long previousCloseMs,
-            double previousClose, List<Bar> bars, Double tickHigh, Double tickLow) {
+            double previousClose, java.util.Collection<Bar> bars, Double tickHigh,
+            Double tickLow) {
         if (nowMs < previousCloseMs) {
             throw new IllegalArgumentException(
                     "the night cannot end before it began: now " + nowMs + " < close "
