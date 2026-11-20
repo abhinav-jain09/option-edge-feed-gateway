@@ -220,11 +220,44 @@ class FeedGapTest {
         }
         g.measure(wide);
 
-        assertEquals(5, g.barsMeasured(), "one bar of each width the topic carries");
+        // C-96 item 3 narrowed what `barsMeasured` counts, and the figure changed from 5 to 1
+        // deliberately: the window is now taken from the SMALLEST width present, so "the bars this
+        // measurement looked at" are the 30-second bars alone. The property this test exists to
+        // prove is untouched and is the next two assertions -- a punctual wide bar is not late.
+        assertEquals(1, g.barsMeasured(),
+                "only the finest width is measured now; the wide bars are not examined at all");
+        assertEquals(30_000L, g.finestWidthMs());
         assertEquals(0, g.lateBars(),
                 "a 30m bar published 5 s after its close is punctual; measured from its START it "
                         + "would be 1,800 s 'late', which is how the whole session got named");
         assertNull(g.label());
+    }
+
+    /**
+     * <b>What C-96 item 3's rule gives up, stated rather than discovered later.</b>
+     *
+     * <p>Taking the window from the smallest width means a genuinely backfilled WIDE bar is
+     * invisible whenever punctual fine bars are present in the same drain. That is the intended
+     * trade: the fine bars are the ground truth for whether the feed was alive, and a wide bar
+     * that merely straddles the outage reports minutes the feed was running. The case is driven
+     * here so that the limitation is a decision with a test on it, not a surprise.
+     */
+    @Test
+    @DisplayName("the cost of the rule: a late WIDE bar beside punctual fine bars is not counted")
+    void aLateWideBarBesidePunctualFineBarsIsNotCounted() {
+        FeedGap g = new FeedGap();
+        List<FeedGap.Published> mixed = new ArrayList<>();
+        for (long t = SESSION_OPEN; t < SESSION_OPEN + 20 * 30_000L; t += 30_000L) {
+            mixed.add(punctual(t, 30_000L));                 // the fine series, all on time
+        }
+        mixed.add(backfilled(SESSION_OPEN, 1_800_000L, SESSION_OPEN + 6 * 3_600_000L));
+        g.measure(mixed);
+
+        assertEquals(30_000L, g.finestWidthMs());
+        assertEquals(20, g.barsMeasured(), "the fine series only");
+        assertEquals(0, g.lateBars(),
+                "the backfilled 30m bar is real but it is not what names this window");
+        assertNull(g.label(), "no fine bar was late, so the feed was alive through these minutes");
     }
 
     @Test
