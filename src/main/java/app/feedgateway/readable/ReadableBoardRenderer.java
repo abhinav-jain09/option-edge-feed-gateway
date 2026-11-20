@@ -176,6 +176,13 @@ public final class ReadableBoardRenderer {
         if (read != null && at != null) {
             vwapHeld.observe("vwapes", read.session(), at);
             vwapHeld.observe("vwaprth", read.rth(), at);
+            // The movement of the two VWAP figures, at the RECORD's own instant, so a latched
+            // figure's age survives a restart of this gateway (a clock of ours would restart with
+            // it). A LATCHED figure usually keeps moving -- measured, see LatchWatch.
+            latches.observe("vwapes", read.session() == null ? null
+                    : read.session().vwap() == null ? null : read.session().vwap().value(), at);
+            latches.observe("vwaprth", read.rth() == null ? null
+                    : read.rth().vwap() == null ? null : read.rth().vwap().value(), at);
         }
         VwapRebuild.Moment m = VwapRebuild.decode(json);
         if (m != null) {
@@ -194,6 +201,17 @@ public final class ReadableBoardRenderer {
      * here where the SPX topic is bound would mean the filter is not running.
      */
     private long otherInstrumentSnapshots;
+
+    /**
+     * <b>When each VWAP figure last changed</b>, so {@code (LATCHED)} can say whether the figure is
+     * still moving. See {@link LatchWatch} for the measurement this closes.
+     */
+    private final LatchWatch latches = new LatchWatch();
+
+    /** The movement store, for a readiness probe and the metrics page. */
+    public LatchWatch latches() {
+        return latches;
+    }
 
     /** Bars PUBLISHED long after their own minute, so the headline can say so. */
     private final FeedGap feedGap = new FeedGap();
@@ -440,7 +458,8 @@ public final class ReadableBoardRenderer {
                         // block is skipped and the heap's own reason is appended by
                         // withOvernightAbsence; here the reason is the reference's, which is the
                         // silence rule's: "no silence of three hours or more has been seen yet".
-                        lowHeap ? HeapGuard.reason() : source.closeAbsenceReason()), lowHeap);
+                        lowHeap ? HeapGuard.reason() : source.closeAbsenceReason(),
+                        latches), lowHeap);
             }
             case "overnight": {
                 boolean lowHeap = HeapGuard.low();
