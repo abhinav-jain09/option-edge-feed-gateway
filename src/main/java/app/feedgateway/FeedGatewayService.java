@@ -427,6 +427,14 @@ public class FeedGatewayService implements ReplayRunner {
      * session and never answer a lookup.
      */
     private final Map<String, String> whatIfMap = new ConcurrentHashMap<>();
+
+    /**
+     * <b>C-61 / C-63</b>: the readable board page, rendered here because this is where all three of
+     * its inputs already live — the map service's published record, the cached footprint bars and
+     * the decoded canonical SPX spot. It formats and decides nothing.
+     */
+    private final app.feedgateway.readable.ReadableBoardRenderer readableBoard =
+            new app.feedgateway.readable.ReadableBoardRenderer(this::newestWhatIfBoard, null);
     /** Gamma Navigator shadow view per chain. REST-only, like gammaRotation. */
     private final Map<String, String> gammaNavigation = new ConcurrentHashMap<>();
     /** Corridor-gauge live state per symbol|expiry (JSON, last-value-wins). Standalone event. */
@@ -1197,6 +1205,13 @@ public class FeedGatewayService implements ReplayRunner {
         }
         if (!"es-footprint-bar".equals(event) && !"es-footprint-outcome".equals(event)) {
             return true;                                            // live snapshots: never admitted to a view
+        }
+        if ("es-footprint-bar".equals(event)) {
+            // C-63: tapped BEFORE admitBar on purpose. FootprintViews keeps ONE session date and
+            // clears every bar when it rolls, but the readable page's night runs from the previous
+            // CASH close and so crosses that roll -- taking the view's bars would silently drop the
+            // first hour of the owner's night. The page's own store is bounded by the night instead.
+            readableBoard.onBarJson(json);
         }
         FootprintViews.Admission a = "es-footprint-bar".equals(event) ? footprintViews.admitBar(json) : footprintViews.admitOutcome(json);
         if (a.reason() != FootprintViews.Reason.ADMITTED) {
@@ -7003,6 +7018,10 @@ public class FeedGatewayService implements ReplayRunner {
                 cacheEventTimes.put(versionKey, eventTime);
                 cachePositions.put(versionKey, recordPosition(record));
                 spxPrices.put(key, json); // canonical SPX spot, kept distinct from ES/index (vix idiom)
+                // C-63: the readable page's last price, and its reference price. The page takes the
+                // previous cash close from the last INDEX print rather than from a calendar, so it
+                // needs every price record and not only the overnight ones.
+                readableBoard.onPriceJson(json, eventTime);
                 return key;
             }
             case "strike-flow" -> {
@@ -9009,6 +9028,42 @@ public class FeedGatewayService implements ReplayRunner {
      * two hand-rolled copies could only ever drift apart — and a mismatch here is invisible: the
      * endpoint answers present:false for a chain that is publishing once a second.
      */
+    /**
+     * The map record of the chain being traded, for the readable page: the cached board with the
+     * greatest expiry.
+     *
+     * <p>Expiries are {@code YYYYMMDD}, so the greatest is the furthest forward, which for this
+     * estate's same-day chains is the current session's. Overnight the only cached board is the
+     * previous session's — which is correct and is why the page prints the board's OWN cycle date
+     * in its heading rather than implying it is current.
+     */
+    private String newestWhatIfBoard() {
+        String best = null;
+        String bestKey = null;
+        for (Map.Entry<String, String> e : whatIfMap.entrySet()) {
+            if (bestKey == null || e.getKey().compareTo(bestKey) > 0) {
+                bestKey = e.getKey();
+                best = e.getValue();
+            }
+        }
+        return best;
+    }
+
+    /** <b>C-61</b>: the bytes of the readable page, as last rendered. Never null, never empty. */
+    public String readableBoardPage() {
+        return readableBoard.page();
+    }
+
+    /** <b>C-61</b>: render the readable page once. Called on the 30-second cadence. */
+    public void renderReadableBoard() {
+        readableBoard.render();
+    }
+
+    /** When the readable page was last rendered, so a stopped renderer is visible. */
+    public long readableBoardRenderedAtMs() {
+        return readableBoard.renderedAtMs();
+    }
+
     private String cachedByChain(Map<String, String> cache, String symbol, String expiry) {
         if (symbol == null || expiry == null) {
             return null;

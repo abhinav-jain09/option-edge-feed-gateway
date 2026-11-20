@@ -1,0 +1,251 @@
+package app.feedgateway.readable;
+
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Locale;
+
+/**
+ * <b>C-61</b>: the readable record as one page of plain text, rendered by the service and served
+ * read-only at one unauthenticated address, so the reviewer reads the service's own output instead
+ * of a page somebody typed by hand.
+ *
+ * <p><b>This is a REPLACE and not an append.</b> The map service's own {@code LiveWriter} seam
+ * appends one block to a tab and R-LIVE-1 forbids it from ever editing an earlier one, which is
+ * what makes that tab evidence. This page is the opposite shape on purpose: it is the newest state,
+ * whole, replaced every 30 seconds, and a reader must never have to scroll to find out what is
+ * current. Two different jobs; folding this into the append-only writer would have broken R-LIVE-1
+ * to do it.
+ *
+ * <p><b>It lives in the GATEWAY, by C-63.</b> The gateway already holds everything this page needs
+ * and the map service holds none of it at night: the board comes from the map service's own
+ * published record on {@code options.spx.whatif.map}, the overnight rows from the cached
+ * {@code es.futures.footprint.bars}, and the last price from the decoded {@code canonicalSpot} of
+ * {@code underlying.spx.price}. So the page needs no new topic and the overnight price does not
+ * depend on the map service being up — which is right, because at night the two have nothing to
+ * do with each other. <b>The gateway FORMATS and does not decide</b>: no gamma, no basis and no
+ * reading is computed here, only laid out.
+ *
+ * <p><b>It is a pure function.</b> Nothing here reads a topic, a clock or a secret: every input is
+ * a parameter, so the page a test renders is byte-for-byte the page the service serves. The path it
+ * is served at is not this class's business and never appears in it (C-61: the address lives in a
+ * Kubernetes secret, never in the repository and never in a log line).
+ *
+ * <p><b>The order of the first line is the owner's</b> (C-60's first addendum, item a): the time of
+ * the last price, in New York and in Amsterdam, then the price, then the time the page was written.
+ * He asked for it in that order because the failure he actually hit was a page whose own write time
+ * looked current while the price in it was ninety minutes old. {@code STALE} opens the line when the
+ * price is older than {@link #STALE_AFTER_SECONDS}, with since when.
+ */
+public final class ReadablePage {
+
+    /** C-61: the page is plain text under twenty thousand characters. */
+    public static final int MAX_CHARS = 20_000;
+
+    /** C-60 addendum (b): older than this and the first line opens with STALE. */
+    public static final long STALE_AFTER_SECONDS = 20 * 60;
+
+    /** The owner trades New York hours from Amsterdam, so every time is given in both. */
+    private static final ZoneId NY = ZoneId.of("America/New_York");
+    private static final ZoneId AMS = ZoneId.of("Europe/Amsterdam");
+    private static final DateTimeFormatter HM = DateTimeFormatter.ofPattern("HH:mm");
+    private static final DateTimeFormatter HMS = DateTimeFormatter.ofPattern("HH:mm:ss");
+
+    /**
+     * The last SPX-equivalent price and where it came from.
+     *
+     * @param epochMs when the price was observed, NOT when it was read
+     * @param spx     the SPX-equivalent price; this service never applies a basis of its own
+     * @param source  the producer's own word, e.g. {@code ES_BASIS_DERIVED} overnight
+     * @param quality the producer's own word, e.g. {@code LIVE_ES_BASIS}
+     */
+    public record Price(long epochMs, double spx, String source, String quality) {
+        public Price {
+            if (epochMs <= 0) {
+                throw new IllegalArgumentException(
+                        "a price with no time cannot be judged stale, which is the one thing this "
+                                + "page must be able to say about it (C-60 addendum b)");
+            }
+        }
+    }
+
+    /**
+     * One 15-minute slot of the fixed grid. Every field but the start is nullable <b>as a block</b>:
+     * a slot the bars have not delivered is a row with its timestamp and empty price cells, which is
+     * C-60's third addendum in one sentence — the grid is a time grid, not a list of what arrived.
+     */
+    public record Slot(long startMs, Double open, Double high, Double low, Double close,
+                       Long volume, String basisState) {
+
+        /** True where this slot has prices. A slot without them keeps its place and stays blank. */
+        public boolean filled() {
+            return close != null;
+        }
+    }
+
+    /**
+     * The overnight path. The high and low are passed in rather than taken from the slots, because
+     * they are computed over the live tick path and the tick low can sit below every bar's low —
+     * measured on 2026-11-20, where it did.
+     */
+    public record Overnight(double previousClose, long previousCloseMs, List<Slot> slots,
+                            Double high, Double low) {
+        public Overnight {
+            slots = List.copyOf(slots);
+        }
+    }
+
+    /**
+     * The gamma block, when a board exists. {@code rowsPresent} of {@code rowsExpected} is the
+     * reviewer's own item 3: the owner sees at once how complete the morning board is, because the
+     * first pre-market boards are thin in the same way 7,170 was.
+     */
+    public record Board(long cycleMs, double spot, int rowsPresent, int rowsExpected,
+                        List<String> lines) {
+        public Board {
+            lines = List.copyOf(lines);
+        }
+    }
+
+    private ReadablePage() {
+    }
+
+    /**
+     * Render the page.
+     *
+     * @param nowMs     the write instant
+     * @param last      the last price, or null where there is none at all
+     * @param overnight the overnight grid, or null before there is one
+     * @param board     the gamma block, or null when no board exists yet — in which case the page
+     *                  says so rather than showing yesterday's as today's (C-60 addendum d)
+     */
+    public static String render(long nowMs, Price last, Overnight overnight, Board board) {
+        StringBuilder out = new StringBuilder(4_096);
+        out.append(firstLine(nowMs, last)).append('\n');
+        if (overnight != null) {
+            out.append('\n').append(overnightSection(nowMs, overnight));
+        }
+        if (board != null) {
+            out.append('\n').append(boardSection(board));
+        } else {
+            out.append("\nGAMMA BOARD\n")
+                    .append("  No board yet. The gamma exposure feed is silent overnight and the "
+                            + "first complete round arrives pre-market; this page will carry it "
+                            + "then. Yesterday's board is deliberately NOT shown here, because a "
+                            + "board without its own cycle time reads as today's.\n");
+        }
+        return cap(out.toString());
+    }
+
+    /** C-60 addendum (a) and (b), in the owner's own order. */
+    private static String firstLine(long nowMs, Price last) {
+        if (last == null) {
+            return "NO PRICE — this page has no SPX-equivalent price at all. Written "
+                    + hm(nowMs, AMS) + " Amsterdam. Nothing below is a current price.";
+        }
+        long ageSeconds = Math.max(0, (nowMs - last.epochMs()) / 1000L);
+        String head = ageSeconds > STALE_AFTER_SECONDS
+                ? "STALE — the last price is " + (ageSeconds / 60) + " minutes old, unchanged since "
+                        + hms(last.epochMs(), NY) + " New York. "
+                : "";
+        return head
+                + "Last price " + hms(last.epochMs(), NY) + " New York / "
+                + hms(last.epochMs(), AMS) + " Amsterdam: "
+                + money(last.spx()) + " SPX-equivalent"
+                + " (" + last.source() + ", " + last.quality() + ")."
+                + " Written " + hms(nowMs, AMS) + " Amsterdam.";
+    }
+
+    private static String overnightSection(long nowMs, Overnight o) {
+        StringBuilder s = new StringBuilder(2_048);
+        s.append("OVERNIGHT — SPX-equivalent, from the platform's own fields\n");
+        s.append("  Previous SPX cash close ").append(money(o.previousClose()))
+                .append(" at ").append(hms(o.previousCloseMs(), NY)).append(" New York.");
+        if (o.high() != null && o.low() != null) {
+            s.append("  High ").append(money(o.high()))
+                    .append(", low ").append(money(o.low())).append('.');
+        } else {
+            s.append("  High and low not measurable yet.");
+        }
+        s.append('\n');
+        int filled = 0;
+        for (Slot slot : o.slots()) {
+            if (slot.filled()) {
+                filled++;
+            }
+        }
+        s.append("  ").append(filled).append(" of ").append(o.slots().size())
+                .append(" 15-minute slots carry bars. A blank slot keeps its place and is filled "
+                        + "in by backfill when the bars arrive; nothing is interpolated.\n\n");
+        s.append("  SLOT(NY)  SLOT(AMS)       OPEN       HIGH        LOW      CLOSE"
+                + "     VOLUME  BASIS\n");
+        for (Slot slot : o.slots()) {
+            s.append(String.format(Locale.ROOT, "  %-9s %-9s", hm(slot.startMs(), NY),
+                    hm(slot.startMs(), AMS)));
+            if (slot.filled()) {
+                s.append(String.format(Locale.ROOT, " %10s %10s %10s %10s %10s  %s",
+                        money(slot.open()), money(slot.high()), money(slot.low()),
+                        money(slot.close()),
+                        slot.volume() == null ? "-" : String.format(Locale.ROOT, "%,d",
+                                slot.volume()),
+                        slot.basisState() == null ? "-" : slot.basisState()));
+            } else {
+                // C-60's third addendum: the row exists with its timestamp and empty price cells.
+                s.append("          -          -          -          -          -  -");
+            }
+            s.append('\n');
+        }
+        return s.toString();
+    }
+
+    /** C-60 addendum (d): the board's own cycle time and date, so it is never read as today's. */
+    private static String boardSection(Board b) {
+        StringBuilder s = new StringBuilder(2_048);
+        s.append("GAMMA BOARD — cycle ")
+                .append(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+                        .format(Instant.ofEpochMilli(b.cycleMs()).atZone(NY)))
+                .append(" New York (")
+                .append(hms(b.cycleMs(), AMS)).append(" Amsterdam)\n");
+        s.append("  Spot ").append(money(b.spot()))
+                .append(" — rows ").append(b.rowsPresent()).append(" of ")
+                .append(b.rowsExpected())
+                .append(". A strike the gamma service published no row for is printed as "
+                        + "\"no row\" and never skipped.\n\n");
+        for (String line : b.lines()) {
+            s.append("  ").append(line).append('\n');
+        }
+        return s.toString();
+    }
+
+    /**
+     * C-61's twenty-thousand-character bound, enforced here rather than hoped for.
+     *
+     * <p>The page is truncated from the <b>end</b>, so the first line and the overnight summary —
+     * the price the owner is actually reading — always survive, and the cut is NAMED. A silent
+     * truncation of a board would read as a short board.
+     */
+    private static String cap(String page) {
+        if (page.length() <= MAX_CHARS) {
+            return page;
+        }
+        String notice = "\n[TRUNCATED: this page exceeded " + MAX_CHARS
+                + " characters and was cut here. The price and the overnight path above are "
+                + "complete; board rows below this point are missing.]\n";
+        int keep = MAX_CHARS - notice.length();
+        int cut = page.lastIndexOf('\n', keep);
+        return page.substring(0, cut > 0 ? cut : keep) + notice;
+    }
+
+    private static String money(double v) {
+        return String.format(Locale.ROOT, "%.2f", v);
+    }
+
+    private static String hm(long ms, ZoneId zone) {
+        return HM.format(Instant.ofEpochMilli(ms).atZone(zone));
+    }
+
+    private static String hms(long ms, ZoneId zone) {
+        return HMS.format(Instant.ofEpochMilli(ms).atZone(zone));
+    }
+}
