@@ -84,3 +84,38 @@ differs it refuses again and this has to be redone.
 The lesson for the next change to this file: a mutation anchor can span twenty lines, so inserting
 anywhere inside a quoted block silently invalidates it. Run the checker against the committed tree
 *before* the 45-minute build, not after it.
+
+## Refresh for the per-topic catch-up gate (build 905)
+
+Build **905** (gateway source `b03548388ab9a5e8c266a690082562ddf8df3e8f`) passed the full suite —
+**2,411 tests, 0 failures, 0 errors, 1 skipped** — and reproduced the 50-mutation campaign: 49
+killed, the one characterized survivor, and *"the record reproduces: 50 mutations, same claim and
+same outcome for every one"*. It then **refused to emit** because the source had moved:
+
+```
+REFUSING TO EMIT:
+   G-R1/G-R2/G-R3/G-R6/G-R9/G-R10: src/main/java/app/feedgateway/FeedGatewayService.java at HEAD is
+   not the file the campaign mutated (sha256 e0a4cc57c27f, the record says 9b89108979f9) — the
+   source has moved and the campaign has to be re-run
+```
+
+**What moved the hash, and it was not this change.** `FeedGatewayService.java` was last touched by
+**#156, "Per-topic catch-up gate: one slow topic can no longer dark the whole board"**, which landed
+at **2026-11-20 12:10:22** and is an ancestor of the built tree. That PR did not refresh this record,
+so every gateway build after it refuses to emit — build 905 was doomed before it started, twenty-four
+minutes later.
+
+**This is the first four entries' kind of refresh, not the 2026-11-19 source-rebinding kind.** There
+*is* a captured artifact: build 905's own
+[`footprint-reverify.json`](http://localhost:8085/job/option-edge-feed-gateway/905/artifact/.jenkins-tmp/es4-tests-905/footprint-reverify.json),
+402,680 bytes, which is the record the build's log names on the line *"Captured current campaign
+record (402680 bytes)"*. `ES-FOOTPRINT-CAMPAIGN.json` is replaced **wholesale** with that file. Every
+patch, baseline, claim and outcome in it is what build 905 measured against the current source, so no
+hash is hand-edited and no claim is carried over untested.
+
+The 22 `FeedGatewayService.java` occurrences — 11 `originalFileSha256` and 11 `original` — now read
+`e0a4cc57c27f5670d46a72bb4bf1a820359dd759a2fc9a8653fcd5817b2393c8`, which is the sha256 of that file
+at `b0354838`. The record grows from 395,780 to 402,680 bytes, and `50` top-level entries are
+unchanged.
+
+Validation: `bash scripts/footprint-reqstate.sh --check` prints **§2a matches the campaign record**.
