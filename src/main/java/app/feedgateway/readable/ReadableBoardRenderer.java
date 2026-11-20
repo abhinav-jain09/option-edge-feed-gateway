@@ -257,9 +257,25 @@ public final class ReadableBoardRenderer {
         if (price != null) {
             source.onPrice(price);
             ReadablePage.Price reference = source.previousCashClose();
-            if (reference != null && reference.epochMs() != nightStartedAt) {
-                // The night starts at the last index print. When that moves -- a new cash close --
-                // the store drops the previous night so a long-running gateway cannot accumulate.
+            // C-97 item 4, THE SECOND HALF OF THE LOOP, and it is guarded here as well as in
+            // OvernightSource on purpose.
+            //
+            // What the old condition believed: "the reference moved, so the session rolled". What
+            // it actually did on 2026-11-20: the pre-market index feed replaced the reference once
+            // a second, this branch read every one of those as a session roll, and
+            // nightStartsAt(now) cleared every bar before it. The night's start marched forward
+            // and the page went from 26 of 51 slots to 0 of 1 in fourteen minutes.
+            //
+            // OvernightSource now freezes the reference, so this branch cannot fire that way any
+            // more -- and that is exactly why the guard belongs here too. A loop this expensive
+            // should not be prevented by one condition in one class: the next person to relax the
+            // freeze would restore it silently. So the start may be set when there is none, and
+            // may be moved EARLIER (a correction learned from history), and is never moved
+            // FORWARD into the live session on the strength of a price. Rolling it forward at a
+            // real cash close needs a session boundary this class does not hold; that is an open
+            // item in the Discussion tab, not something to infer from a tick.
+            if (reference != null
+                    && (nightStartedAt == 0L || reference.epochMs() < nightStartedAt)) {
                 nightStartedAt = reference.epochMs();
                 source.nightStartsAt(nightStartedAt);
             }
