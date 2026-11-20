@@ -39,6 +39,11 @@ public final class ReadableBoardRenderer {
 
     private final OvernightSource source = new OvernightSource();
     private final PreopenSource preopen = new PreopenSource();
+    /** C-65's path of sides. Fed from the indicators snapshot, rebuilt at start-up by C-71. */
+    private final VwapSideTracker sides = new VwapSideTracker();
+    private volatile String indicatorsJson;
+    private volatile String basisJson;
+    private volatile String profileJson;
     private final Supplier<String> boardJson;
     private final LongSupplier clock;
 
@@ -112,6 +117,50 @@ public final class ReadableBoardRenderer {
     /** The pre-open store, for the status page and the tests. */
     public PreopenSource preopenSource() {
         return preopen;
+    }
+
+    /**
+     * One ES indicators snapshot, as the gateway received it.
+     *
+     * <p>Feeds C-69's VWAP cells and C-65's path of sides. The side path is advanced with
+     * <b>this snapshot's own price against this snapshot's own VWAP</b> — the only comparison that
+     * is ever true. The snapshot carries {@code currentPrice} beside {@code asOfEventTime}, so
+     * nothing is borrowed from a neighbouring record.
+     */
+    public void onIndicatorsJson(String json) {
+        if (json == null || json.isBlank()) {
+            return;
+        }
+        indicatorsJson = json;
+        VwapRebuild.Moment m = VwapRebuild.decode(json);
+        if (m != null) {
+            sides.observe(m.atMs(), m.price(), m.vwap(), m.upper1(), m.lower1(), m.anchor());
+        }
+    }
+
+    /** One basis state, as published — plain JSON on {@code spx.basis.state}, never Avro. */
+    public void onBasisJson(String json) {
+        if (json != null && !json.isBlank()) {
+            basisJson = json;
+        }
+    }
+
+    /** One gamma-zone profile, for C-66's footprint-by-price page. */
+    public void onProfileJson(String json) {
+        if (json != null && !json.isBlank()) {
+            profileJson = json;
+        }
+    }
+
+    /**
+     * <b>C-71</b>: rebuild the session's path of sides from snapshot history at start-up.
+     *
+     * <p>Called once by the gateway with the snapshots of this session. Without it, a restart left
+     * the owner's crossings and holding times at zero, which reads as a quiet session rather than
+     * a short memory.
+     */
+    public int rebuildSides(java.util.Collection<String> snapshots) {
+        return VwapRebuild.replay(sides, snapshots);
     }
 
     /** One SPX price record, as the gateway received it. */
@@ -209,6 +258,119 @@ public final class ReadableBoardRenderer {
     private static long boardCycleMs(String json, long fallback) {
         Long at = BoardCycle.epochMsOf(json);
         return at == null ? fallback : at;
+    }
+
+    /**
+     * C-66's pages, rendered on demand from what the gateway holds.
+     *
+     * <p>Unlike the long page these are not cached on the 30-second beat: each is a formatting
+     * pass over state that is already in memory, and a reader who asks for {@code /board} twice in
+     * a second costs nothing. The first line of each still carries the render instant, so a reader
+     * can always tell when what he is looking at was assembled.
+     *
+     * @param name one of board, now, overnight, footprint, recent-full, index
+     * @return the page, or null where that name is not a page
+     */
+    public String namedPage(String name) {
+        return namedPage(name, 1);
+    }
+
+    /** As {@link #namedPage(String)}, for one part of a paged page (1-based). */
+    public String namedPage(String name, int part) {
+        long nowMs = clock.getAsLong();
+        ReadablePage.Price last = source.lastPrice();
+        ReadablePage.Board board = currentBoard(nowMs);
+        switch (name == null ? "" : name) {
+            case "board":
+                return Pages.board(nowMs, last, board);
+            case "now":
+                return Pages.now(nowMs, last, overnightNow(nowMs),
+                        indicatorsJson == null ? null : VwapRead.of(indicatorsJson),
+                        basisJson == null ? null : BasisRead.of(basisJson),
+                        sides.result(), recentRows(), board, stalledInputs());
+            case "overnight":
+                return Pages.overnight(nowMs, last, overnightNow(nowMs));
+            case "footprint":
+                return onePage(Pages.footprint(nowMs, last, board == null ? 0.0 : board.spot(),
+                        footprintLevels(board), basisOrNull()), part);
+            case "recent-full":
+                return onePage(Pages.recentFull(nowMs, last, recentRows()), part);
+            case "index":
+                return Pages.index(nowMs, last, pageStats(nowMs));
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * One part of a paged page, 1-based, or a line saying which parts exist.
+     *
+     * <p>C-66 splits rather than cuts, so a page that does not fit is several pages and the reader
+     * has to be able to ask for the next one. Asking for a part that is not there is answered with
+     * the count rather than with nothing, because a blank page cannot be told from a wrong address.
+     */
+    private static String onePage(java.util.List<String> parts, int part) {
+        if (parts == null || parts.isEmpty()) {
+            return "empty|no rows for this page yet\n";
+        }
+        int index = part <= 0 ? 1 : part;
+        if (index > parts.size()) {
+            return "nosuchpart|asked for " + index + " of " + parts.size()
+                    + "|parts are numbered 1 to " + parts.size() + "\n";
+        }
+        return parts.get(index - 1);
+    }
+
+    /** The footprint levels near spot, or an empty list where there is no profile or no board. */
+    private java.util.List<FootprintByPrice.Level> footprintLevels(ReadablePage.Board board) {
+        if (profileJson == null || board == null) {
+            return java.util.List.of();
+        }
+        java.util.List<FootprintByPrice.Level> all =
+                FootprintByPrice.levels(profileJson, basisOrNull());
+        return FootprintByPrice.near(all, board.spot(), BoardLines.GRID_RADIUS, basisOrNull());
+    }
+
+    private BasisRead basisOrNull() {
+        return basisJson == null ? null : BasisRead.of(basisJson);
+    }
+
+    /** What /index lists: every page, when it was assembled and how long it is. */
+    private java.util.List<Pages.PageStat> pageStats(long nowMs) {
+        java.util.List<Pages.PageStat> out = new java.util.ArrayList<>();
+        for (String name : PAGES) {
+            String body = "index".equals(name) ? null : namedPage(name, 1);
+            out.add(new Pages.PageStat("/" + name, nowMs, body == null ? 0 : body.length()));
+        }
+        return out;
+    }
+
+    /** Every page name this renderer answers to, in the order /index lists them. */
+    public static final java.util.List<String> PAGES =
+            java.util.List.of("board", "now", "overnight", "footprint", "recent-full", "index");
+
+    /** The 30-second rows C-64 asks for, from the bars the gateway already holds. */
+    private java.util.List<RecentRows.Row> recentRows() {
+        return RecentRows.build(clock.getAsLong(), RecentRows.DEFAULT_ROWS,
+                source.bars(RECENT_TIMEFRAME));
+    }
+
+    /** The overnight grid as the long page builds it, shared so the two cannot disagree. */
+    private ReadablePage.Overnight overnightNow(long nowMs) {
+        ReadablePage.Price reference = source.previousCashClose();
+        if (reference == null) {
+            return null;
+        }
+        return OvernightGrid.build(nowMs, reference.epochMs(), reference.spx(),
+                source.bars(NIGHT_TIMEFRAME), null, null);
+    }
+
+    /** The board the pages show: the map record where there is one, else the pre-open board. */
+    private ReadablePage.Board currentBoard(long nowMs) {
+        String json = boardJson.get();
+        ReadablePage.Board board =
+                json == null ? null : BoardLines.from(json, boardCycleMs(json, nowMs));
+        return board != null ? board : preopen.board(nowMs);
     }
 
     /** The bytes to serve: whatever was last rendered. Never null, never empty. */

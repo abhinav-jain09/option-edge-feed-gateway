@@ -32,6 +32,32 @@ public class ReadableBoardController {
         this.service = service;
     }
 
+    /**
+     * <b>C-66</b>: one page of the split record, by name, with an optional part number.
+     *
+     * <p>Why by name rather than one long page: the record no longer fits in something a reader
+     * can take in, and C-66 splits rather than cuts. A name that is not a page answers with the
+     * list of names, not with a 404 — a reader at a secret address cannot tell a 404 from a wrong
+     * address, so this route never makes him guess which it was.
+     */
+    @GetMapping(PATH + "/{name}")
+    public ResponseEntity<String> namedPage(
+            @org.springframework.web.bind.annotation.PathVariable("name") String name,
+            @org.springframework.web.bind.annotation.RequestParam(value = "part",
+                    required = false, defaultValue = "1") int part) {
+        String body = service.readableNamedPage(name, part);
+        if (body == null) {
+            body = "nosuchpage|" + name + "|pages are "
+                    + String.join(", ", app.feedgateway.readable.ReadableBoardRenderer.PAGES)
+                    + "\n";
+        }
+        return ResponseEntity.ok()
+                .contentType(MediaType.TEXT_PLAIN)
+                .header("Cache-Control", "no-store")
+                .header("X-Robots-Tag", "noindex, nofollow")
+                .body(body);
+    }
+
     @GetMapping(PATH)
     public ResponseEntity<String> page() {
         return ResponseEntity.ok()
