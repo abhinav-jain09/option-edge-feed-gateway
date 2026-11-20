@@ -290,6 +290,8 @@ class ReadableReferenceHistoryTest {
         var first = pairs.get(0);
         assertEquals(barStart, first.barStartMs(),
                 "the bar's own minute comes from its own observations block");
+        assertEquals(barStart + 60_000L, first.barEndMs(),
+                "the bar's own close, read from the record and not derived");
         assertEquals(publishedLate, first.publishedMs(),
                 "and the publish instant is the RECORD's timestamp, which is what survives a "
                         + "restart -- not anything taken from our own clock");
@@ -320,9 +322,43 @@ class ReadableReferenceHistoryTest {
         assertTrue(d.polledButConvertedNothing(), d.line());
     }
 
-    /** A footprint bar carrying the one field the publish-time reader needs. */
+    /**
+     * A footprint bar carrying BOTH instants the publish-time reader needs.
+     *
+     * <p>{@code barEndMs} as well as {@code barStartMs}: lateness is the lag after the bar CLOSED,
+     * because the topic carries five timeframes and a 30m bar is 1,800 s after its own start by
+     * construction. A fixture with only the start made this test pass while the page named the
+     * whole session as a gap.
+     */
     private static String bar(long startMs) {
+        return bar(startMs, 60_000L);
+    }
+
+    private static String bar(long startMs, long widthMs) {
         return "{\"schemaVersion\":6,\"symbol\":\"ES.v.0\",\"timeframe\":\"1m\","
-                + "\"observations\":{\"barStartMs\":" + startMs + ",\"volume\":1200}}";
+                + "\"widthMs\":" + widthMs + ",\"observations\":{\"barStartMs\":" + startMs
+                + ",\"barEndMs\":" + (startMs + widthMs) + ",\"volume\":1200}}";
+    }
+
+    @Test
+    @DisplayName("a bar with no close instant is refused, not given a derived one")
+    void aBarWithNoEndIsRefused() {
+        String noEnd = "{\"schemaVersion\":6,\"timeframe\":\"1m\","
+                + "\"observations\":{\"barStartMs\":" + (NOW - 3_600_000L) + "}}";
+        java.util.function.Supplier<org.apache.kafka.clients.consumer.Consumer<String, Object>>
+                consumers = () -> {
+                    Seeking c = new Seeking();
+                    c.hold(new TopicPartition(BARS, 0),
+                            List.of(record(BARS, 0L, NOW - 3_500_000L, noEnd)));
+                    return c;
+                };
+        ReadableReferenceHistory history = new ReadableReferenceHistory(
+                consumers, v -> (String) v, v -> (String) v, PRICES, BARS);
+
+        assertTrue(history.barPublishTimes(NOW - 30L * 3_600_000L, NOW).isEmpty(),
+                "a bar that cannot say which minutes it covers cannot be judged late or punctual; "
+                        + "deriving its close from a width would be a second opinion about a figure "
+                        + "the producer already states");
+        assertEquals(1, history.drains().get(0).unconvertible());
     }
 }
