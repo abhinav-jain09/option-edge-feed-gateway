@@ -66,10 +66,24 @@ public final class Pages {
             "spx-by-this-page=vwapspx and the footprint SPX column are translated here from the "
             + "published ES figure using the published basis; every other SPX price is the topic's";
 
-    /** The reading codes, expanded by every page's legend. */
+    /**
+     * The reading codes, expanded by every page's legend.
+     *
+     * <p><b>C-118 made {@code empty} mean one thing, and the legend now says which.</b> It read
+     * "no data for that slot" while a blank row could also be a bar the platform had not
+     * translated &mdash; nine of them on 2026-11-20, each with a real volume and a real delta. A
+     * blank row is now only a slot with no bar at all, so the legend's old words are true for the
+     * first time; and the two states that used to hide behind it have their own entries, because a
+     * reader meeting {@code ES7168.25} or {@code noSPX} for the first time should not have to
+     * guess whether the page is showing him a different instrument.
+     */
     static final String LEGEND =
             "legend|A=accelerate|H=hold|N=neutral|norow=gamma service published no row|"
-            + "empty=no data for that slot|px=SPX-equivalent|basis A=anchored, ?=none on that bar|"
+            + "empty=no bar arrived for that slot (and nothing else)|"
+            + "ES0000.00=the bar's OWN futures price, printed because the platform published no "
+            + "SPX-equivalent for it; never translated here|"
+            + "noSPX=that bar carries no SPX-equivalent price, so its prices are futures|"
+            + "px=SPX-equivalent|basis A=anchored, ?=none on that bar|"
             + PAGE_COMPUTED;
 
     /**
