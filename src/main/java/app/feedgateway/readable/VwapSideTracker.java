@@ -41,12 +41,29 @@ public final class VwapSideTracker {
     }
 
     /** What the page prints. */
+    /**
+     * @param esPrice the price the side was last decided from, in ES
+     * @param esVwap  the line it was compared against, in ES, from the SAME record (C-83)
+     */
     public record Result(String side, long sideSinceMs, Long lastCrossMs, int crosses,
                          long longestAboveMs, long longestBelowMs, long observedFromMs,
-                         List<Attempt> attempts, String anchorName, int anchorChanges) {
+                         List<Attempt> attempts, String anchorName, int anchorChanges,
+                         Double esPrice, Double esVwap) {
     }
 
     private String side;
+    /**
+     * <b>C-83</b>: the two figures the side was last decided from, published on the {@code hold|}
+     * line so the comparison is checkable on the page.
+     *
+     * <p>The reviewer computed the side himself from the page's {@code now|} line plus the basis
+     * and got the opposite letter — correctly, because {@code now|} comes from
+     * {@code underlying.spx.price} while the side is decided from the indicators record's OWN
+     * price against that same record's own VWAP. The page was giving a reader two of the three
+     * numbers, from different sources. These are the two the comparison actually used, both in ES.
+     */
+    private Double lastEsPrice;
+    private Double lastEsVwap;
     private long sideSince;
     private Long lastCross;
     private int crosses;
@@ -77,6 +94,8 @@ public final class VwapSideTracker {
         if (observedFrom == 0) {
             observedFrom = atMs;
         }
+        lastEsPrice = esPrice;
+        lastEsVwap = esVwap;
         if (anchor != null && !anchor.isBlank()) {
             if (!anchorName.isEmpty() && !anchorName.equals(anchor)) {
                 // THE ANCHOR CHANGED, so this is a different line and the old path cannot be
@@ -184,6 +203,6 @@ public final class VwapSideTracker {
         }
         out.addAll(attempts);
         return new Result(side, sideSince, lastCross, crosses, above, below, observedFrom,
-                List.copyOf(out), anchorName, anchorChanges);
+                List.copyOf(out), anchorName, anchorChanges, lastEsPrice, lastEsVwap);
     }
 }
