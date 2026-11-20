@@ -513,7 +513,24 @@ public final class Pages {
     public static String now(long nowMs, ReadablePage.Price last, ReadablePage.Overnight overnight,
             VwapRead vwap, BasisRead basis, VwapSideTracker.Result holding,
             List<RecentRows.Row> recent, ReadablePage.Board board,
-            List<StalledInputs.Input> stalled, VwapHeld held, String feedGap, String closeAbsenceReason) {
+            List<StalledInputs.Input> stalled, VwapHeld held, String feedGap,
+            String closeAbsenceReason) {
+        return now(nowMs, last, overnight, vwap, basis, holding, recent, board, stalled, held,
+                feedGap, closeAbsenceReason, null);
+    }
+
+    /**
+     * The same page, with the figures' movement (C-“latched is still updating”).
+     *
+     * <p>The watch is LAST and nullable so the twelve-argument form above keeps working unchanged:
+     * every existing caller and test is positional, and inserting a parameter in the middle of a
+     * twelve-argument call is how a test ends up asserting about the wrong column.
+     */
+    public static String now(long nowMs, ReadablePage.Price last, ReadablePage.Overnight overnight,
+            VwapRead vwap, BasisRead basis, VwapSideTracker.Result holding,
+            List<RecentRows.Row> recent, ReadablePage.Board board,
+            List<StalledInputs.Input> stalled, VwapHeld held, String feedGap,
+            String closeAbsenceReason, LatchWatch latches) {
         StringBuilder s = new StringBuilder(8_192);
         s.append(firstLine(nowMs, last)).append('\n');
         // C-75: the facts the reviewer is asked for, as SHORT single-fact labelled lines, above
@@ -553,18 +570,21 @@ public final class Pages {
             // No readable record NOW, but figures were held earlier: keep them, with the time
             // they were read -- "no vwap block at all" is a state of the record, not a reason to
             // drop what the line last knew.
-            s.append(vwapLine("vwapes", null, null, held));
-            s.append(vwapLine("vwaprth", null, null, held));
+            s.append(vwapLine("vwapes", null, null, held, ""));
+            s.append(vwapLine("vwaprth", null, null, held, ""));
         } else {
-            s.append(vwapLine("vwapes", vwap.session(), null, held));
-            s.append(vwapLine("vwaprth", vwap.rth(), null, held));
+            s.append(vwapLine("vwapes", vwap.session(), null, held,
+                    movement(latches, "vwapes", nowMs)));
+            s.append(vwapLine("vwaprth", vwap.rth(), null, held,
+                    movement(latches, "vwaprth", nowMs)));
             if (basis == null) {
                 s.append("vwapspx|absent|no basis published on spx.basis.state\n");
             } else if (!basis.usableForDisplay()) {
                 s.append("vwapspx|absent|basis ").append(basis.cell())
                         .append("|not anchored, so nothing is translated\n");
             } else {
-                s.append(vwapLine("vwapspx", vwap.session(), basis, held));
+                s.append(vwapLine("vwapspx", vwap.session(), basis, held,
+                        movement(latches, "vwapes", nowMs)));
             }
         }
         // C-101 item 2: the basis line stands on its OWN, outside EVERY branch above.
@@ -656,14 +676,24 @@ public final class Pages {
      * has never had a figure says so and names the state that is standing in its way. The absence
      * is always reported — the held figures are never passed off as current.
      */
+    /**
+     * The movement cell for a figure, or empty where nothing is watching or nothing has moved yet.
+     *
+     * <p>Only the VWAP figure carries it. The five band figures move with it by construction, so
+     * repeating the same age six times on one line would spend a reader's attention on one fact.
+     */
+    private static String movement(LatchWatch latches, String name, long nowMs) {
+        return latches == null ? "" : latches.movementCell(name, nowMs);
+    }
+
     private static String vwapLine(String label, VwapRead.Anchor a, BasisRead basis,
-            VwapHeld held) {
+            VwapHeld held, String movement) {
         if (a != null && a.vwap() != null && a.vwap().value() != null) {
-            return label + "|" + figures(a, basis) + "\n";
+            return label + "|" + figures(a, basis, movement) + "\n";
         }
         VwapHeld.Snapshot last = held == null ? null : held.of(label);
         if (last != null) {
-            return label + "|" + figures(last.anchor(), basis)
+            return label + "|" + figures(last.anchor(), basis, movement)
                     + "|held=" + hms(last.atMs(), NY) + "NY"
                     + "|now=" + stateOf(a)
                     + "\n";
@@ -672,8 +702,8 @@ public final class Pages {
     }
 
     /** The five cells and the deviation, in the order the legend names them. */
-    private static String figures(VwapRead.Anchor a, BasisRead basis) {
-        return cellOf(a.vwap(), basis)
+    private static String figures(VwapRead.Anchor a, BasisRead basis, String movement) {
+        return cellOf(a.vwap(), basis, movement)
                 + "|" + cellOf(a.lower2(), basis)
                 + "|" + cellOf(a.lower1(), basis)
                 + "|" + cellOf(a.upper1(), basis)
@@ -699,18 +729,33 @@ public final class Pages {
     }
 
     private static String cellOf(VwapRead.Figure f, BasisRead basis) {
+        return cellOf(f, basis, "");
+    }
+
+    /**
+     * One figure's cell, with the movement appended INSIDE its state brackets.
+     *
+     * <p>Inside the brackets and not after them, so {@code 7130.21(LATCHED,moved 3s)} reads as one
+     * qualified figure rather than a figure followed by a separate cell. A COMPLETE figure has no
+     * brackets and takes no movement: the producer calls it finished, and how long ago it last
+     * changed is then a fact about the market and not about the figure's state.
+     */
+    private static String cellOf(VwapRead.Figure f, BasisRead basis, String movement) {
         if (f == null) {
             return "";
         }
+        String moved = movement == null ? "" : movement;
         if (basis == null) {
-            return f.cell();
+            return f.complete() || moved.isEmpty() || f.value() == null
+                    ? f.cell()
+                    : f.cell().substring(0, f.cell().length() - 1) + moved + ")";
         }
         Double spx = basis.spxEquivalentOf(f.value());
         if (spx == null) {
             return f.cell();
         }
         return f.complete() ? money(spx) : money(spx) + "(" + f.cell().replaceAll("^[0-9.]+", "")
-                .replaceAll("[()]", "") + ")";
+                .replaceAll("[()]", "") + moved + ")";
     }
 
     /**
