@@ -268,6 +268,23 @@ final class C118RowNeverHidesABarTest {
     }
 
     @Test
+    @DisplayName("C-118: the legend's 'empty' means one thing, and names the two that hid behind it")
+    void theLegendSaysWhatEachBlankAndMarkerMeans() {
+        String legend = Pages.LEGEND;
+        assertTrue(legend.contains("empty=no bar arrived for that slot (and nothing else)"),
+                "'no data for that slot' was true of a missing bar AND of nine real bars the "
+                        + "platform had not translated, which is how C-117 read as no data: "
+                        + legend);
+        assertTrue(legend.contains("noSPX=that bar carries no SPX-equivalent price"), legend);
+        assertTrue(legend.contains("ES0000.00=the bar's OWN futures price"),
+                "a reader meeting ES7168.25 for the first time must not have to guess whether "
+                        + "the page switched instrument on him: " + legend);
+        assertTrue(legend.contains("never translated here"),
+                "and the legend says the page applied no basis, which is C-103 in the owner's "
+                        + "own terms: " + legend);
+    }
+
+    @Test
     @DisplayName("C-118: the three headline rows follow the same rule as the table")
     void theHeadlineRowsShowTheBarToo() {
         List<RecentRows.Row> rows = RecentRows.build(FIRST + 9L * 30_000L, 10, elevenBars());
