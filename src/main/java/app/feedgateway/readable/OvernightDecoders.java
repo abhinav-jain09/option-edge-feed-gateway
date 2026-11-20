@@ -15,8 +15,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * <p><b>The bars already carry the translation.</b> Each bar's {@code observations} holds
  * {@code spxEqOpenCents}, {@code spxEqHighCents}, {@code spxEqLowCents}, {@code spxEqCloseCents}
  * and {@code spxEqBasisState} beside the raw ES cents. This reads those and applies no basis of its
- * own; the raw {@code openCents} family is deliberately never touched, because the one arithmetic
- * this estate must not hold two copies of is ES to SPX.
+ * own, because the one arithmetic this estate must not hold two copies of is ES to SPX.
+ *
+ * <p><b>C-118: the raw {@code openCents} family is now read too, and that is not that arithmetic.</b>
+ * It used to be deliberately untouched, and the consequence was that a bar the platform had not
+ * translated was dropped whole &mdash; its volume, its two side counts and its delta with it. Those
+ * cents are carried through as the FUTURES prices they are, printed marked as futures and never as
+ * an index price. Reading a number the bar already holds is not computing a basis; it is the
+ * opposite of computing one.
  *
  * <p><b>The price is the platform's own overnight SPX-equivalent.</b> {@code canonicalSpot} is a
  * decimal rendered as text, so it is parsed and not cast. Overnight its {@code source} reads
@@ -24,8 +30,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * page verbatim so a reader sees which chain the figure came from rather than trusting the number.
  *
  * <p><b>A field that cannot be read makes the record ABSENT, not zero.</b> Every method returns
- * null and the caller counts it. A bar with no {@code spxEqCloseCents} was never translated, and
- * translating it here would be that second copy of the arithmetic.
+ * null and the caller counts it. But a bar with no {@code spxEqCloseCents} is no longer absent: it
+ * is a bar the platform never translated, and under C-118 it is admitted without SPX prices rather
+ * than dropped. Translating it here would still be that second copy of the arithmetic, and is
+ * still not done.
  */
 public final class OvernightDecoders {
 
@@ -40,6 +48,15 @@ public final class OvernightDecoders {
      * <p><b>An INCOMPLETE bar is refused.</b> {@code complete} false means the minute is still
      * forming, and a forming minute's high and low are not the minute's. Admitting it would show a
      * close that moves backwards when the finished bar replaces it.
+     *
+     * <p><b>C-118: a bar with no SPX-equivalent price is ADMITTED, not dropped.</b> This method
+     * used to return null when any of the four {@code spxEq*Cents} was missing, so such a bar never
+     * reached the renderer at all and its row came out blank &mdash; the nine rows of 2026-11-20
+     * (C-117), each one a real bar with real volume. Now the four are read together: all four
+     * present is a translated bar, none present is a bar carrying only its own futures prices, and
+     * a PARTIAL set is still refused, because three index prices and one futures price on one row
+     * read as four prices of the same kind. A bar with neither price set is refused too: there is
+     * nothing for a row to show.
      *
      * <p><b>Only the two finest timeframes are read, and each keeps its own.</b> The platform
      * publishes the same stretch of time at {@code 30s}, {@code 1m}, {@code 5m}, {@code 15m},
@@ -68,18 +85,46 @@ public final class OvernightDecoders {
             return null;
         }
         Long start = longOrNull(o, "barStartMs");
+        if (start == null) {
+            return null;            // a bar with no start cannot be placed in any slot
+        }
         Long open = longOrNull(o, "spxEqOpenCents");
         Long high = longOrNull(o, "spxEqHighCents");
         Long low = longOrNull(o, "spxEqLowCents");
         Long close = longOrNull(o, "spxEqCloseCents");
-        if (start == null || open == null || high == null || low == null || close == null) {
+        int spx = (open == null ? 0 : 1) + (high == null ? 0 : 1)
+                + (low == null ? 0 : 1) + (close == null ? 0 : 1);
+        if (spx != 0 && spx != 4) {
+            return null;            // half-translated: see this method's own javadoc
+        }
+        Long futOpen = longOrNull(o, "openCents");
+        Long futHigh = longOrNull(o, "highCents");
+        Long futLow = longOrNull(o, "lowCents");
+        Long futClose = longOrNull(o, "closeCents");
+        int fut = (futOpen == null ? 0 : 1) + (futHigh == null ? 0 : 1)
+                + (futLow == null ? 0 : 1) + (futClose == null ? 0 : 1);
+        if (spx == 0 && fut != 4) {
+            // Nothing to print: no translation, and not a complete set of the bar's own prices
+            // either. A PARTIAL futures set is not a reason to refuse a bar that IS translated --
+            // real records carry openCents and closeCents without highCents and lowCents, and
+            // refusing those would have thrown away four of this page's own fixtures and every
+            // bar shaped like them.
             return null;
         }
         Long volume = longOrNull(o, "volume");
-        return new OvernightGrid.Bar(start, open / 100.0, high / 100.0, low / 100.0, close / 100.0,
+        boolean futures = fut == 4;
+        return new OvernightGrid.Bar(start,
+                spx == 4 ? open / 100.0 : null,
+                spx == 4 ? high / 100.0 : null,
+                spx == 4 ? low / 100.0 : null,
+                spx == 4 ? close / 100.0 : null,
                 volume == null ? 0L : volume, text(o, "spxEqBasisState"), timeframe,
                 longOrNull(o, "buyerContracts"), longOrNull(o, "sellerContracts"),
-                longOrNull(o, "delta"));
+                longOrNull(o, "delta"),
+                futures ? futOpen / 100.0 : null,
+                futures ? futHigh / 100.0 : null,
+                futures ? futLow / 100.0 : null,
+                futures ? futClose / 100.0 : null);
     }
 
     /**

@@ -105,7 +105,32 @@ public final class BoardLines {
         }
         return new ReadablePage.Board(cycleMs, spot, present, expected, SOURCE,
                 Extremes.largest(byCents, spot, true), Extremes.largest(byCents, spot, false),
-                lines);
+                lines, strikes.size(), holdOf(root));
+    }
+
+    /**
+     * <b>R-B-9 / C-116</b>: the record's own {@code boardHold} block, or null where it is live.
+     *
+     * <p>Read off the record as JSON, like everything else here. The map service decides whether a
+     * board is held and says so in the record; this page's only job is not to draw a held board as
+     * a fresh one, which is C-40's fault over again and the reason the reviewer asked for this line.
+     */
+    static ReadablePage.Board.Hold holdOf(JsonNode root) {
+        JsonNode hold = root.path("boardHold");
+        if (hold.isMissingNode() || hold.isNull() || !hold.isObject()) {
+            return null;                    // absent means live, which is the normal case
+        }
+        JsonNode age = hold.path("ageMs");
+        String reason = text(hold, "reason");
+        if (!age.isNumber() || reason == null) {
+            // A hold block that does not say how old it is or why cannot be printed honestly, and
+            // printing the board without it would be the very thing this exists to prevent.
+            return new ReadablePage.Board.Hold(-1L, reason == null ? "held, reason absent" : reason,
+                    -1);
+        }
+        JsonNode soFar = hold.path("strikesSoFar");
+        return new ReadablePage.Board.Hold(age.longValue(), reason,
+                soFar.isNumber() ? soFar.intValue() : -1);
     }
 
     /**

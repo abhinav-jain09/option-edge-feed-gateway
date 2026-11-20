@@ -56,7 +56,7 @@ class NowPageTest {
     private static List<RecentRows.Row> recent() {
         long slot = RecentRows.slotOf(NOW);
         return RecentRows.build(NOW, 3, List.of(
-                new OvernightGrid.Bar(slot, 7163, 7165, 7162, 7163.95, 300L, "ANCHORED", "30s",
+                OvernightGrid.Bar.spx(slot, 7163, 7165, 7162, 7163.95, 300L, "ANCHORED", "30s",
                         180L, 120L, 60L)));
     }
 

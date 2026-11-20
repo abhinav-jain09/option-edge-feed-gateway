@@ -189,7 +189,9 @@ public final class ReferencePrice {
         OvernightGrid.Bar last = null;
         for (String json : window) {
             OvernightGrid.Bar b = OvernightDecoders.bar(json);
-            if (b == null || !inCashSession(b.startMs())) {
+            if (b == null || !b.hasSpx() || !inCashSession(b.startMs())) {
+                // C-118: an untranslated bar is admitted to the page, but it cannot BE the
+                // previous close -- that figure is an SPX price and this estate never derives one.
                 continue;
             }
             if (last == null || b.startMs() > last.startMs()) {
@@ -200,7 +202,8 @@ public final class ReferencePrice {
             List<String> sessionBars = new ArrayList<>();
             for (String json : window) {
                 OvernightGrid.Bar b = OvernightDecoders.bar(json);
-                if (b != null && inCashSession(b.startMs()) && sameNyDate(b.startMs(), last.startMs())) {
+                if (b != null && b.hasSpx() && inCashSession(b.startMs())
+                        && sameNyDate(b.startMs(), last.startMs())) {
                     sessionBars.add(json);
                 }
             }
@@ -264,7 +267,9 @@ public final class ReferencePrice {
         double low = Double.NaN;
         for (String json : safe(bars)) {
             OvernightGrid.Bar b = OvernightDecoders.bar(json);
-            if (b == null) {
+            if (b == null || !b.hasSpx()) {
+                // C-118: the session's range is an SPX range. An untranslated bar contributes no
+                // index price to it, and unboxing its null here would end the page with an NPE.
                 continue;
             }
             high = Double.isNaN(high) ? b.high() : Math.max(high, b.high());

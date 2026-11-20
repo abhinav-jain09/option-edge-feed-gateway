@@ -17,7 +17,7 @@ class OvernightSourceTest {
     private static final long MIN = 60_000L;
 
     private static OvernightGrid.Bar bar(long at, double close) {
-        return new OvernightGrid.Bar(at, close, close, close, close, 10L, "ANCHORED", "1m", null, null, null);
+        return OvernightGrid.Bar.spx(at, close, close, close, close, 10L, "ANCHORED", "1m", null, null, null);
     }
 
     private static ReadablePage.Price price(long at, double spx) {
@@ -154,9 +154,9 @@ class OvernightSourceTest {
         // minute laid beside its own two halves would double every volume on the row.
         OvernightSource s = new OvernightSource();
         s.nightStartsAt(CLOSE);
-        s.onBar(new OvernightGrid.Bar(CLOSE, 7180, 7180, 7180, 7180, 100L, "ANCHORED", "1m", null, null, null));
-        s.onBar(new OvernightGrid.Bar(CLOSE, 7180, 7180, 7180, 7180, 60L, "ANCHORED", "30s", null, null, null));
-        s.onBar(new OvernightGrid.Bar(CLOSE + 30_000L, 7181, 7181, 7181, 7181, 40L, "ANCHORED",
+        s.onBar(OvernightGrid.Bar.spx(CLOSE, 7180, 7180, 7180, 7180, 100L, "ANCHORED", "1m", null, null, null));
+        s.onBar(OvernightGrid.Bar.spx(CLOSE, 7180, 7180, 7180, 7180, 60L, "ANCHORED", "30s", null, null, null));
+        s.onBar(OvernightGrid.Bar.spx(CLOSE + 30_000L, 7181, 7181, 7181, 7181, 40L, "ANCHORED",
                 "30s", null, null, null));
 
         assertEquals(1, s.barCount("1m"), "the minute is held once");
@@ -176,10 +176,10 @@ class OvernightSourceTest {
     @DisplayName("a bar with no timeframe is refused outright, not given a default")
     void aBarWithoutATimeframeIsRefused() {
         assertThrows(IllegalArgumentException.class,
-                () -> new OvernightGrid.Bar(CLOSE, 7180, 7180, 7180, 7180, 1L, "ANCHORED", null,
+                () -> OvernightGrid.Bar.spx(CLOSE, 7180, 7180, 7180, 7180, 1L, "ANCHORED", null,
                         null, null, null));
         assertThrows(IllegalArgumentException.class,
-                () -> new OvernightGrid.Bar(CLOSE, 7180, 7180, 7180, 7180, 1L, "ANCHORED", " ",
+                () -> OvernightGrid.Bar.spx(CLOSE, 7180, 7180, 7180, 7180, 1L, "ANCHORED", " ",
                         null, null, null));
     }
 }

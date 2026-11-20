@@ -78,8 +78,19 @@ public final class ReadablePage {
     public record Slot(long startMs, Double open, Double high, Double low, Double close,
                        Long volume, String basisState) {
 
-        /** True where this slot has prices. A slot without them keeps its place and stays blank. */
+        /**
+         * True where a bar reached this slot at all, whether or not its price was translated.
+         *
+         * <p><b>C-118.</b> This was {@code close != null}, so a slot whose bars the platform never
+         * translated printed as blank cells and hid the volume that did arrive &mdash; the same
+         * defect as the 30-second row's, one grid up.
+         */
         public boolean filled() {
+            return volume != null;
+        }
+
+        /** True where this slot has SPX-equivalent prices to print (C-118). */
+        public boolean hasPrices() {
             return close != null;
         }
     }
@@ -113,9 +124,32 @@ public final class ReadablePage {
     public record Extreme(double strike, double netGex, double distancePoints) {
     }
 
+    /**
+     * @param published how many strikes the record itself carried, as against the {@code
+     *                  rowsPresent} of the owner's 41-row grid. The reviewer asked for it on the
+     *                  {@code board|} line because the two answer different questions: 41 of 41
+     *                  says his grid is full, and {@code published=368} says how much of the chain
+     *                  the producer sent. A full grid out of a chain that suddenly halved is a
+     *                  fault the grid's own count cannot show. &minus;1 where it is not known
+     * @param hold      the map record's own {@code boardHold} block, or null where the board is
+     *                  live (R-B-9, C-116). A held board that the page draws as fresh is exactly
+     *                  C-40's fault again, so it is carried here and printed
+     */
     public record Board(long cycleMs, double spot, int rowsPresent, int rowsExpected,
                         String source, Extreme largestAbove, Extreme largestBelow,
-                        List<String> lines) {
+                        List<String> lines, int published, Hold hold) {
+
+        /** A board held from an earlier cycle, as the map service published it (R-B-9). */
+        public record Hold(long ageMs, String reason, int strikesSoFar) {
+        }
+
+        /** The shape before the published count and the hold, for the callers that have neither. */
+        public Board(long cycleMs, double spot, int rowsPresent, int rowsExpected, String source,
+                     Extreme largestAbove, Extreme largestBelow, List<String> lines) {
+            this(cycleMs, spot, rowsPresent, rowsExpected, source, largestAbove, largestBelow,
+                    lines, -1, null);
+        }
+
         public Board {
             // The source is required and never blank. Two boards reach this page -- the map
             // service's and the pre-open projection's -- and they carry different things: the
@@ -214,8 +248,10 @@ public final class ReadablePage {
                     hm(slot.startMs(), AMS)));
             if (slot.filled()) {
                 s.append(String.format(Locale.ROOT, " %10s %10s %10s %10s %10s  %s",
-                        money(slot.open()), money(slot.high()), money(slot.low()),
-                        money(slot.close()),
+                        slot.hasPrices() ? money(slot.open()) : "-",
+                        slot.hasPrices() ? money(slot.high()) : "-",
+                        slot.hasPrices() ? money(slot.low()) : "-",
+                        slot.hasPrices() ? money(slot.close()) : "-",
                         slot.volume() == null ? "-" : String.format(Locale.ROOT, "%,d",
                                 slot.volume()),
                         slot.basisState() == null ? "-" : slot.basisState()));
@@ -253,9 +289,27 @@ public final class ReadablePage {
         s.append("  Spot ").append(money(b.spot()))
                 .append(" — source ").append(b.source())
                 .append(" — rows ").append(b.rowsPresent()).append(" of ")
-                .append(b.rowsExpected())
-                .append(". A strike the gamma service published no row for is printed as "
-                        + "\"no row\" and never skipped.\n");
+                .append(b.rowsExpected());
+        if (b.published() >= 0) {
+            s.append(" — ").append(b.published())
+                    .append(" strikes published on the record");
+        }
+        s.append(". A strike the gamma service published no row for is printed as "
+                + "\"no row\" and never skipped.\n");
+        if (b.hold() != null) {
+            // R-B-9: first thing after the cycle time and before a single figure, because every
+            // number below it is the previous cycle's. A reader who gets to the rows without
+            // meeting this sentence has read a held board as a current one.
+            s.append("  THESE FIGURES ARE HELD. They are the last complete board, ")
+                    .append(b.hold().ageMs() < 0 ? "age unknown"
+                            : StalledInputs.ago(b.hold().ageMs()) + " old")
+                    .append(", republished because: ").append(b.hold().reason());
+            if (b.hold().strikesSoFar() >= 0) {
+                s.append(" The round being assembled has reached ")
+                        .append(b.hold().strikesSoFar()).append(" strikes.");
+            }
+            s.append('\n');
+        }
         s.append(extremeLine("  Largest net gamma ABOVE spot: ", b.largestAbove()));
         s.append(extremeLine("  Largest net gamma BELOW spot: ", b.largestBelow()));
         // The rows below are C-66's compact form, so the one-letter readings are spelled out HERE,

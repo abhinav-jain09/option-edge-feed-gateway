@@ -29,7 +29,7 @@ class PagedPagesTest {
         List<OvernightGrid.Bar> bars = new ArrayList<>();
         int slots = (int) ((NOW - CLOSE) / RecentRows.SLOT_MS) + 1;
         for (int i = 0; i < slots; i++) {
-            bars.add(new OvernightGrid.Bar(slot - (long) i * RecentRows.SLOT_MS,
+            bars.add(OvernightGrid.Bar.spx(slot - (long) i * RecentRows.SLOT_MS,
                     7163, 7165, 7161, 7163.95, 123456L, "ANCHORED", "30s", 60000L, 63456L,
                     -3456L));
         }
