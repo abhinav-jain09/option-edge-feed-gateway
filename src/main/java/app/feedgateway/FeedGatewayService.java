@@ -7871,20 +7871,68 @@ public class FeedGatewayService implements ReplayRunner {
     }
 
     private synchronized void purgeExpiredCache(long nowMs) {
-        List<String> expiredKeys = new ArrayList<>();
-        for (Map.Entry<String, Long> entry : cacheEventTimes.entrySet()) {
-            // Event-aware: the versionKey is "<event>:<key>", so max-pain entries are purged on the long
-            // max-pain TTL while everything else stays on the generic 15-min window. Without this, the
-            // periodic purge would evict a perfectly valid (but >15-min-old) max-pain on the next poll.
-            if (isExpired(eventFromCacheKey(entry.getKey()), entry.getValue(), nowMs)) {
-                expiredKeys.add(entry.getKey());
-            }
-        }
+        List<String> expiredKeys = expiredCacheKeys(cacheEventTimes, nowMs);
         expiredKeys.forEach(this::removeCacheEntry);
         // Vol-premium sessions end by the contract's session rule, judged on the vol-premium clock. The
         // store's lock is a LEAF (it calls nothing while held), so taking it under this monitor cannot
         // invert any lock order — which removeCacheEntry's test pins for the emit locks.
         volPremiumStore.purge(volPremiumNow());
+    }
+
+    /**
+     * <b>C-136: the expired keys, with ONE policy lookup per distinct EVENT instead of one per
+     * entry.</b>
+     *
+     * <p><b>Measured on the live pod, 2026-11-20.</b> A 90-second JDK Flight Recorder allocation
+     * profile of the dev gateway ranked every allocation site in the process. Three of the top four
+     * were this sweep:
+     *
+     * <ul>
+     *   <li>{@code FeedGatewayService$CachePolicy.expiring} &mdash; a fresh {@code CachePolicy}
+     *       record per cache entry per sweep;</li>
+     *   <li>{@code java.time.LocalTime.create} &mdash; reached through
+     *       {@code cachePolicyFor} &rarr; {@code isRegularTradingHours}, which builds a
+     *       {@code ZonedDateTime} and a {@code LocalTime} from {@code nowMs}, again per entry;</li>
+     *   <li>{@code FeedGatewayService.purgeExpiredCache} itself &mdash; a
+     *       {@code ConcurrentHashMap$MapEntry} per entry, from iterating {@code entrySet()}.</li>
+     * </ul>
+     *
+     * <p>Together they were <b>about half of everything the process allocated</b>, and the sweep runs
+     * on every poll of both consumer loops. The heap's saw-tooth &mdash; collections every couple of
+     * minutes from a 2,200 MiB peak back to a 900 MiB floor, on a 2,560 MiB ceiling &mdash; is this
+     * churn, not retention: the live set measured by two class histograms four minutes apart grew by
+     * under a megabyte while the peaks were a gigabyte above the floor.
+     *
+     * <p><b>Why one lookup per event is exactly equivalent.</b> {@code nowMs} is a parameter of the
+     * sweep and does not change during it, and {@code cachePolicyFor} is a pure function of
+     * {@code (event, nowMs)} &mdash; it reads settings and the market calendar and nothing that the
+     * sweep mutates. So two calls with the same event inside one sweep cannot disagree, and
+     * memoising them changes no decision. There are tens of distinct events and thousands of cache
+     * entries, which is the whole of the saving.
+     *
+     * <p>{@link java.util.concurrent.ConcurrentHashMap#forEach} is used rather than an
+     * {@code entrySet()} loop because the iterator allocates a {@code MapEntry} per entry and the
+     * traversal does not.
+     *
+     * @param times the cache's event times; the field in production, a fixture under test
+     * @param nowMs the sweep instant, constant for the whole sweep
+     * @return the version keys whose entries have expired, in traversal order
+     */
+    List<String> expiredCacheKeys(Map<String, Long> times, long nowMs) {
+        List<String> expiredKeys = new ArrayList<>();
+        Map<String, CachePolicy> perEvent = new HashMap<>();
+        times.forEach((versionKey, eventTime) -> {
+            // Event-aware: the versionKey is "<event>:<key>", so max-pain entries are purged on the
+            // long max-pain TTL while everything else stays on the generic 15-min window. Without
+            // this, the periodic purge would evict a perfectly valid (but >15-min-old) max-pain on
+            // the next poll.
+            CachePolicy policy = perEvent.computeIfAbsent(eventFromCacheKey(versionKey),
+                    event -> cachePolicyFor(event, nowMs));
+            if (isExpired(policy, eventTime, nowMs)) {
+                expiredKeys.add(versionKey);
+            }
+        });
+        return expiredKeys;
     }
 
     private boolean isCacheFresh(String versionKey, long nowMs) {
@@ -8548,7 +8596,16 @@ public class FeedGatewayService implements ReplayRunner {
 
     /** Event-aware staleness: market-aware for the option-chain cache, generic otherwise. */
     private boolean isExpired(String event, long eventTime, long nowMs) {
-        CachePolicy policy = cachePolicyFor(event, nowMs);
+        return isExpired(cachePolicyFor(event, nowMs), eventTime, nowMs);
+    }
+
+    /**
+     * The same judgement against a policy ALREADY resolved.
+     *
+     * <p>Split out for C-136 so the sweep can resolve one policy per event instead of one per entry.
+     * The body is the original, moved rather than rewritten, so the two callers cannot drift.
+     */
+    private static boolean isExpired(CachePolicy policy, long eventTime, long nowMs) {
         if (policy.neverEvict()) {
             return false;
         }
