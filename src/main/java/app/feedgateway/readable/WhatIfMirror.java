@@ -65,7 +65,7 @@ public final class WhatIfMirror {
     public static final String ASSET = "what-if.js";
 
     /** The web commit the asset was read from. */
-    public static final String ASSET_COMMIT = "ca39c01f";
+    public static final String ASSET_COMMIT = "bd0d6b1f";
 
     /**
      * The screen's own staleness bound, transcribed from the asset: {@code STALE_AFTER_MS = 150000}.
@@ -431,12 +431,12 @@ public final class WhatIfMirror {
         out.append("pivot|panel=Pivot ladder|drawn=yes|axis=").append(fixed(lo, 2)).append(" to ")
                 .append(fixed(hi, 2)).append("|spot=").append(fixed(spot, 2)).append(" dashed\n");
 
-        // rule 2: one bar per drawn strike, red negative, green positive; excluded strikes are not bars
+        // rule 2: one bar per drawn strike with a published net gamma, red negative, green positive
         List<double[]> bars = new ArrayList<>();
         for (JsonNode st : root.path("strikes")) {
             Double c = number(st, "strikeCents");
             Double g = number(st.path("board"), "netGex");
-            if (c == null || g == null || st.path("board").path("excluded").asBoolean(false)) {
+            if (c == null || g == null) {
                 continue;
             }
             double k = c / 100.0;
@@ -769,9 +769,6 @@ public final class WhatIfMirror {
         // C-159 item 3: what a tap on each face row opens, in the screen's labels
         for (Row r : face) {
             JsonNode board = r.node.path("board");
-            if (board.path("excluded").asBoolean(false)) {
-                continue;
-            }
             String dist = bandDistances(r.node.path("deltaBand"), r.strike);
             JsonNode deltas = deltasFor(root, number(r.node, "strikeCents"));
             out.add("tap|" + fixed(r.strike, 0)
@@ -796,14 +793,12 @@ public final class WhatIfMirror {
     private record Row(double strike, JsonNode node) {
     }
 
-    /** One row in the face's columns; an excluded row carries its reason and NO figure (C-159). */
+    /**
+     * One row in the face's columns. C-160: no excluded-row branch; no record carries an excluded
+     * strike, so it returns with C-168 against the shape the service then publishes.
+     */
     private static String faceRow(String prefix, JsonNode root, Row r) {
         JsonNode board = r.node.path("board");
-        if (board.path("excluded").asBoolean(false)) {
-            String why = text(board, "excludedReason");
-            return prefix + '|' + fixed(r.strike, 0) + "|excluded: "
-                    + (why.isEmpty() ? "reason not published" : why);
-        }
         String reading = text(board, "holdOrAccelerate");
         JsonNode deltas = deltasFor(root, number(r.node, "strikeCents"));
         return prefix + '|' + fixed(r.strike, 0)

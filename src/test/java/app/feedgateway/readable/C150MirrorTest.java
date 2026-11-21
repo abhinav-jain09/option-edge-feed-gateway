@@ -420,7 +420,6 @@ class C150MirrorTest {
             + "\"boardHold\":{\"heldFromCycleMs\":1,\"ageMs\":542000,\"reason\":\"INPUT_QUIET\",\"strikesSoFar\":6},"
             + "\"strikes\":[{\"strikeCents\":700000,\"board\":{\"netGex\":-2.39e9,\"holdOrAccelerate\":\"ACCELERATE\",\"strength\":0.84}},"
             + "{\"strikeCents\":690000,\"board\":{\"netGex\":-2.85e9,\"holdOrAccelerate\":\"ACCELERATE\",\"strength\":1.0}},"
-            + "{\"strikeCents\":697000,\"board\":{\"netGex\":0,\"excluded\":true,\"excludedReason\":\"BAND_NOT_BRACKETED\"}},"
             + "{\"strikeCents\":720000,\"board\":{\"netGex\":9e9,\"strength\":1.4}}],"
             + "\"staircases\":[{\"orientation\":\"UP\",\"stairState\":\"WATCH\",\"topRung\":7050,\"lowRung\":6950,"
             + "\"rungCount\":2,\"topStep\":{\"strike\":7050},\"pinTarget\":{\"strike\":7000,\"stoppedBy\":\"BALANCE\"},"
@@ -464,12 +463,11 @@ class C150MirrorTest {
     }
 
     @Test
-    @DisplayName("C-160 CONTRACT SHAPE ONLY (no live record carries excluded:true); C-163 a missing delta is a dash, its reason in words behind the tap")
-    void exclusionsAndDeltaReasons() {
+    @DisplayName("C-163: a missing delta is a dash on the face, its reason in words behind the tap")
+    void deltaReasonsAreWordsBehindTheTap() {
         String page = WhatIfMirror.renderWhole(CYCLE_MS, C150);
-        // C-159: an excluded row carries its reason and NO figure
-        assertTrue(page.contains("row|6970|excluded: BAND_NOT_BRACKETED"), page);
-        assertFalse(page.contains("+0.0M"), page);
+        // C-160: the page reads no excluded-row shape, so no excluded row appears on the mirror
+        assertFalse(page.contains("excluded"), page);
         assertTrue(page.contains("|0.453|-"), page);
         assertTrue(page.contains("|put delta not published: volatility taken from the other side of the strike|"), page);
         assertFalse(page.contains("|PARITY_IV"), "C-163: no producer code on the face\n" + page);
@@ -506,7 +504,7 @@ class C150MirrorTest {
     void drawnLadderSaysEachRule() {
         String page = WhatIfMirror.renderWhole(CYCLE_MS, C159);
         assertTrue(page.contains("pivot|bars=7075 green · 7050 red · 7000 red · 6975 red · 6950 green · 6900 red (longest) · 6875 green"),
-                "the excluded 6970 is not a bar\n" + page);
+                "one bar per strike with a published net gamma\n" + page);
         assertTrue(page.contains("pivot|up|arrow spot to 7000 in BUY|help zone 6963.70 to 7082"
                 + "|job done 7082 solid black|dead zone 7082 to 7087.00"), page);
         assertTrue(page.contains("pivot|down|arrow spot to 7000 in SELL|help zone 6963.70 to 6919"
@@ -521,9 +519,9 @@ class C150MirrorTest {
     @DisplayName("C-159 item 4: four strikes each side of spot plus the named ones; the rest after, as show all")
     void faceWindowAndShowAll() {
         String page = WhatIfMirror.renderWhole(CYCLE_MS, C159);
-        // 12 strikes: seven at or above spot (6970 is above 6963.70), five below; four nearest each side
-        assertTrue(page.contains("table|face rows=8|behind show all=4|spot row drawn=yes"), page);
-        for (String k : new String[] {"7000", "6975", "6970", "6950", "6900", "6875", "6850"}) {
+        // 11 strikes: six at or above spot, five below; the four nearest each side are the face
+        assertTrue(page.contains("table|face rows=8|behind show all=3|spot row drawn=yes"), page);
+        for (String k : new String[] {"7050", "7000", "6975", "6950", "6900", "6875", "6850"}) {
             assertTrue(page.contains("row|" + k + "|"), "face row " + k + "\n" + page);
         }
         assertTrue(page.contains("showall|7150|"), page);
@@ -537,7 +535,6 @@ class C150MirrorTest {
             + strike(715000, 1e8, "HOLD", 0.03) + ',' + strike(710000, 1e8, "HOLD", 0.03) + ','
             + strike(707500, 1e8, "HOLD", 0.03) + ',' + strike(705000, -3.1e8, "ACCELERATE", 0.13) + ','
             + strike(700000, -2.39e9, "ACCELERATE", 0.84) + ',' + strike(697500, -4.937e8, "ACCELERATE", 0.18) + ','
-            + "{\"strikeCents\":697000,\"board\":{\"netGex\":0,\"excluded\":true,\"excludedReason\":\"BAND_NOT_BRACKETED\"}},"
             + strike(695000, 1.2e8, "HOLD", 0.05) + ',' + strike(690000, -2.85e9, "ACCELERATE", 1.0) + ','
             + strike(687500, 1e8, "HOLD", 0.03) + ',' + strike(685000, 1e8, "HOLD", 0.03) + ','
             + strike(682500, 1e8, "HOLD", 0.03) + "],"
