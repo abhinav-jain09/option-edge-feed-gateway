@@ -72,10 +72,15 @@ class C150MirrorTest {
     }
 
     @Test
-    @DisplayName("the band is two distances from the strike, and they are not symmetric")
+    @DisplayName("the band is its two EDGE PRICES named by the published thresholds (accepted screen, C-122)")
     void bandIsTwoDistances() {
-        assertEquals("-84 / +84", band("{\"lowerEdge\":6916,\"upperEdge\":7084}", 7000));
-        assertEquals("-50 / +120", band("{\"lowerEdge\":6950,\"upperEdge\":7120}", 7000));
+        // re-aimed: the screen this mirrors (web 06a3f53b) prints the edge prices; an omitted
+        // threshold is a question, never a claim
+        assertEquals("d05? 6916.00 / d95? 7084.00", band("{\"lowerEdge\":6916,\"upperEdge\":7084}", 7000));
+        assertEquals("d05 6950.00 / d95 7120.00", band("{\"lowerEdge\":6950,\"upperEdge\":7120,"
+                + "\"lowerThreshold\":0.05,\"upperThreshold\":0.95}", 7000));
+        assertEquals("d10 6950.00 / d90 7120.00", band("{\"lowerEdge\":6950,\"upperEdge\":7120,"
+                + "\"lowerThreshold\":0.1,\"upperThreshold\":0.9}", 7000), "a 0.90 band is never named d95");
         assertEquals("-", band("{\"lowerEdge\":6950}", 7000), "one edge is not a band");
         assertEquals("-", band("{}", 7000));
     }
@@ -152,8 +157,8 @@ class C150MirrorTest {
                 + "|strength=2|armed by=sellers_absorbed, trading_off_peak"), page);
 
         assertTrue(page.contains("table|cols=Strike|Net gamma|Reading|Strength"
-                + "|Decay to close (index delta)|Band"), page);
-        assertTrue(page.contains("row|7000|+1.2M|HOLD|34%|64.2k up|-84 / +84"), page);
+                + "|Decay to close (index delta)|Band (edge prices)|Call delta|Put delta"), page);
+        assertTrue(page.contains("row|7000|+1.2M|HOLD|34%|64.2k up|d05? 6916.00 / d95? 7084.00|-|-"), page);
     }
 
     @Test
@@ -197,12 +202,12 @@ class C150MirrorTest {
                 "{\"symbol\":\"SPX\",\"expiry\":\"20261120\",\"spot\":6963.7,"
                         + "\"fingerprint\":{\"valuationTime\":" + CYCLE_MS + "},"
                         + "\"strikes\":[{\"strikeCents\":700000,\"board\":{\"netGex\":1.2e6}}]}");
-        assertTrue(page.contains("pivot|panel=Pivot ladder|drawn=no|reason=the record carries no "
-                + "pivotLadder block"), page);
-        assertTrue(page.contains("unwind|panel=Ladder unwind|drawn=no|reason=the record carries no "
-                + "ladders list"), page);
+        // re-aimed: the screen now SAYS an absent panel in words rather than drawing nothing (R-IN-2)
+        assertTrue(page.contains("pivot|panel=Pivot ladder|drawn=no|Pivot ladder: no strike in reach"), page);
+        assertTrue(page.contains("unwind|panel=Ladder unwind|drawn=no|Ladder unwind: no ladder"), page);
+        assertTrue(page.contains("stair|panel=Staircase|drawn=no|Staircase: no staircase"), page);
         // and the row still renders, with each absent cell named
-        assertTrue(page.contains("row|7000|+1.2M|-|-|-|-"), page);
+        assertTrue(page.contains("row|7000|+1.2M|-|-|-|-|-|-"), page);
     }
 
     @Test
@@ -211,7 +216,7 @@ class C150MirrorTest {
         String page = WhatIfMirror.renderWhole(CYCLE_MS,
                 "{\"symbol\":\"SPX\",\"pivotLadder\":{\"pivotUp\":null,\"pivotDown\":null},"
                         + "\"strikes\":[]}");
-        assertTrue(page.contains("|drawn=no|reason=neither pivot is in reach"), page);
+        assertTrue(page.contains("pivot|panel=Pivot ladder|drawn=no|Pivot ladder: no strike in reach"), page);
     }
 
     @Test
@@ -392,5 +397,63 @@ class C150MirrorTest {
         } catch (Exception e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    // ---- C-150: the panels the page gained (web 06a3f53b), mirrored --------------------------
+
+    private static final String C150 = "{\"symbol\":\"SPX\",\"expiry\":\"20261120\",\"spot\":6963.7,"
+            + "\"fingerprint\":{\"valuationTime\":" + CYCLE_MS + "},"
+            + "\"boardHold\":{\"heldFromCycleMs\":1,\"ageMs\":542000,\"reason\":\"INPUT_QUIET\",\"strikesSoFar\":6},"
+            + "\"strikes\":[{\"strikeCents\":700000,\"board\":{\"netGex\":-2.39e9,\"holdOrAccelerate\":\"ACCELERATE\",\"strength\":0.84}},"
+            + "{\"strikeCents\":690000,\"board\":{\"netGex\":-2.85e9,\"holdOrAccelerate\":\"ACCELERATE\",\"strength\":1.0}},"
+            + "{\"strikeCents\":697000,\"board\":{\"netGex\":0,\"excluded\":true,\"excludedReason\":\"BAND_NOT_BRACKETED\"}},"
+            + "{\"strikeCents\":720000,\"board\":{\"netGex\":9e9,\"strength\":1.4}}],"
+            + "\"staircases\":[{\"orientation\":\"UP\",\"stairState\":\"WATCH\",\"topRung\":7050,\"lowRung\":6950,"
+            + "\"rungCount\":2,\"topStep\":{\"strike\":7050},\"pinTarget\":{\"strike\":7000,\"stoppedBy\":\"BALANCE\"},"
+            + "\"stepsTaken\":0,\"phrase\":{\"text\":\"Stair above. First step 7050.\",\"arbitrated\":false},\"opposed\":true}],"
+            + "\"strikeDeltas\":{\"strikes\":{\"700000\":{\"callDelta\":0.4528,\"putReason\":\"PARITY_IV\"}}}}";
+
+    @Test
+    @DisplayName("C-40/C-116: a held board reads HELD with the board's age and why, never LIVE")
+    void heldBoardIsNeverLive() {
+        String page = WhatIfMirror.renderWhole(CYCLE_MS + 5000, C150);
+        assertTrue(page.contains("|state=HELD|age=board 542s old"), page);
+        assertTrue(page.contains("status|held because no gamma record arrived (6 strikes so far)"), page);
+        assertTrue(!page.contains("state=LIVE"), page);
+    }
+
+    @Test
+    @DisplayName("the accepted screen's biggest strike, within 100 points, from the service's own scale")
+    void biggestStrikeWithinOneHundredPoints() {
+        String page = WhatIfMirror.renderWhole(CYCLE_MS, C150);
+        // 7200 carries 1.4 but is 236 points out; 6900 is the top of the scale inside the window
+        assertTrue(page.contains("status|Biggest strike within 100 points: 6900"), page);
+    }
+
+    @Test
+    @DisplayName("R-ID-2: the line's slot says the signal layer is not built, never NO TRADE")
+    void theLineSlotSaysItIsNotBuilt() {
+        String page = WhatIfMirror.renderWhole(CYCLE_MS, C150);
+        assertTrue(page.contains("line|No line: the signal layer that produces it is not built yet."), page);
+        assertTrue(!page.contains("NO TRADE"), page);
+    }
+
+    @Test
+    @DisplayName("the staircase panel, the phrase as worded, and OPPOSED")
+    void staircaseAndPhrase() {
+        String page = WhatIfMirror.renderWhole(CYCLE_MS, C150);
+        assertTrue(page.contains("stair|Stair above|state=WATCH|rungs=2 (6950 - 7050)|top step=7050"
+                + "|pin target=7000 · pull turns back|steps taken=0"), page);
+        assertTrue(page.contains("stair|Stair above|phrase=\"Stair above. First step 7050.\" "
+                + "not spoken (another pattern has the minute)|OPPOSED"), page);
+    }
+
+    @Test
+    @DisplayName("R-IN-2: an excluded strike prints its reason; a missing delta prints the producer's reason")
+    void exclusionsAndDeltaReasons() {
+        String page = WhatIfMirror.renderWhole(CYCLE_MS, C150);
+        assertTrue(page.contains("row|6970|+0.0M|excluded: BAND_NOT_BRACKETED"), page);
+        assertTrue(page.contains("|0.453|PARITY_IV"), page);
+        assertTrue(!page.contains("note|Call delta and Put delta are empty"), page);
     }
 }

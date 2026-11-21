@@ -65,7 +65,7 @@ public final class WhatIfMirror {
     public static final String ASSET = "what-if.js";
 
     /** The web commit the asset was read from. */
-    public static final String ASSET_COMMIT = "42eaf244";
+    public static final String ASSET_COMMIT = "06a3f53b";
 
     /** The screen's own staleness bound, transcribed from the asset. */
     public static final long STALE_AFTER_MS = 90_000L;
@@ -73,7 +73,7 @@ public final class WhatIfMirror {
     /** The six column headings, in the screen's order. */
     public static final List<String> COLUMNS = List.of(
             "Strike", "Net gamma", "Reading", "Strength",
-            "Decay to close (index delta)", "Band");
+            "Decay to close (index delta)", "Band (edge prices)", "Call delta", "Put delta");
 
     /**
      * Every top-level key any panel of the screen reads. The {@code notdrawn} block is the
@@ -82,7 +82,7 @@ public final class WhatIfMirror {
      */
     public static final Set<String> DRAWN = Set.of(
             "symbol", "expiry", "spot", "fingerprint", "strikes", "pivotLadder", "ladders",
-            "present");
+            "staircases", "boardHold", "strikeDeltas", "present");
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -120,8 +120,10 @@ public final class WhatIfMirror {
 
         chain(head, root);
         status(head, root, nowMs);
+        line(head);
         pivotLadder(head, root);
         unwinds(head, root);
+        staircases(head, root);
 
         // The strike rows are the only part that can outgrow a page, so they are the rows and
         // everything else is the header. Pages.paged is reused rather than re-implemented because
@@ -179,10 +181,76 @@ public final class WhatIfMirror {
             out.append("|state=STALE|age=-");
         } else {
             long age = Math.max(0L, nowMs - cycle);
-            out.append("|state=").append(age > STALE_AFTER_MS ? "STALE" : "LIVE")
-                    .append("|age=").append(ageText(age));
+            JsonNode hold = root.path("boardHold");
+            if (age <= STALE_AFTER_MS && hold.isObject()) {
+                // C-40 / C-116: a held board is republished every cycle, so its PUBLISH is fresh
+                // while the BOARD is not. The screen's chip says HELD with the board's own age,
+                // never LIVE, and the mirror says the same.
+                Double heldAge = number(hold, "ageMs");
+                out.append("|state=HELD|age=").append(heldAge == null ? "age unknown"
+                        : "board " + Math.round(heldAge / 1000.0) + "s old");
+            } else {
+                out.append("|state=").append(age > STALE_AFTER_MS ? "STALE" : "LIVE")
+                        .append("|age=").append(ageText(age));
+            }
         }
         out.append('\n');
+        JsonNode hold = root.path("boardHold");
+        if (hold.isObject()) {
+            out.append("status|").append(fmtHold(hold)).append('\n');
+        }
+        Double biggest = biggestStrike(root.path("strikes"), spot);
+        if (biggest != null) {
+            out.append("status|Biggest strike within 100 points: ").append(fixed(biggest, 0))
+                    .append('\n');
+        }
+    }
+
+    /** {@code fmtHold()}: why the board is held, said once beside the HELD chip. */
+    static String fmtHold(JsonNode h) {
+        String reason = text(h, "reason");
+        String why = switch (reason) {
+            case "INPUT_QUIET" -> "no gamma record arrived";
+            case "ROWS_REFUSED" -> "every gamma record was refused";
+            case "ROUND_NOT_COMPLETE" -> "the gamma round is still filling";
+            default -> reason.isEmpty() ? "reason not published" : reason;
+        };
+        Double sofar = number(h, "strikesSoFar");
+        return "held because " + why + (sofar == null ? "" : " (" + fixed(sofar, 0) + " strikes so far)");
+    }
+
+    /**
+     * {@code biggestStrike()}: the accepted screen's line. SELECTED from the service's own strength
+     * scale within 100 points of spot, ties to the strike nearest spot.
+     */
+    static Double biggestStrike(JsonNode strikes, Double spot) {
+        if (!strikes.isArray() || spot == null) {
+            return null;
+        }
+        Double best = null;
+        Double bestStrength = null;
+        for (JsonNode s : strikes) {
+            Double cents = number(s, "strikeCents");
+            Double strength = number(s.path("board"), "strength");
+            if (cents == null || strength == null) {
+                continue;
+            }
+            double k = cents / 100.0;
+            if (Math.abs(k - spot) > 100) {
+                continue;
+            }
+            if (best == null || strength > bestStrength
+                    || (strength.equals(bestStrength) && Math.abs(k - spot) < Math.abs(best - spot))) {
+                best = k;
+                bestStrength = strength;
+            }
+        }
+        return best;
+    }
+
+    /** R-ID-2: the line's own slot, in the screen's words. */
+    private static void line(StringBuilder out) {
+        out.append("line|No line: the signal layer that produces it is not built yet.\n");
     }
 
     /** {@code freshness()}'s age wording, transcribed: seconds under 90, else whole minutes. */
@@ -201,17 +269,16 @@ public final class WhatIfMirror {
     private static void pivotLadder(StringBuilder out, JsonNode root) {
         JsonNode ladder = root.path("pivotLadder");
         if (!ladder.isObject()) {
-            out.append("pivot|panel=Pivot ladder|drawn=no|reason=the record carries no pivotLadder "
-                    + "block, and the screen draws no panel at all for that (its absence is not a "
-                    + "reading)\n");
+            out.append("pivot|panel=Pivot ladder|drawn=no|Pivot ladder: no strike in reach on "
+                    + "either side this cycle.\n");
             return;
         }
         boolean up = ladder.path("pivotUp").isObject() && number(ladder.path("pivotUp"), "strike") != null;
         boolean down = ladder.path("pivotDown").isObject()
                 && number(ladder.path("pivotDown"), "strike") != null;
         if (!up && !down) {
-            out.append("pivot|panel=Pivot ladder|drawn=no|reason=neither pivot is in reach, and the "
-                    + "screen draws no panel rather than two empty cards\n");
+            out.append("pivot|panel=Pivot ladder|drawn=no|Pivot ladder: no strike in reach on "
+                    + "either side this cycle.\n");
             return;
         }
         out.append("pivot|panel=Pivot ladder\n");
@@ -273,8 +340,8 @@ public final class WhatIfMirror {
     private static void unwinds(StringBuilder out, JsonNode root) {
         JsonNode list = root.path("ladders");
         if (!list.isArray() || list.isEmpty()) {
-            out.append("unwind|panel=Ladder unwind|drawn=no|reason=the record carries no ladders "
-                    + "list, and the screen draws no panel at all for that\n");
+            out.append("unwind|panel=Ladder unwind|drawn=no|Ladder unwind: no ladder on either side "
+                    + "this cycle.\n");
             return;
         }
         out.append("unwind|panel=Ladder unwind|blocks=").append(list.size()).append('\n');
@@ -303,7 +370,75 @@ public final class WhatIfMirror {
                     .append(" / ").append(yesNo(b, "reclaim"))
                     .append('\n');
             reads(out, side, b.path("radarReads"));
+            phrase(out, "unwind|" + side, b);
         }
+    }
+
+    /** C-90 / R-VOICE-1: the phrase as worded, spoken or not, and R-SC-12b's OPPOSED. */
+    private static void phrase(StringBuilder out, String prefix, JsonNode b) {
+        JsonNode p = b.path("phrase");
+        String t = p.isObject() ? text(p, "text") : "";
+        out.append(prefix).append("|phrase=");
+        if (t.isEmpty()) {
+            out.append("no phrase this minute");
+        } else {
+            out.append('"').append(t).append("\" ")
+                    .append(p.path("arbitrated").asBoolean(false) ? "spoken this minute"
+                            : "not spoken (another pattern has the minute)");
+        }
+        if (b.path("opposed").isBoolean() && b.path("opposed").asBoolean()) {
+            out.append("|OPPOSED");
+        }
+        out.append('\n');
+    }
+
+    // ------------------------------------------------------------ panel: §12f's staircase
+
+    private static void staircases(StringBuilder out, JsonNode root) {
+        JsonNode list = root.path("staircases");
+        if (!list.isArray() || list.isEmpty()) {
+            out.append("stair|panel=Staircase|drawn=no|Staircase: no staircase on either side this "
+                    + "cycle.\n");
+            return;
+        }
+        out.append("stair|panel=Staircase|blocks=").append(list.size()).append('\n');
+        for (JsonNode b : list) {
+            String orientation = text(b, "orientation");
+            if (orientation.isEmpty() || text(b, "stairState").isEmpty()) {
+                out.append("stair|DROPPED|reason=no orientation or state on the block; the screen "
+                        + "drops it rather than defaulting a side (R-SC-12)\n");
+                continue;
+            }
+            String side = "DOWN".equals(orientation) ? "Stair below" : "Stair above";
+            Double count = number(b, "rungCount");
+            Double low = number(b, "lowRung");
+            Double top = number(b, "topRung");
+            Double topStep = b.path("topStep").isObject() ? number(b.path("topStep"), "strike") : null;
+            JsonNode pin = b.path("pinTarget");
+            Double pinStrike = pin.isObject() ? number(pin, "strike") : null;
+            Double steps = number(b, "stepsTaken");
+            out.append("stair|").append(side)
+                    .append("|state=").append(text(b, "stairState"))
+                    .append("|rungs=").append(count == null ? "-" : fixed(count, 0) + " ("
+                            + (low == null ? "?" : fixed(low, 0)) + " - "
+                            + (top == null ? "?" : fixed(top, 0)) + ")")
+                    .append("|top step=").append(topStep == null ? "none" : fixed(topStep, 0))
+                    .append("|pin target=").append(pinStrike == null ? "none"
+                            : fixed(pinStrike, 0) + " · " + stoppedBy(text(pin, "stoppedBy")))
+                    .append("|steps taken=").append(steps == null ? "-" : fixed(steps, 0))
+                    .append('\n');
+            phrase(out, "stair|" + side, b);
+        }
+    }
+
+    private static String stoppedBy(String code) {
+        return switch (code) {
+            case "BALANCE" -> "pull turns back";
+            case "GAP" -> "next rung out of reach";
+            case "NEGATIVE_STRIKE" -> "a negative strike between";
+            case "LAST_RUNG" -> "no next rung";
+            default -> code;
+        };
     }
 
     private static String rungs(JsonNode b) {
@@ -412,16 +547,31 @@ public final class WhatIfMirror {
                 spotDrawn = true;
             }
             JsonNode board = r.node.path("board");
+            if (board.path("excluded").asBoolean(false)) {
+                // R-IN-2: the screen prints the reason across the row, never figures that look real
+                String why = text(board, "excludedReason");
+                out.add("row|" + fixed(r.strike, 0) + '|' + fmtGamma(number(board, "netGex"))
+                        + "|excluded: " + (why.isEmpty() ? "reason not published" : why));
+                continue;
+            }
             String reading = text(board, "holdOrAccelerate");
+            JsonNode deltas = deltasFor(root, number(r.node, "strikeCents"));
             out.add("row|" + fixed(r.strike, 0)
                     + '|' + fmtGamma(number(board, "netGex"))
                     + '|' + (reading.isEmpty() ? "-" : reading)
                     + '|' + fmtStrength(number(board, "strength"))
                     + '|' + fmtDecay(r.node.path("decayToExpiry"))
-                    + '|' + fmtBand(r.node.path("deltaBand"), r.strike));
+                    + '|' + fmtBand(r.node.path("deltaBand"), r.strike)
+                    + '|' + fmtDelta(deltas, true)
+                    + '|' + fmtDelta(deltas, false));
         }
         out.add("table|rows=" + rows.size()
                 + "|spot row drawn=" + (spotDrawn ? "yes" : "no"));
+        JsonNode sib = root.path("strikeDeltas");
+        if (!sib.path("strikes").isObject()) {
+            out.add("note|Call delta and Put delta are empty because this gateway is not publishing "
+                    + "the strikeDeltas block yet.");
+        }
     }
 
     private record Row(double strike, JsonNode node) {
@@ -518,10 +668,9 @@ public final class WhatIfMirror {
     }
 
     /**
-     * {@code fmtBand()}: the 0.05-to-0.95 delta band as the two distances from the strike.
-     *
-     * <p>Not two absolute prices: the band is a property OF the strike and the strike is already
-     * on the row. The sides are printed separately because they are NOT symmetric.
+     * {@code fmtBand()}: the band's two EDGE PRICES, each named by the threshold the record
+     * published it at (C-122 / C-125, and the accepted screen's "7,417 - 7,433"). A threshold the
+     * record omits prints as a question ({@code d95?}), never as a claim.
      */
     static String fmtBand(JsonNode band, double strike) {
         Double lo = band.isObject() ? number(band, "lowerEdge") : null;
@@ -529,7 +678,40 @@ public final class WhatIfMirror {
         if (lo == null || hi == null) {
             return "-";
         }
-        return "-" + fixed(strike - lo, 0) + " / +" + fixed(hi - strike, 0);
+        return thresholdName(number(band, "lowerThreshold"), "d05") + ' ' + fixed(lo, 2) + " / "
+                + thresholdName(number(band, "upperThreshold"), "d95") + ' ' + fixed(hi, 2);
+    }
+
+    /** {@code thresholdName()}: d + the threshold in hundredths, or the expected name with a ?. */
+    static String thresholdName(Double value, String expected) {
+        if (value == null) {
+            return expected + "?";
+        }
+        long n = Math.round(value * 100);
+        return "d" + (n < 10 ? "0" : "") + n;
+    }
+
+    /** {@code deltasFor()}: the strikeDeltas sibling's entry for this strike, keyed by CENTS. */
+    private static JsonNode deltasFor(JsonNode root, Double cents) {
+        JsonNode strikes = root.path("strikeDeltas").path("strikes");
+        if (!strikes.isObject() || cents == null) {
+            return null;
+        }
+        JsonNode e = strikes.path(String.valueOf((long) (double) cents));
+        return e.isObject() ? e : null;
+    }
+
+    /** {@code fmtDelta()}: the published delta, else the producer's own reason, never a zero. */
+    static String fmtDelta(JsonNode entry, boolean call) {
+        if (entry == null) {
+            return "-";
+        }
+        Double v = number(entry, call ? "callDelta" : "putDelta");
+        if (v != null) {
+            return fixed(v, 3);
+        }
+        String reason = text(entry, call ? "callReason" : "putReason");
+        return reason.isEmpty() ? "none" : reason;
     }
 
     // ------------------------------------------------------------------------------ plumbing
